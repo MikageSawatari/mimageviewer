@@ -4,6 +4,9 @@
 //! Back/Forward, comparison Left/Right keys, and XButton1/XButton2. Enabling it
 //! must not change dispatch, repeat, generation, overlay, or App decisions.
 
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -43,6 +46,7 @@ pub(crate) enum NativeVideoInputOrigin {
         command: u16,
         device_flags: u16,
         key_state: u16,
+        delivery: NativeAppCommandDelivery,
     },
     Win32MouseButton {
         window_source: NativeVideoWindowSource,
@@ -68,6 +72,110 @@ pub(crate) enum GetMessageRemoval {
     NoRemove,
     Remove,
     Unknown(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeWindowMessage {
+    pub(crate) hwnd: u64,
+    pub(crate) message: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeAppCommandDelivery {
+    pub(crate) in_send_flags: u32,
+    pub(crate) dispatching: bool,
+    pub(crate) outer: Option<NativeWindowMessage>,
+}
+
+#[derive(Clone, Copy)]
+struct DispatchingMessage {
+    message: NativeWindowMessage,
+    entered: bool,
+}
+
+thread_local! {
+    static DISPATCHING_MESSAGE: Cell<Option<DispatchingMessage>> = const { Cell::new(None) };
+    static WNDPROC_MESSAGE: Cell<Option<NativeWindowMessage>> = const { Cell::new(None) };
+}
+
+/// Diagnostic scopes only: restore the previous frame even through a nested pump.
+/// Thread-bound guards must not restore another thread's TLS.
+pub(crate) struct NativeMessageDispatchScope {
+    previous: Option<DispatchingMessage>,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn begin_native_message_dispatch(hwnd: u64, message: u32) -> NativeMessageDispatchScope {
+    NativeMessageDispatchScope {
+        previous: DISPATCHING_MESSAGE.replace(Some(DispatchingMessage {
+            message: NativeWindowMessage { hwnd, message },
+            entered: false,
+        })),
+        _thread_bound: PhantomData,
+    }
+}
+
+impl Drop for NativeMessageDispatchScope {
+    fn drop(&mut self) {
+        DISPATCHING_MESSAGE.set(self.previous);
+    }
+}
+
+pub(crate) struct NativeWndProcScope {
+    outer: Option<NativeWindowMessage>,
+    dispatching: bool,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+pub(crate) fn enter_native_wnd_proc(hwnd: u64, message: u32) -> NativeWndProcScope {
+    let current = NativeWindowMessage { hwnd, message };
+    let dispatching = DISPATCHING_MESSAGE.with(|slot| {
+        let Some(mut dispatch) = slot.get() else {
+            return false;
+        };
+        if dispatch.message != current || dispatch.entered {
+            return false;
+        }
+        // A synchronous reentry with the same HWND/message is a separate receipt,
+        // not the queued message whose DispatchMessageW is still on the stack.
+        dispatch.entered = true;
+        slot.set(Some(dispatch));
+        true
+    });
+    NativeWndProcScope {
+        outer: WNDPROC_MESSAGE.replace(Some(current)),
+        dispatching,
+        _thread_bound: PhantomData,
+    }
+}
+
+impl NativeWndProcScope {
+    pub(crate) fn app_command_delivery(&self, in_send_flags: u32) -> NativeAppCommandDelivery {
+        NativeAppCommandDelivery {
+            in_send_flags,
+            dispatching: self.dispatching,
+            outer: self.outer,
+        }
+    }
+}
+
+impl Drop for NativeWndProcScope {
+    fn drop(&mut self) {
+        WNDPROC_MESSAGE.set(self.outer);
+    }
+}
+
+fn app_command_delivery_label(delivery: NativeAppCommandDelivery) -> &'static str {
+    if delivery.dispatching {
+        "queued"
+    } else if delivery.in_send_flags & 0x000F != 0 {
+        // ISMEX_SEND / NOTIFY / CALLBACK / REPLIED report a cross-thread send.
+        "sent_cross_thread"
+    } else if delivery.in_send_flags == 0 && delivery.outer.is_some() {
+        "sent_same_thread_during"
+    } else {
+        "unknown"
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +241,7 @@ pub(crate) fn win32_app_command_receipt(
     receiver_hwnd: u64,
     command_source_hwnd: u64,
     lparam: isize,
+    delivery: NativeAppCommandDelivery,
 ) -> NativeVideoInputReceipt {
     let key_state = (lparam as u64 & 0xffff) as u16;
     let raw_command_word = ((lparam as u64 >> 16) & 0xffff) as u16;
@@ -144,6 +253,7 @@ pub(crate) fn win32_app_command_receipt(
         command: raw_command_word & 0x0fff,
         device_flags: raw_command_word & 0xf000,
         key_state,
+        delivery,
     })
 }
 
@@ -279,9 +389,21 @@ fn format_origin(origin: NativeVideoInputOrigin) -> String {
             command,
             device_flags,
             key_state,
-        } => format!(
-            "origin=win32_appcommand window_source={window_source:?} receiver_hwnd=0x{receiver_hwnd:X} command_source_hwnd=0x{command_source_hwnd:X} raw_command_word=0x{raw_command_word:04X} command={command} device_flags=0x{device_flags:04X} key_state=0x{key_state:04X}"
-        ),
+            delivery,
+        } => {
+            let delivery_label = app_command_delivery_label(delivery);
+            let outer = match delivery.outer {
+                Some(outer) => format!(
+                    "outer_hwnd=0x{:X} outer_message=0x{:04X}",
+                    outer.hwnd, outer.message
+                ),
+                None => "outer_hwnd=none outer_message=none".to_owned(),
+            };
+            format!(
+                "origin=win32_appcommand window_source={window_source:?} receiver_hwnd=0x{receiver_hwnd:X} command_source_hwnd=0x{command_source_hwnd:X} raw_command_word=0x{raw_command_word:04X} command={command} device_flags=0x{device_flags:04X} key_state=0x{key_state:04X} in_send_flags=0x{:08X} dispatching={} {outer} delivery={delivery_label}",
+                delivery.in_send_flags, delivery.dispatching
+            )
+        }
         NativeVideoInputOrigin::Win32MouseButton {
             window_source,
             receiver_hwnd,
@@ -618,11 +740,17 @@ mod tests {
 
     #[test]
     fn app_command_receipt_keeps_receiver_and_command_source_hwnds() {
+        let delivery = NativeAppCommandDelivery {
+            in_send_flags: 0,
+            dispatching: true,
+            outer: None,
+        };
         let receipt = win32_app_command_receipt(
             NativeVideoWindowSource::Presenter,
             0x1111,
             0x2222,
             ((0x4001_u32 << 16) | 0x000C) as isize,
+            delivery,
         );
         assert!(matches!(
             receipt.origin,
@@ -634,8 +762,151 @@ mod tests {
                 command: 1,
                 device_flags: 0x4000,
                 key_state: 0x000C,
-            }
+                delivery: actual_delivery,
+            } if actual_delivery == delivery
         ));
+    }
+
+    #[test]
+    fn app_command_delivery_classifies_queue_cross_thread_and_nested_receipts() {
+        let outer = Some(NativeWindowMessage {
+            hwnd: 0x1111,
+            message: 0x0101,
+        });
+        for (in_send_flags, dispatching, outer, expected) in [
+            (0, true, None, "queued"),
+            (0, true, outer, "queued"),
+            (0, false, outer, "sent_same_thread_during"),
+            (1, false, None, "sent_cross_thread"),
+            (2, false, outer, "sent_cross_thread"),
+            (4, false, None, "sent_cross_thread"),
+            (8, false, None, "sent_cross_thread"),
+            (9, false, outer, "sent_cross_thread"),
+            (0, false, None, "unknown"),
+            (0x8000_0000, false, outer, "unknown"),
+        ] {
+            let delivery = NativeAppCommandDelivery {
+                in_send_flags,
+                dispatching,
+                outer,
+            };
+            assert_eq!(
+                app_command_delivery_label(delivery),
+                expected,
+                "{delivery:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_command_log_fields_keep_raw_flags_dispatch_and_outer_message_for_both_sources() {
+        for source in [
+            NativeVideoWindowSource::Presenter,
+            NativeVideoWindowSource::Hud,
+        ] {
+            let receipt = win32_app_command_receipt(
+                source,
+                0x2222,
+                0x3333,
+                ((0x8001_u32 << 16) | 0x0005) as isize,
+                NativeAppCommandDelivery {
+                    in_send_flags: 0,
+                    dispatching: false,
+                    outer: Some(NativeWindowMessage {
+                        hwnd: 0x1111,
+                        message: 0x0101,
+                    }),
+                },
+            );
+            assert_eq!(
+                format_origin(receipt.origin),
+                format!(
+                    "origin=win32_appcommand window_source={source:?} receiver_hwnd=0x2222 command_source_hwnd=0x3333 raw_command_word=0x8001 command=1 device_flags=0x8000 key_state=0x0005 in_send_flags=0x00000000 dispatching=false outer_hwnd=0x1111 outer_message=0x0101 delivery=sent_same_thread_during"
+                )
+            );
+            let receipt = win32_app_command_receipt(
+                source,
+                0x2222,
+                0x3333,
+                1 << 16,
+                NativeAppCommandDelivery {
+                    in_send_flags: 0x8000_0001,
+                    dispatching: false,
+                    outer: None,
+                },
+            );
+            assert!(format_origin(receipt.origin).ends_with(
+                "in_send_flags=0x80000001 dispatching=false outer_hwnd=none outer_message=none delivery=sent_cross_thread"
+            ));
+        }
+    }
+
+    #[test]
+    fn native_message_scopes_restore_outer_calls_and_distinguish_same_message_reentry() {
+        let outer = NativeWindowMessage {
+            hwnd: 0x1111,
+            message: 0x0101,
+        };
+        {
+            let _dispatch = begin_native_message_dispatch(outer.hwnd, outer.message);
+            let key_up = enter_native_wnd_proc(outer.hwnd, outer.message);
+            assert!(key_up.dispatching);
+            {
+                let nested = enter_native_wnd_proc(0x2222, 0x0319);
+                assert_eq!(
+                    nested.app_command_delivery(0),
+                    NativeAppCommandDelivery {
+                        in_send_flags: 0,
+                        dispatching: false,
+                        outer: Some(outer),
+                    }
+                );
+            }
+            assert_eq!(WNDPROC_MESSAGE.get(), Some(outer));
+            {
+                // A nested pump can dispatch another queued command while KEYUP
+                // remains on the stack. That command still owns its queue entry.
+                let _nested_dispatch = begin_native_message_dispatch(0x2222, 0x0319);
+                let queued = enter_native_wnd_proc(0x2222, 0x0319);
+                assert!(queued.dispatching);
+                assert_eq!(queued.outer, Some(outer));
+                let reentry = enter_native_wnd_proc(0x2222, 0x0319);
+                assert!(!reentry.dispatching);
+                assert_eq!(
+                    reentry.outer,
+                    Some(NativeWindowMessage {
+                        hwnd: 0x2222,
+                        message: 0x0319
+                    })
+                );
+            }
+            assert_eq!(WNDPROC_MESSAGE.get(), Some(outer));
+            // The outer DispatchMessage has already entered KEYUP once.
+            let reentry = enter_native_wnd_proc(outer.hwnd, outer.message);
+            assert!(!reentry.dispatching);
+        }
+        assert_eq!(WNDPROC_MESSAGE.get(), None);
+        assert!(DISPATCHING_MESSAGE.get().is_none());
+        let outside = enter_native_wnd_proc(0x2222, 0x0319);
+        assert_eq!(
+            app_command_delivery_label(outside.app_command_delivery(0)),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn native_dispatch_identity_requires_both_hwnd_and_message() {
+        let _dispatch = begin_native_message_dispatch(0x1111, 0x0319);
+        {
+            let wrong_window = enter_native_wnd_proc(0x2222, 0x0319);
+            assert!(!wrong_window.dispatching);
+        }
+        {
+            let wrong_message = enter_native_wnd_proc(0x1111, 0x0101);
+            assert!(!wrong_message.dispatching);
+        }
+        let matching = enter_native_wnd_proc(0x1111, 0x0319);
+        assert!(matching.dispatching);
     }
 
     #[test]

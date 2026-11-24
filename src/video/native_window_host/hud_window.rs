@@ -69,14 +69,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
     GWLP_USERDATA, GetWindowLongPtrW, GetWindowRect, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
-    IsWindow, MA_NOACTIVATE, RegisterClassExW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, WINDOWPOS,
-    WM_APPCOMMAND, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_RBUTTONDBLCLK,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_WINDOWPOSCHANGING, WM_XBUTTONDBLCLK,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    InSendMessageEx, IsWindow, MA_NOACTIVATE, RegisterClassExW, SW_HIDE, SW_SHOWNA, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW,
+    WINDOWPOS, WM_APPCOMMAND, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
+    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_WINDOWPOSCHANGING,
+    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{IDC_ARROW, LoadCursorW};
 use windows::core::PCWSTR;
@@ -767,6 +767,7 @@ unsafe extern "system" fn hud_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let message_scope = crate::mouse_seek_debug::enter_native_wnd_proc(hwnd.0 as usize as u64, msg);
     log_win32_message(TouchDebugWindow::Hud, hwnd, msg, wparam, lparam);
     if let Some(state) = window_state(hwnd) {
         let WindowState {
@@ -1065,6 +1066,7 @@ unsafe extern "system" fn hud_wnd_proc(
         }
 
         WM_APPCOMMAND => {
+            let in_send_flags = unsafe { InSendMessageEx(None) };
             // Raw XButton は上の branch が全 message を所有する。mouse driver / AHK が
             // HUD HWND へ `SendMessage(WM_APPCOMMAND, ...)` を直接送る独立経路では、
             // UI 側にナビゲーションを届けるため、
@@ -1088,6 +1090,7 @@ unsafe extern "system" fn hud_wnd_proc(
                             hwnd.0 as usize as u64,
                             wparam.0 as u64,
                             lparam.0,
+                            message_scope.app_command_delivery(in_send_flags),
                         ),
                         virtual_key: vk,
                         scan_code: 0,

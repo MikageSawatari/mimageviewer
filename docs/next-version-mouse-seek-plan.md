@@ -60,6 +60,10 @@ close 契約では stale event を捨てる下限である。テスト fixture �
 
 ### 2.1 presenter / HUD の native route
 
+AppCommand receipt は `in_send_flags`（`InSendMessageEx` の生値）、`dispatching`（追跡中の DispatchMessage と一致）、`outer_hwnd` / `outer_message`（入れ子の外側の wndproc）を記録する。
+`delivery=queued` はポンプの配送、`sent_cross_thread` は送信フラグ付きの別スレッド配送、`sent_same_thread_during` と `outer_message=0x0101` は自身の WM_KEYUP 処理中の同期再入を示す。
+一致も外側もない場合は `unknown` とする。presenter と HUD を同じ TLS scope で追跡し、入れ子のポンプと同一 HWND / message の再入を区別する。生成元は次の実ログで判定し、現時点では断定しない。
+
 `src/video/native_window.rs::wnd_proc` は presenter HWND の `WM_KEYDOWN/WM_SYSKEYDOWN` を
 `NativeVideoKeyEvent` に変換し、lossless route へ送る。browser key は enqueue 後に
 `DefWindowProcW` へ渡さない。`WM_APPCOMMAND` の command 1 / 2 は、それぞれ scan 0 の
@@ -165,7 +169,7 @@ key と raw mouse button の両方に、optional field ではない共通
 
 - `Win32Key { window_source, receiver_hwnd, message }`
 - `Win32AppCommand { window_source, receiver_hwnd, command_source_hwnd, command, device,
-  key_state }`
+  key_state, delivery { in_send_flags, dispatching, outer } }`
 - `Win32MouseButton { window_source, receiver_hwnd, message, button }`
 - `Win32MouseCleanup { window_source, receiver_hwnd, cause_message }`
 - `EguiBackdrop { viewport_id }`
