@@ -683,11 +683,35 @@ pub struct ExportFailure {
 
 #[derive(Clone, Debug)]
 pub enum ExportEvent {
-    Started { label: String },
+    Started {
+        label: String,
+    },
     Completed(ExportSuccess),
     Failed(ExportFailure),
+    Skipped {
+        label: String,
+        path: PathBuf,
+    },
+    ThumbnailNotice {
+        label: String,
+        path: PathBuf,
+        kinds: crate::save_with_metadata::ThumbnailNoticeKinds,
+    },
     Cancelled,
     AllDone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportEnd {
+    Done,
+    Cancelled,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExportThumbnailNotice {
+    pub label: String,
+    pub path: PathBuf,
+    pub kinds: crate::save_with_metadata::ThumbnailNoticeKinds,
 }
 
 pub struct ExportPending {
@@ -698,7 +722,9 @@ pub struct ExportPending {
     pub last_message: String,
     pub successes: Vec<ExportSuccess>,
     pub errors: Vec<ExportFailure>,
-    pub finished: bool,
+    pub skipped: Vec<ExportSuccess>,
+    pub thumbnail_notices: Vec<ExportThumbnailNotice>,
+    pub end: Option<ExportEnd>,
     pub cancel_requested: bool,
 }
 
@@ -722,7 +748,9 @@ pub fn spawn_export_worker(request: ExportRequest) -> Result<ExportPending, Stri
         last_message: "準備中".to_string(),
         successes: Vec::new(),
         errors: Vec::new(),
-        finished: false,
+        skipped: Vec::new(),
+        thumbnail_notices: Vec::new(),
+        end: None,
         cancel_requested: false,
     })
 }
@@ -1156,6 +1184,24 @@ pub(crate) fn scale_export_pixels<'a>(
     if [new_w, new_h] == [w, h] {
         return Ok(pixels);
     }
+    resize_export_pixels(
+        pixels,
+        [new_w, new_h],
+        crate::fast_resize::Quality::Lanczos3,
+    )
+}
+
+/// Shared resize implementation; legacy callers retain their Lanczos3 behavior.
+pub(crate) fn resize_export_pixels<'a>(
+    pixels: Cow<'a, egui::ColorImage>,
+    target: [usize; 2],
+    quality: crate::fast_resize::Quality,
+) -> Result<Cow<'a, egui::ColorImage>, String> {
+    let [w, h] = pixels.size;
+    let [new_w, new_h] = target;
+    if target == pixels.size {
+        return Ok(pixels);
+    }
     let src_w = u32::try_from(w).map_err(|_| "エクスポート画像の幅が大きすぎます".to_string())?;
     let src_h = u32::try_from(h).map_err(|_| "エクスポート画像の高さが大きすぎます".to_string())?;
     let dst_w =
@@ -1165,12 +1211,7 @@ pub(crate) fn scale_export_pixels<'a>(
     let rgba = crate::capture::color_image_to_rgba(pixels.as_ref());
     let src = image::RgbaImage::from_raw(src_w, src_h, rgba)
         .ok_or_else(|| "エクスポート画像の RGBA バッファが不正です".to_string())?;
-    let resized = crate::fast_resize::resize_rgba8_exact(
-        &src,
-        dst_w,
-        dst_h,
-        crate::fast_resize::Quality::Lanczos3,
-    );
+    let resized = crate::fast_resize::resize_rgba8_exact(&src, dst_w, dst_h, quality);
     Ok(Cow::Owned(egui::ColorImage::from_rgba_unmultiplied(
         [new_w, new_h],
         resized.as_raw(),

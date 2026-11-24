@@ -5808,6 +5808,9 @@ pub struct Settings {
     /// 一括エクスポートの出力サイズ。
     #[serde(default)]
     pub export_batch_scale: crate::export_dialog::ExportScale,
+    /// 一括出力の前回値。旧4欄はこの値が無い設定の移行元だけに使う。
+    #[serde(default)]
+    pub export_batch_options: Option<crate::export_batch::BatchExportOptions>,
 
     // ── SNS 分割 ──────────────────────────────────────────────
     /// 直前に選んだ投稿先 (`"x"` / `"instagram"`)。ページ固有の配置は保存しない。
@@ -8842,6 +8845,7 @@ impl Default for Settings {
             export_batch_template: default_export_batch_template(),
             export_batch_format: crate::capture::CaptureFormat::default(),
             export_batch_scale: crate::export_dialog::ExportScale::default(),
+            export_batch_options: None,
             sns_split_target: default_sns_split_target(),
             sns_split_count: default_sns_split_count(),
             sns_split_seam_permille: default_sns_split_seam_permille(),

@@ -197,15 +197,21 @@ const EXEMPTIONS: &[Entry] = &[
     ),
     exempt(
         "src/ui_dialogs/export_batch.rs",
-        "&mut state.template",
+        "&mut state.options.template",
         1,
         "書き出し名テンプレートの設定欄",
     ),
     exempt(
         "src/ui_dialogs/export_batch.rs",
-        "&mut state.output_dir_text",
+        "&mut path_text",
         1,
         "書き出し先。確定時に使用する",
+    ),
+    exempt(
+        "src/ui_dialogs/export_batch.rs",
+        "subfolder",
+        1,
+        "一括出力のサブフォルダ名。書き出す操作時だけ使用する",
     ),
     exempt(
         "src/ui_dialogs/fav_add.rs",

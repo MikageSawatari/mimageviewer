@@ -630,6 +630,16 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+§1.362 段 A の一括エクスポートは、出力先の作成・正規化・衝突判定、元の日時、
+デコード・編集合成・リサイズ・メタデータ検査・エンコード・書き込みを既存の専用workerに置く。
+UI準備に足した情報はsource_dir/source_extのパス・文字列演算だけ。
+既存の6ms予算で読む編集snapshot、保存先初期候補のis_dir確認、開始操作のsettings.saveは既存経路を維持する。
+新しい待機・UIのファイル読込・デコード・GPU操作は追加しない。
+取消tokenはデコードと合成へ引き継ぎ、書込前に確認する。`export_batch/prepare` と
+`export_batch/item` に準備、各処理区間、寸法・形式・結果を記録する。
+終了結果のpollは非blockingで、警告付き終了を保持しても一覧更新は終端採用時の1回だけ。
+自動検証・実機操作・性能測定は未実施で、設計担当の共有runnerへ引き継ぐ。
+
 Ctrl+S / Ctrl+T（案 C）の最終列に対応する読書位置索引は検索workerで準備し、
 `search / page_identity_prepare` に `surface`・`items`・`ms` を記録する。
 Ctrl+S空クエリの空列だけは定数サイズの準備を同期実行する。完成結果の条件一致を確認し、

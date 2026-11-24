@@ -11,12 +11,17 @@
 //! 非対応形式 (HEIC / AVIF / JXL / TIFF / RAW) は [`SrcFormat::Other`] として扱い、
 //! 呼び出し側で JPEG / PNG にフォールバックする (この場合メタデータは失われる)。
 //!
+//! 一括の `batch_metadata` だけが EXIF の共通処理・RGB ICC (JPEG/PNG も含む)・
+//! PNG eXIf 転記と縮小画像の警告検出を有効にする。既存の保存オプションは不変。
+//!
 //! 詳細仕様: [docs/conceal-feature-plan.md §10.5-10.7](../../docs/conceal-feature-plan.md)
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use eframe::egui::ColorImage;
+
+mod batch_metadata;
 
 // ── 公開型 ──────────────────────────────────────────────────────────────
 
@@ -99,6 +104,10 @@ pub struct SaveOptions {
     /// Orientation を 1 に書き換えて二重回転を防ぐ。それ以外のパスでは
     /// 二重回転を起こさないために Orientation を温存する。
     pub caller_applied_orientation: bool,
+    /// 一括用の EXIF 正規化・RGB ICC 転記・縮小画像検出。既存保存経路は OFF。
+    pub batch_metadata: bool,
+    /// 部分を隠す保存済み編集がある場合だけ MakerNote を警告対象にする。
+    pub thumbnail_notice_for_hidden_edits: bool,
 }
 
 impl Default for SaveOptions {
@@ -111,6 +120,8 @@ impl Default for SaveOptions {
             jpeg_matte: crate::capture::JpegMatte::Black,
             include_metadata: true,
             caller_applied_orientation: true,
+            batch_metadata: false,
+            thumbnail_notice_for_hidden_edits: false,
         }
     }
 }
@@ -183,9 +194,50 @@ pub fn save_image_with_metadata(
     write_bytes_create_new(&encoded, dst_path)
 }
 
-/// 内部実装: pixels を encode して `Vec<u8>` を返す。`save_image_with_metadata`
-/// と `save_image_with_metadata_unique` で encode を共有することで、unique 探索時
-/// にファイル名衝突のたびに re-encode しないようにする (Codex P2)。
+/// ColorImage を一度 straight RGBA に変換し、保存バイトと転記した情報の警告を返す。
+/// `src_format` は出力形式。形式が変わるときは呼び出し元が転記元を渡さないこと。
+pub fn encode_image_with_metadata_report(
+    pixels: &ColorImage,
+    src_path: Option<&Path>,
+    src_bytes: Option<&[u8]>,
+    src_format: SrcFormat,
+    options: &SaveOptions,
+) -> Result<EncodedImage, SaveError> {
+    let (w, h) = (pixels.size[0], pixels.size[1]);
+    if w > u32::MAX as usize || h > u32::MAX as usize || pixels.pixels.len() != w.saturating_mul(h)
+    {
+        return Err(SaveError::InvalidPixels(format!("size {w}x{h}")));
+    }
+    encode_rgba_with_metadata(
+        &color_image_to_rgba(pixels),
+        w as u32,
+        h as u32,
+        src_path,
+        src_bytes,
+        src_format,
+        options,
+    )
+}
+
+/// 転記した情報に残る元の縮小画像の警告。検出不能も警告に含める。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ThumbnailNoticeKinds {
+    pub xmp: bool,
+    pub xmp_uninspectable: bool,
+    pub maker_note: bool,
+}
+
+impl ThumbnailNoticeKinds {
+    pub fn is_empty(self) -> bool {
+        !self.xmp && !self.xmp_uninspectable && !self.maker_note
+    }
+}
+
+pub struct EncodedImage {
+    pub bytes: Vec<u8>,
+    pub thumbnail_notice: ThumbnailNoticeKinds,
+}
+
 fn encode_image_with_metadata(
     pixels: &ColorImage,
     src_path: Option<&Path>,
@@ -193,9 +245,28 @@ fn encode_image_with_metadata(
     src_format: SrcFormat,
     options: &SaveOptions,
 ) -> Result<Vec<u8>, SaveError> {
-    let (w, h) = (pixels.size[0], pixels.size[1]);
-    if w == 0 || h == 0 {
-        return Err(SaveError::InvalidPixels(format!("size {w}x{h}")));
+    Ok(encode_image_with_metadata_report(pixels, src_path, src_bytes, src_format, options)?.bytes)
+}
+
+/// 保存用の straight RGBA 入口。ColorImage を経由せず低アルファ画素の色を保つ。
+/// `src_format` は出力形式。同じ形式の転記元だけを渡す (PDF や形式変更は `None`)。
+pub fn encode_rgba_with_metadata(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    src_path: Option<&Path>,
+    src_bytes: Option<&[u8]>,
+    src_format: SrcFormat,
+    options: &SaveOptions,
+) -> Result<EncodedImage, SaveError> {
+    let expected = (w as usize)
+        .checked_mul(h as usize)
+        .and_then(|n| n.checked_mul(4));
+    if w == 0 || h == 0 || expected != Some(rgba.len()) {
+        return Err(SaveError::InvalidPixels(format!(
+            "size {w}x{h}, {} bytes",
+            rgba.len()
+        )));
     }
     if let SrcFormat::Other(ext) = &src_format {
         return Err(SaveError::UnsupportedFormat(ext.clone()));
@@ -208,16 +279,20 @@ fn encode_image_with_metadata(
     //   常に走らせたいので src を読む — Codex P2)
     let needs_src_for_anim_check =
         matches!(src_format, SrcFormat::Webp) && (src_bytes.is_some() || src_path.is_some());
-    let src_bytes_owned: Option<Vec<u8>> = if options.include_metadata || needs_src_for_anim_check {
-        match (src_bytes, src_path) {
-            (Some(b), _) => Some(b.to_vec()),
-            (None, Some(p)) => Some(std::fs::read(p).map_err(SaveError::IoError)?),
-            (None, None) => None,
-        }
+    let src_bytes_owned: Option<Vec<u8>> =
+        if (options.include_metadata || needs_src_for_anim_check) && src_bytes.is_none() {
+            src_path
+                .map(std::fs::read)
+                .transpose()
+                .map_err(SaveError::IoError)?
+        } else {
+            None
+        };
+    let src_bytes_ref = if options.include_metadata || needs_src_for_anim_check {
+        src_bytes.or(src_bytes_owned.as_deref())
     } else {
         None
     };
-    let src_bytes_ref: Option<&[u8]> = src_bytes_owned.as_deref();
 
     // アニメーション WebP は静止画前提なので include_metadata と無関係に拒否。
     if matches!(src_format, SrcFormat::Webp)
@@ -227,12 +302,27 @@ fn encode_image_with_metadata(
         return Err(SaveError::AnimatedWebpNotSupported);
     }
 
-    match &src_format {
-        SrcFormat::Jpeg => encode_jpeg_with_metadata(pixels, src_bytes_ref, options),
-        SrcFormat::Png => encode_png_with_metadata(pixels, src_bytes_ref, options),
-        SrcFormat::Webp => encode_webp_with_metadata(pixels, src_bytes_ref, options),
-        SrcFormat::Other(_) => unreachable!("filtered above"),
+    let mut encoding_options = options.clone();
+    if options.batch_metadata {
+        encoding_options.include_metadata = false;
     }
+    let mut bytes = match &src_format {
+        SrcFormat::Jpeg => encode_jpeg_rgba(rgba, w, h, src_bytes_ref, &encoding_options),
+        SrcFormat::Png => encode_png_rgba(rgba, w, h, src_bytes_ref, &encoding_options),
+        SrcFormat::Webp => encode_webp_rgba(rgba, w, h, src_bytes_ref, &encoding_options),
+        SrcFormat::Other(_) => unreachable!("filtered above"),
+    }?;
+    let mut thumbnail_notice = ThumbnailNoticeKinds::default();
+    if options.batch_metadata
+        && options.include_metadata
+        && let Some(src) = src_bytes_ref
+    {
+        (bytes, thumbnail_notice) = batch_metadata::transfer(&bytes, src, &src_format, options)?;
+    }
+    Ok(EncodedImage {
+        bytes,
+        thumbnail_notice,
+    })
 }
 
 fn write_bytes_create_new(bytes: &[u8], dst_path: &Path) -> Result<(), SaveError> {
@@ -294,15 +384,15 @@ pub fn save_image_with_metadata_unique(
 
 // ── JPEG ──────────────────────────────────────────────────────────────
 
-fn encode_jpeg_with_metadata(
-    pixels: &ColorImage,
+fn encode_jpeg_rgba(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
     src_bytes: Option<&[u8]>,
     options: &SaveOptions,
 ) -> Result<Vec<u8>, SaveError> {
     // RGBA → RGB (アルファは black-matte で flatten)。
-    let (w, h) = (pixels.size[0] as u32, pixels.size[1] as u32);
-    let rgba = color_image_to_rgba(pixels);
-    let rgb = flatten_rgba_to_rgb(&rgba, w, options.jpeg_matte);
+    let rgb = flatten_rgba_to_rgb(rgba, w, options.jpeg_matte);
     let image = image::RgbImage::from_raw(w, h, rgb)
         .ok_or_else(|| SaveError::EncodingFailed("RGB バッファ作成失敗".into()))?;
     let jpeg_bytes = turbojpeg::compress_image(
@@ -339,6 +429,10 @@ fn encode_jpeg_with_metadata(
 /// `Vec<Vec<u8>>` の各要素は `[0xFF, 0xE1, len_hi, len_lo, payload...]` の生表現。
 /// 元の出現順を保つ (Exif APP1 / XMP APP1 が複数並ぶケースに対応)。
 fn extract_jpeg_app1_segments(jpeg: &[u8]) -> Result<Vec<Vec<u8>>, SaveError> {
+    extract_jpeg_segments(jpeg, 0xE1)
+}
+
+fn extract_jpeg_segments(jpeg: &[u8], wanted_marker: u8) -> Result<Vec<Vec<u8>>, SaveError> {
     if jpeg.len() < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
         return Err(SaveError::MetadataReadFailed("JPEG SOI 不正".into()));
     }
@@ -387,7 +481,7 @@ fn extract_jpeg_app1_segments(jpeg: &[u8]) -> Result<Vec<Vec<u8>>, SaveError> {
         if seg_end > jpeg.len() {
             break;
         }
-        if marker == 0xE1 {
+        if marker == wanted_marker {
             // APP1: [0xFF, 0xE1, len_hi, len_lo, payload...]
             let mut seg = Vec::with_capacity(2 + seg_len);
             seg.extend_from_slice(&jpeg[marker_pos..seg_end]);
@@ -545,17 +639,17 @@ fn splice_jpeg_app1_segments(jpeg: &[u8], app1: &[Vec<u8>]) -> Result<Vec<u8>, S
 
 // ── PNG ───────────────────────────────────────────────────────────────
 
-fn encode_png_with_metadata(
-    pixels: &ColorImage,
+fn encode_png_rgba(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
     src_bytes: Option<&[u8]>,
     options: &SaveOptions,
 ) -> Result<Vec<u8>, SaveError> {
     use image::ImageEncoder;
-    let (w, h) = (pixels.size[0] as u32, pixels.size[1] as u32);
-    let rgba = color_image_to_rgba(pixels);
     let mut out: Vec<u8> = Vec::new();
     image::codecs::png::PngEncoder::new(&mut out)
-        .write_image(&rgba, w, h, image::ColorType::Rgba8.into())
+        .write_image(rgba, w, h, image::ColorType::Rgba8.into())
         .map_err(|e| SaveError::EncodingFailed(format!("PNG encoder: {e}")))?;
     if let Some(src) = src_bytes
         && options.include_metadata
@@ -593,6 +687,14 @@ fn png_crc32_compute(bytes: &[u8]) -> u32 {
 /// 壊れた tEXt を含んでいる場合、それを raw で転写すると出力 PNG が strict
 /// デコーダ (libpng 等) で reject される。
 fn extract_png_text_chunks_raw(png: &[u8]) -> Result<Vec<Vec<u8>>, SaveError> {
+    extract_png_chunks(png, false)
+}
+
+fn extract_png_metadata_chunks(png: &[u8]) -> Result<Vec<Vec<u8>>, SaveError> {
+    extract_png_chunks(png, true)
+}
+
+fn extract_png_chunks(png: &[u8], extended: bool) -> Result<Vec<Vec<u8>>, SaveError> {
     if png.len() < 8 || &png[..8] != b"\x89PNG\r\n\x1a\n" {
         return Err(SaveError::MetadataReadFailed("PNG signature 不正".into()));
     }
@@ -607,7 +709,9 @@ fn extract_png_text_chunks_raw(png: &[u8]) -> Result<Vec<Vec<u8>>, SaveError> {
             break;
         }
         match chunk_type {
-            b"tEXt" | b"iTXt" | b"zTXt" => {
+            b"tEXt" | b"iTXt" | b"zTXt" | b"eXIf" | b"iCCP"
+                if extended || matches!(chunk_type, b"tEXt" | b"iTXt" | b"zTXt") =>
+            {
                 // CRC32 を検証 (= chunk_type + data に対して計算)。
                 let crc_pos = pos + 8 + length;
                 let stored_crc = u32::from_be_bytes([
@@ -670,19 +774,20 @@ fn splice_png_text_chunks(png: &[u8], chunks: &[Vec<u8>]) -> Result<Vec<u8>, Sav
 
 // ── WebP ──────────────────────────────────────────────────────────────
 
-fn encode_webp_with_metadata(
-    pixels: &ColorImage,
+fn encode_webp_rgba(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
     src_bytes: Option<&[u8]>,
     options: &SaveOptions,
 ) -> Result<Vec<u8>, SaveError> {
-    let (w, h) = (pixels.size[0] as u32, pixels.size[1] as u32);
-    let rgba = color_image_to_rgba(pixels);
-    let encoder = webp::Encoder::from_rgba(&rgba, w, h);
+    let encoder = webp::Encoder::from_rgba(rgba, w, h);
     let encoded = if options.webp_lossless {
-        encoder.encode_lossless()
+        encoder.encode_simple(true, 75.0)
     } else {
-        encoder.encode(options.webp_quality.clamp(1.0, 100.0))
-    };
+        encoder.encode_simple(false, options.webp_quality.clamp(1.0, 100.0))
+    }
+    .map_err(|e| SaveError::EncodingFailed(format!("WebP encoder: {e:?}")))?;
     let mut out: Vec<u8> = encoded.to_vec();
 
     if let Some(src) = src_bytes
@@ -994,6 +1099,48 @@ fn flatten_rgba_to_rgb_black(rgba: &[u8], width: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn encode_jpeg_with_metadata(
+        pixels: &ColorImage,
+        src: Option<&[u8]>,
+        options: &SaveOptions,
+    ) -> Result<Vec<u8>, SaveError> {
+        encode_jpeg_rgba(
+            &color_image_to_rgba(pixels),
+            pixels.size[0] as u32,
+            pixels.size[1] as u32,
+            src,
+            options,
+        )
+    }
+
+    fn encode_png_with_metadata(
+        pixels: &ColorImage,
+        src: Option<&[u8]>,
+        options: &SaveOptions,
+    ) -> Result<Vec<u8>, SaveError> {
+        encode_png_rgba(
+            &color_image_to_rgba(pixels),
+            pixels.size[0] as u32,
+            pixels.size[1] as u32,
+            src,
+            options,
+        )
+    }
+
+    fn encode_webp_with_metadata(
+        pixels: &ColorImage,
+        src: Option<&[u8]>,
+        options: &SaveOptions,
+    ) -> Result<Vec<u8>, SaveError> {
+        encode_webp_rgba(
+            &color_image_to_rgba(pixels),
+            pixels.size[0] as u32,
+            pixels.size[1] as u32,
+            src,
+            options,
+        )
+    }
     use eframe::egui;
 
     fn sample_color_image(w: usize, h: usize) -> ColorImage {
