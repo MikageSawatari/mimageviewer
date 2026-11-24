@@ -193,10 +193,22 @@ mod tests {
         assert!(script.has_on_event);
         let mut snapshot = StateSnapshot::new(ScriptContext::FsImage);
         snapshot.page.is_last = Some(false);
+        snapshot.item.pinned_tags = Some([true; 20]);
+        snapshot.events = vec![
+            ScriptEvent::Open,
+            ScriptEvent::View,
+            ScriptEvent::Page,
+            ScriptEvent::Select,
+        ];
         let call = |name: &str, state: &StateSnapshot| {
+            let value = state.to_dynamic();
+            script
+                .engine
+                .ensure_data_size_within_limits(&value)
+                .unwrap();
             let result = script
                 .engine
-                .call_fn::<Dynamic>(&mut Scope::new(), &script.ast, name, (state.to_dynamic(),))
+                .call_fn::<Dynamic>(&mut Scope::new(), &script.ast, name, (value,))
                 .unwrap();
             parse_output(result).unwrap().actions
         };
@@ -204,12 +216,15 @@ mod tests {
         snapshot.page.is_last = Some(true);
         assert_eq!(call("next_or_next_book", &snapshot), ["FsSiblingNext"]);
         assert_eq!(call("rate3_next", &snapshot), ["RatingItem3", "FsPageNext"]);
-        snapshot.events = vec![ScriptEvent::View];
         snapshot.book.path = Some(r"C:\manga\book".into());
         snapshot.view.direction = Some("ltr".into());
         assert_eq!(call("on_event", &snapshot), ["FsReadingDirectionToggle"]);
-        for slot in &script.slots {
-            assert!(call(&slot.function, &StateSnapshot::new(ScriptContext::Grid)).is_empty());
+        for context in [ScriptContext::Grid, ScriptContext::FsVideo] {
+            snapshot.context = context;
+            for slot in &script.slots {
+                assert!(call(&slot.function, &snapshot).is_empty());
+            }
+            assert!(call("on_event", &snapshot).is_empty());
         }
     }
 

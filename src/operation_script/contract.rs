@@ -561,10 +561,22 @@ mod tests {
     fn validation_rejects_over_sixteen_actions_and_navigation_conflict() {
         assert_eq!(
             validate_output(
+                output(&["FsBgCycle"; MAX_ACTIONS]),
+                scope(ScriptContext::FsImage)
+            )
+            .unwrap()
+            .operations()
+            .len(),
+            MAX_ACTIONS
+        );
+        assert_eq!(
+            validate_output(
                 output(&["FsBgCycle"; MAX_ACTIONS + 1]),
                 scope(ScriptContext::FsImage)
             ),
-            Err(ValidationError::TooManyActions { count: 17 })
+            Err(ValidationError::TooManyActions {
+                count: MAX_ACTIONS + 1
+            })
         );
         let mut context = scope(ScriptContext::FsImage);
         context.navigation_already_accepted = true;

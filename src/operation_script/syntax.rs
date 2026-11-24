@@ -2,7 +2,7 @@
 
 use rhai::{AST, ASTNode, Engine, Expr, Position, Stmt, Token};
 
-const MAX_MAP_KEY_BYTES: usize = 256;
+pub(super) const MAX_MAP_KEY_BYTES: usize = 256;
 const ASSIGNMENT_ERROR: &str = "添字・プロパティへの代入は使えません。thisへの代入も含め、変数そのものへの代入だけが使用できます";
 const BREAK_VALUE_ERROR: &str =
     "値付きのbreakは使えません。breakの直後は ; または } にしてください";
@@ -207,7 +207,8 @@ fn compile_error(position: Position, reason: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
     use crate::operation_script::{
-        CompiledOperationScript, ScriptContext, StateSnapshot, build_engine, parse_output,
+        CompiledOperationScript, MAX_COLLECTION_SIZE, ScriptContext, StateSnapshot, build_engine,
+        parse_output,
     };
     use rhai::{Dynamic, Scope};
 
@@ -393,8 +394,8 @@ mod tests {
             (
                 format!(
                     "[[{}],[{}]]",
-                    vec!["0"; 500].join(","),
-                    vec!["0"; 499].join(",")
+                    vec!["0"; MAX_COLLECTION_SIZE / 2].join(","),
+                    vec!["0"; MAX_COLLECTION_SIZE - MAX_COLLECTION_SIZE / 2 - 1].join(",")
                 ),
                 "定数のデータが大きさの上限を超えています",
             ),
@@ -460,12 +461,18 @@ mod tests {
     fn syntax_rejects_parent_container_growth_and_map_insert_examples() {
         let engine = build_engine();
         for source in [
-            "let leaf = []; for n in 0..600 { leaf += 0; } let a = [[], []]; a[0] = leaf; a[1] = leaf;",
-            "let m = #{}; for n in 0..1001 { m[n] = (); }",
-            "let m = #{}; m[\"new key\"] = ();",
-            "fn slots() { let m = #{}; m.extra = (); [] }",
+            format!(
+                "let leaf = []; for n in 0..{} {{ leaf += 0; }} let a = [[], []]; a[0] = leaf; a[1] = leaf;",
+                MAX_COLLECTION_SIZE / 2 + 1
+            ),
+            format!(
+                "let m = #{{}}; for n in 0..{} {{ m[n] = (); }}",
+                MAX_COLLECTION_SIZE + 1
+            ),
+            "let m = #{}; m[\"new key\"] = ();".to_owned(),
+            "fn slots() { let m = #{}; m.extra = (); [] }".to_owned(),
         ] {
-            let error = compile_checked(&engine, source).unwrap_err();
+            let error = compile_checked(&engine, &source).unwrap_err();
             assert!(
                 error.contains("添字・プロパティへの代入は使えません"),
                 "{error}"
@@ -536,16 +543,17 @@ mod tests {
                 .join(",")
         };
         for (extra, succeeds) in [(0, true), (1, false)] {
+            let half = MAX_COLLECTION_SIZE / 2;
             let arguments = [
                 format!(
                     "[[{}],[{}]]",
-                    vec!["0"; 500].join(","),
-                    vec!["0"; 498 + extra].join(",")
+                    vec!["0"; half].join(","),
+                    vec!["0"; MAX_COLLECTION_SIZE - half - 2 + extra].join(",")
                 ),
                 format!(
                     "#{{ left: #{{ {} }}, right: #{{ {} }} }}",
-                    fields(499),
-                    fields(499 + extra)
+                    fields(half - 1),
+                    fields(MAX_COLLECTION_SIZE - half - 1 + extra)
                 ),
                 format!(
                     "[\"{}\",\"{}\"]",
@@ -581,11 +589,12 @@ mod tests {
         use crate::operation_script::MAX_STRING_BYTES;
         let engine = build_engine();
         for (extra, succeeds) in [(0, true), (1, false)] {
+            let half = MAX_COLLECTION_SIZE / 2;
             let arguments = [
                 format!(
                     "[[{}],[{}]]",
-                    vec!["zero"; 500].join(","),
-                    vec!["zero"; 498 + extra].join(",")
+                    vec!["zero"; half].join(","),
+                    vec!["zero"; MAX_COLLECTION_SIZE - half - 2 + extra].join(",")
                 ),
                 // Under OptimizationLevel::None, ${...} remains an Expr::Stmt
                 // segment, so interpolation takes the runtime concat checks.

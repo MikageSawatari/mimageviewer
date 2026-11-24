@@ -547,13 +547,12 @@ mod tests {
     #[test]
     fn sandbox_operation_budget_stops_integer_range_iteration() {
         let engine = build_engine();
-        for source in [
-            "let count = 0; for n in 0..9223372036854775807 { count += 1; } count",
-            "let count = 0; for n in 0..=9223372036854775807 { count += 1; } count",
-        ] {
+        for range in ["..", "..="] {
+            let source =
+                format!("let count = 0; for n in 0{range}{MAX_OPERATIONS} {{ count += 1; }} count");
             assert!(
                 matches!(
-                    *engine.run(source).unwrap_err(),
+                    *engine.run(&source).unwrap_err(),
                     EvalAltResult::ErrorTooManyOperations(_)
                 ),
                 "{source}"
@@ -569,11 +568,9 @@ mod tests {
         // removable; optimizer.rs eliminates the loop instead of iterating.
         // This explains the former test result; production uses None because
         // constant folding can otherwise bypass aggregate collection limits.
-        for source in [
-            "for n in 0..9223372036854775807 {}",
-            "for n in 0..=9223372036854775807 {}",
-        ] {
-            engine.run(source).unwrap();
+        for range in ["..", "..="] {
+            let source = format!("for n in 0{range}{MAX_OPERATIONS} {{}}");
+            engine.run(&source).unwrap();
         }
     }
 
@@ -582,13 +579,11 @@ mod tests {
         let engine = build_engine();
         assert_eq!(engine.optimization_level(), rhai::OptimizationLevel::None);
         // eval/stmt.rs charges each iteration even when the body is empty.
-        for source in [
-            "for n in 0..9223372036854775807 {}",
-            "for n in 0..=9223372036854775807 {}",
-        ] {
+        for range in ["..", "..="] {
+            let source = format!("for n in 0{range}{MAX_OPERATIONS} {{}}");
             assert!(
                 matches!(
-                    *engine.run(source).unwrap_err(),
+                    *engine.run(&source).unwrap_err(),
                     EvalAltResult::ErrorTooManyOperations(_)
                 ),
                 "{source}"
@@ -703,17 +698,22 @@ mod tests {
             )
         };
         for (extra, succeeds) in [(0, true), (1, false)] {
+            let half = MAX_COLLECTION_SIZE / 2;
             let cases = [
-                ("array count", ints(500), ints(500 + extra)),
+                (
+                    "array count",
+                    ints(half),
+                    ints(MAX_COLLECTION_SIZE - half + extra),
+                ),
                 (
                     "nested arrays",
-                    Dynamic::from_array(vec![ints(499)]),
-                    Dynamic::from_array(vec![ints(499 + extra)]),
+                    Dynamic::from_array(vec![ints(half - 1)]),
+                    Dynamic::from_array(vec![ints(MAX_COLLECTION_SIZE - half - 1 + extra)]),
                 ),
                 (
                     "nested maps",
-                    Dynamic::from_array(vec![fields(500)]),
-                    Dynamic::from_array(vec![fields(500 + extra)]),
+                    Dynamic::from_array(vec![fields(half)]),
+                    Dynamic::from_array(vec![fields(MAX_COLLECTION_SIZE - half + extra)]),
                 ),
                 (
                     "aggregate string bytes",
@@ -748,15 +748,21 @@ mod tests {
     #[test]
     fn sandbox_array_self_append_cannot_double_past_the_size_limit() {
         let engine = build_engine();
+        let rounds = MAX_COLLECTION_SIZE.ilog2();
         assert_eq!(
             engine
-                .eval::<INT>("let a = [0]; for n in 0..9 { a += a; } a.len()")
+                .eval::<INT>(&format!(
+                    "let a = [0]; for n in 0..{rounds} {{ a += a; }} a.len()"
+                ))
                 .unwrap(),
-            512
+            (1_usize << rounds) as INT
         );
         assert!(matches!(
             *engine
-                .run("let a = [0]; for n in 0..10 { a += a; } a.len()")
+                .run(&format!(
+                    "let a = [0]; for n in 0..{} {{ a += a; }} a.len()",
+                    rounds + 1
+                ))
                 .unwrap_err(),
             EvalAltResult::ErrorDataTooLarge(_, _)
         ));
@@ -814,17 +820,19 @@ mod tests {
         // Exercise runtime construction's cumulative check with variable
         // elements, so constant folding cannot replace the construction. Both
         // inner literals are below the parser's per-literal limit themselves.
-        for (second_count, succeeds) in [(498, true), (499, false)] {
+        let first_count = MAX_COLLECTION_SIZE / 2;
+        for (extra, succeeds) in [(0, true), (1, false)] {
+            let second_count = MAX_COLLECTION_SIZE - first_count - 2 + extra;
             let source = format!(
                 "let zero = 0; [[{}],[{}]]",
-                vec!["zero"; 500].join(","),
+                vec!["zero"; first_count].join(","),
                 vec!["zero"; second_count].join(",")
             );
             assert_eq!(
                 engine.eval::<Array>(&source).is_ok(),
                 succeeds,
                 "nested total {}",
-                500 + second_count + 2
+                first_count + second_count + 2
             );
         }
     }
@@ -840,16 +848,17 @@ mod tests {
                 .join(",")
         };
         for (extra, succeeds) in [(0, true), (1, false)] {
+            let half = MAX_COLLECTION_SIZE / 2;
             let expressions = [
                 format!(
                     "[[{}],[{}]]",
-                    vec!["0"; 500].join(","),
-                    vec!["0"; 498 + extra].join(",")
+                    vec!["0"; half].join(","),
+                    vec!["0"; MAX_COLLECTION_SIZE - half - 2 + extra].join(",")
                 ),
                 format!(
                     "#{{ left: #{{ {} }}, right: #{{ {} }} }}",
-                    fields(499),
-                    fields(499 + extra)
+                    fields(half - 1),
+                    fields(MAX_COLLECTION_SIZE - half - 1 + extra)
                 ),
                 format!(
                     "[\"{}\",\"{}\"]",
@@ -923,8 +932,11 @@ mod tests {
             matches!(*error, EvalAltResult::ErrorTooManyOperations(_)),
             "{error}"
         );
+        let elapsed_ms = elapsed.as_secs_f64() * 1_000.0;
+        const GUIDELINE_MS: f64 = 10.0;
         eprintln!(
-            "[operation-script worst case] {name}: {elapsed:?}, max_operations={MAX_OPERATIONS}"
+            "[operation-script worst case] {name}: elapsed={elapsed_ms:.3} ms, guideline={GUIDELINE_MS:.3} ms, ratio={:.2}x, max_operations={MAX_OPERATIONS}, max_collection_size={MAX_COLLECTION_SIZE}",
+            elapsed_ms / GUIDELINE_MS
         );
     }
 
@@ -990,13 +1002,23 @@ mod tests {
     #[test]
     #[ignore = "release-only worst-case measurement; run with --release --ignored --nocapture"]
     fn perf_max_map_contains_to_operation_limit() {
+        use crate::operation_script::syntax::MAX_MAP_KEY_BYTES;
         let mut scope = Scope::new();
-        let key_prefix = "a".repeat(MAX_STRING_BYTES - 4);
+        let suffix_width = MAX_COLLECTION_SIZE.to_string().len();
+        let key_prefix = "a".repeat(MAX_MAP_KEY_BYTES - suffix_width);
         let values: Map = (0..MAX_COLLECTION_SIZE)
-            .map(|n| (format!("{key_prefix}{n:04}").into(), Dynamic::UNIT))
+            .map(|n| {
+                (
+                    format!("{key_prefix}{n:0suffix_width$}").into(),
+                    Dynamic::UNIT,
+                )
+            })
             .collect();
         scope.push("values", values);
-        scope.push("needle", format!("{key_prefix}9999"));
+        scope.push(
+            "needle",
+            format!("{key_prefix}{MAX_COLLECTION_SIZE:0suffix_width$}"),
+        );
         measure_to_operation_limit(
             "map contains",
             &mut scope,
@@ -1012,13 +1034,15 @@ mod tests {
         let mut scope = Scope::new();
         scope.push("text", "a".repeat(MAX_STRING_BYTES));
         for source in [
-            "text.chars()",
-            "let values = []; for n in 0..1000 { values += text.chars(); } values",
+            "text.chars()".to_owned(),
+            format!(
+                "let values = []; for n in 0..{MAX_COLLECTION_SIZE} {{ values += text.chars(); }} values"
+            ),
         ] {
             assert!(
                 matches!(
                     *engine
-                        .eval_with_scope::<Dynamic>(&mut scope, source)
+                        .eval_with_scope::<Dynamic>(&mut scope, &source)
                         .unwrap_err(),
                     EvalAltResult::ErrorFunctionNotFound(_, _)
                 ),

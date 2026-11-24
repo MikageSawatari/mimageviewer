@@ -209,6 +209,87 @@ impl StateSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation_script::{MAX_COLLECTION_SIZE, MAX_OPERATIONS, build_engine};
+
+    #[test]
+    fn snapshot_all_fields_and_maximum_events_tags_fit_sandbox_limits() {
+        let engine = build_engine();
+        assert_eq!(engine.max_operations(), MAX_OPERATIONS);
+        assert_eq!(engine.max_array_size(), MAX_COLLECTION_SIZE);
+        assert_eq!(engine.max_map_size(), MAX_COLLECTION_SIZE);
+        let ast = engine.compile(r#"
+            fn inspect_state(s) {
+                let checks = [
+                    s.api == 1 && s.events.len() == 4 && "select" in s.events,
+                    s.item.pinned_tags.len() == 20 && 20 in s.item.pinned_tags,
+                    s.window.mode == "fullscreen" && s.window.fullscreen,
+                    s.item.name == "page.png" && s.item.ext == "png"
+                        && s.item.path == "C:/manga/book/page.png" && s.item.kind == "image",
+                    s.item.width == 1200 && s.item.height == 1800 && s.item.rating == 3,
+                    s.book.path == "C:/manga/book" && s.book.kind == "folder",
+                    s.page.index == 1 && s.page.count == 2 && !s.page.is_first && s.page.is_last,
+                    s.view.spread == "single" && s.view.direction == "rtl" && s.view.background == "black",
+                    s.video.playing && s.video.position_sec == 1.5 && s.video.duration_sec == 60.0,
+                    s.grid.selected_count == 1,
+                ];
+                !(false in checks)
+            }
+        "#).unwrap();
+        for context in [
+            ScriptContext::Grid,
+            ScriptContext::FsImage,
+            ScriptContext::FsVideo,
+        ] {
+            let mut snapshot = StateSnapshot::new(context);
+            snapshot.window = WindowSnapshot {
+                fullscreen: Some(true),
+                mode: Some("fullscreen".into()),
+            };
+            snapshot.item = ItemSnapshot {
+                name: Some("page.png".into()),
+                ext: Some("png".into()),
+                path: Some("C:/manga/book/page.png".into()),
+                kind: Some("image".into()),
+                width: Some(1200),
+                height: Some(1800),
+                rating: Some(3),
+                pinned_tags: Some([true; 20]),
+            };
+            snapshot.book = BookSnapshot {
+                path: Some("C:/manga/book".into()),
+                kind: Some("folder".into()),
+            };
+            snapshot.page = PageSnapshot {
+                index: Some(1),
+                count: Some(2),
+                is_first: Some(false),
+                is_last: Some(true),
+            };
+            snapshot.view = ViewSnapshot {
+                spread: Some("single".into()),
+                direction: Some("rtl".into()),
+                background: Some("black".into()),
+            };
+            snapshot.video = VideoSnapshot {
+                playing: Some(true),
+                position_sec: Some(1.5),
+                duration_sec: Some(60.0),
+            };
+            snapshot.grid_selected_count = Some(1);
+            snapshot.events = vec![ScriptEvent::Open; MAX_COLLECTION_SIZE + 1];
+            snapshot
+                .events
+                .extend([ScriptEvent::View, ScriptEvent::Page, ScriptEvent::Select]);
+            let value = snapshot.to_dynamic();
+            // Check the whole nested value, not just each individual section.
+            engine.ensure_data_size_within_limits(&value).unwrap();
+            assert!(
+                engine
+                    .call_fn::<bool>(&mut rhai::Scope::new(), &ast, "inspect_state", (value,))
+                    .unwrap()
+            );
+        }
+    }
 
     #[test]
     fn snapshot_contexts_unknowns_and_values() {
