@@ -7,8 +7,8 @@ use rhai::{AST, Dynamic, Engine, Scope};
 
 use super::{DEFAULT_SCRIPT, ScriptSlot, build_engine, parse_slots};
 
-/// ファイル名スタックと同じ本文の上限。読む量自体もtakeで制限する。
-const MAX_SOURCE_BYTES: u64 = 1024 * 1024;
+/// 操作スクリプト本文の上限。読む量自体もtakeで制限する (§7)。
+const MAX_SOURCE_BYTES: u64 = 256 * 1024;
 
 pub struct CompiledOperationScript {
     pub(super) engine: Engine,
@@ -43,13 +43,17 @@ pub fn script_path(data_dir: &Path) -> PathBuf {
 }
 
 fn load_script(path: &Path) -> Result<CompiledOperationScript, String> {
-    let mut source = String::new();
+    let mut source = Vec::new();
     File::open(path)
-        .and_then(|file| file.take(MAX_SOURCE_BYTES + 1).read_to_string(&mut source))
+        .and_then(|file| file.take(MAX_SOURCE_BYTES + 1).read_to_end(&mut source))
         .map_err(|e| format!("スクリプトの読み込みに失敗 ({}): {e}", path.display()))?;
     if source.len() as u64 > MAX_SOURCE_BYTES {
-        return Err("スクリプトの本文が1 MiBの上限を超えています".into());
+        return Err("スクリプトの本文が256 KiBの上限を超えています".into());
     }
+    // Check the byte limit before UTF-8 decoding: take() may cut a multibyte
+    // character when the file is too large, which must still report the cap.
+    let source = String::from_utf8(source)
+        .map_err(|e| format!("スクリプトの読み込みに失敗 ({}): {e}", path.display()))?;
     CompiledOperationScript::compile(&source)
 }
 
@@ -233,6 +237,37 @@ mod tests {
             .unwrap();
         assert_eq!(result.generation, loader.generation);
         assert_eq!(result.script.unwrap().slots.len(), 2);
+    }
+
+    #[test]
+    fn script_file_size_limit_is_256_kib_and_worker_reports_oversize() {
+        assert_eq!(MAX_SOURCE_BYTES, 256 * 1024);
+        let temp = tempfile::tempdir().unwrap();
+        let path = script_path(temp.path());
+        let mut source = b"fn slots() { [] }\n".to_vec();
+        source.resize(MAX_SOURCE_BYTES as usize, b' ');
+        std::fs::write(&path, &source).unwrap();
+        assert!(load_script(&path).is_ok());
+
+        source.push(b' ');
+        std::fs::write(&path, &source).unwrap();
+        assert!(load_script(&path).err().unwrap().contains("256 KiB"));
+
+        // The bounded read cuts this final character in the middle. The
+        // failure must still be the file-size limit rather than invalid UTF-8.
+        source.truncate(MAX_SOURCE_BYTES as usize - 1);
+        source.extend_from_slice("界".as_bytes());
+        std::fs::write(&path, &source).unwrap();
+        let mut loader = OperationScriptLoader::default();
+        loader.reload(temp.path(), &egui::Context::default());
+        let OperationScriptState::Loading(pending) = &loader.state else {
+            panic!("not loading");
+        };
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(result.script.err().unwrap().contains("256 KiB"));
     }
 
     #[test]

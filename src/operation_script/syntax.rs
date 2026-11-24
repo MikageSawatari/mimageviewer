@@ -2,6 +2,8 @@
 
 use rhai::{AST, ASTNode, Engine, Expr, Position, Stmt};
 
+const MAX_MAP_KEY_BYTES: usize = 256;
+
 /// The worker's only compilation path. Optimization must remain disabled so
 /// every assignment is still present when AST::walk visits function bodies.
 pub(super) fn compile_checked(engine: &Engine, source: &str) -> Result<AST, String> {
@@ -24,13 +26,25 @@ pub(super) fn compile_checked(engine: &Engine, source: &str) -> Result<AST, Stri
                     return false;
                 }
             }
-            Some(ASTNode::Expr(expression))
-                if matches!(expression, Expr::Array(..) | Expr::Map(..) | Expr::InterpolatedString(..)) =>
-            {
+            Some(ASTNode::Expr(expression)) => {
+                // Map keys are absent from Rhai's aggregate string-size check.
+                // Check the parsed UTF-8 key and retain its own source position.
+                // AST::walk also visits nested maps and every function body.
+                if let Expr::Map(map, _) = expression {
+                    for (key, _) in &map.0 {
+                        if key.as_str().len() > MAX_MAP_KEY_BYTES {
+                            failure = Some(compile_error(key.pos, format!(
+                                "マップのキーは{MAX_MAP_KEY_BYTES}バイト以内にしてください"
+                            )));
+                            return false;
+                        }
+                    }
+                }
                 // get_arg_value (func/call.rs) materializes literal arguments
                 // directly, even with optimization disabled. Validate their
                 // aggregate size here before they can bypass runtime construction.
-                if let Some(value) = expression.get_literal_value(None)
+                if matches!(expression, Expr::Array(..) | Expr::Map(..) | Expr::InterpolatedString(..))
+                    && let Some(value) = expression.get_literal_value(None)
                     && let Err(cause) = engine.ensure_data_size_within_limits(&value)
                 {
                     failure = Some(compile_error(
@@ -65,6 +79,49 @@ mod tests {
         CompiledOperationScript, ScriptContext, StateSnapshot, build_engine, parse_output,
     };
     use rhai::{Dynamic, Scope};
+
+    #[test]
+    fn syntax_map_literal_keys_enforce_utf8_byte_limit_in_all_bodies() {
+        assert_eq!(MAX_MAP_KEY_BYTES, 256);
+        for (key, succeeds) in [
+            ("k".repeat(256), true),
+            ("k".repeat(257), false),
+            (format!("{}a", "界".repeat(85)), true),
+            (format!("{}aa", "界".repeat(85)), false),
+        ] {
+            let mut spellings = vec![format!("\"{key}\"")];
+            if key.is_ascii() {
+                spellings.push(key);
+            }
+            for spelling in spellings {
+                for source in [
+                    format!("let m = #{{ {spelling}: 0 }}; fn slots() {{ [] }}"),
+                    format!("const m = #{{ outer: #{{ {spelling}: 0 }} }}; fn slots() {{ [] }}"),
+                    format!("fn slots() {{ let m = #{{ {spelling}: 0 }}; [] }}"),
+                    format!(
+                        "fn slots() {{ [] }} fn unused(s) {{ let m = #{{ outer: #{{ {spelling}: s }} }}; }}"
+                    ),
+                ] {
+                    let result = CompiledOperationScript::compile(&source);
+                    assert_eq!(result.is_ok(), succeeds, "{source}");
+                    if let Err(error) = result {
+                        assert!(error.contains("マップのキーは256バイト以内"), "{error}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn syntax_map_key_failure_reports_key_line_and_column() {
+        let source = format!(
+            "fn slots() {{ [] }}\nfn unused(s) {{\n    let m = #{{\n        {}: s\n    }};\n}}",
+            "k".repeat(257),
+        );
+        let error = CompiledOperationScript::compile(&source).err().unwrap();
+        assert!(error.contains("4行9桁"), "{error}");
+        assert!(error.contains("マップのキーは256バイト以内"), "{error}");
+    }
 
     #[test]
     fn syntax_rejects_index_property_nested_and_compound_assignments() {
