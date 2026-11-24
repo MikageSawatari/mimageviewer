@@ -815,6 +815,105 @@ fn cancellation_during_erase_uses_same_token_and_never_writes() {
 }
 
 #[test]
+fn replace_same_size_output_advances_second_based_cache_stamp() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.png");
+    image::RgbaImage::from_pixel(64, 64, image::Rgba([96, 96, 96, 255]))
+        .save(&source)
+        .unwrap();
+    let mut opts = options(temp.path());
+    opts.overwrite = OverwritePolicy::Replace;
+    opts.keep_file_time = true;
+    let output = temp.path().join("result.png");
+    let first = run(opts.clone(), vec![file_item(&source, "result")]);
+    assert_eq!(completed_paths(&first), vec![output.clone()], "{first:#?}");
+    let before_bytes = std::fs::read(&output).unwrap();
+    let now = SystemTime::now();
+    let current_second = now.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let old_time = UNIX_EPOCH + Duration::from_secs(current_second) + Duration::from_millis(100);
+    std::fs::File::options()
+        .write(true)
+        .open(&output)
+        .unwrap()
+        .set_modified(old_time)
+        .unwrap();
+    let before = crate::catalog::file_stamp(&std::fs::metadata(&output).unwrap());
+    assert_eq!(before.0, current_second as i64);
+    let mut edited = file_item(&source, "result");
+    edited.edits.params.brightness = 25.0;
+    let events = run(opts, vec![edited]);
+    assert_eq!(
+        completed_paths(&events),
+        vec![output.clone()],
+        "{events:#?}"
+    );
+    let after_bytes = std::fs::read(&output).unwrap();
+    assert_ne!(before_bytes, after_bytes);
+    assert_eq!(
+        before_bytes.len(),
+        after_bytes.len(),
+        "reproduce equal encoded sizes"
+    );
+    let after = crate::catalog::file_stamp(&std::fs::metadata(&output).unwrap());
+    assert_eq!(after.1, before.1);
+    assert!(
+        after.0 > before.0,
+        "second-based stamp must advance: {before:?} -> {after:?}"
+    );
+}
+
+#[test]
+fn replacement_file_time_uses_next_second_or_later_write_time() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("output.png");
+    std::fs::write(&output, b"written output").unwrap();
+    let base = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    for (old_ms, written_ms, expected_ms) in [
+        (100, 900, 1000),
+        (900, 950, 1000),
+        (0, 900, 1000),
+        (100, 2345, 2345),
+        (5100, 2345, 6000),
+    ] {
+        let previous = base + Duration::from_millis(old_ms);
+        let written = base + Duration::from_millis(written_ms);
+        set_replacement_file_time(&output, Some(previous), written).unwrap();
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().modified().unwrap(),
+            base + Duration::from_millis(expected_ms),
+            "old={old_ms}ms written={written_ms}ms"
+        );
+    }
+    // A pre-epoch old file is older than the actual write time too.
+    set_replacement_file_time(&output, Some(UNIX_EPOCH - Duration::from_millis(100)), base)
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(&output).unwrap().modified().unwrap(),
+        base
+    );
+}
+
+#[test]
+fn replacement_file_time_leaves_new_output_unchanged() {
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("output.png");
+    std::fs::write(&output, b"new output").unwrap();
+    let before = std::fs::metadata(&output).unwrap().modified().unwrap();
+    // With no previous file, even a later sampled clock must not set the mtime.
+    set_replacement_file_time(&output, None, before + Duration::from_secs(10)).unwrap();
+    assert_eq!(
+        std::fs::metadata(&output).unwrap().modified().unwrap(),
+        before
+    );
+}
+
+#[test]
 fn file_time_follows_overwrite_policy_for_new_and_existing_outputs() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source.png");

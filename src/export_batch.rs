@@ -407,12 +407,22 @@ fn run_batch_export_with_decoder(
             timings.encode = start.elapsed().as_secs_f64() * 1000.0;
             ensure_not_cancelled(&cancel)?;
             let start = Instant::now();
+            let previous_modified = if replace {
+                Some(
+                    std::fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .map_err(|e| format!("上書き前の更新日時を取得できません: {e}"))?,
+                )
+            } else {
+                None
+            };
             write_output(
                 &path,
                 &encoded.bytes,
                 options.overwrite == OverwritePolicy::Replace,
             )?;
             outputs.record_written(&path)?;
+            set_replacement_file_time(&path, previous_modified, SystemTime::now())?;
             if keep_file_time {
                 std::fs::OpenOptions::new()
                     .write(true)
@@ -540,6 +550,33 @@ fn local_datetime(time: SystemTime) -> Result<(String, String), String> {
         format!("{:04}{:02}{:02}", local.wYear, local.wMonth, local.wDay),
         format!("{:02}{:02}{:02}", local.wHour, local.wMinute, local.wSecond),
     ))
+}
+
+fn set_replacement_file_time(
+    path: &Path,
+    previous: Option<SystemTime>,
+    written: SystemTime,
+) -> Result<(), String> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    // Cache stamps use whole seconds. Advance to the next boundary, rather
+    // than adding a second to the old fractional timestamp. Handle pre-epoch
+    // timestamps with the same floor operation.
+    let fractional_nanos = match previous.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.subsec_nanos(),
+        Err(error) => (1_000_000_000 - error.duration().subsec_nanos()) % 1_000_000_000,
+    };
+    let next_second = previous
+        .checked_add(std::time::Duration::from_nanos(u64::from(
+            1_000_000_000 - fractional_nanos,
+        )))
+        .ok_or("出力の更新日時を計算できません")?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(written.max(next_second)))
+        .map_err(|e| format!("出力の更新日時を設定できません: {e}"))
 }
 
 fn write_output(path: &Path, bytes: &[u8], replace: bool) -> Result<(), String> {
