@@ -381,7 +381,8 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn pending_context_async_owners (self) -> Vec < ContextAsyncOwner >",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_removed_epub_generations (& mut self , removed : & [crate :: epub_cache :: GenerationRow] ,)",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn document_modal_owners_in_any_context (& self) -> (bool , bool)",
-    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_final_cover_spread_display_in_parked_contexts (& mut self)",
+    // 1.884 selects the parked owners from a shared-input change (global default or browser root).
+    "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_final_cover_spread_display_in_parked_contexts (& mut self , change : & super :: FinalCoverSharedInputChange < '_ > ,)",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_singleton_spread_placement_in_parked_contexts (& mut self , first_changed : bool , last_changed : bool ,)",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_page_alone_in_parked_contexts (& mut self , after_cover_changed : bool , last_changed : bool ,)",
     "inherent fn # [cfg (windows)]   App ::  pub (crate) fn invalidate_auto_view_trim_display_in_parked_contexts (& mut self)",

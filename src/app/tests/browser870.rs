@@ -1,4 +1,5 @@
 use super::*;
+use crate::settings::FinalCoverSpreadPreference as FinalCover;
 use crate::settings::{ReadingDirection as Direction, ReadingFlow as Flow, SpreadMode as Mode};
 use crate::ui_fullscreen::SpreadPresentationPersistence as Persistence;
 
@@ -400,4 +401,323 @@ fn browser870_load_preserves_non_presentation_preferences() {
     assert_eq!(app.final_cover_spread_preference, final_cover);
     assert_eq!(app.singleton_spread_endpoint_preferences, endpoints);
     assert_eq!(app.page_alone_preferences, alone);
+}
+
+fn has_final_cover_supplement(app: &mut App) -> bool {
+    let last = app.items.len() - 1;
+    app.spread_display_composition_for_anchor(last)
+        .pages_in_reading_order()
+        .iter()
+        .any(|page| page.role == crate::ui_fullscreen::SpreadPageRole::FrontCoverSupplement)
+}
+
+fn adopt_final_cover_container(app: &mut App, path: &Path, pdf: bool) {
+    let pages = (0..2)
+        .map(|index| {
+            if pdf {
+                GridItem::PdfPage {
+                    pdf_path: path.to_path_buf(),
+                    page_num: index,
+                    content_type: None,
+                }
+            } else {
+                GridItem::ZipImage {
+                    zip_path: path.to_path_buf(),
+                    entry_name: format!("{index:03}.jpg"),
+                }
+            }
+        })
+        .collect();
+    app.start_loading_items(
+        path.to_path_buf(),
+        pages,
+        vec![None; 2],
+        Default::default(),
+        Vec::new(),
+        None,
+    );
+    app.finish_page_identity_preparation_for_test();
+    for index in 0..2 {
+        app.record_page_dims_for_spread(index, (8, 12));
+    }
+}
+
+#[test]
+fn browser870_final_cover_defaults_overrides_and_rows_survive_open_close() {
+    let mut app = phase_c_support::setup_app();
+    let root = app.tmp.path().join("browser");
+    let inside = plain_folder_spread::make_folder(&root, "month");
+    let outside = plain_folder_spread::make_folder(app.tmp.path(), "outside");
+    app.settings.browser_view_output_dir = Some(root);
+    for global in [false, true] {
+        app.settings.final_cover_spread_enabled = global;
+        for folder in [&inside, &outside] {
+            for preference in [FinalCover::FollowGlobal, FinalCover::On, FinalCover::Off] {
+                save_fixture(&app, folder, Mode::RtlCover);
+                app.spread_db
+                    .as_ref()
+                    .unwrap()
+                    .set_final_cover_spread_preference(folder, None, preference)
+                    .unwrap();
+                let before = stored(&app, folder);
+                adopt(&mut app, folder, true);
+                app.spread_mode = Mode::LtrCover;
+                let expected = preference.effective(global && folder == &outside);
+                assert_eq!(app.final_cover_spread_preference, preference);
+                assert_eq!(app.final_cover_spread_enabled_for_current_book(), expected);
+                assert_eq!(has_final_cover_supplement(&mut app), expected);
+                // Replacing the listing closes this book without modifying its saved values.
+                let parent = app.tmp.path().to_path_buf();
+                adopt(&mut app, &parent, true);
+                assert_eq!(app.settings.final_cover_spread_enabled, global);
+                assert_eq!(stored(&app, folder), before);
+                assert_eq!(
+                    app.spread_db
+                        .as_ref()
+                        .unwrap()
+                        .get_final_cover_spread_preference_with_fallback(folder, None),
+                    preference
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn browser870_final_cover_zip_composition_and_extracted_keep_existing_policy() {
+    use book_materialization::{BookScope, ExtractedSurface, ProjectionRecipe};
+    let mut app = phase_c_support::setup_app();
+    let root = app.tmp.path().join("browser");
+    let zip = root.join("book.zip");
+    app.settings.browser_view_output_dir = Some(root.clone());
+    adopt_final_cover_container(&mut app, &zip, false);
+    for global in [false, true] {
+        app.settings.final_cover_spread_enabled = global;
+        assert!(!app.current_view_is_browser_directory());
+        assert_eq!(app.final_cover_spread_enabled_for_current_book(), global);
+    }
+    let document = root.join("book.pdf");
+    app.current_folder = Some(document.clone());
+    app.projection_recipe = ProjectionRecipe::Book(BookScope::Document(document.clone()));
+    app.spread_presentation_source = SpreadPresentationSource::PhysicalDirectory {
+        key: document.clone(),
+    };
+    app.book_composition = book_composition_runtime::ViewerBookComposition::Blocked {
+        scope: crate::book_scope::BookScopeKey::document(&document).unwrap(),
+        token: crate::book_composition::CompositionToken {
+            service_epoch: 1,
+            publication_sequence: 1,
+        },
+        error: "unreadable fixture".into(),
+    };
+    for global in [false, true] {
+        app.settings.final_cover_spread_enabled = global;
+        assert!(app.composition_owns_view_settings());
+        assert!(!app.current_view_is_browser_directory());
+        assert!(app.remembers_spread_presentation());
+        assert_eq!(app.final_cover_spread_enabled_for_current_book(), global);
+    }
+    app.projection_recipe = ProjectionRecipe::ExtractedResult(ExtractedSurface::Rating);
+    app.final_cover_spread_preference = FinalCover::On;
+    assert!(!app.final_cover_spread_enabled_for_current_book());
+}
+
+#[cfg(windows)]
+#[test]
+fn browser870_final_cover_context_swap_preserves_each_effective_value() {
+    let mut app = phase_c_support::setup_app();
+    let root = app.tmp.path().join("browser");
+    let month = plain_folder_spread::make_folder(&root, "month");
+    let outside = plain_folder_spread::make_folder(app.tmp.path(), "outside");
+    app.settings.browser_view_output_dir = Some(root);
+    app.settings.final_cover_spread_enabled = true;
+    adopt(&mut app, &month, true);
+    let window = app.allocate_detached_viewer_window_id();
+    let sibling = app.build_window_context_for_test(window, |viewer| {
+        adopt(viewer, &outside, true);
+    });
+    for _ in 0..2 {
+        assert!(!app.final_cover_spread_enabled_for_current_book());
+        app.with_viewer_context(sibling, |viewer| {
+            assert!(viewer.final_cover_spread_enabled_for_current_book());
+        })
+        .unwrap();
+    }
+}
+
+#[cfg(windows)]
+fn seed_final_cover_display(app: &mut App) {
+    app.fs_pan = egui::vec2(12.0, 34.0);
+    app.fs_vertical_scroll = 123.0;
+    app.fs_free_rotation = 27.0;
+    app.fullscreen_page_layout
+        .begin(crate::displayed_image_transform::FullscreenPageLayoutKind::Continuous);
+}
+
+#[cfg(windows)]
+fn assert_final_cover_display(app: &App, invalidated: bool) {
+    use crate::displayed_image_transform::FullscreenPageLayoutKind as Layout;
+    assert_eq!(
+        app.fs_pan,
+        if invalidated {
+            egui::Vec2::ZERO
+        } else {
+            egui::vec2(12.0, 34.0)
+        }
+    );
+    assert_eq!(
+        app.fs_vertical_scroll,
+        if invalidated { 0.0 } else { 123.0 }
+    );
+    assert_eq!(app.fs_free_rotation, if invalidated { 0.0 } else { 27.0 });
+    assert_eq!(
+        app.fullscreen_page_layout.kind(),
+        if invalidated {
+            Layout::Empty
+        } else {
+            Layout::Continuous
+        }
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn browser870_final_cover_root_change_invalidates_only_affected_mounted_and_parked_contexts() {
+    let mut app = phase_c_support::setup_app();
+    let old_root = app.tmp.path().join("browser");
+    let new_root = app.tmp.path().join("new-browser");
+    let month = plain_folder_spread::make_folder(&old_root, "month");
+    let new_month = plain_folder_spread::make_folder(&new_root, "month");
+    let outside = plain_folder_spread::make_folder(app.tmp.path(), "outside");
+    app.settings.final_cover_spread_enabled = true;
+    app.settings.browser_view_output_dir = Some(old_root.clone());
+    adopt(&mut app, &month, true);
+    app.spread_mode = Mode::LtrCover;
+    let mut contexts = Vec::new();
+    for (path, directory, affected) in [
+        (month.clone(), true, true),
+        (new_month, true, true),
+        (outside, true, false),
+        (old_root.join("book.zip"), false, false),
+        (old_root.join("book.pdf"), false, false),
+    ] {
+        let window = app.allocate_detached_viewer_window_id();
+        let id = app.build_window_context_for_test(window, |viewer| {
+            if directory {
+                adopt(viewer, &path, true);
+            } else {
+                adopt_final_cover_container(
+                    viewer,
+                    &path,
+                    path.extension().is_some_and(|extension| extension == "pdf"),
+                );
+            }
+            viewer.spread_mode = Mode::LtrCover;
+            seed_final_cover_display(viewer);
+        });
+        contexts.push((id, path, directory, affected));
+    }
+    let generation = app.items_generation;
+    for (old, new, browser_enabled) in [(&old_root, &new_root, true), (&new_root, &old_root, false)]
+    {
+        seed_final_cover_display(&mut app);
+        app.settings.browser_view_output_dir = Some(new.clone());
+        app.invalidate_final_cover_after_shared_input_change(
+            &egui::Context::default(),
+            FinalCoverSharedInputChange::BrowserRoot {
+                old: Some(old),
+                new: Some(new),
+            },
+        );
+        assert_eq!(app.items_generation, generation, "no listing reload");
+        assert_eq!(
+            app.final_cover_spread_enabled_for_current_book(),
+            browser_enabled
+        );
+        assert_final_cover_display(&app, true);
+        assert_eq!(has_final_cover_supplement(&mut app), browser_enabled);
+        for (id, path, directory, affected) in &contexts {
+            app.with_viewer_context(*id, |viewer| {
+                assert_final_cover_display(viewer, *affected);
+                let expected = !crate::browser_view_policy::is_browser_view_directory(
+                    path,
+                    *directory,
+                    Some(new),
+                );
+                assert_eq!(
+                    viewer.final_cover_spread_enabled_for_current_book(),
+                    expected
+                );
+                assert_eq!(has_final_cover_supplement(viewer), expected);
+                seed_final_cover_display(viewer);
+            })
+            .unwrap();
+        }
+    }
+    // The same selector also leaves an unrelated *mounted* directory/PDF/ZIP untouched.
+    for (id, _, _, affected) in contexts {
+        if !affected {
+            app.with_viewer_context(id, |viewer| {
+                viewer.settings.browser_view_output_dir = Some(new_root.clone());
+                viewer.invalidate_final_cover_after_shared_input_change(
+                    &egui::Context::default(),
+                    FinalCoverSharedInputChange::BrowserRoot {
+                        old: Some(&old_root),
+                        new: Some(&new_root),
+                    },
+                );
+                assert_final_cover_display(viewer, false);
+            })
+            .unwrap();
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn browser870_final_cover_shared_changes_preserve_explicit_preferences() {
+    let mut app = phase_c_support::setup_app();
+    let old = app.tmp.path().join("browser");
+    let new = app.tmp.path().join("elsewhere");
+    let month = plain_folder_spread::make_folder(&old, "month");
+    app.settings.browser_view_output_dir = Some(old.clone());
+    adopt(&mut app, &month, true);
+    let mut contexts = Vec::new();
+    for preference in [FinalCover::FollowGlobal, FinalCover::On, FinalCover::Off] {
+        let window = app.allocate_detached_viewer_window_id();
+        let id = app.build_window_context_for_test(window, |viewer| {
+            adopt(viewer, &month, true);
+            viewer.final_cover_spread_preference = preference;
+            seed_final_cover_display(viewer);
+        });
+        contexts.push((id, preference));
+    }
+    for root_change in [false, true] {
+        app.settings.final_cover_spread_enabled = !app.settings.final_cover_spread_enabled;
+        app.settings.browser_view_output_dir = Some(new.clone());
+        for preference in [FinalCover::FollowGlobal, FinalCover::On, FinalCover::Off] {
+            app.final_cover_spread_preference = preference;
+            seed_final_cover_display(&mut app);
+            app.invalidate_final_cover_after_shared_input_change(
+                &egui::Context::default(),
+                if root_change {
+                    FinalCoverSharedInputChange::BrowserRoot {
+                        old: Some(&old),
+                        new: Some(&new),
+                    }
+                } else {
+                    FinalCoverSharedInputChange::GlobalDefault
+                },
+            );
+            assert_final_cover_display(&app, preference == FinalCover::FollowGlobal);
+        }
+        for (id, preference) in &contexts {
+            app.with_viewer_context(*id, |viewer| {
+                assert_final_cover_display(viewer, *preference == FinalCover::FollowGlobal);
+                assert_eq!(viewer.final_cover_spread_preference, *preference);
+                seed_final_cover_display(viewer);
+            })
+            .unwrap();
+        }
+    }
 }

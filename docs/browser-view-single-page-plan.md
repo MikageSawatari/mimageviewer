@@ -515,3 +515,18 @@
   - P3: 10.11 の変更の範囲が、Remote の計算と無効化の入口を含んでいない。→ 受け入れ。10.11 を直した。
   - P2-1 (Remote) と、根の変更を確定のときに検知して共通の入口へ通す方針は妥当と確認された。全体の値の変更の広い無効化を今回維持することは許容された。凍結の決まりの合意の言葉は 1 回目から変わらない。
 - 3 回目 (`d0f6e47c0`、同じ担当の続き): **ACCEPT**。追加の指摘なし。根の変更のときの候補の判定は、実効値が変わり得る context を漏らさず、表示中・停めた束で共有できると確認された。凍結の決まりの合意は変わらない。[detached-rework-plan.md](detached-rework-plan.md) §11 に記録した。
+
+### 10.13 実装の記録
+
+- 変更ファイル: `src/app.rs`、`src/app/viewer_context_registry.rs`、`src/browser_integration/mod.rs`、`src/ui_dialogs/preferences.rs`、`src/remote_ipc/container.rs`、`src/app/tests/browser870.rs`、`src/remote_ipc/browser870_container_tests.rs`、`src/ui_fullscreen/initial_placement/tests.rs`、`htdocs/mimageviewer/manual/browser-integration.html`、`htdocs/mimageviewer/manual/fullscreen.html`、`htdocs/mimageviewer/manual/settings.html`、`docs/spec.md`、本書。
+- まとめた関数: `App::current_view_is_browser_directory`、`App::invalidate_final_cover_after_shared_input_change`、`FinalCoverSharedInputChange::affects`。
+- 追加テスト:
+  - `browser870_final_cover_defaults_overrides_and_rows_survive_open_close`
+  - `browser870_final_cover_zip_composition_and_extracted_keep_existing_policy`
+  - `browser870_final_cover_context_swap_preserves_each_effective_value`
+  - `browser870_final_cover_root_change_invalidates_only_affected_mounted_and_parked_contexts`
+  - `browser870_final_cover_shared_changes_preserve_explicit_preferences`
+  - `browser870_final_cover_remote_explicit_ltr_cover_respects_directory_default_and_overrides`
+- nextest filter: `test(browser870_final_cover_)`。関連回帰の filter: `test(browser870_) | test(final_cover) | test(spread_shift) | test(plain_folder_spread)`。
+- 設計担当の追記: `invalidate_final_cover_spread_display_in_parked_contexts` の引数が増えたので、`tools/viewer_context_audit/src/lib.rs` の A4 の許可リストの署名を新しい形に合わせた (停めた束を選ぶ条件を引数で受けるだけで、読み書きする束の範囲は変わらない)。
+- 設計担当の検証: 関連テスト 328 件成功 (`run-heavy`、filter `browser870_|final_cover|spread_shift|plain_folder_spread|initial_placement_parked|browser818`)、`viewer_context_audit` exit 0、`cargo fmt --check` 成功。本体 lib の全件と実機は未確認。

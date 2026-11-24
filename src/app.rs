@@ -13792,6 +13792,37 @@ impl SpreadPresentationSource {
     }
 }
 
+/// Select affected contexts without mounting parked owners or resolving their full display state.
+pub(crate) enum FinalCoverSharedInputChange<'a> {
+    GlobalDefault,
+    BrowserRoot {
+        old: Option<&'a Path>,
+        new: Option<&'a Path>,
+    },
+}
+
+impl FinalCoverSharedInputChange<'_> {
+    pub(crate) fn affects(
+        &self,
+        source: &SpreadPresentationSource,
+        preference: crate::settings::FinalCoverSpreadPreference,
+    ) -> bool {
+        if preference != crate::settings::FinalCoverSpreadPreference::FollowGlobal {
+            return false;
+        }
+        match self {
+            Self::GlobalDefault => true,
+            Self::BrowserRoot { old, new } => match source {
+                SpreadPresentationSource::PhysicalDirectory { key } => {
+                    crate::browser_view_policy::is_browser_view_directory(key, true, *old)
+                        != crate::browser_view_policy::is_browser_view_directory(key, true, *new)
+                }
+                SpreadPresentationSource::Other => false,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SpreadRestoreDefaults {
     spread_mode: crate::settings::SpreadMode,
@@ -29350,24 +29381,44 @@ impl App {
             .is_browser_directory(key, &self.settings)
     }
 
+    pub(crate) fn current_view_is_browser_directory(&self) -> bool {
+        !self.composition_owns_view_settings()
+            && self
+                .spread_container_key()
+                .as_deref()
+                .is_some_and(|key| self.browser_directory_presentation_for_key(key))
+    }
+
     /// Display gestures may update the live session without changing durable defaults.
     pub(crate) fn remembers_spread_presentation(&self) -> bool {
         if self.composition_owns_view_settings() {
             return true;
         }
-        self.extracted_result_surface().is_none()
-            && !self
-                .spread_container_key()
-                .as_deref()
-                .is_some_and(|key| self.browser_directory_presentation_for_key(key))
+        self.extracted_result_surface().is_none() && !self.current_view_is_browser_directory()
     }
 
     pub(crate) fn final_cover_spread_enabled_for_current_book(&self) -> bool {
         if self.extracted_result_surface().is_some() {
             return false;
         }
-        self.final_cover_spread_preference
-            .effective(self.settings.final_cover_spread_enabled)
+        let global_default =
+            !self.current_view_is_browser_directory() && self.settings.final_cover_spread_enabled;
+        self.final_cover_spread_preference.effective(global_default)
+    }
+
+    pub(crate) fn invalidate_final_cover_after_shared_input_change(
+        &mut self,
+        ctx: &egui::Context,
+        change: FinalCoverSharedInputChange<'_>,
+    ) {
+        #[cfg(windows)]
+        self.invalidate_final_cover_spread_display_in_parked_contexts(&change);
+        if change.affects(
+            &self.spread_presentation_source,
+            self.final_cover_spread_preference,
+        ) {
+            self.invalidate_final_cover_spread_display(ctx);
+        }
     }
 
     pub(crate) fn singleton_spread_placement_enabled_for_current_book(

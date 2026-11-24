@@ -173,3 +173,96 @@ fn browser870_remote_directory_reads_live_root_and_retains_explicit_request_over
         before
     );
 }
+
+#[test]
+fn browser870_final_cover_remote_explicit_ltr_cover_respects_directory_default_and_overrides() {
+    use crate::settings::FinalCoverSpreadPreference as Preference;
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("browser");
+    for inside in [false, true] {
+        let folder = if inside {
+            root.join("month")
+        } else {
+            temp.path().join("outside")
+        };
+        std::fs::create_dir_all(&folder).unwrap();
+        let pages = (0..4)
+            .map(|index| {
+                let page = folder.join(format!("{index:03}.png"));
+                image::RgbImage::new(8, 12).save(&page).unwrap();
+                crate::grid_item::GridItem::Image(page)
+            })
+            .collect::<Vec<_>>();
+        let resolved = resolve_existing(folder.to_string_lossy().as_ref()).unwrap();
+        for global in [false, true] {
+            for preference in [Preference::FollowGlobal, Preference::On, Preference::Off] {
+                let engine = ContainerEngine::new(crate::settings::Settings {
+                    browser_view_output_dir: Some(root.clone()),
+                    final_cover_spread_enabled: global,
+                    ..Default::default()
+                });
+                let mut db = crate::spread_db::SpreadDb::open_at(Path::new(":memory:")).unwrap();
+                db.set_final_cover_spread_preference(&folder, None, preference)
+                    .unwrap();
+                *engine.spread_db.state.lock().unwrap() = Ok(Some(db));
+                let spread = engine
+                    .spread_payload_with_read(
+                        &ContainerRequest {
+                            address: RemoteAddress::file(folder.to_string_lossy().into_owned()),
+                            spread_mode: Some(RemoteSpreadMode::LtrCover),
+                            reading_direction: Some(RemoteReadingDirection::Ltr),
+                            force_single_page: false,
+                        },
+                        &resolved,
+                        &pages,
+                        None,
+                        None,
+                        SpreadDefaultSource::Directory {
+                            book_locked: false,
+                            canonical_image_book: false,
+                        },
+                        true,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                let expected = preference.effective(!inside && global);
+                assert_eq!(spread.configured, RemoteSpreadMode::LtrCover);
+                assert_eq!(spread.effective, RemoteSpreadMode::LtrCover);
+                assert_eq!(
+                    spread.final_cover_preference,
+                    remote_final_cover_preference(preference)
+                );
+                assert_eq!(spread.final_cover_enabled, expected);
+                assert_eq!(spread.groups.len(), 3);
+                let last = spread.groups.last().unwrap();
+                assert_eq!(last.pages.len(), 1);
+                let supplement = last.presentation.as_ref().is_some_and(|slots| {
+                    slots.iter().any(|slot| {
+                        slot.role == RemotePagePresentationRole::FrontCoverSupplement
+                            && slot.address == spread.groups[0].pages[0]
+                    })
+                });
+                assert_eq!(
+                    supplement, expected,
+                    "inside={inside} global={global} {preference:?}"
+                );
+                assert_eq!(
+                    engine
+                        .spread_db
+                        .state
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .get_final_cover_spread_preference_with_fallback(&folder, None),
+                    preference
+                );
+            }
+        }
+    }
+}

@@ -2656,7 +2656,9 @@ fn initial_placement_parked_geometry_resets_clear_only_the_affected_context_requ
             owner.request_fs_initial_placement(0);
         });
         match reset {
-            0 => app.invalidate_final_cover_spread_display_in_parked_contexts(),
+            0 => app.invalidate_final_cover_spread_display_in_parked_contexts(
+                &crate::app::FinalCoverSharedInputChange::GlobalDefault,
+            ),
             1 => app.invalidate_singleton_spread_placement_in_parked_contexts(true, true),
             _ => app.invalidate_page_alone_in_parked_contexts(true, true),
         }
