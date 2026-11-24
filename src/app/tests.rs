@@ -22013,6 +22013,7 @@ mod folder_pane_open_nav_tests {
     fn empty_scan() -> ScannedDir {
         ScannedDir {
             duration_facts: None,
+            page_count_facts: None,
             precise_stamps: Default::default(),
             reconcile: None,
             auxiliary_media: Default::default(),
@@ -26062,6 +26063,7 @@ mod phase_c_folder_nav_history_tests {
             };
             let mut scan = crate::app::folder_scan::ScannedDir {
                 duration_facts: None,
+                page_count_facts: None,
                 precise_stamps: Default::default(),
                 reconcile: None,
                 auxiliary_media: Default::default(),
@@ -116495,6 +116497,7 @@ fn detached_backend_hwnd_reuse_retires_host_claim_and_reseeds_same_handle() {
 mod duration_762;
 mod facet_835;
 mod page_badge_883;
+mod page_sort_883;
 
 #[path = "tests/prepared_search_adoption.rs"]
 mod prepared_search_adoption;

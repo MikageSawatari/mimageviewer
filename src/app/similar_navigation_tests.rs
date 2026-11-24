@@ -44,6 +44,7 @@ fn grid_item_keys(items: &[GridItem]) -> Vec<String> {
 fn image_scan(paths: &[PathBuf]) -> ScannedDir {
     ScannedDir {
         duration_facts: None,
+        page_count_facts: None,
         precise_stamps: Default::default(),
         reconcile: None,
         auxiliary_media: Default::default(),

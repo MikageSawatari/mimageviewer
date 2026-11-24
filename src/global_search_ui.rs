@@ -12,7 +12,7 @@
 //! - Drill-down view (1 階層降りた先の絞り込み表示) は本モジュールには含まず、
 //!   後続コミットで追加予定 (docs §10.3 の [3] 絞り込みビュー)
 
-use crate::app::listing_sort::{without_duration_order, without_duration_request};
+use crate::app::listing_sort::{without_lazy_metric_order, without_lazy_metric_request};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1463,7 +1463,7 @@ fn build_flat_items_with_recipe(
     rating_filter: &[bool; 6],
     recipe: &crate::rating_membership::RatingPreviewRecipe,
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
-    let sort_order = without_duration_order(sort_order);
+    let sort_order = without_lazy_metric_order(sort_order);
     let rf_active = !rating_filter.iter().all(|&b| b);
     // (GridItem, basename, sort metadata) を集めてからまとめてソートする。
     let mut rows: Vec<(GridItem, String, crate::settings::ListingSortMetadata)> =
@@ -1542,7 +1542,7 @@ fn build_drilled_items_with_recipe(
     rating_filter: &[bool; 6],
     recipe: &crate::rating_membership::RatingPreviewRecipe,
 ) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>, HashSet<PathBuf>) {
-    let sort_order = without_duration_order(sort_order);
+    let sort_order = without_lazy_metric_order(sort_order);
     if is_zip {
         let (items, metas) =
             build_drilled_zip_items_with_recipe(state, current_path, rating_filter, recipe);
@@ -3608,7 +3608,7 @@ impl App {
                             || wish.view == self.global_search.view())
                         && wish.sort_mode == self.global_search.sort_mode
                         && wish.order_request
-                            == without_duration_request(
+                            == without_lazy_metric_request(
                                 crate::rating_sort::ListingOrderRequest::from_settings(
                                     &self.settings,
                                 ),
@@ -4251,7 +4251,7 @@ impl App {
                 through_batch: prepare.raw_batch_sequence,
                 view,
                 sort_mode: self.global_search.sort_mode,
-                order_request: without_duration_request(
+                order_request: without_lazy_metric_request(
                     crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
                 ),
                 rating_write_generation: self.rating_session_write_generation,
@@ -4283,7 +4283,7 @@ impl App {
         // も drill 内で未評価 hits が build_drilled_items 側で落とされていた。
         let adoption = self.capture_search_view_adoption(&self.global_search.view());
         let rating_filter = self.effective_rating_filter();
-        let order_request = without_duration_request(
+        let order_request = without_lazy_metric_request(
             crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
         );
         let sort_order = order_request.standard_fallback();

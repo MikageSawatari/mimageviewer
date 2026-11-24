@@ -931,3 +931,181 @@ cargo nextest run -p mimageviewer --lib -E 'test(/page_badge_883|page_count|pool
   `tests/ui_snapshot.rs`。
 - 文書: 本書、`docs/ui-responsiveness.md`、`docs/architecture-overview.md`、`docs/virtual-folders.md`、
   `htdocs/mimageviewer/manual/grid.html`、`htdocs/mimageviewer/manual/settings.html`、`htdocs/mimageviewer/index.html`。
+
+## 11. 実装記録 (段 2)
+
+2026-11-24。§6 のページ数順を実装した。段 1 のコミット `ee08106d5` からの未コミット差分。
+以下はソース・試験定義・静的照合の台帳であり、コンパイルやテストの成功を示さない。
+利用者の指定により cargo build / test / check / clippy、確認用バイナリの作成・起動、
+git commit / branch / stash / reset は行わない。更新履歴・catalog schema / CATALOG_VERSION は変更なし。
+
+### 11.1 遅延キーへの振り分け台帳
+
+`SortOrder::lazy_metric() -> Option<LazyMetric>` を追加した。`is_duration()` と
+`SortOrder::Duration*` の非テスト参照、および以前の正規化関数を次のように振り分けた。
+
+| 場所 | 遅延キー全体へ共通化したもの / 長さ固有として残したもの |
+| --- | --- |
+| `settings.rs` | `LazyMetric`・ページ数の2 variant・比較・ラベルを追加。collection / folder-thumb は既存 allowlist のまま。ツールバーの10→12移行は長さ固有のまま固定し、12→14移行を別 marker にした。`listing_may_sort_by_duration` は長さ facts のため維持し、ページ数の同型 OR を追加 |
+| `app/listing_sort.rs` | `duration_allowed` → `lazy_metric_allowed`、`without_duration_order/request` → `without_lazy_metric_order/request`。非対応理由は種類別。使える一覧・固定順・既存ロックの判定は共通 |
+| `ui_main.rs` | `sort_control_decision`、再選択の worker reload、ラベルと tooltip の進捗を共通化。長さ facet の条件・表示は長さ固有のまま |
+| `app/gamepad_input.rs` | 同値再選択の扱いを共通化。巡回は既存 capabilities 経由で両種類の非対応候補を飛ばす |
+| `remote_ipc/mod.rs` | 候補・wire 値・実効順の正規化を共通化。`remote_ipc/container.rs` の既存試験もページ数を含めた |
+| `global_search_ui.rs` / `global_search_ui/everything.rs` | producer の要求・比較・projection の名前順正規化を共通化 |
+| `app/smart_folder.rs` / `app/subfolder_expansion.rs` | worker / resident / materialize の要求正規化を共通化 |
+| `rating_view.rs` / `bookmark_browser.rs` | 表示候補と内部 producer の正規化を共通化 |
+| `collection_store/model.rs` / `thumb_loader.rs` | 明示候補に含めず、網羅 match の非対応側へページ数を追加 |
+| `app.rs` / `app/collection_navigation.rs` | 5 worker 入口にページ数要求を追加。reconcile の `is_duration()` は `lazy_metric()` へ。既存 `apply_sort_change_reload` をそのまま再利用 |
+| `app/duration_metadata.rs` | 要件・proof・読み込み文言・メモリ snapshot は共通。長さ facet・`duration_lengths_wanted`・`media_duration_from_meta`・`listing_duration_for_path` は長さ固有 |
+| `app/book_materialization.rs` | `media_sort.is_duration()` は動画・音声の reader を呼ぶ条件なので維持。ページ数 reader は PageCount の要求時だけ `scan.folders` を読む |
+| `settings_transfer/stage1.rs` / `settings_transfer.rs` | 候補にページ数2種、移行 marker は転送対象外へ分類。分類数は520 (転送174・除外346) |
+
+本番で残る `is_duration()` は、`settings.rs` の長さ facts の保守的 OR、
+`app/duration_metadata.rs` の長さ需要、`app/book_materialization.rs` の動画・音声読取りだけ。
+`physical_duration_sort_surface/order` の名前は既存 caller のまま残すが、処理本体は共通 capabilities を使う。
+旧 duration collector / materialize wrapper と duration snapshot helper は既存試験の入口として維持した。
+
+### 11.2 facts・メモリ・materialize の照合
+
+- `ListingSortMetadata.page_count` は既定 Missing。Known は昇順 / 降順で比較し、Unavailable と Missing は
+  両方向とも末尾・名前昇順。同値も名前昇順、4行割当を越えない。スタックのメンバーと passthrough は
+  構造体全体を持ち回り、集約セルは `ListingSortMetadata::new` の Missing を使う。
+- `listing_page_count_for_path` は source stamp・checked・要求 fingerprint を照合する。
+  PDF/EPUB のメモリは既存 credential revision も照合する。EPUB の一覧世代は見ない。
+  表示の最後の値を読む `details_page_count_value` と、全件取得で世代を見て取り直す述語は変更しない。
+- UI の closure と worker の `FolderListingMetadataSnapshot` は同じ accessor を使う。
+  snapshot は長さ・ページ数を1構造体にまとめ、要求した種類だけを作る。新しい UI I/O はない。
+- `FolderPageCountFacts` は要求 fingerprint と一緒に運び、materialize に渡した現 fingerprint と一致するときだけ使う。
+  名前・kind・mtime・size・fingerprint が一致する container 行、または名前・mtime・size が一致する PDF 行を使う。
+  画像フォルダは `ScannedFolderEntry.display_meta` の `(mtime, 0)`、サイズ順の `file_size: None` は維持する。
+  EPUB と password_required PDF は facts を使わない。メモリ → facts → Missing の順、メモリの Unavailable も優先する。
+- `CatalogDb::load_listing_page_count_facts` は既存2表を2 SELECTで読むだけ。
+  `collect_folder_listing_metadata_facts` は不要な要求 / 対象なしでは開かず、必要時は長さと1接続を共有する。
+  `open_existing_read_only` が `open_existing_read_only_admitted` へ委譲する既存 admission を使い、
+  不在は空、異常はログと空 facts、schema を初期化・移行しない。`listing/page_count_facts` に rows / ms / failed。
+
+### 11.3 入口・全件取得・所有境界
+
+長さ計画 §11.2 の入口台帳への追記:
+
+| 入口 | 段2の追加 |
+| --- | --- |
+| open-path-classify | 共通・live・保存済みお気に入りの OR と認識設定から作る fingerprint を要求へ捕捉し、directory scan後に共通 collector |
+| Ctrl+↑↓ / DFS・兄弟・一覧順移動 | 行き先 scan の後に同じ flag / fingerprint で collector |
+| folder pane・更新・並べ替え変更 / 同値再選択 | `start_folder_open_scan_with_restore_and_navigation` の既存 worker に同じ要求を追加 |
+| BS・履歴・物理 preflight | `app/collection_navigation.rs` の directory 分岐へ同じ要求を追加 |
+| 外部変更 reconcile | 共通 collector と要求時メモリ snapshot を worker materialize へ渡す |
+| 変換後の親採用・従来の同期入口 | 新しい catalog 読取を足さない。準備済み facts またはメモリだけ |
+| Smart/Search/Collection等・Remote・固定ページ一覧 | 共通の正規化 / 既存固定順を保つ |
+
+- `ListingMetaRequirements.page_count` を継続条件の `page_counts_wanted` から作り、WholeListing の
+  Planning 選別・cached 充足・target の load_page_count に渡す。全体要件は allow_page_count /
+  whole_listing_only と表示設定を越えるが、対象は `details_item_page_count_needs_fetch` だけで ZipDir は取らない。
+  ページ数だけで動画 probe・AI・作成日時・寸法を増やさず、長さ / AI だけで本を数えない。
+- proof の union / contains / without / perf と `page_count_scan_ready` に page_count を追加。
+  通常 Finished、全cache hitでtarget 0件、計画対象0件のすべてが同じ `finish_details_lazy_session` へ snapshot を渡す。
+  列見出し用の `load_all_page_counts` は既存の別経路のまま。完了時に一覧の並びを変更しない。
+- Susie の版変更と Stale は段1の破棄 → NotRequested → 新sessionの経路を使い、Cancelled にしない。
+  利用者の停止・明示再開、既存 proof 保持、membership変更時の取り直しも共通経路。
+- bundle / swap field は増やしていない。`viewer_context_registry.rs` は既存試験の requirements literal へ
+  page_count=false を足しただけ。detached 述語・viewport・実装の park / mount / drop は変更していない。
+
+### 11.4 追加・変更した試験と filter
+
+以下の37件を追加した (全件未実行)。名前の prefix は省略せず記載する。
+
+`app::tests::page_sort_883` (17件):
+
+- `page_sort_883_whole_worker_counts_hidden_books_with_all_page_displays_off`
+- `page_sort_883_stale_session_restarts_and_completes_from_current_memory`
+- `page_sort_883_requirements_pass_all_target_gates_with_badge_and_column_off`
+- `page_sort_883_planning_includes_filtered_offscreen_books_and_rejects_stale_cache`
+- `page_sort_883_cached_unavailable_zero_and_empty_listing_complete_without_worker`
+- `page_sort_883_finished_and_visible_stage_proofs_do_not_reorder_items`
+- `page_sort_883_membership_changes_retire_sessions_and_reprove_current_snapshot`
+- `page_sort_883_stop_survives_facet_rebuild_until_explicit_resume`
+- `page_sort_883_stale_susie_or_worker_event_restarts_without_false_proof_or_user_stop`
+- `page_sort_883_memory_and_worker_snapshot_match_stamp_fingerprint_and_folder_zero_size`
+- `page_sort_883_epub_sort_ignores_generation_but_scan_requires_refetch`
+- `page_sort_883_memory_preserves_unavailable_and_rejects_unchecked_or_old_pdf_credentials`
+- `page_sort_883_pending_snapshot_keeps_promised_page_fields_after_sort_change`
+- `page_sort_883_duration_and_ai_requirements_do_not_count_books`
+- `page_sort_883_requirements_algebra_keeps_page_count_independent`
+- `page_sort_883_sort_selection_and_reselection_request_worker_refresh`
+- `page_sort_883_proof_cache_and_pending_follow_context_park_mount_drop` (Windows)
+
+facts / materialize / catalog (10件):
+
+- `listing_page_count_bulk_read_preserves_identity_on_read_only_connection`
+- `listing_page_count_bulk_read_does_not_migrate_missing_tables`
+- `page_count_883_facts_match_kind_stamp_and_fingerprint_but_exclude_epub_and_password_pdf`
+- `page_count_883_materialized_memory_facts_missing_and_worker_snapshot_agree`
+- `page_count_883_materialized_stale_facts_and_absent_facts_use_only_memory`
+- `page_count_883_unavailable_memory_overrides_known_catalog_value`
+- `page_count_883_real_folder_scan_matches_details_catalog_stamp_without_known_size`
+- `page_count_883_non_page_sorts_never_read_page_memory`
+- `page_count_883_catalog_collection_skips_unwanted_and_empty_and_missing_catalog_is_empty`
+- `page_count_883_duration_and_page_catalog_facts_share_exactly_one_open`
+
+設定・UI・スタック・4行 (10件):
+
+- `page_count_sort_unknowns_last_both_directions_and_name_ties`
+- `page_count_wire_and_scan_common_live_or_saved_favorite_sort`
+- `page_count_toolbar_migration_only_extends_untouched_defaults_once`
+- `toolbar_page_count_marker_survives_db_reload_without_restoring_hidden_options`
+- `page_count_settings_roundtrip_and_older_reader_preserves_incompatible_db`
+- `page_count_picker_selected_page_count_uses_worker_reload`
+- `page_count_sort_controls_show_progress_only_for_selected_page_count`
+- `page_sort_883_stack_metadata_survives_flat_and_keeps_aggregate_missing`
+- `page_sort_883_extract_stack_parts_preserves_book_page_counts_and_folder_size`
+- `page_sort_883_arrange_compares_only_within_assigned_rows`
+
+既存試験の追従:
+
+- `duration_sort_wire_and_candidate_allowlists` は現候補14件と全wireを確認。`duration_toolbar_migration_only_extends_untouched_defaults_once`
+  は歴史的10→12の意図を保つため新PageCountを除いた12件を期待する。現在のload / marker fixtureは12→14も通す。
+- `duration_762` / `sort_hold_838` の capabilities 名、`facet_835` / registry の requirements literal は機械追従だけ。
+  長さの取得・proof・facet・停止再開の期待は変えていない。
+- listing_sort の対応表・正規化、メニュー / 各toolbar表示 / 再選択、ゲームパッド巡回、Remoteの候補とmaterialize、
+  rating / bookmarkの全候補試験をページ数へ拡張。`all_settings_fields_are_classified` は marker 1件分だけ総数 / 除外数を増やした。
+- 設計担当の関連2171件中2167成功・4失敗の報告後、コレクションpopupの3試験を16行に合わせ1093×614 logical points・UI倍率150%の全行／無効理由／初回clip検査へ更新し、600×480・360×150のscroll検査を維持、評価行の固定indexもページ数2行分を補正した (製品挙動・既定RhaiのCRLFは変更なし、修正後のcargo検証は未実施)。
+- 3件の再失敗を受け、設計担当の指示で `grid_sort_combo` の Area 初回高を計算済みviewport高＋Frame余白へ揃えた (egui既定400−枠余白14＝386では16行の最低406を収容できないため)。
+  `Popup::show` はstyle適用より前にAreaを作るので、Contextの該当themeを作成中だけ差し替え、内容callback前／閉状態／unwindで復元する。vendor・他メニューの既定・行と候補は変更なし。
+  既存3件の期待と小画面scrollを維持し、`sort_popup_actual_listing_routes_fit_all_rows_at_minimum_size_and_150_percent` (実Folder／展開／評価／bookmark、最大17行) と `sort_popup_area_height_restores_both_themes_before_contents_and_other_areas` を追加。snapshot候補は `duration_facet_bar{,_narrow}_dark` と `facet_sort{,_narrow,_edges,_edges_narrow}_dark` (現fixtureは閉状態、PNG未変更・cargo検証未実施)。
+- 設計担当の再実行2310件中2307成功・snapshot277成功後、矩形を持たないListBox役割nodeのqueryを、保持中popup IDの `memory.area_rect` 読取へ修正した。
+  600×480は400pt制約解消後に収まるので全行表示を検査し、確実に内容高を下回る360×150ではoverflow・実wheelで末尾到達・scroll後の画面内保持を検査する (今回は製品コード・PNG・既定Rhai変更なし、修正後のcargo検証未実施)。
+
+設計担当が実行する nextest filter (本作業では実行しない):
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/page_sort_883|page_count|duration|duration_762|page_badge_883|facet_835|settings_transfer::tests|fixed_sort_control|toolbar_wrap|aggregate_picker|rating_sort_click|book_and_extracted_rows|existing_sort_locks|sort_hold_838|listing_sort|ai_facet_|media_resume_meter|details_lazy_session/)'
+```
+
+既存の `duration_762` は全件を含める。UI / native / cold-cacheの実機、Susie実プール差し替え中のI/O、
+大規模本棚・入れ子書庫のperf、旧製品自体を起動する往復は未確認。
+
+### 11.5 設計との差・未確認範囲・変更ファイル
+
+機能仕様・所有境界の変更はない。既存名の wrapper と、テスト可能な1openの `FnOnce` helper を残した。
+互換試験は新旧enumの読取りと settings.db の Incompatible / 保存抑止の契約を検査する定義であり、
+旧製品による adjustment.db 全体の保護は保証しない。現行の `hydrate_favorite_view_states` には
+settingsのfavoritesに無いUUIDを掃除する別経路があるため、旧製品実行時の全保存データ保護をこの試験から推論しない。
+favorite state_json の読取自体がDBを書かないことは別に試験を追加した。
+
+変更ファイル:
+
+- 取得・走査・並び: `src/app.rs`、`src/app/duration_metadata.rs`、`src/app/folder_scan.rs`、
+  `src/app/book_materialization.rs`、`src/app/collection_navigation.rs`、`src/catalog.rs`、`src/grid_item.rs`。
+- 設定・操作: `src/settings.rs`、`src/settings_db.rs`、`src/settings_transfer.rs`、`src/settings_transfer/stage1.rs`、
+  `src/app/listing_sort.rs`、`src/ui_main.rs`、`src/app/gamepad_input.rs`。
+- producer / スタック: `src/global_search_ui.rs`、`src/global_search_ui/everything.rs`、`src/app/smart_folder.rs`、
+  `src/app/subfolder_expansion.rs`、`src/rating_view.rs`、`src/bookmark_browser.rs`、`src/remote_ipc/mod.rs`、
+  `src/remote_ipc/container.rs`、`src/collection_store/model.rs`、`src/thumb_loader.rs`、`src/filename_stack.rs`、`src/filename_stack_ui.rs`。
+- 回帰 / fixture: `src/app/tests/page_sort_883.rs`、`src/app/tests.rs`、`src/app/tests/duration_762/smart_destination.rs`、
+  `src/app/tests/facet_835/proof.rs`、`src/app/tests/sort_hold_838.rs`、`src/app/similar_navigation_tests.rs`、
+  `src/app/viewer_context_registry.rs` (既存試験のみ)。
+- 文書: 本書、`docs/media-duration-sort-filter-plan.md`、`docs/ui-responsiveness.md`、`docs/virtual-folders.md`、
+  `htdocs/mimageviewer/manual/grid.html`。
+
+UIグリフ検査は危険字形0。全体の `cargo fmt` (引数なし) と `git diff --check` は exit 0。
+コンパイル・cargoテスト・check・clippy・確認用ビルドは未実施。

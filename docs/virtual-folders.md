@@ -408,6 +408,8 @@ DB キー、catalog の保存先 hash、元書庫と cache ZIP の identity、ZI
 mtime / size と画像認識 fingerprint を identity に catalog cache へ保存する。画像のみフォルダも
 自動表示設定の ON/OFF とは独立して同じ worker / catalog 経路で判定する。
 
+通常物理フォルダのページ数順も同じ数を使い、画像フォルダは `(mtime, 0)` で照合してサイズ順の `file_size: None` を保ち、EPUB とパスワード必須 PDF の facts は使わない (詳細は [ページ数計画 §6](book-page-count-badge-plan.md#6-段-2-ページ数順の並べ替え)); 本の内部・Remote・集約一覧の順序制限は長さ順と共通にする。
+
 `Folder/Image/Video/ZipFile/PdfFile/ConvertibleArchive` は「外側」= 通常フォルダのリスト。
 `ZipImage/ZipDir/PdfPage` は「内側」= 仮想フォルダのリスト。`SearchContainer` は Ctrl+G 専用ビュー。
 同じリストに外側と内側が混在することはない。

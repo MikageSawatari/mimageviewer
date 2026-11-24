@@ -3,14 +3,17 @@ use super::*;
 use crate::app::duration_metadata::{ListingMetaRequirements, ListingMetaScanProof};
 
 const LENGTHS: ListingMetaRequirements = ListingMetaRequirements {
+    page_count: false,
     duration: true,
     ai: false,
 };
 const AI: ListingMetaRequirements = ListingMetaRequirements {
+    page_count: false,
     duration: false,
     ai: true,
 };
 const BOTH: ListingMetaRequirements = ListingMetaRequirements {
+    page_count: false,
     duration: true,
     ai: true,
 };

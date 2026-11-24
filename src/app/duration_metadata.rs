@@ -1,6 +1,8 @@
 //! Whole-listing requirements and completion belong to the metadata session.
 use super::*;
-use crate::settings::{FacetDurationPreset, ListingDuration, ListingSortMetadata};
+use crate::settings::{
+    FacetDurationPreset, LazyMetric, ListingDuration, ListingPageCount, ListingSortMetadata,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ListingMetaScanProof {
@@ -13,21 +15,25 @@ pub(crate) struct ListingMetaScanProof {
 pub(crate) struct ListingMetaRequirements {
     pub(crate) duration: bool,
     pub(crate) ai: bool,
+    pub(crate) page_count: bool,
 }
 
 impl ListingMetaRequirements {
     pub(crate) fn is_empty(self) -> bool {
-        !self.duration && !self.ai
+        !self.duration && !self.ai && !self.page_count
     }
 
     pub(crate) fn contains(self, other: Self) -> bool {
-        (!other.duration || self.duration) && (!other.ai || self.ai)
+        (!other.duration || self.duration)
+            && (!other.ai || self.ai)
+            && (!other.page_count || self.page_count)
     }
 
     pub(crate) fn union(self, other: Self) -> Self {
         Self {
             duration: self.duration || other.duration,
             ai: self.ai || other.ai,
+            page_count: self.page_count || other.page_count,
         }
     }
 
@@ -35,6 +41,7 @@ impl ListingMetaRequirements {
         Self {
             duration: self.duration && !proven.duration,
             ai: self.ai && !proven.ai,
+            page_count: self.page_count && !proven.page_count,
         }
     }
 }
@@ -49,6 +56,17 @@ impl App {
     pub(super) fn listing_may_sort_by_duration(&self) -> bool {
         self.settings
             .listing_may_sort_by_duration(self.favorite_view_states.values())
+    }
+
+    pub(super) fn listing_may_sort_by_page_count(&self) -> bool {
+        self.settings
+            .listing_may_sort_by_page_count(self.favorite_view_states.values())
+    }
+
+    /// Capture the recognition identity with the request, never on a scan worker.
+    pub(super) fn listing_page_count_facts_fingerprint(&self) -> Option<i64> {
+        self.listing_may_sort_by_page_count()
+            .then(|| folder_scan::image_folder_page_count_options(&self.settings).fingerprint)
     }
 
     // Match the destination owner before adoption, without publishing a surface change.
@@ -133,21 +151,33 @@ impl App {
         self.duration_facet_requested
             || self.settings.facet_filter.duration_preset.is_some()
             || (self.settings.sort_order.is_duration()
-                && self.listing_sort_capabilities().duration_allowed)
+                && self.listing_sort_capabilities().lazy_metric_allowed)
+    }
+
+    pub(crate) fn page_counts_wanted(&self) -> bool {
+        self.settings.sort_order.lazy_metric() == Some(LazyMetric::PageCount)
+            && self.listing_sort_capabilities().lazy_metric_allowed
     }
 
     pub(super) fn whole_listing_meta_scan_wanted(&self) -> bool {
-        self.ai_model_facet_should_load() || self.duration_lengths_wanted()
+        self.ai_model_facet_should_load()
+            || self.duration_lengths_wanted()
+            || self.page_counts_wanted()
     }
 
     pub(crate) fn duration_scan_ready(&self) -> bool {
         self.proven_listing_meta_requirements().duration
     }
 
+    pub(crate) fn page_count_scan_ready(&self) -> bool {
+        self.proven_listing_meta_requirements().page_count
+    }
+
     pub(crate) fn listing_meta_requirements(&self) -> ListingMetaRequirements {
         ListingMetaRequirements {
             duration: self.duration_lengths_wanted(),
             ai: self.ai_model_facet_should_load(),
+            page_count: self.page_counts_wanted(),
         }
     }
 
@@ -207,6 +237,10 @@ impl App {
                     serde_json::Value::from(scan.requirements.duration),
                 ),
                 ("ai", serde_json::Value::from(scan.requirements.ai)),
+                (
+                    "page_count",
+                    serde_json::Value::from(scan.requirements.page_count),
+                ),
             ],
         );
         scan.requirements.without(previous)
@@ -222,20 +256,38 @@ impl App {
     }
 
     pub(crate) fn duration_loading_text(&self) -> Option<String> {
-        if !self.duration_lengths_wanted() || self.duration_scan_ready() {
+        self.lazy_metric_loading_text(LazyMetric::Duration)
+    }
+
+    pub(crate) fn lazy_metric_loading_text(&self, metric: LazyMetric) -> Option<String> {
+        let (wanted, ready, label) = match metric {
+            LazyMetric::Duration => (
+                self.duration_lengths_wanted(),
+                self.duration_scan_ready(),
+                "長さ",
+            ),
+            LazyMetric::PageCount => (
+                self.page_counts_wanted(),
+                self.page_count_scan_ready(),
+                "ページ数",
+            ),
+        };
+        if !wanted || ready {
             return None;
         }
         match self.details_image_dims_state {
             LazyColumnState::Loading { done, total }
                 if self.details_meta_pending.as_ref().is_some_and(|p| {
-                    p.listing_meta_scan
-                        .is_some_and(|scan| scan.requirements.duration)
+                    p.listing_meta_scan.is_some_and(|scan| match metric {
+                        LazyMetric::Duration => scan.requirements.duration,
+                        LazyMetric::PageCount => scan.requirements.page_count,
+                    })
                 }) =>
             {
-                Some(format!("長さを読み込み中 {done}/{total}"))
+                Some(format!("{label}を読み込み中 {done}/{total}"))
             }
-            LazyColumnState::Cancelled => Some("長さの読み込みを停止中".to_string()),
-            _ => Some("長さを読み込み中 0/0".to_string()),
+            LazyColumnState::Cancelled => Some(format!("{label}の読み込みを停止中")),
+            _ => Some(format!("{label}を読み込み中 0/0")),
         }
     }
 
@@ -262,6 +314,107 @@ impl App {
             .filter(|value| *value != ListingDuration::Missing)
     }
 
+    /// Sorting a new listing uses the request's identity, unlike the last-value display accessor.
+    /// EPUB generation only triggers refetching; it does not invalidate a matching memory value.
+    pub(super) fn listing_page_count_for_path(
+        &self,
+        path: &Path,
+        stamp: (i64, i64),
+        fingerprint: i64,
+    ) -> Option<ListingPageCount> {
+        let key = crate::adjustment_db::normalize_path(path);
+        let meta = self.details_lazy_meta.get(&key)?;
+        if !meta.matches_source(Some(stamp))
+            || !meta.page_count_checked
+            || meta.page_count_fingerprint != fingerprint
+        {
+            return None;
+        }
+        if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf") || ext.eq_ignore_ascii_case("epub"))
+            && meta.page_count_pdf_password_revision
+                != Some(self.pdf_passwords.credential_revision(path))
+        {
+            return None;
+        }
+        Some(
+            match meta
+                .page_count
+                .filter(|&count| count > 0 && !meta.page_count_failed)
+            {
+                Some(count) => ListingPageCount::Known(count),
+                None => ListingPageCount::Unavailable,
+            },
+        )
+    }
+
+    pub(super) fn listing_metadata_snapshot(
+        &self,
+        fingerprint: i64,
+        metric: LazyMetric,
+    ) -> Arc<folder_scan::FolderListingMetadataSnapshot> {
+        let started = crate::perf::is_enabled().then(std::time::Instant::now);
+        let mut values = folder_scan::FolderListingMetadataSnapshot::default();
+        for (idx, item) in self.items.iter().enumerate() {
+            let Some((mtime, size)) = self.image_metas.get(idx).copied().flatten() else {
+                continue;
+            };
+            if metric == LazyMetric::Duration
+                && let GridItem::Video(path) | GridItem::Audio(path) = item
+            {
+                if let Some(value) = self
+                    .listing_duration_for_path(path, ListingSortMetadata::new(mtime, Some(size)))
+                {
+                    values.duration.insert(
+                        (crate::adjustment_db::normalize_path(path), mtime, size),
+                        value,
+                    );
+                }
+            } else if metric == LazyMetric::PageCount
+                && self.details_item_page_count_needs_fetch(idx)
+            {
+                let path = match item {
+                    GridItem::Folder(path)
+                    | GridItem::ZipFile(path)
+                    | GridItem::PdfFile(path)
+                    | GridItem::ConvertibleArchive { path, .. } => path,
+                    _ => continue,
+                };
+                if let Some(value) =
+                    self.listing_page_count_for_path(path, (mtime, size), fingerprint)
+                {
+                    values.page_count.insert(
+                        (crate::adjustment_db::normalize_path(path), mtime, size),
+                        value,
+                    );
+                }
+            }
+        }
+        if let Some(started) = started {
+            crate::perf::event(
+                "listing",
+                "lazy_metric_memory_snapshot",
+                None,
+                self.items_generation,
+                &[
+                    ("duration", serde_json::Value::from(values.duration.len())),
+                    (
+                        "page_count",
+                        serde_json::Value::from(values.page_count.len()),
+                    ),
+                    (
+                        "ms",
+                        serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
+        Arc::new(values)
+    }
+
+    #[cfg(test)]
     pub(super) fn listing_duration_snapshot(&self) -> Arc<folder_scan::FolderDurationSnapshot> {
         let started = crate::perf::is_enabled().then(std::time::Instant::now);
         let values = self

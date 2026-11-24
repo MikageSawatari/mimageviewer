@@ -1252,6 +1252,7 @@ impl App {
         password: Option<String>,
     ) -> Result<PhysicalHistoryPreflight, String> {
         let duration_wanted = self.listing_may_sort_by_duration();
+        let page_count_fingerprint = self.listing_page_count_facts_fingerprint();
         let duration_cache_dir = crate::catalog::default_cache_dir();
         let tree_options = crate::folder_tree::FolderTreeOptions::from_settings(&self.settings);
         let show_hidden_files = self.settings.show_hidden_files;
@@ -1314,7 +1315,7 @@ impl App {
                                 Some(worker_cancel.flag()),
                             )
                             .map(|mut scan| {
-                                super::folder_scan::collect_folder_duration_facts(&path, &mut scan, &duration_cache_dir, duration_wanted);
+                                super::folder_scan::collect_folder_listing_metadata_facts(&path, &mut scan, &duration_cache_dir, duration_wanted, page_count_fingerprint);
                                 PhysicalHistoryPreflightPayload::Folder(scan)
                             })
                             .map_err(|error| format!("フォルダを読み込めません: {error}"))

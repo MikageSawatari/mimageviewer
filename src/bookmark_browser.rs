@@ -447,7 +447,7 @@ pub fn sort_rows(rows: &mut [BookmarkBrowserRow], sort: BookmarkViewSort) {
                 .then_with(|| a.stable_key().cmp(&b.stable_key()))
         }),
         BookmarkViewSort::Normal(order) => {
-            let order = crate::app::listing_sort::without_duration_order(order);
+            let order = crate::app::listing_sort::without_lazy_metric_order(order);
             rows.sort_by(|a, b| {
                 let name_a = a.display_name();
                 let name_b = b.display_name();
@@ -1581,6 +1581,8 @@ mod tests {
         for order in [
             crate::settings::SortOrder::DurationAsc,
             crate::settings::SortOrder::DurationDesc,
+            crate::settings::SortOrder::PageCountAsc,
+            crate::settings::SortOrder::PageCountDesc,
         ] {
             let mut rows = base.clone();
             sort_rows(&mut rows, BookmarkViewSort::Normal(order));

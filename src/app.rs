@@ -28183,10 +28183,11 @@ impl App {
         listing_settings.sort_order =
             self.effective_listing_sort_order(listing_settings.sort_order);
         let duration_wanted = self.listing_may_sort_by_duration();
-        let duration_snapshot = if listing_settings.sort_order.is_duration() {
-            self.listing_duration_snapshot()
+        let page_count_fingerprint = self.listing_page_count_facts_fingerprint();
+        let metadata_snapshot = if let Some(metric) = listing_settings.sort_order.lazy_metric() {
+            self.listing_metadata_snapshot(page_count_fingerprint.unwrap_or_default(), metric)
         } else {
-            Arc::new(folder_scan::FolderDurationSnapshot::new())
+            Arc::new(folder_scan::FolderListingMetadataSnapshot::default())
         };
         let duration_cache_dir = crate::catalog::default_cache_dir();
         let baseline = self
@@ -28271,11 +28272,12 @@ impl App {
                 )
                 .ok()
                 .map(|mut scan| {
-                    folder_scan::collect_folder_duration_facts(
+                    folder_scan::collect_folder_listing_metadata_facts(
                         &worker_folder,
                         &mut scan,
                         &duration_cache_dir,
                         duration_wanted,
+                        page_count_fingerprint,
                     );
                     let signature = signature_from_scan(&scan);
                     let mut projection_scan = scan.clone_for_projection();
@@ -28285,7 +28287,7 @@ impl App {
                             .preserve_directory_sort_stamps(&mut projection_scan);
                     }
                     let materialized =
-                        folder_scan::materialize_local_folder_listing_with_order_and_duration(
+                        folder_scan::materialize_local_folder_listing_with_order_and_metadata(
                             &worker_folder,
                             projection_scan,
                             &listing_settings,
@@ -28298,12 +28300,20 @@ impl App {
                                     .map_err(|error| error.to_string())
                             },
                             |path, stamp| {
-                                duration_snapshot
+                                metadata_snapshot
+                                    .duration
                                     .get(&(
                                         crate::adjustment_db::normalize_path(path),
                                         stamp.mtime,
                                         stamp.file_size?,
                                     ))
+                                    .copied()
+                            },
+                            page_count_fingerprint.unwrap_or_default(),
+                            |path, (mtime, size)| {
+                                metadata_snapshot
+                                    .page_count
+                                    .get(&(crate::adjustment_db::normalize_path(path), mtime, size))
                                     .copied()
                             },
                         );
@@ -30221,6 +30231,7 @@ impl App {
         let show_hidden = self.settings.show_hidden_files;
         let file_type_visibility = self.settings.file_type_visibility.clone();
         let duration_wanted = self.listing_may_sort_by_duration();
+        let page_count_fingerprint = self.listing_page_count_facts_fingerprint();
         let duration_cache_dir = crate::catalog::default_cache_dir();
         let (tx, rx) = mpsc::sync_channel(1);
         if std::thread::Builder::new()
@@ -30239,11 +30250,12 @@ impl App {
                             &file_type_visibility,
                             Some(&worker_cancel),
                         )?;
-                        folder_scan::collect_folder_duration_facts(
+                        folder_scan::collect_folder_listing_metadata_facts(
                             &worker_path,
                             &mut scan,
                             &duration_cache_dir,
                             duration_wanted,
+                            page_count_fingerprint,
                         );
                         Ok(ClassifiedOpenPath {
                             rar_volume_proof: None,
@@ -32813,7 +32825,9 @@ impl App {
             }
             None => {
                 let _span = CloseNavSpan::new(CloseNavStage::MaterializeListing);
-                folder_scan::materialize_local_folder_listing_with_order_and_duration(
+                let page_count_fingerprint =
+                    folder_scan::image_page_recognition_fingerprint(&self.settings);
+                folder_scan::materialize_local_folder_listing_with_order_and_metadata(
                     &path,
                     scan,
                     &listing_settings,
@@ -32827,6 +32841,10 @@ impl App {
                             .map_err(|error| error.to_string())
                     },
                     |path, stamp| self.listing_duration_for_path(path, stamp),
+                    page_count_fingerprint,
+                    |path, stamp| {
+                        self.listing_page_count_for_path(path, stamp, page_count_fingerprint)
+                    },
                 )
             }
         };
@@ -61233,6 +61251,7 @@ impl App {
         let archive_cache_db = self.archive_cache_db.clone();
         let show_hidden_files = self.settings.show_hidden_files;
         let duration_wanted = self.listing_may_sort_by_duration();
+        let page_count_fingerprint = self.listing_page_count_facts_fingerprint();
         let duration_cache_dir = crate::catalog::default_cache_dir();
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -61468,11 +61487,12 @@ impl App {
                     }
                     match scan {
                         Ok(mut scan) => {
-                            folder_scan::collect_folder_duration_facts(
+                            folder_scan::collect_folder_listing_metadata_facts(
                                 &o.path,
                                 &mut scan,
                                 &duration_cache_dir,
                                 duration_wanted,
+                                page_count_fingerprint,
                             );
                             FolderNavScanResult::Ready(scan)
                         }
@@ -62126,6 +62146,7 @@ impl App {
         let perf_seq = self.input_seq;
         let perf_purpose = purpose.perf_tag();
         let duration_wanted = self.listing_may_sort_by_duration();
+        let page_count_fingerprint = self.listing_page_count_facts_fingerprint();
         let duration_cache_dir = crate::catalog::default_cache_dir();
         let started_at = std::time::Instant::now();
         std::thread::spawn(move || {
@@ -62146,11 +62167,12 @@ impl App {
                 )
             };
             let scan = scan.map(|mut scan| {
-                folder_scan::collect_folder_duration_facts(
+                folder_scan::collect_folder_listing_metadata_facts(
                     &scan_path,
                     &mut scan,
                     &duration_cache_dir,
                     duration_wanted,
+                    page_count_fingerprint,
                 );
                 scan
             });
@@ -75784,10 +75806,12 @@ impl App {
                 Some(GridItem::Video(_) | GridItem::Audio(_))
             );
             let ai = self.details_item_supports_ai_metadata(idx);
+            let page_count = self.details_item_page_count_needs_fetch(idx);
             if queued_visible.contains(&idx)
                 || !(self.details_item_requires_lazy_meta(idx)
                     || (requirements.duration && media)
-                    || (requirements.ai && ai))
+                    || (requirements.ai && ai)
+                    || (requirements.page_count && page_count))
             {
                 continue;
             }
@@ -75799,6 +75823,13 @@ impl App {
                 )
                 && (!requirements.duration || !media || meta.media.satisfies(self.items_generation))
                 && (!requirements.ai || !ai || meta.ai_metadata_checked)
+                && (!requirements.page_count
+                    || !page_count
+                    || self.details_page_count_meta_satisfies_idx_with_fingerprint(
+                        idx,
+                        meta,
+                        page_count_fingerprint,
+                    ))
             {
                 plan.total += 1;
                 plan.cached_done += 1;
@@ -76335,9 +76366,11 @@ impl App {
                 || visible_near.contains(&idx)
                 || self.selection_info_lazy_target_idx() == Some(idx))
             && existing_meta.is_none_or(|meta| !meta.media.satisfies(self.items_generation));
-        let load_page_count = !whole_listing_only
-            && allow_page_count
-            && self.lazy_load_page_count_for_idx(idx)
+        let whole_listing_page_count =
+            requirements.page_count && self.details_item_page_count_needs_fetch(idx);
+        let load_page_count = (whole_listing_page_count || !whole_listing_only)
+            && (whole_listing_page_count || allow_page_count)
+            && (whole_listing_page_count || self.lazy_load_page_count_for_idx(idx))
             && existing_meta.is_none_or(|meta| {
                 !self.details_page_count_meta_satisfies_idx_with_fingerprint(
                     idx,

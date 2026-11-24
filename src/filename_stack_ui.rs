@@ -4322,6 +4322,31 @@ mod tests {
     }
 
     #[test]
+    fn page_sort_883_extract_stack_parts_preserves_book_page_counts_and_folder_size() {
+        use crate::settings::ListingPageCount;
+        let items = vec![
+            GridItem::Folder(PathBuf::from(r"C:\root\photos")),
+            GridItem::ZipFile(PathBuf::from(r"C:\root\book.zip")),
+            GridItem::Image(PathBuf::from(r"C:\root\post_1.jpg")),
+        ];
+        let mut folder = ListingSortMetadata::new(7, None);
+        folder.page_count = ListingPageCount::Known(12);
+        let mut book = ListingSortMetadata::new(8, Some(30));
+        book.page_count = ListingPageCount::Known(24);
+        let image = ListingSortMetadata::new(9, Some(40));
+        let (passthrough, metas, sort_metas, media) = extract_stack_parts(
+            &items,
+            &[Some((7, 0)), Some((8, 30)), Some((9, 40))],
+            &[folder, book, image],
+        );
+        assert_eq!(passthrough.len(), 2);
+        assert_eq!(metas, [Some((7, 0)), Some((8, 30))]);
+        assert_eq!(sort_metas, [folder, book]);
+        assert_eq!(media[0].sort_meta, image);
+        assert_eq!(media[0].sort_meta.page_count, ListingPageCount::Missing);
+    }
+
+    #[test]
     fn script_grouping_scopes_keys_by_parent_for_subfolder_stack() {
         let images = vec![
             image(r"C:\root\a\scan_001.jpg"),

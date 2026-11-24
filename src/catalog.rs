@@ -245,6 +245,26 @@ pub(crate) struct VideoDurationFact {
     pub(crate) duration_secs: Option<f64>,
 }
 
+/// Stored page counts retain every component of their cache identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContainerPageCountFact {
+    pub(crate) filename: String,
+    pub(crate) kind: i64,
+    pub(crate) mtime: i64,
+    pub(crate) file_size: i64,
+    pub(crate) fingerprint: i64,
+    pub(crate) page_count: Option<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PdfPageCountFact {
+    pub(crate) filename: String,
+    pub(crate) mtime: i64,
+    pub(crate) file_size: i64,
+    pub(crate) page_count: u32,
+    pub(crate) password_required: bool,
+}
+
 /// 保存済みサムネのバイト列からヘッダのみで `(w, h)` を取り出す。
 /// フォーマットは auto-detect (`with_guessed_format`)。これは旧バージョンが JPEG で
 /// 保存していたエントリ ([`decode_thumb_to_color_image`] が "WebP or old JPEG" の
@@ -2455,6 +2475,45 @@ impl CatalogDb {
         rows.collect()
     }
 
+    /// Two read-only SELECTs; never initialize or migrate page-count tables.
+    pub(crate) fn load_listing_page_count_facts(
+        &self,
+    ) -> rusqlite::Result<(Vec<ContainerPageCountFact>, Vec<PdfPageCountFact>)> {
+        let conn = self.phase()?;
+        let mut containers = conn.prepare(
+            "SELECT filename, kind, mtime, file_size, fingerprint, page_count FROM container_page_meta",
+        )?;
+        let containers = containers
+            .query_map([], |row| {
+                let count: Option<i64> = row.get(5)?;
+                Ok(ContainerPageCountFact {
+                    filename: row.get(0)?,
+                    kind: row.get(1)?,
+                    mtime: row.get(2)?,
+                    file_size: row.get(3)?,
+                    fingerprint: row.get(4)?,
+                    page_count: count.and_then(|value| u32::try_from(value).ok()),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut pdfs = conn.prepare(
+            "SELECT filename, mtime, file_size, page_count, password_required FROM pdf_meta",
+        )?;
+        let pdfs = pdfs
+            .query_map([], |row| {
+                let count: i64 = row.get(3)?;
+                Ok(PdfPageCountFact {
+                    filename: row.get(0)?,
+                    mtime: row.get(1)?,
+                    file_size: row.get(2)?,
+                    page_count: u32::try_from(count).unwrap_or(0),
+                    password_required: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((containers, pdfs))
+    }
+
     pub fn get_video_meta(
         &self,
         filename: &str,
@@ -3316,6 +3375,102 @@ mod tests {
             ThumbnailColumns::CURRENT,
             Some('c'),
         )
+    }
+
+    #[test]
+    fn listing_page_count_bulk_read_preserves_identity_on_read_only_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("books");
+        let writer = CatalogDb::open(temp.path(), &folder).unwrap();
+        writer
+            .set_container_page_meta("images", ContainerPageKind::Folder, 12, 0, 77, Some(3))
+            .unwrap();
+        writer
+            .set_container_page_meta("book.zip", ContainerPageKind::Zip, 13, 42, 78, Some(9))
+            .unwrap();
+        writer
+            .set_container_page_meta("ordinary", ContainerPageKind::Folder, 14, 0, 77, None)
+            .unwrap();
+        writer.set_pdf_meta("book.pdf", 15, 43, 10, false).unwrap();
+        writer.set_pdf_meta("locked.pdf", 16, 44, 11, true).unwrap();
+        writer.set_pdf_meta("book.epub", 17, 45, 12, false).unwrap();
+        let reader = CatalogDb::open_existing_read_only(temp.path(), &folder)
+            .unwrap()
+            .unwrap();
+        let schema_before: i64 = reader
+            .phase()
+            .unwrap()
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        let (mut containers, mut pdfs) = reader.load_listing_page_count_facts().unwrap();
+        containers.sort_by(|a, b| a.filename.cmp(&b.filename));
+        pdfs.sort_by(|a, b| a.filename.cmp(&b.filename));
+        assert_eq!(containers.len(), 3);
+        assert_eq!(
+            containers[0],
+            ContainerPageCountFact {
+                filename: "book.zip".into(),
+                kind: ContainerPageKind::Zip as i64,
+                mtime: 13,
+                file_size: 42,
+                fingerprint: 78,
+                page_count: Some(9),
+            }
+        );
+        assert_eq!(containers[1].file_size, 0);
+        assert_eq!(containers[2].page_count, None);
+        assert_eq!(pdfs.len(), 3);
+        assert_eq!(
+            pdfs[2],
+            PdfPageCountFact {
+                filename: "locked.pdf".into(),
+                mtime: 16,
+                file_size: 44,
+                page_count: 11,
+                password_required: true,
+            }
+        );
+        assert!(
+            reader
+                .phase()
+                .unwrap()
+                .execute("DELETE FROM pdf_meta", [])
+                .is_err()
+        );
+        let schema_after: i64 = reader
+            .phase()
+            .unwrap()
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_before, schema_after);
+    }
+
+    #[test]
+    fn listing_page_count_bulk_read_does_not_migrate_missing_tables() {
+        let temp = tempfile::tempdir().unwrap();
+        for table in ["container_page_meta", "pdf_meta"] {
+            let folder = temp.path().join(table);
+            let writer = CatalogDb::open(temp.path(), &folder).unwrap();
+            writer
+                .phase()
+                .unwrap()
+                .execute_batch(&format!("DROP TABLE {table}"))
+                .unwrap();
+            let reader = CatalogDb::open_existing_read_only(temp.path(), &folder)
+                .unwrap()
+                .unwrap();
+            assert!(reader.load_listing_page_count_facts().is_err());
+            let count: i64 = writer
+                .phase()
+                .unwrap()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0);
+        }
     }
 
     #[test]

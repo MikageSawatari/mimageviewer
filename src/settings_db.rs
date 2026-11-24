@@ -9718,6 +9718,151 @@ mod tests {
     }
 
     #[test]
+    fn page_count_settings_roundtrip_and_older_reader_preserves_incompatible_db() {
+        #[derive(serde::Deserialize)]
+        enum OldSortOrder {
+            FileName,
+            FileNameDesc,
+            Numeric,
+            NumericDesc,
+            DateAsc,
+            DateDesc,
+            SizeAsc,
+            SizeDesc,
+            DurationAsc,
+            DurationDesc,
+            RatingAsc,
+            RatingDesc,
+        }
+        for order in [
+            crate::settings::SortOrder::PageCountAsc,
+            crate::settings::SortOrder::PageCountDesc,
+        ] {
+            let wire = serde_json::to_string(&order).unwrap();
+            let error = match serde_json::from_str::<OldSortOrder>(&wire) {
+                Ok(_) => panic!("old sort enum must reject page count sort"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                classify_settings_deserialization_error(error),
+                SettingsDbError::Incompatible(_)
+            ));
+        }
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            let settings = Settings {
+                sort_order: crate::settings::SortOrder::PageCountDesc,
+                ..Default::default()
+            };
+            db.save_full(&settings).unwrap();
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(loaded.sort_order, settings.sort_order);
+            assert_eq!(loaded.toolbar_sort_items, settings.toolbar_sort_items);
+            assert!(loaded.toolbar_sort_page_count_options_migrated);
+
+            db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        }
+        // Favorite view state is persisted separately from common settings.
+        let favorite_path = dir.join("adjustment.db");
+        let favorites = [
+            crate::settings::SortOrder::PageCountAsc,
+            crate::settings::SortOrder::PageCountDesc,
+        ]
+        .map(|order| {
+            let mut state = crate::settings::FavoriteViewState::from_settings(&Settings::default());
+            state.sort_order = order;
+            (uuid::Uuid::new_v4(), state)
+        });
+        {
+            let db = crate::adjustment_db::AdjustmentDb::open_at(&favorite_path).unwrap();
+            for (id, state) in &favorites {
+                db.set_favorite_view_state(*id, state).unwrap();
+            }
+        }
+        {
+            let db = crate::adjustment_db::AdjustmentDb::open_at(&favorite_path).unwrap();
+            let loaded = db.load_all_favorite_view_states();
+            for (id, state) in &favorites {
+                assert_eq!(loaded.get(id), Some(state));
+            }
+        }
+        #[derive(serde::Deserialize)]
+        struct OldFavoriteViewState {
+            #[serde(rename = "sort_order")]
+            _sort_order: OldSortOrder,
+        }
+        let before_favorites = std::fs::read(&favorite_path).unwrap();
+        {
+            let conn = rusqlite::Connection::open_with_flags(
+                &favorite_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            for (id, _) in &favorites {
+                let raw: String = conn
+                    .query_row(
+                        "SELECT state_json FROM favorite_view_states WHERE favorite_id = ?1",
+                        [id.to_string()],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let error = match serde_json::from_str::<OldFavoriteViewState>(&raw) {
+                    Ok(_) => panic!("old favorite view reader must reject page count order"),
+                    Err(error) => error,
+                };
+                assert!(matches!(
+                    classify_settings_deserialization_error(error),
+                    SettingsDbError::Incompatible(_)
+                ));
+            }
+        }
+        assert_eq!(std::fs::read(&favorite_path).unwrap(), before_favorites);
+        let before_legacy_reads = std::fs::read(dir.join("settings.db")).unwrap();
+        let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        // Use the production typed DB reader with the previous version's enum.
+        assert!(matches!(
+            read_settings_kv_typed::<OldSortOrder>(&conn, "sort_order", || OldSortOrder::FileName),
+            Err(SettingsDbError::Incompatible(_))
+        ));
+        assert!(matches!(
+            read_settings_kv_typed::<Vec<OldSortOrder>>(&conn, "toolbar_sort_items", Vec::new),
+            Err(SettingsDbError::Incompatible(_))
+        ));
+        assert_eq!(
+            std::fs::read(dir.join("settings.db")).unwrap(),
+            before_legacy_reads
+        );
+        // Exercise this build's Incompatible boot path without a historical executable.
+        conn.execute(
+            "UPDATE settings_kv SET value = '\"FuturePageCountDesc\"' WHERE key = 'sort_order'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let before_main = std::fs::read(dir.join("settings.db")).unwrap();
+        let before_backup = std::fs::read(dir.join("settings.db.bak1")).unwrap();
+        let outcome = boot_settings_db(dir);
+        assert_eq!(outcome.source, BootSource::IncompatibleSettings);
+        assert!(outcome.db.is_none());
+        assert!(save_suppressed());
+        assert_eq!(std::fs::read(dir.join("settings.db")).unwrap(), before_main);
+        assert_eq!(
+            std::fs::read(dir.join("settings.db.bak1")).unwrap(),
+            before_backup
+        );
+        assert_eq!(
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupted-"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn unknown_remote_video_encoder_is_incompatible_not_corrupted() {
         let dir = tempfile::tempdir().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();

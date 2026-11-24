@@ -1458,6 +1458,99 @@ mod tests {
     }
 
     #[test]
+    fn page_sort_883_arrange_compares_only_within_assigned_rows() {
+        use crate::settings::{
+            GridDisplayOrder, GridItemDisplayKind, ListingPageCount, ListingSortMetadata, SortOrder,
+        };
+        let input = vec![
+            GridItem::Folder(PathBuf::from(r"C:\grid\ordinary")),
+            GridItem::ZipFile(PathBuf::from(r"C:\grid\large.zip")),
+            GridItem::Folder(PathBuf::from(r"C:\grid\photos")),
+            GridItem::PdfFile(PathBuf::from(r"C:\grid\small.pdf")),
+            GridItem::Video(PathBuf::from(r"C:\grid\a.mp4")),
+            GridItem::Image(PathBuf::from(r"C:\grid\b.jpg")),
+        ];
+        let counts = [
+            ListingPageCount::Unavailable,
+            ListingPageCount::Known(20),
+            ListingPageCount::Known(10),
+            ListingPageCount::Known(10),
+            ListingPageCount::Missing,
+            ListingPageCount::Missing,
+        ];
+        for sort in [SortOrder::PageCountAsc, SortOrder::PageCountDesc] {
+            let mut items = input.clone();
+            let mut display = vec![Some((7, 0)); items.len()];
+            let mut sort_metas: Vec<_> = counts
+                .into_iter()
+                .map(|page_count| ListingSortMetadata {
+                    page_count,
+                    ..ListingSortMetadata::new(7, None)
+                })
+                .collect();
+            arrange_grid_items_with_sort_metadata(
+                &mut items,
+                &mut display,
+                &mut sort_metas,
+                &GridDisplayOrder::default(),
+                Some(sort),
+            );
+            let expected = if sort == SortOrder::PageCountAsc {
+                [
+                    "photos",
+                    "small.pdf",
+                    "large.zip",
+                    "ordinary",
+                    "a.mp4",
+                    "b.jpg",
+                ]
+            } else {
+                [
+                    "large.zip",
+                    "photos",
+                    "small.pdf",
+                    "ordinary",
+                    "a.mp4",
+                    "b.jpg",
+                ]
+            };
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| item.name().into_owned())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(
+                sort_metas
+                    .iter()
+                    .filter(|meta| meta.page_count == ListingPageCount::Known(10))
+                    .count(),
+                2
+            );
+
+            // Move images to row zero and books to row three; global count ordering
+            // must never cross the user's category assignment.
+            let order = GridDisplayOrder::from_rows([
+                vec![GridItemDisplayKind::Image],
+                vec![GridItemDisplayKind::VideoAudio],
+                vec![],
+                vec![GridItemDisplayKind::Folder, GridItemDisplayKind::Archive],
+            ]);
+            arrange_grid_items_with_sort_metadata(
+                &mut items,
+                &mut display,
+                &mut sort_metas,
+                &order,
+                Some(sort),
+            );
+            assert_eq!(items[0].name(), "b.jpg");
+            assert_eq!(items[1].name(), "a.mp4");
+            assert_eq!(items[5].name(), "ordinary");
+        }
+    }
+
+    #[test]
     fn size_arrange_keeps_categories_and_narrows_virtual_sizes_to_unknown() {
         use crate::settings::GridItemDisplayKind::{Archive, Folder, Image, VideoAudio};
         let mut items = vec![

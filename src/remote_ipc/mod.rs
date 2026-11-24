@@ -401,14 +401,17 @@ pub(super) fn parse_sort_order_wire(
     let order: crate::settings::SortOrder =
         serde_json::from_value(serde_json::Value::String(value.to_owned()))
             .map_err(|_| "並び順が正しくありません")?;
-    if order.is_duration() {
-        return Err("Remoteでは長さ順を使えません");
+    if let Some(metric) = order.lazy_metric() {
+        return Err(match metric {
+            crate::settings::LazyMetric::Duration => "Remoteでは長さ順を使えません",
+            crate::settings::LazyMetric::PageCount => "Remoteではページ数順を使えません",
+        });
     }
     Ok(order)
 }
 
 pub(super) fn remote_sort_order(order: crate::settings::SortOrder) -> crate::settings::SortOrder {
-    crate::app::listing_sort::without_duration_order(order)
+    crate::app::listing_sort::without_lazy_metric_order(order)
 }
 
 pub(super) fn remote_grid_sort_state(
@@ -420,7 +423,7 @@ pub(super) fn remote_grid_sort_state(
         options: crate::settings::SortOrder::all()
             .iter()
             .copied()
-            .filter(|order| !order.is_duration())
+            .filter(|order| order.lazy_metric().is_none())
             .map(|order| mimageviewer_ipc::RemoteGridSortOption {
                 value: sort_order_wire_value(order),
                 label: order.label().to_owned(),
@@ -985,7 +988,7 @@ mod adjustment_value_tests {
         let state = remote_grid_sort_state(crate::settings::SortOrder::DateDesc, None);
         let options = crate::settings::SortOrder::all()
             .iter()
-            .filter(|order| !order.is_duration())
+            .filter(|order| order.lazy_metric().is_none())
             .collect::<Vec<_>>();
         assert_eq!(state.options.len(), options.len());
         for (option, order) in state.options.iter().zip(options) {
@@ -1003,7 +1006,12 @@ mod adjustment_value_tests {
     #[test]
     fn remote_duration_sort_is_name_order_and_cannot_be_selected() {
         use crate::settings::SortOrder;
-        for order in [SortOrder::DurationAsc, SortOrder::DurationDesc] {
+        for order in [
+            SortOrder::DurationAsc,
+            SortOrder::DurationDesc,
+            SortOrder::PageCountAsc,
+            SortOrder::PageCountDesc,
+        ] {
             let state = remote_grid_sort_state(order, None);
             assert_eq!(state.selected, sort_order_wire_value(SortOrder::FileName));
             assert!(
