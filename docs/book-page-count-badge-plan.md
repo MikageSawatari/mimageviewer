@@ -2,9 +2,9 @@
 
 最終更新: 2026-11-24
 
-状態: 設計第3版。第1版 (`7aa5c6918`) はレビュー 1 回目で REVISE、第2版 (`5fed5048d`) はレビュー 2 回目で
-REVISE (どちらも Sol / xhigh)。第3版はその指摘を、仕組みを足すのではなく状態を減らす形で直したもので、
-まだレビューを受けていない (§9)。実装はまだしない。収録版は未定。
+状態: 設計第4版。第1版 (`7aa5c6918`)・第2版 (`5fed5048d`)・第3版 (`e6d109cbb`) は独立設計レビュー
+(Sol / xhigh) 1〜3 回目でいずれも REVISE。第2版からは、指摘を仕組みを足すのではなく状態を減らす形で直している。
+第4版は 3 回目の指摘を反映したもので、まだレビューを受けていない (§9)。実装はまだしない。収録版は未定。
 正本のバックログは [next-release-backlog.md](next-release-backlog.md) §1.883。
 
 ## 1. 目的と範囲
@@ -189,34 +189,61 @@ REVISE (どちらも Sol / xhigh)。第3版はその指摘を、仕組みを足�
 取り直しが終われば値が置き換わる。3 つの consumer が別々に判定を持たないよう、値を返す accessor を 1 つにして
 全部そこを通す (`details_page_count_value(idx) -> Option<PageCountValue>`)。
 
-今の fingerprint:
+今の fingerprint (レビュー 3 回目 P2-1 で第3版の「フレームの先頭で 1 回」をやめた):
 
-- **1 フレームに 1 回**、`App::update` のフレームの先頭 (どの viewer context の poll よりも前) の 1 か所で
-  `image_page_recognition_fingerprint` を計算し、App 全体の値として置く (viewer context の bundle には入れない。
-  入力の設定はお気に入り別の表示状態の切り替え対象ではない)。I/O はしない (Susie の `try_get_pool` は初期化を
-  始めない。レビュー 2 回目で確認)。details-meta の poll はサムネイル表示で 1 フレームに複数回呼ばれるので、
-  poll の中では計算しない。
-- job を始めるときの `DetailsPageCountConfig.fingerprint` もこの値を使う (同じフレームの中で 2 つの値が並ばない)。
+- **job が使う判定設定と fingerprint は、job を始めるときに同じ snapshot から作る**。`DetailsPageCountConfig` を
+  作るとき、設定から `image_folder_page_count_options` を作り、その中の fingerprint を `fingerprint` にも使う
+  (今は `image_page_recognition_fingerprint` と `image_folder_page_count_options` が別々に計算している。1 回の
+  計算にまとめる)。環境設定がフレームの途中で適用されても、1 つの job の中で古い fingerprint と新しい判定設定が
+  組み合わさらない。catalog へ書く fingerprint は必ずその job が数えた規則のもの。
+- 取り直しの判定に使う「今の fingerprint」は、判定を繰り返す関数 (Planning の 1 slice、
+  `details_visible_stage_needs_load`、`launch_details_meta_worker` の可視 target の選び直しなど) の呼び出しごとに
+  1 回だけ計算して、ループの中で使い回す。セルごとには計算しない。App に値を置かない (書き手と更新の時点を
+  増やさない)。計算は拡張子の列の hash だけで I/O をしない (Susie の `try_get_pool` は初期化を始めない。
+  レビュー 2 回目で確認)。
 
-取り直しが始まる経路 (新しい再開の仕組みは足さない):
+取り直しが始まる経路 (新しい再開の仕組みは足さない)。**取り直しの判定に合わなくなった値は、次に実際の取得要求が
+始まるまで最後の値のまま表示し、取得要求が始まればその範囲で取り直す**。取得要求が始まる条件は既存のまま:
 
-- **判定設定の変更**: 判定設定 (表示する種類・隠しファイル・重複の扱い・拡張子の優先度・Susie) を変えると、
-  環境設定の適用で今の一覧を読み直す (`apply_file_type_visibility_change` /
-  `reload_current_folder_preserving_override`、`ui_dialogs/preferences.rs`)。一覧の install は details-meta の
-  状態を `NotRequested` に戻すので、段階取得も詳細表示のページ数ソートの全件取得も、新しい fingerprint で
-  取り直す。取り直しは catalog を新しい fingerprint で引くので、以前その設定で数えた本でなければ数え直しになる
-  (`container_page_meta` の主キーは `(filename, kind)` で、別の fingerprint の結果は同じ行を上書きする。
-  設定を行き来すると毎回数え直す。レビュー 2 回目 P3)。
-- **ほかの窓 (detached / park 中の context)**: その窓の一覧は読み直すまで古い規則で作られたままで、ページ数も
-  それに合う古い値を表示し続ける。段階取得の範囲に入った本は、次の段階取得 (scroll・選択の変更・読み直し) で
-  新しい fingerprint で取り直す。詳細表示のページ数ソートで Ready になっている窓は、読み直すまで古い値のまま
-  並ぶ (一覧そのものが古い規則のままなので、ページ数だけ先に変えない)。context ごとに値を消して回らない。
-- **EPUB**: 変換していない EPUB を開くと変換し、本を閉じて一覧へ戻ると一覧を install し直すので世代が進み、
-  変換キャッシュから数え直す (戻りで install し直すことは実装時に確かめる)。一覧を表示したまま別の経路
-  (Remote など) で変換・再変換・変換キャッシュの削除が起きた場合は、その一覧の世代が進む操作 (最新の情報に
-  更新・開き直し・一覧内の削除など) の後に取り直す。それまでは最後に数えた値 (または無し) を出す。
-- 世代が進むたびに EPUB は取り直すが、取り直しは変換キャッシュの解決 (stat と DB) と catalog の SELECT だけで、
-  その間も最後の値を表示するのでバッジは消えない。EPUB 以外は世代で取り直さない。
+- サムネイル表示の段階取得と、詳細表示の可視範囲の段階取得は、Ready の間も毎フレーム
+  `details_visible_stage_needs_load` で範囲内の未充足を見ている。fingerprint や EPUB の世代が合わなくなれば、
+  範囲が変わらなくても次の段階取得が始まり、範囲内を取り直す (レビュー 3 回目 P3 の確認どおり)。ほかの窓
+  (detached / park 中の context) も、その窓の poll が回れば同じ。
+- 詳細表示のページ数ソート (一覧全体の取得) が Ready の間は、可視範囲の自動の取り直しの対象外 (既存)。一覧の
+  install・利用者の更新など、次に全件の取得が始まるときに取り直す。それまでは最後の値で並ぶ。選択情報の対象が
+  未充足なら、その 1 件だけ VisibleStage で取り直す (既存)。
+- 一覧の install は details-meta の状態を `NotRequested` に戻すので、どの表示でも取り直しが始まる。
+
+fingerprint が変わる場面と、その後の流れ:
+
+- **環境設定の適用で判定設定を変えたとき** (表示する種類・隠しファイル・重複の扱い・拡張子の優先度・Susie の
+  ON/OFF): 環境設定の適用が今の一覧を読み直す (`apply_file_type_visibility_change` /
+  `reload_current_folder_preserving_override`、`ui_dialogs/preferences.rs`)。install で取り直しが始まる。
+- **「プラグインを再読み込み」ボタン** (`ui_dialogs/preferences/pages.rs`) と、**起動時の Susie のプールの非同期の
+  差し替え** (`susie_loader::init_pool`。空のプールで先に動き、作り終えたプールへ差し替える): どちらも一覧を
+  読み直さない (レビュー 3 回目 P2-3)。一覧の中身も読み直すまで古い規則のままなので、ページ数だけ揃えるための
+  読み直しは足さない。上の規則どおり、段階取得の範囲内は次の段階取得で新しい fingerprint で取り直し、範囲外と
+  詳細表示のページ数ソートは次の取得要求まで最後の値を出す。
+  - 起動時の差し替えの前に数えた本は、差し替えの後にもう一度数える (catalog の行は fingerprint ごとに上書きされる
+    ので、次の起動でも差し替えの前後で 1 回ずつ数え直す)。Susie を有効にしている利用者で、起動直後の数百 ms の
+    間に範囲へ入った本だけに起きる費用で、詳細表示のページ数列では今も同じことが起きている。プールを待つ状態は
+    足さない (待つ間に段階取得が空回りしないよう別の状態が要るため)。perf の `page_counted` で件数を確かめる。
+- ネイティブ対応の拡張子の追加と、拡張子の優先度の起動時の補完は、起動時の処理なので実行中の一覧の読み直しは
+  要らない (レビュー 3 回目で確認)。
+- 判定設定を行き来すると、catalog は新しい fingerprint で引くので数え直しになる (`container_page_meta` の主キーは
+  `(filename, kind)` で、別の fingerprint の結果は同じ行を上書きする。レビュー 2 回目 P3)。
+
+EPUB:
+
+- 変換していない EPUB を開くと変換する。本を閉じて親の物理フォルダへ戻るときは親への `Direct` で一覧を install
+  し直す (`app/close_return.rs`。レビュー 3 回目で確認) ので、世代が進み、変換キャッシュから数え直す。
+  独立した別の窓で開いて閉じた場合は、元の窓の一覧と世代はそのまま (既存の挙動、`close_return_tests.rs`) で、
+  次の取得要求まで最後の値 (未変換のときは無し) を出す。
+- 一覧を表示したまま別の経路 (Remote など) で変換・再変換・変換キャッシュの削除が起きた場合も、その一覧の
+  世代が進み、次の取得要求が始まったときに取り直す。世代は一覧内の削除などで install せずに進むこともあり、
+  そのときも段階取得の範囲内の EPUB は次の段階取得で取り直す。
+- 取り直しは変換キャッシュの解決 (stat と DB) と catalog の SELECT だけで、その間も最後の値を表示するので
+  バッジは消えない。同じ世代の中では繰り返さない。EPUB 以外は世代で取り直さない。
 
 詳細表示のページ数列・選択情報も同じ accessor と判定を通るので、以前からの同じ問題もあわせて直る。
 永続データは変わらない (メモリの構造だけ)。
@@ -325,9 +352,14 @@ fn thumbnail_page_count_enabled(&self) -> bool {
   (`ZipTree::page_count_for_prefix_str` → `total_image_count`)。同じ target は Planning・worker 起動時の
   `initial_priority_targets`・選択行の slice ごとの再作成で何度も作られ、計測の区間 (`target_scan_slice`) にも
   全部は入っていない (レビュー 1 回目 P2-3、2 回目 P2-3)。**上限の議論と計測を足すのではなく、集計そのものを
-  UI スレッドから無くす**: `ZipTree::build` (木は作った後に変更されず `Arc` で共有される) で各ノードの
-  部分木の画像数を一度だけ数えて持たせ、`page_count_for_prefix_str` はノードを探して値を読むだけにする
-  (費用は prefix の深さ)。木を作る費用はノード数に比例して一度だけ増える。
+  UI スレッドから無くす**: 各 `ZipTreeNode` に部分木の画像数を持たせ、**木を作る 2 つの経路の両方で**、作るときに
+  一度だけ数える。
+  - `ZipTree::build` (列挙結果から作る生の木)。
+  - `ZipTree::project` / `project_node` (表示の種類で画像と子を絞った投影の木。レビュー 3 回目 P2-2)。残した
+    画像数と、作り終えた子の値を足すだけで、全体の走査は増えない。
+  - 不変条件: どちらの木も、各ノードの値が自分の部分木に残っている画像の数と一致する。木は作った後に変更されず
+    `Arc` で共有される (公開後にノードを書き換える経路は無い。レビュー 3 回目で確認)。
+  - `page_count_for_prefix_str` はノードを探して値を読むだけにする (費用は prefix の深さ)。
   - レーティング一覧などで外側 ZIP の木が無い (`zip_nav` が無い) `ZipDir` は、今と同じく値が取れずバッジを出さない。
 - 計装: 既存の `details_meta/load_done` に、ページ数の件数を足す
   (`page_targets`・`page_cache_hits`・`page_counted` を種類別 (zip / zip_nested / folder / rar / pdf / epub)・
@@ -413,10 +445,15 @@ fn thumbnail_page_count_enabled(&self) -> bool {
   ときは今の取得を保ち、本を数えない (レビュー 1 回目 P3)。可視 + 先読み範囲の外は数えない、AI facet・長さ
   facet の全体取得中も表示集合の外の本を数えない、設定の切り替えで要件を作り直す。
 - 取り直し (§4.3.1): 判定設定を変えて一覧を読み直すと新しい fingerprint で取り直し、取り直しの間も最後の値を
-  表示する (消えない)。EPUB は一覧の世代が進むと取り直し、ほかの種類は取り直さない。未変換の EPUB を開いて
-  変換し一覧へ戻るとバッジが出る。ほかの窓の値は読み直すまで変えない。表示・並べ替え・バッジが同じ accessor を
-  通る。fingerprint はフレームに 1 回だけ計算する。PDF パスワードの revision の既存テストを保つ。
-- `ZipTree`: 部分木の画像数を build で持たせ、`page_count_for_prefix_str` が再帰しない。
+  表示する (消えない)。段階取得は Ready の間に fingerprint・EPUB の世代が合わなくなると範囲内を取り直し、詳細表示の
+  ページ数ソートの Ready は次の全件の取得まで最後の値で並ぶ。EPUB は世代が進むと取り直し、同じ世代では繰り返さず、
+  ほかの種類は世代で取り直さない。未変換の EPUB を開いて変換し親のフォルダへ戻るとバッジが出る。表示・並べ替え・
+  バッジが同じ accessor を通る。PDF パスワードの revision の既存テストを保つ。
+- job の snapshot: 環境設定を同じフレームの途中で適用しても、1 つの job の判定設定と catalog へ書く fingerprint が
+  同じ snapshot から来る。`image_folder_page_count_options` と config の fingerprint が同じ値。
+- Susie: プールの差し替え (起動時・再読み込み) の後、範囲内は取り直し、範囲外は最後の値のまま。
+- `ZipTree`: `build` と `project` の両方の木で、各ノードの画像数が部分木の実数と一致する。`page_count_for_prefix_str`
+  が再帰しない。
 - 取消 (§4.4.1): RAR とフォルダの走査が job の cancel で止まり、記録も checked も立てない。
 - 値: `page_count = None`・0・失敗でバッジなし、PDF のパスワードの revision、`ZipDir` は `ZipTree` の値、
   ドライブ一覧でバッジなし。
@@ -450,4 +487,15 @@ fn thumbnail_page_count_enabled(&self) -> bool {
   - P3 「設定を戻せば記録で済む」は主キーの都合で成り立たない → 記述を直した。
   - fingerprint を App 全体に置くこと、Susie の扱い、再開ループが無いこと、Remote / MCP に独自の EPUB 変換の
     公開経路が無いことは確認された。
-- 3 回目: 未実施。
+- 3 回目 (Sol / xhigh、同じセッション、第3版 `e6d109cbb`): **REVISE**。
+  - P2-1 フレームの先頭で計算した fingerprint を job に使うと、同じフレームの途中で適用された環境設定と食い違い、
+    ZIP は食い違った fingerprint で catalog に書く。`image_folder_page_count_options` も別に計算している
+    → job の判定設定と fingerprint を同じ snapshot から作り、判定用の値は呼び出しごとに計算する形にした。
+  - P2-2 部分木の画像数は `ZipTree::project` の投影の木にも要る → 両方の経路で持たせる不変条件にした。
+  - P2-3 Susie の「プラグインを再読み込み」と起動時のプールの差し替えは一覧を読み直さない → 次の取得要求まで
+    最後の値、範囲内は自動で取り直す、と決め、起動時の数え直しの費用を書いた。
+  - P3 Ready の後の取り直しの説明が実際の条件と合わない → 「次に実際の取得要求が始まるまで最後の値」に統一した。
+  - 「取り直しの判定」と「表示する値」を分ける方針は成り立つこと、同じ fingerprint・同じ世代で EPUB を繰り返す
+    ループが無いこと、完了時の詳細の並べ直しが世代を進めないこと、AI / 長さの全件取得と facet に干渉しないこと、
+    親のフォルダへ戻ると一覧を install し直すこと、は確認された。
+- 4 回目: 未実施。
