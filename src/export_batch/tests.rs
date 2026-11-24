@@ -52,6 +52,112 @@ fn completed_paths(events: &[ExportEvent]) -> Vec<PathBuf> {
 #[test]
 fn legacy_all_format_scale_combinations_preserve_bytes_and_names() {
     use crate::capture::CaptureFormat;
+    use sha2::Digest;
+
+    // Fixed output hashes from books::write_composited_page at commit 2e8686a2d,
+    // using the fixture below (Cw90, Black matte, default bake stage, no RAW).
+    const BASELINES: [(CaptureFormat, ExportScale, &str); 20] = [
+        (
+            CaptureFormat::Png,
+            ExportScale::Full,
+            "0d9092e4f6333a59f6aca900d1492de812ddccb360cec9db0571a472cc7ff397",
+        ),
+        (
+            CaptureFormat::Png,
+            ExportScale::Half,
+            "7b52b7d0e2d822d0582fc0c23601e796bc159d976889ada3fa08f111bc84a843",
+        ),
+        (
+            CaptureFormat::Png,
+            ExportScale::Quarter,
+            "df03ef8e47d656b558db5c46e929f765c6d899e465e132a5261099c99274b0c3",
+        ),
+        (
+            CaptureFormat::Png,
+            ExportScale::LongEdge(256),
+            "356f2e05fac8c82d1c772b94c5027355e6403e54177ab2382e471741f6782740",
+        ),
+        (
+            CaptureFormat::Png,
+            ExportScale::LongEdge(4096),
+            "0d9092e4f6333a59f6aca900d1492de812ddccb360cec9db0571a472cc7ff397",
+        ),
+        (
+            CaptureFormat::Jpeg95,
+            ExportScale::Full,
+            "d14af6871a8898cffc9bb187bfb4dc79cab0dc298ae1286e8cda84cafa1de49c",
+        ),
+        (
+            CaptureFormat::Jpeg95,
+            ExportScale::Half,
+            "897a523d9b6787f0fca7524fe8755352278897af23d32175226403cbeefc4f2a",
+        ),
+        (
+            CaptureFormat::Jpeg95,
+            ExportScale::Quarter,
+            "945da0d93a746f904bcb93ab384e8870d1afcd11784a2e1d6941446db104d2d3",
+        ),
+        (
+            CaptureFormat::Jpeg95,
+            ExportScale::LongEdge(256),
+            "f547daf714d3f42db8f4beb3456e1593e0cb915b224149a4028e2a1fc3517ab9",
+        ),
+        (
+            CaptureFormat::Jpeg95,
+            ExportScale::LongEdge(4096),
+            "d14af6871a8898cffc9bb187bfb4dc79cab0dc298ae1286e8cda84cafa1de49c",
+        ),
+        (
+            CaptureFormat::Jpeg85,
+            ExportScale::Full,
+            "662abe560d9cb6a979e080309196a1b0e177f22eb1929b439b1e4d102db85a24",
+        ),
+        (
+            CaptureFormat::Jpeg85,
+            ExportScale::Half,
+            "42fe2554a65d08aaea42fc55dc86452f800ff3768ace8ad79f709e3402177a9b",
+        ),
+        (
+            CaptureFormat::Jpeg85,
+            ExportScale::Quarter,
+            "116f3891b3a762a9e32910d9305f4da8fbe36a4efaee37a707061f39b0a2556a",
+        ),
+        (
+            CaptureFormat::Jpeg85,
+            ExportScale::LongEdge(256),
+            "eae2b99d6361b91b08e3eb654ea17219fc1a2878d6824cc212e2e0ff23f0f901",
+        ),
+        (
+            CaptureFormat::Jpeg85,
+            ExportScale::LongEdge(4096),
+            "662abe560d9cb6a979e080309196a1b0e177f22eb1929b439b1e4d102db85a24",
+        ),
+        (
+            CaptureFormat::Jpeg75,
+            ExportScale::Full,
+            "c23d03f1674f4b1aa314f4a131e2b82b77788035c38fa7d9a01d852aeaabdc6f",
+        ),
+        (
+            CaptureFormat::Jpeg75,
+            ExportScale::Half,
+            "0c4c5892c87c61a875dad97b6dd1ade8b345d3ecbe17b0c23355b5e09f5cb357",
+        ),
+        (
+            CaptureFormat::Jpeg75,
+            ExportScale::Quarter,
+            "877f56d2fa9b795635a3fb83d31d8e1d9e120e3706f2ae9c81cb6bd2ed40d15a",
+        ),
+        (
+            CaptureFormat::Jpeg75,
+            ExportScale::LongEdge(256),
+            "660bd1c78da43553671becbfd4bf2f95c6b8a599354d3b13e70a85282ffe7b16",
+        ),
+        (
+            CaptureFormat::Jpeg75,
+            ExportScale::LongEdge(4096),
+            "c23d03f1674f4b1aa314f4a131e2b82b77788035c38fa7d9a01d852aeaabdc6f",
+        ),
+    ];
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source.png");
     let image = image::RgbaImage::from_fn(513, 261, |x, y| {
@@ -63,72 +169,55 @@ fn legacy_all_format_scale_combinations_preserve_bytes_and_names() {
         ])
     });
     image.save(&source).unwrap();
-    for format in [
-        CaptureFormat::Png,
-        CaptureFormat::Jpeg95,
-        CaptureFormat::Jpeg85,
-        CaptureFormat::Jpeg75,
-    ] {
-        for scale in [
-            ExportScale::Full,
-            ExportScale::Half,
-            ExportScale::Quarter,
-            ExportScale::LongEdge(256),
-            ExportScale::LongEdge(4096),
-        ] {
-            let out = tempfile::tempdir_in(temp.path()).unwrap();
-            let legacy = tempfile::tempdir_in(temp.path()).unwrap();
-            let mut entries = Vec::new();
-            for _ in 0..2 {
-                let mut entry = file_item(&source, "source");
-                entry.edits.format = format;
-                entry.edits.rotation = crate::rotation_db::Rotation::Cw90;
-                entries.push(entry);
-            }
-            // Reference remains the pre-cutover books writer. Run and capture fixed
-            // output hashes in the authorized verification checkout before acceptance.
-            for (index, entry) in entries.iter().enumerate() {
-                let name = if index == 0 {
-                    format!("source_source.{}", format.extension())
-                } else {
-                    format!("source_source_1.{}", format.extension())
-                };
-                crate::books::write_composited_page(
-                    &entry.source,
-                    &entry.edits,
-                    &legacy.path().join(name),
-                    scale,
-                    None,
-                )
-                .unwrap();
-            }
-            let events = run(
-                BatchExportOptions::from_legacy(
-                    out.path().to_owned(),
-                    "<dirname>_<filename>".into(),
-                    format,
-                    scale,
-                ),
-                entries,
+    for (format, scale, expected_sha256) in BASELINES {
+        let out = tempfile::tempdir_in(temp.path()).unwrap();
+        let legacy = tempfile::tempdir_in(temp.path()).unwrap();
+        let mut entries = Vec::new();
+        for _ in 0..2 {
+            let mut entry = file_item(&source, "source");
+            entry.edits.format = format;
+            entry.edits.rotation = crate::rotation_db::Rotation::Cw90;
+            entries.push(entry);
+        }
+        // Also preserve byte-for-byte agreement with the current books writer.
+        for (index, entry) in entries.iter().enumerate() {
+            let name = if index == 0 {
+                format!("source_source.{}", format.extension())
+            } else {
+                format!("source_source_1.{}", format.extension())
+            };
+            crate::books::write_composited_page(
+                &entry.source,
+                &entry.edits,
+                &legacy.path().join(name),
+                scale,
+                None,
+            )
+            .unwrap();
+        }
+        let events = run(
+            BatchExportOptions::from_legacy(
+                out.path().to_owned(),
+                "<dirname>_<filename>".into(),
+                format,
+                scale,
+            ),
+            entries,
+        );
+        let paths = completed_paths(&events);
+        assert_eq!(paths.len(), 2, "{format:?} {scale:?}");
+        for path in paths {
+            let expected = legacy.path().join(path.file_name().unwrap());
+            assert!(expected.exists(), "filename changed: {}", path.display());
+            let reference_bytes = std::fs::read(expected).unwrap();
+            let output_bytes = std::fs::read(&path).unwrap();
+            assert_eq!(
+                format!("{:x}", sha2::Sha256::digest(&output_bytes)),
+                expected_sha256,
+                "baseline 2e8686a2d: {format:?} {scale:?} {}",
+                path.display()
             );
-            let paths = completed_paths(&events);
-            assert_eq!(paths.len(), 2, "{format:?} {scale:?}");
-            for path in paths {
-                let expected = legacy.path().join(path.file_name().unwrap());
-                assert!(expected.exists(), "filename changed: {}", path.display());
-                let reference_bytes = std::fs::read(expected).unwrap();
-                use sha2::Digest;
-                eprintln!(
-                    "legacy export reference {format:?}/{scale:?}/{} sha256={:x}",
-                    path.file_name().unwrap().to_string_lossy(),
-                    sha2::Sha256::digest(&reference_bytes)
-                );
-                assert_eq!(
-                    std::fs::read(path).unwrap(),
-                    reference_bytes,
-                    "{format:?} {scale:?}"
-                );
-            }
+            assert_eq!(output_bytes, reference_bytes, "{format:?} {scale:?}");
         }
     }
 }
@@ -456,6 +545,104 @@ fn skip_existing_never_calls_decoder_and_duplicate_gets_number() {
         std::fs::read(temp.path().join("same.png")).unwrap(),
         b"existing"
     );
+}
+
+#[test]
+fn replace_supports_long_valid_filenames_for_new_and_existing_outputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.png");
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([20, 30, 40, 255]))
+        .save(&source)
+        .unwrap();
+    let mut opts = options(temp.path());
+    opts.overwrite = OverwritePolicy::Replace;
+    opts.template = "a".repeat(241);
+    let output = temp.path().join(format!("{}.png", opts.template));
+    assert_eq!(output.file_name().unwrap().len(), 245);
+    for existing in [false, true] {
+        if existing {
+            std::fs::write(&output, b"old").unwrap();
+        }
+        let events = run(opts.clone(), vec![file_item(&source, "source")]);
+        assert_eq!(
+            completed_paths(&events),
+            vec![output.clone()],
+            "existing={existing}, events={events:#?}"
+        );
+        assert_eq!(image::image_dimensions(&output).unwrap(), (2, 2));
+        assert_eq!(
+            image::open(&output).unwrap().to_rgba8(),
+            image::open(&source).unwrap().to_rgba8()
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ExportEvent::Failed(_)))
+        );
+    }
+    assert!(std::fs::read_dir(temp.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".miv-tmp-")
+    }));
+}
+
+#[test]
+#[cfg(windows)]
+fn replace_supports_unprefixed_long_directory_for_new_and_existing_outputs() {
+    use std::os::windows::ffi::OsStrExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.png");
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([20, 30, 40, 255]))
+        .save(&source)
+        .unwrap();
+    let mut directory = temp.path().to_owned();
+    while directory.as_os_str().encode_wide().count() <= 280 {
+        directory.push("batch-export-long-path-segment");
+    }
+    assert!(directory.is_absolute());
+    assert!(!directory.to_string_lossy().starts_with(r"\\?\"));
+    std::fs::create_dir_all(&directory).unwrap();
+
+    // The pre-stage-A batch writer uses this std OpenOptions save path, without
+    // tempfile's native MoveFileExW publication. It must still support this path.
+    let reference = directory.join("books.png");
+    let entry = file_item(&source, "source");
+    crate::books::write_composited_page(
+        &entry.source,
+        &entry.edits,
+        &reference,
+        ExportScale::Full,
+        None,
+    )
+    .unwrap();
+    let reference_bytes = std::fs::read(&reference).unwrap();
+    let mut opts = options(&directory);
+    opts.overwrite = OverwritePolicy::Replace;
+    opts.template = "output".into();
+    let output = directory.join("output.png");
+    for existing in [false, true] {
+        if existing {
+            std::fs::write(&output, b"old").unwrap();
+        }
+        let events = run(opts.clone(), vec![file_item(&source, "source")]);
+        assert_eq!(
+            completed_paths(&events),
+            vec![output.clone()],
+            "existing={existing}, events={events:#?}"
+        );
+        assert_eq!(std::fs::read(&output).unwrap(), reference_bytes);
+    }
+    assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".miv-tmp-")
+    }));
 }
 
 #[test]

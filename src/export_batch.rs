@@ -545,18 +545,24 @@ fn write_output(path: &Path, bytes: &[u8], replace: bool) -> Result<(), String> 
     use std::io::Write;
     if replace {
         let parent = path.parent().ok_or("保存先フォルダがありません")?;
-        let prefix = format!(
-            "{}.miv-tmp-",
-            path.file_name().unwrap_or_default().to_string_lossy()
-        );
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        // tempfile's Windows persist calls SetFileAttributesW / MoveFileExW
+        // directly. Canonicalize the parent so both native paths retain the
+        // verbatim prefix, including when the destination does not exist yet.
+        let parent = parent.canonicalize().map_err(|e| e.to_string())?;
+        let destination = parent.join(path.file_name().ok_or("保存先のファイル名がありません")?);
         let mut tmp = tempfile::Builder::new()
-            .prefix(&prefix)
-            .tempfile_in(parent)
+            .prefix(".miv-tmp-")
+            .tempfile_in(&parent)
             .map_err(|e| e.to_string())?;
         tmp.write_all(bytes)
             .and_then(|_| tmp.flush())
             .map_err(|e| e.to_string())?;
-        tmp.persist(path).map_err(|e| e.to_string())?;
+        tmp.persist(&destination).map_err(|e| e.to_string())?;
     } else {
         let mut file = std::fs::OpenOptions::new()
             .write(true)

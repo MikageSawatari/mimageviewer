@@ -732,6 +732,41 @@ fn batch_export_dialog_edit_start_persist_reopen_and_worker_effect() {
         h.state().export_batch_dialog.as_ref().unwrap().options,
         saved
     );
+    h.get_by_label("書き出す").click();
+    h.run_steps(2);
+    assert!(h.state().export_batch_dialog.is_none());
+    let mut restored_output = None;
+    loop {
+        match h
+            .state()
+            .export_pending
+            .as_ref()
+            .unwrap()
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap()
+        {
+            ExportEvent::Completed(success) => restored_output = Some(success.path),
+            ExportEvent::Failed(error) => panic!("{}", error.message),
+            ExportEvent::AllDone => break,
+            ExportEvent::Cancelled => panic!("unexpected cancel"),
+            _ => {}
+        }
+    }
+    let restored_output = restored_output.unwrap();
+    assert_eq!(restored_output, directory.join("input_1.png"));
+    assert_eq!(image::image_dimensions(&restored_output).unwrap(), (6, 4));
+    assert_eq!(
+        image::guess_format(&std::fs::read(&restored_output).unwrap()).unwrap(),
+        image::ImageFormat::Png
+    );
+    assert_eq!(
+        std::fs::metadata(restored_output)
+            .unwrap()
+            .modified()
+            .unwrap(),
+        time
+    );
 }
 
 #[test]
