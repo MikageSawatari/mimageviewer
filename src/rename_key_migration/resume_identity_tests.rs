@@ -441,6 +441,129 @@ fn section1885_virtual_prefix_copy_and_move_restore_only_selected_rows() {
 }
 
 #[test]
+fn section1885_restore_same_source_to_two_targets_keeps_each_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let old = Path::new("C:/section1885/before/a.zip");
+    let targets = [
+        Path::new("D:/section1885/dir/a.zip"),
+        Path::new("D:/section1885/dir/a - copy.zip"),
+    ];
+    let prefix = vec!["Chapter".into(), "Inner.zip".into()];
+    let old_inner = PathBuf::from(format!("{}::inner.zip", old.display()));
+    let sources = [
+        (BookResumeKey::legacy(old), archive_pages(old, &[])),
+        (
+            BookResumeKey::legacy(&old_inner),
+            archive_pages(&old_inner, &[]),
+        ),
+        (
+            BookResumeKey::archive(old, &prefix).unwrap(),
+            archive_pages(old, &prefix),
+        ),
+    ];
+    let before = sources
+        .iter()
+        .map(|(key, pages)| record_position(temp.path(), key, pages, None, SAVED_PAGE))
+        .collect::<Vec<_>>();
+    let mappings = targets
+        .iter()
+        .flat_map(|&target| {
+            [
+                StoreCopyPathMapping::exact(old, target),
+                StoreCopyPathMapping::virtual_prefix(old, target),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let report = copy_stores_at(temp.path(), &mappings);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    for target in targets {
+        let inner = PathBuf::from(format!("{}::inner.zip", target.display()));
+        for (key, pages) in [
+            (BookResumeKey::legacy(target), archive_pages(target, &[])),
+            (BookResumeKey::legacy(&inner), archive_pages(&inner, &[])),
+            (
+                BookResumeKey::archive(target, &prefix).unwrap(),
+                archive_pages(target, &prefix),
+            ),
+        ] {
+            assert_restored(temp.path(), &key, &pages, None, SAVED_PAGE);
+        }
+    }
+    for ((key, _), position) in sources.iter().zip(before) {
+        assert_eq!(read_position(temp.path(), key), Some(position));
+    }
+}
+
+#[test]
+fn section1885_restore_same_converted_source_to_two_targets_keeps_each_identity() {
+    for extension in ["rar", "7z", "lzh", "zip"] {
+        let temp = tempfile::tempdir().unwrap();
+        let old = PathBuf::from(format!("C:/section1885/before/a.{extension}"));
+        let targets = [
+            PathBuf::from(format!("D:/section1885/dir/a.{extension}")),
+            PathBuf::from(format!("D:/section1885/dir/a - copy.{extension}")),
+        ];
+        let old_cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), &old);
+        let old_cache_inner = PathBuf::from(format!("{}::inner.zip", old_cache.display()));
+        let prefix = vec!["Chapter".into(), "Inner.zip".into()];
+        // Ordinary root and virtual-prefix rows have cache keys with logical
+        // source identities; namespaced inner-book rows use the logical key too.
+        let sources = [
+            (
+                BookResumeKey::legacy(&old_cache),
+                archive_pages(&old_cache, &[]),
+            ),
+            (
+                BookResumeKey::legacy(&old_cache_inner),
+                archive_pages(&old_cache_inner, &[]),
+            ),
+            (
+                BookResumeKey::archive(&old, &prefix).unwrap(),
+                archive_pages(&old_cache, &prefix),
+            ),
+        ];
+        let before = sources
+            .iter()
+            .map(|(key, pages)| record_position(temp.path(), key, pages, Some(&old), SAVED_PAGE))
+            .collect::<Vec<_>>();
+        let mappings = targets
+            .iter()
+            .flat_map(|target| {
+                let cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), target);
+                [
+                    StoreCopyPathMapping::exact(&old, target),
+                    StoreCopyPathMapping::virtual_prefix(&old, target),
+                    StoreCopyPathMapping::exact(&old_cache, &cache),
+                    StoreCopyPathMapping::virtual_prefix(&old_cache, &cache),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let report = copy_stores_at(temp.path(), &mappings);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        for target in targets {
+            let cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), &target);
+            let cache_inner = PathBuf::from(format!("{}::inner.zip", cache.display()));
+            for (key, pages) in [
+                (BookResumeKey::legacy(&cache), archive_pages(&cache, &[])),
+                (
+                    BookResumeKey::legacy(&cache_inner),
+                    archive_pages(&cache_inner, &[]),
+                ),
+                (
+                    BookResumeKey::archive(&target, &prefix).unwrap(),
+                    archive_pages(&cache, &prefix),
+                ),
+            ] {
+                assert_restored(temp.path(), &key, &pages, Some(&target), SAVED_PAGE);
+            }
+        }
+        for ((key, _), position) in sources.iter().zip(before) {
+            assert_eq!(read_position(temp.path(), key), Some(position));
+        }
+    }
+}
+
+#[test]
 fn section1885_converted_archive_batch_rewrites_logical_and_cache_identity_paths() {
     for extension in ["rar", "7z", "lzh", "zip"] {
         for identity_is_logical in [false, true] {

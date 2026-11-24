@@ -2382,8 +2382,6 @@ fn copy_resume_store(
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         let columns = table_columns(&tx, descriptor.table).map_err(|e| e.to_string())?;
-        // Converted books may store a cache-ZIP key and a logical-source identity.
-        // Rewrite once against the whole restore batch, not only the key's mapping.
         let pairs = mappings
             .iter()
             .map(|mapping| match mapping {
@@ -2392,8 +2390,30 @@ fn copy_resume_store(
                     (old_path.clone(), new_path.clone())
                 }
             })
-            .collect::<Vec<_>>();
-        let source_mappings = resume_source_mappings(&pairs);
+            .collect::<BTreeSet<_>>();
+        // A converted book's physical and logical paths form one candidate.
+        // Index both directions once, rather than scanning the batch per copy.
+        let mut related_pairs = BTreeMap::<_, Vec<_>>::new();
+        for pair in &pairs {
+            related_pairs
+                .entry(pair.clone())
+                .or_default()
+                .push(pair.clone());
+            let cache_pair = (
+                crate::archive_cache::cache_zip_path_for_data_dir(data_dir, &pair.0),
+                crate::archive_cache::cache_zip_path_for_data_dir(data_dir, &pair.1),
+            );
+            if pairs.contains(&cache_pair) {
+                related_pairs
+                    .entry(pair.clone())
+                    .or_default()
+                    .push(cache_pair.clone());
+                related_pairs
+                    .entry(cache_pair)
+                    .or_default()
+                    .push(pair.clone());
+            }
+        }
         let mut changed = 0;
         for mapping in mappings {
             let (old, new) = match mapping {
@@ -2402,6 +2422,15 @@ fn copy_resume_store(
                     (old_path, new_path)
                 }
             };
+            // The same source may be restored to multiple targets in this batch.
+            // Only this pair and its source/cache counterpart may rewrite this
+            // destination, including logical identities stored under cache keys.
+            let current = (old.clone(), new.clone());
+            let source_mappings = resume_source_mappings(
+                related_pairs
+                    .get(&current)
+                    .expect("every copy pair is indexed"),
+            );
             for (key, scope) in archive_resume_rows(&tx).map_err(|e| e.to_string())? {
                 if !scope.matches_source_family(old, false) {
                     continue;

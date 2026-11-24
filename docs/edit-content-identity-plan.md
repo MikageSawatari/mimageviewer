@@ -360,8 +360,9 @@ INSERT OR IGNORE INTO t (c1, c2, ...) SELECT ?new, c2, ... FROM t WHERE c1 = ?ol
 
 - `INSERT OR IGNORE` が「復元先に既存があれば既存優先」を自然に満たす。
 - 本の読書位置 (`book_resume`) は、実際に複製した宛先行の `page_identity` も同じ transaction で
-  新パスへ書き換える。Image の path / Archive・Document の container にバッチ全体の元パス・
-  予測 cache ZIP の mapping を一度適用し、entry 名・文書内ページ番号・`page` 列は変えない。
+  新パスへ書き換える。Image の path / Archive・Document の container には、その行を複製した
+  復元候補の元パス・予測 cache ZIP の mapping だけを一度適用する。同じ元から複数の宛先へ
+  復元する場合も他の宛先の mapping を使わず、entry 名・文書内ページ番号・`page` 列は変えない。
   複製元と既存優先の宛先行は触らず、既に不一致の保存行の修復や読取時の代用は行わない。
 - prefix コピーは `move_prefix` と同じく **LIKE ではなく `substr` 等値**で列挙する
   (path 中の `%` / `_` を誤爆させない)。長さ引数は SQLite では文字数なので `chars().count()`。
