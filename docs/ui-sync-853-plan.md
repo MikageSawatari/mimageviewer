@@ -1,6 +1,6 @@
 # UI スレッドに残る同期処理 3 件 (§1.861・§1.859・§1.853)
 
-状態: 設計 r2 (2026-11-24、設計レビュー r1 の指摘を反映、§5.1)。担当: 設計・検収 = ClaudeCode Opus 5.5 (ui-sync-853)、実装 = Codex GPT-6.1 Sol / high、
+状態: 設計 r3 (2026-11-24、設計レビュー r1・r2 の指摘を反映、§5.1・§5.2)。担当: 設計・検収 = ClaudeCode Opus 5.5 (ui-sync-853)、実装 = Codex GPT-6.1 Sol / high、
 独立レビュー = GPT-6.1 Sol / xhigh。ブランチ `ui-sync-853` (`G:\home\mimageviewer-uisync853`)。
 
 観測の出どころ: 下の時間はすべてサブ PC / サブ PC2 担当の perf ログ (next-release-backlog の各節)。本担当は実行時の
@@ -41,7 +41,8 @@
 - `open_recycle_bin_async` と同じ「短命の名前付き thread を 1 本立てて投げ放し」。UI は URL の検査
   (`normalize_http_url`、メモリだけ) と spawn だけを行う。
 - worker の中で COM STA を初期化してから `opener::open` を呼ぶ (`ShellExecute` は COM を使う handler に委譲し得る。
-  既存の `open_with::initialize_com_sta` (今は private) を `pub(crate)` にして共有する)。
+  既存の `open_with::initialize_com_sta` (今は private) と、その戻り値の `ComApartmentGuard` (field は private のまま) を
+  `pub(crate)` にして共有する)。
 - 共通の 1 関数 `external_links::spawn_open(target: OpenTarget, on_failure: Option<FailureSink>)` に集約し、
   `ui_helpers::open_url` / `open_external_player` / ツイートの 3 か所 / マップから呼ぶ。spawn 失敗はログ (+ マップは警告)。
 - 起動の順序・重複は保証しない (人の操作の速さでしか来ない。2 回押せば 2 回開くのは従来どおり)。
@@ -90,7 +91,7 @@
 
 | r2 の問題 | 今回の扱い |
 | --- | --- |
-| クリック時と別のクリップボードを貼り得る | **r2: 同一性は保証しない (まれな組み合わせの割り切り)**。Shell は `InvokeCommand` の中で、その時点のクリップボードを読む。クリックから読み取りまで (bind・query の時間、通常 1 秒未満) の間に利用者が別の内容をコピーした場合だけ、新しい内容が貼られる。利用者が作ったデータが失われる操作ではなく (コピーなら複製が増える、切り取りなら利用者が直前に切り取った物が移る)、通常の使い方でまず起きない。r1 の案の `GetClipboardSequenceNumber` の照合は、遅延レンダリング (Shell の query や mIV の切り取り監視の読み取りで実体化) でも番号が進み、内容が同じでも誤って断るため採らない (設計レビュー r1 P2-1)。クリック時の `IDataObject` を worker へ運んで落とし先へ渡す案は、r2 時の apartment の問題を戻すので採らない |
+| クリック時と別のクリップボードを貼り得る | **r3: 中身の照合** (設計レビュー r1 P2-1・r2 P2-1)。常駐 thread は要求を受け取った直後 (bind より前。単一実行なので待ち行列は無く、クリックから数 ms) に、クリップボードの `CF_HDROP` のパス一覧と `Preferred DropEffect` (切り取り / コピー) を読んで控える。bind・query の後、`InvokeCommand` の直前にもう一度読み、**中身**が同じかを比べる。違えば貼らずに「クリップボードの内容が変わったため貼り付けませんでした」(ログ + 通知)。遅い貼り付け先の準備中に別の物を切り取った場合 (レビュー r2 の例) は、ここで断る。遅延レンダリングで番号が進んでも中身は同じなので誤って断らない (r1 の番号照合は採らない)。読み取りは UI スレッドでは行わない。残る幅は「クリックから受付直後の読み取りまで」と「直前の読み取りから Shell の読み取りまで」の数 ms ずつで、まれな組み合わせとして割り切る。クリック時の `IDataObject` を worker へ運ぶ案は、r2 時の apartment の問題を戻すので採らない |
 | 切り取りの data object の apartment | worker は使い捨てではなく、**アプリの寿命のあいだ生きてメッセージを回す STA thread 1 本** (`shell-paste`) にする。`OleInitialize` 済みで、Shell が `OleGetClipboard` で作る包み object と、Shell の転送 thread がそれへ持つ proxy は、この thread が生きて pump している限り有効 (今の UI スレッドで呼ぶ場合と同じ条件)。mIV 自身の切り取り (`LocalCutDataObject`) は UI スレッドの apartment にあり、Shell からの `SetData` (Paste Succeeded 等) は COM が UI スレッドへ運ぶ。UI スレッドは winit の message loop で pump しているので届く。UI スレッドはこの thread を待たない (join しない) ので、互いに待つ形は生じない |
 | worker の OLE 初期化 | 上の常駐 thread の起動時に 1 回 `OleInitialize`。失敗したら以後の貼り付けを「貼り付けを開始できませんでした」で断る (ログ + 通知) |
 | 選択要求の取り違え | `PostOperationSelection` に要求番号を持たせ、貼り付けの完了が失敗のとき「自分の番号のときだけ」取り下げる。間に別の操作 (新しいフォルダの作成 `new_folder.rs:101` など) が要求を置き換えていれば何もしない。番号は `request_post_operation_selection` が一か所で振る (全 producer 共通) |
@@ -99,13 +100,15 @@
 
 - `ShellPasteService` (process 共通、App が 1 つ持つ): 初回の貼り付けで `shell-paste` thread を起こす。thread は
   `OleInitialize` → `MsgWaitForMultipleObjects` で要求の到着とメッセージの両方を待ち、到着した要求を 1 件ずつ処理する
-  (bind → query → `InvokeCommand`)。既存の `verb_shell_bind` / `verb_query_shell` / `verb_invoke` の計測は
+  (中身を控える → bind → query → 中身の再照合 → `InvokeCommand`)。既存の `verb_shell_bind` / `verb_query_shell` / `verb_invoke` の計測は
   そのまま thread 内で出る。結果は要求ごとの `mpsc::Sender` へ返し、ROOT の repaint を要求する。結果が表すのは
   **動詞の呼び出しの完了**で、転送の完了ではない (転送は Shell が別に進める。名前・ログも invocation と書く)。
 - thread は App の lock や UI が持つ資源を持たずに Shell を呼ぶ。UI から thread への起動・終了の同期の握手はしない
   (起動は spawn だけ、要求は channel と event で送る)。
-- App の受付: 1 か所の関数 `start_shell_paste(ctx, folder, origin)` に 3 入口を集める。順序は従来の同期版と同じ:
-  (ツリーだけ) 述語の再確認と本棚の拒否 → `admit_book_append_followup_mutation()` → 「貼り付け中」なら断る →
+- App の受付: 1 か所の関数 `start_shell_paste(ctx, folder, origin)` に 3 入口を集める。r3 (設計レビュー r2 P2-4):
+  読み取りだけの拒否判定を先に全部済ませ、副作用のある受付はその後にする。順序: 「貼り付け中」なら断る →
+  (ツリーだけ) 述語の再確認と本棚の拒否 (`shell_transfer_submission_admission_with`、読み取りだけ) →
+  `admit_book_append_followup_mutation()` (本への追記の取り消し記録を消す副作用あり。ここより前で断れば記録は残る) →
   先が今の実フォルダのときだけ選択要求を作る (番号を控える) → 要求を送る。
 - 同時に 1 件。`shell_paste_request: Option<ShellPasteRunning { rx, selection_id, origin, started_at, perf_seq }>`。
   実行中の 2 回目の貼り付けは「貼り付けが完了するまでお待ちください」で断る (従来は UI が止まっている間の 2 回目が
@@ -118,7 +121,8 @@
 
 - root の poll (`poll_file_organize` の隣、early return より前) で `try_recv`。
   - `Ok`: repaint を要求 (従来と同じ。貼られたファイルの一覧への反映は既存のフォルダ変更検知と選択要求が担う)。
-  - `Err`: 従来どおりログだけ + 自分の番号なら選択要求を取り下げ。
+  - `Err(ClipboardChanged)`: 通知 (上の文言) + 自分の番号なら選択要求を取り下げ。
+  - その他の `Err`: 従来どおりログだけ + 自分の番号なら選択要求を取り下げ。
   - `Disconnected` (thread の異常): ログ + 「貼り付けを完了できませんでした」+ 取り下げ。
 - 完了時に `resync_egui_modifiers_from_os` を呼ぶ (従来は同期呼び出しの直後。Shell の画面がフォーカスを取った場合の
   修飾キーの食い違いを同じく直す)。
@@ -151,7 +155,10 @@
   1 件出る、(2) 実行中の 2 回目が通知付きで断られ、実行中の整理・D&D の受付も断られる (逆に整理の実行中はツリーの
   貼り付けが断られ、Ctrl+V・一覧メニューは受け付ける)、(3) 失敗の完了で自分の選択要求だけが消え、間に実際の
   新しいフォルダの完了が置き換えた要求は残る、(4) 成功の完了で選択要求が残り repaint が出る、(5) thread の切断で通知、
-  (6) ツリーの本棚拒否・述語の拒否は従来どおり受付で起きる、(7) 選択要求の番号が全 producer で一意に振られる。
+  (6) ツリーの本棚拒否・述語の拒否は従来どおり受付で起きる、(7) 選択要求の番号が全 producer で一意に振られ、既存の
+  take / 戻しの経路で番号が保たれる、(8) 断られた 2 回目の貼り付けで本への追記の取り消し記録と revision が変わらない、
+  (9) クリップボードの中身の照合: 準備中に中身が変わると貼らずに通知、パス一覧と効果が同じなら (番号だけ進んでも) 貼る
+  (読み取りは差し替え)。
 - ignored の実 Shell テスト (一時フォルダ、設計担当が run-heavy で流す。製品は起動しない): (a) ファイルの CF_HDROP を
   クリップボードへ置いて常駐 thread で貼る、(b) **mIV の切り取り**: 別の pump する STA thread (UI 役) が既存の
   `LocalCutDataObject` 包みを `OleSetClipboard` し、常駐 thread の貼り付けの `InvokeCommand` が戻った後に、Shell からの
@@ -199,10 +206,17 @@
   (ファイル・ZIP/PDF・変換書庫・RAR の証明待ち・detached へ渡すブックマーク) は今の経路のまま。
   RAR の証明不足の分類経路、要求したファイルの選択・hydration の続き (`select_requested_file` / `DirectMedia`)、
   既定の場所の `auto_fullscreen=false`、activation の保留・Remote の延期は今の順序のまま。
-- **走査の設定の照合** (r2、設計レビュー r1 P2-3): 結果は走査に使った `FolderScanPolicy` を持ち、採用の直前に今の
-  設定から作った値と比べる。違えば (走査中に隠しファイル・種類の表示・書庫/EPUB の扱いを変えた) その結果を採らず、
-  **同じ要求 (同じ owner・request identity) のまま** resolver の worker を今の設定でもう一度出す。新しい要求としては
-  扱わない (退役・履歴・test-script の数を変えない)。設定の変更が普通の操作なので割り切りではなく構造で扱う。
+- **走査の設定の照合** (r2、設計レビュー r1 P2-3。r3 で r2 P2-2・P2-3 を反映): 結果は走査に使った `FolderScanPolicy`
+  を持つ。policy には r3 で **Susie の対応拡張子の世代** (`susie_loader` に世代番号を置き、起動時の読み込み完了と
+  `reload` で進める) を加える (走査は `is_recognized_image_ext` で live の Susie を見るため)。worker は走査の前後で
+  世代を読み、変わっていれば「混ざった」結果として扱う。
+  poll は結果を受け取ったとき、**pending を取り出す前に**今の設定から作った policy と比べる。違えば (走査中に
+  隠しファイル・種類の表示・書庫/EPUB の扱い・Susie を変えた) その結果を捨て、**同じ pending を取り出さずに**、
+  解決済みの行き先に対する「走査だけの続き」の worker を今の policy で出し、pending の受信口だけを差し替える
+  (cancel token・owner・navigation・lease・保留中の activation・診断 span・走査の段階の開始時刻はそのまま)。
+  解決・受付 (`start_startup_open_request_with_navigation` の admission) は繰り返さない。新しい要求としては扱わない
+  (退役・履歴・test-script の数を変えない)。走査の段階は最初の走査の開始から最後の結果まで続くので、ブックマークの
+  期限にも数えない。設定の変更が普通の操作なので割り切りではなく構造で扱う。
   ツリー・§1.805 の pre_scan も同じ穴を持つが、リリース済みの経路なので今回は変えず、別項目の候補として報告する。
 - **既定の場所 (A')**: `open_default_startup_target` を同期の解決・読込から、同じ resolver への「既定の場所」要求に
   変える (startup-diagnostics-plan §6.1 の typed input)。worker が `known_folders::startup_folder` (Previous は
@@ -222,6 +236,10 @@
   いたのはこの段階だけなので、利用者決定 (§0) の範囲に収まる。解決の段階 (今も非同期で、一覧を操作でき、別の
   ブックマークも選べる) は止めない。`grid_item_input_block` の `DirectNavigationScan`、`location_navigation_pending`、
   `direct_navigation_wait_overlay_delay` の経過時間の 3 か所が同じ `main_startup_scan_elapsed()` を読む。
+  この述語は要求の owner だけでなく、今投影している context が main であること (`app.rs:31180` 付近の
+  `main_folder_history_available` と同じ判定) も見る (drive jump の `drive_jump_pending` と同じ形。兄弟 context の
+  回帰は `drive_jump_tests.rs:900` に倣う)。ブックマークの期限の免除は、その pending が同じブックマークの
+  `request_id` を持つときだけ。
   既存の 400 ms の「パスを確認しています…」通知は解決の段階だけに出す (走査の段階に入っていれば出さず、待機表示に任せる)。
   detached lease のあるブックマークの待ちでは何も止めない。
 - **ブックマークの 45 秒の期限** (r2、設計レビュー r1 P2-6): `poll_bookmark_book_open` の `Resolving` の期限
@@ -265,8 +283,10 @@
 - 起動・activation・agent・ブックマークの実フォルダ: dispatch したフレームと採用のフレームで UI の同期走査が 0 回
   (§1.805 の cfg(test) 計数)。採用後の一覧・選択・履歴・カーソル復元が従来と同じ。拡張子付きの名前の実フォルダ
   (`x.zip` / `x.pdf` / `x.epub` という名前のフォルダ) と、要求した画像の親フォルダへの解決も worker で走査する。
-- 走査中の設定変更: 走査を止めた状態で隠しファイル・種類の表示・書庫/EPUB の扱いを変え、採用では古い結果を使わず
-  同じ要求のまま今の設定で走査し直す (履歴・要求数は 1 回分)。
+- 走査中の設定変更: 走査を止めた状態で隠しファイル・種類の表示・書庫/EPUB の扱い・Susie の世代を変え、採用では
+  古い結果を使わず同じ要求のまま今の設定で走査し直す (履歴・要求数・診断の終端は 1 回分、解決は繰り返さない)。
+  ブックマークで「走査が 45 秒を超える → 設定の不一致 → 走査し直し」でも取り消されない。
+- 兄弟 context: detached を投影している間は main の走査待ちで入力を止めない。
 - 段階: 解決の段階では入力を止めず (従来どおり)、走査の段階に入ると止まる。待機表示は走査が 500 ms を超えてから。
   400 ms の通知は解決の段階だけ。detached のブックマークの待ちは止めない。
 - ブックマーク: 走査の段階が 45 秒を超えても取り消されず、解決の段階の 45 秒の期限は従来どおり (時計は差し替え)。
@@ -310,3 +330,19 @@ P2×6・P3×2。設計担当がコードで照合し、すべて r2 で設計を
 
 ほか: 常駐 STA は apartment の寿命の設計として成立 (レビュー担当の所見)。切り取りの完了 `SetData` の ignored 実テストと、
 別 thread を持ち主にした Shell の画面の実機確認を足した (§2.6)。
+
+### 5.2 設計レビュー r2 (同じ担当の継続、cf1d91516、2026-11-24): REJECT
+
+r1 の P2-2・P2-4・P2-5・P3-7・P3-8 は解消と判定。新たに P2×4・P3×1。設計担当がコードで照合し、すべて r3 で直した。
+
+| 指摘 | 対応 (r3) |
+| --- | --- |
+| P2-1 準備中に別の物を切り取ると、それが貼られる (通常の操作順で起き得る) | 受付直後と呼び出し直前にクリップボードの中身 (パス一覧と切り取り/コピー) を比べ、違えば断って通知 (§2.1) |
+| P2-2 設定の不一致での出し直しが、期限・受付・診断の寿命を壊す | pending を取り出さずに、走査だけの続きで受信口を差し替える (§3.2) |
+| P2-3 policy に Susie の対応拡張子が入っていない | Susie の世代を policy に加える (§3.2) |
+| P2-4 2 回目の貼り付けを断る前に、本への追記の取り消し記録を消してしまう | 読み取りだけの拒否を先に済ませる順序に変えた (§2.2) |
+| P3-5 COM の guard の型も公開が要る | 型も `pub(crate)` に (§1.2) |
+
+実装時の注意 (レビュー担当): 述語は今投影している context が main かも見る。ブックマークの期限の免除は同じ request_id のときだけ (§3.2 に反映)。
+注: この回は `codex exec resume` のため sandbox が workspace-write で起動した (resume は sandbox を指定できない)。
+レビュー担当はファイルを変えていないと報告し、作業ツリーにも変更は無かった。
