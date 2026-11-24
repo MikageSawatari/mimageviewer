@@ -5721,18 +5721,22 @@ impl App {
         }
     }
 
-    /// A global final-cover setting is shared by every viewer context, while the geometry and
+    /// Final-cover defaults and the browser root are shared, while the geometry and
     /// interaction owners it changes are context-local. Reset parked owners in place without
     /// mounting them or cancelling unrelated workers; their navigation demand is rebound by the
     /// normal renderer after that context is mounted again.
-    pub(crate) fn invalidate_final_cover_spread_display_in_parked_contexts(&mut self) {
+    pub(crate) fn invalidate_final_cover_spread_display_in_parked_contexts(
+        &mut self,
+        change: &super::FinalCoverSharedInputChange<'_>,
+    ) {
         for id in self.viewer_contexts.table.other_ids() {
             let Some(bundle) = self.viewer_contexts.table.at_rest_mut(id) else {
                 continue;
             };
-            if bundle.final_cover_spread_preference
-                != crate::settings::FinalCoverSpreadPreference::FollowGlobal
-            {
+            if !change.affects(
+                &bundle.spread_presentation_source,
+                bundle.final_cover_spread_preference,
+            ) {
                 continue;
             }
             if bundle.spread_mode.has_cover() {
@@ -10251,7 +10255,9 @@ mod tests {
             }
         }
 
-        app.invalidate_final_cover_spread_display_in_parked_contexts();
+        app.invalidate_final_cover_spread_display_in_parked_contexts(
+            &crate::app::FinalCoverSharedInputChange::GlobalDefault,
+        );
 
         assert!(
             app.similar_panel.has_info_target_for_test(),
