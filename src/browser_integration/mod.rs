@@ -519,7 +519,19 @@ impl crate::app::App {
             )),
             _ => None,
         };
-        if let Some(event) = self.browser_integration.poll(&mut self.settings, ctx) {
+        let old_output_dir = self.settings.browser_view_output_dir.clone();
+        let event = self.browser_integration.poll(&mut self.settings, ctx);
+        if old_output_dir != self.settings.browser_view_output_dir {
+            let new_output_dir = self.settings.browser_view_output_dir.clone();
+            self.invalidate_final_cover_after_shared_input_change(
+                ctx,
+                crate::app::FinalCoverSharedInputChange::BrowserRoot {
+                    old: old_output_dir.as_deref(),
+                    new: new_output_dir.as_deref(),
+                },
+            );
+        }
+        if let Some(event) = event {
             match event {
                 Event::Changed(selection, warning) => {
                     if let Some(preferences) = self.pref_state.as_mut() {

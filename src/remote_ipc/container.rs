@@ -7071,8 +7071,8 @@ impl ContainerEngine {
         } else {
             self.cached_landscape_flags_with_read(&resolved.logical, items, read)
         };
-        let final_cover_enabled =
-            final_cover_preference.effective(reading_settings.final_cover_spread_enabled);
+        let final_cover_enabled = final_cover_preference
+            .effective(!browser_directory && reading_settings.final_cover_spread_enabled);
         let singleton_placement_enabled = singleton_placement_preference.effective(
             crate::settings::SingletonSpreadEndpointSettings {
                 first: reading_settings.singleton_spread_first_enabled,

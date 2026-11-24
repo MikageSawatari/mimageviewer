@@ -3210,13 +3210,10 @@ impl App {
                 }
             }
             if old_final_cover_spread_enabled != self.settings.final_cover_spread_enabled {
-                #[cfg(windows)]
-                self.invalidate_final_cover_spread_display_in_parked_contexts();
-                if self.final_cover_spread_preference
-                    == crate::settings::FinalCoverSpreadPreference::FollowGlobal
-                {
-                    self.invalidate_final_cover_spread_display(ctx);
-                }
+                self.invalidate_final_cover_after_shared_input_change(
+                    ctx,
+                    crate::app::FinalCoverSharedInputChange::GlobalDefault,
+                );
             }
             let first_endpoint_changed = old_singleton_spread_placement_enabled.0
                 != self.settings.singleton_spread_first_enabled;

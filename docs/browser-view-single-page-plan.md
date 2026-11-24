@@ -396,3 +396,146 @@
 - 3 回目 (`7bd6724e5`): **ACCEPT**。追加の指摘なし。master への取り込みに合意。
 - 凍結の決まりの点の言葉:「読込元の事実を一覧の所有 context とともに運び、共通の境界で表示・永続化を決める本実装は、detached の述語・viewport・窓の寿命・placement を変更しない構造的修正であり、症状パッチではない。」
 - 設計担当の検証: 関連テスト 920 件成功 (`run-heavy`、filter `browser870_|browser818|plain_folder_spread|snapshot|spread_shift|remote_reading|favorite_spread|favorite_view|set_spread|set_view_mode|persist_spread|path_key`)、`viewer_context_audit` exit 0、`cargo fmt --check` 成功。本体 lib の全件と実機は未確認。
+
+## 10. §1.884 保存先のフォルダでは「末尾に表紙を添える」の全体の既定を OFF として扱う (2026-11-24 追記)
+
+設計担当 ClaudeCode。ブランチ `browser-884-final-cover` (master `874eff456` から)。起票は [next-release-backlog.md](next-release-backlog.md) §1.884。
+
+### 10.1 観測と原因
+
+- **観測** (サブ PC2 の Claude、2026-11-24、v5.7.0 候補のインストーラ `ba81fdab0`。§1.870 の通しの確認の追加の操作): 保存先の月のフォルダに photo-a (横長)・photo-b (縦長)・photo-c (横長) を受け取った後、photo-c の窓でキー 3 (見開き 左→右 表紙あり) を押すと、左 photo-c・右 photo-a の見開きになった。photo-b の窓では左 photo-b・右 photo-a。写真は `C:\home\mimageviewer-subpc\browser870-installer\results\a3-key3-extra.jpg`・`a2-key3-spread.jpg`。
+- **原因** (コード): 表紙ありの見開きで末尾が単独になると、「末尾に表紙を添える」(`final_cover_spread_enabled`、既定 ON) が末尾のページの隣へ先頭のページを表紙として添える。実効値は `App::final_cover_spread_enabled_for_current_book` (`src/app.rs`) の 1 か所で決まり、本ごとの選択 (`final_cover_spread_preference`、`全体に従う / オン / オフ`) が `全体に従う` なら全体の設定を使う。保存先の月のフォルダも、ほかのフォルダと同じくこの値を使う。保存先は本ではなく、別々に受け取った画像の集まりなので、関係のない最初の 1 枚が表紙として添えられる。§1.870 と同じ種類の見え方 (本の規則を、本でないフォルダへ当てている)。
+- 規則どおりの動きで、ほかの組 (キー 2 で photo-b が 1 枚のまま) は、横長のページを単独で表示する既存の規則 ([spec.md](spec.md) の見開きの節) による。§1.884 の対象ではない。
+
+### 10.2 方針 (統括の案、利用者了承 2026-11-24)
+
+- 保存先のフォルダでは、この機能の**全体の既定だけ**を OFF として扱う。
+- 本ごとの選択が全体の既定に優先する順番は変えない。保存先のフォルダで本ごとに「オン」を選んだ場合は、今までどおりそれが効く。
+- 保存してある値 (環境設定の全体の値、spread.db の本ごとの選択) は書き換えない。
+
+### 10.3 変更
+
+- `final_cover_spread_enabled_for_current_book` の全体の既定を、次の 1 つの判定で決める。
+  - 今の表示が保存先のフォルダの表示なら `false`、そうでなければ `self.settings.final_cover_spread_enabled`。
+  - そのあと、今までどおり `self.final_cover_spread_preference.effective(<全体の既定>)`。抽出一覧の結果の面 (`extracted_result_surface`) が `false` を返す先頭の分岐も今までどおり。
+- 「保存先のフォルダの表示」の判定は、§1.870 の `remembers_spread_presentation` が使っている条件と同じものにする。
+  - 本の構成がページ構成を持つ場合 (`composition_owns_view_settings`) は本として扱い、保存先のフォルダの扱いにしない。
+  - それ以外で、`spread_container_key()` が `browser_directory_presentation_for_key` に当たるとき。これは §1.870 の `SpreadPresentationSource` (読み込みで運んだ事実と、保存先の根の設定) で決まり、ZIP・PDF は当たらない。
+  - 二重に書かないため、この条件を 1 つの関数 (例 `current_view_is_browser_directory`) にまとめ、`remembers_spread_presentation` とこの関数の両方から使う。
+- 実効値の利用者は、すべて `final_cover_spread_enabled_for_current_book` を通っている (描画の構成、ページめくりの束ね、需要集合など)。直接 `settings.final_cover_spread_enabled` を読む経路は、環境設定の画面・設定の保存と読み込み・Remote だけ。新しい分岐はこの関数の中だけに置く。
+
+### 10.4 先頭側・ほかの本向けの設定は変えない (判断)
+
+本ごとの表示の設定はほかに、「先頭の単ページを本来の側に置く」「末尾の単ページを本来の側に置く」(`singleton_spread_first/last_enabled`)、「表紙の次のページを単独で表示」「最終ページを単独で表示」(`page_after_cover_alone_enabled` / `last_page_alone_enabled`) がある。どれも**変えない**。
+
+- 理由: これらはページを単独にするか、単独のページをどちらの側に置くかを決めるだけで、隣り合わない 2 枚を組にしない。関係のない画像を組にするのは、末尾へ先頭を添える「末尾に表紙を添える」だけ。
+- 見開き自体は、保存先のフォルダでも利用者がその場で選べる (§1.870)。選んだ見開きの中で隣り合う 2 枚が組になるのは、利用者の選んだとおりの表示で、§1.884 の対象ではない。
+- 「最終ページを単独で表示」が ON のとき、空いた側には今まで表紙が添えられていた。保存先のフォルダでは、全体の既定が OFF になるので白い面になる (本ごとに「オン」を選んだ場合を除く)。
+
+### 10.5 表示中の切り替えと寿命
+
+- 判定の入力のうち、`spread_presentation_source`・`composition_owns_view_settings`・本ごとの選択は viewer context ごとに持ち運ばれる (§1.870 で `swap_field!`・fork・snapshot を通した)。別の窓・停めた context の値を見ない。
+- **保存先の根の設定 (`browser_view_output_dir`) と全体の値 (`final_cover_spread_enabled`) は、全 context で共有する設定**で、context ごとには持たない。§1.870 の決定どおり、根は読み込みの時点の値を覚えず、いつも今の設定から解く (`SpreadPresentationSource` の注記)。この 2 つが変わると、表示中・停めた context の実効値が、一覧を読み直さずに変わることがある。
+  - 1 回目の設計で「根を変えると一覧が読み直される」と書いたのは誤り (独立レビュー 1 回目の P2)。根の変更の完了 (`poll_browser_integration` の `Event::Changed`、`src/browser_integration/mod.rs`) は設定を反映するだけで、一覧の再読込も表紙の表示の無効化もしない。
+- そこで、この 2 つの共有の入力の変更を、**同じ 1 つの無効化の入口**に通す。
+  - 入口は、今の全体の値の変更の処理 (`src/ui_dialogs/preferences.rs` の `old_final_cover_spread_enabled` の比較の分岐) と同じ中身にする: 停めた context は `invalidate_final_cover_spread_display_in_parked_contexts`、表示中の context は本ごとの選択が `全体に従う` なら `invalidate_final_cover_spread_display`。これを 1 つの関数 (例 `invalidate_final_cover_after_shared_input_change`) にまとめ、全体の値の変更と根の変更の両方から呼ぶ。
+  - 根の変更の側は、`poll_browser_integration` で `browser_integration.poll` の前後の `settings.browser_view_output_dir` を比べ、変わったときだけ呼ぶ。処理中の取り込みの扱いなど、ほかの流れは変えない。
+- **根の変更では、無効化する context を絞る** (独立レビュー 2 回目の P2)。根の変更は今まで表示を初期化しなかったので、関係のない本 (保存先の外の PDF・ZIP・フォルダ) の表示の状態を失わせると、新しい退行になる。
+  - 対象: 本ごとの選択が `全体に従う` で、かつ `SpreadPresentationSource` が実フォルダ (`PhysicalDirectory { key }`) で、その `key` が保存先の下かどうかが、古い根と新しい根で変わる context だけ。判定は既存の `browser_view_policy::is_browser_view_directory(key, true, <根>)` を古い根・新しい根で 1 回ずつ呼んで比べる。
+  - これは実効値の完全な判定ではなく、実効値が変わり得る context の候補を、読み込みの事実と根の関係だけで選ぶもの。本の構成・抽出一覧などの条件は見ないので、候補は実効値が変わる context を必ず含む (多めに選ぶことはあっても、漏らさない)。
+  - 表示中の context と停めた context の両方に同じ判定を使う。停めた束は `spread_presentation_source` と `final_cover_spread_preference` を持っているので、束の側に新しい判定を書かずに済む。
+  - 共通の入口の関数は、「どの context を無効化するか」を引数 (全部の `全体に従う` / 根の変化で選んだもの) で受け、中の無効化の処理 (表示中は `invalidate_final_cover_spread_display`、停めた束は `invalidate_final_cover_spread_display_in_parked_contexts` と同じ中身) は 1 つにする。
+- **全体の値の変更では、今までどおり `全体に従う` の context すべてを無効化する**。実効値が本当に変わった context だけに絞ることはしない (独立レビュー 1 回目の P2 の提案を採らない。2 回目のレビューで、この範囲を今回維持することは許容された)。
+  - 理由: 停めた context の実効値を求めるには、一覧の種類 (`zip_nav`・`current_folder`)・抽出一覧・本の構成・読み込みの事実を、停めたままの束から読み直す必要がある。それは `final_cover_spread_enabled_for_current_book` と同じ判定を、束の側にもう 1 つ書くことになる (1 つの意味を 2 か所に書かない)。
+  - 今の全体の値の変更でも、単ページや表紙なしの見開きの context のように実効値の変化が表示に効かない context まで、`全体に従う` なら同じく無効化している。保存先のフォルダの context が加わるのは、この既存の扱いと同じ種類で、新しい退行ではない。
+  - 失うのは、停めた context のスクロール・パン・自由回転の位置で、環境設定で全体の値か保存先を変えたときだけ起きる。ふだんの閲覧では起きない。
+- 本ごとの選択の保存 (`set_final_cover_spread_preference_for_fullscreen`) は今のまま書く。§1.870 の「覚えない」はページ構成 (見開き・連結・向き) の話で、本ごとの選択は利用者が明示して選ぶ別の設定。方針 10.2 の「優先の順番を変えない」に合わせて、読みも書きも変えない。
+
+### 10.6 見開きメニューの表示
+
+- フルスクリーンの見開きメニューの「末尾に表紙を添える」は、選択肢の名前 (`全体に従う / オン / オフ`) と、今の選択の強調だけを出していて、実効値は出していない。保存先のフォルダで `全体に従う` が選ばれていると、全体の値が ON でも表紙は添えられない。
+- 表示は変えない。文言を足すと UI の分岐とスナップショットが増えるわりに、表紙ありの見開きを保存先のフォルダで選ぶ場面が少ない。マニュアルに「保存先のフォルダでは、全体の設定が ON でも添えない (本ごとにオンを選んだ場合を除く)」と書く。
+
+### 10.7 mIV Remote
+
+- 1 回目の設計で「Remote は保存先の月のフォルダではいつも単ページなので、表紙の処理は動かない」と書いたのは誤り (独立レビュー 1 回目の P2)。R2 が止めたのは見開きを**保存する** 3 経路で、表示の要求に `spread_mode` を明示した場合は、それが保存の値より優先される (`resolve_spread_state`、`src/remote_ipc/container.rs`)。既存のテスト (`browser870_container_tests.rs`) もこの優先を保っている。ふだんの Web の画面は `spread` を送らないが、HTTP / IPC で明示する経路は残る。
+- そこで Remote も、同じ方針で全体の既定を決める。`src/remote_ipc/container.rs` の実効値の計算 (`final_cover_preference.effective(reading_settings.final_cover_spread_enabled)`) で、同じ関数の中で既に求めている保存先の判定 (`browser_directory`、§1.870 で保存の行を無視するのに使っているもの) が真なら、全体の既定を `false` にする。本ごとの選択が優先する順番は同じ。
+- 状態も wire も増やさない。IPC の wire と PROTOCOL_VERSION は変わらない。
+- Remote は要求のたびに実効値を求めるので、根や全体の値の変更の無効化は要らない。
+
+### 10.8 永続データ
+
+- スキーマも保存する値も変えない。§1.870 と保存先の判定はどちらも未リリース (v5.7.0 で初めて出す) なので、移行は要らない。
+
+### 10.9 テスト (実装時)
+
+- 状態の検査 (`src/app/tests/browser870.rs` に足す、名前は `browser870_final_cover_` で始める):
+  - 全体 ON・本ごと `全体に従う`・保存先の月のフォルダ: 実効値が `false`。表紙ありの見開きで末尾が単独のとき、表紙が添えられない (表示の構成に `FrontCoverSupplement` が無い)。
+  - 同じ条件で、保存先の外のふつうのフォルダ: 実効値が `true` (今までどおり)。
+  - 保存先の月のフォルダで本ごと `オン`: 実効値が `true`。本ごと `オフ`: `false`。
+  - 保存先の根の下の ZIP: 実効値が全体の値に従う (ZIP は当たらない)。
+  - 本の構成がページ構成を持つ場合: 全体の値に従う。
+  - 保存先のフォルダの context と、ふつうのフォルダの context を切り替えても、それぞれの実効値が保たれる (context の入れ替え)。
+  - 全体の値・spread.db の本ごとの行が、保存先のフォルダを開いて閉じた後も変わっていない。
+  - 表示中の保存先のフォルダの context で、保存先の根を別の場所へ変える (一覧は読み直さない) と、実効値が `true` に変わり、10.5 の入口で表示の無効化が走る。根を戻すと `false` に戻り、同じく無効化が走る。
+  - 停めた context (保存先のフォルダ、`全体に従う`) がある状態で根を変えると、その束の表示の状態が無効化され、戻したときに新しい実効値で描かれる。
+  - 本ごとの選択が `オン` / `オフ` の context は、根や全体の値を変えても無効化されない (今までどおり)。
+  - 根を変えても、保存先の古い根・新しい根のどちらの下でもない context (別の窓の PDF・ZIP、保存先の外のフォルダ) は、`全体に従う` でも表示の状態 (パン・スクロール・自由回転) が保たれる。
+- Remote (`src/remote_ipc/browser870_container_tests.rs` に足す): 保存先の月のフォルダ・全体 ON・本ごと `全体に従う`・要求で `LtrCover` を明示したとき、末尾が単独でも表紙の補助が付かない。同じ要求で保存先の外のフォルダなら付く (今までどおり)。保存先の月のフォルダで本ごと `オン` なら付く。
+- 実行するのは関連の filter だけ (`browser870_|final_cover|spread_shift|plain_folder_spread` など)。本体 lib の全件は、取り込みの後に統括が流す。
+
+### 10.10 文書
+
+- [browser-integration.html](../htdocs/mimageviewer/manual/browser-integration.html)・[fullscreen.html](../htdocs/mimageviewer/manual/fullscreen.html) の「末尾に表紙を添える」・[settings.html](../htdocs/mimageviewer/manual/settings.html) の同じ行に、保存先のフォルダでは全体の設定が ON でも添えない (本ごとに「オン」を選んだ場合を除く) ことを書く。
+- [spec.md](spec.md) の該当の節にも同じことを書く。
+- 更新履歴の §1.870 の下書き (共有メモ `browser-870-changelog-draft.md`) に 1 文足す。
+
+### 10.11 凍結の決まりとの照合
+
+- 別ウィンドウの述語 (`DetachedWindowPurpose`・linked / independent)・viewport・窓の寿命・placement に触れない。
+- 変えるのは次の 3 つ。どれも §1.870 と同じく、読み込みで運んだ事実と保存先の根の設定で決まり、窓の種類を見ない。
+  - デスクトップの実効値を決める 1 つの関数 (`final_cover_spread_enabled_for_current_book`) の全体の既定。
+  - Remote の実効値の計算の全体の既定 (10.7)。要求ごとに求める値で、状態を足さない。
+  - 共有の入力 (全体の値・保存先の根) が変わったときの、表示の無効化の入口 (10.5)。既存の全体の値の変更の無効化を 1 つにまとめ、根の変更からも呼ぶ。無効化する context は、本ごとの選択と読み込みの事実で選び、窓の種類では選ばない。表示を作り直すのは、実効値が変わり得る context の表示の構成を新しい実効値で描き直すためで、症状を隠すための一括 reset ではない。
+- 症状を消す guard / delay / retry / 一括 reset / silent fallback ではない。原因 (本の規則を、本でない保存先のフォルダへ当てていた) に対応する。
+- 独立設計レビューの合意の言葉は、10.12 に記録し、[detached-rework-plan.md](detached-rework-plan.md) §11 にも足す。
+
+### 10.12 独立設計レビューの記録
+
+(設計担当が書く。実装担当は書かない。)
+
+- 1 回目 (`80da43700`、GPT-6.1 Sol / xhigh、read-only): REVISE。P2 が 3 件。
+  - P2-1: Remote は要求の `spread_mode` の明示で保存先の月のフォルダでも見開きになり、表紙の補助が付く。→ 受け入れ。10.7 を、Remote も保存先の判定で全体の既定を `false` にする形に改めた。テストを 10.9 に足した。
+  - P2-2: 保存先の根の変更は一覧を読み直さないので、実効値が変わっても表示の無効化が無い。→ 受け入れ。10.5 で、根の変更と全体の値の変更を同じ無効化の入口に通す形にした。
+  - P2-3: 全体の値の変更で、実効値の変わらない保存先の context まで無効化され、スクロール等を失う。実効値の変わった context だけにするべき。→ 採らない。理由は 10.5 (停めた束の側に同じ判定を二重に書くことになる。今の全体の値の変更も、実効値の変化が表示に効かない context まで無効化しており、同じ種類の扱い)。
+  - そのほかの判断 (唯一の所有者、共通の判定への集約、本の構成の除外、context の運搬、10.4 の各設定を変えないこと、本ごとの選択の読み書き、メニューの表示) には合意を得た。
+  - 凍結の決まりの点の言葉:「読込元の事実と現在の保存先設定から共通の実効値決定境界で全体既定を解決する本方針は、detached の述語・viewport・窓の寿命・placement を変更しない構造的修正であり、症状パッチではない。」
+- 2 回目 (`03e2e60b2`、同じ担当の続き): REVISE。
+  - P2: 根の変更で `全体に従う` の context すべてを無効化すると、保存先と関係のない PDF などの表示の状態まで失わせる。根の変更は今まで初期化しなかったので、新しい退行。→ 受け入れ。10.5 で、根の変更のときは、読み込みの事実 (実フォルダの key) が保存先の下かどうかが古い根と新しい根で変わる context だけを無効化する形にした。テストを 10.9 に足した。
+  - P3: 10.11 の変更の範囲が、Remote の計算と無効化の入口を含んでいない。→ 受け入れ。10.11 を直した。
+  - P2-1 (Remote) と、根の変更を確定のときに検知して共通の入口へ通す方針は妥当と確認された。全体の値の変更の広い無効化を今回維持することは許容された。凍結の決まりの合意の言葉は 1 回目から変わらない。
+- 3 回目 (`d0f6e47c0`、同じ担当の続き): **ACCEPT**。追加の指摘なし。根の変更のときの候補の判定は、実効値が変わり得る context を漏らさず、表示中・停めた束で共有できると確認された。凍結の決まりの合意は変わらない。[detached-rework-plan.md](detached-rework-plan.md) §11 に記録した。
+
+### 10.13 実装の記録
+
+- 変更ファイル: `src/app.rs`、`src/app/viewer_context_registry.rs`、`src/browser_integration/mod.rs`、`src/ui_dialogs/preferences.rs`、`src/remote_ipc/container.rs`、`src/app/tests/browser870.rs`、`src/remote_ipc/browser870_container_tests.rs`、`src/ui_fullscreen/initial_placement/tests.rs`、`htdocs/mimageviewer/manual/browser-integration.html`、`htdocs/mimageviewer/manual/fullscreen.html`、`htdocs/mimageviewer/manual/settings.html`、`docs/spec.md`、本書。
+- まとめた関数: `App::current_view_is_browser_directory`、`App::invalidate_final_cover_after_shared_input_change`、`FinalCoverSharedInputChange::affects`。
+- 追加テスト:
+  - `browser870_final_cover_defaults_overrides_and_rows_survive_open_close`
+  - `browser870_final_cover_zip_composition_and_extracted_keep_existing_policy`
+  - `browser870_final_cover_context_swap_preserves_each_effective_value`
+  - `browser870_final_cover_root_change_invalidates_only_affected_mounted_and_parked_contexts`
+  - `browser870_final_cover_shared_changes_preserve_explicit_preferences`
+  - `browser870_final_cover_remote_explicit_ltr_cover_respects_directory_default_and_overrides`
+- nextest filter: `test(browser870_final_cover_)`。関連回帰の filter: `test(browser870_) | test(final_cover) | test(spread_shift) | test(plain_folder_spread)`。
+- 設計担当の追記: `invalidate_final_cover_spread_display_in_parked_contexts` の引数が増えたので、`tools/viewer_context_audit/src/lib.rs` の A4 の許可リストの署名を新しい形に合わせた (停めた束を選ぶ条件を引数で受けるだけで、読み書きする束の範囲は変わらない)。
+- 設計担当の検証: 関連テスト 328 件成功 (`run-heavy`、filter `browser870_|final_cover|spread_shift|plain_folder_spread|initial_placement_parked|browser818`)、`viewer_context_audit` exit 0、`cargo fmt --check` 成功。本体 lib の全件と実機は未確認。
+
+### 10.14 独立実装レビュー (2026-11-24、GPT-6.1 Sol / xhigh、実装者とは別の会話、read-only)
+
+- 1 回目 (`92f8be392`): **ACCEPT**。P1〜P3 の指摘なし。設計 §10 への適合と、設計自体に直すべき問題が無いことを確認された。
+  - `affects` は実効値が変わり得る context を漏らさず、表示中・停めた束で同じ判定になる。明示の保存先が無いときも同じ既定の根へ解決される。
+  - 根の適用・取り込みは成功時の採用に集約され、失敗時に戻すのは環境設定の画面の下書きだけなので、`poll` の前後の比較で足りる。
+  - Remote は §1.870 の `browser_directory` をそのまま使い、wire の変更と新しい同期 I/O は無い。
+  - 追加の 6 本は §10.9 の項目を検査し、補助表紙の有無には正負の対照がある。根の変更は共通の入口の直接の呼び出しで検査しており、`poll` との接続と既定の根への遷移は静的に確認された。
+- 凍結の決まりの点の言葉:「読込元の事実と現在の共有設定から実効値と無効化対象を共通の境界で決める本実装は、detached の述語・viewport・窓の寿命・placement を変更しない構造的修正であり、症状パッチではない。」
