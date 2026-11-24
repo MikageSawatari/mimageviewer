@@ -1,6 +1,6 @@
 # UI スレッドに残る同期処理 3 件 (§1.861・§1.859・§1.853)
 
-状態: 設計 r3 (2026-11-24、設計レビュー r1・r2 の指摘を反映、§5.1・§5.2)。担当: 設計・検収 = ClaudeCode Opus 5.5 (ui-sync-853)、実装 = Codex GPT-6.1 Sol / high、
+状態: 設計 r4 (2026-11-25、§2 のクリップボードを利用者決定 §0 で確定。§1・§3 は r3 のまま実装済み)。担当: 設計・検収 = ClaudeCode Opus 5.5 (ui-sync-853)、実装 = Codex GPT-6.1 Sol / high、
 独立レビュー = GPT-6.1 Sol / xhigh。ブランチ `ui-sync-853` (`G:\home\mimageviewer-uisync853`)。
 
 観測の出どころ: 下の時間はすべてサブ PC / サブ PC2 担当の perf ログ (next-release-backlog の各節)。本担当は実行時の
@@ -18,6 +18,9 @@
   (番号は統括が master で取る)。
 - §1.859: 「断るでよい (Recommended)」。貼り付けの処理中の 2 回目は、断って通知を出す。
 - §1.861: 「案のとおり進めてください」。
+- §1.859 のクリップボードの扱い (2026-11-25、設計レビュー r3 の後に統括経由で質問): 「準備中は mIV の切り取りを断る
+  (Recommended)」。貼るのは Shell が読む時点のクリップボード。貼り付けの準備中は、mIV 自身のファイルの切り取り・
+  コピーを断って通知を出す (§2.1・§2.2、設計 r4)。
 
 ---
 
@@ -91,7 +94,7 @@
 
 | r2 の問題 | 今回の扱い |
 | --- | --- |
-| クリック時と別のクリップボードを貼り得る | **r3: 中身の照合** (設計レビュー r1 P2-1・r2 P2-1)。常駐 thread は要求を受け取った直後 (bind より前。単一実行なので待ち行列は無く、クリックから数 ms) に、クリップボードの `CF_HDROP` のパス一覧と `Preferred DropEffect` (切り取り / コピー) を読んで控える。bind・query の後、`InvokeCommand` の直前にもう一度読み、**中身**が同じかを比べる。違えば貼らずに「クリップボードの内容が変わったため貼り付けませんでした」(ログ + 通知)。遅い貼り付け先の準備中に別の物を切り取った場合 (レビュー r2 の例) は、ここで断る。遅延レンダリングで番号が進んでも中身は同じなので誤って断らない (r1 の番号照合は採らない)。読み取りは UI スレッドでは行わない。残る幅は「クリックから受付直後の読み取りまで」と「直前の読み取りから Shell の読み取りまで」の数 ms ずつで、まれな組み合わせとして割り切る。クリック時の `IDataObject` を worker へ運ぶ案は、r2 時の apartment の問題を戻すので採らない |
+| クリック時と別のクリップボードを貼り得る | **r4 (利用者決定 §0、2026-11-25)**: 貼るのは **Shell が `InvokeCommand` の中で読む時点のクリップボード**。mIV はクリップボードを読まず、照合もしない (r3 の中身の照合は撤回。CF_HDROP の無い形式・読み取りの失敗の扱いが増え続けたため、設計レビュー r3)。押してから Shell が読むまで (貼り付け先の bind・query。遅いネットワーク先では数秒) の間に**ほかのアプリ (エクスプローラー等) で**切り取った・コピーした物は、新しい物が貼られる。これは従来の同期版でも同じ (mIV が止まっている間もほかのアプリは動く)。従来なかったのは「準備中に mIV 自身で切り取る・コピーする」組み合わせだけなので、それを受付で断る: mIV のファイルの切り取り・コピーが必ず通る `invoke_shell_clipboard_verb_for_paths` (`app.rs:64455`。Ctrl+X / Ctrl+C の `invoke_shell_clipboard_verb` と、一覧の右クリックの「切り取り」「コピー」 `context_menu.rs:1802` の両方がここを通る) の先頭で、貼り付けの準備中なら「貼り付けが完了するまでお待ちください」と通知して何もしない (`reserve_clipboard_write_sequence` や `begin_local_write` より前の、読み取りだけの判定)。Windows の Shell メニューの中の「切り取り」「コピー」は OS のメニューの動詞で、ほかのアプリと同じ扱い (断らない)。画像・テキストのコピーはファイルを置かないので、貼り付けでファイルが作られることはなく、断らない。r1 の番号照合、クリック時の `IDataObject` を worker へ運ぶ案も採らない |
 | 切り取りの data object の apartment | worker は使い捨てではなく、**アプリの寿命のあいだ生きてメッセージを回す STA thread 1 本** (`shell-paste`) にする。`OleInitialize` 済みで、Shell が `OleGetClipboard` で作る包み object と、Shell の転送 thread がそれへ持つ proxy は、この thread が生きて pump している限り有効 (今の UI スレッドで呼ぶ場合と同じ条件)。mIV 自身の切り取り (`LocalCutDataObject`) は UI スレッドの apartment にあり、Shell からの `SetData` (Paste Succeeded 等) は COM が UI スレッドへ運ぶ。UI スレッドは winit の message loop で pump しているので届く。UI スレッドはこの thread を待たない (join しない) ので、互いに待つ形は生じない |
 | worker の OLE 初期化 | 上の常駐 thread の起動時に 1 回 `OleInitialize`。失敗したら以後の貼り付けを「貼り付けを開始できませんでした」で断る (ログ + 通知) |
 | 選択要求の取り違え | `PostOperationSelection` に要求番号を持たせ、貼り付けの完了が失敗のとき「自分の番号のときだけ」取り下げる。間に別の操作 (新しいフォルダの作成 `new_folder.rs:101` など) が要求を置き換えていれば何もしない。番号は `request_post_operation_selection` が一か所で振る (全 producer 共通) |
@@ -100,7 +103,7 @@
 
 - `ShellPasteService` (process 共通、App が 1 つ持つ): 初回の貼り付けで `shell-paste` thread を起こす。thread は
   `OleInitialize` → `MsgWaitForMultipleObjects` で要求の到着とメッセージの両方を待ち、到着した要求を 1 件ずつ処理する
-  (中身を控える → bind → query → 中身の再照合 → `InvokeCommand`)。既存の `verb_shell_bind` / `verb_query_shell` / `verb_invoke` の計測は
+  (bind → query → `InvokeCommand`。r4 でクリップボードの読み取り・照合は外した)。既存の `verb_shell_bind` / `verb_query_shell` / `verb_invoke` の計測は
   そのまま thread 内で出る。結果は要求ごとの `mpsc::Sender` へ返し、ROOT の repaint を要求する。結果が表すのは
   **動詞の呼び出しの完了**で、転送の完了ではない (転送は Shell が別に進める。名前・ログも invocation と書く)。
 - thread は App の lock や UI が持つ資源を持たずに Shell を呼ぶ。UI から thread への起動・終了の同期の握手はしない
@@ -121,8 +124,7 @@
 
 - root の poll (`poll_file_organize` の隣、early return より前) で `try_recv`。
   - `Ok`: repaint を要求 (従来と同じ。貼られたファイルの一覧への反映は既存のフォルダ変更検知と選択要求が担う)。
-  - `Err(ClipboardChanged)`: 通知 (上の文言) + 自分の番号なら選択要求を取り下げ。
-  - その他の `Err`: 従来どおりログだけ + 自分の番号なら選択要求を取り下げ。
+  - `Err`: 従来どおりログだけ + 自分の番号なら選択要求を取り下げ。
   - `Disconnected` (thread の異常): ログ + 「貼り付けを完了できませんでした」+ 取り下げ。
 - 完了時に `resync_egui_modifiers_from_os` を呼ぶ (従来は同期呼び出しの直後。Shell の画面がフォーカスを取った場合の
   修飾キーの食い違いを同じく直す)。
@@ -157,8 +159,9 @@
   新しいフォルダの完了が置き換えた要求は残る、(4) 成功の完了で選択要求が残り repaint が出る、(5) thread の切断で通知、
   (6) ツリーの本棚拒否・述語の拒否は従来どおり受付で起きる、(7) 選択要求の番号が全 producer で一意に振られ、既存の
   take / 戻しの経路で番号が保たれる、(8) 断られた 2 回目の貼り付けで本への追記の取り消し記録と revision が変わらない、
-  (9) クリップボードの中身の照合: 準備中に中身が変わると貼らずに通知、パス一覧と効果が同じなら (番号だけ進んでも) 貼る
-  (読み取りは差し替え)。
+  (9) r4: 貼り付けの準備中は、Ctrl+X / Ctrl+C と一覧の右クリックの「切り取り」「コピー」が通知付きで断られ、
+  クリップボードの書き込み (`reserve_clipboard_write_sequence`・`begin_local_write`・Shell の動詞) が起きない。完了後は
+  従来どおり受け付ける。画像のコピーは準備中も受け付ける。
 - ignored の実 Shell テスト (一時フォルダ、設計担当が run-heavy で流す。製品は起動しない): (a) ファイルの CF_HDROP を
   クリップボードへ置いて常駐 thread で貼る、(b) **mIV の切り取り**: 別の pump する STA thread (UI 役) が既存の
   `LocalCutDataObject` 包みを `OleSetClipboard` し、常駐 thread の貼り付けの `InvokeCommand` が戻った後に、Shell からの
@@ -364,6 +367,8 @@ r2 の P2-2・P2-3・P2-4・P3-5 は解消、P2-1 は一部解消と判定。§1
 
 §2 は判断待ちのためコードも対応文書も変更していない。コンパイル・Rust テスト・cargo fmt/check/clippy・
 ビルド・製品起動は利用者の指示により未実行。独立実装レビューは未実施。
+
+追補（2026-11-25、`79cc5bf58` 後）: 設計担当から run-heavy の関連 nextest 448 件中446件成功・2件失敗の報告を受け、コードを照合して修正した。`location_and_address_plain_physical_dispatch_scan_off_caller_and_adopt_once` は Quick Folder が有効でも未使用の `folder_nav_back_stack` を数えていたテスト前提の誤りで、`src/app/location_jump.rs` の同テストを active な履歴の参照へ変更し、slot 無し/A の両方と再 poll 後の履歴 snapshot 不変を検査する。`startup_default_specific_worker_preserves_cursor_only_at_the_same_place` の「同じ場所なら b を復元する」期待は §3.2 どおりで、実装側では App へ置いたヒントが `adopt_main_list_navigation` の `navigation.selection_after_load` 公開で上書きされていたため、`src/app/startup_ops.rs` で既定先のヒント（別の場所なら None）を採用要求自身へ渡すよう修正した。`src/app/startup_default_tests.rs` の同テストには競合する受付前ヒントを置き、置換/クリアと消費を追加検査した。再受付・新しい状態・同期 I/O は追加していない。この修正のコンパイル・Rust テストは未実行で、cargo・git の commit/stash/reset/checkout・製品起動も行っていない。
 
 | 変更ファイル | 設計節と実装内容 |
 | --- | --- |
@@ -624,3 +629,8 @@ section1335_extra_video_normal_parent_return_still_restores_parent_list
 section1335_tray_image_folder_book_direct_quit_restarts_parent_and_preserves_resume
 section1335_tray_image_folder_book_backspace_quit_restarts_explicit_book_list
 ```
+
+### 5.5 設計 r4 (2026-11-25、§2 のクリップボードのみ)
+
+利用者決定 (§0) を受けて、§2.1 の表の 1 行目・§2.2・§2.3・§2.6 の (9) を直した。r3 の中身の照合 (`ClipboardChanged`)
+は撤回し、mIV 自身のファイルの切り取り・コピーを貼り付けの準備中に断る受付 1 か所に置き換えた。§1・§3 は変えていない。
