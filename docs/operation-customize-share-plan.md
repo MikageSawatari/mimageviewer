@@ -20,7 +20,7 @@
 ### 現状 (調査結果)
 
 - 操作カスタマイズは独立ファイルではなく `settings.db` の `keymap` / `ring_shortcuts` /
-  `menu_layout` / `context_menu_layout` / `gamepad_enabled` に保存される。構造設定は
+  `menu_layout` / `context_menu_layout` / `gamepad_enabled` / `fullscreen_primary_click` に保存される。構造設定は
   `serde` + `PartialEq/Eq` 対応。
 - 操作カスタマイズダイアログの「保存」は `apply_operation_customize_state()`
   (`src/ui_dialogs/preferences.rs`) → `settings.save()` で、他設定と同じ経路。
@@ -54,6 +54,7 @@
 | `menu_layout` | `MenuLayoutSettings` | top menu 順序 / メニュー内コマンド順序 / 非表示コマンド |
 | `context_menu_layout` | `ContextMenuLayoutSettings` | Grid / Fullscreen 共通の右クリック静的項目の階層別順序 / 非表示項目 / 項目に追従する直前separator指定 |
 | `gamepad_enabled` | `bool` | ゲームパッド入力の有効 / 無効 |
+| `fullscreen_primary_click` | `FullscreenPrimaryClickMode` | 閲覧中の左クリック (`"page_turn"` = クリックでページを送る / `"double_click_close"` = クリックでは送らず、ダブルクリックで閉じる)。2026-11-24 追加 (§1.471) |
 
 - エクスポート / インポート / 差分は常にこの一式が対象。「キーだけ」の部分入出力は
   初版では作らない。
@@ -75,7 +76,8 @@
   "ring_shortcuts": { ... },
   "menu_layout": { ... },
   "context_menu_layout": { ... },
-  "gamepad_enabled": true
+  "gamepad_enabled": true,
+  "fullscreen_primary_click": "page_turn"
 }
 ```
 
@@ -85,6 +87,10 @@
   未知バージョンなら警告して可能な範囲で取り込む。
 - `app_version` は互換警告用。取り込みを拒否する材料にはしない (未知アクションは §3 の
   warn-and-skip で吸収する)。
+- 項目の追加 (2026-11-24、§1.471): `fullscreen_primary_click` を足した。`format_version` は 1 のまま
+  (欠けてよい追加項目で、古い mIV は未知の項目を無視する)。この項目の無い古いファイル・世代を
+  取り込むと既定の `page_turn` になる (`gamepad_enabled` の欠落を既定値にするのと同じ考え方)。
+  未知の値 (将来の版の値) は JSON の読み取りエラーとして取り込みを拒否し、黙って既定にしない。
 
 ## 3. 取り込み (インポート / 世代取り込み) の意味論
 
@@ -135,6 +141,15 @@
 初版はキー表を主役にし、リング/メニューは「変更あり/なし + 件数」から始めて、詳細表示は
 段階的に足す。
 
+### 単独の設定項目は変更前 → 変更後の行
+
+`gamepad_enabled` と `fullscreen_primary_click` は、キー表と同じ表に 1 行ずつ「変更前 → 変更後」で出す
+(「ゲームパッドの操作を受け付ける: オン → オフ」「閲覧中の左クリック: クリックでページを送る →
+クリックでは送らず、ダブルクリックで閉じる」)。どちらかだけが違う取り込み元でも「差分はありません」に
+ならない。`apply_to` が書く項目はすべて `diff` が比べることを、bundle の項目を 1 つずつ変えるテスト
+(`operation_diff_covers_every_applied_bundle_setting`) で固定している (2026-11-24、§1.471。それまで
+`gamepad_enabled` も比較から漏れていた)。
+
 ### 比較対象マトリクス (行/取り込み元ごとに選べる)
 
 | 対象 | vs 標準 (デフォルト) | vs 現在の設定 | vs 前世代 |
@@ -152,7 +167,7 @@
 
 - `OperationCustomizeBundle { keymap: KeymapSettings, ring_shortcuts: RingShortcutSettings,
   menu_layout: MenuLayoutSettings, context_menu_layout: ContextMenuLayoutSettings,
-  gamepad_enabled: bool }` + ヘッダ meta。`serde`。
+  gamepad_enabled: bool, fullscreen_primary_click: FullscreenPrimaryClickMode }` + ヘッダ meta。`serde`。
   - `Bundle::from_settings(&Settings) -> Bundle`
   - `Bundle::apply_to(&self, &mut Settings)` (置換)
   - `Bundle::defaults() -> Bundle`

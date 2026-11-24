@@ -485,11 +485,18 @@ pub struct OperationDiff {
     pub key_changes: Vec<KeyDiff>,
     pub ring_change_count: usize,
     pub menu_change_count: usize,
+    pub fullscreen_primary_click_change:
+        Option<(FullscreenPrimaryClickMode, FullscreenPrimaryClickMode)>,
+    pub gamepad_enabled_change: Option<(bool, bool)>,
 }
 
 impl OperationDiff {
     pub fn is_empty(&self) -> bool {
-        self.key_changes.is_empty() && self.ring_change_count == 0 && self.menu_change_count == 0
+        self.key_changes.is_empty()
+            && self.ring_change_count == 0
+            && self.menu_change_count == 0
+            && self.fullscreen_primary_click_change.is_none()
+            && self.gamepad_enabled_change.is_none()
     }
 }
 
@@ -529,6 +536,10 @@ pub fn diff(a: &OperationCustomizeBundle, b: &OperationCustomizeBundle) -> Opera
         ring_change_count: structured_change_count(&a.ring_shortcuts, &b.ring_shortcuts),
         menu_change_count: structured_change_count(&a.menu_layout, &b.menu_layout)
             + structured_change_count(&a.context_menu_layout, &b.context_menu_layout),
+        fullscreen_primary_click_change: (a.fullscreen_primary_click != b.fullscreen_primary_click)
+            .then_some((a.fullscreen_primary_click, b.fullscreen_primary_click)),
+        gamepad_enabled_change: (a.gamepad_enabled != b.gamepad_enabled)
+            .then_some((a.gamepad_enabled, b.gamepad_enabled)),
     }
 }
 
@@ -1092,6 +1103,146 @@ mod tests {
                 .any(|change| change.action == KeyAction::FsToggleMetadata),
             "multiple chord order is significant"
         );
+    }
+
+    #[test]
+    fn primary_click_only_diff_tracks_both_directions() {
+        use FullscreenPrimaryClickMode::{DoubleClickClose, PageTurn};
+
+        for (before, after) in [(PageTurn, DoubleClickClose), (DoubleClickClose, PageTurn)] {
+            let mut current = OperationCustomizeBundle::defaults();
+            current.fullscreen_primary_click = before;
+            let mut imported = current.clone();
+            imported.fullscreen_primary_click = after;
+            let changes = diff(&current, &imported);
+            assert!(!changes.is_empty());
+            assert_eq!(
+                changes.fullscreen_primary_click_change,
+                Some((before, after))
+            );
+            assert_eq!(changes.gamepad_enabled_change, None);
+            assert!(changes.key_changes.is_empty());
+            assert_eq!(changes.ring_change_count, 0);
+            assert_eq!(changes.menu_change_count, 0);
+        }
+    }
+
+    #[test]
+    fn gamepad_only_diff_tracks_both_directions() {
+        for (before, after) in [(true, false), (false, true)] {
+            let mut current = OperationCustomizeBundle::defaults();
+            current.gamepad_enabled = before;
+            let mut imported = current.clone();
+            imported.gamepad_enabled = after;
+            let changes = diff(&current, &imported);
+            assert!(!changes.is_empty());
+            assert_eq!(changes.gamepad_enabled_change, Some((before, after)));
+            assert_eq!(changes.fullscreen_primary_click_change, None);
+            assert!(changes.key_changes.is_empty());
+            assert_eq!(changes.ring_change_count, 0);
+            assert_eq!(changes.menu_change_count, 0);
+        }
+    }
+
+    #[test]
+    fn older_bundle_primary_click_reset_is_a_diff() {
+        let mut current = OperationCustomizeBundle::defaults();
+        current.fullscreen_primary_click = FullscreenPrimaryClickMode::DoubleClickClose;
+        let imported =
+            parse_json(r#"{"format":"mimageviewer.operation-customize","format_version":1}"#)
+                .unwrap();
+        let changes = diff(&current, &imported.bundle);
+        assert!(!changes.is_empty());
+        assert_eq!(
+            changes.fullscreen_primary_click_change,
+            Some((
+                FullscreenPrimaryClickMode::DoubleClickClose,
+                FullscreenPrimaryClickMode::PageTurn
+            ))
+        );
+        assert_eq!(changes.gamepad_enabled_change, None);
+        assert!(changes.key_changes.is_empty());
+        assert_eq!(changes.ring_change_count, 0);
+        assert_eq!(changes.menu_change_count, 0);
+    }
+
+    #[test]
+    fn operation_diff_covers_every_applied_bundle_setting() {
+        let original = OperationCustomizeBundle::defaults();
+        let serialized = serde_json::to_value(&original).unwrap();
+        let metadata = [
+            "format",
+            "format_version",
+            "app_version",
+            "exported_at",
+            "label",
+        ];
+        let mut before = Settings::default();
+        original.apply_to(&mut before);
+        let before = serde_json::to_value(before).unwrap();
+
+        // Discover the groups from the wire schema so an added setting needs a fixture.
+        for field in serialized.as_object().unwrap().keys() {
+            if metadata.contains(&field.as_str()) {
+                continue;
+            }
+            let mut changed = original.clone();
+            match field.as_str() {
+                "keymap" => changed.keymap.overrides = vec![binding("GridPin", &["Q"])],
+                "ring_shortcuts" => changed.ring_shortcuts.mouse_ring_help_visible = false,
+                "menu_layout" => changed
+                    .menu_layout
+                    .hidden_commands
+                    .push("SettingsOperationCustomize".into()),
+                "context_menu_layout" => changed
+                    .context_menu_layout
+                    .set_visible(ContextMenuItemId::CopyPath, false),
+                "gamepad_enabled" => changed.gamepad_enabled = false,
+                "fullscreen_primary_click" => {
+                    changed.fullscreen_primary_click = FullscreenPrimaryClickMode::DoubleClickClose
+                }
+                _ => panic!("add an apply/diff fixture for bundle setting {field}"),
+            }
+            let mut applied = Settings::default();
+            changed.apply_to(&mut applied);
+            let applied = serde_json::to_value(applied).unwrap();
+            let changed_fields: Vec<_> = applied
+                .as_object()
+                .unwrap()
+                .keys()
+                .filter(|key| applied[*key] != before[*key])
+                .collect();
+            assert_eq!(
+                changed_fields,
+                vec![field],
+                "apply_to must change exactly {field}"
+            );
+            assert_eq!(
+                applied[field],
+                serde_json::to_value(&changed).unwrap()[field]
+            );
+            assert!(
+                !diff(&original, &changed).is_empty(),
+                "diff must include {field}"
+            );
+            assert!(
+                !diff(&changed, &original).is_empty(),
+                "reverse diff must include {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_diff_ignores_export_metadata_when_settings_are_identical() {
+        let original = OperationCustomizeBundle::defaults();
+        let mut other = original.clone();
+        other.format = "other".into();
+        other.format_version += 1;
+        other.app_version = "future".into();
+        other.exported_at = "other time".into();
+        other.label = Some("other label".into());
+        assert!(diff(&original, &original).is_empty());
+        assert!(diff(&original, &other).is_empty());
     }
 
     #[test]
