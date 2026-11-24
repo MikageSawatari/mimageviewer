@@ -396,3 +396,89 @@
 - 3 回目 (`7bd6724e5`): **ACCEPT**。追加の指摘なし。master への取り込みに合意。
 - 凍結の決まりの点の言葉:「読込元の事実を一覧の所有 context とともに運び、共通の境界で表示・永続化を決める本実装は、detached の述語・viewport・窓の寿命・placement を変更しない構造的修正であり、症状パッチではない。」
 - 設計担当の検証: 関連テスト 920 件成功 (`run-heavy`、filter `browser870_|browser818|plain_folder_spread|snapshot|spread_shift|remote_reading|favorite_spread|favorite_view|set_spread|set_view_mode|persist_spread|path_key`)、`viewer_context_audit` exit 0、`cargo fmt --check` 成功。本体 lib の全件と実機は未確認。
+
+## 10. §1.884 保存先のフォルダでは「末尾に表紙を添える」の全体の既定を OFF として扱う (2026-11-24 追記)
+
+設計担当 ClaudeCode。ブランチ `browser-884-final-cover` (master `874eff456` から)。起票は [next-release-backlog.md](next-release-backlog.md) §1.884。
+
+### 10.1 観測と原因
+
+- **観測** (サブ PC2 の Claude、2026-11-24、v5.7.0 候補のインストーラ `ba81fdab0`。§1.870 の通しの確認の追加の操作): 保存先の月のフォルダに photo-a (横長)・photo-b (縦長)・photo-c (横長) を受け取った後、photo-c の窓でキー 3 (見開き 左→右 表紙あり) を押すと、左 photo-c・右 photo-a の見開きになった。photo-b の窓では左 photo-b・右 photo-a。写真は `C:\home\mimageviewer-subpc\browser870-installer\results\a3-key3-extra.jpg`・`a2-key3-spread.jpg`。
+- **原因** (コード): 表紙ありの見開きで末尾が単独になると、「末尾に表紙を添える」(`final_cover_spread_enabled`、既定 ON) が末尾のページの隣へ先頭のページを表紙として添える。実効値は `App::final_cover_spread_enabled_for_current_book` (`src/app.rs`) の 1 か所で決まり、本ごとの選択 (`final_cover_spread_preference`、`全体に従う / オン / オフ`) が `全体に従う` なら全体の設定を使う。保存先の月のフォルダも、ほかのフォルダと同じくこの値を使う。保存先は本ではなく、別々に受け取った画像の集まりなので、関係のない最初の 1 枚が表紙として添えられる。§1.870 と同じ種類の見え方 (本の規則を、本でないフォルダへ当てている)。
+- 規則どおりの動きで、ほかの組 (キー 2 で photo-b が 1 枚のまま) は、横長のページを単独で表示する既存の規則 ([spec.md](spec.md) の見開きの節) による。§1.884 の対象ではない。
+
+### 10.2 方針 (統括の案、利用者了承 2026-11-24)
+
+- 保存先のフォルダでは、この機能の**全体の既定だけ**を OFF として扱う。
+- 本ごとの選択が全体の既定に優先する順番は変えない。保存先のフォルダで本ごとに「オン」を選んだ場合は、今までどおりそれが効く。
+- 保存してある値 (環境設定の全体の値、spread.db の本ごとの選択) は書き換えない。
+
+### 10.3 変更
+
+- `final_cover_spread_enabled_for_current_book` の全体の既定を、次の 1 つの判定で決める。
+  - 今の表示が保存先のフォルダの表示なら `false`、そうでなければ `self.settings.final_cover_spread_enabled`。
+  - そのあと、今までどおり `self.final_cover_spread_preference.effective(<全体の既定>)`。抽出一覧の結果の面 (`extracted_result_surface`) が `false` を返す先頭の分岐も今までどおり。
+- 「保存先のフォルダの表示」の判定は、§1.870 の `remembers_spread_presentation` が使っている条件と同じものにする。
+  - 本の構成がページ構成を持つ場合 (`composition_owns_view_settings`) は本として扱い、保存先のフォルダの扱いにしない。
+  - それ以外で、`spread_container_key()` が `browser_directory_presentation_for_key` に当たるとき。これは §1.870 の `SpreadPresentationSource` (読み込みで運んだ事実と、保存先の根の設定) で決まり、ZIP・PDF は当たらない。
+  - 二重に書かないため、この条件を 1 つの関数 (例 `current_view_is_browser_directory`) にまとめ、`remembers_spread_presentation` とこの関数の両方から使う。
+- 実効値の利用者は、すべて `final_cover_spread_enabled_for_current_book` を通っている (描画の構成、ページめくりの束ね、需要集合など)。直接 `settings.final_cover_spread_enabled` を読む経路は、環境設定の画面・設定の保存と読み込み・Remote だけ。新しい分岐はこの関数の中だけに置く。
+
+### 10.4 先頭側・ほかの本向けの設定は変えない (判断)
+
+本ごとの表示の設定はほかに、「先頭の単ページを本来の側に置く」「末尾の単ページを本来の側に置く」(`singleton_spread_first/last_enabled`)、「表紙の次のページを単独で表示」「最終ページを単独で表示」(`page_after_cover_alone_enabled` / `last_page_alone_enabled`) がある。どれも**変えない**。
+
+- 理由: これらはページを単独にするか、単独のページをどちらの側に置くかを決めるだけで、隣り合わない 2 枚を組にしない。関係のない画像を組にするのは、末尾へ先頭を添える「末尾に表紙を添える」だけ。
+- 見開き自体は、保存先のフォルダでも利用者がその場で選べる (§1.870)。選んだ見開きの中で隣り合う 2 枚が組になるのは、利用者の選んだとおりの表示で、§1.884 の対象ではない。
+- 「最終ページを単独で表示」が ON のとき、空いた側には今まで表紙が添えられていた。保存先のフォルダでは、全体の既定が OFF になるので白い面になる (本ごとに「オン」を選んだ場合を除く)。
+
+### 10.5 表示中の切り替えと寿命
+
+- 判定の入力 (`spread_presentation_source`・保存先の根の設定・`composition_owns_view_settings`・本ごとの選択) は、どれも viewer context ごとに持ち運ばれる (§1.870 で `swap_field!`・fork・snapshot を通した)。別の窓・停めた context の値を見ない。
+- 環境設定で全体の値を変えたときの、停めた context の無効化 (`invalidate_final_cover_spread_display_in_parked_contexts`) は今のまま。保存先のフォルダの context で `全体に従う` の場合は、全体の値が変わっても実効値は変わらないので、無効化は余分になるだけで害は無い。
+- 保存先の根の設定を変えると、§1.870 のとおり表示中の一覧は読み直される。実効値は次の描画で新しい判定から求まる。
+- 本ごとの選択の保存 (`set_final_cover_spread_preference_for_fullscreen`) は今のまま書く。§1.870 の「覚えない」はページ構成 (見開き・連結・向き) の話で、本ごとの選択は利用者が明示して選ぶ別の設定。方針 10.2 の「優先の順番を変えない」に合わせて、読みも書きも変えない。
+
+### 10.6 見開きメニューの表示
+
+- フルスクリーンの見開きメニューの「末尾に表紙を添える」は、選択肢の名前 (`全体に従う / オン / オフ`) と、今の選択の強調だけを出していて、実効値は出していない。保存先のフォルダで `全体に従う` が選ばれていると、全体の値が ON でも表紙は添えられない。
+- 表示は変えない。文言を足すと UI の分岐とスナップショットが増えるわりに、表紙ありの見開きを保存先のフォルダで選ぶ場面が少ない。マニュアルに「保存先のフォルダでは、全体の設定が ON でも添えない (本ごとにオンを選んだ場合を除く)」と書く。
+
+### 10.7 mIV Remote
+
+- Remote は保存先の月のフォルダで見開きを選べない (§1.870 の R2)。表示はいつも単ページなので、末尾に表紙を添える処理は動かない。
+- そのため Remote (`src/remote_ipc/container.rs` の `final_cover_preference.effective(reading_settings.final_cover_spread_enabled)`) は変えない。IPC の wire と PROTOCOL_VERSION も変わらない。
+- 確かめること (実装時): 保存先の月のフォルダの Remote の表示で、実効のページ構成がいつも Single であり、`final_cover_enabled` が見開きの構成に使われないこと。既存の browser870 の Remote のテストがこれを押さえているかを確かめ、無ければ足す。
+
+### 10.8 永続データ
+
+- スキーマも保存する値も変えない。§1.870 と保存先の判定はどちらも未リリース (v5.7.0 で初めて出す) なので、移行は要らない。
+
+### 10.9 テスト (実装時)
+
+- 状態の検査 (`src/app/tests/browser870.rs` に足す、名前は `browser870_final_cover_` で始める):
+  - 全体 ON・本ごと `全体に従う`・保存先の月のフォルダ: 実効値が `false`。表紙ありの見開きで末尾が単独のとき、表紙が添えられない (表示の構成に `FrontCoverSupplement` が無い)。
+  - 同じ条件で、保存先の外のふつうのフォルダ: 実効値が `true` (今までどおり)。
+  - 保存先の月のフォルダで本ごと `オン`: 実効値が `true`。本ごと `オフ`: `false`。
+  - 保存先の根の下の ZIP: 実効値が全体の値に従う (ZIP は当たらない)。
+  - 本の構成がページ構成を持つ場合: 全体の値に従う。
+  - 保存先のフォルダの context と、ふつうのフォルダの context を切り替えても、それぞれの実効値が保たれる (context の入れ替え)。
+  - 全体の値・spread.db の本ごとの行が、保存先のフォルダを開いて閉じた後も変わっていない。
+- Remote: 10.7 の確認。
+- 実行するのは関連の filter だけ (`browser870_|final_cover|spread_shift|plain_folder_spread` など)。本体 lib の全件は、取り込みの後に統括が流す。
+
+### 10.10 文書
+
+- [browser-integration.html](../htdocs/mimageviewer/manual/browser-integration.html)・[fullscreen.html](../htdocs/mimageviewer/manual/fullscreen.html) の「末尾に表紙を添える」・[settings.html](../htdocs/mimageviewer/manual/settings.html) の同じ行に、保存先のフォルダでは全体の設定が ON でも添えない (本ごとに「オン」を選んだ場合を除く) ことを書く。
+- [spec.md](spec.md) の該当の節にも同じことを書く。
+- 更新履歴の §1.870 の下書き (共有メモ `browser-870-changelog-draft.md`) に 1 文足す。
+
+### 10.11 凍結の決まりとの照合
+
+- 別ウィンドウの述語 (`DetachedWindowPurpose`・linked / independent)・viewport・窓の寿命・placement に触れない。変えるのは、実効値を決める 1 つの関数の全体の既定の値だけで、§1.870 と同じく、読み込みで運んだ事実と保存先の根の設定で決まり、窓の種類を見ない。
+- 症状を消す guard / delay / retry / 一括 reset / silent fallback ではない。原因 (本の規則を、本でない保存先のフォルダへ当てていた) に対応する。
+- 独立設計レビューの合意の言葉は、10.12 に記録し、[detached-rework-plan.md](detached-rework-plan.md) §11 にも足す。
+
+### 10.12 独立設計レビューの記録
+
+(レビューの後に設計担当が書く。実装担当は書かない。)
