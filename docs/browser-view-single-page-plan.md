@@ -530,3 +530,12 @@
 - nextest filter: `test(browser870_final_cover_)`。関連回帰の filter: `test(browser870_) | test(final_cover) | test(spread_shift) | test(plain_folder_spread)`。
 - 設計担当の追記: `invalidate_final_cover_spread_display_in_parked_contexts` の引数が増えたので、`tools/viewer_context_audit/src/lib.rs` の A4 の許可リストの署名を新しい形に合わせた (停めた束を選ぶ条件を引数で受けるだけで、読み書きする束の範囲は変わらない)。
 - 設計担当の検証: 関連テスト 328 件成功 (`run-heavy`、filter `browser870_|final_cover|spread_shift|plain_folder_spread|initial_placement_parked|browser818`)、`viewer_context_audit` exit 0、`cargo fmt --check` 成功。本体 lib の全件と実機は未確認。
+
+### 10.14 独立実装レビュー (2026-11-24、GPT-6.1 Sol / xhigh、実装者とは別の会話、read-only)
+
+- 1 回目 (`92f8be392`): **ACCEPT**。P1〜P3 の指摘なし。設計 §10 への適合と、設計自体に直すべき問題が無いことを確認された。
+  - `affects` は実効値が変わり得る context を漏らさず、表示中・停めた束で同じ判定になる。明示の保存先が無いときも同じ既定の根へ解決される。
+  - 根の適用・取り込みは成功時の採用に集約され、失敗時に戻すのは環境設定の画面の下書きだけなので、`poll` の前後の比較で足りる。
+  - Remote は §1.870 の `browser_directory` をそのまま使い、wire の変更と新しい同期 I/O は無い。
+  - 追加の 6 本は §10.9 の項目を検査し、補助表紙の有無には正負の対照がある。根の変更は共通の入口の直接の呼び出しで検査しており、`poll` との接続と既定の根への遷移は静的に確認された。
+- 凍結の決まりの点の言葉:「読込元の事実と現在の共有設定から実効値と無効化対象を共通の境界で決める本実装は、detached の述語・viewport・窓の寿命・placement を変更しない構造的修正であり、症状パッチではない。」
