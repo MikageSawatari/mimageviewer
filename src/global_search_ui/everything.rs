@@ -1,6 +1,6 @@
 //! Everything is a producer of the shared Search surface, not a second list owner.
 use super::*;
-use crate::app::listing_sort::without_duration_request;
+use crate::app::listing_sort::without_lazy_metric_request;
 pub(super) mod metadata;
 mod shortcut;
 pub(super) use metadata::prepare as prepare_everything_metadata;
@@ -430,7 +430,7 @@ impl App {
             through_batch: 0,
             view,
             sort_mode: self.global_search.sort_mode,
-            order_request: without_duration_request(
+            order_request: without_lazy_metric_request(
                 crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
             ),
             rating_write_generation: self.rating_session_write_generation,

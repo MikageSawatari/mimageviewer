@@ -28,7 +28,7 @@ impl RatingViewSort {
                 Self::Normal(crate::settings::SortOrder::FileName)
             }
             Self::Normal(order) => {
-                Self::Normal(crate::app::listing_sort::without_duration_order(order))
+                Self::Normal(crate::app::listing_sort::without_lazy_metric_order(order))
             }
             _ => self,
         }
@@ -461,7 +461,7 @@ pub fn sort_rows(rows: &mut [RatingViewRow], sort: RatingViewSort) {
                 .then_with(|| compare_row_names(a, b, crate::settings::SortOrder::FileName))
         }),
         RatingViewSort::Normal(order) => {
-            let order = crate::app::listing_sort::without_duration_order(order);
+            let order = crate::app::listing_sort::without_lazy_metric_order(order);
             rows.sort_by(|a, b| compare_row_names(a, b, order));
         }
     }
@@ -1265,6 +1265,8 @@ mod tests {
         for order in [
             crate::settings::SortOrder::DurationAsc,
             crate::settings::SortOrder::DurationDesc,
+            crate::settings::SortOrder::PageCountAsc,
+            crate::settings::SortOrder::PageCountDesc,
         ] {
             assert_eq!(
                 RatingViewSort::Normal(order).normalized_for_rating_view(),

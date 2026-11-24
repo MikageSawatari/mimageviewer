@@ -19,6 +19,7 @@ fn media_app() -> AppTestEnv {
     app.settings.grid_view_mode = GridViewMode::Thumbnail;
     app.settings.thumb_show_resume_meter = true;
     app.settings.thumb_show_media_duration = false;
+    app.settings.thumb_show_page_count = false;
     app.settings.selection_info_display_mode = SelectionInfoDisplayMode::Hidden;
     let root = app.tmp.path().join("uncreated-media");
     app.install_new_items(
@@ -213,7 +214,7 @@ fn media_resume_meter_shared_setting_hides_meter_and_preserves_duration_badge() 
     app.settings.thumb_show_media_duration = true;
     app.settings.thumb_show_resume_meter = false;
     assert!(
-        app.thumbnail_media_metadata_enabled(),
+        app.thumbnail_media_fields_enabled(),
         "badge alone still requests duration"
     );
     assert_eq!(app.thumbnail_resume_meter(0), None);

@@ -385,6 +385,9 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
 
 ## 11. 実装記録と設計担当への引き渡し
 
+本節の §1.762 当時の識別子・候補数は実装履歴として残す。§1.883 段 2 で共通化した現行の
+契約は §11.9 と [ページ数計画 §6](book-page-count-badge-plan.md#6-段-2-ページ数順の並べ替え) を参照する。
+
 ### 11.1 実装範囲
 
 - `src/settings.rs` / `settings_db.rs` / `settings_transfer.rs`: ListingDuration、12種類の一覧順、明示的なCollection・代表画像候補、長さfacetのプリセット・分単位範囲、設定互換と候補補完marker。
@@ -524,3 +527,12 @@ PNG更新候補（全て未更新）:
 - 新規 `src/app/tests/duration_762/smart_destination.rs`: `duration_762_offscreen_smart_history_child_uses_destination_name_sort` と `duration_762_resident_smart_child_uses_destination_name_sort`。既存App fixtureと本物の履歴／直接drillのworker・採用経路を使う。stamp一致の既知長さ600秒／30秒、共通DurationAsc、実itemsの `a-long.mp4 → b-short.mp4`、Smart所有状態を検証する。Offscreenテストは採用前のFolder・非resident状態と履歴Back/Forwardのcommitも検査する。固定sleep・実機のキー状態読取は追加しない。
 - 共有runner向けfilter案は `test(/duration_762/)`。必要に応じ既存Smart履歴・drillと、今回引数を更新した `collection_physical_thumbnail` / `collection_physical_load` / `section1339_adoption_precedes_real_sidecar_hydration_and_commits_once` の回帰も確認する。コンパイル・テスト・check・build・testスクリプト・製品起動・PNG更新は利用者の指示で実施しない。既報の関連500件・core check成功は修正前コミット `76ab07779` に対する設計担当の結果である。
 - 本番差分・全呼出台帳・新規2テストの独立静的レビュー (Sol / xhigh) はACCEPT。`cargo fmt` / `cargo fmt --check` / `git diff --check` はすべてexit 0。コンパイル・実行の証拠ではない。git add・commitは行っていない。
+
+### 11.9 ページ数順との共通化 (§1.883 段 2、実行検証待ち)
+
+`LazyMetric::{Duration, PageCount}` で使える一覧・正規化・入口・Remote・ゲームパッド・進捗表示を共有し、
+長さ facet と動画メタデータの読取りは長さ固有のまま残した。§11.2 の各 worker 入口にはページ数の
+要求 flag と fingerprint を追加し、catalog は両種類で 1 回の read-only open、reconcile のメモリは
+要求した種類だけを入れた共通 snapshot を使う。`ListingMetaRequirements.page_count` は表示設定と独立し、
+同じ全件計画・完了 proof・停止再開に乗せる。自動整列はせず、更新・同値再選択・開き直しで採用する。
+変更箇所・facts の照合・追加試験と未実行の検証は [段 2 の実装記録](book-page-count-badge-plan.md#11-実装記録-段-2) を参照。

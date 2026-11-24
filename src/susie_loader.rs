@@ -666,7 +666,29 @@ impl Drop for SusieWorkerPool {
 // グローバルシングルトン (設定から起動時に初期化)
 // ─────────────────────────────────────────────────────────────────
 
-static POOL: OnceLock<RwLock<Arc<SusieWorkerPool>>> = OnceLock::new();
+struct PoolState {
+    pool: Arc<SusieWorkerPool>,
+    revision: u64,
+}
+
+impl PoolState {
+    fn empty() -> Self {
+        Self {
+            pool: Arc::new(empty_pool()),
+            revision: 0,
+        }
+    }
+
+    fn replace(&mut self, pool: SusieWorkerPool) -> Arc<SusieWorkerPool> {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("Susie pool revision overflow");
+        std::mem::replace(&mut self.pool, Arc::new(pool))
+    }
+}
+
+static POOL: OnceLock<RwLock<PoolState>> = OnceLock::new();
 
 /// `init_pool` 完了フラグ + 待機用 Condvar (Codex P2 v14 2026-05-14)。
 ///
@@ -750,7 +772,7 @@ pub fn init_pool(enabled: bool, parallel: bool) {
     // Step 0: 世代スナップショット (Codex P2 v14c 2026-05-14)。
     let my_gen = INIT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     // Step 1: cheap empty install.
-    let rwlock = POOL.get_or_init(|| RwLock::new(Arc::new(empty_pool())));
+    let rwlock = POOL.get_or_init(|| RwLock::new(PoolState::empty()));
     // Step 2: heavy build outside the OnceLock init.
     let pool = if enabled {
         SusieWorkerPool::start(parallel)
@@ -760,8 +782,11 @@ pub fn init_pool(enabled: bool, parallel: bool) {
     // Step 3: 世代再確認 + swap。reload や別の init_pool が走っていれば
     // 自分の build 物は捨てる (= ユーザー choice / 最新値を尊重)。
     if INIT_GENERATION.load(Ordering::SeqCst) == my_gen {
-        let mut writer = rwlock.write().unwrap_or_else(|e| e.into_inner());
-        *writer = Arc::new(pool);
+        let previous = rwlock
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(pool);
+        drop(previous);
     } else {
         crate::logger::log(
             "susie_loader: init_pool: generation moved during build; \
@@ -790,7 +815,7 @@ pub fn get_pool() -> Arc<SusieWorkerPool> {
         if *done {
             // POOL は init_pool で必ず populate されている前提だが、防御的に。
             if let Some(rwlock) = POOL.get() {
-                return Arc::clone(&rwlock.read().unwrap());
+                return Arc::clone(&rwlock.read().unwrap().pool);
             }
         }
     }
@@ -816,13 +841,13 @@ pub fn get_pool() -> Arc<SusieWorkerPool> {
                 "susie_loader: get_pool: init_pool not called within {INIT_TIMEOUT_MS}ms; \
                  installing empty_pool fallback"
             ));
-            POOL.get_or_init(|| RwLock::new(Arc::new(empty_pool())));
+            POOL.get_or_init(|| RwLock::new(PoolState::empty()));
         },
     );
     let rwlock = POOL
         .get()
         .expect("POOL set by init_pool or timeout fallback");
-    Arc::clone(&rwlock.read().unwrap())
+    Arc::clone(&rwlock.read().unwrap().pool)
 }
 
 /// テスト用: `INIT_DONE` フラグをリセットして次回 `init_pool` を再走らせる。
@@ -836,7 +861,22 @@ pub fn reset_init_for_test() {
 /// プールが既に初期化されていれば `Some` を返す。未初期化なら `None` (spawn しない)。
 /// 起動時パス判定など軽量処理で呼ばれる想定。
 pub fn try_get_pool() -> Option<Arc<SusieWorkerPool>> {
-    POOL.get().map(|lock| Arc::clone(&lock.read().unwrap()))
+    pool_snapshot().0
+}
+
+/// Take the published pool and revision under the same lock, without initialization.
+pub fn pool_snapshot() -> (Option<Arc<SusieWorkerPool>>, u64) {
+    POOL.get().map_or((None, 0), |lock| {
+        let state = lock.read().unwrap_or_else(|e| e.into_inner());
+        (Some(Arc::clone(&state.pool)), state.revision)
+    })
+}
+
+/// Revision of the published recognition rules; never starts workers.
+pub fn pool_revision() -> u64 {
+    POOL.get().map_or(0, |lock| {
+        lock.read().unwrap_or_else(|e| e.into_inner()).revision
+    })
 }
 
 /// ある拡張子が Susie プラグインで扱えるか。
@@ -869,7 +909,7 @@ pub fn supports_extension(ext_lower: &str) -> bool {
 pub fn reload(enabled: bool, parallel: bool) {
     use std::sync::atomic::Ordering;
     let my_gen = INIT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    let lock = POOL.get_or_init(|| RwLock::new(Arc::new(empty_pool())));
+    let lock = POOL.get_or_init(|| RwLock::new(PoolState::empty()));
     let new_pool = if enabled {
         SusieWorkerPool::start(parallel)
     } else {
@@ -877,7 +917,11 @@ pub fn reload(enabled: bool, parallel: bool) {
     };
     if INIT_GENERATION.load(Ordering::SeqCst) == my_gen {
         // 旧プールの Drop がここで走る
-        *lock.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new_pool);
+        let previous = lock
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(new_pool);
+        drop(previous);
     } else {
         crate::logger::log(
             "susie_loader: reload: generation moved during build; \
@@ -1572,6 +1616,19 @@ fn parse_decode_response(data: &[u8]) -> std::io::Result<image::DynamicImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_replacement_publishes_revision_with_the_pool() {
+        let lock = RwLock::new(PoolState::empty());
+        let initial = Arc::clone(&lock.read().unwrap().pool);
+        for revision in 1..=2 {
+            let previous = lock.write().unwrap().replace(empty_pool());
+            let state = lock.read().unwrap();
+            assert_eq!(state.revision, revision);
+            assert!(!Arc::ptr_eq(&previous, &state.pool));
+            assert!(!Arc::ptr_eq(&initial, &state.pool));
+        }
+    }
 
     #[test]
     fn init_fallback_keeps_one_deadline_and_releases_all_waiters() {

@@ -1175,6 +1175,74 @@ mod tests {
     }
 
     #[test]
+    fn page_sort_883_stack_metadata_survives_flat_and_keeps_aggregate_missing() {
+        use crate::settings::{GridDisplayOrder, GridItemDisplayKind, ListingPageCount};
+        // Synthetic member values exercise metadata transport independently of eligibility:
+        // physical materialization only supplies page counts for book rows.
+        let mut members = vec![img("post_p1.jpg"), img("post_p0.jpg")];
+        for member in &mut members {
+            member.sort_meta.page_count = ListingPageCount::Known(1);
+        }
+        let mut display = GridDisplayOrder::default();
+        for kind in GridItemDisplayKind::ALL {
+            display.assign(kind, 0);
+        }
+        let mut small = ListingSortMetadata::new(7, Some(10));
+        small.page_count = ListingPageCount::Known(10);
+        let mut large = ListingSortMetadata::new(8, Some(20));
+        large.page_count = ListingPageCount::Known(20);
+        for order in [SortOrder::PageCountAsc, SortOrder::PageCountDesc] {
+            let groups = group_media(members.clone(), '_', order);
+            assert!(
+                groups[0]
+                    .members
+                    .iter()
+                    .all(|member| member.sort_meta.page_count == ListingPageCount::Known(1))
+            );
+            let view = StackView::from_groups_with_display_order(
+                PathBuf::from(r"C:\dl"),
+                vec![
+                    GridItem::ZipFile(PathBuf::from(r"C:\dl\small.zip")),
+                    GridItem::PdfFile(PathBuf::from(r"C:\dl\large.pdf")),
+                ],
+                vec![Some((7, 10)), Some((8, 20))],
+                vec![small, large],
+                '_',
+                order,
+                groups,
+                display.clone(),
+            );
+            let (aggregate, _) = view.materialize_aggregated();
+            let expected = if order == SortOrder::PageCountAsc {
+                ["small.zip", "large.pdf"]
+            } else {
+                ["large.pdf", "small.zip"]
+            };
+            assert_eq!(
+                aggregate[..2].iter().map(item_name).collect::<Vec<_>>(),
+                expected
+            );
+            assert!(
+                matches!(aggregate[2], GridItem::Stack { .. }),
+                "stack count stays Missing"
+            );
+            let (flat, _) = view.materialize_flat();
+            let start = if order == SortOrder::PageCountAsc {
+                0
+            } else {
+                2
+            };
+            assert_eq!(
+                flat[start..start + 2]
+                    .iter()
+                    .map(item_name)
+                    .collect::<Vec<_>>(),
+                ["post_p0.jpg", "post_p1.jpg"]
+            );
+        }
+    }
+
+    #[test]
     fn empty_input_yields_no_groups() {
         let groups = group_media(Vec::new(), '_', SortOrder::FileName);
         assert!(groups.is_empty());

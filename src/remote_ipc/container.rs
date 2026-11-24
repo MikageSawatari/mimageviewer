@@ -20026,7 +20026,12 @@ pub(super) mod tests {
     #[test]
     fn remote_duration_settings_are_normalized_before_physical_materialization() {
         use crate::settings::SortOrder;
-        for order in [SortOrder::DurationAsc, SortOrder::DurationDesc] {
+        for order in [
+            SortOrder::DurationAsc,
+            SortOrder::DurationDesc,
+            SortOrder::PageCountAsc,
+            SortOrder::PageCountDesc,
+        ] {
             let settings = crate::settings::Settings {
                 sort_order: order,
                 ..Default::default()

@@ -400,6 +400,7 @@ pub(crate) fn layout_cell_overlays(
     is_checked: bool,
     filter_match_count: Option<u32>,
     media_duration: Option<&str>,
+    page_count: Option<&str>,
     book_resume_meter: bool,
     name_style: crate::thumb_overlay_layout::ThumbnailNameStyle,
     show_type_icon: bool,
@@ -462,6 +463,7 @@ pub(crate) fn layout_cell_overlays(
             },
             filter_match_count: filter_match_count.filter(|_| item.is_container_ratable()),
             media_duration,
+            page_count,
             bookmark_time,
             bookmark_title,
             upscaled_video,
@@ -1629,6 +1631,9 @@ fn paint_cell(
         );
     }
 
+    if let Some(placement) = overlay_layout.page_count.as_ref() {
+        crate::ui_helpers::draw_overlay_media_duration_badge(painter, placement);
+    }
     if let Some(placement) = overlay_layout.media_duration.as_ref() {
         crate::ui_helpers::draw_overlay_media_duration_badge(painter, placement);
     }
@@ -1914,7 +1919,7 @@ mod thumbnail_name_style_tests {
                                                 &item, &thumb, &tags, None, None, false,
                                                 VideoThumbnailIndicator::BottomLeftBadge,
                                                 AudioThumbnailIndicator::default(), false, None,
-                                                None, true, name_style,
+                                                None, None, true, name_style,
                                             false,
                                             false,
                                             )
@@ -2099,7 +2104,7 @@ mod book_resume_meter_tests {
                             output=Some(crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(),|ctx| {ctx.root_ui(|root_ui| egui::CentralPanel::default().show(root_ui,|ui| {
                             let cell=egui::Rect::from_min_size(egui::pos2(20.3,20.7),egui::vec2(width,width));
                             let layout=layout_cell_overlays(ui.painter(),cell,EditBadgeFlags::default(),4,&item,&ThumbnailState::Pending,&[],None, None,false,
-                                VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,None,Some("22:35"),true,
+                                VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,None,Some("22:35"),None,true,
                                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                                 false,
                                 false,
@@ -2182,6 +2187,7 @@ mod book_resume_meter_tests {
                                             VideoThumbnailIndicator::Hidden,
                                             AudioThumbnailIndicator::default(),
                                             false,
+                                            None,
                                             None,
                                             None,
                                             enabled,
@@ -2300,6 +2306,7 @@ mod book_resume_meter_tests {
                                     false,
                                     None,
                                     None,
+                                    None,
                                     true,
                                     crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                                     false,
@@ -2393,6 +2400,7 @@ mod book_resume_meter_tests {
                                         VideoThumbnailIndicator::Hidden,
                                         AudioThumbnailIndicator::default(),
                                         false,
+                                        None,
                                         None,
                                         None,
                                         true,
@@ -2622,6 +2630,7 @@ mod book_resume_meter_tests {
                                                     false,
                                                     None,
                                                     duration,
+                                                    None,
                                                     enabled,
                                                     crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                                                 false,
@@ -2744,6 +2753,7 @@ mod book_resume_meter_tests {
                                     false,
                                     None,
                                     None,
+                                    None,
                                     true,
                                     crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                                     false,
@@ -2829,6 +2839,7 @@ mod book_resume_meter_tests {
                                 true,
                                 None,
                                 Some("1:02:03"),
+                                None,
                                 true,
                                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                                 false,
@@ -3097,6 +3108,7 @@ mod book_resume_meter_tests {
             dense,
             dense.then_some(42),
             duration,
+            None,
             true,
             crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
             false,
@@ -3377,6 +3389,7 @@ mod book_resume_meter_tests {
                         false,
                         None,
                         duration,
+                        None,
                         enabled,
                         crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                         false,
@@ -3943,6 +3956,7 @@ fn draw_video_indicator_snapshot_cell(
         false,
         None,
         None,
+        None,
         false,
         crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
         false,
@@ -4087,6 +4101,7 @@ fn draw_thumbnail_name_settings_snapshot(ui: &mut egui::Ui, prioritize_width: bo
                         false,
                         None,
                         duration,
+                        None,
                         true,
                         crate::thumb_overlay_layout::ThumbnailNameStyle {
                             font_scale: if prioritize_width { 1.0 } else { 1.5 },
@@ -4550,6 +4565,7 @@ pub fn draw_audio_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
                     false,
                     None,
                     Some("3:45"),
+                    None,
                     true,
                     crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                     false,

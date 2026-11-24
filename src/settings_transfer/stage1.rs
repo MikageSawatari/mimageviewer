@@ -524,6 +524,8 @@ impl Stage1Value for SortOrder {
             (Self::SizeDesc, Self::SizeDesc.label().into()),
             (Self::DurationAsc, Self::DurationAsc.label().into()),
             (Self::DurationDesc, Self::DurationDesc.label().into()),
+            (Self::PageCountAsc, Self::PageCountAsc.label().into()),
+            (Self::PageCountDesc, Self::PageCountDesc.label().into()),
             (Self::RatingAsc, Self::RatingAsc.label().into()),
             (Self::RatingDesc, Self::RatingDesc.label().into()),
         ])

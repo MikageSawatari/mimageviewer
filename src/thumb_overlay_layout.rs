@@ -115,6 +115,7 @@ pub enum BadgeKind {
     TypeIcon,
     StackCount,
     FilterMatchCount,
+    PageCount,
     MediaDuration,
     BookmarkTime,
     BookmarkTitle,
@@ -142,6 +143,7 @@ pub enum BadgePriority {
     Filename,
     Rating,
     FilterMatchCount,
+    PageCount,
     MediaDuration,
 }
 
@@ -213,6 +215,7 @@ pub struct ThumbnailOverlayLayout {
     pub top_left: TopLeftOverlayLayout,
     pub bottom_left: BottomLeftOverlayLayout,
     pub filter_match_count: Option<BadgePlacement>,
+    pub page_count: Option<BadgePlacement>,
     pub media_duration: Option<BadgePlacement>,
 }
 
@@ -225,6 +228,7 @@ impl ThumbnailOverlayLayout {
             .chain(self.top_left.placements())
             .chain(self.bottom_left.placements())
             .chain(self.filter_match_count.iter())
+            .chain(self.page_count.iter())
             .chain(self.media_duration.iter())
     }
 }
@@ -274,6 +278,7 @@ pub struct ThumbnailOverlayLayoutInput<'a> {
     pub checked: bool,
     pub stack_count: Option<usize>,
     pub filter_match_count: Option<u32>,
+    pub page_count: Option<&'a str>,
     pub media_duration: Option<&'a str>,
     pub bookmark_time: Option<&'a str>,
     pub bookmark_title: Option<&'a str>,
@@ -1169,8 +1174,24 @@ fn layout_badges(
                 })
         });
 
-    // Existing badges reserve first; the filter count also owns the right corner ahead of length.
+    // The filter count owns the right corner; page count and length yield to all prior badges.
     occupied.extend(filter_match_count.iter().map(|badge| badge.rect));
+    let page_count = input
+        .page_count
+        .filter(|text| !text.is_empty())
+        .and_then(|text| {
+            let style = media_duration_style();
+            let size = measured_badge_size(text, style, &mut measure);
+            let rect = place_bottom_right(input.cell, size, bottom_reserve, &occupied)?;
+            Some(BadgePlacement {
+                kind: BadgeKind::PageCount,
+                priority: BadgePriority::PageCount,
+                rect,
+                text: text.to_owned(),
+                style,
+            })
+        });
+    occupied.extend(page_count.iter().map(|badge| badge.rect));
     let media_duration = input
         .media_duration
         .filter(|text| !text.is_empty())
@@ -1196,6 +1217,7 @@ fn layout_badges(
         top_left,
         bottom_left,
         filter_match_count,
+        page_count,
         media_duration,
     }
 }
@@ -2799,6 +2821,7 @@ mod tests {
             checked: false,
             stack_count: None,
             filter_match_count: None,
+            page_count: None,
             media_duration: Some("1:02:03"),
             bookmark_time: None,
             bookmark_title: None,
@@ -3016,6 +3039,80 @@ mod tests {
         }
     }
 
+    fn page_count_input(
+        cell: egui::Rect,
+        inner: egui::Rect,
+    ) -> ThumbnailOverlayLayoutInput<'static> {
+        ThumbnailOverlayLayoutInput {
+            page_count: Some("123P"),
+            media_duration: None,
+            ..duration_input(cell, inner)
+        }
+    }
+
+    #[test]
+    fn page_count_883_uses_bottom_right_and_length_style_without_abbreviation() {
+        let (cell, inner) = cell(240.0);
+        for text in ["123P", "10000P"] {
+            let mut input = page_count_input(cell, inner);
+            input.page_count = Some(text);
+            let layout = layout_thumbnail_overlays(input, measure);
+            let badge = layout.page_count.as_ref().unwrap();
+            assert_eq!(badge.kind, BadgeKind::PageCount);
+            assert_eq!(badge.text, text);
+            assert_eq!(badge.style, media_duration_style());
+            assert_eq!(badge.rect.max, cell.max - egui::vec2(3.0, 3.0));
+            assert_placements_inside_cell(&layout, cell);
+        }
+    }
+
+    #[test]
+    fn page_count_883_lifts_above_filter_count_and_book_resume_meter() {
+        let (cell, inner) = square_cell(100.0);
+        for filter in [None, Some(42)] {
+            let mut input = page_count_input(cell, inner);
+            input.filter_match_count = filter;
+            input.book_resume_meter = true;
+            let layout = layout_thumbnail_overlays(input, measure);
+            let page = layout.page_count.as_ref().unwrap();
+            let meter = layout.book_resume_meter.unwrap();
+            assert!(page.rect.max.y < meter.min.y);
+            if let Some(count) = &layout.filter_match_count {
+                assert!(count.priority < page.priority);
+                assert!(page.rect.max.y <= count.rect.min.y - BOTTOM_ITEM_GAP);
+            }
+            assert_pairwise_non_intersecting(layout.badge_placements());
+            assert_placements_inside_cell(&layout, cell);
+        }
+    }
+
+    #[test]
+    fn page_count_883_yields_without_changing_existing_badges() {
+        for width in [32.0, 100.0, 240.0] {
+            let (cell, inner) = square_cell(width);
+            let mut input = page_count_input(cell, inner);
+            input.checked = true;
+            input.filter_match_count = Some(123);
+            input.book_resume_meter = true;
+            input.filename = Some("book.zip");
+            input.bottom_container = Some(BottomContainerInput {
+                kind: BottomContainerKind::Format(FormatBadgeKind::Zip),
+                label: "ZIP",
+            });
+            let mut without_page_count = input.clone();
+            without_page_count.page_count = None;
+            let baseline = layout_thumbnail_overlays(without_page_count, measure);
+            let mut layout = layout_thumbnail_overlays(input, measure);
+            assert_pairwise_non_intersecting(layout.badge_placements());
+            assert_placements_inside_cell(&layout, cell);
+            if width == 32.0 {
+                assert!(layout.page_count.is_none());
+            }
+            layout.page_count = None;
+            assert_eq!(layout, baseline);
+        }
+    }
+
     #[test]
     fn media_duration_uses_bottom_right_and_preserves_hour_text_width() {
         let (cell, inner) = cell(240.0);
@@ -3118,6 +3215,7 @@ mod tests {
                     checked: true,
                     stack_count: None,
                     filter_match_count: Some(123),
+                    page_count: None,
                     media_duration: None,
                     bookmark_time: None,
                     bookmark_title: None,
@@ -3181,6 +3279,7 @@ mod tests {
                     checked: false,
                     stack_count: Some(120),
                     filter_match_count: None,
+                    page_count: None,
                     media_duration: None,
                     bookmark_time: None,
                     bookmark_title: None,
@@ -3219,6 +3318,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: Some(42),
+                page_count: None,
                 media_duration: None,
                 bookmark_time: None,
                 bookmark_title: None,
@@ -3251,6 +3351,7 @@ mod tests {
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
+                    page_count: None,
                     media_duration: None,
                     bookmark_time: None,
                     bookmark_title: None,
@@ -3295,6 +3396,7 @@ mod tests {
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
+                    page_count: None,
                     media_duration: None,
                     bookmark_time: Some("12:34"),
                     bookmark_title: None,
@@ -3358,6 +3460,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                page_count: None,
                 media_duration: None,
                 bookmark_time: Some("12:34"),
                 bookmark_title: None,
@@ -3396,6 +3499,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                page_count: None,
                 media_duration: None,
                 bookmark_time: Some("0:07"),
                 bookmark_title: None,
@@ -3444,6 +3548,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                page_count: None,
                 media_duration: None,
                 bookmark_time: Some("12:34"),
                 bookmark_title: None,
@@ -3480,6 +3585,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                page_count: None,
                 media_duration: None,
                 bookmark_time: None,
                 bookmark_title: None,
@@ -3520,6 +3626,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                page_count: None,
                 media_duration: None,
                 bookmark_time: None,
                 bookmark_title: None,
@@ -3557,6 +3664,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                page_count: None,
                 media_duration: None,
                 bookmark_time: None,
                 bookmark_title: None,
@@ -3594,6 +3702,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                page_count: None,
                 media_duration: None,
                 bookmark_time: None,
                 bookmark_title: None,
@@ -3631,6 +3740,7 @@ mod tests {
                 checked: false,
                 stack_count: None,
                 filter_match_count: None,
+                page_count: None,
                 media_duration: None,
                 bookmark_time: None,
                 bookmark_title: None,

@@ -7685,7 +7685,7 @@ impl App {
             .listing_sort_capabilities()
             .disabled_reason(sort_order)
             .is_some()
-            || (self.settings.sort_order == sort_order && !sort_order.is_duration())
+            || (self.settings.sort_order == sort_order && sort_order.lazy_metric().is_none())
         {
             return;
         }
@@ -12511,6 +12511,24 @@ mod tests {
             .folder_pane_open_pending
             .as_ref()
             .expect("duration worker reload");
+        pending
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn page_count_picker_selected_page_count_uses_worker_reload() {
+        use crate::settings::SortOrder;
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let folder = app.tmp.path().join("picker-page-count");
+        std::fs::create_dir(&folder).unwrap();
+        app.current_folder = Some(folder);
+        app.settings.sort_order = SortOrder::PageCountAsc;
+        app.apply_grid_picker_sort_order(SortOrder::PageCountAsc);
+        let pending = app
+            .folder_pane_open_pending
+            .as_ref()
+            .expect("page count worker reload");
         pending
             .cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);

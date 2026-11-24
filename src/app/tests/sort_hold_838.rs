@@ -170,7 +170,7 @@ impl Harness {
         };
         h.settle();
         assert_eq!(h.names(), ["C.png", "B.png", "Z.wav"]);
-        assert!(h.env.listing_sort_capabilities().duration_allowed);
+        assert!(h.env.listing_sort_capabilities().lazy_metric_allowed);
         h.env.move_grid_cursor(Some(0), GridCursorIntent::Automatic);
         h.tick(vec![]);
         h.assert_grid_owner();

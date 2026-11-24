@@ -4239,6 +4239,7 @@ fn cell_filename_mixed_glyphs_dark() {
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
+                    page_count: None,
                     media_duration: None,
                     bookmark_time: None,
                     bookmark_title: None,
@@ -4307,6 +4308,7 @@ fn compact_file_format_badges_light() {
                         checked: false,
                         stack_count: None,
                         filter_match_count: None,
+                        page_count: None,
                         media_duration: None,
                         bookmark_time: None,
                         bookmark_title: None,
@@ -4425,6 +4427,7 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
+                    page_count: None,
                     media_duration: None,
                     bookmark_time: Some("0:25"),
                     bookmark_title: None,
@@ -4457,7 +4460,7 @@ fn rating_shares_the_bottom_row_with_a_centred_filename_dark() {
     );
 }
 
-fn media_duration_badges_fixture(ui: &mut egui::Ui) {
+fn numeric_thumbnail_badges_fixture(ui: &mut egui::Ui, page_counts: bool) {
     use mimageviewer::thumb_overlay_layout::{
         BadgeKind, BottomContainerInput, BottomContainerKind, EditBadgeFlags, FormatBadgeKind,
         ThumbnailOverlayLayoutInput, layout_thumbnail_overlays,
@@ -4483,14 +4486,15 @@ fn media_duration_badges_fixture(ui: &mut egui::Ui) {
                 name_style: Default::default(),
                 cell,
                 inner,
-                book_resume_meter: false,
+                book_resume_meter: page_counts,
                 checked: false,
                 stack_count: None,
                 filter_match_count: count,
-                media_duration: Some(duration),
+                page_count: page_counts.then_some(duration),
+                media_duration: (!page_counts).then_some(duration),
                 bookmark_time: None,
                 bookmark_title: None,
-                upscaled_video: dense,
+                upscaled_video: dense && !page_counts,
                 edit_badges: EditBadgeFlags {
                     crop: dense,
                     pin: dense,
@@ -4498,11 +4502,19 @@ fn media_duration_badges_fixture(ui: &mut egui::Ui) {
                 },
                 tags: &[],
                 bottom_container: dense.then_some(BottomContainerInput {
-                    kind: BottomContainerKind::Format(FormatBadgeKind::Video),
-                    label: "MOV",
+                    kind: BottomContainerKind::Format(if page_counts {
+                        FormatBadgeKind::Zip
+                    } else {
+                        FormatBadgeKind::Video
+                    }),
+                    label: if page_counts { "ZIP" } else { "MOV" },
                 }),
                 rating_text: dense.then_some("★★★"),
-                filename: dense.then_some("holiday.mp4"),
+                filename: dense.then_some(if page_counts {
+                    "book.zip"
+                } else {
+                    "holiday.mp4"
+                }),
             },
             |text, style| {
                 mimageviewer::ui_helpers::measure_thumbnail_badge_text(&painter, text, style)
@@ -4510,7 +4522,7 @@ fn media_duration_badges_fixture(ui: &mut egui::Ui) {
         );
         for placement in layout.badge_placements() {
             match placement.kind {
-                BadgeKind::MediaDuration => {
+                BadgeKind::MediaDuration | BadgeKind::PageCount => {
                     mimageviewer::ui_helpers::draw_overlay_media_duration_badge(&painter, placement)
                 }
                 BadgeKind::UpscaledVideo => {
@@ -4552,17 +4564,68 @@ fn media_duration_badges_fixture(ui: &mut egui::Ui) {
             }
         }
     };
-    ui.label("Media duration: short and long");
-    ui.horizontal(|ui| {
-        draw_cell(ui, 200.0, "0:07", None, false);
-        draw_cell(ui, 200.0, "100:02:03", None, false);
+    ui.label(if page_counts {
+        "Page count: normal and 10,000 pages; saved-position band reserved"
+    } else {
+        "Media duration: short and long"
     });
-    ui.label("Filter count owns the corner; small cells omit duration");
     ui.horizontal(|ui| {
-        draw_cell(ui, 200.0, "1:02:03", Some(42), true);
-        draw_cell(ui, 100.0, "1:02:03", Some(42), true);
-        draw_cell(ui, 32.0, "1:02:03", Some(42), true);
+        draw_cell(
+            ui,
+            200.0,
+            if page_counts { "123P" } else { "0:07" },
+            None,
+            false,
+        );
+        draw_cell(
+            ui,
+            200.0,
+            if page_counts { "10000P" } else { "100:02:03" },
+            None,
+            false,
+        );
     });
+    ui.label(if page_counts {
+        "Filter count owns the corner; small cells omit page count"
+    } else {
+        "Filter count owns the corner; small cells omit duration"
+    });
+    ui.horizontal(|ui| {
+        draw_cell(
+            ui,
+            200.0,
+            if page_counts { "123P" } else { "1:02:03" },
+            Some(42),
+            true,
+        );
+        draw_cell(
+            ui,
+            100.0,
+            if page_counts { "123P" } else { "1:02:03" },
+            Some(42),
+            true,
+        );
+        draw_cell(
+            ui,
+            32.0,
+            if page_counts { "123P" } else { "1:02:03" },
+            Some(42),
+            true,
+        );
+    });
+}
+
+fn media_duration_badges_fixture(ui: &mut egui::Ui) {
+    numeric_thumbnail_badges_fixture(ui, false);
+}
+
+#[test]
+fn page_count_883_badges_dark() {
+    snapshot_with_theme(
+        "page_count_883_badges_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| numeric_thumbnail_badges_fixture(ui, true),
+    );
 }
 
 #[test]
@@ -4612,6 +4675,7 @@ fn bookmark_time_and_tag_badges_dark() {
                     checked: false,
                     stack_count: None,
                     filter_match_count: None,
+                    page_count: None,
                     media_duration: None,
                     bookmark_time: Some("12:34"),
                     bookmark_title: None,
