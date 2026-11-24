@@ -60,6 +60,272 @@ fn finish_migrations(app: &mut App) {
     assert!(app.rename_migration_boot_retry.is_empty());
 }
 
+fn recover_journal_through_collection_actor(legacy_without_rels: bool) {
+    use crate::collection_store::{
+        CollectionRegistration, CollectionResolvedKind, CollectionStoreRuntime,
+    };
+    let mut env = setup_app();
+    let data = env.tmp.path().to_path_buf();
+    let app = &mut env.app;
+    let ctx = egui::Context::default();
+    app.rename_migration_data_dir_override = Some(data.clone());
+    assert!(matches!(
+        app.rename_migration_journal_admission,
+        RenameMigrationJournalAdmission::Unloaded
+    ));
+    assert!(app.rename_migration_queue.is_empty());
+    assert!(app.rename_migration_in_flight.is_none());
+
+    let old = data.join("before");
+    let new = data.join("after");
+    let rels = [PathBuf::from("one.rar"), PathBuf::from("nested/two.7z")];
+    // Model filesystem commit before the previous session stopped. The old
+    // journal must not reconstruct a missing inventory from this existing tree.
+    std::fs::create_dir_all(new.join("nested")).unwrap();
+    for relative in &rels {
+        std::fs::write(new.join(relative), b"archive fixture").unwrap();
+    }
+    let old_caches = rels.each_ref().map(|rel| cache(&data, &old.join(rel)));
+    let new_caches = rels.each_ref().map(|rel| cache(&data, &new.join(rel)));
+    let mut saved_positions = Vec::new();
+    for (index, backing) in old_caches.iter().enumerate() {
+        saved_positions.push(record_position(
+            &data,
+            &BookResumeKey::legacy(backing),
+            &archive_pages(backing, &[]),
+            None,
+            2,
+        ));
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.brightness = 11.0 + index as f32;
+        app.adjustment_db
+            .as_ref()
+            .unwrap()
+            .set_page_params(&page_key(backing), &params)
+            .unwrap();
+    }
+    let old_logical = old.join(&rels[0]);
+    let new_logical = new.join(&rels[0]);
+    let mut logical_params = crate::adjustment::AdjustParams::default();
+    logical_params.brightness = 31.0;
+    app.adjustment_db
+        .as_ref()
+        .unwrap()
+        .set_page_params(&page_key(&old_logical), &logical_params)
+        .unwrap();
+
+    let runtime = CollectionStoreRuntime::start_at(data.join("collection.db")).unwrap();
+    let client = runtime.client();
+    app.install_collection_runtime(runtime);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(app.collection_store_client_for_read(), Ok(Some(_))) {
+        assert!(
+            Instant::now() < deadline,
+            "collection actor did not become ready"
+        );
+        app.poll_collection_ui(&ctx);
+        std::thread::yield_now();
+    }
+    let created = client
+        .create_collection("section1886 journal recovery".into())
+        .unwrap()
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    // The cache entries are sentinels: adding cache pairs to the actor's batch
+    // would move them, even when every generic store correctly skips those pairs.
+    let sources = [
+        (old.clone(), CollectionResolvedKind::Folder),
+        (
+            old_logical.clone(),
+            CollectionResolvedKind::ConvertibleArchive,
+        ),
+        (
+            old.join(&rels[1]),
+            CollectionResolvedKind::ConvertibleArchive,
+        ),
+        (old_caches[0].clone(), CollectionResolvedKind::Zip),
+        (old_caches[1].clone(), CollectionResolvedKind::Zip),
+    ];
+    let registrations = sources
+        .iter()
+        .map(|(path, kind)| CollectionRegistration::from_trusted_path(path, *kind).unwrap())
+        .collect();
+    let before = client
+        .add_batch(created.collection_id(), created.revision(), registrations)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    assert_eq!(before.entries.len(), sources.len());
+
+    let mut job = migration::PathMigrationJob::shell_rename(old.clone(), new.clone(), true);
+    job.generic_pending = legacy_without_rels;
+    job.converted_archive_rels = rels.to_vec();
+    if legacy_without_rels {
+        let mut json = serde_json::to_value(vec![job.clone()]).unwrap();
+        json[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("converted_archive_rels");
+        std::fs::write(
+            data.join(migration::JOURNAL_FILE),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+    } else {
+        migration::journal_save(&data, std::slice::from_ref(&job)).unwrap();
+    }
+
+    // The same lazy startup reader loads the queue; never enqueue the decoded
+    // job ourselves or call run_at directly in place of the dispatcher.
+    assert!(app.ensure_rename_migration_journal_loaded());
+    assert_eq!(app.rename_migration_queue.len(), 1);
+    let recovered = &app.rename_migration_queue[0];
+    assert_eq!(recovered.mappings, job.mappings);
+    assert_eq!(recovered.generic_pending, legacy_without_rels);
+    if legacy_without_rels {
+        assert!(recovered.converted_archive_rels.is_empty());
+    } else {
+        assert_eq!(recovered.converted_archive_rels, job.converted_archive_rels);
+    }
+    app.try_start_next_rename_migration();
+    let mut saw_generic = false;
+    let mut saw_collection = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while app.rename_migration_in_flight.is_some() || !app.rename_migration_queue.is_empty() {
+        assert!(Instant::now() < deadline, "journal recovery did not finish");
+        match app.rename_migration_in_flight.as_ref() {
+            Some(RenameMigrationInFlight::Generic { .. }) => {
+                assert!(
+                    legacy_without_rels,
+                    "generic_pending=false must never start a generic worker"
+                );
+                saw_generic = true;
+            }
+            Some(RenameMigrationInFlight::Collection {
+                job: dispatched, ..
+            }) => {
+                assert!(!dispatched.generic_pending);
+                assert_eq!(dispatched.mappings, job.mappings);
+                saw_collection = true;
+            }
+            None => {}
+        }
+        app.poll_rename_migration_pending(&ctx);
+        std::thread::yield_now();
+    }
+    assert_eq!(saw_generic, legacy_without_rels);
+    assert!(
+        saw_collection,
+        "recovery must reach the installed collection actor"
+    );
+    assert!(app.rename_migration_boot_retry.is_empty());
+    app.flush_rename_migration_journal().unwrap();
+    assert!(
+        migration::journal_load(&data).unwrap().is_empty(),
+        "actor ACK must retire the journal"
+    );
+
+    let after = client
+        .load_collection(before.collection_id())
+        .unwrap()
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    let expected_paths = [
+        new.clone(),
+        new_logical.clone(),
+        new.join(&rels[1]),
+        old_caches[0].clone(),
+        old_caches[1].clone(),
+    ];
+    assert_eq!(after.entries.len(), before.entries.len());
+    assert!(
+        after.revision() > before.revision(),
+        "the logical tree mapping must actually commit"
+    );
+    for ((original, migrated), path) in before
+        .entries
+        .iter()
+        .zip(after.entries.iter())
+        .zip(expected_paths)
+    {
+        assert_eq!(migrated.id, original.id);
+        assert_eq!(
+            migrated.source_path, path,
+            "only the original logical mapping may change collection sources"
+        );
+        let expected =
+            CollectionRegistration::from_trusted_path(&path, original.resolved_kind).unwrap();
+        assert_eq!(&migrated.source_key, expected.source_key());
+    }
+    for (index, (backing, destination)) in old_caches.iter().zip(new_caches.iter()).enumerate() {
+        assert_eq!(
+            read_position(&data, &BookResumeKey::legacy(backing)),
+            Some(saved_positions[index].clone())
+        );
+        assert_restored(
+            &data,
+            &BookResumeKey::legacy(backing),
+            &archive_pages(backing, &[]),
+            None,
+            2,
+        );
+        assert!(read_position(&data, &BookResumeKey::legacy(destination)).is_none());
+        assert_eq!(
+            app.adjustment_db
+                .as_ref()
+                .unwrap()
+                .get_page_params(&page_key(backing))
+                .unwrap()
+                .brightness,
+            11.0 + index as f32
+        );
+        assert!(
+            app.adjustment_db
+                .as_ref()
+                .unwrap()
+                .get_page_params(&page_key(destination))
+                .is_none()
+        );
+    }
+    let (present, absent) = if legacy_without_rels {
+        (&new_logical, &old_logical)
+    } else {
+        (&old_logical, &new_logical)
+    };
+    assert_eq!(
+        app.adjustment_db
+            .as_ref()
+            .unwrap()
+            .get_page_params(&page_key(present))
+            .unwrap()
+            .brightness,
+        31.0
+    );
+    assert!(
+        app.adjustment_db
+            .as_ref()
+            .unwrap()
+            .get_page_params(&page_key(absent))
+            .is_none()
+    );
+    app.shutdown_collection_runtime_for_exit();
+}
+
+#[test]
+fn section1886_handler_journal_collection_only_recovery_keeps_cache_faces_and_logical_mapping_only()
+{
+    recover_journal_through_collection_actor(false);
+}
+
+#[test]
+fn section1886_handler_legacy_journal_recovery_keeps_cache_faces_and_logical_mapping_only() {
+    recover_journal_through_collection_actor(true);
+}
+
 fn consecutive_renames(pending_save: bool) {
     let mut env = setup_app();
     let data = env.tmp.path().to_path_buf();

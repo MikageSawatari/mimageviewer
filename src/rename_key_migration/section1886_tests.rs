@@ -1,8 +1,4 @@
-use super::resume_identity_tests::{
-    SAVED_PAGE, archive_pages, assert_restored, read_position, record_position,
-};
 use super::*;
-use crate::book_resume_key::BookResumeKey;
 
 fn adjustment_fixture(data: &Path) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open(data.join("adjustment.db")).unwrap();
@@ -352,7 +348,7 @@ fn section1886_pure_pairs_reject_invalid_journal_relative_paths() {
 }
 
 #[test]
-fn section1886_journal_roundtrip_default_legacy_and_collection_only_keep_logical_mappings() {
+fn section1886_journal_roundtrip_defaults_and_legacy_formats() {
     let temp = tempfile::tempdir().unwrap();
     let old = Path::new("C:/section1886/old");
     let new = Path::new("C:/section1886/new");
@@ -371,35 +367,10 @@ fn section1886_journal_roundtrip_default_legacy_and_collection_only_keep_logical
     let tuples = parse_journal_bytes(&tuples).unwrap();
     assert!(tuples[0].converted_archive_rels.is_empty());
     assert!(tuples[0].generic_pending);
-    let cache =
-        crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), &old.join("one.rar"));
-    record_position(
-        temp.path(),
-        &BookResumeKey::legacy(&cache),
-        &archive_pages(&cache, &[]),
-        None,
-        SAVED_PAGE,
-    );
     job.generic_pending = false;
     journal_save(temp.path(), std::slice::from_ref(&job)).unwrap();
     let loaded = journal_load(temp.path()).unwrap().remove(0);
-    assert!(
-        loaded.generic_pair().is_none(),
-        "stopped generic stage must not run cache migrations"
-    );
+    assert!(!loaded.generic_pending);
     assert_eq!(loaded.mappings, job.mappings);
-    assert_eq!(
-        loaded.mappings.len(),
-        1,
-        "only the logical mapping reaches collections"
-    );
     assert_eq!(loaded.converted_archive_rels, job.converted_archive_rels);
-    assert!(read_position(temp.path(), &BookResumeKey::legacy(&cache)).is_some());
-    assert_restored(
-        temp.path(),
-        &BookResumeKey::legacy(&cache),
-        &archive_pages(&cache, &[]),
-        None,
-        SAVED_PAGE,
-    );
 }

@@ -1,6 +1,6 @@
 # 変換して開く書庫の改名・移動で、変換キャッシュ側のキーも移す (§1.886)
 
-2026-11-24 設計担当 ClaudeCode Opus 5.5 (セッション conv-rename-886)。状態: **設計 v5 (独立設計レビュー r5 ACCEPT)、実装中**。
+2026-11-24 設計担当 ClaudeCode Opus 5.5 (セッション conv-rename-886)。状態: **設計 v5 (独立設計レビュー r5 ACCEPT)、実装済み・実装の独立レビュー中**。
 バックログの正本は [next-release-backlog.md](next-release-backlog.md) §1.886。前提として読む文書:
 [edit-content-identity-plan.md](edit-content-identity-plan.md) §4 (変換キャッシュ ZIP の置き場と 4 面)、
 [book-key-migration-plan.md](book-key-migration-plan.md) §3.4、`src/rename_key_migration.rs` のモジュール doc、
@@ -292,6 +292,16 @@ job は今までどおり配下の cache の面を移さないだけ)。旧形�
   新規の行も対象になり影響範囲は広がるが、C6 で明記した制限と §5 の別項目を前提に、r4 の P2 を §1.886 の阻害指摘から外す
   (問題自体が解消したという評価ではない)。
   - P3: C4 に C6 の例外の参照を足す、§4 の「新しく生まれるものではない」を「既存の仕組みで、適用範囲が広がる」にする。→ 直した。
+- **実装 r1** (Codex gpt-6.1-sol / xhigh、read-only、実装・設計レビューとは別の会話、SID 01a20e5b-a5b1-7eb1-9c1a-d52b4a490118、
+  2026-11-25、対象 92477d048..b7b1e3ec8): **REVISE** (P1 なし、P2 1 件、P3 1 件)。transaction・行の省略・identity の
+  1 回の書き換え・DestinationWins・列挙と journal の受け渡しに阻害指摘なし。
+  - P2: 移した編集プレビュー (`edit_previews`) の `source_mtime` は旧キャッシュ ZIP の値のままで、改名後に変換し直した ZIP は
+    日時が変わるので、`edit_preview_cache.rs` の照合で行が消え、通常のサムネイルに戻る。→ 設計担当の判断: 変換キャッシュの
+    ページの日時は ZIP ファイルの日時 (`zip_loader.rs` の `zip_mtime`) なので、改名に限らず、容量上限・管理画面での削除の後に
+    変換し直したときも同じことが起きる既存の性質。プレビューは作り直せる派生データで、編集自体は残る。この項目では直さず
+    §5 に記録した。
+  - P3: journal のテストが job を実行していない。→ 実装担当が、起動時の読み込みから本番のキュー・dispatcher・collection 段の
+    完了までを通す handler テストに直した。
 
 ## 5. 別項目の候補 (この項目では直さない)
 
@@ -304,7 +314,9 @@ job は今までどおり配下の cache の面を移さないだけ)。旧形�
   動かしてしまうこと (元の組も cache の組も同じ。C6)。直すなら、旧パスとその配下への新しい閲覧・保存を、該当する
   移行の確定まで受け付けない境界が要り、既存の操作を待たせることになるので、統括・利用者の判断が要る。
   移行 job は通常、改名の直後 (保存 worker が空いた時点) に始まるので、窓は短い (未計測)。
-
+- 変換し直した書庫の編集プレビューが使われないこと: 変換キャッシュのページの日時は ZIP ファイルの日時なので、変換し直すと
+  (改名・移動の後、容量上限や管理画面での削除の後) 保存済みのプレビューの照合が合わず、通常のサムネイルに戻る
+  (実装の独立レビュー r1 P2。コード参照、実機未確認)。
 
 ## 6. 実装記録
 
@@ -343,6 +355,13 @@ job は今までどおり配下の cache の面を移さないだけ)。旧形�
   ROOT の `service_update_registered_writers` を通る Building → 実 DB worker の Running → fresh snapshot の採用、
   採用 stamp と保存された補正の値を検査する。10 秒の期限は延ばしていない。元の論理パスの非同期再準備にも同じ回帰検査を加えた。
   unused import の `ConvertedArchiveEnumeration` の再公開を削除した。この追加修正の build・test・check は実行していない。
+- journal の動作確認を App の handler テストへ移した。`generic_pending=false` で一覧を持つ job と、
+  一覧の欄が無い旧 journal のフォルダ job をディスクへ保存し、App の起動時の読み込みと
+  `try_start_next_rename_migration` から実 collection actor の ACK・journal 消去まで実行する。
+  元の論理参照と旧 cache の参照を同じ collection に登録し、元の参照だけが移ることを確認する。
+  cache の読書位置・補正は旧側に残り、新側に作られないことも確認する。
+  旧 journal の job では generic 段の実行と元の補正の移行も確認し、generic 段を止めた job では起動しないことを確認する。
+  純粋な journal テストは保存・読み込みと既定値・旧 tuple 形式の互換確認に限定した。この変更はテストと本節だけで、実行は設計担当へ引き継ぐ。
 
 追加したテストの名前 (Windows / Unix 限定のものを含む。未実行):
 
@@ -370,12 +389,14 @@ section1886_fs_enumeration_has_stable_relative_paths_and_reports_failure
 section1886_fs_enumeration_never_enters_junction_or_junction_root
 section1886_fs_enumeration_never_enters_symlinks
 section1886_pure_pairs_reject_invalid_journal_relative_paths
-section1886_journal_roundtrip_default_legacy_and_collection_only_keep_logical_mappings
+section1886_journal_roundtrip_defaults_and_legacy_formats
 ```
 
 `src/app/converted_archive_rename/tests.rs`:
 
 ```text
+section1886_handler_journal_collection_only_recovery_keeps_cache_faces_and_logical_mapping_only
+section1886_handler_legacy_journal_recovery_keeps_cache_faces_and_logical_mapping_only
 section1886_handler_consecutive_folder_renames_use_frozen_fs_inventory
 section1886_handler_consecutive_renames_wait_for_unfinished_cache_save
 section1886_handler_delete_waits_for_rename_and_suppresses_cache_stage
