@@ -1876,7 +1876,28 @@ fn draw_operation_diff(
                 ui.label(format_chords(&change.after));
                 ui.end_row();
             }
+            if let Some((before, after)) = operation_diff.fullscreen_primary_click_change {
+                ui.label("閲覧中の左クリック");
+                ui.label(primary_click_diff_label(before));
+                ui.label(primary_click_diff_label(after));
+                ui.end_row();
+            }
+            if let Some((before, after)) = operation_diff.gamepad_enabled_change {
+                ui.label("ゲームパッドの操作を受け付ける");
+                ui.label(if before { "オン" } else { "オフ" });
+                ui.label(if after { "オン" } else { "オフ" });
+                ui.end_row();
+            }
         });
+}
+
+fn primary_click_diff_label(mode: crate::settings::FullscreenPrimaryClickMode) -> &'static str {
+    match mode {
+        crate::settings::FullscreenPrimaryClickMode::PageTurn => "クリックでページを送る",
+        crate::settings::FullscreenPrimaryClickMode::DoubleClickClose => {
+            "クリックでは送らず、ダブルクリックで閉じる"
+        }
+    }
 }
 
 fn format_chords(chords: &[String]) -> String {
@@ -2154,6 +2175,67 @@ mod tests {
     }
 
     #[test]
+    fn operation_file_import_unknown_primary_click_mode_shows_error() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut app = crate::app::setup_app_for_test();
+        let before = crate::operation_customize_share::OperationCustomizeBundle::from_settings(
+            &app.settings,
+        );
+        let mut json = serde_json::to_value(&before).unwrap();
+        json["fullscreen_primary_click"] = serde_json::json!("future_click_mode");
+        let path = app.tmp.path().join("unknown-primary-click.mivkeys.json");
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        app.show_settings_restore = true;
+        app.settings_restore_state.tab = SettingsRestoreTab::OperationCustomize;
+        begin_file_import(&mut app, path);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1200.0, 950.0))
+            .build_ui_state(
+                |root_ui, app| app.show_settings_restore_dialog(root_ui.ctx()),
+                app,
+            );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while harness
+            .state()
+            .settings_restore_state
+            .operation_task_rx
+            .is_some()
+        {
+            harness.run_steps(2);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "file import did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        harness.run();
+        let (is_error, message) = harness
+            .state()
+            .settings_restore_state
+            .operation_message
+            .as_ref()
+            .unwrap();
+        assert!(*is_error);
+        assert!(message.contains("ファイルを読み込めませんでした"));
+        assert!(message.contains("future_click_mode"));
+        assert!(harness.query_by_label(message).is_some());
+        assert!(
+            harness
+                .state()
+                .settings_restore_state
+                .operation_modal
+                .is_none()
+        );
+        assert!(before.settings_eq(
+            &crate::operation_customize_share::OperationCustomizeBundle::from_settings(
+                &harness.state().settings,
+            )
+        ));
+    }
+
+    #[test]
     fn operation_modal_size_is_clamped_to_the_viewport() {
         assert_eq!(
             operation_modal_size(egui::vec2(1_200.0, 900.0)),
@@ -2176,6 +2258,122 @@ mod tests {
             operation_modal_body_height(OPERATION_MODAL_MIN_SIZE.y),
             320.0
         );
+    }
+
+    #[test]
+    fn operation_primary_click_change_is_visible_in_import_and_generation_previews() {
+        use crate::operation_customize_share::OperationCustomizeBundle;
+
+        let current = OperationCustomizeBundle::defaults();
+        let mut imported = current.clone();
+        imported.fullscreen_primary_click =
+            crate::settings::FullscreenPrimaryClickMode::DoubleClickClose;
+        assert_operation_setting_diff_previews(
+            &current,
+            &imported,
+            "閲覧中の左クリック",
+            "クリックでページを送る",
+            "クリックでは送らず、ダブルクリックで閉じる",
+        );
+    }
+
+    #[test]
+    fn operation_older_bundle_primary_click_reset_is_visible_in_previews() {
+        use crate::operation_customize_share::{OperationCustomizeBundle, parse_json};
+
+        let mut current = OperationCustomizeBundle::defaults();
+        current.fullscreen_primary_click =
+            crate::settings::FullscreenPrimaryClickMode::DoubleClickClose;
+        let imported =
+            parse_json(r#"{"format":"mimageviewer.operation-customize","format_version":1}"#)
+                .unwrap();
+        assert_operation_setting_diff_previews(
+            &current,
+            &imported.bundle,
+            "閲覧中の左クリック",
+            "クリックでは送らず、ダブルクリックで閉じる",
+            "クリックでページを送る",
+        );
+    }
+
+    #[test]
+    fn operation_gamepad_change_is_visible_in_import_and_generation_previews() {
+        use crate::operation_customize_share::OperationCustomizeBundle;
+
+        let current = OperationCustomizeBundle::defaults();
+        let mut imported = current.clone();
+        imported.gamepad_enabled = false;
+        assert_operation_setting_diff_previews(
+            &current,
+            &imported,
+            "ゲームパッドの操作を受け付ける",
+            "オン",
+            "オフ",
+        );
+    }
+
+    fn assert_operation_setting_diff_previews(
+        current: &crate::operation_customize_share::OperationCustomizeBundle,
+        imported: &crate::operation_customize_share::OperationCustomizeBundle,
+        label: &str,
+        before: &str,
+        after: &str,
+    ) {
+        use egui_kittest::kittest::Queryable;
+
+        for target in [
+            None,
+            Some(DiffCompareTarget::Current),
+            Some(DiffCompareTarget::Previous),
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            current.apply_to(&mut app.settings);
+            app.settings_restore_state.operation_modal = Some(match target {
+                None => OperationModal::Import {
+                    source_label: "取り込むファイル".into(),
+                    bundle: imported.clone(),
+                    warnings: vec![],
+                    ignored_items: 0,
+                },
+                Some(target) => OperationModal::Diff {
+                    source_label: "世代 1".into(),
+                    source: BackupSource::Bak(1),
+                    bundle: imported.clone(),
+                    current: current.clone(),
+                    target,
+                    previous: Some(Ok(("世代 2".into(), current.clone()))),
+                },
+            });
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1200.0, 950.0))
+                .build_ui_state(
+                    |root_ui, app| app.show_operation_share_modal(root_ui.ctx()),
+                    app,
+                );
+            harness.run();
+            assert!(
+                harness.query_by_label(label).is_some(),
+                "{target:?}: {label}"
+            );
+            assert!(
+                harness.query_by_label(before).is_some(),
+                "{target:?}: {before}"
+            );
+            assert!(
+                harness.query_by_label(after).is_some(),
+                "{target:?}: {after}"
+            );
+            assert!(
+                harness.query_by_label("差分はありません。").is_none(),
+                "{target:?}"
+            );
+            assert!(
+                harness
+                    .query_by_label("クリックでページを送る (既定)")
+                    .is_none()
+            );
+        }
     }
 
     #[test]
