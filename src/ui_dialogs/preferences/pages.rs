@@ -1438,7 +1438,8 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.checkbox(
             &mut state.settings.thumb_cover_auto_crop,
             "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)",
-        );
+        )
+        .on_hover_text("お気に入りごとの入/切は「お気に入り」→「編集」で変えられます。");
         ui.add_enabled_ui(state.settings.thumb_cover_auto_crop, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("綴じ方向:");

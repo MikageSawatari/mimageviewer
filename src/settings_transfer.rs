@@ -3352,6 +3352,7 @@ mod tests {
             path: sentinel.into(),
         }];
         settings.favorites = vec![FavoriteEntry {
+            cover_auto_crop: Default::default(),
             id: uuid::Uuid::new_v4(),
             name: "private-favorite".into(),
             path: sentinel.into(),

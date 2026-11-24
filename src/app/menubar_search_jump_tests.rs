@@ -164,6 +164,7 @@ fn configure_destination(app: &mut App, entrance: Entrance, target: &Path) {
     match entrance {
         Entrance::Favorite => {
             app.settings.favorites = vec![crate::settings::FavoriteEntry {
+                cover_auto_crop: Default::default(),
                 id: uuid::Uuid::new_v4(),
                 name: "search jump test favorite".into(),
                 path: target.to_path_buf(),

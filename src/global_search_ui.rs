@@ -6369,6 +6369,7 @@ pub(crate) mod tests {
 
     fn favorite_filter_fixture(id: u128, path: &str, on: bool) -> crate::settings::FavoriteEntry {
         crate::settings::FavoriteEntry {
+            cover_auto_crop: Default::default(),
             id: Uuid::from_u128(id),
             name: String::new(),
             path: path.into(),

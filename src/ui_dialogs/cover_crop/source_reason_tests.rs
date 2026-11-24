@@ -25,7 +25,13 @@ fn assert_folder_stop(
     assert_eq!(
         prepared.auto_detection,
         AutoDetection::Stopped(
-            AutoStop::for_source(&resolved.auto_cover_crop, env.auto_cover_crop.is_some()).unwrap()
+            AutoStop::for_source(
+                &resolved.auto_cover_crop,
+                env.cover_auto_crop_scope
+                    .identity_for(&container.path)
+                    .is_some(),
+            )
+            .unwrap()
         )
     );
     assert_eq!(
@@ -38,7 +44,10 @@ fn assert_folder_stop(
     {
         assert_eq!(
             prepared.auto_detection.enabled(),
-            env.auto_cover_crop.is_some() && auto_eligible_after_clear,
+            env.cover_auto_crop_scope
+                .identity_for(&container.path)
+                .is_some()
+                && auto_eligible_after_clear,
             "manual reason must retain the setting for clear-crop guidance"
         );
     }
@@ -67,10 +76,12 @@ fn cover_crop_folder_stops_arrive_from_worker_for_pin_manual_setting_and_descend
     let mut env = BookCoverEnv {
         books_root: Some(temp.path().to_owned()),
         pin_db: Some(pin_db.clone()),
-        auto_cover_crop: Some(crate::cover_auto_crop::AutoCropIdentity {
-            binding: crate::settings::ReadingDirection::Rtl,
-            folders: true,
-        }),
+        cover_auto_crop_scope: CoverAutoCropScope::for_identity(Some(
+            crate::cover_auto_crop::AutoCropIdentity {
+                binding: crate::settings::ReadingDirection::Rtl,
+                folders: true,
+            },
+        )),
         ..Default::default()
     };
     let source = FolderPinSource::File {
@@ -103,7 +114,7 @@ fn cover_crop_folder_stops_arrive_from_worker_for_pin_manual_setting_and_descend
         .unwrap();
     for enabled in [true, false] {
         if !enabled {
-            env.auto_cover_crop = None;
+            env.cover_auto_crop_scope = CoverAutoCropScope::default();
         }
         assert_folder_stop(
             &container,
@@ -123,8 +134,8 @@ fn cover_crop_folder_stops_arrive_from_worker_for_pin_manual_setting_and_descend
         AutoCoverSkip::Off,
         "自動の切り出しはオフです",
     );
-    env.auto_cover_crop = Some(crate::cover_auto_crop::AutoCropIdentity::new(
-        crate::settings::ReadingDirection::Rtl,
+    env.cover_auto_crop_scope = CoverAutoCropScope::for_identity(Some(
+        crate::cover_auto_crop::AutoCropIdentity::new(crate::settings::ReadingDirection::Rtl),
     ));
     assert_folder_stop(
         &container,
@@ -133,7 +144,11 @@ fn cover_crop_folder_stops_arrive_from_worker_for_pin_manual_setting_and_descend
         AutoCoverSkip::FolderDisabled,
         "画像フォルダの本は自動の対象にしていません (環境設定で変えられます)",
     );
-    env.auto_cover_crop.as_mut().unwrap().folders = true;
+    env.cover_auto_crop_scope =
+        CoverAutoCropScope::for_identity(Some(crate::cover_auto_crop::AutoCropIdentity {
+            binding: crate::settings::ReadingDirection::Rtl,
+            folders: true,
+        }));
     let parent = BookCoverContainer {
         path: temp.path().to_owned(),
         ..container.clone()

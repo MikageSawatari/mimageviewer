@@ -42,8 +42,9 @@ use crate::external_tool::{
     SelectionPolicy, SpreadPolicy, VideoPolicy, classify_legacy_recent_launch,
 };
 use crate::settings::{
-    AgentLevel, FavoriteEntry, LegacyOpenWithApp, PermissionSnapshot, RecentApp, Settings, TagDef,
-    Vst3ChainPresetSlot, Vst3ChainPresetSlots, Vst3PluginEntry,
+    AgentLevel, FavoriteCoverAutoCropPreference, FavoriteEntry, LegacyOpenWithApp,
+    PermissionSnapshot, RecentApp, Settings, TagDef, Vst3ChainPresetSlot, Vst3ChainPresetSlots,
+    Vst3PluginEntry,
 };
 
 const SCHEMA_VERSION: &str = "1";
@@ -1919,7 +1920,8 @@ fn init_schema_inner(conn: &Connection) -> rusqlite::Result<()> {
             auto_index_structure  INTEGER NOT NULL DEFAULT 0,
             auto_index_metadata   INTEGER NOT NULL DEFAULT 0,
             auto_index_thumbs     INTEGER NOT NULL DEFAULT 0,
-            auto_index_similar    INTEGER NOT NULL DEFAULT 0
+            auto_index_similar    INTEGER NOT NULL DEFAULT 0,
+            cover_auto_crop       INTEGER NOT NULL DEFAULT 0
          );
          CREATE INDEX IF NOT EXISTS favorites_sort ON favorites(sort_index);
 
@@ -2062,6 +2064,13 @@ fn migrate_favorites_table(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute(
             "ALTER TABLE favorites
              ADD COLUMN auto_index_similar INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !table_has_column(conn, "favorites", "cover_auto_crop")? {
+        conn.execute(
+            "ALTER TABLE favorites
+             ADD COLUMN cover_auto_crop INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
@@ -2361,8 +2370,8 @@ fn write_favorites(
         "INSERT INTO favorites
             (id, name, path, sort_index,
              auto_index_structure, auto_index_metadata, auto_index_thumbs,
-             auto_index_similar)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             auto_index_similar, cover_auto_crop)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
     )?;
     for (idx, fav) in favorites.iter().enumerate() {
         stmt.execute(params![
@@ -2374,6 +2383,11 @@ fn write_favorites(
             fav.auto_index_metadata as i64,
             fav.auto_index_thumbs as i64,
             fav.auto_index_similar as i64,
+            match fav.cover_auto_crop {
+                FavoriteCoverAutoCropPreference::FollowGlobal => 0_i64,
+                FavoriteCoverAutoCropPreference::On => 1,
+                FavoriteCoverAutoCropPreference::Off => 2,
+            },
         ])?;
     }
     Ok(())
@@ -2382,7 +2396,7 @@ fn write_favorites(
 fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbError> {
     let mut stmt = conn.prepare(
         "SELECT id, name, path, auto_index_structure, auto_index_metadata, auto_index_thumbs,
-                auto_index_similar
+                auto_index_similar, cover_auto_crop
          FROM favorites
          ORDER BY sort_index ASC",
     )?;
@@ -2394,6 +2408,7 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
         let auto_index_metadata: i64 = row.get(4)?;
         let auto_index_thumbs: i64 = row.get(5)?;
         let auto_index_similar: i64 = row.get(6)?;
+        let cover_auto_crop: i64 = row.get(7)?;
         Ok((
             id_bytes,
             name,
@@ -2402,11 +2417,16 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
             auto_index_metadata != 0,
             auto_index_thumbs != 0,
             auto_index_similar != 0,
+            match cover_auto_crop {
+                1 => FavoriteCoverAutoCropPreference::On,
+                2 => FavoriteCoverAutoCropPreference::Off,
+                _ => FavoriteCoverAutoCropPreference::FollowGlobal,
+            },
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id_bytes, name, path, ais, aim, ait, aiv) = row?;
+        let (id_bytes, name, path, ais, aim, ait, aiv, cover_auto_crop) = row?;
         // Codex P2 v8 (2026-05-13): UUID 長が 16 でないなら row 破損。silently nil に
         // fallback すると save_full 後に「ユーザーが個別 favorite を編集していた状態」
         // が消える。Corrupted で上層に伝え、bak / JSON migration へ倒す。
@@ -2424,6 +2444,7 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
             auto_index_metadata: aim,
             auto_index_thumbs: ait,
             auto_index_similar: aiv,
+            cover_auto_crop,
         });
     }
     Ok(out)
@@ -2513,6 +2534,7 @@ fn favorite_entries_equal(left: &[FavoriteEntry], right: &[FavoriteEntry]) -> bo
                 && left.auto_index_metadata == right.auto_index_metadata
                 && left.auto_index_thumbs == right.auto_index_thumbs
                 && left.auto_index_similar == right.auto_index_similar
+                && left.cover_auto_crop == right.cover_auto_crop
         })
 }
 
@@ -5672,6 +5694,7 @@ mod tests {
                 auto_index_metadata: false,
                 auto_index_thumbs: true,
                 auto_index_similar: true,
+                cover_auto_crop: FavoriteCoverAutoCropPreference::On,
             },
             FavoriteEntry {
                 id: Uuid::new_v4(),
@@ -5681,6 +5704,7 @@ mod tests {
                 auto_index_metadata: true,
                 auto_index_thumbs: false,
                 auto_index_similar: false,
+                cover_auto_crop: FavoriteCoverAutoCropPreference::Off,
             },
         ];
         s.tags = vec![
@@ -7393,6 +7417,7 @@ mod tests {
             auto_index_metadata: false,
             auto_index_thumbs: false,
             auto_index_similar: false,
+            cover_auto_crop: FavoriteCoverAutoCropPreference::FollowGlobal,
         };
         settings.favorites = vec![favorite.clone()];
         settings.global_preset.brightness = 11.0;
@@ -7454,6 +7479,99 @@ mod tests {
             loaded.erase_inpaint_mono_tolerance,
             crate::settings::default_erase_inpaint_mono_tolerance()
         );
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_db_roundtrip_all_preferences() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        settings.favorites = FavoriteCoverAutoCropPreference::all()
+            .iter()
+            .enumerate()
+            .map(|(index, preference)| {
+                let mut favorite = FavoriteEntry::new(
+                    format!("favorite{index}"),
+                    PathBuf::from(format!("C:/books/{index}")),
+                );
+                favorite.cover_auto_crop = *preference;
+                favorite
+            })
+            .collect();
+        db.save_full(&settings).unwrap();
+
+        let loaded = db.load_into_settings().unwrap();
+        assert!(favorite_entries_equal(
+            &settings.favorites,
+            &loaded.favorites
+        ));
+        let inner = db.inner.lock().unwrap();
+        let mut statement = inner
+            .conn
+            .prepare("SELECT cover_auto_crop FROM favorites ORDER BY sort_index")
+            .unwrap();
+        let values = statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(values, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_db_unknown_values_follow_global() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut settings = Settings::default();
+        let mut favorite = FavoriteEntry::new("book".into(), PathBuf::from(r"C:\book"));
+        favorite.cover_auto_crop = FavoriteCoverAutoCropPreference::On;
+        settings.favorites.push(favorite);
+        db.save_full(&settings).unwrap();
+
+        for unknown in [-1, 3, i64::MIN, i64::MAX] {
+            db.inner
+                .lock()
+                .unwrap()
+                .conn
+                .execute("UPDATE favorites SET cover_auto_crop = ?1", [unknown])
+                .unwrap();
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(
+                loaded.favorites[0].cover_auto_crop,
+                FavoriteCoverAutoCropPreference::FollowGlobal,
+                "unknown stored value: {unknown}"
+            );
+        }
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_reader_observes_preference_only_changes() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings::default();
+        settings
+            .favorites
+            .push(FavoriteEntry::new("book".into(), PathBuf::from(r"C:\book")));
+        db.save_full(&settings).unwrap();
+        let mut reader = SettingsFavoritesReader::open_existing_read_only_at(
+            &settings_db_path(dir.path()),
+            settings.favorites.clone(),
+        )
+        .unwrap();
+        let mut previous = reader.current().unwrap();
+
+        for preference in [
+            FavoriteCoverAutoCropPreference::On,
+            FavoriteCoverAutoCropPreference::Off,
+            FavoriteCoverAutoCropPreference::FollowGlobal,
+        ] {
+            settings.favorites[0].cover_auto_crop = preference;
+            db.save_full(&settings).unwrap();
+            let current = reader.current().unwrap();
+            assert!(!Arc::ptr_eq(&previous, &current));
+            assert_eq!(current[0].cover_auto_crop, preference);
+            db.save_full(&settings).unwrap();
+            assert!(Arc::ptr_eq(&current, &reader.current().unwrap()));
+            previous = current;
+        }
     }
 
     #[test]
@@ -7616,6 +7734,75 @@ mod tests {
     }
 
     #[test]
+    fn favorite_cover_auto_crop_released_table_migrates_without_quarantine() {
+        let guard = DataDirOverrideGuard::new();
+        let db = SettingsDb::create_new(guard.path()).unwrap();
+        let mut settings = Settings::default();
+        let mut favorite = FavoriteEntry::new(
+            "既存のお気に入り".to_owned(),
+            PathBuf::from(r"C:\Pictures\old"),
+        );
+        favorite.auto_index_structure = true;
+        favorite.auto_index_metadata = true;
+        favorite.auto_index_thumbs = true;
+        favorite.auto_index_similar = true;
+        settings.favorites.push(favorite.clone());
+        db.save_full(&settings).unwrap();
+        drop(db);
+
+        // 自動切り出し列のないリリース済みの表を再現し、元の行を保持して移行する。
+        let conn = Connection::open(guard.path().join("settings.db")).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE favorites RENAME TO favorites_legacy;
+             DROP INDEX favorites_sort;
+             CREATE TABLE favorites (
+                id                    BLOB PRIMARY KEY,
+                name                  TEXT NOT NULL,
+                path                  TEXT NOT NULL,
+                sort_index            INTEGER NOT NULL,
+                auto_index_structure  INTEGER NOT NULL DEFAULT 0,
+                auto_index_metadata   INTEGER NOT NULL DEFAULT 0,
+                auto_index_thumbs     INTEGER NOT NULL DEFAULT 0,
+                auto_index_similar    INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO favorites
+                (id, name, path, sort_index, auto_index_structure,
+                 auto_index_metadata, auto_index_thumbs, auto_index_similar)
+             SELECT id, name, path, sort_index, auto_index_structure,
+                    auto_index_metadata, auto_index_thumbs, auto_index_similar
+             FROM favorites_legacy;
+             DROP TABLE favorites_legacy;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let outcome = boot_settings_db(guard.path());
+        assert_eq!(outcome.source, BootSource::LoadedExistingDb);
+        let db = outcome.db.as_ref().unwrap();
+        assert!(favorite_entries_equal(
+            &outcome.settings.favorites,
+            std::slice::from_ref(&favorite)
+        ));
+        let inner = db.inner.lock().unwrap();
+        assert_eq!(
+            inner
+                .conn
+                .query_row("SELECT cover_auto_crop FROM favorites", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        // 再適用しても列の追加を繰り返さない。
+        migrate_favorites_table(&inner.conn).unwrap();
+        assert!(
+            !std::fs::read_dir(guard.path())
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".corrupted-"))
+        );
+    }
+
+    #[test]
     fn released_favorites_table_without_similar_flag_migrates_without_quarantine() {
         let guard = DataDirOverrideGuard::new();
         let db = SettingsDb::create_new(guard.path()).unwrap();
@@ -7664,6 +7851,10 @@ mod tests {
         assert!(loaded.auto_index_structure);
         assert!(loaded.auto_index_metadata);
         assert!(!loaded.auto_index_similar);
+        assert_eq!(
+            loaded.cover_auto_crop,
+            FavoriteCoverAutoCropPreference::FollowGlobal
+        );
         assert!(
             !std::fs::read_dir(guard.path())
                 .unwrap()

@@ -26,6 +26,7 @@ fn cover_auto_folder_direct_selection_reuses_listing_and_excludes_descendants_an
         ..Default::default()
     };
     req.set_auto_cover_crop(Some(identity));
+    req.cover_auto_crop_scope = crate::cover_auto_crop::CoverAutoCropScope::for_identity(req.auto_cover_crop);
     assert_eq!(
         req.cache_key_override.as_deref(),
         Some("folderthumb:book|autocrop:v4f:rtl")
@@ -74,6 +75,7 @@ fn cover_auto_folder_direct_selection_reuses_listing_and_excludes_descendants_an
     req.set_auto_cover_crop(Some(crate::cover_auto_crop::AutoCropIdentity::new(
         identity.binding,
     )));
+    req.cover_auto_crop_scope = crate::cover_auto_crop::CoverAutoCropScope::for_identity(req.auto_cover_crop);
     assert!(
         resolve_read_after_cache_miss(&req, None, None)
             .auto_cover_crop
@@ -324,6 +326,7 @@ fn cover_auto_photo_shot_exif_reaches_zip_and_folder_workers_with_upright_materi
                         binding: crate::settings::ReadingDirection::Rtl,
                         folders: true,
                     }));
+                    req.cover_auto_crop_scope = crate::cover_auto_crop::CoverAutoCropScope::for_identity(req.auto_cover_crop);
                     let catalog = Arc::new(
                         crate::catalog::CatalogDb::open(&temp.path().join("cache"), temp.path())
                             .unwrap(),

@@ -23169,6 +23169,7 @@ impl App {
 
         let min_samples = crate::auto_aspect::min_samples_for(eligible_total);
         let mut probe_budget: usize = min_samples.saturating_mul(2);
+        let cover_auto_crop_scope = self.thumbnail_auto_crop_scope();
         let use_full_path_keys = self.use_full_path_cache_keys();
 
         // staged: (idx, ratio) を guard 内で集めて、guard を落としてから state 更新
@@ -23190,7 +23191,7 @@ impl App {
                 let Some((mtime, file_size)) = self.image_metas.get(idx).and_then(|m| *m) else {
                     continue;
                 };
-                let Some(req) = make_load_request_with_auto_crop(
+                let Some(req) = make_load_request_with_crop_scope(
                     item,
                     idx,
                     mtime,
@@ -23207,7 +23208,7 @@ impl App {
                     self.video_pin_db.as_ref(),
                     use_full_path_keys,
                     self.listing_file_type_visibility(),
-                    self.thumbnail_auto_crop_identity(),
+                    &cover_auto_crop_scope,
                 ) else {
                     continue;
                 };
@@ -30654,6 +30655,13 @@ impl App {
     }
 
     #[cfg(test)]
+    pub(crate) fn poll_current_view_order_refresh_for_test(&mut self, ctx: &egui::Context) {
+        if self.view_order_refresh_scan_pending() {
+            self.post_render_main_navigation(ctx, update_phases::MainFrameNavigation::default());
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn poll_history_navigation_transition_for_test(&mut self, ctx: &egui::Context) {
         self.poll_collection_history_transition(ctx);
     }
@@ -32947,6 +32955,8 @@ impl App {
         } else {
             std::collections::HashMap::new()
         };
+        let cover_auto_crop_scope =
+            crate::cover_auto_crop::CoverAutoCropScope::from_settings(&self.settings);
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
             .zip(image_metas.iter())
@@ -32960,7 +32970,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     use_full_path_cache_keys,
                     &self.settings.file_type_visibility,
-                    configured_thumbnail_auto_crop(&self.settings),
+                    cover_auto_crop_for_item(&cover_auto_crop_scope, it, None, None),
                 )
             })
             .collect();
@@ -35520,6 +35530,8 @@ impl App {
         } else {
             std::collections::HashMap::new()
         };
+        let cover_auto_crop_scope =
+            crate::cover_auto_crop::CoverAutoCropScope::from_settings(&self.settings);
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
             .zip(image_metas.iter())
@@ -35533,7 +35545,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     true,
                     &self.settings.file_type_visibility,
-                    configured_thumbnail_auto_crop(&self.settings),
+                    cover_auto_crop_for_item(&cover_auto_crop_scope, it, None, None),
                 )
             })
             .collect();
@@ -35976,6 +35988,8 @@ impl App {
         } else {
             std::collections::HashMap::new()
         };
+        let cover_auto_crop_scope =
+            crate::cover_auto_crop::CoverAutoCropScope::from_settings(&self.settings);
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
             .zip(image_metas.iter())
@@ -35991,7 +36005,7 @@ impl App {
                     // 同名コンテナが共存しうるので basename だと衝突する)
                     true,
                     &self.settings.file_type_visibility,
-                    configured_thumbnail_auto_crop(&self.settings),
+                    cover_auto_crop_for_item(&cover_auto_crop_scope, it, None, None),
                 )
             })
             .collect();
@@ -36408,6 +36422,8 @@ impl App {
         } else {
             std::collections::HashMap::new()
         };
+        let cover_auto_crop_scope =
+            crate::cover_auto_crop::CoverAutoCropScope::from_settings(&self.settings);
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
             .zip(image_metas.iter())
@@ -36421,7 +36437,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     true,
                     &self.settings.file_type_visibility,
-                    configured_thumbnail_auto_crop(&self.settings),
+                    cover_auto_crop_for_item(&cover_auto_crop_scope, it, None, None),
                 )
             })
             .collect();
@@ -39884,6 +39900,9 @@ impl App {
                 rating_preview: self.rating_preview_recipe(),
                 visibility: self.settings.file_type_visibility.clone(),
                 sidecar_settings: self.settings.thumbnail_source_discovery_snapshot(),
+                cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope::from_settings(
+                    &self.settings,
+                ),
                 intent,
                 sort,
                 include_epub: !self.settings.epub_file_handling_ignores_epub(),
@@ -40082,6 +40101,8 @@ impl App {
         } else {
             std::collections::HashMap::new()
         };
+        let cover_auto_crop_scope =
+            crate::cover_auto_crop::CoverAutoCropScope::from_settings(&self.settings);
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
             .zip(image_metas.iter())
@@ -40095,7 +40116,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     true,
                     &self.settings.file_type_visibility,
-                    configured_thumbnail_auto_crop(&self.settings),
+                    cover_auto_crop_for_item(&cover_auto_crop_scope, it, None, None),
                 )
             })
             .collect();
@@ -40798,7 +40819,14 @@ impl App {
         // サムネが delete_missing で stale 削除されて再生成ループになる (Codex P2)。
         let mut existing_keys: std::collections::HashSet<String> =
             tree.all_cache_keys().into_iter().collect();
-        let auto = configured_thumbnail_auto_crop(&self.settings);
+        let auto = crate::cover_auto_crop::CoverAutoCropScope::from_settings(&self.settings)
+            .identity_for(logical_pin_source.unwrap_or_else(|| {
+                zip_pin_root_path(
+                    &zip_path,
+                    self.archive_source_override.as_deref(),
+                    self.current_folder.as_deref(),
+                )
+            }));
         let auto_zipdir_keys: Vec<_> = existing_keys
             .iter()
             .filter(|key| key.starts_with("zipdir:"))
@@ -58621,6 +58649,7 @@ impl App {
             ThumbnailState::Pending | ThumbnailState::Evicted => {}
         }
 
+        let cover_auto_crop_scope = self.thumbnail_auto_crop_scope();
         let use_full_path_keys = self.use_full_path_cache_keys();
         let req_opt = if self.items_are_drive_list {
             self.items.get(idx).and_then(|item| {
@@ -58644,7 +58673,7 @@ impl App {
                 return PriorityThumbnailAdmission::MissingMetadata;
             };
             self.items.get(idx).and_then(|item| {
-                make_load_request_with_auto_crop(
+                make_load_request_with_crop_scope(
                     item,
                     idx,
                     mtime,
@@ -58661,7 +58690,7 @@ impl App {
                     self.video_pin_db.as_ref(),
                     use_full_path_keys,
                     self.listing_file_type_visibility(),
-                    self.thumbnail_auto_crop_identity(),
+                    &cover_auto_crop_scope,
                 )
             })
         };
@@ -58995,6 +59024,7 @@ impl App {
         );
         let mut suppressed_regular: usize = 0;
         let mut suppressed_heavy: usize = 0;
+        let cover_auto_crop_scope = self.thumbnail_auto_crop_scope();
         for i in self.keep_set_sorted() {
             if crate::grid_item::container_icon_only(
                 &self.items[i],
@@ -59056,7 +59086,7 @@ impl App {
                     continue;
                 };
                 self.items.get(i).and_then(|item| {
-                    make_load_request_with_auto_crop(
+                    make_load_request_with_crop_scope(
                         item,
                         i,
                         mtime,
@@ -59073,7 +59103,7 @@ impl App {
                         self.video_pin_db.as_ref(),
                         use_full_path_keys,
                         self.listing_file_type_visibility(),
-                        self.thumbnail_auto_crop_identity(),
+                        &cover_auto_crop_scope,
                     )
                 })
             };
@@ -59633,6 +59663,7 @@ impl App {
         //    なので大量 push しても害は無い (古い結果は poll_thumbnails で
         //    keep_set 外なら自動破棄される)。
         let mut upgrade_reqs: Vec<LoadRequest> = Vec::new();
+        let cover_auto_crop_scope = self.thumbnail_auto_crop_scope();
         for i in self.keep_set_sorted() {
             if crate::grid_item::container_icon_only(
                 &self.items[i],
@@ -59734,7 +59765,7 @@ impl App {
             // T54: Ctrl+S 検索結果は full-path キーで衝突回避 (= idle upgrade も同じく)
             let use_full_path_keys = self.use_full_path_cache_keys();
             let Some(mut req) = self.items.get(i).and_then(|item| {
-                make_load_request_with_auto_crop(
+                make_load_request_with_crop_scope(
                     item,
                     i,
                     mtime,
@@ -59751,7 +59782,7 @@ impl App {
                     self.video_pin_db.as_ref(),
                     use_full_path_keys,
                     self.listing_file_type_visibility(),
-                    self.thumbnail_auto_crop_identity(),
+                    &cover_auto_crop_scope,
                 )
             }) else {
                 continue;
@@ -76549,6 +76580,7 @@ impl App {
         // Both sets are ascending item indices. Advance once through the old
         // projection instead of searching it again for every accepted row.
         let mut old_visible_cursor = 0;
+        let cover_auto_crop_scope = self.thumbnail_auto_crop_scope();
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
             if !self.direct_media_basis_allows_index(i) {
@@ -76604,7 +76636,8 @@ impl App {
             if !self.passes_facet_filter(i, None) {
                 continue;
             }
-            if !self.passes_color_filter_for_scope(i, color_scope_signature) {
+            if !self.passes_color_filter_for_scope(i, color_scope_signature, &cover_auto_crop_scope)
+            {
                 continue;
             }
             if check_added_meta && !added_meta_needed {
@@ -104938,25 +104971,45 @@ fn parent_row_for_item(
     })
 }
 
-/// Settings alone are used while preparing a new list; its previous mounted
-/// context (possibly Drive) must not affect the incoming cache namespace.
+/// Compatibility for uniform-policy regression fixtures. Production resolves each item.
+#[cfg(test)]
 pub(crate) fn configured_thumbnail_auto_crop(
     settings: &crate::settings::Settings,
 ) -> Option<crate::cover_auto_crop::AutoCropIdentity> {
-    settings
-        .thumb_cover_auto_crop
-        .then(|| crate::cover_auto_crop::AutoCropIdentity {
-            binding: settings.thumb_cover_auto_crop_binding,
-            folders: settings.thumb_cover_auto_crop_folders,
-        })
+    crate::cover_auto_crop::CoverAutoCropScope::from_settings(settings).identity_for(Path::new(""))
 }
 
 impl App {
-    fn thumbnail_auto_crop_identity(&self) -> Option<crate::cover_auto_crop::AutoCropIdentity> {
-        (!self.items_are_drive_list)
-            .then(|| configured_thumbnail_auto_crop(&self.settings))
-            .flatten()
+    fn thumbnail_auto_crop_scope(&self) -> crate::cover_auto_crop::CoverAutoCropScope {
+        if self.items_are_drive_list {
+            Default::default()
+        } else {
+            crate::cover_auto_crop::CoverAutoCropScope::from_settings(&self.settings)
+        }
     }
+
+    #[cfg(test)]
+    fn thumbnail_auto_crop_identity(&self) -> Option<crate::cover_auto_crop::AutoCropIdentity> {
+        self.thumbnail_auto_crop_scope().identity_for(Path::new(""))
+    }
+}
+
+/// Use the logical book location, never the converted archive's read path.
+pub(crate) fn cover_auto_crop_for_item(
+    scope: &crate::cover_auto_crop::CoverAutoCropScope,
+    item: &GridItem,
+    archive_source_override: Option<&Path>,
+    current_folder: Option<&Path>,
+) -> Option<crate::cover_auto_crop::AutoCropIdentity> {
+    let path = match item {
+        GridItem::ZipDir { zip_path, .. } => Some(zip_pin_root_path(
+            zip_path,
+            archive_source_override,
+            current_folder,
+        )),
+        _ => item.container_path(),
+    }?;
+    scope.identity_for(path)
 }
 
 fn auto_crop_leaf_allowed(request: &LoadRequest) -> bool {
@@ -104991,6 +105044,50 @@ fn auto_crop_leaf_allowed(request: &LoadRequest) -> bool {
                     | crate::file_type_visibility::FileTypeCategory::Audio
             )
         )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_load_request_with_crop_scope(
+    item: &GridItem,
+    idx: usize,
+    mtime: i64,
+    file_size: i64,
+    bypass_cache: bool,
+    pdf_password: Option<&str>,
+    folder_thumb_sort: Option<crate::settings::SortOrder>,
+    folder_thumb_depth: u32,
+    pin_map: &HashMap<String, crate::folder_thumb_pins::FolderPin>,
+    converted_archive_cache_paths: &HashMap<String, ConvertedArchiveSourceState>,
+    archive_source_override: Option<&Path>,
+    current_folder: Option<&Path>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    video_pin_db: Option<&crate::video_pins::VideoPinDb>,
+    use_full_path_keys: bool,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    scope: &crate::cover_auto_crop::CoverAutoCropScope,
+) -> Option<LoadRequest> {
+    let auto = cover_auto_crop_for_item(scope, item, archive_source_override, current_folder);
+    let mut request = make_load_request_with_auto_crop(
+        item,
+        idx,
+        mtime,
+        file_size,
+        bypass_cache,
+        pdf_password,
+        folder_thumb_sort,
+        folder_thumb_depth,
+        pin_map,
+        converted_archive_cache_paths,
+        archive_source_override,
+        current_folder,
+        pin_db,
+        video_pin_db,
+        use_full_path_keys,
+        visibility,
+        auto,
+    )?;
+    request.cover_auto_crop_scope = scope.clone();
+    Some(request)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -105043,6 +105140,7 @@ fn make_load_request_with_auto_crop(
         _ => false,
     };
     request.set_auto_cover_crop(auto.filter(|_| eligible && auto_crop_leaf_allowed(&request)));
+    request.cover_auto_crop_scope = crate::cover_auto_crop::CoverAutoCropScope::for_identity(auto);
     Some(request)
 }
 
@@ -106117,6 +106215,7 @@ fn apply_folder_thumb_pin(
             file_size: resolved.file_size,
             cover_crop: None,
             auto_cover_crop: None,
+            cover_auto_crop_scope: base_req.cover_auto_crop_scope.clone(),
             edit_preview_key: None,
             edit_preview_validate_container: false,
             pinned_page_adjustment_key: None,
@@ -106302,6 +106401,7 @@ fn apply_folder_thumb_pin(
         raw_source: crate::thumb_loader::LoadRequestSource::Original,
         cover_crop: None,
         auto_cover_crop: None,
+        cover_auto_crop_scope: base_req.cover_auto_crop_scope.clone(),
     };
     resolved.assign_to_load_request(
         &mut request,
@@ -106870,6 +106970,8 @@ mod cover_auto_tests;
 mod cover_crop_tests;
 #[cfg(test)]
 mod cover_scope_tests;
+#[cfg(test)]
+mod favorite_cover_auto_crop_tests;
 #[cfg(test)]
 mod favsearch_typing_frame_tests;
 #[cfg(test)]

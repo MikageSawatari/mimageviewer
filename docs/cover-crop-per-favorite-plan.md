@@ -241,3 +241,33 @@
   - 連鎖 (子の行を持つフォルダの revision が `proof.directories` に入り、保存・更新・削除で進み、次の読み取りで相違を検出) は
     コードで成立、残るのは K2 の古い表示で K3 違反ではない、保持中の一覧を範囲外にする判断も妥当、撤回した仕組みへの依存は
     残っていない、との照合結果。
+
+## 12. 実装記録
+
+- `settings.rs` に `FavoriteCoverAutoCropPreference` と `FavoriteEntry.cover_auto_crop` を追加した。
+  手書き serde・構造体リテラル・`settings_db.rs` の favorites 読み書きと等価判定を更新し、
+  リリース済みの表には既定値 0 の列を加える移行を追加した。未知の数値は `FollowGlobal` として読む。
+- `cover_auto_crop/scope.rs` に純粋な `CoverAutoCropScope` を置いた。値を持つ根を正規化して深い順に比較し、
+  `FollowGlobal` は素通しする。全体 OFF・お気に入り On が無い場合は識別子を比較に含めない。
+  根の不変な配列を共有するので、要求や worker に渡す clone は根の文字列を複製しない。
+- `app.rs` の要求4経路と存続集合、`rating_view.rs` の準備、`app/color_filter.rs`、
+  `app/book_cover.rs`、コレクションの digest / reuse key を scope に接続した。
+  ZIP 内一覧では staged の `logical_pin_source`、通常の変換書庫では元書庫のパスで解決する。
+  キーの版の判定と切り出し指示の設定は既存の所有者に残した。
+- `thumb_loader.rs` のフォルダ代表選択には scope を渡し、子の行を子の場所で解決したキーで探す。
+  親のキーの印は増やしていない。fallback 要求とピン解決後の要求にも同じ scope を引き継ぐ。
+- お気に入り編集の即時保存後に変更前後の scope を比較し、変われば既存の一覧読み直しを1回呼ぶ。
+  横スクロールを追加し、小画面で新しい列へ到達できるようにした。環境設定は最新のお気に入りを
+  下書きへ引き継いだ後に scope を比較する。画像フォルダ ZIP 化は既存の clone が値を継承し、
+  採用後の既存の親一覧再走査が新しい scope を使うため、別の読み直しは足していない。
+- 追加したテストは24本。解決4本、設定/DB7本、要求・存続集合・論理書庫・合成一覧・コレクション4本、
+  色1本、BookCover1本、★準備1本、ZIP化1本、K2の子キー/証明失効2本、編集/環境設定3本。
+  編集の通しテストは実コンボ操作、DB往復、Loadedの退避、新しい内外の要求までを対象にした。
+  K2は保存なしで既存表示が残り得ること、子の実保存・`delete_missing` で証明が失効することを対象にした。
+- 実装担当はコンパイルもテスト実行も行っていない（利用者の指示により設計担当の共有ランナーへ引き継ぐ）。
+  `cargo fmt` と `python scripts/check_ui_glyphs.py` のみ実行した。製品起動・コミットは行っていない。
+  `favorites_*_snapshot_dark` の画像更新・比較と、小画面の実際の表示確認は未実施。
+- 別件のソース上の所見: 未固定 ZipDir の BookCover 代替要求は従来から代表キーを持たず、
+  全体 ON でも自動切り出しの eligibility を通らない。この既存挙動は変更していない。
+  保持中の別 viewer context に設定変更が反映されない共通課題も §6 のとおり範囲外で、
+  detached 述語・viewport/HWND・registry mount は変更していない。

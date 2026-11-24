@@ -167,6 +167,7 @@ impl LoadRequest {
         self.catalog_target = outer.catalog_target.clone();
         self.parent_observed = outer.parent_observed;
         self.parent_request_key = outer.parent_request_key.clone();
+        self.cover_auto_crop_scope = outer.cover_auto_crop_scope.clone();
     }
 
     /// The source variant owns this distinction; idx is unused for catalog work.
@@ -1249,7 +1250,7 @@ pub(crate) fn resolve_read_after_cache_miss(
         folder_auto_pages,
     ) = if is_folder_thumb {
         let t_resolve = std::time::Instant::now();
-        let (resolution, proof) = select_folder_thumb_image_with_policy_and_auto(
+        let (resolution, proof) = select_folder_thumb_image_with_policy_and_scope(
             &req.path,
             req.folder_thumb_sort
                 .unwrap_or(crate::settings::SortOrder::Numeric),
@@ -1258,7 +1259,7 @@ pub(crate) fn resolve_read_after_cache_miss(
             &crate::catalog::default_cache_dir(),
             cancel,
             &req.file_type_visibility,
-            req.auto_cover_crop,
+            &req.cover_auto_crop_scope,
         );
         let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
         if resolve_ms > 10.0 {
@@ -1618,6 +1619,9 @@ pub struct LoadRequest {
     /// Representative-only crop, assigned atomically with its pinned key.
     pub(crate) cover_crop: Option<crate::folder_thumb_pins::CoverCrop>,
     pub(crate) auto_cover_crop: Option<crate::cover_auto_crop::AutoCropIdentity>,
+    /// Immutable favorite resolution for K2 child rows; the parent key remains
+    /// owned by `set_auto_cover_crop` and its logical parent location.
+    pub(crate) cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope,
     /// ZIP/PDF 内ページを親コンテナの手動代表として読む要求。
     /// true のときは page の size ではなく、worker 上で `path` の mtime + size を読み、
     /// 保存済み container identity と照合する。UI thread へ archive stat を追加しない。
@@ -5496,7 +5500,7 @@ fn selection_stamp_hooks()
 struct FolderResolveContext<'a> {
     cache_dir: &'a Path,
     policy: &'a crate::file_type_visibility::FileTypeVisibility,
-    auto_cover_crop: Option<crate::cover_auto_crop::AutoCropIdentity>,
+    cover_auto_crop_scope: &'a crate::cover_auto_crop::CoverAutoCropScope,
     pin_db: Option<&'a crate::folder_thumb_pins::FolderThumbPinDb>,
     cancel: Option<&'a Arc<AtomicBool>>,
     catalogs: std::collections::HashMap<std::path::PathBuf, Option<crate::catalog::CatalogDb>>,
@@ -5996,7 +6000,7 @@ fn select_folder_thumb_image_with_policy(
     Option<FolderThumbResolution>,
     Option<crate::catalog::FolderSelectionProof>,
 ) {
-    select_folder_thumb_image_with_policy_and_auto(
+    select_folder_thumb_image_with_policy_and_scope(
         folder,
         sort,
         remaining_depth,
@@ -6004,10 +6008,11 @@ fn select_folder_thumb_image_with_policy(
         cache_dir,
         cancel,
         policy,
-        None,
+        &crate::cover_auto_crop::CoverAutoCropScope::default(),
     )
 }
 
+#[cfg(test)]
 fn select_folder_thumb_image_with_policy_and_auto(
     folder: &Path,
     sort: crate::settings::SortOrder,
@@ -6021,10 +6026,35 @@ fn select_folder_thumb_image_with_policy_and_auto(
     Option<FolderThumbResolution>,
     Option<crate::catalog::FolderSelectionProof>,
 ) {
+    select_folder_thumb_image_with_policy_and_scope(
+        folder,
+        sort,
+        remaining_depth,
+        pin_db,
+        cache_dir,
+        cancel,
+        policy,
+        &crate::cover_auto_crop::CoverAutoCropScope::for_identity(auto_cover_crop),
+    )
+}
+
+fn select_folder_thumb_image_with_policy_and_scope(
+    folder: &Path,
+    sort: crate::settings::SortOrder,
+    remaining_depth: u32,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    cache_dir: &Path,
+    cancel: Option<&Arc<AtomicBool>>,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+    cover_auto_crop_scope: &crate::cover_auto_crop::CoverAutoCropScope,
+) -> (
+    Option<FolderThumbResolution>,
+    Option<crate::catalog::FolderSelectionProof>,
+) {
     let mut context = FolderResolveContext {
         cache_dir,
         policy,
-        auto_cover_crop,
+        cover_auto_crop_scope,
         pin_db,
         cancel,
         catalogs: std::collections::HashMap::new(),
@@ -6103,9 +6133,8 @@ pub(crate) fn direct_folder_representative_key(
     sort: crate::settings::SortOrder,
     policy: &crate::file_type_visibility::FileTypeVisibility,
 ) -> Option<String> {
-    let (selected, _) = select_folder_thumb_image_with_policy_and_auto(
-        folder, sort, 0, None, folder, None, policy, None,
-    );
+    let (selected, _) =
+        select_folder_thumb_image_with_policy(folder, sort, 0, None, folder, None, policy);
     match selected {
         Some(FolderThumbResolution::Image(
             path,
@@ -6253,7 +6282,11 @@ fn resolve_folder_thumb_image_inner(
             .collect();
         keyed_images
             .sort_by(|(_, a_mt, ak), (_, b_mt, bk)| sort.compare_name_keys(ak, *a_mt, bk, *b_mt));
-        let mut pages: Vec<_> = if context.auto_cover_crop.is_some_and(|auto| auto.folders) {
+        let mut pages: Vec<_> = if context
+            .cover_auto_crop_scope
+            .identity_for(folder)
+            .is_some_and(|auto| auto.folders)
+        {
             keyed_images
                 .iter()
                 .map(|(path, _, _)| path.clone())
@@ -6406,14 +6439,16 @@ fn resolve_folder_thumb_image_inner(
                         )
                     )
             });
-            // Folder automatic rows share the setting identity; explicit folder
-            // pins use Seeded keys even when their resolved leaf is a file book.
+            // K2 reads the child's writer identity at its logical tile location,
+            // even when the parent resolves to a different favorite preference.
+            // Explicit folder pins retain Seeded keys for file-book leaves.
             let automatic_folder = key.starts_with("folderthumb:auto-v3:");
             *key = representative_cache_key_for_policy_with_auto(
                 key,
                 context.policy,
                 context
-                    .auto_cover_crop
+                    .cover_auto_crop_scope
+                    .identity_for(&candidate.path)
                     .filter(|_| (automatic_folder || !candidate.is_dir) && !manual_crop),
             );
         }
@@ -11988,6 +12023,254 @@ mod tests {
         assert_eq!(cached.cache_key, key);
     }
 
+    fn favorite_cover_auto_crop_settings(
+        parent: &Path,
+        child: &Path,
+        parent_on: bool,
+        child_on: bool,
+    ) -> crate::settings::Settings {
+        use crate::settings::{FavoriteCoverAutoCropPreference as Preference, FavoriteEntry};
+        let mut parent_favorite = FavoriteEntry::new("parent".into(), parent.to_owned());
+        parent_favorite.cover_auto_crop = if parent_on {
+            Preference::On
+        } else {
+            Preference::Off
+        };
+        let mut child_favorite = FavoriteEntry::new("child".into(), child.to_owned());
+        child_favorite.cover_auto_crop = if child_on {
+            Preference::On
+        } else {
+            Preference::Off
+        };
+        crate::settings::Settings {
+            favorites: vec![parent_favorite, child_favorite],
+            thumb_cover_auto_crop_binding: crate::settings::ReadingDirection::Rtl,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_parent_reads_opposite_child_writer_identity() {
+        use crate::cover_auto_crop::CoverAutoCropScope;
+        for parent_on in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let parent = temp.path().join("library");
+            let child = parent.join("nested");
+            std::fs::create_dir_all(&child).unwrap();
+            let book = child.join("book.pdf");
+            std::fs::write(&book, b"cache-only selection must not render this PDF").unwrap();
+            let cache = temp.path().join("cache");
+            let pins =
+                crate::folder_thumb_pins::FolderThumbPinDb::open_at(&temp.path().join("pins.db"))
+                    .unwrap();
+            let settings =
+                favorite_cover_auto_crop_settings(&parent, &child, parent_on, !parent_on);
+            let scope = CoverAutoCropScope::from_settings(&settings);
+            let mut writer = LoadRequest {
+                path: book.clone(),
+                cache_key_override: Some("pdfthumb:book.pdf".into()),
+                cover_auto_crop_scope: scope.clone(),
+                ..Default::default()
+            };
+            writer.set_auto_cover_crop(scope.identity_for(&book));
+            let child_key = cache_key_for_request(&writer).unwrap().into_owned();
+            save_archive_tile(&cache, &child, &book, &child_key);
+
+            let (selected, proof) = select_folder_thumb_image_with_policy_and_scope(
+                &parent,
+                SortOrder::Numeric,
+                2,
+                Some(&pins),
+                &cache,
+                None,
+                &settings.file_type_visibility,
+                &scope,
+            );
+            let Some(FolderThumbResolution::CachedPinned(cached)) = selected else {
+                panic!("parent must read the nested favorite's completed child row");
+            };
+            assert_eq!(cached.cache_key, child_key);
+            assert_eq!(cached.source_path, book);
+            assert_eq!(
+                proof.unwrap().winner.archive_row_key.as_deref(),
+                Some(child_key.as_str())
+            );
+
+            let mut request = LoadRequest {
+                path: parent.clone(),
+                cache_key_override: folder_thumb_auto_cache_key_for_path(
+                    &parent,
+                    false,
+                    SortOrder::Numeric,
+                    2,
+                ),
+                folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+                cover_auto_crop_scope: scope.clone(),
+                ..Default::default()
+            };
+            request.set_auto_cover_crop(scope.identity_for(&parent));
+            let expected = if parent_on {
+                "folderthumb:auto-v3:numeric:d2:library|autocrop:v4:rtl"
+            } else {
+                "folderthumb:auto-v3:numeric:d2:library"
+            };
+            assert_eq!(cache_key_for_request(&request).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_child_save_and_delete_missing_invalidate_parent_proof() {
+        use crate::cover_auto_crop::CoverAutoCropScope;
+        use crate::settings::FavoriteCoverAutoCropPreference as Preference;
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("library");
+        let child = parent.join("nested");
+        std::fs::create_dir_all(&child).unwrap();
+        let book = child.join("book.pdf");
+        std::fs::write(&book, b"cache-only PDF").unwrap();
+        let cache = temp.path().join("cache");
+        let pins =
+            crate::folder_thumb_pins::FolderThumbPinDb::open_at(&temp.path().join("pins.db"))
+                .unwrap();
+        let mut settings = favorite_cover_auto_crop_settings(&parent, &child, true, false);
+        let original_scope = CoverAutoCropScope::from_settings(&settings);
+        let base = "pdfthumb:book.pdf";
+        let auto =
+            crate::cover_auto_crop::AutoCropIdentity::new(crate::settings::ReadingDirection::Rtl);
+        let auto_key = representative_cache_key_for_policy_with_auto(
+            base,
+            &settings.file_type_visibility,
+            Some(auto),
+        );
+        // Both variants already exist: reading either must leave revisions unchanged.
+        save_archive_tile(&cache, &child, &book, base);
+        save_archive_tile(&cache, &child, &book, &auto_key);
+        let select = |scope: &CoverAutoCropScope| {
+            select_folder_thumb_image_with_policy_and_scope(
+                &parent,
+                SortOrder::Numeric,
+                2,
+                Some(&pins),
+                &cache,
+                None,
+                &crate::file_type_visibility::FileTypeVisibility::default(),
+                scope,
+            )
+        };
+        let (selected, proof) = select(&original_scope);
+        assert!(
+            matches!(selected, Some(FolderThumbResolution::CachedPinned(ref row)) if row.cache_key == base)
+        );
+        let mut request = LoadRequest {
+            path: parent.clone(),
+            cache_key_override: folder_thumb_auto_cache_key_for_path(
+                &parent,
+                false,
+                SortOrder::Numeric,
+                2,
+            ),
+            folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
+            cover_auto_crop_scope: original_scope,
+            ..Default::default()
+        };
+        request.set_auto_cover_crop(request.cover_auto_crop_scope.identity_for(&parent));
+        let parent_key = cache_key_for_request(&request).unwrap().into_owned();
+        let parent_catalog = crate::catalog::CatalogDb::open(&cache, temp.path()).unwrap();
+        parent_catalog
+            .save_auto_folder_bytes(
+                &parent_key,
+                0,
+                0,
+                None,
+                None,
+                &fixture_webp(),
+                proof.as_ref(),
+                &CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
+            )
+            .unwrap();
+        let old_row = parent_catalog.load_one(&parent_key).unwrap().unwrap();
+
+        settings.favorites[1].cover_auto_crop = Preference::On;
+        let changed_scope = CoverAutoCropScope::from_settings(&settings);
+        request.cover_auto_crop_scope = changed_scope.clone();
+        request.set_auto_cover_crop(changed_scope.identity_for(&parent));
+        assert_eq!(
+            cache_key_for_request(&request).as_deref(),
+            Some(parent_key.as_str())
+        );
+        let (selected, _) = select(&changed_scope);
+        assert!(
+            matches!(selected, Some(FolderThumbResolution::CachedPinned(ref row)) if row.cache_key == auto_key)
+        );
+        assert!(
+            folder_cached_row_usable_in_cache_dir_with_pins(
+                &request,
+                &old_row,
+                &cache,
+                Some(&pins),
+            ),
+            "changing the scope and reading an existing child row may retain the old parent"
+        );
+
+        save_archive_tile(&cache, &child, &book, &auto_key);
+        assert!(!folder_cached_row_usable_in_cache_dir_with_pins(
+            &request,
+            &old_row,
+            &cache,
+            Some(&pins),
+        ));
+        let (selected, proof) = select(&changed_scope);
+        assert!(
+            matches!(selected, Some(FolderThumbResolution::CachedPinned(ref row)) if row.cache_key == auto_key)
+        );
+        let updated_row = proof_entry(proof.unwrap());
+        assert!(folder_cached_row_usable_in_cache_dir_with_pins(
+            &request,
+            &updated_row,
+            &cache,
+            Some(&pins),
+        ));
+
+        settings.favorites[1].cover_auto_crop = Preference::Off;
+        let off_scope = CoverAutoCropScope::from_settings(&settings);
+        request.cover_auto_crop_scope = off_scope.clone();
+        request.set_auto_cover_crop(off_scope.identity_for(&parent));
+        assert_eq!(
+            cache_key_for_request(&request).as_deref(),
+            Some(parent_key.as_str())
+        );
+        let keys = crate::app::folder_thumb_existing_keys_for_with_auto_crop(
+            &crate::grid_item::GridItem::PdfFile(book.clone()),
+            Some(crate::catalog::file_stamp(
+                &std::fs::metadata(&book).unwrap(),
+            )),
+            &Default::default(),
+            Some(&pins),
+            Some(SortOrder::Numeric),
+            2,
+            false,
+            &settings.file_type_visibility,
+            off_scope.identity_for(&book),
+        );
+        let child_catalog = crate::catalog::CatalogDb::open(&cache, &child).unwrap();
+        child_catalog
+            .delete_missing(&keys.into_iter().collect())
+            .unwrap();
+        assert!(child_catalog.load_one(base).unwrap().is_some());
+        assert!(child_catalog.load_one(&auto_key).unwrap().is_none());
+        assert!(!folder_cached_row_usable_in_cache_dir_with_pins(
+            &request,
+            &updated_row,
+            &cache,
+            Some(&pins),
+        ));
+        let (selected, _) = select(&off_scope);
+        assert!(
+            matches!(selected, Some(FolderThumbResolution::CachedPinned(ref row)) if row.cache_key == base)
+        );
+    }
+
     #[test]
     fn cover_crop_child_image_pin_is_inherited_and_crop_change_invalidates_selection() {
         use crate::folder_thumb_pins::{FileKind, FolderPinSource};
@@ -12517,7 +12800,7 @@ mod tests {
         assert_eq!(entry.selection_proof.as_ref().unwrap().winner.path, winner);
         let cache_dir = tmp.path().join("cache");
         let mut context = FolderResolveContext {
-            auto_cover_crop: None,
+            cover_auto_crop_scope: &crate::cover_auto_crop::CoverAutoCropScope::default(),
             cache_dir: &cache_dir,
             policy: &policy,
             pin_db: None,

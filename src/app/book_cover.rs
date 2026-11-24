@@ -4,6 +4,7 @@
 use super::*;
 use crate::ai_caption_db::FileSignature;
 use crate::archive_converter::ArchiveFormat;
+use crate::cover_auto_crop::CoverAutoCropScope;
 use crate::folder_thumb_pins::{
     CoverCrop, FileKind, FolderPin, FolderPinSource, PinKeyMode, ResolvedKind, ResolvedPinTarget,
 };
@@ -71,7 +72,7 @@ pub(crate) struct BookCoverEnv {
     pub(crate) folder_thumb_sort: crate::settings::SortOrder,
     pub(crate) folder_thumb_depth: u32,
     pub(crate) visibility: crate::file_type_visibility::FileTypeVisibility,
-    pub(crate) auto_cover_crop: Option<crate::cover_auto_crop::AutoCropIdentity>,
+    pub(crate) cover_auto_crop_scope: CoverAutoCropScope,
     pub(crate) edit_preview_db: Option<Arc<crate::edit_preview_cache::EditPreviewCacheDb>>,
     pub(crate) pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
     pub(crate) video_pins: Option<crate::video_pins::VideoPinReadSource>,
@@ -88,7 +89,7 @@ impl Default for BookCoverEnv {
             folder_thumb_sort: crate::settings::SortOrder::Numeric,
             folder_thumb_depth: 3,
             visibility: Default::default(),
-            auto_cover_crop: None,
+            cover_auto_crop_scope: CoverAutoCropScope::default(),
             edit_preview_db: None,
             pin_db: None,
             video_pins: None,
@@ -108,7 +109,7 @@ impl App {
             folder_thumb_sort: self.settings.folder_thumb_sort,
             folder_thumb_depth: self.settings.folder_thumb_depth,
             visibility: self.listing_file_type_visibility().clone(),
-            auto_cover_crop: configured_thumbnail_auto_crop(&self.settings),
+            cover_auto_crop_scope: CoverAutoCropScope::from_settings(&self.settings),
             edit_preview_db: self.edit_preview_cache.as_ref().map(|service| service.db()),
             pin_db: self.folder_thumb_pin_db.clone(),
             video_pins: self.video_pin_db.as_ref().and_then(|db| db.read_source()),
@@ -497,7 +498,6 @@ impl CoverResolver<'_> {
             })
         })
         .ok_or(BookCoverFailure::ReadFailed)?;
-        request.set_auto_cover_crop(self.env.auto_cover_crop);
         // The selected cached row owns its exact fixed page/entry. The synthetic
         // source above feeds that position back through the released App planner.
         if request.folder_thumb_provenance == Some(crate::catalog::FolderThumbProvenance::Seeded)
@@ -519,6 +519,8 @@ impl CoverResolver<'_> {
             });
         }
         loop {
+            request.cover_auto_crop_scope = self.env.cover_auto_crop_scope.clone();
+            request.set_auto_cover_crop(self.env.cover_auto_crop_scope.identity_for(path));
             if !request.file_type_visibility.is_all_visible()
                 && request.epub_pin_fallback.is_some()
                 && (request.zip_entry.is_some()
@@ -1279,6 +1281,113 @@ mod tests {
     }
 
     #[test]
+    fn favorite_cover_auto_crop_book_cover_uses_logical_archive_and_pinned_zipdir_paths() {
+        use crate::settings::{FavoriteCoverAutoCropPreference as Preference, FavoriteEntry};
+
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let tmp = TempDir::new().unwrap();
+        let books = tmp.path().join("books");
+        let cached = tmp.path().join("cache");
+        std::fs::create_dir_all(&books).unwrap();
+        std::fs::create_dir_all(&cached).unwrap();
+        let original = books.join("book.7z");
+        let zip = books.join("book.zip");
+        let converted = cached.join("converted.zip");
+        std::fs::write(&original, b"original sevenz").unwrap();
+        for path in [&zip, &converted] {
+            write_zip(path, &["chapter/first.jpg", "chapter/second.jpg"]);
+        }
+        let metadata = std::fs::metadata(&original).unwrap();
+        let cache = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        cache
+            .record(
+                &original,
+                crate::ui_helpers::mtime_secs(&metadata),
+                metadata.len() as i64,
+                ArchiveFormat::SevenZ,
+                &converted,
+                std::fs::metadata(&converted).unwrap().len() as i64,
+                2,
+                false,
+            )
+            .unwrap();
+        let mut settings = crate::settings::Settings {
+            thumb_cover_auto_crop_binding: crate::settings::ReadingDirection::Ltr,
+            thumb_cover_auto_crop_folders: true,
+            favorites: vec![
+                FavoriteEntry::new("logical".into(), books),
+                FavoriteEntry::new("physical".into(), cached),
+            ],
+            ..Default::default()
+        };
+        let mut env = BookCoverEnv {
+            books_root: Some(tmp.path().to_owned()),
+            archive_cache: Some(cache),
+            ..Default::default()
+        };
+        for enabled in [true, false] {
+            settings.thumb_cover_auto_crop = !enabled;
+            settings.favorites[0].cover_auto_crop = if enabled {
+                Preference::On
+            } else {
+                Preference::Off
+            };
+            settings.favorites[1].cover_auto_crop = if enabled {
+                Preference::Off
+            } else {
+                Preference::On
+            };
+            env.cover_auto_crop_scope = CoverAutoCropScope::from_settings(&settings);
+            for (path, kind, physical) in [
+                (&zip, BookKind::Zip, &zip),
+                (
+                    &original,
+                    BookKind::Archive(ArchiveFormat::SevenZ),
+                    &converted,
+                ),
+            ] {
+                for prefix in [None, Some("chapter/")] {
+                    let container = BookCoverContainer {
+                        path: path.clone(),
+                        kind,
+                        zip_dir_prefix: prefix.map(str::to_owned),
+                    };
+                    let selected_source = prefix.map(|_| {
+                        FolderPinSource::ZipEntry {
+                            zip_rel: String::new(),
+                            entry: "chapter/first.jpg".into(),
+                        }
+                        .into()
+                    });
+                    let cover = readable(resolve_logical_book_cover(
+                        &container,
+                        selected_source,
+                        &env,
+                    ));
+                    assert_eq!(cover.signature_path, *path);
+                    assert!(matches!(
+                        cover.location,
+                        ReadLocation::ArchiveEntry { archive, .. } if archive == *physical
+                    ));
+                    if enabled {
+                        let automatic = cover.auto_cover_crop.unwrap();
+                        assert_eq!(
+                            automatic.identity.binding,
+                            crate::settings::ReadingDirection::Ltr
+                        );
+                        assert!(automatic.identity.folders);
+                    } else {
+                        assert_eq!(
+                            cover.auto_cover_crop.unwrap_err(),
+                            crate::thumb_loader::AutoCoverSkip::Off
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn book_cover_direct_rar_uses_original_book_identity() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("testdata/archives/rar-multipart-filename-regression/○×△□ Vol.2.rar");
@@ -1354,8 +1463,8 @@ mod tests {
         std::fs::write(&path, b"native boundary fixture").unwrap();
         let mut env = pin_env(&tmp);
         env.books_root = Some(tmp.path().to_owned());
-        env.auto_cover_crop = Some(crate::cover_auto_crop::AutoCropIdentity::new(
-            crate::settings::ReadingDirection::Rtl,
+        env.cover_auto_crop_scope = CoverAutoCropScope::for_identity(Some(
+            crate::cover_auto_crop::AutoCropIdentity::new(crate::settings::ReadingDirection::Rtl),
         ));
         env.pin_db
             .as_ref()
@@ -1530,7 +1639,7 @@ mod tests {
             binding: crate::settings::ReadingDirection::Rtl,
             folders: true,
         };
-        env.auto_cover_crop = Some(identity);
+        env.cover_auto_crop_scope = CoverAutoCropScope::for_identity(Some(identity));
         let source = FolderPinSource::ZipEntry {
             zip_rel: String::new(),
             entry: "fixed.jpg".into(),

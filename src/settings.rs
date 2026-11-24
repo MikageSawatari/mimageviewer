@@ -304,6 +304,29 @@ impl DetachedViewerWindowPlacement {
 // FavoriteEntry
 // -----------------------------------------------------------------------
 
+/// お気に入りの配下で表紙の自動切り出しを使うか。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FavoriteCoverAutoCropPreference {
+    #[default]
+    FollowGlobal,
+    On,
+    Off,
+}
+
+impl FavoriteCoverAutoCropPreference {
+    pub(crate) const fn all() -> &'static [Self] {
+        &[Self::FollowGlobal, Self::On, Self::Off]
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::FollowGlobal => "全体設定に従う",
+            Self::On => "切り出す",
+            Self::Off => "切り出さない",
+        }
+    }
+}
+
 /// お気に入りフォルダの 1 エントリ。
 ///
 /// `name` はユーザが任意に付けられる表示名 (ツールバーのボタンラベル等で使用)。
@@ -334,6 +357,8 @@ pub struct FavoriteEntry {
     pub auto_index_thumbs: bool,
     /// 現在の画像の別バージョンを探す索引の対象にするか。
     pub auto_index_similar: bool,
+    /// 表紙の自動切り出し。全体設定に従う場合は親のお気に入りの指定も引き継ぐ。
+    pub cover_auto_crop: FavoriteCoverAutoCropPreference,
 }
 
 // -----------------------------------------------------------------------
@@ -511,6 +536,8 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                 auto_index_thumbs: bool,
                 #[serde(default)]
                 auto_index_similar: bool,
+                #[serde(default)]
+                cover_auto_crop: FavoriteCoverAutoCropPreference,
             },
         }
 
@@ -529,6 +556,7 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                     auto_index_metadata: false,
                     auto_index_thumbs: false,
                     auto_index_similar: false,
+                    cover_auto_crop: FavoriteCoverAutoCropPreference::default(),
                 })
             }
             Raw::Full {
@@ -539,6 +567,7 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                 auto_index_metadata,
                 auto_index_thumbs,
                 auto_index_similar,
+                cover_auto_crop,
             } => Ok(FavoriteEntry {
                 id: id.unwrap_or_else(Uuid::nil),
                 name,
@@ -547,6 +576,7 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                 auto_index_metadata,
                 auto_index_thumbs,
                 auto_index_similar,
+                cover_auto_crop,
             }),
         }
     }
@@ -558,7 +588,7 @@ impl serde::Serialize for FavoriteEntry {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("FavoriteEntry", 7)?;
+        let mut s = serializer.serialize_struct("FavoriteEntry", 8)?;
         s.serialize_field("id", &self.id)?;
         s.serialize_field("name", &self.name)?;
         s.serialize_field("path", &self.path)?;
@@ -566,6 +596,7 @@ impl serde::Serialize for FavoriteEntry {
         s.serialize_field("auto_index_metadata", &self.auto_index_metadata)?;
         s.serialize_field("auto_index_thumbs", &self.auto_index_thumbs)?;
         s.serialize_field("auto_index_similar", &self.auto_index_similar)?;
+        s.serialize_field("cover_auto_crop", &self.cover_auto_crop)?;
         s.end()
     }
 }
@@ -581,6 +612,7 @@ impl FavoriteEntry {
             auto_index_metadata: false,
             auto_index_thumbs: false,
             auto_index_similar: false,
+            cover_auto_crop: FavoriteCoverAutoCropPreference::default(),
         }
     }
 }
@@ -18937,6 +18969,61 @@ mod tests {
     }
 
     // -- FavoriteEntry serde --
+
+    #[test]
+    fn favorite_cover_auto_crop_preferences_match_labels_and_default() {
+        use FavoriteCoverAutoCropPreference::{FollowGlobal, Off, On};
+
+        assert_eq!(
+            FavoriteCoverAutoCropPreference::all(),
+            &[FollowGlobal, On, Off]
+        );
+        assert_eq!(FavoriteCoverAutoCropPreference::default(), FollowGlobal);
+        assert_eq!(FollowGlobal.label(), "全体設定に従う");
+        assert_eq!(On.label(), "切り出す");
+        assert_eq!(Off.label(), "切り出さない");
+        assert_eq!(
+            FavoriteEntry::new("new".into(), PathBuf::from(r"C:\new")).cover_auto_crop,
+            FollowGlobal
+        );
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_json_missing_defaults_to_follow_global() {
+        for json in [
+            r#""C:\\legacy""#,
+            r#"{"name":"old","path":"C:\\old"}"#,
+            r#"{"name":"old","path":"C:\\old","auto_index_similar":true,"future_field":1}"#,
+        ] {
+            let entry: FavoriteEntry = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                entry.cover_auto_crop,
+                FavoriteCoverAutoCropPreference::FollowGlobal
+            );
+        }
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_json_roundtrip_all_preferences() {
+        for preference in FavoriteCoverAutoCropPreference::all() {
+            let mut entry = FavoriteEntry::new("book".into(), PathBuf::from(r"C:\book"));
+            entry.auto_index_similar = true;
+            entry.cover_auto_crop = *preference;
+            let json = serde_json::to_value(&entry).unwrap();
+            assert_eq!(json.as_object().unwrap().len(), 8);
+            assert_eq!(
+                json["cover_auto_crop"],
+                serde_json::to_value(preference).unwrap()
+            );
+
+            let restored: FavoriteEntry = serde_json::from_value(json).unwrap();
+            assert_eq!(restored.id, entry.id);
+            assert_eq!(restored.name, entry.name);
+            assert_eq!(restored.path, entry.path);
+            assert!(restored.auto_index_similar);
+            assert_eq!(restored.cover_auto_crop, *preference);
+        }
+    }
 
     #[test]
     fn favorite_deserialize_legacy_string() {

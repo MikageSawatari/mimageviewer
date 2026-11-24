@@ -227,6 +227,7 @@ mod tests {
     use super::*;
     fn fav(id: u128, root: &str, on: bool) -> FavoriteEntry {
         FavoriteEntry {
+            cover_auto_crop: Default::default(),
             id: Uuid::from_u128(id),
             name: String::new(),
             path: root.into(),

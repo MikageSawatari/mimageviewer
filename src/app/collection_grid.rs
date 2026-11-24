@@ -278,7 +278,7 @@ pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
 ) -> Result<CollectionGridPreparedThumbnailDelivery, CollectionPrepareError> {
     use sha2::Digest as _;
 
-    if sources.auto_cover_crop.is_none()
+    if sources.cover_auto_crop_scope == Default::default()
         && sources.video_sidecars.is_empty()
         && sources.video_pin_blobs.is_empty()
         && sources.folder_pin_map.is_empty()
@@ -288,14 +288,10 @@ pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
     }
     let mut digest = sha2::Sha256::new();
     digest.update(b"miv.collection-thumbnail-sources.v2\0");
-    if let Some(auto) = sources.auto_cover_crop {
-        digest.update(b"auto-cover-crop\0");
-        hash_collection_thumbnail_identity_part(
-            &mut digest,
-            auto.suffix_for_key(crate::thumb_loader::CACHE_KEY_FOLDER)
-                .as_bytes(),
-        );
-    }
+    hash_collection_thumbnail_identity_part(
+        &mut digest,
+        &sources.cover_auto_crop_scope.digest_bytes(),
+    );
 
     let mut sidecars = sources.video_sidecars.iter().collect::<Vec<_>>();
     sidecars.sort_unstable_by(|left, right| left.0.cmp(right.0));
@@ -612,7 +608,9 @@ pub(in crate::app) fn prepare_collection_grid_install(
     let identity_start = crate::perf::is_enabled().then(Instant::now);
     let thumbnail_sources = prepare_collection_grid_thumbnail_sources(
         CollectionGridThumbnailSources {
-            auto_cover_crop: super::configured_thumbnail_auto_crop(settings),
+            cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope::from_settings(
+                settings,
+            ),
             video_sidecars: sidecars.by_video_path,
             video_pin_blobs: Arc::new(video_pin_blobs),
             folder_pin_map,

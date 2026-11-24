@@ -122,10 +122,12 @@ fn evaluate_one(
         // Avoid Shell/default-root lookup. These inputs are ordinary image
         // folders, not compiled direct children of an implicit books root.
         books_root: Some(path.to_path_buf()),
-        auto_cover_crop: Some(AutoCropIdentity {
-            binding: options.binding,
-            folders: true,
-        }),
+        cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope::for_identity(Some(
+            AutoCropIdentity {
+                binding: options.binding,
+                folders: true,
+            },
+        )),
         ..Default::default()
     };
     let cover = match resolve_book_cover(path, kind, &env) {
