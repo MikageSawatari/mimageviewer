@@ -100924,6 +100924,211 @@ pub(crate) mod page_turn_submission_tests {
         }
     }
 
+    fn reading_direction_app(
+        ctx: &egui::Context,
+        mode: SpreadMode,
+        direction: ReadingDirection,
+        current: usize,
+    ) -> crate::app::AppTestEnvForTest {
+        let mut app = ready_app(ctx, mode);
+        app.settings.page_turn_animation_enabled = false;
+        assert_eq!(
+            app.settings.fullscreen_horizontal_cursor_direction,
+            crate::settings::FullscreenHorizontalCursorDirection::FollowPage
+        );
+        app.reading_direction = direction;
+        app.fullscreen_idx = Some(current);
+        app.selected = Some(current);
+        app
+    }
+
+    fn reading_direction_key(app: &mut App, ctx: &egui::Context, key: egui::Key) {
+        let mut release = pressed(key);
+        if let egui::Event::Key { pressed, .. } = &mut release {
+            *pressed = false;
+        }
+        frame_with_events(ctx, vec![pressed(key), release], |ctx| {
+            crate::keyboard_input::cache_keyboard_owner(
+                ctx,
+                crate::keyboard_input::KeyboardOwner::ApplicationShortcut {
+                    scope: crate::keyboard_input::ShortcutScope::new(
+                        ctx.viewport_id(),
+                        crate::keyboard_input::ShortcutSurface::Fullscreen,
+                    ),
+                },
+            );
+            let current = app.fullscreen_idx.unwrap();
+            let mut operation = None;
+            let action = app.handle_fs_key_input_with_operation(
+                ctx,
+                current,
+                app.spread_mode.is_spread(),
+                &mut operation,
+            );
+            app.handle_fs_navigation_with_operation(
+                ctx,
+                action.close,
+                action.close_to_page_list,
+                action.ctrl_nav,
+                action.sibling_nav,
+                action.mouse_nav,
+                action.page_nav,
+                action.jump_to,
+                current,
+                operation,
+            );
+        });
+    }
+
+    #[test]
+    fn single_rtl_arrow_right_goes_to_previous_page() {
+        let ctx = egui::Context::default();
+        let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Rtl, 1);
+        reading_direction_key(&mut app, &ctx, egui::Key::ArrowRight);
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+
+    #[test]
+    fn single_rtl_arrow_left_goes_to_next_page() {
+        let ctx = egui::Context::default();
+        let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Rtl, 1);
+        reading_direction_key(&mut app, &ctx, egui::Key::ArrowLeft);
+        assert_eq!(app.fullscreen_idx, Some(2));
+    }
+
+    #[test]
+    fn single_ltr_arrow_right_still_goes_to_next_page() {
+        let ctx = egui::Context::default();
+        let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Ltr, 1);
+        reading_direction_key(&mut app, &ctx, egui::Key::ArrowRight);
+        assert_eq!(app.fullscreen_idx, Some(2));
+    }
+
+    #[test]
+    fn rtl_spread_arrow_right_still_goes_to_previous_spread() {
+        let ctx = egui::Context::default();
+        // The spread's own direction takes precedence over the Single-mode direction.
+        let mut app = reading_direction_app(&ctx, SpreadMode::Rtl, ReadingDirection::Ltr, 2);
+        reading_direction_key(&mut app, &ctx, egui::Key::ArrowRight);
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+
+    #[test]
+    fn single_reading_direction_key_flips_arrow_right_navigation() {
+        let ctx = egui::Context::default();
+        let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Ltr, 1);
+        // Inspect the handler's requests at a fixed middle page so display-readiness
+        // waits from a preceding navigation do not become part of this state test.
+        for (key, direction, expected_nav) in [
+            (
+                egui::Key::ArrowRight,
+                ReadingDirection::Ltr,
+                FsPageNav::Delta(1),
+            ),
+            (egui::Key::Num7, ReadingDirection::Rtl, FsPageNav::None),
+            (
+                egui::Key::ArrowRight,
+                ReadingDirection::Rtl,
+                FsPageNav::Delta(-1),
+            ),
+            (egui::Key::Num7, ReadingDirection::Ltr, FsPageNav::None),
+            (
+                egui::Key::ArrowRight,
+                ReadingDirection::Ltr,
+                FsPageNav::Delta(1),
+            ),
+        ] {
+            let mut release = pressed(key);
+            if let egui::Event::Key { pressed, .. } = &mut release {
+                *pressed = false;
+            }
+            frame_with_events(&ctx, vec![pressed(key), release], |ctx| {
+                crate::keyboard_input::cache_keyboard_owner(
+                    ctx,
+                    crate::keyboard_input::KeyboardOwner::ApplicationShortcut {
+                        scope: crate::keyboard_input::ShortcutScope::new(
+                            ctx.viewport_id(),
+                            crate::keyboard_input::ShortcutSurface::Fullscreen,
+                        ),
+                    },
+                );
+                let action = app.handle_fs_key_input(ctx, 1, false);
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(app.reading_direction, direction, "key={key:?}");
+                assert_eq!(action.page_nav, expected_nav, "key={key:?}");
+                assert_eq!(app.fullscreen_idx, Some(1));
+            });
+        }
+    }
+
+    fn single_rtl_canvas_click(pos: egui::Pos2, expected: usize) {
+        let ctx = egui::Context::default();
+        let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Rtl, 1);
+        app.settings.fullscreen_primary_click =
+            crate::settings::FullscreenPrimaryClickMode::PageTurn;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+        // Establish the backing widget, then drive an actual press/release through
+        // the fullscreen canvas handler, rather than supplying its RTL argument.
+        for frame in 0..3 {
+            let mut events = vec![egui::Event::PointerMoved(pos)];
+            if frame > 0 {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: frame == 1,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    time: Some(frame as f64 * 0.05),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let state = app.prepare_fullscreen_state(&ctx, 1, FsPageTurnDecision::normal());
+                    let (nav, close) = app.handle_fs_wheel_and_click_with_geometry(
+                        ui,
+                        &ctx,
+                        rect,
+                        &state,
+                        StillSeekGeometry::bar_only(),
+                        false,
+                        0,
+                        &mut None,
+                        None,
+                        false,
+                    );
+                    assert!(!close);
+                    if frame < 2 {
+                        assert!(nav.is_none());
+                    } else {
+                        assert!(
+                            !nav.is_none(),
+                            "the released click must produce PageSide navigation"
+                        );
+                        app.handle_fs_navigation(
+                            &ctx, false, false, None, None, None, nav, None, 1,
+                        );
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(app.fullscreen_idx, Some(expected));
+    }
+
+    #[test]
+    fn single_rtl_right_canvas_click_goes_to_previous_page() {
+        single_rtl_canvas_click(egui::pos2(450.0, 200.0), 0);
+    }
+
+    #[test]
+    fn single_rtl_left_canvas_click_goes_to_next_page() {
+        single_rtl_canvas_click(egui::pos2(150.0, 200.0), 2);
+    }
+
     #[test]
     fn page_turn_actual_navigation_waits_for_adopted_flat_then_bookmark_uses_new_page() {
         #[cfg(windows)]

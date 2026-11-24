@@ -11456,6 +11456,30 @@ mod manual_nav_wrap_input_tests {
     use super::*;
     use crate::ui_fullscreen::page_turn_submission_tests::{frame, ready_app};
 
+    fn single_rtl_pad_direction(dir: PadDir, expected: usize) {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.settings.page_turn_animation_enabled = false;
+        app.reading_direction = crate::settings::ReadingDirection::Rtl;
+        app.fullscreen_idx = Some(1);
+        app.selected = Some(1);
+        assert_eq!(app.dpad_route(), DpadRoute::Still(1));
+        frame(&ctx, |_, ctx| {
+            app.handle_gamepad_direction(ctx, dir, false);
+        });
+        assert_eq!(app.fullscreen_idx, Some(expected));
+    }
+
+    #[test]
+    fn single_rtl_pad_right_goes_to_previous_page() {
+        single_rtl_pad_direction(PadDir::Right, 0);
+    }
+
+    #[test]
+    fn single_rtl_pad_left_goes_to_next_page() {
+        single_rtl_pad_direction(PadDir::Left, 2);
+    }
+
     #[test]
     fn manual_nav_wrap_gamepad_and_assigned_mouse_page_steps_land_at_the_same_endpoint() {
         for wrap in [false, true] {
