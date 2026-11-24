@@ -1,7 +1,28 @@
-//! Request-scoped presentation and selection policy. No App-global next-open flags.
+//! Request-scoped viewer opening policy, plus process-wide external Shell failures.
+//! No App-global next-open flags.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+impl super::App {
+    /// The photo/spread side is resolved by the drawing pass; no pending GPS
+    /// state survives navigation. Only failures travel back to the root poll.
+    pub(crate) fn open_google_maps(&self, ctx: &egui::Context, url: String) {
+        let _ = crate::external_links::spawn_open(
+            crate::external_links::OpenTarget::Map(url),
+            Some(crate::external_links::FailureSink {
+                tx: self.external_open_failure_tx.clone(),
+                ctx: ctx.clone(),
+            }),
+        );
+    }
+
+    pub(crate) fn poll_external_open_failures(&mut self) {
+        while let Ok(failure) = self.external_open_failures.try_recv() {
+            self.show_feedback_warning(failure.message().to_owned());
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ViewerOpenIntent {
@@ -192,6 +213,103 @@ impl ViewerOpenAdoption {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_open_map_failure_repaints_root_and_root_poll_warns() {
+        use crate::external_links::{OpenTarget, TestOpenerGuard};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let mut app = super::super::tests::phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        // Drain egui's initial repaint budget so the worker wake is observable.
+        for _ in 0..3 {
+            ctx.run_pass(Default::default(), |_| {})
+                .drop_without_applying_deltas();
+        }
+        let (repaint_tx, repaint_rx) = mpsc::channel();
+        ctx.set_request_repaint_callback(move |info| {
+            let _ = repaint_tx.send(info.viewport_id);
+        });
+        let caller = std::thread::current().id();
+        let _opener = TestOpenerGuard::install(move |target| {
+            assert_ne!(caller, std::thread::current().id());
+            let OpenTarget::Map(url) = target else {
+                panic!("expected map")
+            };
+            Err(format!("failed URL: {url}"))
+        });
+
+        app.open_google_maps(&ctx, "https://www.google.com/maps/?q=35,139".into());
+        assert_eq!(
+            repaint_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            egui::ViewportId::ROOT
+        );
+        assert!(
+            app.fs_feedback_toast.is_none(),
+            "worker must not mutate App"
+        );
+        // Exercise the root worker phase, rather than draining the receiver in the test.
+        app.render_other_worker_results(&ctx);
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("Google マップを開けませんでした")
+        );
+        assert!(app.fs_feedback_toast_surface.is_none());
+        assert_eq!(
+            app.feedback_toasts_for_test.last().map(|toast| toast.1),
+            Some(crate::feedback::FeedbackKind::Warning)
+        );
+        assert!(matches!(
+            app.external_open_failures.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn external_open_general_failure_does_not_publish_notification() {
+        use crate::external_links::{OpenTarget, TestOpenerGuard};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let mut app = super::super::tests::phase_c_support::setup_app();
+        let ctx = egui::Context::default();
+        let (called_tx, called_rx) = mpsc::channel();
+        let _opener = TestOpenerGuard::install(move |_| {
+            called_tx.send(()).unwrap();
+            Err("Shell rejected the target".into())
+        });
+        crate::ui_helpers::open_url("https://example.com");
+        crate::ui_helpers::open_external_player(std::path::Path::new("movie.mp4"));
+        crate::external_links::spawn_open(
+            OpenTarget::Tweet("https://x.com/example/status/1".into()),
+            None,
+        )
+        .unwrap();
+        for _ in 0..3 {
+            called_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        app.render_other_worker_results(&ctx);
+        assert!(app.fs_feedback_toast.is_none());
+        assert!(matches!(
+            app.external_open_failures.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn external_open_invalid_map_request_warns_without_calling_shell() {
+        let mut app = super::super::tests::phase_c_support::setup_app();
+        let _opener =
+            crate::external_links::TestOpenerGuard::install(|_| panic!("invalid map opened"));
+        let ctx = egui::Context::default();
+        app.open_google_maps(&ctx, "javascript:alert(1)".into());
+        app.render_other_worker_results(&ctx);
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("Google マップを開けませんでした")
+        );
+    }
 
     #[test]
     fn browser818_open_owner_same_path_has_distinct_identity_and_retains_intent() {

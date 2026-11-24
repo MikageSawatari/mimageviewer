@@ -1458,6 +1458,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-25: 起動 resolver の main 走査の段階（§1.853、実装・検証待ち）
+
+- 正本: [ui-sync-853-plan.md](ui-sync-853-plan.md) §3.2・§5.3。main の resolver と detached lease 付き
+  ブックマークを既存の所有境界で区別し、さらに `main_folder_history_available()` で今の投影 context を確かめる。
+  走査を同じ worker に移すことに伴う入力/待機表示/同じ request ID の期限の契約で、症状を隠す guard・delay ではない。
+- detached の分類・記述子・viewport・placement は変えない。実装前に §2 を読み、設計 r3 の main 投影と lease 除外を
+  実装の根拠とした。受けていない独立実装レビューの合意・検証結果は記載しない。コンパイル・Rust テストは未実施。
+
 ### 2026-11-23: ブラウザ閲覧の保存先のフォルダはページ構成の既定を単ページにする (§1.870、設計の段階。実装はこれから)
 
 - 正本は [browser-view-single-page-plan.md](browser-view-single-page-plan.md)。ブラウザから開いた画像が、保存先の月のフォルダの関係のない画像と見開きになる件。

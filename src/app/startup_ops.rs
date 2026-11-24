@@ -1,6 +1,64 @@
 use super::*;
 use miv_startup::{Lane, Outcome, Stage, WatchHandle, WatchSlot, event_span};
 
+/// One timestamp, shared with the existing resolver owner. Zero means resolving.
+pub(super) struct StartupScanPhase {
+    origin: std::time::Instant,
+    started_us: std::sync::atomic::AtomicU64,
+}
+
+impl StartupScanPhase {
+    pub(super) fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            started_us: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn begin(&self) {
+        let stamp = (self.origin.elapsed().as_micros() as u64).saturating_add(1);
+        let _ = self
+            .started_us
+            .compare_exchange(0, stamp, Ordering::Release, Ordering::Relaxed);
+    }
+
+    fn elapsed(&self) -> Option<std::time::Duration> {
+        let stamp = self.started_us.load(Ordering::Acquire);
+        (stamp != 0).then(|| {
+            self.origin
+                .elapsed()
+                .saturating_sub(std::time::Duration::from_micros(stamp - 1))
+        })
+    }
+}
+
+enum StartupResolveInput {
+    Explicit {
+        requested: PathBuf,
+        source: StartupOpenPathSource,
+        bookmark: Option<crate::book_bookmarks::BookBookmark>,
+    },
+    Default(Box<crate::settings::Settings>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StartupResolveInputKind {
+    Explicit(StartupOpenPathSource),
+    Default,
+}
+
+/// The default request carries its UI continuation with the resolved payload, including
+/// through a policy-only rescan. It can never recurse into another default request.
+pub(super) enum DefaultStartupTarget {
+    Drives,
+    ReadingHistory,
+    Folder {
+        intent: StartupListIntent,
+        cursor: Option<(String, Option<u32>)>,
+    },
+    Unavailable,
+}
+
 fn unresolved_open_owner_is_main(owner: &StartupOpenPathOwner) -> bool {
     #[cfg(windows)]
     if matches!(owner, StartupOpenPathOwner::Bookmark(owner)
@@ -687,14 +745,6 @@ impl App {
             }
         }
 
-        let diagnostic = matches!(source, StartupOpenPathSource::InitialStartup)
-            .then(|| InitialNavigationTrace::begin("initial-resolver-dispatch-to-ui-admission"));
-        let trace_correlation = diagnostic.as_ref().map(InitialNavigationTrace::correlation);
-        let trace_watch = diagnostic.as_ref().and_then(|trace| trace.watch);
-        let (tx, rx) = mpsc::channel();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cancel_w = Arc::clone(&cancel);
-        let worker_requested = requested.clone();
         let bookmark = matches!(owner, StartupOpenPathOwner::Bookmark(_))
             .then(|| {
                 self.bookmark_open_pending
@@ -703,8 +753,58 @@ impl App {
                     .map(|pending| pending.bookmark.clone())
             })
             .flatten();
-        let worker_bookmark = bookmark.clone();
+        self.spawn_startup_resolver(
+            StartupResolveInput::Explicit {
+                requested,
+                source,
+                bookmark,
+            },
+            owner,
+            requested_owner,
+            navigation,
+            held_resolve_for_activation_admission,
+            hold_bookmark_continuation,
+            ctx,
+        )
+    }
+
+    pub(super) fn folder_scan_policy(&self) -> folder_scan::FolderScanPolicy {
+        folder_scan::FolderScanPolicy::capture(
+            &self.settings,
+            self.listing_may_sort_by_duration(),
+            crate::catalog::default_cache_dir(),
+        )
+    }
+
+    fn spawn_startup_resolver(
+        &mut self,
+        input: StartupResolveInput,
+        owner: StartupOpenPathOwner,
+        requested: crate::pdf_loader::LeasedEpubPath,
+        navigation: Option<MainListNavigation>,
+        held_resolve_for_activation_admission: Option<Box<StartupOpenPathResolvePending>>,
+        held_continuation: bool,
+        ctx: &egui::Context,
+    ) -> StartupOpenAdmission {
+        let input_kind = match &input {
+            StartupResolveInput::Explicit { source, .. } => {
+                StartupResolveInputKind::Explicit(*source)
+            }
+            StartupResolveInput::Default(_) => StartupResolveInputKind::Default,
+        };
+        let diagnostic = matches!(owner, StartupOpenPathOwner::InitialStartup(_))
+            .then(|| InitialNavigationTrace::begin("initial-resolver-dispatch-to-ui-admission"));
+        let correlation = diagnostic.as_ref().map(InitialNavigationTrace::correlation);
+        let watch = diagnostic.as_ref().and_then(|trace| trace.watch);
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let scan_phase = Arc::new(StartupScanPhase::new());
+        let cancel_w = Arc::clone(&cancel);
+        let phase_w = Arc::clone(&scan_phase);
+        let policy = self.folder_scan_policy();
+        let scan_main = unresolved_open_owner_is_main(&owner);
         let repaint_ctx = ctx.clone();
+        let perf_seq = self.input_seq;
         #[cfg(test)]
         let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
         let worker = move || {
@@ -714,115 +814,138 @@ impl App {
             if cancel_w.load(Ordering::Relaxed) {
                 return;
             }
-            let resolve_span = trace_correlation.map(|id| {
+            let resolve_span = correlation.map(|id| {
                 event_span(Lane::Navigation, Stage::InitialTargetResolve, id)
-                    .watched_optional(trace_watch)
+                    .watched_optional(watch)
             });
-            let result =
-                resolve_startup_open_path(worker_requested, source, worker_bookmark.as_ref(), true);
-            if let Some(resolve_span) = resolve_span {
-                resolve_span.finish(if cancel_w.load(Ordering::Relaxed) {
+            let (mut result, source) = match input {
+                StartupResolveInput::Explicit {
+                    requested,
+                    source,
+                    bookmark,
+                } => (
+                    resolve_startup_open_path(requested, source, bookmark.as_ref(), true),
+                    match source {
+                        StartupOpenPathSource::InitialStartup => "initial",
+                        StartupOpenPathSource::Activation => "activation",
+                        StartupOpenPathSource::Agent => "agent",
+                        StartupOpenPathSource::Bookmark => "bookmark",
+                    },
+                ),
+                StartupResolveInput::Default(settings) => {
+                    (resolve_default_startup_target(&settings), "default")
+                }
+            };
+            if let Some(span) = resolve_span {
+                span.finish(if cancel_w.load(Ordering::Relaxed) {
                     Outcome::Cancelled
-                } else if result.resolved.is_some() {
+                } else if result.resolved.is_some()
+                    || matches!(
+                        result.default_target,
+                        Some(DefaultStartupTarget::Drives | DefaultStartupTarget::ReadingHistory)
+                    )
+                {
                     Outcome::Ok
                 } else {
                     Outcome::Error
                 });
             }
-            if cancel_w.load(Ordering::Relaxed) {
-                return;
+            let resolve_ms = result.elapsed_ms;
+            scan_startup_resolved_target(
+                &mut result,
+                policy,
+                scan_main,
+                &cancel_w,
+                &phase_w,
+                &repaint_ctx,
+                correlation,
+                watch,
+                source,
+                perf_seq,
+                resolve_ms,
+            );
+            if !cancel_w.load(Ordering::Relaxed) {
+                let _ = tx.send(result);
             }
-            let _ = tx.send(result);
-            repaint_ctx.request_repaint();
+            repaint_ctx.request_repaint_of(egui::ViewportId::ROOT);
         };
-        #[cfg(test)]
-        let force_spawn_failure =
-            FORCE_STARTUP_OPEN_RESOLVE_SPAWN_FAILURE.with(std::cell::Cell::get);
-        #[cfg(not(test))]
-        let force_spawn_failure = false;
-        let spawn_result = if force_spawn_failure {
-            Err(std::io::Error::other(
-                "forced startup path resolver spawn failure",
-            ))
-        } else {
-            std::thread::Builder::new()
-                .name("startup-open-resolve".to_string())
-                .spawn(worker)
+        let pending = StartupOpenPathResolvePending {
+            requested,
+            owner,
+            input_kind,
+            navigation,
+            cancel,
+            rx,
+            started_at: std::time::Instant::now(),
+            toast_shown: false,
+            scan_phase,
+            held_resolve_for_activation_admission,
+            diagnostic,
         };
-
-        match spawn_result {
+        match spawn_startup_worker(worker) {
             Ok(_) => {
-                self.install_startup_open_path_resolve_pending(
-                    StartupOpenPathResolvePending {
-                        requested: requested_owner,
-                        owner,
-                        cancel,
-                        rx,
-                        started_at: std::time::Instant::now(),
-                        toast_shown: false,
-                        held_resolve_for_activation_admission,
-                        diagnostic,
-                        navigation,
-                    },
-                    hold_bookmark_continuation,
-                );
+                self.install_startup_open_path_resolve_pending(pending, held_continuation);
+                StartupOpenAdmission::Admitted
             }
-            Err(e) => {
-                if matches!(source, StartupOpenPathSource::Agent) {
-                    crate::logger::log("agent_ipc: open_in_viewer refused worker_start");
-                    return StartupOpenAdmission::Refused(ActivationOpenRefusal::Internal);
-                }
+            Err(error) => {
                 crate::logger::log(format!(
-                    "startup open: resolve worker spawn failed: {e}; running synchronously"
+                    "startup open: resolve worker spawn failed: {error}"
                 ));
-                let resolve_started_at = std::time::Instant::now();
-                let resolve_span = trace_correlation.map(|id| {
-                    event_span(Lane::Navigation, Stage::InitialTargetResolve, id)
-                        .watched_optional(trace_watch)
-                });
-                let result = resolve_startup_open_path(requested, source, bookmark.as_ref(), false);
-                if let Some(resolve_span) = resolve_span {
-                    resolve_span.finish(if result.resolved.is_some() {
-                        Outcome::Ok
-                    } else {
-                        Outcome::Error
-                    });
-                }
-                let held_duration = resolve_started_at.elapsed();
-                if hold_bookmark_continuation {
-                    // Preserve the existing synchronous spawn-failure fallback, but leave its
-                    // result behind the same activation admission gate as a worker result.
-                    let (tx, rx) = mpsc::channel();
-                    let _ = tx.send(result);
-                    self.install_startup_open_path_resolve_pending(
-                        StartupOpenPathResolvePending {
-                            requested: requested_owner,
-                            owner,
-                            cancel,
-                            rx,
-                            started_at: resolve_started_at,
-                            toast_shown: false,
-                            held_resolve_for_activation_admission,
-                            diagnostic,
-                            navigation,
-                        },
-                        true,
-                    );
-                    return StartupOpenAdmission::Admitted;
-                }
-                self.finish_startup_open_path_resolve_with_held(
-                    owner,
-                    result,
-                    held_resolve_for_activation_admission,
-                    held_duration,
-                    Some(requested_owner),
-                    diagnostic,
-                    navigation,
-                    ctx,
-                );
+                self.fail_startup_resolver(pending, "resolve_spawn_failed");
+                StartupOpenAdmission::Refused(ActivationOpenRefusal::Internal)
             }
         }
-        StartupOpenAdmission::Admitted
+    }
+
+    fn fail_startup_resolver(
+        &mut self,
+        mut pending: StartupOpenPathResolvePending,
+        reason: &'static str,
+    ) {
+        let current = self.startup_open_path_owner_is_current(&pending.owner);
+        let owner = pending.owner.clone();
+        let held = pending.held_resolve_for_activation_admission.take();
+        let held_duration = pending.elapsed();
+        if let Some(trace) = pending.diagnostic.take() {
+            trace.finish(Outcome::Error);
+        }
+        drop(pending);
+        if !current {
+            return;
+        }
+        match owner {
+            StartupOpenPathOwner::Bookmark(owner) => {
+                self.cancel_bookmark_open_request(owner.request_id, reason);
+            }
+            StartupOpenPathOwner::Activation(_) => {
+                self.resume_activation_held_open(held, held_duration)
+            }
+            StartupOpenPathOwner::InitialStartup(_) => {}
+        }
+        self.show_feedback_warning(
+            "場所を開く準備ができませんでした。もう一度開いてください".into(),
+        );
+    }
+
+    pub(crate) fn main_startup_scan_elapsed(&self) -> Option<std::time::Duration> {
+        if !self.main_folder_history_available() {
+            return None;
+        }
+        let pending = self.startup_open_path_resolve_pending.as_ref()?;
+        if !unresolved_open_owner_is_main(&pending.owner) {
+            return None;
+        }
+        pending.scan_phase.elapsed()
+    }
+
+    pub(super) fn main_startup_scan_owns_bookmark(
+        &self,
+        request_id: crate::bookmark_browser::BookmarkOpenRequestId,
+    ) -> bool {
+        self.main_startup_scan_elapsed().is_some()
+            && self.startup_open_path_resolve_pending.as_ref().is_some_and(|pending| {
+                matches!(&pending.owner, StartupOpenPathOwner::Bookmark(owner) if owner.request_id == request_id)
+            })
     }
 
     fn install_startup_open_path_resolve_pending(
@@ -880,6 +1003,15 @@ impl App {
 
         match recv {
             Ok(result) => {
+                if result
+                    .scan_policy
+                    .as_ref()
+                    .is_some_and(|policy| *policy != self.folder_scan_policy())
+                    || result.scan_policy_mixed
+                {
+                    self.continue_startup_scan(result, ctx);
+                    return;
+                }
                 let mut pending = self.startup_open_path_resolve_pending.take().unwrap();
                 let owner = pending.owner.clone();
                 let held = pending.held_resolve_for_activation_admission.take();
@@ -904,6 +1036,13 @@ impl App {
                 let Some(pending) = self.startup_open_path_resolve_pending.as_mut() else {
                     return;
                 };
+                if pending.scan_phase.elapsed().is_some() {
+                    ctx.request_repaint_after_for(
+                        std::time::Duration::from_millis(100),
+                        egui::ViewportId::ROOT,
+                    );
+                    return;
+                }
                 let elapsed = pending.elapsed();
                 if !pending.toast_shown && elapsed >= STARTUP_OPEN_PATH_RESOLVE_TOAST_DELAY {
                     pending.toast_shown = true;
@@ -919,31 +1058,77 @@ impl App {
                 }
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                let mut pending = self.startup_open_path_resolve_pending.take().unwrap();
-                let owner = pending.owner.clone();
-                let held = pending.held_resolve_for_activation_admission.take();
-                let held_duration = pending.elapsed();
-                if let Some(diagnostic) = pending.diagnostic.take() {
-                    diagnostic.finish(Outcome::Error);
-                }
+                let pending = self.startup_open_path_resolve_pending.take().unwrap();
                 crate::logger::log(format!(
                     "startup open: resolve worker disconnected source={} requested={}",
-                    owner.perf_tag(),
+                    pending.owner.perf_tag(),
                     pending.requested.display()
                 ));
-                drop(pending);
-                let source = owner.source();
-                if matches!(source, StartupOpenPathSource::InitialStartup) {
-                    self.open_default_startup_target();
-                } else {
-                    if let StartupOpenPathOwner::Bookmark(owner) = owner {
-                        self.cancel_bookmark_open_request(owner.request_id, "resolve_disconnected");
-                    } else if matches!(source, StartupOpenPathSource::Activation) {
-                        self.resume_activation_held_open(held, held_duration);
-                    }
-                    self.show_feedback_warning("パスの確認を完了できませんでした".to_string());
-                }
+                self.fail_startup_resolver(pending, "resolve_disconnected");
                 ctx.request_repaint();
+            }
+        }
+    }
+
+    fn continue_startup_scan(
+        &mut self,
+        mut result: StartupOpenPathResolveResult,
+        ctx: &egui::Context,
+    ) {
+        let policy = self.folder_scan_policy();
+        let pending = self.startup_open_path_resolve_pending.as_mut().unwrap();
+        let cancel = Arc::clone(&pending.cancel);
+        let phase = Arc::clone(&pending.scan_phase);
+        let correlation = pending
+            .diagnostic
+            .as_ref()
+            .map(InitialNavigationTrace::correlation);
+        let watch = pending.diagnostic.as_ref().and_then(|trace| trace.watch);
+        let source = match pending.input_kind {
+            StartupResolveInputKind::Default => "default",
+            StartupResolveInputKind::Explicit(source) => match source {
+                StartupOpenPathSource::InitialStartup => "initial",
+                StartupOpenPathSource::Activation => "activation",
+                StartupOpenPathSource::Agent => "agent",
+                StartupOpenPathSource::Bookmark => "bookmark",
+            },
+        };
+        let (tx, rx) = mpsc::channel();
+        let repaint = ctx.clone();
+        let seq = self.input_seq;
+        #[cfg(test)]
+        let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
+        let worker = move || {
+            #[cfg(test)]
+            let _test_epoch_scope =
+                test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
+            scan_startup_resolved_target(
+                &mut result,
+                policy,
+                true,
+                &cancel,
+                &phase,
+                &repaint,
+                correlation,
+                watch,
+                source,
+                seq,
+                0.0,
+            );
+            if !cancel.load(Ordering::Relaxed) {
+                let _ = tx.send(result);
+            }
+            repaint.request_repaint_of(egui::ViewportId::ROOT);
+        };
+        // Do not take the pending: identity, lease, held activation, trace and phase survive.
+        match spawn_startup_worker(worker) {
+            Ok(_) => pending.rx = rx,
+            Err(error) => {
+                crate::logger::log(format!(
+                    "startup open: scan continuation spawn failed: {error}"
+                ));
+                let pending = self.startup_open_path_resolve_pending.take().unwrap();
+                self.fail_startup_resolver(pending, "scan_spawn_failed");
             }
         }
     }
@@ -1018,10 +1203,14 @@ impl App {
             return;
         }
         let source = owner.source();
-        if let Some(message) = result
-            .rar_volume_proof
-            .as_ref()
-            .and_then(crate::rar_loader::RarVolumeProof::rejection_message)
+        let is_default = result.default_target.is_some();
+        // Default restoration retains the owned loader's archive error/dialog contract.
+        // Explicit opens already reported volume refusal here before default became async.
+        if !is_default
+            && let Some(message) = result
+                .rar_volume_proof
+                .as_ref()
+                .and_then(crate::rar_loader::RarVolumeProof::rejection_message)
         {
             // A volume refusal has no admission authority over a held first-volume request.
             if matches!(source, StartupOpenPathSource::Activation) {
@@ -1036,7 +1225,7 @@ impl App {
             if let Some(diagnostic) = diagnostic {
                 diagnostic.finish(Outcome::Error);
             }
-            if matches!(source, StartupOpenPathSource::InitialStartup) {
+            if matches!(source, StartupOpenPathSource::InitialStartup) && !is_default {
                 self.open_default_startup_target();
             }
             self.show_feedback_warning(message);
@@ -1100,14 +1289,7 @@ impl App {
                 .watched_optional(watch)
                 .detail("resolver-result-ui-admission")
         });
-        let outcome = self.apply_startup_open_path_resolve_result(
-            &owner,
-            result,
-            ctx,
-            correlation,
-            watch,
-            navigation,
-        );
+        let outcome = self.apply_startup_open_path_resolve_result(&owner, result, ctx, navigation);
         let trace_outcome = if matches!(outcome, StartupOpenApplyOutcome::Opened) {
             Outcome::Ok
         } else {
@@ -1130,7 +1312,7 @@ impl App {
                     source.perf_tag(),
                     requested_display
                 ));
-                if matches!(source, StartupOpenPathSource::InitialStartup) {
+                if matches!(source, StartupOpenPathSource::InitialStartup) && !is_default {
                     self.open_default_startup_target();
                 }
                 return;
@@ -1146,7 +1328,9 @@ impl App {
             StartupOpenApplyOutcome::NotOpenable => {}
         }
         if matches!(source, StartupOpenPathSource::InitialStartup) {
-            self.open_default_startup_target();
+            if !is_default {
+                self.open_default_startup_target();
+            }
         } else {
             if let StartupOpenPathOwner::Bookmark(bookmark_owner) = owner {
                 self.cancel_bookmark_open_request(bookmark_owner.request_id, "not_openable");
@@ -1458,7 +1642,9 @@ impl App {
         // target must remain pending until Local owns the viewer again.
         let mut held = self.startup_open_path_resolve_pending.as_ref();
         while let Some(pending) = held {
-            if let StartupOpenPathOwner::InitialStartup(request) = &pending.owner {
+            if matches!(pending.input_kind, StartupResolveInputKind::Explicit(_))
+                && let StartupOpenPathOwner::InitialStartup(request) = &pending.owner
+            {
                 self.startup_open_path.get_or_insert_with(|| {
                     ExplicitOpenPath::new(pending.requested.to_path_buf(), *request)
                 });
@@ -1708,10 +1894,8 @@ impl App {
     fn apply_startup_open_path_resolve_result(
         &mut self,
         owner: &StartupOpenPathOwner,
-        result: StartupOpenPathResolveResult,
+        mut result: StartupOpenPathResolveResult,
         ctx: &egui::Context,
-        trace_correlation: Option<u64>,
-        trace_watch: Option<WatchHandle>,
         navigation: Option<MainListNavigation>,
     ) -> StartupOpenApplyOutcome {
         if navigation
@@ -1721,6 +1905,19 @@ impl App {
             return StartupOpenApplyOutcome::NotOpenable;
         }
         let source = owner.source();
+        let default_continuation = match result.default_target.take() {
+            Some(DefaultStartupTarget::Drives) => {
+                self.enter_drive_list(None);
+                return StartupOpenApplyOutcome::Opened;
+            }
+            Some(DefaultStartupTarget::ReadingHistory) => {
+                self.enter_reading_history();
+                return StartupOpenApplyOutcome::Opened;
+            }
+            Some(DefaultStartupTarget::Unavailable) => return StartupOpenApplyOutcome::NotOpenable,
+            Some(DefaultStartupTarget::Folder { intent, cursor }) => Some((intent, cursor)),
+            None => None,
+        };
         let Some(resolution) = result.resolved else {
             crate::logger::log(format!(
                 "startup open: no openable path for {}",
@@ -1730,7 +1927,33 @@ impl App {
         };
 
         let openable = resolution.path;
+        let pre_scan = match result.folder_scan.take() {
+            Some(Ok(scan)) => Some(scan),
+            Some(Err(error)) => {
+                crate::logger::log(format!(
+                    "load_folder scan failed path={} error={error}",
+                    openable.display()
+                ));
+                self.pending_auto_fs_open = false;
+                self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+                self.release_fs_nav_lock();
+                self.show_feedback_warning("フォルダを読み取れませんでした".into());
+                return StartupOpenApplyOutcome::NotOpenable;
+            }
+            None => None,
+        };
         let viewer_adoption = owner.viewer_open_adoption();
+        // The old default loader captured SameLocation for an already shown target.
+        // Keep the dispatch-time source proof, adjusting only its history operation once
+        // the worker has resolved the destination (no second navigation admission).
+        let default_same_location = default_continuation.is_some()
+            && (self
+                .effective_folder()
+                .is_some_and(|current| crate::folder_tree::path_eq(&current, &openable))
+                || self
+                    .current_folder
+                    .as_ref()
+                    .is_some_and(|current| crate::folder_tree::path_eq(current, &openable)));
         let navigation = navigation
             .or_else(|| {
                 viewer_adoption
@@ -1745,6 +1968,9 @@ impl App {
             })
             .map(|mut navigation| {
                 navigation.viewer_adoption = viewer_adoption;
+                if default_same_location {
+                    navigation.history = MainHistoryOperation::SameLocation;
+                }
                 navigation
             });
         if matches!(resolution.kind, crate::folder_tree::OpenablePathKind::File)
@@ -1757,16 +1983,17 @@ impl App {
         if matches!(resolution.kind, crate::folder_tree::OpenablePathKind::File)
             && crate::rar_loader::is_rar_path(&openable)
             && result.rar_volume_proof.is_none()
+            && default_continuation.is_none()
         {
-            // The resolver's UI-side spawn-failure fallback never probes a RAR header. Keep
-            // the same request owner and let existing classification prove it asynchronously
-            // before any cache or detached descriptor can adopt it.
-            let auto_fullscreen = matches!(source, StartupOpenPathSource::Bookmark)
-                || startup_openable_should_auto_fullscreen(
-                    &self.settings,
-                    &openable,
-                    resolution.kind,
-                );
+            // Keep proof-incomplete RAR results in the existing classification continuation.
+            // A failed header probe must not admit a cached or detached descriptor.
+            let auto_fullscreen = default_continuation.is_none()
+                && (matches!(source, StartupOpenPathSource::Bookmark)
+                    || startup_openable_should_auto_fullscreen(
+                        &self.settings,
+                        &openable,
+                        resolution.kind,
+                    ));
             return match self
                 .load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
                     openable,
@@ -1774,7 +2001,8 @@ impl App {
                     owner.open_request_owner(),
                     None,
                     None,
-                    super::StartupListIntent::container_open(auto_fullscreen),
+                    default_continuation.map(|(intent, _)| intent)
+                        .unwrap_or_else(|| super::StartupListIntent::container_open(auto_fullscreen)),
                     navigation,
                     MainListRequestStage::Continuation,
                     super::DirectoryScanRoute::UiThread,
@@ -1920,13 +2148,37 @@ impl App {
         {
             return StartupOpenApplyOutcome::NotOpenable;
         }
-        let auto_fullscreen = matches!(source, StartupOpenPathSource::Bookmark)
-            || startup_openable_should_auto_fullscreen(&self.settings, &openable, resolution.kind);
-        let scan = trace_correlation.map(|id| {
-            event_span(Lane::Navigation, Stage::InitialTargetScan, id)
-                .watched_optional(trace_watch)
-                .detail("existing-loader-call-return")
-        });
+        let auto_fullscreen = default_continuation.is_none()
+            && (matches!(source, StartupOpenPathSource::Bookmark)
+                || startup_openable_should_auto_fullscreen(
+                    &self.settings,
+                    &openable,
+                    resolution.kind,
+                ));
+        let previous_selection = self.select_after_load.clone();
+        let previous_scroll = self.grid_scroll.row_anchor();
+        let restore_default_cursor = default_continuation
+            .as_ref()
+            .is_some_and(|(intent, _)| matches!(intent, StartupListIntent::ExplicitList));
+        if let Some((_, cursor)) = default_continuation
+            .as_ref()
+            .filter(|_| restore_default_cursor)
+        {
+            self.select_after_load = cursor
+                .as_ref()
+                .map(|(name, _)| AfterLoadSelection::Name(name.clone()));
+            self.grid_scroll
+                .set_row_anchor(cursor.as_ref().and_then(|(_, rows)| *rows));
+        }
+        let restore_intent = default_continuation
+            .map(|(intent, _)| intent)
+            .unwrap_or_else(|| {
+                if select_requested_file {
+                    StartupListIntent::PageContinuation
+                } else {
+                    StartupListIntent::container_open(auto_fullscreen)
+                }
+            });
         let classified_kind = Some(match resolution.kind {
             crate::folder_tree::OpenablePathKind::Directory => OpenPathKind::Directory,
             crate::folder_tree::OpenablePathKind::File => OpenPathKind::File,
@@ -1937,27 +2189,20 @@ impl App {
                 auto_fullscreen,
                 owner.open_request_owner(),
                 classified_kind,
-                None,
-                if select_requested_file {
-                super::StartupListIntent::PageContinuation
-                } else {
-                super::StartupListIntent::container_open(auto_fullscreen)
-                },
+                pre_scan,
+                restore_intent,
                 navigation,
                 MainListRequestStage::Continuation,
                 super::DirectoryScanRoute::UiThread,
             );
-        if let Some(scan) = scan {
-            scan.finish(
-                if matches!(
-                    outcome,
-                    FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
-                ) {
-                    Outcome::Error
-                } else {
-                    Outcome::Ok
-                },
-            );
+        if restore_default_cursor
+            && matches!(
+                outcome,
+                FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
+            )
+        {
+            self.select_after_load = previous_selection;
+            self.grid_scroll.set_row_anchor(previous_scroll);
         }
         match outcome {
             FolderOpenOutcome::Ignored => return StartupOpenApplyOutcome::NotOpenable,
@@ -2298,95 +2543,32 @@ impl App {
     }
 
     pub(crate) fn open_default_startup_target(&mut self) {
-        let diagnostic = InitialNavigationTrace::begin("default-target-existing-loader-return");
-        let correlation = diagnostic.correlation();
-        let watch = diagnostic.watch;
-        let adoption = event_span(Lane::Navigation, Stage::InitialTargetAdopt, correlation)
-            .watched_optional(watch)
-            .detail("default-target-call-return");
-        let outcome = self.open_default_startup_target_observed(correlation, watch);
-        adoption.finish(outcome);
-        diagnostic.finish(outcome);
+        self.start_default_startup_input(self.settings.clone());
     }
 
-    fn open_default_startup_target_observed(
-        &mut self,
-        correlation: u64,
-        watch: Option<WatchHandle>,
-    ) -> Outcome {
-        if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::Previous {
-            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
-                .watched_optional(watch)
-                .detail("previous-list-call-return");
-            self.open_previous_startup_list();
-            load.finish(Outcome::Ok);
-            return Outcome::Ok;
+    pub(super) fn start_default_startup_input(&mut self, settings: crate::settings::Settings) {
+        let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+        // This is a typed default input to the same resolver, never an explicit empty path.
+        if let Some(pending) = self.startup_open_path_resolve_pending.take() {
+            self.finish_replaced_startup_open_pending(pending, "resolver_replaced");
         }
-        if self.settings.startup_folder_mode == crate::settings::StartupFolderMode::ReadingHistory {
-            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
-                .watched_optional(watch)
-                .detail("reading-history-call-return");
-            self.enter_reading_history();
-            load.finish(Outcome::Ok);
-        } else if should_start_in_drive_list(&self.settings) {
-            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
-                .watched_optional(watch)
-                .detail("drive-list-call-return");
-            self.enter_drive_list(None);
-            load.finish(Outcome::Ok);
-        } else {
-            let resolve = event_span(Lane::Navigation, Stage::InitialTargetResolve, correlation)
-                .watched_optional(watch)
-                .detail("default-known-folder-resolution");
-            let folder = crate::known_folders::startup_folder(
-                self.settings.startup_folder_mode,
-                self.settings.last_folder.as_deref(),
-                self.settings.startup_folder_path.as_deref(),
-            );
-            resolve.finish(if folder.is_some() {
-                Outcome::Ok
-            } else {
-                Outcome::Skipped
-            });
-            let Some(folder) = folder else {
-                return Outcome::Skipped;
-            };
-            // last_folder には変換アーカイブ (RAR/CBR/7z/LZH) の元パスが入りうるので、
-            // load_folder ではなく load_folder_or_convert_archive を通す。キャッシュが
-            // あれば open_archive_via_cache が元アーカイブを開き直し (current_folder は
-            // キャッシュ ZIP だが address/override は元アーカイブ)、無ければ変換ダイアログを
-            // 出す。通常フォルダ / ネイティブ ZIP/PDF は format=None なので load_folder に委譲され挙動不変。
-            //
-            // 前回のカーソルは、開くのが**前回いた場所そのもの**のときだけ復元する。
-            // 選択機構は増やさず、BS 戻りや親フォルダボタンが使っている `select_after_load`
-            // にそのまま乗る (名前でケース無視照合 → フィルタで隠れていれば直近の可視 idx)。
-            // 代入が無条件なのは、起動フォルダを開く時点で `select_after_load` に意見を
-            // 持つ経路が他に無いため (BS 戻りも親フォルダボタンも、まだ 1 度も動いていない)。
-            let previous_selection = self.select_after_load.clone();
-            let previous_scroll = self.grid_scroll.row_anchor();
-            let hint = crate::known_folders::startup_cursor_hint(&self.settings, &folder);
-            self.select_after_load = hint
-                .as_ref()
-                .map(|(name, _)| name.clone())
-                .map(crate::app::AfterLoadSelection::Name);
-            self.grid_scroll
-                .set_row_anchor(hint.and_then(|(_, rows)| rows));
-            let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)
-                .watched_optional(watch)
-                .detail("default-existing-loader-call-return");
-            let outcome = self.load_folder_or_convert_archive(folder);
-            let refused = matches!(
-                outcome,
-                FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
-            );
-            load.finish(if refused { Outcome::Error } else { Outcome::Ok });
-            if refused {
-                self.select_after_load = previous_selection;
-                self.grid_scroll.set_row_anchor(previous_scroll);
-                return Outcome::Error;
-            }
-        }
-        Outcome::Ok
+        let requested = crate::pdf_loader::LeasedEpubPath::try_new(PathBuf::new())
+            .expect("an empty default placeholder cannot hold an EPUB lease");
+        let navigation = self.main_folder_history_available().then(|| {
+            self.capture_main_list_navigation(
+                MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation),
+                self.copied_destination_source_proof(),
+            )
+        });
+        let _ = self.spawn_startup_resolver(
+            StartupResolveInput::Default(Box::new(settings)),
+            StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
+            requested,
+            navigation,
+            None,
+            false,
+            &ctx,
+        );
     }
 
     /// The owned preparation retains the absolute target path and its metadata, and adoption
@@ -2921,12 +3103,214 @@ fn resolve_startup_open_path(
         rar_volume_proof,
         elapsed_ms,
         direct_media,
+        folder_scan: None,
+        scan_policy: None,
+        scan_policy_mixed: false,
+        default_target: None,
+    }
+}
+
+fn spawn_startup_worker(
+    worker: impl FnOnce() + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if FORCE_STARTUP_OPEN_RESOLVE_SPAWN_FAILURE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other(
+            "forced startup path resolver spawn failure",
+        ));
+    }
+    std::thread::Builder::new()
+        .name("startup-open-resolve".into())
+        .spawn(worker)
+}
+
+fn resolve_default_startup_target(
+    settings: &crate::settings::Settings,
+) -> StartupOpenPathResolveResult {
+    use crate::settings::{StartupFolderMode as Mode, StartupListRestore, StartupListTarget};
+    let started = std::time::Instant::now();
+    let (folder, target) = match settings.startup_folder_mode {
+        Mode::ReadingHistory => (None, DefaultStartupTarget::ReadingHistory),
+        Mode::Drives => (None, DefaultStartupTarget::Drives),
+        Mode::Previous => {
+            let StartupListRestore::V1 { target, cursor } =
+                settings.startup_list_restore.clone().unwrap_or_default();
+            if target == StartupListTarget::DriveList {
+                (None, DefaultStartupTarget::Drives)
+            } else {
+                let path = match &target {
+                    StartupListTarget::PhysicalList { logical_path, .. } => {
+                        Some(logical_path.as_path())
+                    }
+                    _ => None,
+                };
+                let folder = crate::known_folders::startup_folder(Mode::Previous, path, None);
+                let target = if let Some(folder) = folder.as_ref() {
+                    let (target, cursor) =
+                        if path.is_some_and(|path| crate::folder_tree::path_eq(path, folder)) {
+                            (target, cursor)
+                        } else {
+                            (
+                                StartupListTarget::PhysicalList {
+                                    logical_path: folder.clone(),
+                                    zip_prefix: None,
+                                },
+                                None,
+                            )
+                        };
+                    DefaultStartupTarget::Folder {
+                        intent: StartupListIntent::RestoreList { target, cursor },
+                        cursor: None,
+                    }
+                } else {
+                    DefaultStartupTarget::Unavailable
+                };
+                (folder, target)
+            }
+        }
+        mode => {
+            let folder = crate::known_folders::startup_folder(
+                mode,
+                settings.last_folder.as_deref(),
+                settings.startup_folder_path.as_deref(),
+            );
+            let target = folder
+                .as_ref()
+                .map(|folder| DefaultStartupTarget::Folder {
+                    intent: StartupListIntent::ExplicitList,
+                    cursor: crate::known_folders::startup_cursor_hint(settings, folder),
+                })
+                .unwrap_or(DefaultStartupTarget::Unavailable);
+            (folder, target)
+        }
+    };
+    // Use the physical resolver's classification, including directories named *.zip/pdf/epub.
+    let mut result = match folder {
+        Some(folder) => {
+            resolve_startup_open_path(folder, StartupOpenPathSource::InitialStartup, None, true)
+        }
+        None => StartupOpenPathResolveResult {
+            requested: PathBuf::new(),
+            resolved: None,
+            bookmark_relative_page_openable: None,
+            rar_volume_proof: None,
+            elapsed_ms: 0.0,
+            direct_media: None,
+            folder_scan: None,
+            scan_policy: None,
+            scan_policy_mixed: false,
+            default_target: None,
+        },
+    };
+    result.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    result.default_target = Some(target);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_startup_resolved_target(
+    result: &mut StartupOpenPathResolveResult,
+    policy: folder_scan::FolderScanPolicy,
+    scan_main: bool,
+    cancel: &AtomicBool,
+    phase: &StartupScanPhase,
+    ctx: &egui::Context,
+    correlation: Option<u64>,
+    watch: Option<WatchHandle>,
+    source: &'static str,
+    seq: u64,
+    resolve_ms: f64,
+) {
+    let scan_started = std::time::Instant::now();
+    let directory = scan_main
+        && result.resolved.as_ref().is_some_and(|resolution| {
+            matches!(
+                resolution.kind,
+                crate::folder_tree::OpenablePathKind::Directory
+            )
+        });
+    if directory && !cancel.load(Ordering::Relaxed) {
+        phase.begin();
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+        let span = correlation.map(|id| {
+            event_span(Lane::Navigation, Stage::InitialTargetScan, id).watched_optional(watch)
+        });
+        let before = crate::susie_loader::extensions_generation();
+        let scan = policy.scan(&result.resolved.as_ref().unwrap().path, Some(cancel));
+        let after = crate::susie_loader::extensions_generation();
+        result.scan_policy_mixed = before != after || before != policy.susie_extensions_generation;
+        if let Some(span) = span {
+            span.finish(if cancel.load(Ordering::Relaxed) {
+                Outcome::Cancelled
+            } else if scan.is_ok() {
+                Outcome::Ok
+            } else {
+                Outcome::Error
+            });
+        }
+        result.folder_scan = Some(scan.map_err(|error| error.to_string()));
+        result.scan_policy = Some(policy);
+    }
+    if crate::perf::is_enabled() {
+        let (folders, media) = result
+            .folder_scan
+            .as_ref()
+            .and_then(|scan| scan.as_ref().ok())
+            .map_or((0, 0), |scan| (scan.folders.len(), scan.all_media.len()));
+        let outcome = if cancel.load(Ordering::Relaxed) {
+            "cancelled"
+        } else if result.folder_scan.as_ref().is_some_and(Result::is_err)
+            || (result.resolved.is_none()
+                && !matches!(
+                    result.default_target,
+                    Some(DefaultStartupTarget::Drives | DefaultStartupTarget::ReadingHistory)
+                ))
+        {
+            "failed"
+        } else if result.folder_scan.is_some() {
+            "scanned"
+        } else {
+            "not_directory"
+        };
+        crate::perf::event(
+            "nav",
+            "startup_resolve_scan",
+            None,
+            seq,
+            &[
+                ("resolve_ms", serde_json::Value::from(resolve_ms)),
+                (
+                    "scan_ms",
+                    serde_json::Value::from(if directory {
+                        scan_started.elapsed().as_secs_f64() * 1000.0
+                    } else {
+                        0.0
+                    }),
+                ),
+                ("folders", serde_json::Value::from(folders)),
+                ("media", serde_json::Value::from(media)),
+                ("outcome", serde_json::Value::from(outcome)),
+                ("source", serde_json::Value::from(source)),
+            ],
+        );
     }
 }
 
 #[cfg(test)]
 #[path = "agent_open_tests.rs"]
 mod agent_open_tests;
+
+#[cfg(test)]
+#[path = "startup_scan_tests.rs"]
+mod startup_scan_tests;
+
+#[cfg(test)]
+#[path = "startup_scan_policy_tests.rs"]
+mod startup_scan_policy_tests;
+
+#[cfg(test)]
+#[path = "startup_default_tests.rs"]
+mod startup_default_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3115,6 +3499,10 @@ mod tests {
             rx,
             started_at: std::time::Instant::now(),
             toast_shown: false,
+            scan_phase: std::sync::Arc::new(crate::app::startup_ops::StartupScanPhase::new()),
+            input_kind: crate::app::startup_ops::StartupResolveInputKind::Explicit(
+                StartupOpenPathSource::InitialStartup,
+            ),
             held_resolve_for_activation_admission: None,
             diagnostic: None,
         });
@@ -3133,6 +3521,10 @@ mod tests {
             bookmark_relative_page_openable: None,
             elapsed_ms: 1.0,
             direct_media: None,
+            folder_scan: None,
+            scan_policy: None,
+            scan_policy_mixed: false,
+            default_target: None,
         }
     }
 

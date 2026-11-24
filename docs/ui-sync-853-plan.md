@@ -359,3 +359,268 @@ r2 の P2-2・P2-3・P2-4・P3-5 は解消、P2-1 は一部解消と判定。§1
 全部保つ。走査し直しの取消・`Disconnected` の変種もテストする。`Disconnected` は §6.2.1 の終端 (ログ + 通知) にし、
 今の起動時の既定の場所への fallback (`startup_ops.rs:935`) を戻さない。Susie の世代は、対応拡張子の公開と同時に進める
 (`susie_loader` の既存の `INIT_GENERATION` は処理の入口で進むもので、公開された拡張子の版ではない)。
+
+### 5.4 実装の記録（2026-11-25、§1・§3 のみ、未コミット）
+
+§2 は判断待ちのためコードも対応文書も変更していない。コンパイル・Rust テスト・cargo fmt/check/clippy・
+ビルド・製品起動は利用者の指示により未実行。独立実装レビューは未実施。
+
+| 変更ファイル | 設計節と実装内容 |
+| --- | --- |
+| `src/external_links.rs`、`src/open_with.rs`、`src/ui_helpers.rs` | §1.2・§1.5。HTTP(S) の在メモリ検査、共通 spawn、短命 COM STA worker、失敗のログと map 通知、計測、opener 差し替え |
+| `src/ui_metadata_panel.rs`、`src/app/external_open.rs` | §1.3。tweet 3 入口、EXIF 描画から map 要求を返す経路、map 受付と root 通知 poll、描画/handler テスト |
+| `src/app.rs`、`src/app/update_phases.rs` | §1.3 と §3.2。App 共通の map 受信口と早期 return 前の poll、resolver の走査 payload/段階、同じ bookmark request ID の期限免除、既存 pane 走査の共通 policy 利用 |
+| `src/app/startup_ops.rs`、`src/app/startup_list_restore.rs` | §3.2・§3.3・§5.3。既存 resolver の解決＋走査、typed Default、Previous/カーソルの継続、同期 fallback 撤去、設定照合後の受信口交換、payload/lease/held/時計/診断の保持、Remote 取消時の入力種別、worker 計測 |
+| `src/app/folder_scan.rs`、`src/susie_loader.rs` | §3.2。共通 `FolderScanPolicy`、Susie pool と対応拡張子世代の同時公開、publication lock 外の旧 pool 終了 |
+| `src/app/location_jump.rs`、`src/filename_stack_ui.rs` | §3.2・§3.4。検索外 Physical の Worker、入力停止・場所待ち・500 ms 表示猶予を同じ main 走査述語へ接続 |
+| `scripts/analyze_perf.py` | §3.3。startup/nav の worker 解決・走査時間と source/outcome/件数の内訳 |
+| `src/app/startup_scan_tests.rs`、`src/app/startup_scan_policy_tests.rs`、`src/app/startup_default_tests.rs` | §3.7・§5.3。実 worker と制御した受信口による handler/状態遷移テスト |
+| `src/app/tests.rs`、`src/app/tests/startup_restore.rs`、`src/app/tests/direct_navigation_worker_scan.rs`、`src/app/rar_archive_cache_tests.rs` | §3.7。既定起動/Previous の worker 完了＋poll helper、B の producer を同期テストから worker テストへ移動。既存の採用結果の期待値は維持 |
+| `src/app/subfolder_expansion.rs`、`src/app/browser818_presentation_tests.rs` | §3.7。既存の制御した resolver fixture に新しい payload/段階の初期値を追加 |
+| `docs/ui-responsiveness.md`、`docs/async-architecture.md`、`docs/startup-diagnostics-plan.md`、`docs/next-release-backlog.md`、本書 | §4。§1・§3 の実装範囲、検証待ち、Phase B の Deferred wake 残件を記録。貼り付けの既知例外は維持 |
+| `docs/detached-rework-plan.md` §11 | main 投影と detached lease の所有境界を使う走査述語の到達範囲を記録。viewport/placement/既存 detached 分岐は変更しない |
+
+設計との差・コード照合で明確になった点:
+
+- §1.5 の extras `kind=url|player|tweet|map` は `perf::event` の予約キーで、イベント名 `open_end` と衝突する。
+  分類キーだけ `target_kind` とした。`ext/open_end` は維持する。
+- §3.7 の「走査の失敗で一覧は変わらない」は、明示 InitialStartup の失敗について既存コードと読み分けが要る。
+  従来も loader の `Ignored` → `NotOpenable` → 既定先へ一度だけ fallback するので、この既存挙動は維持した。
+  失敗した同じ場所を UI で再走査することはない。Default 自身の失敗と spawn 失敗/切断は終端とする。
+- Default の RAR は従来の owned loader の error/dialog 契約を保ち、明示起動先だけが持っていた resolver 側の
+  巻拒否通知へ変更しない。RAR 証明不足の明示要求は既存の分類継続へ渡す。
+- Default は `StartupResolveInput::Default` とし、pending には typed `input_kind` を保持する。Remote 取得時に
+  placeholder の空パスを明示要求として延期しないためで、Default は既存の返却時の「採用済み一覧を優先、空なら既定先」へ戻す。
+  Agent の source も同じ型で保持し、走査だけの継続でも計測上 Activation と取り違えない。
+- Default の解決済みの行き先が現一覧と同じなら、捕捉済み navigation の history operation だけを
+  `SameLocation` とする。従来の default loader と同じ履歴の扱いを保ち、受付/証明を取り直さない。
+- 走査だけの継続の計測は `resolve_ms=0`。元 payload の `elapsed_ms` は保持し、解決を再実行した時間として重複集計しない。
+- Desktop のテストは実 known-folder パスの解決までとし、一覧の採用は隔離した一時フォルダの実 scan payload で検査する。
+  利用者の Desktop 内容の列挙や、製品バイナリによる描画 snapshot は行っていない。
+
+実行した非 cargo の点検: `rustfmt --edition 2024 --check --config skip_children=true`、`git diff --check`、
+`python scripts/check_ui_glyphs.py` (危険 glyph 0)、`scripts/analyze_perf.py` の構文検査と合成ログの startup/nav 内訳。
+これらはコンパイル・Rust テスト・実機の動作/性能の証拠ではない。
+
+残件: 設計担当の共有 runner でコンパイルと下記テスト、独立実装レビュー、必要な実機計測。
+ツリー・§1.805 の既存 pre_scan の設定照合は範囲外の残件候補、Phase B の Deferred normal-present wake も未実装のまま。
+
+追加・更新したテスト名（すべて Rust 実行は未実施）:
+
+新規 (40 件):
+
+`src/app/external_open.rs`
+
+```text
+external_open_map_failure_repaints_root_and_root_poll_warns
+external_open_general_failure_does_not_publish_notification
+external_open_invalid_map_request_warns_without_calling_shell
+```
+
+`src/app/folder_scan.rs`
+
+```text
+section1853_policy_snapshot_tracks_all_scan_inputs
+section1853_policy_scan_preserves_visibility_and_cancellation
+```
+
+`src/app/location_jump.rs`
+
+```text
+location_and_address_plain_physical_dispatch_scan_off_caller_and_adopt_once
+```
+
+`src/external_links.rs`
+
+```text
+external_open_url_returns_before_shell_and_opens_once_on_worker
+external_open_invalid_urls_never_spawn
+external_open_player_and_tweet_use_the_same_worker_boundary
+```
+
+`src/susie_loader.rs`
+
+```text
+section1853_extensions_generation_advances_only_with_publication
+```
+
+`src/app/startup_default_tests.rs`
+
+```text
+startup_default_previous_worker_restores_same_folder_cursor_and_rows
+startup_default_previous_missing_folder_uses_nearest_ancestor_without_old_cursor
+startup_default_same_folder_keeps_existing_history_without_an_extra_departure
+startup_default_specific_worker_preserves_cursor_only_at_the_same_place
+startup_default_desktop_and_previous_desktop_fallback_keep_typed_list_continuations
+startup_default_drives_reading_history_and_previous_drive_list_do_not_scan
+startup_default_explicit_not_openable_falls_back_once_and_default_failures_are_terminal
+startup_default_remote_return_redispatches_asynchronously_without_empty_explicit_request
+startup_default_remote_return_preserves_an_already_adopted_local_folder
+startup_default_late_tree_favorite_and_dfs_requests_retire_the_old_default
+```
+
+`src/app/startup_scan_policy_tests.rs`
+
+```text
+section1853_hidden_setting_rescans_same_request_before_adoption
+section1853_visibility_setting_rescans_same_request_before_adoption
+section1853_archive_setting_rescans_same_request_before_adoption
+section1853_epub_setting_rescans_same_request_before_adoption
+section1853_susie_publication_rescans_same_request_before_adoption
+section1853_mixed_recognition_rescans_even_with_equal_policy
+section1853_scan_continuation_keeps_pending_identity_and_full_resolved_payload
+section1853_scan_continuation_cancel_discards_late_result
+section1853_scan_continuation_disconnected_is_terminal_without_default_fallback
+```
+
+`src/app/startup_scan_tests.rs`
+
+```text
+section1853_initial_activation_agent_and_bookmark_directories_scan_only_on_worker
+section1853_archive_suffix_directories_keep_directory_worker_classification
+section1853_requested_image_parent_scans_off_caller_and_keeps_file_selection
+section1853_resolve_and_scan_share_stage_predicate_and_visual_grace
+section1853_main_scan_does_not_block_independent_mounted_grid_or_detached_owner
+section1853_bookmark_scan_timeout_exemption_requires_same_request_and_scan_stage
+section1853_spawn_failure_and_disconnected_initial_are_terminal_without_default_fallback
+section1853_activation_spawn_failure_and_disconnect_resume_exact_held_resolver
+section1853_policy_rescan_spawn_failure_is_terminal_without_synchronous_retry
+section1853_detached_bookmark_resolver_worker_does_not_scan_or_block_main
+section1853_bookmark_over_deadline_keeps_timeout_exemption_through_policy_rescan
+```
+
+本体・fixture 初期値を直接更新 (26 件):
+
+`src/app/browser818_presentation_tests.rs`
+
+```text
+browser818_admission_snapshot_refusal_focuses_main_from_resolved_request
+browser818_presentation_activation_restore_materialized_keeps_request_seed
+```
+
+`src/app/tests.rs`
+
+```text
+snapshot_refusal_preserves_unresolved_startup_open_owner
+refused_snapshot_activation_resumes_held_bookmark_resolver
+cached_converted_archive_keeps_bookmark_owner_through_cache_zip_load
+startup_open_path_resolve_shows_delayed_toast
+startup_open_path_resolve_cancels_previous_pending
+normal_navigation_cancels_slow_bookmark_resolve_and_ignores_late_result
+detached_grid_archive_claim_supersedes_slow_bookmark_resolve
+replacing_bookmark_a_with_b_cannot_cancel_or_apply_over_b
+quick_folder_none_startup_pdf_password_cancel_exit_reload_preserves_ownership
+ignored_epub_bookmark_resolver_keeps_refusal_feedback
+detached_media_bookmark_resolve_cancel_preserves_main_and_target_until_exact_retirement
+remote_acquire_retires_startup_resolves_and_rejects_new_activations
+section1335_direct_zip_exit_restart_keeps_explicit_parent_list
+```
+
+`src/app/tests/direct_navigation_worker_scan.rs`
+
+```text
+direct_navigation_worker_dispatch_has_zero_caller_scans_and_adopts_once
+direct_navigation_worker_unmarked_producers_keep_synchronous_adoption
+```
+
+`src/app/tests/startup_restore.rs`
+
+```text
+section1335_drive_and_other_startup_modes_retain_their_explicit_dispatch
+section1335_first_app_startup_migrates_missing_record_and_second_startup_keeps_new_owner
+section1335_previous_zip_missing_or_recapsed_prefix_rejects_old_same_name_cursor
+section1335_departing_same_items_page_open_captures_list_cursor_before_page_navigation
+section1335_synthetic_install_captures_changed_physical_departure_without_manual_capture
+section1335_startup_cursor_rows_survive_grid_page_acceptance_before_first_scroll_layout
+section1335_bookshelf_compiled_folder_direct_read_and_explicit_list_restart_differ
+```
+
+`src/ui_metadata_panel.rs`
+
+```text
+gps_maps_panel_click_uses_current_photo_and_spread_side
+gps_maps_panel_hides_invalid_missing_and_filtered_locations
+```
+
+以下はテスト本体の期待値を変えず、更新した共有 helper (`exit_and_restart` / `restart_previous_from_saved_settings` /
+`section1285_resolver` / `section1285_result` / `section1285_resolver_result` / RAR の `open_entry`) を使う既存テスト。
+filter を選ぶ際の関連範囲として列挙する。これらも Rust 実行は未実施。
+
+`src/app/rar_archive_cache_tests.rs`
+
+```text
+rar_archive_cache_first_volume_normal_open_reuses_live_cached_zip
+rar_archive_cache_first_volume_smart_open_reuses_live_cached_zip
+rar_archive_cache_first_volume_history_open_reuses_live_cached_zip
+rar_archive_cache_first_volume_rating_open_reuses_live_cached_zip
+rar_archive_cache_first_volume_collection_open_reuses_live_cached_zip
+rar_archive_cache_later_volume_normal_open_refuses_first_cache
+rar_archive_cache_later_volume_smart_open_refuses_first_cache
+rar_archive_cache_later_volume_history_open_refuses_first_cache
+rar_archive_cache_later_volume_rating_open_refuses_first_cache
+rar_archive_cache_later_volume_collection_open_refuses_first_cache
+rar_archive_cache_later_volume_startup_restore_refuses_first_cache
+rar_archive_cache_later_volume_bookmark_handler_refuses_first_cache
+rar_archive_cache_later_volume_detached_grid_handler_refuses_first_cache
+rar_archive_cache_later_volume_direct_without_cache_is_refused
+```
+
+`src/app/startup_ops.rs`
+
+```text
+browser818_open_owner_same_path_new_request_cancels_only_old_receiver
+browser818_open_owner_remote_suspension_keeps_initial_identity
+realmachine50_cancelled_bookmark_resolve_does_not_handoff_live_owner
+realmachine50_stale_bookmark_resolve_does_not_handoff_live_owner
+section1419_candidate_main_continuation_keeps_provisional_activation
+section1419_retired_held_detached_context_does_not_panic_on_refusal_or_replacement
+section1419_failed_activation_does_not_resume_the_retired_pane
+section1285_new_main_requests_retire_startup_and_activation_resolvers
+section1473_history_menu_retires_startup_even_through_transparent_search
+section1285_reload_keeps_unresolved_initial_request_without_user_navigation
+section1285_fix_and_unfix_list_retire_older_main_resolvers
+section1285_remote_retains_deferred_target_through_operations_and_local_reload
+section1285_main_collection_keeps_detached_bookmark_even_under_activation
+section1285_classification_handoffs_preserve_later_activation
+section1285_candidate_main_join_retires_older_startup_and_activation
+section1285_accepted_pane_join_preserves_later_activation
+section1285_explicit_zip_level_moves_retire_unresolved_main_opens
+section1285_zip_root_back_without_a_move_keeps_unresolved_open
+section1285_untouched_initial_resolver_still_opens_its_target
+```
+
+`src/app/subfolder_expansion.rs`
+
+```text
+section1285_subfolder_scan_handoff_preserves_later_activation
+```
+
+`src/app/tests.rs`
+
+```text
+quick_folder_restart_after_b_exit_preserves_a_workspace
+quick_folder_restart_after_a_exit_preserves_b_workspace
+quick_folder_restart_after_none_exit_keeps_both_workspaces
+quick_folder_restart_after_none_collection_exit_keeps_both_workspaces
+quick_folder_restart_after_none_smart_folder_exit_keeps_both_workspaces
+```
+
+`src/app/tests/startup_restore.rs`
+
+```text
+section1335_explicit_book_list_and_direct_read_restart_choose_different_lists
+section1335_back_to_list_acceptance_captures_viewed_page_instead_of_grid_selection
+section1335_quit_immediately_after_transition_acceptance_restores_accepted_book_list
+section1335_nested_zip_previous_rebuilds_effective_prefix_and_back_stack
+section1335_converted_archive_records_logical_source_and_keeps_it_on_restart
+section1335_tray_direct_book_quit_while_hidden_restarts_at_preserved_parent_list
+section1335_collection_ctrl_down_zip_adoption_restores_with_sidecars_on_and_off
+section1335_video_ring_close_accepts_current_folder_list_for_exit_and_restart
+section1335_extra_video_native_window_close_rejects_stale_then_restores_folder_list
+section1335_extra_video_native_close_fullscreen_rejects_stale_then_restores_folder_list
+section1335_extra_video_parked_native_closes_preserve_main_list_restore
+section1335_extra_video_egui_close_key_restores_folder_list
+section1335_extra_video_normal_parent_return_still_restores_parent_list
+section1335_tray_image_folder_book_direct_quit_restarts_parent_and_preserves_resume
+section1335_tray_image_folder_book_backspace_quit_restarts_explicit_book_list
+```

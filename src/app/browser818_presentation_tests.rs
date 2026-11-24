@@ -751,6 +751,10 @@ fn browser818_admission_snapshot_refusal_focuses_main_from_resolved_request() {
                 rar_volume_proof: None,
                 elapsed_ms: 0.0,
                 direct_media: None,
+                folder_scan: None,
+                scan_policy: None,
+                scan_policy_mixed: false,
+                default_target: None,
             },
             ctx,
         )
@@ -934,6 +938,10 @@ fn browser818_presentation_activation_restore_materialized_keeps_request_seed() 
         rar_volume_proof: None,
         elapsed_ms: 0.0,
         direct_media: None,
+        folder_scan: None,
+        scan_policy: None,
+        scan_policy_mixed: false,
+        default_target: None,
     })
     .unwrap();
     let output = ctx.run_pass(Default::default(), |ctx| {

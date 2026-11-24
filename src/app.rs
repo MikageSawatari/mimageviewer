@@ -4759,7 +4759,7 @@ impl StartupOpenPathSource {
     }
 }
 
-/// `resolve_openable_path_detailed` を UI スレッド外で済ませた結果。
+/// パス解決と、main の実フォルダなら走査まで UI スレッド外で済ませた結果。
 pub(crate) struct StartupOpenPathResolveResult {
     rar_volume_proof: Option<crate::rar_loader::RarVolumeProof>,
     requested: PathBuf,
@@ -4769,20 +4769,26 @@ pub(crate) struct StartupOpenPathResolveResult {
     bookmark_relative_page_openable: Option<bool>,
     elapsed_ms: f64,
     direct_media: Option<startup_ops::DirectMediaPrepared>,
+    folder_scan: Option<Result<ScannedDir, String>>,
+    scan_policy: Option<folder_scan::FolderScanPolicy>,
+    scan_policy_mixed: bool,
+    default_target: Option<startup_ops::DefaultStartupTarget>,
 }
 
 /// 起動引数 / 2 重起動 activation のパス解決 worker。
 ///
 /// `Path::is_file` / `is_dir` は切断ネットワークパス等で UI を止めうるため、
-/// resolve だけ先に worker へ逃がし、完了後の実ロードだけ UI スレッドで行う。
+/// 既定先も同じ resolver に載せ、main の実フォルダは走査済みの一覧を UI で採用する。
 pub(crate) struct StartupOpenPathResolvePending {
     requested: crate::pdf_loader::LeasedEpubPath,
     owner: StartupOpenPathOwner,
+    input_kind: startup_ops::StartupResolveInputKind,
     navigation: Option<MainListNavigation>,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<StartupOpenPathResolveResult>,
     started_at: std::time::Instant,
     toast_shown: bool,
+    scan_phase: Arc<startup_ops::StartupScanPhase>,
     /// A snapshot-gated Activation temporarily owns the resolver it displaced. If the
     /// Activation is refused, this exact request (receiver and cancel token included) resumes.
     held_resolve_for_activation_admission: Option<Box<StartupOpenPathResolvePending>>,
@@ -18278,6 +18284,8 @@ pub struct App {
     pub(crate) startup_open_path: Option<ExplicitOpenPath>,
     /// 起動引数 / 2 重起動 activation で渡されたパスを UI スレッド外で解決中。
     pub(crate) startup_open_path_resolve_pending: Option<StartupOpenPathResolvePending>,
+    external_open_failure_tx: mpsc::Sender<crate::external_links::ExternalOpenFailure>,
+    external_open_failures: mpsc::Receiver<crate::external_links::ExternalOpenFailure>,
 
     // ── UI テーマ (v0.7.0) ──────────────────────────────────────
     /// 直近に ctx に適用した「解決後」のテーマ (Light / Dark)。
@@ -20344,6 +20352,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         #[cfg(windows)]
         let (activation_open_path_tx, activation_open_path_rx) = mpsc::channel();
+        let (external_open_failure_tx, external_open_failures) = mpsc::channel();
         // 360 度パノラマビュー Phase 2a: NeedsUserConfirmation → SettleApproved の
         // 追加 worker → UI channel (docs/panorama-360-view-plan.md §4.6.0)。
         let (pano_high_res_tx, pano_high_res_rx) = mpsc::channel();
@@ -21657,6 +21666,8 @@ impl App {
             initialized: false,
             startup_open_path: None,
             startup_open_path_resolve_pending: None,
+            external_open_failure_tx,
+            external_open_failures,
             applied_ui_theme: None,
             applied_text_contrast: None,
             wgpu_render_state: None,
@@ -55637,7 +55648,9 @@ impl App {
                 // confirmed, unlocked, or converted. User interaction and real conversions can
                 // legitimately exceed the path-resolver timeout; activation/navigation cancel
                 // the shared request (and worker) through its ID instead.
-                if self.archive_convert_owns_bookmark_request(pending.request_id) {
+                if self.archive_convert_owns_bookmark_request(pending.request_id)
+                    || self.main_startup_scan_owns_bookmark(pending.request_id)
+                {
                     return;
                 }
                 if pending.started_at.elapsed() > std::time::Duration::from_secs(45) {
@@ -62102,42 +62115,13 @@ impl App {
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
         let scan_path = path.clone();
-        let include_convertible_archives =
-            !self.settings.archive_file_handling_ignores_convertible();
-        let include_epub = !self.settings.epub_file_handling_ignores_epub();
-        let show_hidden_files = self.settings.show_hidden_files;
-        let file_type_visibility = self.settings.file_type_visibility.clone();
+        let scan_policy = self.folder_scan_policy();
         let perf_seq = self.input_seq;
         let perf_purpose = purpose.perf_tag();
-        let duration_wanted = self.listing_may_sort_by_duration();
-        let duration_cache_dir = crate::catalog::default_cache_dir();
         let started_at = std::time::Instant::now();
         std::thread::spawn(move || {
             let scan_started = std::time::Instant::now();
-            let scan = if cancel_w.load(Ordering::Relaxed) {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "folder scan cancelled",
-                ))
-            } else {
-                folder_scan::scan_directory_with_visibility_cancel(
-                    &scan_path,
-                    include_convertible_archives,
-                    include_epub,
-                    show_hidden_files,
-                    &file_type_visibility,
-                    Some(&cancel_w),
-                )
-            };
-            let scan = scan.map(|mut scan| {
-                folder_scan::collect_folder_duration_facts(
-                    &scan_path,
-                    &mut scan,
-                    &duration_cache_dir,
-                    duration_wanted,
-                );
-                scan
-            });
+            let scan = scan_policy.scan(&scan_path, Some(&cancel_w));
             if crate::perf::is_enabled() {
                 let (folders, media, failed) = match &scan {
                     Ok(scan) => (scan.folders.len(), scan.all_media.len(), false),

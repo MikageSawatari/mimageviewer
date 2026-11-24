@@ -1,5 +1,28 @@
 # UI スレッドの応答性 (Ctrl+↑↓ 連打が引っかからないために)
 
+## 外部リンクと起動先・場所のフォルダ走査（§1.861・§1.853、実装・検証待ち）
+
+URL・外部プレイヤー・ツイート・Google マップの Shell 呼び出しは、COM STA を初期化した短命の
+`external-open-*` worker に置く。UI は HTTP(S) の検査と投入だけを行い、終了時も join しない。
+マップの失敗だけ App 共通の受信口へ返し、early return 前の root poll で従来の警告を出す。
+`ext/open_end` の分類は予約キー `kind` と衝突しない `target_kind` に記録する。
+
+起動引数・activation・agent・main のブックマークと既定の場所は、既存 `startup-open-resolve` が解決から
+実フォルダの走査まで担当し、UI は分類済みの `pre_scan` を採用する。拡張子が ZIP/PDF/EPUB に見える実フォルダも含む。
+走査設定はツリーと共通の `FolderScanPolicy` に控える。採用前の設定・Susie 公開拡張子世代の不一致や走査中の
+世代変更では、pending を取り出さず受信口だけ差し替え、解決済み payload を保持して走査だけ続ける。
+要求の受付・履歴・取消・lease・診断・走査開始時刻は取り直さない。spawn 失敗・切断で UI の同期 fallback は行わない。
+既定の場所も typed input として同じ resolver に載せ、明示初期起動先からの fallback は一度だけとする。
+Remote 取得では明示入力だけ延期し、既定の場所は既存の返却時の一覧優先・空なら既定先という分岐に戻す。
+
+入力停止・待機表示・同じブックマークの期限免除は `main_startup_scan_elapsed()` から読む。
+main の走査中だけ旧一覧の項目入力を止め、500 ms 後に既存の移動待ち表示を出す。解決中と兄弟 context は止めない。
+400 ms のパス確認通知は解決中だけとし、走査とその継続はブックマークの45秒の解決期限に数えない。
+検索外の `dispatch_location_jump` / `dispatch_address_input` の Physical も既存 `DirectNavigation` worker に載せる。
+通常の一覧フォルダ open・親移動・読み直し・「元の場所へ」は今回変更しない。
+`nav/startup_resolve_scan` に解決・走査時間と件数・source/outcome を記録する。Rust 検証・実機計測は未実施。
+詳細は [設計書 §1・§3](ui-sync-853-plan.md)。貼り付け (§1.859) の既知の例外は変更していない。
+
 ## スタック用スクリプトのファイル操作（§1.843）
 
 環境設定の「スクリプトを開く」「既定に戻す」は `filename_stack_script` の enqueue API だけを呼ぶ。
@@ -64,7 +87,7 @@ AIの `upscale_end` も画素正規化・結果送信の前なので、UI再開�
 
 ## 直接移動のフォルダ事前走査（§1.805）
 
-main 一覧のお気に入り・アドレス欄 Enter (検索外)・最近開いたフォルダのメニューだけを対象とし、
+main 一覧のお気に入り・アドレス欄 Enter (検索外)・最近開いたフォルダのメニューを対象とし、
 拒否判定と owner 受理を済ませてから、既存の folder open worker にフィールドなしの
 `DirectNavigation` を渡す。元 navigation を保持し、完了は通常 nav 裁定から ExplicitList・
 Navigation owner の pre-scan 付き読込へ戻す。走査済みパスの再分類を省く変更は撤回し、
@@ -82,6 +105,7 @@ worker の `nav/folder_open_scan` と採用側の `nav/lf_scan` (`pre_scanned=tr
 一覧フォルダ・親への移動・コレクション物理元・フォルダを開くダイアログ・コンテキストメニューの
 同期走査は維持する。即時全画面close経路・`load_folder` 系・detached も対象外。
 詳細は [設計書](direct-navigation-worker-scan-plan.md) を参照。
+§1.853 で検索外の場所移動・特殊な場所のアドレス入力の Physical にも同じ経路を拡張した (上記)。
 
 ## 本を閉じるときの catalog 全行読み込みの撤去（§1.800 S1）
 

@@ -3180,6 +3180,10 @@ mod tests {
             rx,
             started_at: Instant::now(),
             toast_shown: false,
+            scan_phase: std::sync::Arc::new(crate::app::startup_ops::StartupScanPhase::new()),
+            input_kind: crate::app::startup_ops::StartupResolveInputKind::Explicit(
+                StartupOpenPathSource::InitialStartup,
+            ),
             held_resolve_for_activation_admission: None,
             diagnostic: None,
         });
@@ -3194,6 +3198,10 @@ mod tests {
             bookmark_relative_page_openable: None,
             elapsed_ms: 1.0,
             direct_media: None,
+            folder_scan: None,
+            scan_policy: None,
+            scan_policy_mixed: false,
+            default_target: None,
         }
     }
 

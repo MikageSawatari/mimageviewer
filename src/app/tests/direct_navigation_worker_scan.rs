@@ -196,7 +196,15 @@ fn direct_navigation_worker_admission_does_not_take_global_fullscreen_reservatio
 fn direct_navigation_worker_dispatch_has_zero_caller_scans_and_adopts_once() {
     use crate::ui_main::AddressBarNav;
     for producer in [
-        "toolbar", "menu", "keyboard", "gamepad", "ring", "address", "recent",
+        "toolbar",
+        "menu",
+        "keyboard",
+        "gamepad",
+        "ring",
+        "address",
+        "address-input",
+        "location-jump",
+        "recent",
     ] {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;
@@ -217,6 +225,16 @@ fn direct_navigation_worker_dispatch_has_zero_caller_scans_and_adopts_once() {
             "ring" => app.mouse_ring_nav = Some(AddressBarNav::WorkerFavorite(target.clone())),
             "address" => {
                 frame.address_nav = Some(AddressBarNav::AddressEnterPhysical(target.clone()))
+            }
+            "address-input" => {
+                frame.address_nav = Some(AddressBarNav::AddressInput(
+                    crate::ui_main::LocationJumpTarget::Physical(target.clone()),
+                ))
+            }
+            "location-jump" => {
+                frame.address_nav = Some(AddressBarNav::LocationJump(
+                    crate::ui_main::LocationJumpTarget::Physical(target.clone()),
+                ))
             }
             "recent" => frame.address_nav = Some(AddressBarNav::RecentFolder(target.clone())),
             _ => unreachable!(),
@@ -247,16 +265,8 @@ fn direct_navigation_worker_dispatch_has_zero_caller_scans_and_adopts_once() {
 
 #[test]
 fn direct_navigation_worker_unmarked_producers_keep_synchronous_adoption() {
-    use crate::ui_main::{AddressBarNav, LocationJumpTarget};
-    for producer in [
-        "dialog",
-        "grid",
-        "parent",
-        "favorite",
-        "address-input",
-        "location-jump",
-        "wrapper",
-    ] {
+    use crate::ui_main::AddressBarNav;
+    for producer in ["dialog", "grid", "parent", "favorite", "wrapper"] {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;
         let target = folder(&app, "target");
@@ -280,16 +290,6 @@ fn direct_navigation_worker_unmarked_producers_keep_synchronous_adoption() {
             }
             "parent" => frame.keyboard_nav = app.handle_grid_parent_folder_action(),
             "favorite" => frame.keyboard_nav = Some(AddressBarNav::Favorite(target.clone())),
-            "address-input" => {
-                frame.address_nav = Some(AddressBarNav::AddressInput(LocationJumpTarget::Physical(
-                    target.clone(),
-                )))
-            }
-            "location-jump" => {
-                frame.address_nav = Some(AddressBarNav::LocationJump(LocationJumpTarget::Physical(
-                    target.clone(),
-                )))
-            }
             "wrapper" => app.open_direct_navigation_target(
                 target.clone(),
                 None,

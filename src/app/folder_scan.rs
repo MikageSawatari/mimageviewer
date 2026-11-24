@@ -2,6 +2,165 @@ use std::path::PathBuf;
 
 use crate::grid_item::GridItem;
 
+/// Memory-only snapshot shared by pane scans and startup resolution workers.
+/// Susie recognition remains live while scanning, so startup adoption must also
+/// compare its generation before/after scanning and against this snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FolderScanPolicy {
+    include_convertible_archives: bool,
+    include_epub: bool,
+    show_hidden_files: bool,
+    file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
+    duration_wanted: bool,
+    duration_cache_dir: PathBuf,
+    pub(crate) susie_extensions_generation: u64,
+}
+
+impl FolderScanPolicy {
+    pub(crate) fn capture(
+        settings: &crate::settings::Settings,
+        duration_wanted: bool,
+        duration_cache_dir: PathBuf,
+    ) -> Self {
+        Self {
+            include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
+            include_epub: !settings.epub_file_handling_ignores_epub(),
+            show_hidden_files: settings.show_hidden_files,
+            file_type_visibility: settings.file_type_visibility.clone(),
+            duration_wanted,
+            duration_cache_dir,
+            susie_extensions_generation: crate::susie_loader::extensions_generation(),
+        }
+    }
+
+    /// Worker-only: directory metadata and optional read-only duration catalog.
+    pub(crate) fn scan(
+        &self,
+        path: &std::path::Path,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<ScannedDir> {
+        if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "folder scan cancelled",
+            ));
+        }
+        let mut scan = scan_directory_with_visibility_cancel(
+            path,
+            self.include_convertible_archives,
+            self.include_epub,
+            self.show_hidden_files,
+            &self.file_type_visibility,
+            cancel,
+        )?;
+        collect_folder_duration_facts(
+            path,
+            &mut scan,
+            &self.duration_cache_dir,
+            self.duration_wanted,
+        );
+        Ok(scan)
+    }
+}
+
+#[cfg(test)]
+mod folder_scan_policy_tests {
+    use super::*;
+
+    #[test]
+    fn section1853_policy_snapshot_tracks_all_scan_inputs() {
+        let mut settings = crate::settings::Settings::default();
+        let policy = FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-a"));
+        assert_eq!(
+            policy,
+            FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-a"))
+        );
+        settings.show_hidden_files = !settings.show_hidden_files;
+        assert_ne!(
+            policy,
+            FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-a"))
+        );
+        // The snapshot owns its visibility set rather than sharing later edits.
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("jpg".into());
+        assert!(
+            !policy
+                .file_type_visibility
+                .excluded_extensions
+                .contains("jpg")
+        );
+        let captured = FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-a"));
+        settings.show_hidden_files = !settings.show_hidden_files;
+        settings.file_type_visibility.excluded_extensions.clear();
+        assert_ne!(captured, policy);
+        assert_ne!(
+            policy,
+            FolderScanPolicy::capture(&settings, true, PathBuf::from("cache-a"))
+        );
+        assert_ne!(
+            policy,
+            FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-b"))
+        );
+        settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ignore;
+        assert_ne!(
+            policy,
+            FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-a"))
+        );
+        settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ask;
+        settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+        assert_ne!(
+            policy,
+            FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-a"))
+        );
+        let mut changed = policy.clone();
+        changed.susie_extensions_generation = changed.susie_extensions_generation.wrapping_add(1);
+        assert_ne!(changed, policy);
+    }
+
+    #[test]
+    fn section1853_policy_scan_preserves_visibility_and_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("keep.jpg"), b"fixture").unwrap();
+        std::fs::write(temp.path().join("omit.png"), b"fixture").unwrap();
+        std::fs::write(temp.path().join("omit.7z"), b"fixture").unwrap();
+        std::fs::write(temp.path().join("omit.epub"), b"fixture").unwrap();
+        std::fs::create_dir(temp.path().join("directory.zip")).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ignore;
+        settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        let cache = temp.path().join("no-catalog-created");
+        let policy = FolderScanPolicy::capture(&settings, false, cache.clone());
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let scan = policy.scan(temp.path(), Some(&cancel)).unwrap();
+        assert_eq!(scan.all_media.len(), 1);
+        assert_eq!(scan.all_media[0].path, temp.path().join("keep.jpg"));
+        assert_eq!(scan.omitted.counts.file_type, 1);
+        assert_eq!(scan.omitted.counts.ignored_archive, 1);
+        assert_eq!(scan.omitted.counts.ignored_epub, 1);
+        assert!(scan.folders.iter().any(|entry| {
+            matches!(&entry.item, GridItem::Folder(path) if path == &temp.path().join("directory.zip"))
+        }));
+        assert!(!cache.exists());
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        // A pre-cancelled request must return Interrupted before touching even
+        // a missing path, which would otherwise produce NotFound.
+        assert_eq!(
+            policy
+                .scan(&temp.path().join("missing"), Some(&cancel))
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::Interrupted
+        );
+    }
+}
+
 /// `all_media` の各要素がどの `GridItem` になるかのスキャン時分類。
 /// Image → `GridItem::Image`、Video → `GridItem::Video`、Audio → `GridItem::Audio`。
 /// 動画のアップスケール派生ペア除去 (`filter_upscaled_video_pairs_fast`) は Video のみ対象。
