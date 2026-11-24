@@ -40,6 +40,14 @@
 
 ## 1. 優先候補
 
+### 1.885 「編集内容の復元」や mIV 内の名前の変更・移動の後、本を開くと読書位置が使われず先頭から開く — §1.875 a のサブ PC 確認から (2026-11-24)
+
+- 状態: **原因確認済み (コードと使い捨てのテスト、担当 tree-dnd-464)、未着手、収録版は利用者の判断待ち**。v4.6.0 (291b32e5b) からのリリース済みの不具合で、v5.7.0 の退行ではない。
+- 観測 (サブ PC 担当の Claude、master 1d0433e84): 復元したあと、一覧の本には読んだ位置のバーが出るのに、開くと 1 ページ目からになる。ログは `book resume skipped: reason=HiddenIdentity`。移動先で読み直すと直る。
+- 原因 (担当のコード参照と使い捨てのテスト): 読書位置の行の `page_identity` に本の絶対パス (`container`) が入っている。`copy_resume_store` (復元のコピー) と `migrate_resume_store` → `migrate_store_family` (mIV 内の名前の変更・移動) は行のキーだけを書き換え、identity は元のパスのまま残す。開くときの `PreparedPageIdentityIndex::resolve` は完全一致で照合するので HiddenIdentity になり、`app.rs` の本の再開が先頭を開く。ZIP 内の本の行・製本・画像フォルダ→ZIP 変換は identity も書き換えていて正しい。
+- 不変条件: キーを変える操作は、同じトランザクションで identity も書き換える。
+- 直し方の案 A (担当の推奨): `rewrite_archive_resume_identity` を Archive・Document・Image の 3 種類に広げ、`copy_resume_store` と `migrate_resume_store` の通常の行でも呼ぶ。製品コード 40〜80 行、resolver まで通す handler テスト 5 本ほど。データの形は変えないので移行は要らない。既に食い違っている行の一括修正と、読む側で container を無視する案は採らない。詳細は共有メモ `restore-875-resume-hidden-identity.md`。
+
 ### 1.884 ブラウザ閲覧の保存先のフォルダでは「末尾の単ページへ表紙を添える」を既定で効かせない — §1.870 のサブ PC2 確認から (2026-11-24)
 
 - 状態: **v5.7.0 に入れる (利用者決定 2026-11-24「お願いします」)、設計の独立レビュー r3 ACCEPT・実装の独立レビュー ACCEPT、master に取り込み (11bfbcceb、2026-11-24)、実機は未確認**。
