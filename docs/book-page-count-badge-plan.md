@@ -4,9 +4,10 @@
 
 状態: 設計第4版。第1版 (`7aa5c6918`)・第2版 (`5fed5048d`)・第3版 (`e6d109cbb`) は独立設計レビュー
 (Sol / xhigh) 1〜3 回目でいずれも REVISE。第2版からは、指摘を仕組みを足すのではなく状態を減らす形で直している。
-第4版 (`d93388e71`) はレビュー 4 回目で REVISE。第5版は 4 回目の指摘を反映し、さらに利用者の決定
+第4版 (`d93388e71`) はレビュー 4 回目で REVISE。第5版 (`2fbcdef49`) は 4 回目の指摘を反映し、さらに利用者の決定
 (2026-11-24、統括経由「ページ数バッジ・ソートまでいれて、次の5.7.0リリースへと進めたいと思います。」) に従い、
-ページ数順を同じ版に入れる前提で §6 を設計し直した (§9)。実装はまだしない。**収録版は v5.7.0**。
+ページ数順を同じ版に入れる前提で §6 を設計し直した。第5版はレビュー 5 回目で REVISE、第6版はその指摘の反映で、
+まだレビューを受けていない (§9)。実装はまだしない。**収録版は v5.7.0**。
 正本のバックログは [next-release-backlog.md](next-release-backlog.md) §1.883。
 
 ## 1. 目的と範囲
@@ -133,7 +134,10 @@
 - 画像フォルダは「画像のみのフォルダを本として扱う」の ON/OFF に関わらず数える (詳細列と同じ、
   `page_count_options_do_not_depend_on_image_folder_auto_open`)。普通の写真フォルダにも枚数のバッジが出る。
   → §7 の問 2 で確認する。
-- `ZipDir` (ZIP 内の書庫) は `ZipTree` から数えた値だけを出す (I/O なし)。
+- `ZipDir` (ZIP 内の書庫) は、表示中の外側 ZIP の木 (`zip_nav` の `ZipTree`) の値を**その場で読む** (I/O なし、§4.9)。
+  details-meta のメモリには入れない (レビュー 5 回目 P2-2)。木は外側 ZIP を開いたときの認識規則で作られ、
+  開き直せば作り直されるので、ページ数の所有者は木にする。メモリに fingerprint の印を付けて持つと、Susie を
+  再読み込みした後も古い木の数を新しい印で持ち続けてしまう。
 
 ### 4.2 数える費用 (見立て、未計測)
 
@@ -207,10 +211,19 @@
   - `susie_loader` に、RwLock の中のプールを入れ替えるたびに上がる版数 (`pool_revision()`) を足す (入れ替えの
     直前に上げる今の `INIT_GENERATION` とは別。入れ替えた時点で上げる)。
   - job を始めるとき、fingerprint と同時に版数を取る (fingerprint はその版のプールの拡張子から作る)。
-  - 1 冊を数え終えたら、catalog に書く前に版数を見直し、変わっていればその結果を捨てる (catalog に書かず、メモリの
-    checked も立てない。取消と同じ扱い)。その本は次の取得要求で、新しい版のプールと fingerprint で数え直す。
-  - 待つ状態や監視は足さない。プールの差し替えは起動時に 1 回と、利用者の再読み込みのときだけなので、捨てる
-    結果は数冊に限られる。
+  - 版数はプールの入れ替えと同じロックの中で上げ、読むときも同じロックで読む (プールと版数が食い違って
+    見えない)。起動時の空のプール → 作り終えたプールの差し替えも 1 回の入れ替えとして数える。
+  - 1 冊を数え終えたら、catalog に書く前に版数を見直す。変わっていれば、その結果を catalog にもメモリにも残さず、
+    **その job (session) を「古くなった」として終える** (レビュー 5 回目 P2-1)。利用者の停止に使う `Cancelled` には
+    しない (`Cancelled` は自動で再開しないため、全件の取得が止まったままになる)。また、その本だけ飛ばして
+    `Finished` にもしない (数えていない本を含んだまま完了の証明が立つため)。
+  - 「古くなった」終わり方は、既存の「一覧の世代が変わった session の取り消し」と同じ扱いにする: 状態を
+    `NotRequested` へ戻し、完了の証明を立てない。次の poll が新しい版のプールと fingerprint で session を始め直す
+    (media-duration-sort-filter-plan §5.2「動いている session の対象が古くなったとき」と同じ経路。新しい状態は
+    足さない)。UI 側でも、poll で session の版数と今の版数が違えばその session を取り消して `NotRequested` へ戻す
+    (worker が書く前に気づくのと、UI が先に気づくのの両方を同じ終わり方にする)。
+  - 待つ状態や監視は足さない。プールの差し替えは起動時に 1 回と、利用者の再読み込みのときだけなので、
+    始め直しもその回数に限られる。
 - これで catalog へ書く fingerprint は、必ずその本を数えた規則のものになる。テストの helper
   (`archive_details_config`、`metadata_ops.rs`) にも同じ 1 回の計算を使う (レビュー 4 回目で確認された、残っている
   二重計算)。
@@ -390,6 +403,12 @@ fn thumbnail_page_count_enabled(&self) -> bool {
     `Arc` で共有される (公開後にノードを書き換える経路は無い。レビュー 3 回目で確認)。
   - `page_count_for_prefix_str` はノードを探して値を読むだけにする (費用は prefix の深さ)。
   - レーティング一覧などで外側 ZIP の木が無い (`zip_nav` が無い) `ZipDir` は、今と同じく値が取れずバッジを出さない。
+  - **`ZipDir` は details-meta のページ数の target にしない** (レビュー 5 回目 P2-2)。今の `warm_page_count` の
+    経路 (target を作って worker がその値を返し、メモリへ入れる) をやめ、ページ数の accessor
+    (`details_page_count_value`) が `ZipDir` のときは今の `zip_nav` の木から直接読む。詳細表示のページ数列・
+    列見出しの並べ替え・選択情報・バッジが同じ accessor を通るので、`ZipDir` の数の書き手は木だけになる。
+    木が作り直されれば次のフレームから新しい数になる。ZIP の中の一覧はページ順が固定で、一覧の並べ替え
+    (ページ数順) の対象にはならない (§6.4)。
 - 計装: 既存の `details_meta/load_done` に、ページ数の件数を足す
   (`page_targets`・`page_cache_hits`・`page_counted` を種類別 (zip / zip_nested / folder / rar / pdf / epub)・
   `page_failed`・`page_ms`)。取り消した job は `load_done` に届かず途中で返るので、既存の
@@ -482,9 +501,14 @@ materialize は各本のページ数を次の順で決める (先に見つかっ
 2. **catalog** (`ScannedDir.page_count_facts`): 下の一括読み取りで、名前・種類・mtime・size・fingerprint が
    記録の再利用と同じ条件で一致する行。
    - ZIP・RAR: `container_page_meta` (kind=Zip / Archive) の名前・mtime・size・fingerprint。
-   - 画像フォルダ: `container_page_meta` (kind=Folder) の名前・mtime・fingerprint。**走査の結果から作るフォルダの
-     mtime / size が、details-meta が記録を書くときの値 (`image_metas` 由来) と同じか、実装時にテストで確かめる**
-     (違えば facts は当たらず、メモリと取得だけで並ぶ。誤った値は使わない)。
+   - 画像フォルダ: `container_page_meta` (kind=Folder) の名前・mtime・size=0・fingerprint。
+     **ページ数の identity は種類ごとに決める** (レビュー 5 回目 P2-4)。走査はフォルダについて、表示用の stamp を
+     `(mtime, 0)`、並べ替え用の `ListingSortMetadata` を `file_size: None` で作る (`folder_scan.rs` の
+     `ScannedFolderEntry`)。details-meta は前者 (`image_metas`) で catalog を照合・保存する。そこで、ページ数の照合
+     (メモリ・facts とも) は **表示用の stamp を使い、フォルダは `(mtime, 0)`** とする。長さの reader のように
+     `ListingSortMetadata.file_size?` で弾くと、フォルダは一度も当たらない。サイズ順のための `None` は変えない。
+   - 本の件数の入力は、長さが使う `all_media` ではなく、書庫も含む `scan.folders` 側
+     (`book_materialization.rs` の物理 materialize) から取る。
    - PDF: `pdf_meta` の名前・mtime・size。`password_required` の行は使わない (資格情報で値が変わるので、
      メモリの値だけを使う)。
    - EPUB: `pdf_meta` は変換世代の stamp で書かれ、走査の stamp では照合できないので使わない (メモリだけ)。
@@ -520,6 +544,17 @@ catalog の一括読み取り (worker だけ):
   この一覧で使えること (`lazy_metric_allowed`)。**継続条件** (長さと同じく「未取得がある間だけ」にしない)。
 - 対象はその一覧の **全部の本** (`items` のうち `details_item_supports_page_count` が真のもの。表示集合・絞り込み・
   可視範囲に依らない)。`whole_listing_meta_scan_wanted()` にページ数を足す。
+- **`requirements.page_count` は表示の設定から独立して、取得の全部の関門を通る** (レビュー 5 回目 P2-3)。
+  バッジも詳細表示のページ数列も OFF のままページ数順を選んでも数える。今は次の関門がそれぞれ表示の需要
+  (`lazy_load_page_count_for_idx`) だけを見ているので、全部に `requirements.page_count && 本` を足す:
+  - Planning の対象の選別と、メモリで満たしているかの判定 (`advance_details_meta_target_plan` の
+    `details_item_requires_lazy_meta(idx) || (requirements.duration && media) || (requirements.ai && ai)` と、
+    その後の cached の判定)。
+  - target の生成 (`details_meta_target_for_idx_with_requirements` の `load_page_count`。`allow_page_count` と
+    `whole_listing_only` の制限も、`requirements.page_count` のときは通す)。
+  - target が 0 件でも完了の証明を立てる経路 (`launch_details_meta_worker` の `plan.total == 0 || target_count == 0`)
+    は、ページ数の要件を含む snapshot をそのまま渡す。
+  - 詳細表示の列見出しの並べ替え用の既存の `load_all_page_counts` は、別の経路としてそのまま残す。
 - フィールドの規則 (§1.835 の「長さだけの要求で AI・日時・寸法・ページ数を増やさない」を保つ):
   - 表示集合の外では、全体要件に含まれるフィールドだけを取る。`whole_listing_only` の target でも、
     `requirements.page_count` のときだけページ数を取る (`allow_page_count` の判定に足す)。
@@ -537,8 +572,11 @@ catalog の一括読み取り (worker だけ):
 
 ### 6.6 ページ数順へ変える操作と入口
 
-- メニュー・ツールバー・ゲームパッドでページ数順へ変える、または選択中のページ数順を選び直すときは、物理フォルダの
-  再読込を worker 走査 (`apply_sort_change_reload_without_ui_io`) で行う (長さ順と同じ入口の判定を遅延キー全体へ)。
+- メニュー・ツールバー・ゲームパッドでページ数順へ変える、または選択中のページ数順を選び直すときは、今の
+  `apply_sort_change_reload` (`src/app.rs`) をそのまま使う。master では、通常の物理フォルダの並べ替えの再読込は
+  既に worker 走査 (`start_folder_open_scan` の `CurrentViewOrderRefresh`) へ渡している (レビュー 5 回目 P3。
+  第5版が書いた `apply_sort_change_reload_without_ui_io` は今のコードに無い)。ここは長さの判定の一般化ではなく、
+  今の入口の再利用になる。
 - そのほかの入口 (開く・Ctrl+↑↓・BS・folder pane・更新・外部変更) は、長さ順の実装で作った入口の台帳
   ([media-duration-sort-filter-plan.md](media-duration-sort-filter-plan.md) §11.2) をそのまま使い、facts の要求に
   ページ数の flag と fingerprint を足す。同期走査の入口はメモリだけで並ぶ。
@@ -614,7 +652,8 @@ catalog の一括読み取り (worker だけ):
 - `ZipTree`: `build` と `project` の両方の木で、各ノードの画像数が部分木の実数と一致する。`page_count_for_prefix_str`
   が再帰しない。
 - 取消 (§4.4.1): RAR とフォルダの走査が job の cancel で止まり、記録も checked も立てない。
-- 値: `page_count = None`・0・失敗でバッジなし、PDF のパスワードの revision、`ZipDir` は `ZipTree` の値、
+- 値: `page_count = None`・0・失敗でバッジなし、PDF のパスワードの revision、`ZipDir` は今の `zip_nav` の木の値を
+  accessor が直接読み、details-meta の target にならない、
   ドライブ一覧でバッジなし。
 - 設定: 既定 true、旧設定に field が無いと true、false の往復、settings_transfer、件数のテスト。
 - ページ数順 (§6):
@@ -628,7 +667,11 @@ catalog の一括読み取り (worker だけ):
   - 遅延キーの共通化: `is_duration()` から置き換えた全箇所の台帳 (使える一覧・正規化・入口・Remote・ゲームパッド・
     ツールバーの補完)。長さ順の既存テスト (`duration_762` 一式) が全部通る。
   - 取得: ページ数だけの全体要件で本を全部数え、動画を probe しない。長さだけ・AI だけの全体要件で本を数えない。
-    proof に page_count が立つ・失効する。読み込み中の表示と停止 / 再開。
+    **バッジと詳細表示のページ数列を両方 OFF にしてページ数順を選んでも数える** (Planning の選別・cached 判定・
+    target 生成・0 件の完了の全部)。proof に page_count が立つ・失効する。読み込み中の表示と停止 / 再開。
+  - 画像フォルダ: メモリ・facts の照合が `(mtime, 0)` で当たり、サイズ順の `file_size: None` は変わらない。
+  - Susie のプールの差し替え: 全件の取得の途中で差し替わると、その session は「古くなった」として `NotRequested` へ
+    戻り、新しい版で始め直して完了する (`Cancelled` で止まらない、数えていない本を含む証明が立たない)。
   - 入口: ページ数順への変更・選び直しが worker 走査を使う。
   - スタック・Remote・使えない一覧の正規化・ツールバーの 12 → 14 値の一回限りの補完・旧版相当の enum で読んで
     DB を書き換えないこと。
@@ -680,4 +723,19 @@ catalog の一括読み取り (worker だけ):
   - 判定用の fingerprint を呼び出しごとに計算することは妥当 (判断の差だけで再開や取消を繰り返さず、設定とプールが
     落ち着けば収束する)、`DetailsPageCountConfig` を作る本番の入口が 1 つであること、`build` / `project` の両方での
     事前集計と不変条件、「最後の値」と実際の取得の開始を分けた説明は妥当とされた。
-- 5 回目: 未実施。第5版は 4 回目の指摘に加え、ページ数順を同じ版に入れる §6 を新しく設計したので、§6 も対象にする。
+- 5 回目 (Sol / xhigh、同じセッション、第5版 `2fbcdef49`、§6 のページ数順を含む): **REVISE**。
+  - P2-1 プールの版数の変化を取消と同じに扱うと、全件の取得が `Cancelled` のまま止まる。その本だけ飛ばすと
+    数えていない本を含む証明が立つ → session を「古くなった」として `NotRequested` へ戻す既存の経路を使う。
+  - P2-2 `ZipDir` の数を新しい fingerprint の印でメモリに持つと、古い木の数が残る → `ZipDir` は木の値を accessor が
+    直接読み、details-meta の target にしない。
+  - P2-3 ページ数の全体要件が、表示の需要を見ている関門 (選別・cached 判定・target 生成・0 件の完了) を通らない
+    → 全部の関門に足すと明記した。
+  - P2-4 画像フォルダの stamp は表示用が `(mtime, 0)`、並べ替え用が `file_size: None` で、長さの reader の形では
+    当たらない → ページ数の identity を種類ごとに決め、フォルダは `(mtime, 0)` とした。入力は `scan.folders` 側。
+  - P3 入口の関数名が今のコードと違う → 今の `apply_sort_change_reload` を再利用すると直した。
+  - プールと版数を同じロックで公開・取得すれば版数の方式で空 → 作り終えたプールの差し替えも捉えられること、RAR の
+    検査キャッシュのキー追加、ZIP の `NESTED_CACHE` と目次・名前索引のキャッシュは認識した画像の集合を持たないので
+    変更不要なこと、遅延キーの共通化・不明は末尾・スタックの構造体の持ち回り・Remote の正規化を共有する方針は
+    妥当とされた。利用者への事前説明では、ツールバーの補完でページ数順を使わない利用者にも旧版との設定の境界が
+    及ぶ点を残すこと (§7 の問 4)。
+- 6 回目: 未実施。
