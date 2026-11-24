@@ -728,3 +728,17 @@ waiting_does_not_expire_while_files_keep_arriving
 `python scripts/check_ui_glyphs.py` は成功（危険な UI 字形 0 件）。これはコンパイル・テストの結果ではない。
 
 独立実装レビュー r1 の P2-1・P2-2 対応: `src/native_context_menu.rs` の `ClipboardDataObject` を `Agile = false` とし、STA 専用の inner `IDataObject` への委譲を所有 apartment に戻す。クリップボードを使わず fake inner と STA 間 marshal proxy で検査する `clipboard_data_object_does_not_implement_iagile_object`、`clipboard_data_object_marshaling_delegates_getdata_and_setdata_to_owner_sta` を追加。`src/app.rs` と `src/app/startup_ops.rs` は、同じ request_id のメディアブックマークについて走査中の30秒期限を免除し、policy 再走査を含む連続した走査時間を採用時に一度だけ pending の起点へ加算する。既存の activation 保留による期限延長と走査時間の重複は二重に控除しない。本は既存の `begin_page_wait` が採用後の `AwaitingPage` に新しい起点を作るため変更不要と確認した。`src/app/startup_scan_tests.rs` に、時計を渡して検査する `section1853_media_bookmark_scan_timeout_exemption_requires_same_request_and_scan_stage`、`section1853_media_bookmark_policy_rescans_credit_scan_once_before_player_wait`、`section1853_media_bookmark_scan_adoption_never_credits_another_request`、`section1853_media_bookmark_activation_hold_and_scan_credit_do_not_overlap`、`section1853_book_bookmark_page_wait_starts_fresh_after_scan` を追加（既存テストの期待値変更なし）。cargo・コンパイル・Rust テスト・製品起動は未実施、commit / stash / reset / checkout は行っていない。
+
+時刻差し替えテストの修正: `startup_scan_tests.rs` と `startup_scan_policy_tests.rs` の本ブランチで追加したテストから、`Instant::now()` を過去へ引く設定を除いた。起点を現在時刻に置き、期限・再走査・表示猶予は未来の観測時刻を `_at` helper に渡して検査する。走査の印だけが必要なケースは経過時間を作らず開始済みの phase を使う。本の poll と走査時間・表示猶予の取得にも観測時刻を渡す seam を設け、通常の呼び出しは現在時刻を渡す。ブランチ開始前からあるテストと期待する結果は変更せず、cargo・Rust テスト・製品起動は未実施。
+
+### 5.8 独立実装レビュー (GPT-6.1 Sol / xhigh、read-only、設計・実装とは別の担当、2026-11-25)
+
+- r1 (d3e0e7aed): REJECT、P2×2。P2-1 `ClipboardDataObject` が agile (FTM) のままで、別 STA の貼り付けから Shell の
+  STA 専用 object へ直接委譲され得る → `Agile = false` と marshal の単体テスト。P2-2 動画・音声ブックマークの 30 秒の期限が
+  走査の段階を免除していない → 同じ request の走査中は免除し、走査時間を採用時に 1 回だけ起点へ足す。いずれも設計担当が
+  コードで確かめて正しいと判断し、7cad8585d で直した。
+- r2 (7cad8585d): ACCEPT-WITH-CHANGES。r1 の 2 件は解消。P3×1 (新しいテストが `Instant::now()` から過去を引き、起動直後の
+  環境で underflow し得る) → 基準を「今」に置き、`_at` の seam に未来の時刻を渡す形に直した (次のコミット)。
+- 設計担当が run-heavy で流した関連の filter: 最終 818 件すべて成功。本体 lib 全件は流していない (統括が master で流す)。
+  ignored の実 Shell テスト 2 件 (`shell_paste_native_*`) はデスクトップのクリップボードを置き換えるため、メイン PC では
+  流していない。

@@ -55578,6 +55578,10 @@ impl App {
     }
 
     fn poll_bookmark_book_open(&mut self, ctx: &egui::Context) {
+        self.poll_bookmark_book_open_at(ctx, std::time::Instant::now());
+    }
+
+    fn poll_bookmark_book_open_at(&mut self, ctx: &egui::Context, now: std::time::Instant) {
         if self.sidecar_restore_active() {
             return;
         }
@@ -55669,7 +55673,9 @@ impl App {
                 {
                     return;
                 }
-                if pending.started_at.elapsed() > std::time::Duration::from_secs(45) {
+                if now.saturating_duration_since(pending.started_at)
+                    > std::time::Duration::from_secs(45)
+                {
                     let cancelled = self
                         .cancel_bookmark_open_request(pending.request_id, "book_resolve_timeout");
                     #[cfg(windows)]
@@ -55681,7 +55687,7 @@ impl App {
                 return;
             }
         };
-        if started_at.elapsed() > std::time::Duration::from_secs(45) {
+        if now.saturating_duration_since(started_at) > std::time::Duration::from_secs(45) {
             let cancelled =
                 self.cancel_bookmark_open_request(pending.request_id, "book_page_timeout");
             #[cfg(windows)]

@@ -274,7 +274,7 @@ fn section1853_scan_continuation_keeps_pending_identity_and_full_resolved_payloa
     let (mut request, tx) = pending(requested.clone());
     assert!(request.requested.has_epub_lease());
     request.toast_shown = true;
-    request.started_at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    request.started_at = std::time::Instant::now();
     request.scan_phase.begin();
     request.diagnostic = Some(InitialNavigationTrace::begin("section1853-policy-test"));
     let trace = request.diagnostic.as_ref().unwrap().correlation();
@@ -308,7 +308,10 @@ fn section1853_scan_continuation_keeps_pending_identity_and_full_resolved_payloa
     result.scan_policy_mixed = true;
     app.startup_open_path_resolve_pending = Some(request);
     assert!(tx.send(result).is_ok());
-    app.poll_startup_open_path_resolve(&egui::Context::default());
+    app.poll_startup_open_path_resolve_at(
+        &egui::Context::default(),
+        started_at + std::time::Duration::from_secs(60),
+    );
     let retained = app.startup_open_path_resolve_pending.as_ref().unwrap();
     assert_eq!(retained.owner, owner);
     assert_eq!(retained.requested.as_path(), requested.as_path());

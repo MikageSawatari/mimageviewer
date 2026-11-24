@@ -931,6 +931,13 @@ impl App {
     }
 
     pub(crate) fn main_startup_scan_elapsed(&self) -> Option<std::time::Duration> {
+        self.main_startup_scan_elapsed_at(std::time::Instant::now())
+    }
+
+    pub(crate) fn main_startup_scan_elapsed_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
         if !self.main_folder_history_available() {
             return None;
         }
@@ -938,7 +945,7 @@ impl App {
         if !unresolved_open_owner_is_main(&pending.owner) {
             return None;
         }
-        pending.scan_phase.elapsed()
+        pending.scan_phase.elapsed_at(now)
     }
 
     pub(super) fn main_startup_scan_owns_bookmark(
@@ -1051,7 +1058,7 @@ impl App {
                     );
                     return;
                 }
-                let elapsed = pending.elapsed();
+                let elapsed = now.saturating_duration_since(pending.started_at);
                 if !pending.toast_shown && elapsed >= STARTUP_OPEN_PATH_RESOLVE_TOAST_DELAY {
                     pending.toast_shown = true;
                     self.show_feedback_toast("パスを確認しています…".to_string());

@@ -85,13 +85,6 @@ fn pending(
     )
 }
 
-fn scan_phase(elapsed: Duration) -> Arc<StartupScanPhase> {
-    Arc::new(StartupScanPhase {
-        origin: Instant::now() - elapsed,
-        started_us: std::sync::atomic::AtomicU64::new(1),
-    })
-}
-
 fn adopt_real_worker_result(app: &mut App, target: &Path, caller_scans: usize) {
     let pending = app.startup_open_path_resolve_pending.as_mut().unwrap();
     let result = pending.rx.recv_timeout(Duration::from_secs(30)).unwrap();
@@ -198,12 +191,13 @@ fn section1853_resolve_and_scan_share_stage_predicate_and_visual_grace() {
         StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
         &target,
     );
-    request.started_at = Instant::now() - Duration::from_secs(1);
+    let base = Instant::now();
+    request.started_at = base;
     app.startup_open_path_resolve_pending = Some(request);
     assert!(app.main_startup_scan_elapsed().is_none());
     assert!(!app.location_navigation_pending());
     assert!(app.grid_item_input_allowed());
-    app.poll_startup_open_path_resolve(&egui::Context::default());
+    app.poll_startup_open_path_resolve_at(&egui::Context::default(), base + Duration::from_secs(1));
     assert!(
         app.startup_open_path_resolve_pending
             .as_ref()
@@ -229,11 +223,15 @@ fn section1853_resolve_and_scan_share_stage_predicate_and_visual_grace() {
             .unwrap()
             .toast_shown
     );
+    let scan_started_at = Instant::now();
     app.startup_open_path_resolve_pending
         .as_mut()
         .unwrap()
-        .scan_phase = scan_phase(Duration::from_millis(501));
-    assert!(app.direct_navigation_wait_overlay_delay().is_none());
+        .scan_phase = scan_phase_at(scan_started_at);
+    assert!(
+        app.direct_navigation_wait_overlay_delay_at(scan_started_at + Duration::from_millis(501))
+            .is_none()
+    );
     assert!(!app.grid_item_input_allowed());
 }
 
@@ -253,7 +251,7 @@ fn section1853_main_scan_does_not_block_independent_mounted_grid_or_detached_own
         StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
         &target,
     );
-    request.scan_phase = scan_phase(Duration::from_secs(1));
+    request.scan_phase = scan_phase_at(Instant::now());
     let cancel = Arc::clone(&request.cancel);
     app.startup_open_path_resolve_pending = Some(request);
     assert!(!app.grid_item_input_allowed());
@@ -287,26 +285,27 @@ fn section1853_bookmark_scan_timeout_exemption_requires_same_request_and_scan_st
         let (mut app, _) = fixture();
         let target = app.tmp.path().join("bookmark");
         let owner = arm_bookmark(&mut app, &target, 853);
+        let base = Instant::now();
         app.bookmark_open_pending
             .as_mut()
             .unwrap()
             .book_mut()
             .unwrap()
-            .started_at = Instant::now() - Duration::from_secs(46);
+            .started_at = base;
         let mut resolve_owner = owner.clone();
         if mode == "different-request" {
             resolve_owner.request_id = BookmarkOpenRequestId(854);
         }
         let (mut request, _tx) = pending(StartupOpenPathOwner::Bookmark(resolve_owner), &target);
         if mode != "resolving" {
-            request.scan_phase = scan_phase(Duration::from_secs(46));
+            request.scan_phase = scan_phase_at(base);
         }
         app.startup_open_path_resolve_pending = Some(request);
         assert_eq!(
             app.main_startup_scan_owns_bookmark(owner.request_id),
             mode == "scan"
         );
-        app.poll_bookmark_book_open(&egui::Context::default());
+        app.poll_bookmark_book_open_at(&egui::Context::default(), base + Duration::from_secs(46));
         assert_eq!(app.bookmark_open_pending.is_some(), mode == "scan");
         if mode == "scan" {
             assert!(app.fs_feedback_toast.is_none());
@@ -373,7 +372,7 @@ fn section1853_activation_spawn_failure_and_disconnect_resume_exact_held_resolve
         let target = app.tmp.path().join("activation");
         let held_owner = StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences());
         let (mut held, held_tx) = pending(held_owner.clone(), &origin);
-        held.scan_phase = scan_phase(Duration::from_secs(1));
+        held.scan_phase = scan_phase_at(Instant::now());
         let held_phase = Arc::clone(&held.scan_phase);
         let held_cancel = Arc::clone(&held.cancel);
         if spawn_failure {
@@ -433,17 +432,22 @@ fn start_policy_rescan(
     owner: StartupOpenPathOwner,
 ) -> Arc<AtomicBool> {
     let (mut request, tx) = pending(owner.clone(), target);
-    request.scan_phase = scan_phase(Duration::from_secs(46));
+    let base = Instant::now();
+    request.scan_phase = scan_phase_at(base);
     let phase = Arc::clone(&request.scan_phase);
     let cancel = Arc::clone(&request.cancel);
     tx.send(obsolete_scan_result(app, target)).unwrap();
     app.startup_open_path_resolve_pending = Some(request);
-    app.poll_startup_open_path_resolve(&egui::Context::default());
+    let observed_at = base + Duration::from_secs(46);
+    app.poll_startup_open_path_resolve_at(&egui::Context::default(), observed_at);
     let continued = app.startup_open_path_resolve_pending.as_ref().unwrap();
     assert_eq!(continued.owner, owner);
     assert!(Arc::ptr_eq(&continued.cancel, &cancel));
     assert!(Arc::ptr_eq(&continued.scan_phase, &phase));
-    assert!(continued.scan_phase.elapsed().unwrap() >= Duration::from_secs(46));
+    assert_eq!(
+        continued.scan_phase.elapsed_at(observed_at),
+        Some(Duration::from_secs(46))
+    );
     cancel
 }
 
@@ -548,18 +552,19 @@ fn section1853_bookmark_over_deadline_keeps_timeout_exemption_through_policy_res
     let target = app.tmp.path().join("bookmark-rescan");
     std::fs::create_dir(&target).unwrap();
     let owner = arm_bookmark(&mut app, &target, 853);
+    let base = Instant::now();
     app.bookmark_open_pending
         .as_mut()
         .unwrap()
         .book_mut()
         .unwrap()
-        .started_at = Instant::now() - Duration::from_secs(46);
+        .started_at = base;
     let cancel = start_policy_rescan(
         &mut app,
         &target,
         StartupOpenPathOwner::Bookmark(owner.clone()),
     );
-    app.poll_bookmark_book_open(&egui::Context::default());
+    app.poll_bookmark_book_open_at(&egui::Context::default(), base + Duration::from_secs(46));
     assert_eq!(
         app.bookmark_open_pending
             .as_ref()
@@ -611,7 +616,7 @@ fn section1853_media_bookmark_scan_timeout_exemption_requires_same_request_and_s
         for mode in ["scan", "resolving", "different-request", "different-owner"] {
             let (mut app, _) = fixture();
             let target = app.tmp.path().join(format!("bookmark.{extension}"));
-            let base = Instant::now() - Duration::from_secs(120);
+            let base = Instant::now();
             let owner = arm_media_bookmark(&mut app, &target, 1853, base);
             let mut resolve_owner = owner.clone();
             if mode == "different-request" {
@@ -662,7 +667,7 @@ fn section1853_media_bookmark_policy_rescans_credit_scan_once_before_player_wait
     let folder = app.tmp.path().join("media-rescan");
     std::fs::create_dir(&folder).unwrap();
     let target = folder.join("video.mp4");
-    let base = Instant::now() - Duration::from_secs(180);
+    let base = Instant::now();
     let owner = arm_media_bookmark(&mut app, &target, 1853, base);
     let (mut request, tx) = pending(StartupOpenPathOwner::Bookmark(owner.clone()), &target);
     request.scan_phase = scan_phase_at(base + Duration::from_secs(3));
@@ -737,7 +742,7 @@ fn section1853_media_bookmark_policy_rescans_credit_scan_once_before_player_wait
 fn section1853_media_bookmark_scan_adoption_never_credits_another_request() {
     let (mut app, _) = fixture();
     let path = app.tmp.path().join("video.mp4");
-    let base = Instant::now() - Duration::from_secs(120);
+    let base = Instant::now();
     let mut old_owner = arm_media_bookmark(&mut app, &path, 1853, base);
     old_owner.request_id = BookmarkOpenRequestId(1852);
     let (mut request, _tx) = pending(StartupOpenPathOwner::Bookmark(old_owner), &path);
@@ -761,7 +766,7 @@ fn section1853_media_bookmark_activation_hold_and_scan_credit_do_not_overlap() {
     for scan_start in [3, 15] {
         let (mut app, _) = fixture();
         let path = app.tmp.path().join("video.mp4");
-        let base = Instant::now() - Duration::from_secs(120);
+        let base = Instant::now();
         let owner = arm_media_bookmark(&mut app, &path, 1853, base);
         let (mut held, _tx) = pending(StartupOpenPathOwner::Bookmark(owner), &path);
         held.scan_phase = scan_phase_at(base + Duration::from_secs(scan_start));
@@ -789,7 +794,7 @@ fn section1853_book_bookmark_page_wait_starts_fresh_after_scan() {
     let (mut app, _) = fixture();
     let path = app.tmp.path().join("book");
     let owner = arm_bookmark(&mut app, &path, 1853);
-    let base = Instant::now() - Duration::from_secs(120);
+    let base = Instant::now();
     app.bookmark_open_pending
         .as_mut()
         .unwrap()
