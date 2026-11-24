@@ -56,7 +56,7 @@
 
 ### 1.883 本のサムネイル右下にページ数のバッジを出す (あわせてページ数で並べ替え) — 利用者要望 (2026-11-24)
 
-- 状態: **v5.7.0 に入れる、バッジとページ数ソートの両方 (利用者決定 2026-11-24「ページ数バッジ・ソートまでいれて、次の5.7.0リリースへと進めたい」)。設計は [book-page-count-badge-plan.md](book-page-count-badge-plan.md) 第7.1版で、独立設計レビュー (Sol / xhigh) は 7 回目で ACCEPT_WITH_NITS。設計書 §7 の利用者の判断を待って実装に入る**。
+- 状態: **v5.7.0 に入れる、バッジとページ数ソートの両方 (利用者決定 2026-11-24「ページ数バッジ・ソートまでいれて、次の5.7.0リリースへと進めたい」)。設計は [book-page-count-badge-plan.md](book-page-count-badge-plan.md) 第7.1版で、独立設計レビュー (Sol / xhigh) は 7 回目で ACCEPT_WITH_NITS。利用者の判断 (§7) は 2026-11-24 に決定。実装はブランチ claude/page-badge-883-abc598 (段 1 ee08106d5・段 2 7fe8f76c6・修正 2826b665b / 965e24e3e)、実装の独立レビュー (Sol / xhigh) 3 回目で ACCEPT、関連テストは成功、master 取り込み前、実機は未確認**。
 - 利用者の要望: 動画・音声の長さのバッジ (`thumb_show_media_duration`、既定 ON、環境設定「サムネイル」で OFF にできる) と同じように、本のサムネイル右下にページ数を出したい。既定 ON で、設定で ON/OFF できる形。あわせて、動画の長さで並べ替える機能 (§1.762、[media-duration-sort-filter-plan.md](media-duration-sort-filter-plan.md)) と体験をそろえるため、ページ数でも並べ替えられるとよい (利用者の発案、2026-11-24)。
 - 今の作り (統括のコード参照): ページ数は選択情報 (ツールチップ) の「ページ数」で、選んだ 1 冊ずつ数えている (`App::details_item_supports_page_count`・`metadata_ops::load_details_page_count`。ZIP は目次、PDF は PDFium のワーカー、画像フォルダは中を数える)。長さのバッジは記録済みの長さを読むだけで描く (`thumb_overlay_layout` の `BadgeKind::MediaDuration`)。
 - 設計で決めること: 見えている本をすべて数える費用と、数えた結果を覚えておくか (覚えるなら永続ストアの扱い)。数え終わる前の表示。右下のバッジの優先順位 (フィルタの一致数・長さのバッジ・下端の読書位置のメーター)。並べ替えを同じ版に入れるか、別に分けるか。UI スレッドで同期 I/O をしないこと。
