@@ -1,10 +1,12 @@
-# 本のサムネイル右下のページ数バッジ (§1.883)
+# 本のページ数バッジとページ数順 (§1.883)
 
 最終更新: 2026-11-24
 
 状態: 設計第4版。第1版 (`7aa5c6918`)・第2版 (`5fed5048d`)・第3版 (`e6d109cbb`) は独立設計レビュー
 (Sol / xhigh) 1〜3 回目でいずれも REVISE。第2版からは、指摘を仕組みを足すのではなく状態を減らす形で直している。
-第4版は 3 回目の指摘を反映したもので、まだレビューを受けていない (§9)。実装はまだしない。収録版は未定。
+第4版 (`d93388e71`) はレビュー 4 回目で REVISE。第5版は 4 回目の指摘を反映し、さらに利用者の決定
+(2026-11-24、統括経由「ページ数バッジ・ソートまでいれて、次の5.7.0リリースへと進めたいと思います。」) に従い、
+ページ数順を同じ版に入れる前提で §6 を設計し直した (§9)。実装はまだしない。**収録版は v5.7.0**。
 正本のバックログは [next-release-backlog.md](next-release-backlog.md) §1.883。
 
 ## 1. 目的と範囲
@@ -14,14 +16,15 @@
 あわせて、長さ順 (§1.762、[media-duration-sort-filter-plan.md](media-duration-sort-filter-plan.md)) と体験を
 そろえるため、ページ数でも並べ替えられるとよい (利用者の発案)。
 
-本書は 2 段に分ける。
+本書は 2 段に分けるが、どちらも v5.7.0 に入れる (利用者決定 2026-11-24)。
 
-- **段 1 (本書の主題)**: サムネイル表示のページ数バッジと、その設定。
-- **段 2 (別項目にすることを推奨、§6)**: 一覧の並べ替え (`SortOrder`) の「ページ数順」。
+- **段 1 (§4)**: サムネイル表示のページ数バッジと、その設定。
+- **段 2 (§6)**: 一覧の並べ替え (`SortOrder`) の「ページ数順」。
 
-段 2 は段 1 と費用も永続データへの影響もまったく違う (§6.3)。段 1 は既存の取得経路と記録を使うだけで
-済むのに対し、段 2 は §1.762 と同じ規模の仕組み (一覧全体の取得、完了の証明、`SortOrder` の新しい値による
-旧版との設定の境界) を要る。
+段 2 は段 1 と費用も永続データへの影響も違う。段 1 は既存の取得経路と記録を使うだけで済むのに対し、
+段 2 は §1.762 の長さ順と同じ仕組み (一覧全体の取得、完了の証明、`SortOrder` の新しい値による旧版との
+設定の境界) を要る。段 2 は長さ順の部品を「後から分かる並べ替えの値」として共通にし、ページ数を 2 つ目の
+値として乗せる (§6.1)。実装は段 1 → 段 2 の順にコミットを分ける。
 
 ## 2. 現状 (コードで確認、2026-11-24 master `b7be127da`)
 
@@ -195,7 +198,32 @@
   作るとき、設定から `image_folder_page_count_options` を作り、その中の fingerprint を `fingerprint` にも使う
   (今は `image_page_recognition_fingerprint` と `image_folder_page_count_options` が別々に計算している。1 回の
   計算にまとめる)。環境設定がフレームの途中で適用されても、1 つの job の中で古い fingerprint と新しい判定設定が
-  組み合わさらない。catalog へ書く fingerprint は必ずその job が数えた規則のもの。
+  組み合わさらない。
+- **Susie のプールは設定の snapshot に入らない** (レビュー 4 回目 P2-1)。fingerprint は作ったときのプールの
+  対応拡張子を含むが、ZIP・フォルダ・RAR の列挙は実行時のグローバルなプールを見る (`folder_tree::is_recognized_image_ext`
+  など)。job の途中でプールが差し替わると (起動時の差し替え・「プラグインを再読み込み」)、古い fingerprint の印で
+  新しい規則の数を catalog に書いてしまう。プールを job に渡す形にすると列挙の関数を全部変えることになるので、
+  **プールの版数で採否を決める**:
+  - `susie_loader` に、RwLock の中のプールを入れ替えるたびに上がる版数 (`pool_revision()`) を足す (入れ替えの
+    直前に上げる今の `INIT_GENERATION` とは別。入れ替えた時点で上げる)。
+  - job を始めるとき、fingerprint と同時に版数を取る (fingerprint はその版のプールの拡張子から作る)。
+  - 1 冊を数え終えたら、catalog に書く前に版数を見直し、変わっていればその結果を捨てる (catalog に書かず、メモリの
+    checked も立てない。取消と同じ扱い)。その本は次の取得要求で、新しい版のプールと fingerprint で数え直す。
+  - 待つ状態や監視は足さない。プールの差し替えは起動時に 1 回と、利用者の再読み込みのときだけなので、捨てる
+    結果は数冊に限られる。
+- これで catalog へ書く fingerprint は、必ずその本を数えた規則のものになる。テストの helper
+  (`archive_details_config`、`metadata_ops.rs`) にも同じ 1 回の計算を使う (レビュー 4 回目で確認された、残っている
+  二重計算)。
+
+RAR の検査キャッシュ (レビュー 4 回目 P2-2):
+
+- RAR のページ数は、表示の種類を絞っていないとき `inspect_for_direct_read` の `summary.image_count` を使う。
+  検査の結果は process 内のキャッシュ (`DECISION_CACHE`、`rar_loader.rs`) に path・size・mtime をキーにして残り、
+  画像の判定 (`archive_converter::is_image_entry`) は Susie の対応拡張子を含む。Susie を有効にしたり
+  プラグインを足したりしても、古い検査結果の件数を返し、新しい fingerprint の行として catalog に書いてしまう
+  (並行操作なしでも起きる。詳細表示のページ数列・直接閲覧の判定にもある以前からの問題)。
+- 検査キャッシュのキーに上の `pool_revision()` を足す。プールが変われば検査し直す。検査を使う直接閲覧・変換の判定も
+  同じ認識規則に従うので、ページ数のためだけの分岐にはならない。
 - 取り直しの判定に使う「今の fingerprint」は、判定を繰り返す関数 (Planning の 1 slice、
   `details_visible_stage_needs_load`、`launch_details_meta_worker` の可視 target の選び直しなど) の呼び出しごとに
   1 回だけ計算して、ループの中で使い回す。セルごとには計算しない。App に値を置かない (書き手と更新の時点を
@@ -226,7 +254,8 @@ fingerprint が変わる場面と、その後の流れ:
   詳細表示のページ数ソートは次の取得要求まで最後の値を出す。
   - 起動時の差し替えの前に数えた本は、差し替えの後にもう一度数える (catalog の行は fingerprint ごとに上書きされる
     ので、次の起動でも差し替えの前後で 1 回ずつ数え直す)。Susie を有効にしている利用者で、起動直後の数百 ms の
-    間に範囲へ入った本だけに起きる費用で、詳細表示のページ数列では今も同じことが起きている。プールを待つ状態は
+    間に範囲へ入った本だけに起きる費用で、**この変更で新しく増える** (今の詳細表示のページ数列は fingerprint を
+    メモリで照合しないので、差し替えの後に数え直さない。レビュー 4 回目 P3)。プールを待つ状態は
     足さない (待つ間に段階取得が空回りしないよう別の状態が要るため)。perf の `page_counted` で件数を確かめる。
 - ネイティブ対応の拡張子の追加と、拡張子の優先度の起動時の補完は、起動時の処理なので実行中の一覧の読み直しは
   要らない (レビュー 3 回目で確認)。
@@ -382,46 +411,171 @@ fn thumbnail_page_count_enabled(&self) -> bool {
   数えていない可能性があり、規則を 2 か所に書くことになる。サムネイルが記録済みのフォルダでは効かない。
   段 1 では採らず、perf ログで初回の費用が問題になったら検討する。
 - **数え終わるまで「…」を出す**。§3 のとおり状態が増える。長さのバッジとも揃わない。
-- **一覧全体を数える**。バッジには要らない。並べ替え (段 2) の要件。
+- **バッジのために一覧全体を数える**。バッジには要らない。一覧全体を数えるのは、ページ数順を選んでいるときだけ
+  (段 2、§6.5)。
 
-## 6. 段 2: ページ数順の並べ替え (別項目を推奨)
+## 6. 段 2: ページ数順の並べ替え
 
-### 6.1 長さ順の仕組みに乗せられるか
+### 6.1 方針: 長さ順の部品を共通にして乗せる (CLAUDE.md「設計の簡素化」)
 
-形は乗せられる。§1.762 は、長さを一般の「後から分かる並べ替えの値」として作ってはいないが、同じ形を
-ページ数に複製できる。
+§1.762 の長さ順は、次の部品でできている ([media-duration-sort-filter-plan.md](media-duration-sort-filter-plan.md)
+§3〜§5、コードは `src/app/duration_metadata.rs`・`src/app/listing_sort.rs`・`src/app/folder_scan.rs` の
+`FolderDurationFacts`・`src/settings.rs` の `ListingDuration`)。
 
-- `ListingSortMetadata` に `page_count: ListingPageCount { Known(u32) / Unavailable / Missing }` を足す。
-- 走査の worker で、ページ数順になり得るときだけ catalog を read-only で開き、`container_page_meta` と
-  `pdf_meta` を一括で読む API を足す (schema 変更なし)。`listing_may_sort_by_page_count` (共通・live・
-  お気に入り別)。
-- `ListingMetaRequirements` に `page_count` を足し、一覧全体の取得と完了の証明 (`listing_meta_scan_proof`) を
-  長さ・AI と共有する。今は「長さだけの要求でページ数を増やさない」規則があり (§1.835)、ページ数の要件を
-  足すと `whole_listing_only` と `allow_page_count` の規則を変えることになる。
-- `SortOrder` に `PageCountAsc` / `PageCountDesc`、`listing_sort_capabilities`、ツールバーの既定の補完
-  (12 → 14 値の marker)、ゲームパッド、Remote の候補から外す、ファイル名スタック、読み込み中の表示
-  「ページ数を読み込み中 n/m」。
+1. 並べ替えのキー (`ListingSortMetadata.duration`) と比較 (`SortOrder::compare_listing_keys`)。不明は末尾。
+2. 値の出どころ: メモリ (`details_lazy_meta`) → catalog の一括読み取り (`ScannedDir.duration_facts`、worker が
+   要るときだけ作る) → 不明。materialize は I/O をしない純関数のまま。
+3. 使える一覧の判定 (`listing_sort_capabilities` の `duration_allowed`、物理フォルダだけ) と、使えない一覧での
+   名前順への正規化 (`without_duration_order` / `without_duration_request`)。
+4. 一覧全体の取得の要件 (`ListingMetaRequirements`) と完了の証明 (`listing_meta_scan_proof`)、読み込み中の表示。
+5. 長さ順へ変える操作・選び直しを worker 走査に通す入口。
+6. ツールバーの既定の補完 (marker 方式)、ゲームパッドの巡回、Remote の候補からの除外、ファイル名スタックの
+   メタデータの持ち回り、自動では並べ直さない (利用者決定 B)。
 
-### 6.2 長さ順と違う点
+ページ数順はこの 6 つを全部要る。ページ数専用に複製すると、同じ規則 (使える一覧・正規化・入口・Remote) が
+2 か所に書かれて食い違う。そこで **「後から分かる並べ替えの値」(以下、遅延キー) を共通の概念にして、
+長さとページ数をその 2 つの種類にする**。
 
-- 記録の照合に、ファイルの stamp だけでなく判定設定の fingerprint と種類が要る。worker へ fingerprint を渡す。
-- EPUB の記録は変換世代の stamp で引くので、走査の stamp では照合できない。EPUB はメモリにある分だけになる。
-- 画像フォルダの記録はフォルダの mtime で引く。走査で得るフォルダの mtime と同じ値か、実装時に確かめる。
-- パスワードの要る PDF は、保存済みパスワードの有無で値が変わる。
-- 一覧全体を数える費用は、本が多いフォルダで大きい (2,000 冊の ZIP なら初回は 2,000 回開く)。長さ順と同じく
-  取消できるが、初めて開くフォルダでは並びが揃うまで時間がかかる。
+- `SortOrder::lazy_metric(self) -> Option<LazyMetric>` (`LazyMetric::{Duration, PageCount}`)。`is_duration()` を
+  判定に使っている箇所は、規則が遅延キー全体に当たるもの (使える一覧・正規化・worker 走査の入口・Remote・
+  ゲームパッド・ツールバーの補完) を `lazy_metric().is_some()` へ、長さ固有のもの (長さ facet・`video_meta` の
+  読み取り) をそのままにする。置き換える箇所は実装時に全部列挙し、検証台帳に残す (今の非テストの参照は
+  `src/` で約 20 ファイル)。
+- `listing_sort_capabilities` の `duration_allowed` は `lazy_metric_allowed` にする (使える一覧は同じ: PC 本体の
+  物理フォルダの通常一覧)。`DURATION_SORT_UNSUPPORTED` の文言は種類ごとに出す。
+- 自動では並べ直さない。ページ数が後から分かっても並びは動かさず、「最新の情報に更新」・ページ数順の選び直し・
+  開き直しで並べ直す (長さ順・評価順と同じ。体験をそろえるという利用者の発案に合わせる)。
 
-### 6.3 分けることを推奨する理由
+### 6.2 並べ替えのキー
 
-- 段 1 は既存の経路に設定 1 つとバッジ 1 つを足すだけで、永続データの境界が無い。段 2 は §1.762 と同じく
-  `SortOrder` の新しい値で、旧版 (v5.7.0 より前) へ戻すと `Incompatible` として既定設定で起動する境界に入る
-  (ツールバーの補完で、使っていない利用者も入る)。§1.762 の設計は独立レビューを 5 回、実装レビューを 3 回
-  受けており、同じ規模の確認が要る見込み。
-- 既に詳細表示の「ページ数」列の見出しで、どの一覧でもページ数順に並べられる (`DetailsSortKey::PageCount`、
-  一覧全体を数えてから並べる)。段 2 が入るまでの代わりになる。
-- 段 1 を先に入れると、見た本のページ数が catalog に溜まり、段 2 の一括読み取りが記録で済む割合が増える。
+```rust
+pub(crate) enum ListingPageCount {
+    /// 本として数えたページ数。
+    Known(u32),
+    /// 数えたが本ではない (本でないフォルダ・数えられなかった・パスワードの要る PDF)。
+    Unavailable,
+    /// まだ分からない、本の種類でない、またはページ数順でない。
+    Missing,
+}
+```
 
-推奨: 段 1 を §1.883 として先に入れ、段 2 は新しいバックログ番号で別項目にする (番号は master で先に取る)。
+- `ListingSortMetadata` に `page_count: ListingPageCount` を足す (`Copy` のまま、`new` は `Missing`)。
+- `PageCountAsc`: Known を少ない順、その後 Unavailable と Missing (区別せず名前昇順)。`PageCountDesc`: Known を
+  多い順、その後同じ。**不明は昇順・降順とも末尾**。同値は名前昇順。4 行割当の行の中だけで比べる (長さ順と同じ)。
+- 既定の割当では 1 行目が実フォルダ + 書庫類なので、本 (ZIP・PDF・画像フォルダ・RAR) がページ数順に並び、
+  本でないフォルダはその後ろに名前順で並ぶ。2 行目の画像・動画は全部 Missing で名前順。
+- 対象の種類は `details_item_supports_page_count` と同じ (ドライブ一覧を除く)。7z・LZH は Missing。
+- ラベル: 「ページ数（少ない順）」「ページ数（多い順）」、短いラベル「ページ↑」「ページ↓」。説明:
+  「本のページ数が少ない順。ページ数が分からないものは末尾。読み込み後に更新すると並べ直します」。
+
+### 6.3 値の出どころ
+
+materialize は各本のページ数を次の順で決める (先に見つかったものを使う)。
+
+1. **メモリ** (`details_lazy_meta`): 元ファイルの stamp が一致し、**判定設定の fingerprint が今の一覧の要求の
+   fingerprint と一致する**値 (Known / Unavailable)。表示の「最後の値」(§4.3.1) とは違い、並べ替えでは
+   fingerprint が合わない値は使わない (新しい一覧は今の規則で作るので、古い規則の数で並べない)。
+   EPUB の世代は見ない (世代は取り直しのきっかけで、値の正しさは stamp と fingerprint で決まる)。
+   - UI スレッドの materialize は `details_lazy_meta` を引く closure (長さの `listing_duration_for_path` と同じ形)。
+   - worker の materialize (外部変更の reconcile) は、要求を作るときに UI が今の一覧の本のページ数の不変 snapshot
+     (`Arc`) を作って渡す (長さの `listing_duration_snapshot` と同じ形。1 つの snapshot に長さとページ数を入れる)。
+2. **catalog** (`ScannedDir.page_count_facts`): 下の一括読み取りで、名前・種類・mtime・size・fingerprint が
+   記録の再利用と同じ条件で一致する行。
+   - ZIP・RAR: `container_page_meta` (kind=Zip / Archive) の名前・mtime・size・fingerprint。
+   - 画像フォルダ: `container_page_meta` (kind=Folder) の名前・mtime・fingerprint。**走査の結果から作るフォルダの
+     mtime / size が、details-meta が記録を書くときの値 (`image_metas` 由来) と同じか、実装時にテストで確かめる**
+     (違えば facts は当たらず、メモリと取得だけで並ぶ。誤った値は使わない)。
+   - PDF: `pdf_meta` の名前・mtime・size。`password_required` の行は使わない (資格情報で値が変わるので、
+     メモリの値だけを使う)。
+   - EPUB: `pdf_meta` は変換世代の stamp で書かれ、走査の stamp では照合できないので使わない (メモリだけ)。
+3. どちらにも無ければ Missing。
+
+catalog の一括読み取り (worker だけ):
+
+- 要求を作るとき、UI が `listing_may_sort_by_page_count` (共通・live・保存済みのお気に入り別のどれかがページ数順。
+  長さの `listing_may_sort_by_duration` と同じ保守的な OR) と、判定設定の snapshot から作った fingerprint を
+  worker へ渡す。false なら catalog を開かない (通常の一覧の費用は増えない)。
+- true のとき、走査の後で本が 1 件以上あれば、フォルダの catalog を read-only で開き
+  (`open_existing_read_only_admitted()`、無ければ空)、新しく足す 2 つの SELECT
+  (`container_page_meta` の全行、`pdf_meta` の全行。schema は変えない) で facts を作る。長さの facts も要るときは
+  同じ接続を使う (1 フォルダ 1 回の open)。`perf::event("listing", "page_count_facts")` に件数と ms。
+- UI スレッドの同期走査は facts を作らない (`None`)。`None` でページ数順になったときはメモリだけで並べる。
+
+### 6.4 使える一覧と正規化
+
+長さ順と同じ表 ([media-duration-sort-filter-plan.md](media-duration-sort-filter-plan.md) §3.3) を遅延キー全体に
+使う。使えるのは PC 本体の物理フォルダの通常一覧 (main と各 detached context)。
+
+- ページ順が固定の一覧 (本扱いの画像フォルダ・製本・ZIP/PDF の中) は固定順のまま。
+- Ctrl+G・スマートフォルダ・サブフォルダ展開・レーティング一覧・ブックマーク・コレクションでは選べず、理由を
+  出す: 「この一覧ではページ数順を使えません。詳細表示のページ数列で並べ替えられます」。全体の設定がページ数順の
+  まま開いたときは名前昇順で並ぶ (`without_lazy_metric_order`)。
+- Remote: 候補に出さない。PC 本体の設定がページ数順のとき、Remote の一覧は名前順で並ぶ (長さ順と同じ)。
+- フォルダ代表サムネイルの候補順・コレクションの並べ替えの候補: 明示の一覧から外す (長さ順と同じ)。
+- 詳細表示の列見出しの並べ替え (`DetailsSortKey::PageCount`) はそのまま。どの一覧でも使える。
+
+### 6.5 一覧全体の取得と完了の証明
+
+- `ListingMetaRequirements` に `page_count: bool` を足す。`page_counts_wanted()` = 今の並べ替えがページ数順で、
+  この一覧で使えること (`lazy_metric_allowed`)。**継続条件** (長さと同じく「未取得がある間だけ」にしない)。
+- 対象はその一覧の **全部の本** (`items` のうち `details_item_supports_page_count` が真のもの。表示集合・絞り込み・
+  可視範囲に依らない)。`whole_listing_meta_scan_wanted()` にページ数を足す。
+- フィールドの規則 (§1.835 の「長さだけの要求で AI・日時・寸法・ページ数を増やさない」を保つ):
+  - 表示集合の外では、全体要件に含まれるフィールドだけを取る。`whole_listing_only` の target でも、
+    `requirements.page_count` のときだけページ数を取る (`allow_page_count` の判定に足す)。
+  - ページ数だけの要求で、動画の probe・AI・日時・寸法を増やさない。長さ・AI だけの要求で本を数えない。
+- 完了の証明: `ListingMetaScanProof.requirements` に `page_count` が入る。`page_count_scan_ready()`。
+  立てる・失効・取り直し・停止の規則は長さと同じ (同じ proof を共有する)。
+- 取り直しの判定 (§4.3.1) は、全体走査の target にも同じものを使う。全体走査の Planning で、メモリの値が
+  fingerprint・EPUB の世代で合わなければ取り直す。
+- 読み込み中の表示: ページ数順の並べ替え項目 (ツールバーのボタン・メニューの選択中の項目) の tooltip と短い
+  ラベルの後ろに「ページ数を読み込み中 n/m」、停止中は「ページ数の読み込みを停止中」(長さの
+  `duration_loading_text` と同じ形。共通の関数にして種類で文言を変える)。
+- 停止 / 再開は既存の details-meta の停止をそのまま使う。
+- 段階取得 (バッジ) は、未証明の全体要件が無くなってから始まる (既存の規則)。ページ数順で全体を取り終えれば、
+  バッジの値もそろう。
+
+### 6.6 ページ数順へ変える操作と入口
+
+- メニュー・ツールバー・ゲームパッドでページ数順へ変える、または選択中のページ数順を選び直すときは、物理フォルダの
+  再読込を worker 走査 (`apply_sort_change_reload_without_ui_io`) で行う (長さ順と同じ入口の判定を遅延キー全体へ)。
+- そのほかの入口 (開く・Ctrl+↑↓・BS・folder pane・更新・外部変更) は、長さ順の実装で作った入口の台帳
+  ([media-duration-sort-filter-plan.md](media-duration-sort-filter-plan.md) §11.2) をそのまま使い、facts の要求に
+  ページ数の flag と fingerprint を足す。同期走査の入口はメモリだけで並ぶ。
+- 選択中のページ数順を再び選ぶと再読込して並べ直す (`SortControlDecision::Reload`)。
+
+### 6.7 ツールバー・ゲームパッド・ファイル名スタック
+
+- `SortOrder::all()` に `PageCountAsc` / `PageCountDesc` を足す (並びは長さ順の後ろ)。
+- ツールバーの既定の補完: 今の既定 12 値と完全一致するときだけ、一回限りで 14 値へ補完する (既存の marker 方式。
+  長さ順を足したときと同じ)。→ §7 の問 4。
+- ゲームパッドの巡回: 使えない並べ替えを飛ばす (既存の判定を遅延キー全体へ)。
+- ファイル名スタック: 物理 materialize で得た `ListingSortMetadata` をそのまま持ち回る経路が長さ順で既にある
+  (`StackMember`)。`page_count` も同じ構造体に入るので落ちない。集約したスタックセル自身は Missing。
+
+### 6.8 費用
+
+- ページ数順を初めて選んだフォルダでは、本を全部数える (worker、進捗と停止あり)。2,000 冊の ZIP なら初回は
+  2,000 回開く。入れ子の合本・RAR・未記録の PDF は 1 冊ごとに重い (§4.2)。これは今、詳細表示のページ数列の
+  見出しで並べ替えたときに払っている費用と同じ。
+- 2 回目からは catalog の一括読み取り (1 フォルダ 1 回の open と 2 つの SELECT) で、materialize の時点で並ぶ。
+- ページ数順でない一覧の費用は増えない (`listing_may_sort_by_page_count` が false なら catalog を開かない)。
+
+### 6.9 永続データ
+
+- catalog: schema は変えない。読み取りの API を足すだけ (`container_page_meta` / `pdf_meta` は出荷済み)。
+- settings: `SortOrder` の新しい値 (`settings.sort_order`・`FavoriteViewState.sort_order`・`toolbar_sort_items`)。
+  - **v5.6.x 以前がこの値を読むと、その版は `Incompatible` として既定設定 + 保存抑止で起動する** (DB は書き換え
+    ない。v5.7.0 に戻せば元の設定で起動する)。長さ順・サイズ順・評価順を足したときと同じ境界。ツールバーの補完に
+    よって、ページ数順を使っていない利用者もこの境界に入る。→ §7 の問 4。
+  - 新旧の wire (serde 文字列) と、旧版相当の enum で読んだとき DB を書き換えないことを試験する。
+
+### 6.10 detached viewer・Remote
+
+- `listing_meta_scan_proof` は既に viewer context の bundle にある。中の要件の型に field が 1 つ増えるだけで、
+  swap の field は増えない。detached 述語・viewport 経路には触れない見込み。触れた場合は CLAUDE.md の合意手続に
+  従う。park / mount / drop で兄弟 context の状態が変わらないことを試験する。
+- Remote IPC: 候補からページ数順を外すだけで wire の構造は変えない。
 
 ## 7. 利用者に確認すること
 
@@ -431,8 +585,11 @@ fn thumbnail_page_count_enabled(&self) -> bool {
 2. **画像だけのフォルダ**: 普通の写真フォルダにも、画像の枚数がバッジとして出る (詳細表示のページ数列と同じ)。
    「画像のみのフォルダを本として扱う」が ON のときだけにするか、常に出すか (推奨: 詳細列と同じく常に出す)。
 3. **表記**: 「123P」「123p」「123ページ」のどれにするか (推奨: 「123P」)。
-4. **並べ替えの分け方**: ページ数順 (段 2) を別項目にしてよいか (推奨: 別項目。それまでは詳細表示の列見出しで
-   並べられる)。同じ版に入れたい場合は、段 2 の設計と独立レビューを別に行う。
+4. **ツールバーの既定と旧版との境界** (ページ数順): 長さ順のときと同じく、ツールバーの既定の並べ替えに
+   ページ数順の 2 つを足し、そのため v5.6.x 以前へ戻すと既定設定で起動する (保存はしない。v5.7.0 に戻せば元に
+   戻る) 扱いでよいか (推奨: 長さ順と同じ扱い)。
+5. **ページ数順でも自動では並べ直さない** (長さ順の決定 B と同じ。数え終わった後は更新・選び直し・開き直しで
+   並ぶ) でよいか (推奨: 長さ順とそろえる)。
 
 ## 8. 検証計画 (実装時)
 
@@ -451,15 +608,32 @@ fn thumbnail_page_count_enabled(&self) -> bool {
   バッジが同じ accessor を通る。PDF パスワードの revision の既存テストを保つ。
 - job の snapshot: 環境設定を同じフレームの途中で適用しても、1 つの job の判定設定と catalog へ書く fingerprint が
   同じ snapshot から来る。`image_folder_page_count_options` と config の fingerprint が同じ値。
-- Susie: プールの差し替え (起動時・再読み込み) の後、範囲内は取り直し、範囲外は最後の値のまま。
+- Susie: プールの差し替え (起動時・再読み込み) の後、範囲内は取り直し、範囲外は最後の値のまま。数えている途中で
+  差し替わった本の結果は catalog にもメモリにも残らず、次の取得で数え直す。RAR の検査キャッシュはプールの版数が
+  変わると使われない。
 - `ZipTree`: `build` と `project` の両方の木で、各ノードの画像数が部分木の実数と一致する。`page_count_for_prefix_str`
   が再帰しない。
 - 取消 (§4.4.1): RAR とフォルダの走査が job の cancel で止まり、記録も checked も立てない。
 - 値: `page_count = None`・0・失敗でバッジなし、PDF のパスワードの revision、`ZipDir` は `ZipTree` の値、
   ドライブ一覧でバッジなし。
 - 設定: 既定 true、旧設定に field が無いと true、false の往復、settings_transfer、件数のテスト。
+- ページ数順 (§6):
+  - 比較: Known の昇順・降順、Unavailable・Missing が両方向で末尾、名前の tie、4 行割当、本でないフォルダの位置。
+  - 出どころ: メモリ (stamp と fingerprint が一致する値だけ) → catalog の facts → Missing。fingerprint が違う
+    メモリの値・facts を使わない。EPUB と `password_required` の PDF は facts を使わない。画像フォルダの facts が
+    details-meta の書いた行と同じ stamp で当たる。UI の closure と worker の snapshot で同じ順。facts `None` は
+    メモリだけで並ぶ。ページ数順以外ではページ数を引かない。
+  - catalog: 一括読み取りの API (2 つの SELECT、read-only open、catalog 無しは空)、`listing_may_sort_by_page_count`
+    が false のとき開かない、長さとページ数の両方が要るとき 1 回の open。
+  - 遅延キーの共通化: `is_duration()` から置き換えた全箇所の台帳 (使える一覧・正規化・入口・Remote・ゲームパッド・
+    ツールバーの補完)。長さ順の既存テスト (`duration_762` 一式) が全部通る。
+  - 取得: ページ数だけの全体要件で本を全部数え、動画を probe しない。長さだけ・AI だけの全体要件で本を数えない。
+    proof に page_count が立つ・失効する。読み込み中の表示と停止 / 再開。
+  - 入口: ページ数順への変更・選び直しが worker 走査を使う。
+  - スタック・Remote・使えない一覧の正規化・ツールバーの 12 → 14 値の一回限りの補完・旧版相当の enum で読んで
+    DB を書き換えないこと。
 - 関連する既存テスト: `duration_762` の visible_stages、`media_resume_meter_tests`、metadata_ops の
-  `details_page_count_*`。
+  `details_page_count_*`、`facet_835`。
 - perf: `details_meta/load_done` の新しい件数の出力。実機の perf ログで、冷たいキャッシュ・入れ子の合本・
   scroll による取消のときの件数と ms を見る。
 - 実機確認 (利用者): ZIP・PDF・EPUB・画像フォルダ・RAR・ZIP 内の書庫が混ざるフォルダで、初回にバッジが
@@ -498,4 +672,12 @@ fn thumbnail_page_count_enabled(&self) -> bool {
   - 「取り直しの判定」と「表示する値」を分ける方針は成り立つこと、同じ fingerprint・同じ世代で EPUB を繰り返す
     ループが無いこと、完了時の詳細の並べ直しが世代を進めないこと、AI / 長さの全件取得と facet に干渉しないこと、
     親のフォルダへ戻ると一覧を install し直すこと、は確認された。
-- 4 回目: 未実施。
+- 4 回目 (Sol / xhigh、同じセッション、第4版 `d93388e71`): **REVISE**。
+  - P2-1 設定の snapshot だけでは Susie のプールを固定できず、job の途中の差し替えで古い fingerprint の印のまま
+    新しい規則の数を書ける → プールの版数を job の開始時に取り、1 冊ごとに書く前に見直して、変わっていれば捨てる。
+  - P2-2 RAR の検査キャッシュが認識規則を区別しない → キーにプールの版数を足す。
+  - P3 起動時の差し替えで数え直す費用は、今の詳細列には無い新しい費用 → 記述を直した。
+  - 判定用の fingerprint を呼び出しごとに計算することは妥当 (判断の差だけで再開や取消を繰り返さず、設定とプールが
+    落ち着けば収束する)、`DetailsPageCountConfig` を作る本番の入口が 1 つであること、`build` / `project` の両方での
+    事前集計と不変条件、「最後の値」と実際の取得の開始を分けた説明は妥当とされた。
+- 5 回目: 未実施。第5版は 4 回目の指摘に加え、ページ数順を同じ版に入れる §6 を新しく設計したので、§6 も対象にする。
