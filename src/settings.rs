@@ -3751,7 +3751,7 @@ impl FinalCoverSpreadPreference {
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
-            Self::FollowGlobal => "全体に従う",
+            Self::FollowGlobal => "全体設定に従う",
             Self::On => "オン",
             Self::Off => "オフ",
         }
