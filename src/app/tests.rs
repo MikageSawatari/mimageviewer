@@ -51672,6 +51672,7 @@ mod favorite_adjustment_defaults_tests {
             crate::export_dialog::ExportSuccess {
                 label: "current".to_string(),
                 path: output.clone(),
+                replaced: false,
             },
         ))
         .unwrap();

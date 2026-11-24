@@ -673,6 +673,7 @@ pub(crate) fn plan_export_entries(
 pub struct ExportSuccess {
     pub label: String,
     pub path: PathBuf,
+    pub replaced: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -990,6 +991,7 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
                 let _ = tx.send(ExportEvent::Completed(ExportSuccess {
                     label: entry.label,
                     path,
+                    replaced: false,
                 }));
             }
             Err(SaveError::IoError(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {

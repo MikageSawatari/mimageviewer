@@ -419,6 +419,9 @@ fn run_batch_export_with_decoder(
                     .and_then(|f| f.set_modified(modified.unwrap()))
                     .map_err(|e| format!("出力の更新日時を設定できません: {e}"))?;
             }
+            if replace {
+                invalidate_replaced_output_catalog(&path);
+            }
             timings.write = start.elapsed().as_secs_f64() * 1000.0;
             Ok(ItemResult::Written {
                 path,
@@ -439,6 +442,7 @@ fn run_batch_export_with_decoder(
                 let _ = tx.send(ExportEvent::Completed(ExportSuccess {
                     label: label.clone(),
                     path: path.clone(),
+                    replaced,
                 }));
                 if !kinds.is_empty() {
                     log::warn!(
@@ -539,6 +543,51 @@ fn local_datetime(time: SystemTime) -> Result<(String, String), String> {
         format!("{:04}{:02}{:02}", local.wYear, local.wMonth, local.wDay),
         format!("{:02}{:02}{:02}", local.wHour, local.wMinute, local.wSecond),
     ))
+}
+
+fn invalidate_replaced_output_catalog(path: &Path) {
+    let absolute = match std::path::absolute(path) {
+        Ok(path) => path,
+        Err(error) => {
+            crate::logger::log(format!(
+                "batch export catalog path: {}: {error}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let Some(row) = crate::app::parent_row_for_item(
+        &crate::grid_item::GridItem::Image(absolute.clone()),
+        &absolute,
+        None,
+        0,
+    ) else {
+        crate::logger::log(format!(
+            "batch export catalog row unavailable: {}",
+            path.display()
+        ));
+        return;
+    };
+    // Use the same parent identity/key as ordinary image thumbnail requests.
+    // Open only an existing catalog: export must not create a missing cache.
+    match crate::catalog::CatalogWork::default().open_existing_for_update(&row.folder) {
+        Ok(Some(db)) => {
+            if let Err(error) = db.delete_exact_keys(&[row.row_key]) {
+                crate::logger::log(format!(
+                    "batch export catalog delete: {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+        Ok(None) => crate::logger::log(format!(
+            "batch export catalog absent: {}",
+            row.folder.display()
+        )),
+        Err(error) => crate::logger::log(format!(
+            "batch export catalog open: {}: {error}",
+            row.folder.display()
+        )),
+    }
 }
 
 fn write_output(path: &Path, bytes: &[u8], replace: bool) -> Result<(), String> {

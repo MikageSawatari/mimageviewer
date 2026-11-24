@@ -770,6 +770,145 @@ fn batch_export_dialog_edit_start_persist_reopen_and_worker_effect() {
 }
 
 #[test]
+fn batch_export_completion_evicts_only_replaced_outputs_in_current_listing() {
+    use crate::grid_item::{GridItem, ThumbnailState};
+    use crate::thumb_loader::{LoadRequest, ThumbLoadOrigin};
+    use std::collections::HashMap;
+    use std::sync::{Condvar, Mutex, RwLock};
+
+    for end in [ExportEnd::Done, ExportEnd::Cancelled] {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let current = app.tmp.path().join("current");
+        let paths = [
+            current.join("replaced.png"),
+            current.join("new.png"),
+            current.join("unrelated.png"),
+        ];
+        let outside = app.tmp.path().join("other/unrelated.png");
+        app.current_folder = Some(current);
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.image_metas = vec![Some((17, 100)); paths.len()];
+        let ctx = egui::Context::default();
+        let pixels = Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::GRAY));
+        let texture = ctx.load_texture(
+            "export-replaced",
+            pixels.as_ref().clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.thumbnails = paths
+            .iter()
+            .map(|_| {
+                ThumbnailState::loaded_raster(
+                    texture.clone(),
+                    ThumbLoadOrigin::UpgradeableCache,
+                    false,
+                    2,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((2, 2)),
+                    None,
+                )
+            })
+            .collect();
+        let requests: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(idx, path)| LoadRequest {
+                idx,
+                path: path.clone(),
+                ..Default::default()
+            })
+            .collect();
+        for idx in 0..paths.len() {
+            app.requested.insert(idx, false);
+            app.thumb_pixels.insert(idx, Arc::clone(&pixels));
+        }
+        let reload = Arc::new((Mutex::new(requests.clone()), Condvar::new()));
+        let heavy = Arc::new((Mutex::new(requests.clone()), Condvar::new()));
+        app.reload_queue = Some(Arc::clone(&reload));
+        app.heavy_io_queue = Some(Arc::clone(&heavy));
+        let keys: Vec<_> = requests
+            .iter()
+            .map(|request| {
+                crate::thumb_loader::cache_key_for_request(request)
+                    .unwrap()
+                    .into_owned()
+            })
+            .collect();
+        let entries = keys
+            .iter()
+            .map(|key| {
+                (
+                    key.clone(),
+                    crate::catalog::CacheEntry {
+                        mtime: 17,
+                        file_size: 100,
+                        jpeg_data: vec![1],
+                        cover: crate::cover_identity::CoverIdentity::Unrotatable,
+                        auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
+                        source_dims: Some((2, 2)),
+                        layout_dims: None,
+                        folder_provenance: None,
+                        selection_proof: None,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let map = Arc::new(RwLock::new(entries));
+        app.current_color_cache_map = Some(Arc::clone(&map));
+        let (p, tx) = pending();
+        app.export_pending = Some(p);
+        for (path, replaced) in [
+            (paths[0].clone(), true),
+            (paths[1].clone(), false),
+            (outside, true),
+        ] {
+            tx.send(ExportEvent::Completed(ExportSuccess {
+                label: "image".into(),
+                path,
+                replaced,
+            }))
+            .unwrap();
+        }
+        app.poll_export_pending(&ctx);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+        assert!(!app.requested.contains_key(&0));
+        assert!(!app.thumb_pixels.contains_key(&0));
+        assert!(!map.read().unwrap().contains_key(&keys[0]));
+        for idx in [1, 2] {
+            assert!(matches!(app.thumbnails[idx], ThumbnailState::Loaded { .. }));
+            assert!(app.requested.contains_key(&idx));
+            assert!(app.thumb_pixels.contains_key(&idx));
+            assert!(map.read().unwrap().contains_key(&keys[idx]));
+        }
+        for queue in [&reload, &heavy] {
+            assert_eq!(
+                queue
+                    .0
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|req| req.idx)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+        }
+        // A replacement completion is consumed once. A later terminal event must
+        // not evict a thumbnail/request already installed by the normal reload.
+        app.thumbnails[0] = ThumbnailState::Pending;
+        app.requested.insert(0, false);
+        tx.send(if end == ExportEnd::Done {
+            ExportEvent::AllDone
+        } else {
+            ExportEvent::Cancelled
+        })
+        .unwrap();
+        app.poll_export_pending(&ctx);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+        assert!(app.requested.contains_key(&0));
+    }
+}
+
+#[test]
 fn batch_export_endings_keep_notices_after_disconnect_and_refresh_matching_folder_once() {
     for end in [ExportEnd::Done, ExportEnd::Cancelled] {
         let mut app = crate::app::tests::phase_c_support::setup_app();
@@ -783,6 +922,7 @@ fn batch_export_endings_keep_notices_after_disconnect_and_refresh_matching_folde
             tx.send(ExportEvent::Completed(ExportSuccess {
                 label: "image".into(),
                 path: path.clone(),
+                replaced: false,
             }))
             .unwrap();
             tx.send(ExportEvent::ThumbnailNotice {
@@ -865,6 +1005,7 @@ fn batch_export_poll_implements_every_completion_notification_and_plain_cancel()
             tx.send(ExportEvent::Completed(ExportSuccess {
                 label: "image".into(),
                 path: app.tmp.path().join(format!("output-{i}.png")),
+                replaced: false,
             }))
             .unwrap();
         }

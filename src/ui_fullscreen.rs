@@ -60015,6 +60015,7 @@ impl App {
         // N エントリで N 回 load_folder が走り、UI が thrash していた
         // (Codex review CONFIRMED)。
         let mut refresh_after_done = false;
+        let mut replaced_paths = Vec::new();
 
         loop {
             match pending.rx.try_recv() {
@@ -60022,6 +60023,9 @@ impl App {
                     pending.last_message = format!("{label} を保存中");
                 }
                 Ok(crate::export_dialog::ExportEvent::Completed(success)) => {
+                    if success.replaced {
+                        replaced_paths.push(success.path.clone());
+                    }
                     pending.done = pending.done.saturating_add(1);
                     pending.last_message = format!("保存しました: {}", success.label);
                     pending.successes.push(success);
@@ -60034,9 +60038,11 @@ impl App {
                 Ok(crate::export_dialog::ExportEvent::Skipped { label, path }) => {
                     pending.done = pending.done.saturating_add(1);
                     pending.last_message = format!("スキップしました: {label}");
-                    pending
-                        .skipped
-                        .push(crate::export_dialog::ExportSuccess { label, path });
+                    pending.skipped.push(crate::export_dialog::ExportSuccess {
+                        label,
+                        path,
+                        replaced: false,
+                    });
                 }
                 Ok(crate::export_dialog::ExportEvent::ThumbnailNotice { label, path, kinds }) => {
                     pending
@@ -60086,6 +60092,8 @@ impl App {
                 }
             }
         }
+
+        self.evict_replaced_export_thumbnails(&replaced_paths);
 
         // Same-as-source can write into multiple folders. Refresh the displayed one once.
         let first_success_path = if refresh_after_done {
