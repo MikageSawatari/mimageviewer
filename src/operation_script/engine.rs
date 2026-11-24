@@ -33,6 +33,10 @@ pub fn build_engine() -> Engine {
     // runtime construction check. Disable that optimization so every literal
     // takes the bounded Array/Map evaluator in both workers and UI calls.
     engine.set_optimization_level(rhai::OptimizationLevel::None);
+    // The fast Array += Array built-in checks only the pre-append value.
+    // Normal operator dispatch also checks the entire result after mutation
+    // (eval/stmt.rs:173), including nested collections and string totals.
+    engine.set_fast_operators(false);
     ArithmeticPackage::new().register_into_engine(&mut engine);
     LogicPackage::new().register_into_engine(&mut engine);
     // Register only the bounded containers needed by `for`. The iterator
@@ -647,6 +651,109 @@ mod tests {
                 .unwrap_err(),
             EvalAltResult::ErrorDataTooLarge(_, _)
         ));
+    }
+
+    #[test]
+    fn sandbox_array_append_checks_complete_result_against_aggregate_limits() {
+        let engine = build_engine();
+        assert!(!engine.fast_operators());
+        let ints = |count| Dynamic::from_array(vec![Dynamic::from(0 as INT); count]);
+        let fields = |count| {
+            Dynamic::from_map(
+                (0..count)
+                    .map(|n| (format!("k{n}").into(), Dynamic::UNIT))
+                    .collect(),
+            )
+        };
+        for (extra, succeeds) in [(0, true), (1, false)] {
+            let cases = [
+                ("array count", ints(500), ints(500 + extra)),
+                (
+                    "nested arrays",
+                    Dynamic::from_array(vec![ints(499)]),
+                    Dynamic::from_array(vec![ints(499 + extra)]),
+                ),
+                (
+                    "nested maps",
+                    Dynamic::from_array(vec![fields(500)]),
+                    Dynamic::from_array(vec![fields(500 + extra)]),
+                ),
+                (
+                    "aggregate string bytes",
+                    Dynamic::from_array(vec![Dynamic::from("a".repeat(MAX_STRING_BYTES / 2))]),
+                    Dynamic::from_array(vec![Dynamic::from(
+                        "b".repeat(MAX_STRING_BYTES / 2 + extra),
+                    )]),
+                ),
+            ];
+            for (name, left, right) in cases {
+                engine.ensure_data_size_within_limits(&left).unwrap();
+                engine.ensure_data_size_within_limits(&right).unwrap();
+                let mut scope = Scope::new();
+                scope.push("left", left);
+                scope.push("right", right);
+                let result = engine.run_with_scope(&mut scope, "left += right;");
+                assert_eq!(
+                    result.is_ok(),
+                    succeeds,
+                    "{name}, extra={extra}: {result:?}"
+                );
+                if let Err(error) = result {
+                    assert!(
+                        matches!(*error, EvalAltResult::ErrorDataTooLarge(_, _)),
+                        "{error}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sandbox_array_self_append_cannot_double_past_the_size_limit() {
+        let engine = build_engine();
+        assert_eq!(
+            engine
+                .eval::<INT>("let a = [0]; for n in 0..9 { a += a; } a.len()")
+                .unwrap(),
+            512
+        );
+        assert!(matches!(
+            *engine
+                .run("let a = [0]; for n in 0..10 { a += a; } a.len()")
+                .unwrap_err(),
+            EvalAltResult::ErrorDataTooLarge(_, _)
+        ));
+    }
+
+    #[test]
+    fn sandbox_preserves_variable_assignment_action_append_and_value_copies() {
+        let engine = build_engine();
+        let ops = engine.eval::<Array>(
+            r#"let ops = []; let initial = ["FsPagePrev"]; ops = initial; ops += "FsPageNext"; ops"#
+        ).unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].clone().cast::<String>(), "FsPagePrev");
+        assert_eq!(ops[1].clone().cast::<String>(), "FsPageNext");
+        for source in [
+            "let original = [1, 2]; let copy = original; copy += 3; original.len() == 2 && copy.len() == 3",
+            "let original = [[1, 2]]; let copy = original[0]; copy += 3; original[0].len() == 2 && copy.len() == 3",
+            "let original = #{ values: [1, 2] }; let copy = original.values; copy += 3; original.values.len() == 2 && copy.len() == 3",
+        ] {
+            assert!(engine.eval::<bool>(source).unwrap(), "{source}");
+        }
+    }
+
+    #[test]
+    fn sandbox_native_helpers_leave_borrowed_container_targets_unchanged() {
+        let engine = build_engine();
+        for source in [
+            "let source = [[1, 2]]; let count = source[0].len(); let found = source[0].contains(2); count == 2 && found && source[0][0] == 1 && source[0][1] == 2",
+            "let source = #{ values: [1, 2], info: #{ tag: 3 } }; let count = source.values.len(); let found = source.values.contains(2); let present = source.info.contains(\"tag\"); count == 2 && found && present && source.values[0] == 1 && source.info.tag == 3",
+            "const source = [1, 2]; source.len() == 2 && source.contains(2) && source[0] == 1 && source[1] == 2",
+            "const source = #{ tag: 3 }; source.contains(\"tag\") && source.tag == 3",
+        ] {
+            assert!(engine.eval::<bool>(source).unwrap(), "{source}");
+        }
     }
 
     #[test]

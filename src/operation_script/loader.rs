@@ -21,9 +21,7 @@ impl CompiledOperationScript {
     /// 読み込みworker上でだけ呼ぶ。UIでのコンパイルし直しは行わない。
     pub fn compile(source: &str) -> Result<Self, String> {
         let engine = build_engine();
-        let ast = engine
-            .compile(source)
-            .map_err(|e| format!("コンパイルに失敗: {e}"))?;
+        let ast = super::syntax::compile_checked(&engine, source)?;
         let has_on_event = ast
             .iter_functions()
             .any(|f| f.name == "on_event" && f.params.len() == 1);
@@ -233,6 +231,32 @@ mod tests {
             .unwrap();
         assert_eq!(result.generation, loader.generation);
         assert_eq!(result.script.unwrap().slots.len(), 2);
+    }
+
+    #[test]
+    fn worker_returns_assignment_compile_failure_with_line_and_column() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            script_path(temp.path()),
+            "fn slots() { throw \"must not execute\"; }\nfn unused(s) {\n    s[0] += 1;\n}",
+        )
+        .unwrap();
+        let mut loader = OperationScriptLoader::default();
+        loader.reload(temp.path(), &egui::Context::default());
+        let OperationScriptState::Loading(pending) = &loader.state else {
+            panic!("not loading");
+        };
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let reason = result.script.err().unwrap();
+        assert!(reason.contains("3行5桁"), "{reason}");
+        assert!(
+            reason.contains("添字・プロパティへの代入は使えません"),
+            "{reason}"
+        );
+        assert!(!reason.contains("must not execute"), "{reason}");
     }
 
     #[test]

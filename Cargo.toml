@@ -513,7 +513,7 @@ signalsmith-stretch = "0.1.3"
 # ファイル名スタックのユーザー定義分割ルール (docs/filename-stack-scripting-plan.md)。
 # 純 Rust なので crt-static と両立 (C ビルド不要)。操作上限つきサンドボックスで
 # ユーザー編集スクリプトを安全に実行する。
-rhai = { version = "1", features = ["sync"] }
+rhai = { version = "1", features = ["sync", "internals"] }
 # 上記スクリプトから使う正規表現ヘルパー (regex_capture 等) の裏付け。線形時間保証
 # (ReDoS 不可) なのでユーザー入力パターンでも安全。tantivy 等が間接依存しているが
 # スクリプトヘルパーで直接使うため明示依存にする。

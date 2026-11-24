@@ -5,6 +5,7 @@ mod contract;
 mod engine;
 mod loader;
 mod snapshot;
+mod syntax;
 
 pub use contract::*;
 pub use engine::build_engine;
