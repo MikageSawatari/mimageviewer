@@ -293,3 +293,22 @@
   snapshot 規約に合わせるには表の共通描画への分離が必要となる。既存の `favorites_*_snapshot_dark` の
   PNG 更新・比較は設計担当へ引き継ぐ（`UPDATE_SNAPSHOTS=1` で生成し、通常比較と目視を行う）。
   実装担当によるコンパイル・テスト実行・PNG生成・製品起動・コミットは今回も行っていない。
+
+## 13. 実装の独立レビューとテストの記録 (設計担当が記入)
+
+- テスト (設計担当が共有ランナー経由で実行、関連 filter のみ): `e0cfdfa38` 相当で本体 lib の filter
+  `favorite_cover_auto_crop|cover_auto|cover_crop|favorites_editor|folder_auto|auto_material|representative_cache_key|color_filter|rating_view|collection_grid|settings_db|book_cover|favorite_view|preferences`
+  が 1062 件成功、`ui_snapshot` の `cover_|favorite|preferences` が 37 件成功。既存の `favorites_*_snapshot_dark` は
+  通常比較で一致したので PNG は更新していない。
+- 1 回目 (Codex gpt-6.1-sol / xhigh、read-only、`c23cbf3e2`): **REVISE** (P1 なし)。
+  - P2 Folder→Folder の固定で、標本収集の可否を固定先の場所で決め直していた → 要求自身の識別子で決める (`e0cfdfa38`)。
+  - P3 お気に入りの削除で再読込が 2 回走る → フレーム末尾で 1 回にまとめた。
+  - P3 優先要求で scope を 1 件ごとに作っていた → バッチの入口で 1 回。
+  - P3 小画面の検査不足 → 1093×614・複数行・長いパスで各行の操作と「閉じる」に届く検査を追加。
+  - 同じ時点の設計担当のテスト実行で出た 5 件の失敗 (pruning の fixture、チェックボックスの名前、
+    標本収集の退行による切り出しダイアログの 3 件) も `e0cfdfa38` で修正した。
+- 2 回目 (同じ thread を resume、`e0cfdfa38`): **ACCEPT_WITH_NITS** (P1・P2 なし)。
+  - 前回の 4 件は解消、要求キーと存続キーの整合・K2 の子行の検索・再読込の集約に新しい問題なし、との照合結果。
+  - 編集表全体の snapshot は今回見送り可 (描画の分離を必須にしない)。
+  - P3 (残す) 小画面の検査は `scroll_to_me()` で移動しており、ホイール・横バーの入力そのものは検査していない。
+    既存の検査で各操作への到達は確かめているので、今回は直さず記録だけ残す。
