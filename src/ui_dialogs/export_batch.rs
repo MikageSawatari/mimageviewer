@@ -8,11 +8,15 @@ use eframe::egui;
 use crate::app::App;
 use crate::export_batch::*;
 
+mod watermark;
+use watermark::{LogoCheck, draw_watermark};
+
 #[derive(Default)]
 struct BatchDialogAction {
     start: bool,
     cancel: bool,
     pick_folder: bool,
+    pick_logo: bool,
 }
 
 /// Enter is a candidate until the widgets have processed this frame's input.
@@ -22,6 +26,7 @@ struct EnterOwner {
     operated: bool,
     gained: bool,
     text_submitted: bool,
+    logo_submitted: bool,
 }
 
 impl EnterOwner {
@@ -32,6 +37,7 @@ impl EnterOwner {
             operated: false,
             gained: false,
             text_submitted: false,
+            logo_submitted: false,
         }
     }
     fn widget(&mut self, response: &egui::Response) {
@@ -61,6 +67,7 @@ fn draw_batch_window(
     state: &mut ExportBatchDialogState,
     enter: bool,
 ) -> BatchDialogAction {
+    state.poll_logo_check(ctx);
     let mut action = BatchDialogAction::default();
     let mut owner = EnterOwner::new(ctx);
     let mut open = true;
@@ -97,7 +104,7 @@ fn draw_batch_window(
             draw_batch_actions(ui, state, &mut owner, &mut action);
         });
     action.cancel |= !open;
-    action.start |= owner.submit(ctx, enter) && state.can_start();
+    action.start |= owner.submit(ctx, enter) && !owner.logo_submitted && state.can_start();
     action
 }
 
@@ -153,6 +160,7 @@ fn draw_batch_body(
     ui.separator();
     ui.strong("サイズ");
     draw_resize(ui, &mut state.options.resize, owner);
+    draw_watermark(ui, state, owner, action);
     // All popups must consume their own wheel before the parent body.
     protect_popup_wheel(ui.ctx(), owner.popup);
 }
@@ -679,6 +687,7 @@ pub struct ExportBatchDialogState {
     pub options: BatchExportOptions,
     pub initial_focus_done: bool,
     pub error: Option<String>,
+    logo_check: Option<LogoCheck>,
 }
 
 impl ExportBatchDialogState {
@@ -688,6 +697,7 @@ impl ExportBatchDialogState {
 
     fn can_start(&self) -> bool {
         !self.preparing()
+            && self.logo_error().is_none()
             && !self.items.is_empty()
             && !self.options.template.trim().is_empty()
             && match &self.options.destination {
@@ -737,6 +747,7 @@ impl App {
             options,
             initial_focus_done: false,
             error: None,
+            logo_check: None,
         });
         ctx.request_repaint();
     }
@@ -757,6 +768,7 @@ impl App {
             options: BatchExportOptions::default(),
             initial_focus_done: true,
             error: None,
+            logo_check: None,
         };
         while state.preparing() {
             self.advance_export_batch_preparation(&mut state);
@@ -833,6 +845,21 @@ impl App {
         let enter = self.dialog_enter_pressed(ctx);
         let escape = self.dialog_escape_pressed(ctx);
         let action = draw_batch_window(ctx, &mut state, enter);
+        if action.pick_logo {
+            let mut picker = rfd::FileDialog::new().add_filter(
+                "透かしの画像",
+                &["png", "webp", "jpg", "jpeg", "bmp", "gif"],
+            );
+            if let Some(path) = &state.options.watermark.image_path {
+                if let Some(parent) = path.parent() {
+                    picker = picker.set_directory(parent);
+                }
+            }
+            if let Some(path) = picker.pick_file() {
+                state.options.watermark.image_path = Some(path);
+                state.begin_logo_check(ctx);
+            }
+        }
         if action.pick_folder {
             let directory = match &state.options.destination {
                 BatchDestination::Folder { path, .. } => path.clone(),

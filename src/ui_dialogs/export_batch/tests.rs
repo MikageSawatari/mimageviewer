@@ -7,6 +7,8 @@ use egui_kittest::{
 };
 use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
+mod watermark_tests;
+
 fn item() -> BatchExportItem {
     BatchExportItem::new(
         "画像の名前".into(),
@@ -33,7 +35,7 @@ fn item() -> BatchExportItem {
     )
 }
 
-fn dialog(expanded: bool) -> ExportBatchDialogState {
+pub(super) fn dialog(expanded: bool) -> ExportBatchDialogState {
     let mut options = BatchExportOptions::from_legacy(
         "C:/書き出し".into(),
         "<filename>_<num:3>".into(),
@@ -60,6 +62,7 @@ fn dialog(expanded: bool) -> ExportBatchDialogState {
         options,
         initial_focus_done: true,
         error: None,
+        logo_check: None,
     }
 }
 

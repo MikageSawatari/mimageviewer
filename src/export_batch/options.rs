@@ -5,6 +5,116 @@ use serde::{Deserialize, Serialize};
 use crate::{capture::CaptureFormat, export_dialog::ExportScale, save_with_metadata::SrcFormat};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WatermarkKind {
+    #[default]
+    Text,
+    Image,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageWatermarkSize {
+    PercentOfWidth(u32),
+    Original,
+}
+
+impl Default for ImageWatermarkSize {
+    fn default() -> Self {
+        Self::PercentOfWidth(20)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WatermarkAnchor {
+    TopLeft,
+    TopCenter,
+    TopRight,
+    CenterLeft,
+    Center,
+    CenterRight,
+    BottomLeft,
+    BottomCenter,
+    #[default]
+    BottomRight,
+}
+
+impl WatermarkAnchor {
+    pub const ALL: [Self; 9] = [
+        Self::TopLeft,
+        Self::TopCenter,
+        Self::TopRight,
+        Self::CenterLeft,
+        Self::Center,
+        Self::CenterRight,
+        Self::BottomLeft,
+        Self::BottomCenter,
+        Self::BottomRight,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TopLeft => "左上",
+            Self::TopCenter => "上中央",
+            Self::TopRight => "右上",
+            Self::CenterLeft => "左中央",
+            Self::Center => "中央",
+            Self::CenterRight => "右中央",
+            Self::BottomLeft => "左下",
+            Self::BottomCenter => "下中央",
+            Self::BottomRight => "右下",
+        }
+    }
+
+    pub(super) fn axes(self) -> (u32, u32) {
+        let index = Self::ALL.iter().position(|anchor| *anchor == self).unwrap() as u32;
+        (index % 3, index / 3)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BatchWatermark {
+    pub enabled: bool,
+    pub kind: WatermarkKind,
+    pub text: String,
+    pub text_color: [u8; 3],
+    pub text_outline: bool,
+    pub text_size_percent: u32,
+    pub image_path: Option<PathBuf>,
+    pub image_size: ImageWatermarkSize,
+    pub anchor: WatermarkAnchor,
+    pub margin_percent: u32,
+    pub opacity_percent: u32,
+}
+
+impl Default for BatchWatermark {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            kind: WatermarkKind::Text,
+            text: String::new(),
+            text_color: [255; 3],
+            text_outline: true,
+            text_size_percent: 4,
+            image_path: None,
+            image_size: ImageWatermarkSize::default(),
+            anchor: WatermarkAnchor::BottomRight,
+            margin_percent: 2,
+            opacity_percent: 60,
+        }
+    }
+}
+
+pub(crate) fn supported_logo_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ["png", "webp", "jpg", "jpeg", "bmp", "gif"]
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+        })
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BatchFormatKind {
     #[default]
     Png,
@@ -164,6 +274,8 @@ pub struct BatchExportOptions {
     pub overwrite: OverwritePolicy,
     pub keep_metadata: bool,
     pub keep_file_time: bool,
+    #[serde(default)]
+    pub watermark: BatchWatermark,
 }
 
 impl Default for BatchExportOptions {
@@ -176,6 +288,7 @@ impl Default for BatchExportOptions {
             overwrite: OverwritePolicy::Rename,
             keep_metadata: false,
             keep_file_time: false,
+            watermark: BatchWatermark::default(),
         }
     }
 }

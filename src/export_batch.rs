@@ -3,6 +3,7 @@
 
 mod options;
 mod paths;
+mod watermark;
 pub use options::*;
 
 use std::borrow::Cow;
@@ -227,6 +228,7 @@ struct ItemTimings {
     decode: f64,
     compose: f64,
     resize: f64,
+    watermark: f64,
     encode: f64,
     write: f64,
     dimensions: [usize; 2],
@@ -280,8 +282,18 @@ fn run_batch_export_with_decoder(
     let prepared = Instant::now();
     let base = paths::common_ancestor(&request.items);
     let mut outputs = OutputReservation::default();
-    if request.options.overwrite == OverwritePolicy::Replace {
-        if let Err(message) = outputs.protect_sources(&request.items) {
+    let mut watermark = match (|| {
+        if request.options.overwrite == OverwritePolicy::Replace {
+            outputs.protect_sources(&request.items)?;
+            let logo = &request.options.watermark;
+            if logo.enabled && logo.kind == WatermarkKind::Image {
+                outputs.protect_logo(logo.image_path.as_deref().unwrap_or(Path::new("")))?;
+            }
+        }
+        watermark::WatermarkAssets::load(&request.options.watermark)
+    })() {
+        Ok(assets) => assets,
+        Err(message) => {
             for item in &request.items {
                 log::error!("batch export {}: {message}", item.filename);
                 let _ = tx.send(ExportEvent::Failed(ExportFailure {
@@ -292,7 +304,7 @@ fn run_batch_export_with_decoder(
             let _ = tx.send(ExportEvent::AllDone);
             return;
         }
-    }
+    };
     crate::perf::event(
         "export_batch/prepare",
         "complete",
@@ -376,6 +388,10 @@ fn run_batch_export_with_decoder(
             )?;
             timings.resize = start.elapsed().as_secs_f64() * 1000.0;
             ensure_not_cancelled(&cancel)?;
+            let start = Instant::now();
+            let watermarked = watermark.apply(pixels.as_ref(), &options.watermark)?;
+            timings.watermark = start.elapsed().as_secs_f64() * 1000.0;
+            ensure_not_cancelled(&cancel)?;
             let save_options = SaveOptions {
                 jpeg_quality: options.format.jpeg_quality.clamp(1, 100),
                 webp_quality: options.format.webp_quality.clamp(1, 100) as f32,
@@ -396,13 +412,25 @@ fn run_batch_export_with_decoder(
                 None
             };
             let start = Instant::now();
-            let encoded = crate::save_with_metadata::encode_image_with_metadata_report(
-                pixels.as_ref(),
-                src_path,
-                bytes.as_deref(),
-                format,
-                &save_options,
-            )
+            let encoded = if let Some(rgba) = watermarked {
+                crate::save_with_metadata::encode_rgba_with_metadata(
+                    &rgba,
+                    target_size[0] as u32,
+                    target_size[1] as u32,
+                    src_path,
+                    bytes.as_deref(),
+                    format,
+                    &save_options,
+                )
+            } else {
+                crate::save_with_metadata::encode_image_with_metadata_report(
+                    pixels.as_ref(),
+                    src_path,
+                    bytes.as_deref(),
+                    format,
+                    &save_options,
+                )
+            }
             .map_err(|e| e.to_string())?;
             timings.encode = start.elapsed().as_secs_f64() * 1000.0;
             ensure_not_cancelled(&cancel)?;
@@ -480,7 +508,7 @@ fn run_batch_export_with_decoder(
                 ("decode_ms", serde_json::json!(timings.decode)),
                 ("compose_ms", serde_json::json!(timings.compose)),
                 ("resize_ms", serde_json::json!(timings.resize)),
-                ("watermark_ms", serde_json::json!(0)),
+                ("watermark_ms", serde_json::json!(timings.watermark)),
                 ("encode_ms", serde_json::json!(timings.encode)),
                 ("write_ms", serde_json::json!(timings.write)),
                 ("size", serde_json::json!(timings.dimensions)),

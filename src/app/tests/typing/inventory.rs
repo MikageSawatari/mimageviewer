@@ -94,6 +94,18 @@ const INPUT_TESTS: &[Entry] = &[
 
 const EXEMPTIONS: &[Entry] = &[
     exempt(
+        "src/ui_dialogs/export_batch/watermark.rs",
+        "&mut options.text",
+        1,
+        "透かしの文字。書き出す操作時だけ使用する",
+    ),
+    exempt(
+        "src/ui_dialogs/export_batch/watermark.rs",
+        "&mut path_text",
+        1,
+        "ロゴのパス。入力終了時だけ存在確認する",
+    ),
+    exempt(
         "src/ui_dialogs/preferences/browser_integration.rs",
         "input,",
         1,

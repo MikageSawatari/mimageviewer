@@ -49,6 +49,149 @@ fn completed_paths(events: &[ExportEvent]) -> Vec<PathBuf> {
         .collect()
 }
 
+fn logo_options(directory: &Path, logo: &Path) -> BatchExportOptions {
+    let mut options = options(directory);
+    options.watermark = BatchWatermark {
+        enabled: true,
+        kind: WatermarkKind::Image,
+        image_path: Some(logo.to_owned()),
+        image_size: ImageWatermarkSize::Original,
+        anchor: WatermarkAnchor::TopLeft,
+        margin_percent: 0,
+        opacity_percent: 100,
+        ..Default::default()
+    };
+    options
+}
+
+#[test]
+fn watermark_worker_png_roundtrip_keeps_low_alpha_color_after_resize() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source.png");
+    image::RgbaImage::new(8, 8).save(&source).unwrap();
+    let logo = tmp.path().join("logo.png");
+    image::RgbaImage::from_pixel(1, 1, image::Rgba([100, 0, 0, 16]))
+        .save(&logo)
+        .unwrap();
+    let mut options = logo_options(&tmp.path().join("out"), &logo);
+    options.resize.mode = BatchResizeMode::Percent(50);
+    let events = run(options, vec![file_item(&source, "source")]);
+    let paths = completed_paths(&events);
+    assert_eq!(paths.len(), 1);
+    let output = image::open(&paths[0]).unwrap().into_rgba8();
+    assert_eq!(output.dimensions(), (4, 4));
+    assert_eq!(*output.get_pixel(0, 0), image::Rgba([100, 0, 0, 16]));
+    assert_eq!(*output.get_pixel(1, 0), image::Rgba([0; 4]));
+}
+
+#[test]
+fn watermark_worker_zero_opacity_preserves_encoded_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source.png");
+    image::RgbaImage::from_pixel(8, 8, image::Rgba([45, 90, 135, 64]))
+        .save(&source)
+        .unwrap();
+    let logo = tmp.path().join("logo.png");
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([100, 0, 0, 16]))
+        .save(&logo)
+        .unwrap();
+    for kind in [
+        BatchFormatKind::Png,
+        BatchFormatKind::Jpeg,
+        BatchFormatKind::Webp,
+    ] {
+        let mut plain = options(&tmp.path().join("plain"));
+        plain.format.kind = kind;
+        let baseline = completed_paths(&run(plain.clone(), vec![file_item(&source, "source")]));
+        for watermark_kind in [WatermarkKind::Image, WatermarkKind::Text] {
+            let mut marked = plain.clone();
+            marked.destination = BatchDestination::Folder {
+                path: tmp.path().join(format!("{kind:?}_{watermark_kind:?}")),
+                keep_structure: false,
+            };
+            marked.watermark = logo_options(tmp.path(), &logo).watermark;
+            marked.watermark.kind = watermark_kind;
+            marked.watermark.text = "作者".into();
+            marked.watermark.opacity_percent = 0;
+            let paths = completed_paths(&run(marked, vec![file_item(&source, "source")]));
+            assert_eq!(paths.len(), 1);
+            assert_eq!(
+                std::fs::read(&baseline[0]).unwrap(),
+                std::fs::read(&paths[0]).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn watermark_worker_missing_or_corrupt_logo_fails_all_before_decode_or_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source.png");
+    for (name, contents) in [
+        ("missing.png", None),
+        ("broken.png", Some(b"broken".as_slice())),
+        ("wrong.svg", Some(b"svg".as_slice())),
+    ] {
+        let logo = tmp.path().join(name);
+        if let Some(contents) = contents {
+            std::fs::write(&logo, contents).unwrap();
+        }
+        let directory = tmp.path().join(format!("out_{name}"));
+        let (tx, rx) = mpsc::channel();
+        let mut calls = 0;
+        run_batch_export_with_decoder(
+            BatchExportPlan {
+                options: logo_options(&directory, &logo),
+                items: vec![file_item(&source, "a"), file_item(&source, "b")],
+                raw: None,
+            },
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            &mut |_, _, _, _| {
+                calls += 1;
+                panic!("must fail before source decoding")
+            },
+        );
+        assert_eq!(calls, 0);
+        assert!(!directory.exists());
+        let events: Vec<_> = rx.into_iter().collect();
+        let messages: Vec<_> = events
+            .iter()
+            .filter_map(|event| {
+                if let ExportEvent::Failed(failure) = event {
+                    Some(&failure.message)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0], messages[1]);
+        assert!(messages[0].starts_with("透かしの画像を読めません:"));
+        assert!(matches!(events.last(), Some(ExportEvent::AllDone)));
+    }
+}
+
+#[test]
+fn watermark_worker_replace_protects_logo_case_and_path_alias() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source.png");
+    image::RgbaImage::new(8, 8).save(&source).unwrap();
+    let logo = tmp.path().join("Logo.PNG");
+    image::RgbaImage::from_pixel(2, 2, image::Rgba([100, 0, 0, 16]))
+        .save(&logo)
+        .unwrap();
+    let before = std::fs::read(&logo).unwrap();
+    let alias = tmp.path().join(".").join("lOgO.pNg");
+    let mut options = logo_options(tmp.path(), &alias);
+    options.overwrite = OverwritePolicy::Replace;
+    options.template = "logo".into();
+    let events = run(options, vec![file_item(&source, "source")]);
+    assert!(completed_paths(&events).is_empty());
+    assert!(events.iter().any(|event| matches!(event, ExportEvent::Failed(error) if error.message.contains("元ファイルは上書きしません"))));
+    assert_eq!(std::fs::read(logo).unwrap(), before);
+}
+
 #[test]
 fn legacy_all_format_scale_combinations_preserve_bytes_and_names() {
     use crate::capture::CaptureFormat;

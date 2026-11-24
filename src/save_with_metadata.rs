@@ -1058,7 +1058,7 @@ fn vp8l_has_alpha(data: &[u8]) -> bool {
 /// sRGB) に戻してからエンコーダに渡す。これをやらないと半透明ピクセルが
 /// premultiplied 値で書かれてしまい、PNG / WebP デコーダで暗く再現される
 /// (Codex P1)。
-fn color_image_to_rgba(image: &ColorImage) -> Vec<u8> {
+pub(crate) fn color_image_to_rgba(image: &ColorImage) -> Vec<u8> {
     let mut out = Vec::with_capacity(image.pixels.len() * 4);
     for px in &image.pixels {
         let [r, g, b, a] = px.to_srgba_unmultiplied();

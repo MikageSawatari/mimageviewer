@@ -119,6 +119,14 @@ pub(super) struct OutputReservation {
 }
 
 impl OutputReservation {
+    pub fn protect_logo(&mut self, path: &Path) -> Result<(), String> {
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| format!("透かしの画像を読めません: {}: {error}", path.display()))?;
+        self.protected.insert(OutputKey::from_path(&canonical));
+        Ok(())
+    }
+
     pub fn protect_sources(&mut self, items: &[BatchExportItem]) -> Result<(), String> {
         for item in items {
             let path = super::source_path(&item.source);

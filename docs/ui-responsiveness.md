@@ -640,6 +640,15 @@ UI準備に足した情報はsource_dir/source_extのパス・文字列演算だ
 終了結果のpollは非blockingで、警告付き終了を保持しても一覧更新は終端採用時の1回だけ。
 自動検証・実機操作・性能測定は未実施で、設計担当の共有runnerへ引き継ぐ。
 
+段 B の透かしも同じ一括 worker が所有する。フォント・ロゴは開始時に 1 回読み、
+ロゴのデコード、アルファを考慮した縮小、文字描画と straight RGBA 合成は UI から呼ばない。
+同寸法のロゴは直前の縮小結果を再利用し、`export_batch/item` の `watermark_ms` に合成区間を記録する。
+素材読み込みは `export_batch/prepare` の時間に含む。UI の拡張子確認は文字列演算だけで、
+存在確認の metadata は短命 `export-logo-check` スレッドに置く。ダイアログの `logo_check` は
+確認ごとの専用 receiver を 1 つだけ持ち、選び直しや閉じる操作で旧 receiver を捨てる。
+UI は try_recv だけで採用し、確認中も開始可能。画像の実読込は worker が開始時に行う。
+段 B のコンパイル・自動テスト・実機確認は未実行。共有 runner での検証に引き継ぐ。
+
 Ctrl+S / Ctrl+T（案 C）の最終列に対応する読書位置索引は検索workerで準備し、
 `search / page_identity_prepare` に `surface`・`items`・`ms` を記録する。
 Ctrl+S空クエリの空列だけは定数サイズの準備を同期実行する。完成結果の条件一致を確認し、
