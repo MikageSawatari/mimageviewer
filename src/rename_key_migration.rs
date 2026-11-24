@@ -22,6 +22,8 @@
 //!   (`old/…` → `new/…`)、アーカイブ内エントリ / PDF ページ (`old::…` → `new::…`、
 //!   `adjustment_db::zip_entry_key` 形式)。prefix 照合は LIKE ではなく BINARY index range
 //!   (path に `%` / `_` が含まれても誤爆しない)。
+//! - 本 resume のキーを移す・複製する場合は、同じ transaction で page identity の
+//!   パスも同じ mapping に従わせる。複製元と既存優先の宛先は変更せず、page 列は更新しない。
 //!
 //! ## 本の構造操作
 //! `books` worker は FS 確定後、[`acquire_store_maintenance`] で両端の EPUB 範囲と
@@ -35,7 +37,8 @@
 //!   transaction 内で行い、コピーは移動後のキーを読む。汎用改名・内容同一性復元の先勝は変えない。
 //! - コピーは同じ表の `copies_with_book_page` に従い、従来の編集・★・タグの 8 種だけを写す。
 //!   写さないストアもコピー先を初期化する。本単位キーはページ mapping には一致しない。
-//! - resume の Image identity、pin の相対画像参照、ratings の source_path も更新する。
+//! - resume の Image / Archive / Document identity、pin の相対画像参照、ratings の source_path も更新する。
+//!   通常 resume 行と内部本の名前空間行は別々の所有経路で一度だけ書き換える。
 //!   別本へ移した画像を指す pin は外す。preview はキーだけでなく所有ファイルの hash 配置も移す。
 //! - FS 確定後のストア失敗は結果へ集計してログ・通知へ返す。ストア完了印や再実行 journal は足さない。
 //!   本削除は既存の guarded purge と同じ [`STORES`] を使う。
@@ -2163,7 +2166,7 @@ fn resume_source_mappings(pairs: &[(PathBuf, PathBuf)]) -> Vec<(String, String)>
         .collect()
 }
 
-fn rewrite_archive_resume_identity(
+fn rewrite_resume_identity(
     tx: &rusqlite::Transaction<'_>,
     columns: &[String],
     key: &str,
@@ -2180,21 +2183,22 @@ fn rewrite_archive_resume_identity(
     let Some(json) = json else {
         return Ok(0);
     };
-    let Ok(crate::book_resume_db::PageIdentity::Archive {
-        container,
-        entry_name,
-    }) = serde_json::from_str(&json)
+    let Ok(mut identity) = serde_json::from_str::<crate::book_resume_db::PageIdentity>(&json)
     else {
         return Ok(0);
     };
-    let Some(container) = rewrite_book_key(&container, mappings) else {
+    use crate::book_resume_db::PageIdentity;
+    let path = match &mut identity {
+        PageIdentity::Image { path } => path,
+        PageIdentity::Archive { container, .. } | PageIdentity::Document { container, .. } => {
+            container
+        }
+    };
+    let Some(rewritten) = rewrite_book_key(path, mappings) else {
         return Ok(0);
     };
-    let json = serde_json::to_string(&crate::book_resume_db::PageIdentity::Archive {
-        container,
-        entry_name,
-    })
-    .expect("serializable archive identity");
+    *path = rewritten;
+    let json = serde_json::to_string(&identity).expect("serializable page identity");
     tx.execute(
         "UPDATE book_resume SET page_identity = ?1 WHERE path = ?2",
         rusqlite::params![json, key],
@@ -2267,7 +2271,7 @@ fn migrate_archive_resume_rows(
         )?;
         changed += moved;
         if moved > 0 {
-            changed += rewrite_archive_resume_identity(tx, columns, &destination, &mappings)?;
+            changed += rewrite_resume_identity(tx, columns, &destination, &mappings)?;
         }
         changed += tx.execute("DELETE FROM book_resume WHERE path = ?1", [temporary])?;
     }
@@ -2291,6 +2295,46 @@ fn migrate_resume_store(
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         let columns = table_columns(&tx, descriptor.table).map_err(|e| e.to_string())?;
+        let old_key = descriptor.normalize_path(old);
+        let new_key = descriptor.normalize_path(new);
+        // Snapshot only source rows whose destination is vacant. DestinationWins
+        // must not rewrite an existing destination, even if its identity happens
+        // to match the old path. The immediate transaction owns both checks and move.
+        let mut moved_destinations = Vec::new();
+        if old_key != new_key {
+            let mut sources = tx
+                .prepare("SELECT path FROM book_resume WHERE path = ?1")
+                .map_err(|e| e.to_string())?
+                .query_map([&old_key], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| e.to_string())?;
+            for delimiter in ["/", "::"] {
+                sources.extend(
+                    indexed_prefix_keys(
+                        &tx,
+                        descriptor.table,
+                        descriptor.column,
+                        &format!("{old_key}{delimiter}"),
+                    )
+                    .map_err(|e| e.to_string())?,
+                );
+            }
+            for source in sources {
+                let destination = format!("{new_key}{}", &source[old_key.len()..]);
+                let exists: bool = tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM book_resume WHERE path = ?1)",
+                        [&destination],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                if !exists {
+                    moved_destinations.push(destination);
+                }
+            }
+        }
+        let source_mappings = resume_source_mappings(&[(old.to_path_buf(), new.to_path_buf())]);
         let mut changed = migrate_archive_resume_rows(
             &tx,
             &columns,
@@ -2301,11 +2345,15 @@ fn migrate_resume_store(
         changed += migrate_store_family(
             &tx,
             descriptor,
-            &descriptor.normalize_path(old),
-            &descriptor.normalize_path(new),
+            &old_key,
+            &new_key,
             PathMigrationCollision::DestinationWins,
         )
         .map_err(|e| e.to_string())?;
+        for destination in moved_destinations {
+            changed += rewrite_resume_identity(&tx, &columns, &destination, &source_mappings)
+                .map_err(|e| e.to_string())?;
+        }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(changed)
     })();
@@ -2335,6 +2383,38 @@ fn copy_resume_store(
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
         let columns = table_columns(&tx, descriptor.table).map_err(|e| e.to_string())?;
+        let pairs = mappings
+            .iter()
+            .map(|mapping| match mapping {
+                StoreCopyPathMapping::Exact { old_path, new_path }
+                | StoreCopyPathMapping::VirtualPrefix { old_path, new_path } => {
+                    (old_path.clone(), new_path.clone())
+                }
+            })
+            .collect::<BTreeSet<_>>();
+        // A converted book's physical and logical paths form one candidate.
+        // Index both directions once, rather than scanning the batch per copy.
+        let mut related_pairs = BTreeMap::<_, Vec<_>>::new();
+        for pair in &pairs {
+            related_pairs
+                .entry(pair.clone())
+                .or_default()
+                .push(pair.clone());
+            let cache_pair = (
+                crate::archive_cache::cache_zip_path_for_data_dir(data_dir, &pair.0),
+                crate::archive_cache::cache_zip_path_for_data_dir(data_dir, &pair.1),
+            );
+            if pairs.contains(&cache_pair) {
+                related_pairs
+                    .entry(pair.clone())
+                    .or_default()
+                    .push(cache_pair.clone());
+                related_pairs
+                    .entry(cache_pair)
+                    .or_default()
+                    .push(pair.clone());
+            }
+        }
         let mut changed = 0;
         for mapping in mappings {
             let (old, new) = match mapping {
@@ -2343,7 +2423,15 @@ fn copy_resume_store(
                     (old_path, new_path)
                 }
             };
-            let source_mappings = resume_source_mappings(&[(old.clone(), new.clone())]);
+            // The same source may be restored to multiple targets in this batch.
+            // Only this pair and its source/cache counterpart may rewrite this
+            // destination, including logical identities stored under cache keys.
+            let current = (old.clone(), new.clone());
+            let source_mappings = resume_source_mappings(
+                related_pairs
+                    .get(&current)
+                    .expect("every copy pair is indexed"),
+            );
             for (key, scope) in archive_resume_rows(&tx).map_err(|e| e.to_string())? {
                 if !scope.matches_source_family(old, false) {
                     continue;
@@ -2366,13 +2454,9 @@ fn copy_resume_store(
                 .map_err(|e| e.to_string())?;
                 changed += copied;
                 if copied > 0 {
-                    changed += rewrite_archive_resume_identity(
-                        &tx,
-                        &columns,
-                        &destination,
-                        &source_mappings,
-                    )
-                    .map_err(|e| e.to_string())?;
+                    changed +=
+                        rewrite_resume_identity(&tx, &columns, &destination, &source_mappings)
+                            .map_err(|e| e.to_string())?;
                 }
             }
             let old_key = descriptor.normalize_path(old);
@@ -2380,29 +2464,41 @@ fn copy_resume_store(
             if old_key == new_key {
                 continue;
             }
-            changed += match mapping {
-                StoreCopyPathMapping::Exact { .. } => copy_exact(
-                    &tx,
-                    descriptor.table,
-                    descriptor.column,
-                    &columns,
-                    &old_key,
-                    &new_key,
-                )
-                .map_err(|e| e.to_string())?,
-                StoreCopyPathMapping::VirtualPrefix { .. } => {
-                    copy_prefix(
+            let copied = match mapping {
+                StoreCopyPathMapping::Exact { .. } => {
+                    let rows = copy_exact(
                         &tx,
                         descriptor.table,
                         descriptor.column,
                         &columns,
-                        &format!("{old_key}::"),
-                        &format!("{new_key}::"),
+                        &old_key,
+                        &new_key,
                     )
-                    .map_err(|e| e.to_string())?
-                    .rows
+                    .map_err(|e| e.to_string())?;
+                    GenericCopyOutcome {
+                        rows,
+                        copied_keys: if rows > 0 {
+                            vec![(old_key, new_key)]
+                        } else {
+                            Vec::new()
+                        },
+                    }
                 }
+                StoreCopyPathMapping::VirtualPrefix { .. } => copy_prefix(
+                    &tx,
+                    descriptor.table,
+                    descriptor.column,
+                    &columns,
+                    &format!("{old_key}::"),
+                    &format!("{new_key}::"),
+                )
+                .map_err(|e| e.to_string())?,
             };
+            changed += copied.rows;
+            for (_, destination) in copied.copied_keys {
+                changed += rewrite_resume_identity(&tx, &columns, &destination, &source_mappings)
+                    .map_err(|e| e.to_string())?;
+            }
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(changed)
@@ -2637,30 +2733,21 @@ fn rewrite_book_store_values(
         .collect::<Vec<_>>();
     let mut changed = 0;
     if descriptor.table == "book_resume" && columns.iter().any(|c| c == "page_identity") {
-        let rows = {
+        // The enclosing book's Image identity can refer to a swapped page even
+        // when its own key does not move. Visit ordinary rows by identity, but
+        // leave namespaced inner books to migrate_archive_resume_rows exactly once.
+        let keys = {
             let mut statement = tx.prepare(
-                "SELECT path, page_identity FROM book_resume WHERE page_identity IS NOT NULL",
+                "SELECT path FROM book_resume WHERE page_identity IS NOT NULL
+                 AND NOT (path >= 'miv:zipbook:' AND path < 'miv:zipbook;')",
             )?;
             statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
+                .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for (key, json) in rows {
-            if let Ok(crate::book_resume_db::PageIdentity::Image { path }) =
-                serde_json::from_str(&json)
-                && let Some(path) = rewrite_book_key(&path, &mappings)
-            {
-                let json =
-                    serde_json::to_string(&crate::book_resume_db::PageIdentity::Image { path })
-                        .expect("serializable image identity");
-                // Updating page even to itself would clear identity through the legacy trigger.
-                changed += tx.execute(
-                    "UPDATE book_resume SET page_identity = ?1 WHERE path = ?2",
-                    rusqlite::params![json, key],
-                )?;
-            }
+        let resume_mappings = resume_source_mappings(moves);
+        for key in keys {
+            changed += rewrite_resume_identity(tx, columns, &key, &resume_mappings)?;
         }
     }
     if descriptor.table == "folder_thumb_pins" && columns.iter().any(|c| c == "source_rel") {
@@ -3943,6 +4030,9 @@ fn migrate_reading_history(
         Err(e) => report.errors.push(format!("reading_history: {e}")),
     }
 }
+
+#[cfg(test)]
+mod resume_identity_tests;
 
 #[cfg(test)]
 mod tests {

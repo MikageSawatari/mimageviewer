@@ -162,8 +162,10 @@ Requested(要求) ──静止を確認──> Running(worker) ──結果を U
 
 同じ worker の、そのストアの transaction の中で値も書き換える。
 
-- `book_resume.page_identity` が `Image { path }` で、その path が mapping の旧側なら新側へ。本の改名では配下 prefix を
-  付け替える。`page` 列は更新しない (`page` の更新で identity を消すトリガーがあるため)。
+- 通常の `book_resume.page_identity` は Image の path、Archive / Document の container が mapping の旧側なら新側へ。
+  本の改名では配下 prefix も付け替える。内部本の `miv:zipbook:` 行は専用のキー移行だけで書き換え、二重適用しない。
+  ページ交換では本自身のキーが変わらなくても Image identity を元 mapping で一度更新する。
+  `page` 列は更新しない (`page` の更新で identity を消すトリガーがあるため)。
 - `folder_thumb_pins` (`container_key` が本フォルダ):
   - `source_rel` が同じ本の中で名前の変わったページなら、新しいページ名へ。
   - `source_rel` が**別の本へ移したページ**なら、その pin を外す (行を消す)。残すと、移動後の詰め直しで同じ名前に
