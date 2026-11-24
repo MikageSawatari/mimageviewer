@@ -5,20 +5,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ブラウザ連携 — mImageViewer マニュアル</title>
   <!-- meta:begin (generated) -->
-  <meta name="description" content="ブラウザ連携の登録と解除、保存先、重ねて開く窓の操作と注意点を説明します。拡張機能は公開準備中です。">
+  <meta name="description" content="ブラウザ連携の登録と解除、保存先、重ねて開く窓の操作と注意点、Chrome 用の拡張機能の入れ方を説明します。Edge 用は公開準備中です。">
   <link rel="canonical" href="https://mikage.to/mimageviewer/manual/browser-integration.html">
   <meta property="og:type" content="article">
   <meta property="og:site_name" content="mImageViewer">
   <meta property="og:locale" content="ja_JP">
   <meta property="og:url" content="https://mikage.to/mimageviewer/manual/browser-integration.html">
   <meta property="og:title" content="ブラウザ連携｜mImageViewer">
-  <meta property="og:description" content="ブラウザ連携の登録と解除、保存先、重ねて開く窓の操作と注意点を説明します。拡張機能は公開準備中です。">
+  <meta property="og:description" content="ブラウザ連携の登録と解除、保存先、重ねて開く窓の操作と注意点、Chrome 用の拡張機能の入れ方を説明します。Edge 用は公開準備中です。">
   <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="ブラウザ連携｜mImageViewer">
-  <meta name="twitter:description" content="ブラウザ連携の登録と解除、保存先、重ねて開く窓の操作と注意点を説明します。拡張機能は公開準備中です。">
+  <meta name="twitter:description" content="ブラウザ連携の登録と解除、保存先、重ねて開く窓の操作と注意点、Chrome 用の拡張機能の入れ方を説明します。Edge 用は公開準備中です。">
   <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
   <!-- meta:end -->
   <link rel="stylesheet" href="style.css">
@@ -84,11 +84,11 @@
   <main class="content">
     <h1 class="page-title">ブラウザ連携</h1>
     <p class="page-desc">ブラウザで見ている画像を PC に保存し、mImageViewer の窓で開くための設定です。</p>
-    <p><strong>Chrome / Edge 用の拡張機能は公開準備中です。</strong>本体側の設定を先に用意しています。ブラウザから開くには、拡張機能の公開をお待ちください。</p>
+    <p>Chrome 用の拡張機能「mIV で見る」を入れ、mIV 側で連携を登録すると、ブラウザで右クリックした画像を mIV で開けます。Edge 用の拡張機能は公開準備中です。</p>
     <nav class="page-toc">
       <div class="page-toc-title">目次</div>
       <ul>
-        <li><a href="#install-extension">拡張機能の入れ方・公開後の使い方</a></li>
+        <li><a href="#install-extension">拡張機能の入れ方と使い方</a></li>
         <li><a href="#registration">mIV 側の登録と解除</a></li>
         <li><a href="#destination">保存先と「ブラウザ閲覧」</a></li>
         <li><a href="#window">重ねて開く窓の動き</a></li>
@@ -97,9 +97,13 @@
       </ul>
     </nav>
 
-    <h2 id="install-extension">拡張機能の入れ方・公開後の使い方</h2>
-    <p><strong>公開準備中です。現在はストアからインストールできません。</strong>公開後、この節に Chrome / Edge のインストール先と手順を掲載します。</p>
-    <p>以下は拡張機能の公開後に使える操作と注意点です。</p>
+    <h2 id="install-extension">拡張機能の入れ方と使い方</h2>
+    <p>拡張機能「mIV で見る」は、Chrome ウェブストアから無料でインストールできます。</p>
+    <ul>
+      <li>Chrome: <a href="https://chromewebstore.google.com/detail/fpppoodelfkddekjahhmalmmfdhbpdma" target="_blank" rel="noopener">Chrome ウェブストア</a></li>
+      <li>Edge: 公開準備中です。現在は Microsoft Edge アドオンからインストールできません。</li>
+    </ul>
+    <p>インストールした後は、次の手順で使います。</p>
     <ol>
       <li>下記の <a href="#registration">mIV 側の登録</a>を行います。</li>
       <li>ブラウザで画像を右クリックし、「mIV で見る」を選びます。サイト独自のメニューが出る場合は、<kbd>Shift</kbd> を押しながら右クリックするとブラウザのメニューを出せることがあります。</li>
@@ -164,7 +168,7 @@
     <p>サムネイルに反映されるのは色の補正で、アップスケールやポストフィルタは反映されません。補正や編集を画像ファイルとして残すには、<kbd>Ctrl</kbd>+<kbd>E</kbd> の<a href="export.html">エクスポート</a>を使います。詳しくは<a href="adjustment.html">画像補正</a>をご覧ください。</p>
 
     <h2 id="data">通信と出どころの記録</h2>
-    <p>拡張機能の公開後、「mIV で見る」を選んだときだけ、選んだ画像を拡張機能が取得します。画像ファイルへのリンクがある場合はリンク先を先に取得し、画像ではなかったときだけページに表示されている画像を取得します。サイトの Cookie はブラウザの規則に従って付きます。それぞれの最初の URL への要求には、ページや画像の参照元の指定にかかわらず、ページのアドレスのホスト名まで（例: <code>https://example.com/</code>）を参照元として送ります。参照元にページのパスや検索語は含めません。転送先への要求とその参照元はブラウザの規則に従い、転送先の許可がない場合などは取得できないことがあります。</p>
+    <p>「mIV で見る」を選んだときだけ、選んだ画像を拡張機能が取得します。画像ファイルへのリンクがある場合はリンク先を先に取得し、画像ではなかったときだけページに表示されている画像を取得します。サイトの Cookie はブラウザの規則に従って付きます。それぞれの最初の URL への要求には、ページや画像の参照元の指定にかかわらず、ページのアドレスのホスト名まで（例: <code>https://example.com/</code>）を参照元として送ります。参照元にページのパスや検索語は含めません。転送先への要求とその参照元はブラウザの規則に従い、転送先の許可がない場合などは取得できないことがあります。</p>
     <p>許可したサイトでは、窓の位置合わせのために直前の右クリックの座標と窓の位置・大きさを記録します。ページ本文は読みません。「mIV で見る」を選んだときだけ、画像データとページ・画像・転送後の URL、窓と右クリックの座標を、この PC 内の mIV へ渡します。これらを開発者へ送信することはありません。</p>
     <p>保存した画像には Windows の Mark of the Web として、ページの URL と取得後の画像の URL を記録します。ファイルの内容とは別の記録で、Windows がインターネット由来のファイルとして扱うためのものです。通信と保存データの詳細は<a href="../privacy.html">プライバシーポリシー</a>をご覧ください。</p>
   </main>
