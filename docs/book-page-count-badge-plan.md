@@ -6,8 +6,9 @@
 (Sol / xhigh) 1〜3 回目でいずれも REVISE。第2版からは、指摘を仕組みを足すのではなく状態を減らす形で直している。
 第4版 (`d93388e71`) はレビュー 4 回目で REVISE。第5版 (`2fbcdef49`) は 4 回目の指摘を反映し、さらに利用者の決定
 (2026-11-24、統括経由「ページ数バッジ・ソートまでいれて、次の5.7.0リリースへと進めたいと思います。」) に従い、
-ページ数順を同じ版に入れる前提で §6 を設計し直した。第5版はレビュー 5 回目で REVISE、第6版はその指摘の反映で、
-まだレビューを受けていない (§9)。実装はまだしない。**収録版は v5.7.0**。
+ページ数順を同じ版に入れる前提で §6 を設計し直した。第5版はレビュー 5 回目で REVISE、第6版 (`042c98a7b`) は
+6 回目で REVISE (残り 1 件)。第7版はその反映で、まだレビューを受けていない (§9)。実装はまだしない。
+**収録版は v5.7.0**。
 正本のバックログは [next-release-backlog.md](next-release-backlog.md) §1.883。
 
 ## 1. 目的と範囲
@@ -409,6 +410,16 @@ fn thumbnail_page_count_enabled(&self) -> bool {
     列見出しの並べ替え・選択情報・バッジが同じ accessor を通るので、`ZipDir` の数の書き手は木だけになる。
     木が作り直されれば次のフレームから新しい数になる。ZIP の中の一覧はページ順が固定で、一覧の並べ替え
     (ページ数順) の対象にはならない (§6.4)。
+  - **「ページ数を表示できる」と「ページ数を非同期に取る必要がある」を分ける** (レビュー 6 回目 P2-1)。
+    `details_item_supports_page_count` (表示できるか) は今のまま `ZipDir` を含める (外すと詳細表示の文字も消える)。
+    新しく `details_item_page_count_needs_fetch(idx)` (= 表示できて `ZipDir` でない) を置き、**取得の需要を見る
+    述語は全部こちらを使う**: `lazy_load_page_count_for_idx`、選択情報の `selection_info_item_requires_lazy_meta`、
+    段階取得の `details_visible_stage_needs_load`、Planning の選別、全体要件 (`requirements.page_count` の対象)。
+    `target` から外すだけだと、メモリが無い `ZipDir` が「未充足」と見なされ、0 件の target → Ready → 未充足 →
+    次の段階取得、を繰り返すため。`ZipDir` の作成日時は今も取得対象外 (`details_created_time_path` が `None`) なので、
+    `ZipDir` は選択情報の遅延取得の対象そのものにならない。
+  - 木が無い `ZipDir` (レーティング一覧など) は「取得待ち」ではなく「取れない」: accessor は Unavailable を返し、
+    詳細表示は「-」、並べ替えの値は不明 (末尾)、バッジは出さない。今の未取得の表示 (Ready でも「…」) へ流さない。
 - 計装: 既存の `details_meta/load_done` に、ページ数の件数を足す
   (`page_targets`・`page_cache_hits`・`page_counted` を種類別 (zip / zip_nested / folder / rar / pdf / epub)・
   `page_failed`・`page_ms`)。取り消した job は `load_done` に届かず途中で返るので、既存の
@@ -653,7 +664,9 @@ catalog の一括読み取り (worker だけ):
   が再帰しない。
 - 取消 (§4.4.1): RAR とフォルダの走査が job の cancel で止まり、記録も checked も立てない。
 - 値: `page_count = None`・0・失敗でバッジなし、PDF のパスワードの revision、`ZipDir` は今の `zip_nav` の木の値を
-  accessor が直接読み、details-meta の target にならない、
+  accessor が直接読み、details-meta の target にならない、木が無い `ZipDir` は「-」・不明・バッジなし、
+- `ZipDir` の需要: 木あり / 木なし、選択情報だけ有効、詳細表示のページ数ソート、サムネイル表示の段階取得の各条件で、
+  poll を繰り返しても details-meta の session が増えない (取得の需要の述語が `ZipDir` を含まない)、
   ドライブ一覧でバッジなし。
 - 設定: 既定 true、旧設定に field が無いと true、false の往復、settings_transfer、件数のテスト。
 - ページ数順 (§6):
@@ -738,4 +751,11 @@ catalog の一括読み取り (worker だけ):
     変更不要なこと、遅延キーの共通化・不明は末尾・スタックの構造体の持ち回り・Remote の正規化を共有する方針は
     妥当とされた。利用者への事前説明では、ツールバーの補完でページ数順を使わない利用者にも旧版との設定の境界が
     及ぶ点を残すこと (§7 の問 4)。
-- 6 回目: 未実施。
+- 6 回目 (Sol / xhigh、同じセッション、第6版 `042c98a7b`): **REVISE** (1 件)。
+  - P2-1 `ZipDir` を target から外すだけでは、段階取得・選択情報の需要の判定がメモリの無い `ZipDir` を未充足と見て、
+    0 件の target → Ready → 段階取得を繰り返す。木が無い `ZipDir` を未取得の表示へ流すと「…」のまま → 表示できるかと
+    非同期に取る必要があるかの述語を分け、需要の述語は全部後者を使う。木が無いときは「-」・不明・バッジなし。
+  - ほかの 5 回目の指摘は解消とされた。「古くなった」終わり方は今の pending と受信口を破棄する既存の経路を使えば、
+    停止の後の遅れた通知で再開しない。既存の経路は proof を消さず新しい証明も立てないので、有効だった AI / 長さの
+    証明は保たれる。フォルダの identity、表示の設定から独立した全体要件、今の入口の再利用にも追加の指摘なし。
+- 7 回目: 未実施。
