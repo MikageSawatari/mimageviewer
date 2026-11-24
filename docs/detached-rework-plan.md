@@ -1461,8 +1461,8 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ### 2026-11-24: 操作のスクリプトはメインウィンドウの context だけで実行・イベント検出する (§1.363、設計の段階。実装はこれから)
 
 - 正本は [operation-script-plan.md](operation-script-plan.md) §3.2「凍結の決まり (detached リワーク) との照合」。キー・リング・右クリック等からスクリプトの操作の並びを実行し、本を開いた・ページが変わった等のイベントでも動く機能。
-- detached に触れる範囲: 入口の関数 (全画面のキー処理・`apply_ring_action`・右クリックメニュー) とイベントの検出点 (`render_fs_body`) は、別ウィンドウの context を取り付けている間も走る。本機能は `run_script_slot` の冒頭とイベントの検出の冒頭の 2 か所で、§1.733 と同じ既存の述語 `projected_viewer_context_id() == viewer_context_main()` を読み、メインでなければ実行・検出をしない。別ウィンドウの述語・viewport・窓の寿命・placement・context の取り付けと bundle の入れ替えは変えない。App に足す状態はメインの context 用で、bundle には入れない。
-- 合意: 独立設計レビュー (GPT-6.1 Sol / xhigh、read-only) の r6 で取る。結果をここに足す。
+- detached に触れる範囲: 入口の関数 (全画面のキー処理・`apply_ring_action`・右クリックメニュー) とイベントの検出点 (`render_fs_body`) は、別ウィンドウの context を取り付けている間も走る。本機能は 1 つの利用資格の関数を `run_script_slot` の冒頭とイベントの検出の冒頭の 2 か所から呼び、既存の述語を読むだけで判断する: 今の context がメインか (`projected_viewer_context_id() == viewer_context_main()`、§1.733 と同じ)、全画面の viewer の面では今の viewer の表示先が別ウィンドウか・そこへ切り替え中か (`current_viewer_session_is_detached_or_switching`。F12 の別ウィンドウ表示はメインの context のままでも起きるため)。メインウィンドウの一覧の面はメインの viewer の表示先を見ない。別ウィンドウの述語・viewport・窓の寿命・placement・context の取り付けと bundle の入れ替えは変えない。App に足す状態はメインの context 用で、bundle には入れない。
+- 合意: 独立設計レビュー (GPT-6.1 Sol / xhigh、read-only) の r6 では、方針 (メイン専用の所有範囲を既存の context・表示先・遷移の事実で定義する) は「症状パッチではなく構造的な決定」と評価されたが、具体案 (context ID の比較だけ) には合意が無かった。r7 で表示先・遷移の事実を加えた。r7 の結果をここに足す。
 
 ### 2026-11-23: ブラウザ閲覧の保存先のフォルダはページ構成の既定を単ページにする (§1.870、設計の段階。実装はこれから)
 
