@@ -37,7 +37,8 @@
 //!   transaction 内で行い、コピーは移動後のキーを読む。汎用改名・内容同一性復元の先勝は変えない。
 //! - コピーは同じ表の `copies_with_book_page` に従い、従来の編集・★・タグの 8 種だけを写す。
 //!   写さないストアもコピー先を初期化する。本単位キーはページ mapping には一致しない。
-//! - resume の Image identity、pin の相対画像参照、ratings の source_path も更新する。
+//! - resume の Image / Archive / Document identity、pin の相対画像参照、ratings の source_path も更新する。
+//!   通常 resume 行と内部本の名前空間行は別々の所有経路で一度だけ書き換える。
 //!   別本へ移した画像を指す pin は外す。preview はキーだけでなく所有ファイルの hash 配置も移す。
 //! - FS 確定後のストア失敗は結果へ集計してログ・通知へ返す。ストア完了印や再実行 journal は足さない。
 //!   本削除は既存の guarded purge と同じ [`STORES`] を使う。
@@ -2732,30 +2733,21 @@ fn rewrite_book_store_values(
         .collect::<Vec<_>>();
     let mut changed = 0;
     if descriptor.table == "book_resume" && columns.iter().any(|c| c == "page_identity") {
-        let rows = {
+        // The enclosing book's Image identity can refer to a swapped page even
+        // when its own key does not move. Visit ordinary rows by identity, but
+        // leave namespaced inner books to migrate_archive_resume_rows exactly once.
+        let keys = {
             let mut statement = tx.prepare(
-                "SELECT path, page_identity FROM book_resume WHERE page_identity IS NOT NULL",
+                "SELECT path FROM book_resume WHERE page_identity IS NOT NULL
+                 AND NOT (path >= 'miv:zipbook:' AND path < 'miv:zipbook;')",
             )?;
             statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
+                .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for (key, json) in rows {
-            if let Ok(crate::book_resume_db::PageIdentity::Image { path }) =
-                serde_json::from_str(&json)
-                && let Some(path) = rewrite_book_key(&path, &mappings)
-            {
-                let json =
-                    serde_json::to_string(&crate::book_resume_db::PageIdentity::Image { path })
-                        .expect("serializable image identity");
-                // Updating page even to itself would clear identity through the legacy trigger.
-                changed += tx.execute(
-                    "UPDATE book_resume SET page_identity = ?1 WHERE path = ?2",
-                    rusqlite::params![json, key],
-                )?;
-            }
+        let resume_mappings = resume_source_mappings(moves);
+        for key in keys {
+            changed += rewrite_resume_identity(tx, columns, &key, &resume_mappings)?;
         }
     }
     if descriptor.table == "folder_thumb_pins" && columns.iter().any(|c| c == "source_rel") {

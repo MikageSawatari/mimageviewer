@@ -641,6 +641,108 @@ fn section1885_inner_archive_rows_still_resolve_after_copy_and_rename() {
 }
 
 #[test]
+fn section1885_book_folder_rename_restores_nested_zip_and_pdf_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let old = Path::new("C:/section1885/books/one");
+    let new = Path::new("D:/section1885/books/two");
+    let sibling = Path::new("C:/section1885/books/one-other");
+    let pages_for_folder = |folder: &Path| {
+        let zip = folder.join("chapter.zip");
+        let pdf = folder.join("chapter.pdf");
+        let prefix = vec!["Chapter".into(), "Inner.zip".into()];
+        [
+            (BookResumeKey::legacy(folder), image_pages(folder)),
+            (BookResumeKey::legacy(&zip), archive_pages(&zip, &[])),
+            (BookResumeKey::legacy(&pdf), document_pages(&pdf)),
+            (
+                BookResumeKey::archive(&zip, &prefix).unwrap(),
+                archive_pages(&zip, &prefix),
+            ),
+        ]
+    };
+    let originals = pages_for_folder(old);
+    for (key, pages) in &originals {
+        record_position(temp.path(), key, pages, None, SAVED_PAGE);
+    }
+    let sibling_rows = pages_for_folder(sibling);
+    let sibling_before = sibling_rows
+        .iter()
+        .map(|(key, pages)| record_position(temp.path(), key, pages, None, 1))
+        .collect::<Vec<_>>();
+    let coverage = [old, new]
+        .map(|root| crate::pdf_loader::EpubPinCoverage::PathAndDescendants(root.to_path_buf()));
+    let guard = acquire_store_maintenance(temp.path(), &coverage).unwrap();
+    let report = migrate_book_paths_at(
+        temp.path(),
+        &[(old.to_path_buf(), new.to_path_buf())],
+        &[],
+        &guard,
+    );
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    for (key, _) in originals {
+        assert!(read_position(temp.path(), &key).is_none());
+    }
+    for (key, pages) in pages_for_folder(new) {
+        assert_restored(temp.path(), &key, &pages, None, SAVED_PAGE);
+    }
+    for ((key, pages), position) in sibling_rows.iter().zip(sibling_before) {
+        assert_eq!(read_position(temp.path(), key), Some(position));
+        assert_restored(temp.path(), key, pages, None, 1);
+    }
+}
+
+#[test]
+fn section1885_book_folder_chain_rewrites_inner_identity_once() {
+    let temp = tempfile::tempdir().unwrap();
+    let roots =
+        ["one", "two", "three"].map(|name| PathBuf::from(format!("C:/section1885/books/{name}")));
+    let prefix = vec!["Chapter".into(), "Inner.zip".into()];
+    for (index, root) in roots[..2].iter().enumerate() {
+        let zip = root.join("chapter.zip");
+        record_position(
+            temp.path(),
+            &BookResumeKey::archive(&zip, &prefix).unwrap(),
+            &archive_pages(&zip, &prefix),
+            None,
+            index + 1,
+        );
+    }
+    let coverage = roots
+        .iter()
+        .cloned()
+        .map(crate::pdf_loader::EpubPinCoverage::PathAndDescendants)
+        .collect::<Vec<_>>();
+    let guard = acquire_store_maintenance(temp.path(), &coverage).unwrap();
+    let report = migrate_book_paths_at(
+        temp.path(),
+        &[
+            (roots[0].clone(), roots[1].clone()),
+            (roots[1].clone(), roots[2].clone()),
+        ],
+        &[],
+        &guard,
+    );
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(
+        read_position(
+            temp.path(),
+            &BookResumeKey::archive(&roots[0].join("chapter.zip"), &prefix).unwrap()
+        )
+        .is_none()
+    );
+    for (index, root) in roots[1..].iter().enumerate() {
+        let zip = root.join("chapter.zip");
+        assert_restored(
+            temp.path(),
+            &BookResumeKey::archive(&zip, &prefix).unwrap(),
+            &archive_pages(&zip, &prefix),
+            None,
+            index + 1,
+        );
+    }
+}
+
+#[test]
 fn section1885_identity_write_failure_rolls_back_ordinary_key_copy_and_move() {
     for copy in [false, true] {
         let temp = tempfile::tempdir().unwrap();
