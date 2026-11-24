@@ -873,7 +873,9 @@ mod windows_impl {
     /// BHID_DataObject のファイル形式をそのまま委譲し、Copy/Cut の意図だけを追加する。
     /// Shell の IDataObject は SetData が E_NOTIMPL のため、既知の追加形式を所有する外側の
     /// IDataObject が必要になる。
-    #[windows::core::implement(IDataObject)]
+    // windows-implement defaults to agile/FTM. Opt out, otherwise delegation could access
+    // the STA-bound Shell object directly from the target's background apartment.
+    #[windows::core::implement(IDataObject, Agile = false)]
     struct ClipboardDataObject {
         inner: IDataObject,
         preferred_format: u16,
@@ -1802,6 +1804,267 @@ mod windows_impl {
             }
         }
         unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+    }
+
+    #[cfg(test)]
+    mod clipboard_sta_tests {
+        use super::*;
+        use std::ffi::c_void;
+        use std::ptr::null_mut;
+        use std::sync::{Arc, Mutex};
+        use std::thread::ThreadId;
+        use std::time::Duration;
+        use windows::Win32::Foundation::{E_NOINTERFACE, E_NOTIMPL};
+        use windows::Win32::System::Com::StructuredStorage::CreateStreamOnHGlobal;
+        use windows::Win32::System::Com::{
+            CoCancelCall, CoDisableCallCancellation, CoDisconnectObject, CoEnableCallCancellation,
+            IAgileObject, TYMED_ISTREAM,
+        };
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE,
+            PeekMessageW, QS_ALLINPUT,
+        };
+        use windows::core::{BOOL, GUID};
+
+        // Test-only declarations avoid enabling the Com_Marshal feature in production.
+        #[link(name = "ole32")]
+        unsafe extern "system" {
+            fn CoMarshalInterThreadInterfaceInStream(
+                iid: *const GUID,
+                unknown: *mut c_void,
+                stream: *mut *mut c_void,
+            ) -> HRESULT;
+            fn CoGetInterfaceAndReleaseStream(
+                stream: *mut c_void,
+                iid: *const GUID,
+                out: *mut *mut c_void,
+            ) -> HRESULT;
+        }
+
+        struct Sta;
+
+        impl Sta {
+            fn new() -> Self {
+                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() }
+                    .expect("initialize test STA");
+                Self
+            }
+        }
+
+        impl Drop for Sta {
+            fn drop(&mut self) {
+                unsafe { CoUninitialize() };
+            }
+        }
+
+        type Calls = Arc<Mutex<Vec<(&'static str, ThreadId)>>>;
+
+        // No real Shell object or OS clipboard is involved in these tests.
+        #[windows::core::implement(IDataObject, Agile = false)]
+        struct RecordingDataObject {
+            calls: Calls,
+        }
+
+        impl IDataObject_Impl for RecordingDataObject_Impl {
+            fn GetData(&self, _format: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(("GetData", std::thread::current().id()));
+                preferred_drop_effect_medium(DROP_EFFECT_MOVE_VALUE)
+            }
+
+            fn GetDataHere(
+                &self,
+                _format: *const FORMATETC,
+                _medium: *mut STGMEDIUM,
+            ) -> windows::core::Result<()> {
+                Err(E_NOTIMPL.into())
+            }
+
+            fn QueryGetData(&self, _format: *const FORMATETC) -> HRESULT {
+                S_OK
+            }
+
+            fn GetCanonicalFormatEtc(
+                &self,
+                _format_in: *const FORMATETC,
+                _format_out: *mut FORMATETC,
+            ) -> HRESULT {
+                E_NOTIMPL
+            }
+
+            fn SetData(
+                &self,
+                _format: *const FORMATETC,
+                _medium: *const STGMEDIUM,
+                _release: BOOL,
+            ) -> windows::core::Result<()> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(("SetData", std::thread::current().id()));
+                // Preserve a delegated failure too. Ownership remains with the caller.
+                Err(E_NOTIMPL.into())
+            }
+
+            fn EnumFormatEtc(&self, _direction: u32) -> windows::core::Result<IEnumFORMATETC> {
+                Err(E_NOTIMPL.into())
+            }
+
+            fn DAdvise(
+                &self,
+                _format: *const FORMATETC,
+                _flags: u32,
+                _sink: Ref<IAdviseSink>,
+            ) -> windows::core::Result<u32> {
+                Err(E_NOTIMPL.into())
+            }
+
+            fn DUnadvise(&self, _connection: u32) -> windows::core::Result<()> {
+                Err(E_NOTIMPL.into())
+            }
+
+            fn EnumDAdvise(&self) -> windows::core::Result<IEnumSTATDATA> {
+                Err(E_NOTIMPL.into())
+            }
+        }
+
+        fn wrapped() -> (IDataObject, Calls) {
+            let calls = Calls::default();
+            let inner: IDataObject = RecordingDataObject {
+                calls: calls.clone(),
+            }
+            .into();
+            let data = ClipboardDataObject {
+                inner,
+                preferred_format: 0x0200, // Private format; no registration or clipboard write.
+                preferred_effect: DROP_EFFECT_MOVE_VALUE,
+                owner_format: None,
+                cut_data_object: None,
+            }
+            .into();
+            (data, calls)
+        }
+
+        fn pump_until(mut done: impl FnMut() -> bool, duration: Duration) -> bool {
+            let deadline = Instant::now() + duration;
+            while !done() {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                unsafe {
+                    MsgWaitForMultipleObjectsEx(None, 10, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                    let mut message = MSG::default();
+                    while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                        DispatchMessageW(&message);
+                    }
+                }
+            }
+            true
+        }
+
+        #[test]
+        fn clipboard_data_object_does_not_implement_iagile_object() {
+            let _sta = Sta::new();
+            let (data, _) = wrapped();
+            assert_eq!(
+                data.cast::<IAgileObject>().err().map(|error| error.code()),
+                Some(E_NOINTERFACE)
+            );
+        }
+
+        #[test]
+        fn clipboard_data_object_marshaling_delegates_getdata_and_setdata_to_owner_sta() {
+            let _sta = Sta::new();
+            let owner_thread = std::thread::current().id();
+            let (data, calls) = wrapped();
+            let mut stream = null_mut();
+            unsafe {
+                CoMarshalInterThreadInterfaceInStream(
+                    &IDataObject::IID,
+                    data.as_raw(),
+                    &mut stream,
+                )
+                .ok()
+                .expect("marshal wrapper from owner STA");
+            }
+            // Transfer only the marshaled stream, never the apartment-bound interface.
+            let stream = stream as usize;
+            let (client_tx, client_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || -> windows::core::Result<ThreadId> {
+                let _sta = Sta::new();
+                struct CallCancellation;
+                impl Drop for CallCancellation {
+                    fn drop(&mut self) {
+                        unsafe {
+                            let _ = CoDisableCallCancellation(None);
+                        }
+                    }
+                }
+                unsafe { CoEnableCallCancellation(None)? };
+                let _cancellation = CallCancellation;
+                client_tx.send(unsafe { GetCurrentThreadId() }).unwrap();
+                unsafe {
+                    let mut raw = null_mut();
+                    CoGetInterfaceAndReleaseStream(
+                        stream as *mut c_void,
+                        &IDataObject::IID,
+                        &mut raw,
+                    )
+                    .ok()?;
+                    let proxy = IDataObject::from_raw(raw);
+                    let format = preferred_drop_effect_format(0x0201);
+                    let mut medium = proxy.GetData(&format)?;
+                    ReleaseStgMedium(&mut medium);
+                    // A stream is not a cut-completion effect; no clipboard format
+                    // registration or clipboard access is needed for this delegation.
+                    let format = FORMATETC {
+                        tymed: TYMED_ISTREAM.0 as u32,
+                        ..format
+                    };
+                    let mut medium = STGMEDIUM {
+                        tymed: TYMED_ISTREAM.0 as u32,
+                        u: STGMEDIUM_0 {
+                            pstm: ManuallyDrop::new(Some(CreateStreamOnHGlobal(
+                                Default::default(),
+                                true,
+                            )?)),
+                        },
+                        pUnkForRelease: ManuallyDrop::new(None),
+                    };
+                    let result = proxy.SetData(&format, &medium, false);
+                    ReleaseStgMedium(&mut medium);
+                    assert_eq!(result.err().map(|error| error.code()), Some(E_NOTIMPL));
+                }
+                Ok(std::thread::current().id())
+            });
+
+            let completed = pump_until(|| worker.is_finished(), Duration::from_secs(10));
+            if !completed {
+                // Bound a failing RPC test without leaving the owner STA waiting on join.
+                if let Ok(thread) = client_rx.try_recv() {
+                    unsafe {
+                        let _ = CoCancelCall(thread, 0);
+                    }
+                }
+                unsafe {
+                    let _ = CoDisconnectObject(&data, None);
+                }
+                pump_until(|| worker.is_finished(), Duration::from_secs(2));
+            }
+            assert!(completed, "cross-STA IDataObject calls timed out");
+            let client_thread = worker
+                .join()
+                .expect("client STA thread")
+                .expect("proxy calls");
+            assert_ne!(client_thread, owner_thread);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![("GetData", owner_thread), ("SetData", owner_thread)]
+            );
+        }
     }
 
     #[cfg(test)]

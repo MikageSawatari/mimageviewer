@@ -23,10 +23,13 @@ impl StartupScanPhase {
     }
 
     fn elapsed(&self) -> Option<std::time::Duration> {
+        self.elapsed_at(std::time::Instant::now())
+    }
+
+    fn elapsed_at(&self, now: std::time::Instant) -> Option<std::time::Duration> {
         let stamp = self.started_us.load(Ordering::Acquire);
         (stamp != 0).then(|| {
-            self.origin
-                .elapsed()
+            now.saturating_duration_since(self.origin)
                 .saturating_sub(std::time::Duration::from_micros(stamp - 1))
         })
     }
@@ -970,6 +973,10 @@ impl App {
     }
 
     pub(super) fn poll_startup_open_path_resolve(&mut self, ctx: &egui::Context) {
+        self.poll_startup_open_path_resolve_at(ctx, std::time::Instant::now());
+    }
+
+    fn poll_startup_open_path_resolve_at(&mut self, ctx: &egui::Context, now: std::time::Instant) {
         if self.remote_session_blocks_local_control() {
             self.cancel_unresolved_open_for_remote_session();
             return;
@@ -1013,6 +1020,7 @@ impl App {
                     return;
                 }
                 let mut pending = self.startup_open_path_resolve_pending.take().unwrap();
+                self.credit_startup_media_bookmark_scan_at(&pending, now);
                 let owner = pending.owner.clone();
                 let held = pending.held_resolve_for_activation_admission.take();
                 let held_duration = pending.elapsed();
@@ -1067,6 +1075,32 @@ impl App {
                 self.fail_startup_resolver(pending, "resolve_disconnected");
                 ctx.request_repaint();
             }
+        }
+    }
+
+    fn credit_startup_media_bookmark_scan_at(
+        &mut self,
+        pending: &StartupOpenPathResolvePending,
+        now: std::time::Instant,
+    ) {
+        let StartupOpenPathOwner::Bookmark(owner) = &pending.owner else {
+            return;
+        };
+        if !unresolved_open_owner_is_main(&pending.owner)
+            || !self.main_folder_history_available()
+            || !self.bookmark_open_pending.as_ref().is_some_and(|current| {
+                current
+                    .media()
+                    .is_some_and(|media| media.request_id == owner.request_id)
+            })
+        {
+            return;
+        }
+        if let Some(duration) = pending.scan_phase.elapsed_at(now) {
+            // The resolver slot is taken once, after policy validation. Book
+            // adoption starts a fresh AwaitingPage clock instead; media reuses
+            // its admission clock, so only that exact media request is shifted.
+            self.defer_current_bookmark_open_timeout_at(duration, now);
         }
     }
 
@@ -1381,7 +1415,8 @@ impl App {
         duration: std::time::Duration,
         held: Option<&StartupOpenPathResolvePending>,
     ) {
-        self.defer_current_bookmark_open_timeout_by(duration);
+        let now = std::time::Instant::now();
+        self.defer_activation_main_bookmark_timeout_at(duration, held, now);
         // The resolver is process-wide, but its clocks belong to the exact leased context.
         // Do not scan independent readers or compensate a newer bookmark's clocks there.
         #[cfg(windows)]
@@ -1400,6 +1435,28 @@ impl App {
                 }
             });
         }
+    }
+
+    fn defer_activation_main_bookmark_timeout_at(
+        &mut self,
+        duration: std::time::Duration,
+        held: Option<&StartupOpenPathResolvePending>,
+        now: std::time::Instant,
+    ) {
+        let scan_overlap = held
+            .filter(|held| unresolved_open_owner_is_main(&held.owner))
+            .filter(|held| {
+                matches!(&held.owner, StartupOpenPathOwner::Bookmark(owner)
+                    if self.bookmark_open_pending.as_ref()
+                        .and_then(crate::bookmark_browser::PendingBookmarkOpen::media)
+                        .is_some_and(|pending| pending.request_id == owner.request_id))
+            })
+            .and_then(|held| held.scan_phase.elapsed_at(now))
+            .unwrap_or_default();
+        // Adoption will credit this continuous scan phase once. Only defer the
+        // non-overlapping part of the activation hold here, preserving the
+        // original resolve/player budget instead of subtracting the hold twice.
+        self.defer_current_bookmark_open_timeout_at(duration.saturating_sub(scan_overlap), now);
     }
 
     fn defer_current_bookmark_open_timeout_at(

@@ -573,3 +573,242 @@ fn section1853_bookmark_over_deadline_keeps_timeout_exemption_through_policy_res
     assert!(cancel.load(Ordering::Relaxed));
     assert!(app.bookmark_open_pending.is_none());
 }
+
+fn arm_media_bookmark(
+    app: &mut App,
+    path: &Path,
+    id: u64,
+    started_at: Instant,
+) -> BookmarkOpenRequestOwner {
+    app.settings.fullfeature_media_window = false;
+    let mut owner = arm_bookmark(app, path, id);
+    owner.target = BookmarkViewReturnTarget::Media(path.to_path_buf());
+    if let Some(BookmarkViewState::Opening { target, .. }) = &mut app.bookmark_view_state {
+        *target = owner.target.clone();
+    }
+    app.bookmark_open_pending = Some(PendingBookmarkOpen::Media(
+        crate::bookmark_browser::PendingMediaOpen {
+            request_id: owner.request_id,
+            path: path.to_path_buf(),
+            pts_secs: 12.0,
+            started_at,
+            last_wait: None,
+        },
+    ));
+    owner
+}
+
+fn scan_phase_at(started_at: Instant) -> Arc<StartupScanPhase> {
+    Arc::new(StartupScanPhase {
+        origin: started_at,
+        started_us: std::sync::atomic::AtomicU64::new(1),
+    })
+}
+
+#[test]
+fn section1853_media_bookmark_scan_timeout_exemption_requires_same_request_and_scan_stage() {
+    for extension in ["mp4", "mp3"] {
+        for mode in ["scan", "resolving", "different-request", "different-owner"] {
+            let (mut app, _) = fixture();
+            let target = app.tmp.path().join(format!("bookmark.{extension}"));
+            let base = Instant::now() - Duration::from_secs(120);
+            let owner = arm_media_bookmark(&mut app, &target, 1853, base);
+            let mut resolve_owner = owner.clone();
+            if mode == "different-request" {
+                resolve_owner.request_id = BookmarkOpenRequestId(1854);
+            }
+            let resolve_owner = if mode == "different-owner" {
+                StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences())
+            } else {
+                StartupOpenPathOwner::Bookmark(resolve_owner)
+            };
+            let (mut request, _tx) = pending(resolve_owner, &target);
+            if mode != "resolving" {
+                request.scan_phase = scan_phase_at(base + Duration::from_secs(3));
+            }
+            app.startup_open_path_resolve_pending = Some(request);
+            app.poll_bookmark_media_open_at(
+                &egui::Context::default(),
+                base + Duration::from_secs(64),
+            );
+            assert_eq!(app.bookmark_open_pending.is_some(), mode == "scan");
+            if mode == "scan" {
+                let media = app.bookmark_open_pending.as_ref().unwrap().media().unwrap();
+                assert_eq!(media.request_id, owner.request_id);
+                assert_eq!(media.started_at, base, "no per-poll time credit");
+                assert_eq!(media.last_wait, None);
+                assert!(app.fs_feedback_toast.is_none());
+            } else {
+                assert!(app.fs_feedback_toast.is_some());
+            }
+        }
+    }
+}
+
+/// Complete a real scan worker without starting a decoder: the directory is
+/// empty, so adoption leaves the media request waiting for its player surface.
+fn requeue_media_scan_result(app: &mut App) {
+    let request = app.startup_open_path_resolve_pending.as_mut().unwrap();
+    let result = request.rx.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert!(result.folder_scan.as_ref().is_some_and(Result::is_ok));
+    let (tx, rx) = mpsc::channel();
+    request.rx = rx;
+    tx.send(result).unwrap();
+}
+
+#[test]
+fn section1853_media_bookmark_policy_rescans_credit_scan_once_before_player_wait() {
+    let (mut app, _) = fixture();
+    let folder = app.tmp.path().join("media-rescan");
+    std::fs::create_dir(&folder).unwrap();
+    let target = folder.join("video.mp4");
+    let base = Instant::now() - Duration::from_secs(180);
+    let owner = arm_media_bookmark(&mut app, &target, 1853, base);
+    let (mut request, tx) = pending(StartupOpenPathOwner::Bookmark(owner.clone()), &target);
+    request.scan_phase = scan_phase_at(base + Duration::from_secs(3));
+    let phase = request.scan_phase.clone();
+    let cancel = request.cancel.clone();
+    let mut result = obsolete_scan_result(&app, &folder);
+    result.requested = target;
+    tx.send(result).unwrap();
+    app.startup_open_path_resolve_pending = Some(request);
+    let ctx = egui::Context::default();
+    app.poll_startup_open_path_resolve_at(&ctx, base + Duration::from_secs(40));
+    for elapsed in [40, 70] {
+        let continued = app.startup_open_path_resolve_pending.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&continued.scan_phase, &phase));
+        assert!(Arc::ptr_eq(&continued.cancel, &cancel));
+        assert_eq!(
+            continued.owner,
+            StartupOpenPathOwner::Bookmark(owner.clone())
+        );
+        app.poll_bookmark_media_open_at(&ctx, base + Duration::from_secs(elapsed));
+        assert_eq!(
+            app.bookmark_open_pending
+                .as_ref()
+                .unwrap()
+                .media()
+                .unwrap()
+                .started_at,
+            base
+        );
+        requeue_media_scan_result(&mut app);
+        if elapsed == 40 {
+            app.settings.show_hidden_files = !app.settings.show_hidden_files;
+            app.poll_startup_open_path_resolve_at(&ctx, base + Duration::from_secs(70));
+        }
+    }
+    let adopted_at = base + Duration::from_secs(95);
+    app.poll_startup_open_path_resolve_at(&ctx, adopted_at);
+    assert!(app.startup_open_path_resolve_pending.is_none());
+    assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
+    let credited = app
+        .bookmark_open_pending
+        .as_ref()
+        .unwrap()
+        .media()
+        .unwrap()
+        .started_at;
+    assert_eq!(credited, base + Duration::from_secs(92));
+    app.poll_startup_open_path_resolve_at(&ctx, adopted_at + Duration::from_secs(1));
+    assert_eq!(
+        app.bookmark_open_pending
+            .as_ref()
+            .unwrap()
+            .media()
+            .unwrap()
+            .started_at,
+        credited,
+        "polling after adoption cannot credit the scan again"
+    );
+    app.poll_bookmark_media_open_at(&ctx, adopted_at + Duration::from_secs(26));
+    assert!(
+        app.bookmark_open_pending.is_some(),
+        "3 resolve + 26 player seconds"
+    );
+    app.poll_bookmark_media_open_at(&ctx, adopted_at + Duration::from_secs(28));
+    assert!(
+        app.bookmark_open_pending.is_none(),
+        "3 resolve + 28 player seconds"
+    );
+}
+
+#[test]
+fn section1853_media_bookmark_scan_adoption_never_credits_another_request() {
+    let (mut app, _) = fixture();
+    let path = app.tmp.path().join("video.mp4");
+    let base = Instant::now() - Duration::from_secs(120);
+    let mut old_owner = arm_media_bookmark(&mut app, &path, 1853, base);
+    old_owner.request_id = BookmarkOpenRequestId(1852);
+    let (mut request, _tx) = pending(StartupOpenPathOwner::Bookmark(old_owner), &path);
+    request.scan_phase = scan_phase_at(base + Duration::from_secs(3));
+    app.credit_startup_media_bookmark_scan_at(&request, base + Duration::from_secs(64));
+    assert_eq!(
+        app.bookmark_open_pending
+            .as_ref()
+            .unwrap()
+            .media()
+            .unwrap()
+            .started_at,
+        base
+    );
+    app.poll_bookmark_media_open_at(&egui::Context::default(), base + Duration::from_secs(64));
+    assert!(app.bookmark_open_pending.is_none());
+}
+
+#[test]
+fn section1853_media_bookmark_activation_hold_and_scan_credit_do_not_overlap() {
+    for scan_start in [3, 15] {
+        let (mut app, _) = fixture();
+        let path = app.tmp.path().join("video.mp4");
+        let base = Instant::now() - Duration::from_secs(120);
+        let owner = arm_media_bookmark(&mut app, &path, 1853, base);
+        let (mut held, _tx) = pending(StartupOpenPathOwner::Bookmark(owner), &path);
+        held.scan_phase = scan_phase_at(base + Duration::from_secs(scan_start));
+        // Activation holds [10, 30]; the worker may enter scanning during that hold.
+        app.defer_activation_main_bookmark_timeout_at(
+            Duration::from_secs(20),
+            Some(&held),
+            base + Duration::from_secs(30),
+        );
+        app.credit_startup_media_bookmark_scan_at(&held, base + Duration::from_secs(64));
+        let active_elapsed = (base + Duration::from_secs(64)).duration_since(
+            app.bookmark_open_pending
+                .as_ref()
+                .unwrap()
+                .media()
+                .unwrap()
+                .started_at,
+        );
+        assert_eq!(active_elapsed, Duration::from_secs(scan_start.min(10)));
+    }
+}
+
+#[test]
+fn section1853_book_bookmark_page_wait_starts_fresh_after_scan() {
+    let (mut app, _) = fixture();
+    let path = app.tmp.path().join("book");
+    let owner = arm_bookmark(&mut app, &path, 1853);
+    let base = Instant::now() - Duration::from_secs(120);
+    app.bookmark_open_pending
+        .as_mut()
+        .unwrap()
+        .book_mut()
+        .unwrap()
+        .started_at = base;
+    let (mut request, _tx) = pending(StartupOpenPathOwner::Bookmark(owner.clone()), &path);
+    request.scan_phase = scan_phase_at(base + Duration::from_secs(3));
+    app.credit_startup_media_bookmark_scan_at(&request, base + Duration::from_secs(64));
+    let before = Instant::now();
+    assert!(app.begin_bookmark_page_wait(&owner));
+    let after = Instant::now();
+    let book = app.bookmark_open_pending.as_ref().unwrap().book().unwrap();
+    assert_eq!(
+        book.started_at, base,
+        "media credit must not change the book clock"
+    );
+    let PendingBookOpenStage::AwaitingPage { started_at, .. } = book.stage else {
+        panic!("accepted book must own the page-wait stage");
+    };
+    assert!(started_at >= before && started_at <= after);
+}

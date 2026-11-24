@@ -55458,7 +55458,11 @@ impl App {
         }
     }
 
-    fn poll_bookmark_media_open(&mut self, _ctx: &egui::Context) {
+    fn poll_bookmark_media_open(&mut self, ctx: &egui::Context) {
+        self.poll_bookmark_media_open_at(ctx, std::time::Instant::now());
+    }
+
+    fn poll_bookmark_media_open_at(&mut self, _ctx: &egui::Context, now: std::time::Instant) {
         if self.sidecar_restore_active() {
             return;
         }
@@ -55474,7 +55478,13 @@ impl App {
             return;
         }
 
-        if pending.started_at.elapsed() > std::time::Duration::from_secs(30) {
+        // The resolver owns this wait until the parent listing is adopted. Its
+        // continuous scan phase includes policy rescans; admission credits that
+        // time once so the later player/seek wait retains its existing budget.
+        if self.main_startup_scan_owns_bookmark(pending.request_id) {
+            return;
+        }
+        if now.saturating_duration_since(pending.started_at) > std::time::Duration::from_secs(30) {
             let current_item = self
                 .fullscreen_idx
                 .and_then(|idx| self.items.get(idx))
