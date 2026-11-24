@@ -2642,13 +2642,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 517);
+        assert_eq!(entries.len(), 518);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            172
+            173
         );
         assert_eq!(
             entries
@@ -2697,7 +2697,7 @@ mod tests {
                 "AI permissions must not become writable: {key}"
             );
         }
-        assert_eq!(wire.len(), 170);
+        assert_eq!(wire.len(), 171);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
