@@ -746,6 +746,7 @@ preferences_policy! {
         export_batch_template => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         export_batch_format => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         export_batch_options => "環境設定外で管理する一括書き出しの前回値 (PC 固有パスを含む)";
+        export_batch_presets => "環境設定外で管理する一括書き出しのプリセット (保存先・ロゴの PC 固有パスを含む)";
         export_batch_scale => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         sns_split_target => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         sns_split_count => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -2643,7 +2644,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 519);
+        assert_eq!(entries.len(), 520);
         assert_eq!(
             entries
                 .iter()
@@ -2656,7 +2657,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            346
+            347
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2692,6 +2693,12 @@ mod tests {
                 .any(|(field, reason)| *field == "export_batch_options" && reason.is_some())
         );
         assert!(!wire.contains(&"export_batch_options"));
+        assert!(
+            entries
+                .iter()
+                .any(|(field, reason)| *field == "export_batch_presets" && reason.is_some())
+        );
+        assert!(!wire.contains(&"export_batch_presets"));
         for key in ["agent_show_current_view", "agent_allow_settings"] {
             assert!(
                 entries

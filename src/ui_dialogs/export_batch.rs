@@ -10,6 +10,8 @@ use crate::export_batch::*;
 
 mod watermark;
 use watermark::{LogoCheck, draw_watermark};
+mod presets;
+use presets::{PresetAction, PresetUi, draw_presets};
 
 #[derive(Default)]
 struct BatchDialogAction {
@@ -17,6 +19,7 @@ struct BatchDialogAction {
     cancel: bool,
     pick_folder: bool,
     pick_logo: bool,
+    preset: Option<PresetAction>,
 }
 
 /// Enter is a candidate until the widgets have processed this frame's input.
@@ -27,6 +30,7 @@ struct EnterOwner {
     gained: bool,
     text_submitted: bool,
     logo_submitted: bool,
+    preset_submitted: bool,
 }
 
 impl EnterOwner {
@@ -38,6 +42,7 @@ impl EnterOwner {
             gained: false,
             text_submitted: false,
             logo_submitted: false,
+            preset_submitted: false,
         }
     }
     fn widget(&mut self, response: &egui::Response) {
@@ -65,6 +70,7 @@ const DIALOG_MARGIN: f32 = 20.0;
 fn draw_batch_window(
     ctx: &egui::Context,
     state: &mut ExportBatchDialogState,
+    presets: &[BatchExportPreset],
     enter: bool,
 ) -> BatchDialogAction {
     state.poll_logo_check(ctx);
@@ -88,6 +94,15 @@ fn draw_batch_window(
         .show(ctx, |ui| {
             ui.set_width(width);
             draw_batch_heading(ui, state);
+            // The body reserves this gutter for its vertical scroll bar. Give the
+            // fixed preset row the same content width, including at 200% UI scale.
+            let scroll = super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
+            let preset_width = (ui.available_width() - scroll.allocated_width()).max(1.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(preset_width, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| draw_presets(ui, state, presets, &mut owner, &mut action),
+            );
             let footer = batch_footer_height(ui, state.error.as_deref());
             let body = super::startup_dialog_scroll_body(ui, "batch_export_body", footer, |ui| {
                 draw_batch_body(ui, state, &mut owner, &mut action);
@@ -104,7 +119,13 @@ fn draw_batch_window(
             draw_batch_actions(ui, state, &mut owner, &mut action);
         });
     action.cancel |= !open;
-    action.start |= owner.submit(ctx, enter) && !owner.logo_submitted && state.can_start();
+    if owner.submit(ctx, enter) {
+        if owner.preset_submitted {
+            action.preset = Some(PresetAction::Save);
+        } else if !owner.logo_submitted {
+            action.start |= state.can_start();
+        }
+    }
     action
 }
 
@@ -688,6 +709,7 @@ pub struct ExportBatchDialogState {
     pub initial_focus_done: bool,
     pub error: Option<String>,
     logo_check: Option<LogoCheck>,
+    preset: PresetUi,
 }
 
 impl ExportBatchDialogState {
@@ -748,6 +770,7 @@ impl App {
             initial_focus_done: false,
             error: None,
             logo_check: None,
+            preset: PresetUi::default(),
         });
         ctx.request_repaint();
     }
@@ -769,6 +792,7 @@ impl App {
             initial_focus_done: true,
             error: None,
             logo_check: None,
+            preset: PresetUi::default(),
         };
         while state.preparing() {
             self.advance_export_batch_preparation(&mut state);
@@ -844,7 +868,10 @@ impl App {
         self.advance_export_batch_preparation(&mut state);
         let enter = self.dialog_enter_pressed(ctx);
         let escape = self.dialog_escape_pressed(ctx);
-        let action = draw_batch_window(ctx, &mut state, enter);
+        let action = draw_batch_window(ctx, &mut state, &self.settings.export_batch_presets, enter);
+        if let Some(preset) = action.preset {
+            self.apply_batch_preset_action(&mut state, preset);
+        }
         if action.pick_logo {
             let mut picker = rfd::FileDialog::new().add_filter(
                 "透かしの画像",

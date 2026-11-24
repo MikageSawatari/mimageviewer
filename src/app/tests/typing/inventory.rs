@@ -226,6 +226,12 @@ const EXEMPTIONS: &[Entry] = &[
         "一括出力のサブフォルダ名。書き出す操作時だけ使用する",
     ),
     exempt(
+        "src/ui_dialogs/export_batch/presets.rs",
+        "show_singleline(ui, name,",
+        1,
+        "一括出力のプリセット名。入力中は検査とボタン表示だけ、保存操作時に設定へ反映する",
+    ),
+    exempt(
         "src/ui_dialogs/fav_add.rs",
         "&mut self.fav_add_name_input",
         1,

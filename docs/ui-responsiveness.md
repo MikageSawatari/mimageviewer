@@ -649,6 +649,12 @@ UI準備に足した情報はsource_dir/source_extのパス・文字列演算だ
 UI は try_recv だけで採用し、確認中も開始可能。画像の実読込は worker が開始時に行う。
 段 B のコンパイル・自動テスト・実機確認は未実行。共有 runner での検証に引き継ぐ。
 
+段 C のプリセット呼び出しは `BatchExportOptions` の clone だけで、画像の透かしなら
+既存の `begin_logo_check` で確認ごとの receiver を置き換える。保存・削除の明示操作だけは
+設計書 §8 のとおり既存の設定保存経路 `Settings::save_checked()` を同期で呼ぶ。
+専用の書き込み worker や待機は追加せず、失敗はログと通知に残しメモリ上の変更を保持する。
+段 C のコンパイル・自動テスト・snapshot PNG の生成は共有 runner へ引き継ぐ (実装担当では未実行)。
+
 Ctrl+S / Ctrl+T（案 C）の最終列に対応する読書位置索引は検索workerで準備し、
 `search / page_identity_prepare` に `surface`・`items`・`ms` を記録する。
 Ctrl+S空クエリの空列だけは定数サイズの準備を同期実行する。完成結果の条件一致を確認し、

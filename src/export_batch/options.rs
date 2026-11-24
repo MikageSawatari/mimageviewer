@@ -278,6 +278,13 @@ pub struct BatchExportOptions {
     pub watermark: BatchWatermark,
 }
 
+/// Named value snapshot; editing a recalled preset never changes this copy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchExportPreset {
+    pub name: String,
+    pub options: BatchExportOptions,
+}
+
 impl Default for BatchExportOptions {
     fn default() -> Self {
         Self {

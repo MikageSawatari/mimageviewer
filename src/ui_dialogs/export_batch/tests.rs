@@ -7,6 +7,7 @@ use egui_kittest::{
 };
 use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
+mod preset_tests;
 mod watermark_tests;
 
 fn item() -> BatchExportItem {
@@ -63,6 +64,7 @@ pub(super) fn dialog(expanded: bool) -> ExportBatchDialogState {
         initial_focus_done: true,
         error: None,
         logo_check: None,
+        preset: PresetUi::default(),
     }
 }
 
@@ -118,6 +120,8 @@ struct WindowState {
     starts: usize,
     picks: usize,
     cancels: usize,
+    presets: Vec<BatchExportPreset>,
+    saves: usize,
 }
 fn window_harness(size: egui::Vec2, scale: f32, expanded: bool) -> Harness<'static, WindowState> {
     let mut ready = false;
@@ -137,7 +141,14 @@ fn window_harness(size: egui::Vec2, scale: f32, expanded: bool) -> Harness<'stat
                 let ctx = ui.ctx();
                 let enter = !crate::ime_focus::ime_input_active(ctx)
                     && ctx.input(|i| i.key_pressed(egui::Key::Enter));
-                let action = draw_batch_window(ctx, &mut state.dialog, enter);
+                let action = draw_batch_window(ctx, &mut state.dialog, &state.presets, enter);
+                if let Some(preset) = action.preset {
+                    match state.dialog.edit_presets(&mut state.presets, preset) {
+                        Ok(true) => state.saves += 1,
+                        Ok(false) => {}
+                        Err(error) => state.dialog.error = Some(error),
+                    }
+                }
                 state.starts += usize::from(action.start);
                 state.picks += usize::from(action.pick_folder);
                 state.cancels += usize::from(action.cancel);
@@ -147,6 +158,8 @@ fn window_harness(size: egui::Vec2, scale: f32, expanded: bool) -> Harness<'stat
                 starts: 0,
                 picks: 0,
                 cancels: 0,
+                presets: Vec::new(),
+                saves: 0,
             },
         )
 }
