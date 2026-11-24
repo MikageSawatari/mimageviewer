@@ -21,7 +21,8 @@
 | 準備 | `advance_export_batch_preparation` が UI スレッドで 1 件ずつ `batch_export_item_for_target` → `book_baked_edit_snapshot` を読む (6ms 予算、1 件は必ず進める)。§1.177 は未解決。 |
 | 形式 | `crate::capture::CaptureFormat` (PNG / JPEG 95・85・75)。この型は**キャプチャ設定と共有**している (`CaptureFormat::ALL` のコメント)。 |
 | サイズ | `crate::export_dialog::ExportScale` (そのまま / 1/2 / 1/4 / 長辺 N px 以下・縮小のみ)。この型は**単ページの `export_default_scale` とも共有**し、設定へ serde で保存している。縮小は `scale_export_pixels` (Lanczos3 固定)。 |
-| 書き出し | `export_batch::run_batch_export` → `books::write_composited_page` (呼び出し元はこの 1 か所だけ) → `write_composited_color_image` (`include_metadata: false` 固定、`edits.format` で JPEG/PNG を選ぶ)。 |
+| 書き出し | `export_batch::run_batch_export` → `books::write_composited_page` → `write_composited_color_image` (`include_metadata: false` 固定、`edits.format` で JPEG/PNG を選ぶ)。`write_composited_page` は**製本の `write_source` (`BookPageSource::Composited`) も使う**。 |
+| 完了処理 | `poll_export_pending` は成功が 1 件なら Explorer で示し、複数なら件数を通知する。一覧の更新は「成功は全部同じフォルダ」を前提に、最初の成功パスだけを `note_exported_file_for_folder_refresh` へ渡す。 |
 | 名前 | `<filename>` `<dirname>` `<num>` (4 桁)。既存・同一実行内の衝突は `_1`〜`_9999`。上書きなし (`save_image_with_metadata` も `create_new`)。 |
 | 取消 | 項目の間だけ。`decode_composite_source` / `compose_book_page` は呼ぶたびに新しい未使用の `AtomicBool` を作るので、1 件の途中 (AI・消しゴム・補正レイヤー) は止まらない。 |
 | 記憶 | `export_batch_directory` / `export_batch_template` / `export_batch_format` / `export_batch_scale` (いずれもリリース済み)。 |
@@ -29,10 +30,15 @@
 
 報告に無かった事実:
 
-- `save_with_metadata` の JPEG 転記は元の APP1 を**そのまま**挿入する (`extract_jpeg_app1_segments`)。
-  EXIF の IFD1 (元画像の縮小サムネイル) も残る。JPEG の ICC (APP2) と PNG の `iCCP` は転記しない
-  (WebP は `ICCP` を転記する)。§6.3 で扱う。
-- mIV のデコードは ICC による色変換をしない (コードに ICC 変換が無い)。画素は元の色空間のまま。
+- `save_with_metadata` の転記は形式ごとに違う。JPEG は元の APP1 (EXIF・XMP) を**そのまま**挿入し、
+  EXIF の Orientation だけ 1 にする (IFD1 = 元画像の縮小サムネイルも残る)。PNG はテキストチャンク
+  (tEXt / iTXt / zTXt) だけで、`eXIf` と `iCCP` は転記しない。WebP は `ICCP`・`EXIF`・`XMP ` を
+  そのまま転記し、Orientation も直さない。JPEG の ICC (APP2) は転記しない。§3.6 で扱う。
+- mIV のデコードは ICC による色変換をしない (コードに ICC 変換が無い)。ただしデコード結果は常に
+  RGBA へ変換する (`dynamic_image_to_color_image`) ので、グレースケールや CMYK の元画像の ICC は
+  出力の画素形式と合わない。
+- WebP の書き出しは `webp 0.3` の `Encoder::encode` / `encode_lossless` で、内部のエラーを
+  `unwrap()` する (libwebp の上限 16383px を超えると worker が panic する)。
 
 ## 2. 段の分け方
 
@@ -77,6 +83,12 @@ struct BatchFormat {
   品質は上の `jpeg_quality` / `webp_quality` を使う。
 - JPEG のサブサンプリング・progressive、PNG の圧縮レベル、AVIF/JXL/TIFF は範囲外 (§1.362)。
 - 透過: JPEG は今と同じく `edits.jpeg_matte` で背景を合成する。PNG・WebP はアルファを保つ。
+- **形式ごとの寸法の上限**: エンコードの前に出力寸法を確かめ、WebP は各辺 16383px、JPEG は各辺 65535px を
+  超えたらその項目を「この形式で書ける大きさを超えています (W×H)」の失敗にして次へ進む
+  (リサイズの指定と保存済みの AI 拡大の組み合わせで、通常の操作でも起こり得るため)。
+  WebP のエンコードは `Result` を返す `encode_simple(false, quality)` / `encode_simple(true, 75.0)` へ替える
+  (`encode` / `encode_lossless` はこれを `unwrap()` しているだけなので、同じ入力では同じバイト列になり、
+  単ページの出力は変わらない)。
 - 形式の決定は **worker の書き出しだけが持つ**。`BakedEditSnapshot.format` は製本・外部ツール用に
   残すが、一括の新しい書き出し関数は読まない (同じ意味を 2 か所に持たない)。
 - `CaptureFormat` と `ExportFormat` は変えない (キャプチャ設定・単ページと共有のため)。
@@ -178,6 +190,12 @@ enum OverwritePolicy { Rename, Skip, Replace } // 既定 Rename (今の挙動)
   置き換えたファイルはごみ箱へ送らない (戻せないことをダイアログに書く)。
 - **同一実行内の衝突は方針に関係なく常に連番**にする。2 つの項目が同じ名前へ落ちたとき、
   後の項目が前の項目の出力を上書き・スキップしない。
+- **予約キー**: 同一実行内の名前の予約 (今の `claimed: HashSet<PathBuf>`) は、パスそのものではなく
+  `OutputKey` で比較する。`OutputKey` は出力先の絶対パスを区切り `\` に揃え、`.` / `..` を畳み、
+  末尾の `.` と空白を除き、全体を小文字化した文字列 (Windows のファイル名は大小文字を区別しないため)。
+  別フォルダの `A.jpg` と `a.jpg`、`C:\out` と `c:\OUT\` のように表記が違っても同じ出力は同じキーになる。
+  判定の順は「予約済みのキーなら連番へ進む」→「予約されていなければ、方針に従って既存ファイルを見る」。
+  既存ファイルの有無は今と同じく `exists()` (ファイルシステムの比較規則) で見る。
 - **今回の入力は上書きしない**: `Replace` でも、今回の対象の元ファイル (画像ファイル・ZIP・PDF) と
   同じ実体へは書かない。worker は開始時に全項目の元を `canonicalize` した集合を作り、
   既存の出力先を置き換える前にそれも `canonicalize` して照合する。一致したら置き換えず、
@@ -193,16 +211,29 @@ keep_file_time: bool,  // 既定 false
 ```
 
 - `keep_metadata`: **出力の形式が元と同じ (JPEG→JPEG / PNG→PNG / WebP→WebP) の項目だけ**、
-  元の EXIF・XMP・AI プロンプト (PNG のテキスト) と ICC を残す。形式が変わる項目・PDF ページは残さない
-  (単ページの規則と同じ)。ダイアログの説明文に書く。
-  - 転記は既存の `save_with_metadata` の仕組みを使い、`SaveOptions` に ICC の欄を足して
-    JPEG の APP2 (`ICC_PROFILE`、複数セグメント) と PNG の `iCCP` も転記する (WebP は既に転記する)。
-    デコードで色変換をしていない (§1) ので、元の ICC を付けるのが正しい。
-  - **EXIF の埋め込みサムネイル (IFD1) は消す**。元の縮小画像が残ると、消しゴム・隠蔽・切り取りで
-    消した部分が出力ファイルの中に残る。IFD0 の「次の IFD」を 0 にし、IFD1 が指す
-    サムネイルのバイト範囲を 0 で埋める (APP1 の長さとオフセットは変えない)。
-    MakerNote など、メーカー独自の領域の中身は解釈しない (§13 Q3 で利用者確認)。
-  - Orientation は今の単ページと同じく 1 にする (`caller_applied_orientation: true`)。
+  元の情報を残す。形式が変わる項目・PDF ページは残さない (単ページの規則と同じ)。ダイアログの説明文に書く。
+  形式ごとの転記対象:
+
+  | 形式 | 残すもの |
+  | --- | --- |
+  | JPEG | APP1 (EXIF・XMP)、APP2 の ICC (`ICC_PROFILE`、複数セグメントを順に) |
+  | PNG | tEXt / iTXt / zTXt (AI プロンプト)、`eXIf`、`iCCP` |
+  | WebP | `EXIF`、`XMP `、`ICCP` |
+
+  - **EXIF の共通処理**: 3 形式とも、EXIF は TIFF 本体 (JPEG は APP1 の `Exif\0\0` の後、PNG の `eXIf` は
+    本体そのもの、WebP の `EXIF` は先頭に `Exif\0\0` があればその後) に対して同じ関数で処理する。
+    処理は 2 つだけ: Orientation を 1 にする、IFD1 (埋め込みの縮小画像) を外す (IFD0 の「次の IFD」を 0 にし、
+    IFD1 が指す縮小画像のバイト範囲を 0 で埋める。長さとオフセットは変えない)。TIFF として読めない EXIF は
+    転記しない (その項目は EXIF なしで書き、失敗にはしない)。
+  - **ICC は出力の画素形式に合うものだけ**: 出力は常に RGB(A) なので、ICC ヘッダの色空間
+    (先頭から 16〜19 バイト) が `RGB ` のものだけ転記する。グレースケール (`GRAY`)・CMYK などの ICC は
+    付けない (付けると出力に合わないプロファイルになる)。それらの元画像は ICC なしの出力になり、
+    他のソフトでは sRGB として表示される。
+  - **単ページの出力は変えない**: `SaveOptions` に足す欄 (EXIF の共通処理、JPEG/PNG の ICC 転記、
+    PNG の `eXIf` 転記) は既定で OFF にし、一括の書き出しだけが ON にする。単ページの WebP は今と同じく
+    EXIF をそのまま転記する (単ページの IFD1 の扱いは §13 の補足、別件)。
+  - XMP は解釈せずそのまま残す。XMP の `xmp:Thumbnails`、EXIF の MakerNote (メーカー独自の領域) に
+    含まれ得る縮小画像は消さない (§13 Q3 で利用者確認)。
   - EXIF の画素数タグは書き換えない (単ページと同じ)。
   - ZIP 内画像の転記元はデコードに使ったエントリのバイト列 (同じ読み込みを使い、2 回読まない)。
 - `keep_file_time`: 書き出した後、出力ファイルの更新日時を元の更新日時 (§3.4 と同じ値) にする。
@@ -238,15 +269,15 @@ keep_file_time: bool,  // 既定 false
    diffusion fallback の戻り値は今と同じく使わない)。
 8. **リサイズ** (§3.2)。
 9. **透かし** (段 B)。
-10. **エンコード** (§3.1、`keep_metadata` なら転記元を渡す)。
+10. **形式ごとの寸法の上限を確かめ** (§3.1)、**エンコード** (`keep_metadata` なら転記元を渡す)。
 11. 書き込み: `Rename` / `Skip` は `create_new`、`Replace` は一時ファイル→置き換え。
 12. **`keep_file_time` なら更新日時を設定**。失敗しても出力は残し、その項目を失敗として報告する
     (まれな失敗の割り切り、§9)。
 13. `Completed`。
 
-- 一括の書き出し関数は `export_batch` に新しく置き (`write_batch_item` など)、
-  `books::write_composited_page` は呼び出し元が無くなるので削除する。製本の合成
-  (`compose_book_page*`) は共有のまま変えない。
+- 一括の書き出し関数は `export_batch` に新しく置き (`write_batch_item` など)、一括はそちらだけを通る。
+  `books::write_composited_page` は**製本 (`write_source`) のために残し、変えない**。製本の合成
+  (`compose_book_page*`) も共有のまま変えない。
 - 縮小は `scale_export_pixels` から「目標寸法へリサイズする」部分を切り出して共有し、
   単ページは今の `ExportScale` のまま同じ部分を呼ぶ (単ページの挙動は変えない)。
 
@@ -260,8 +291,26 @@ keep_file_time: bool,  // 既定 false
 
 ### 4.4 進捗と結果
 
-- `ExportEvent` に `Skipped { label, path }` を足し、進捗ダイアログに「スキップ N 件」を出す。
-  単ページの worker は送らない。
+- `ExportEvent` に `Skipped { label, path }` を足し、`ExportPending` に `skipped: Vec<…>` を持つ。
+  単ページの worker は送らない (単ページの完了処理は今と同じ結果になる)。
+- 進捗: 分母は今と同じ対象件数、完了数は「成功 + スキップ + 失敗」。進捗ダイアログに
+  「成功 N / スキップ M / 失敗 K」を出す。
+- 完了 (`AllDone`) の通知:
+
+  | 結果 | 通知 |
+  | --- | --- |
+  | 失敗あり | 今と同じく進捗ダイアログを残し「完了: 成功 N / スキップ M / 失敗 K」 |
+  | 失敗なし・スキップなし・成功 1 件 | 今と同じく Explorer で示す |
+  | 失敗なし・スキップなし・成功 2 件以上 | 今と同じく「N 件をエクスポートしました」 |
+  | 失敗なし・スキップあり・成功 1 件以上 | 「N 件をエクスポートしました (既にある M 件はスキップ)」 |
+  | 失敗なし・全件スキップ | 「既にある M 件をスキップしました (書き出した画像はありません)」 |
+
+  取消 (`Cancelled`) の通知は今と同じ文で、スキップ件数は足さない。
+- **一覧の更新**: `AllDone` / `Cancelled` のどちらでも、成功パスのうち**親フォルダが今の表示先と一致する
+  ものを探し**、1 つでもあればそのパスで `note_exported_file_for_folder_refresh` を 1 回だけ呼ぶ
+  (今は最初の成功パスだけを渡しており、「元と同じフォルダ」で出力先が複数になると、
+  先頭が別のフォルダのとき今の表示先が更新されない)。判定は今の関数と同じ `path_eq`。
+  単ページは出力先が 1 つなので結果は今と同じ。
 - 区間の計測: `perf::event("export_batch/item", …)` に decode / compose / resize / watermark /
   encode / write の ms、出力寸法、形式、方針の結果 (written / skipped / replaced / failed) を入れる。
   開始時の準備 (基点・正規化・透かし読み込み) も 1 つの event にする。
@@ -293,9 +342,12 @@ pub export_batch_presets: Vec<BatchExportPreset>,     // 段 C
 
 - ダイアログを開くとき、`export_batch_options` が `None` なら旧 4 欄から `BatchExportOptions` を作る
   (`BatchExportOptions::from_legacy`)。`Some` ならそれだけを使い、旧 4 欄は読まない。
-- 書き出しを始めると `export_batch_options = Some(...)` を保存する。**旧 4 欄にはもう書かない**
-  (前回の設定の持ち主は新しい欄 1 つ)。旧 4 欄は読み替えの元として `Settings` に残す
-  (消すと保存済み DB の読み込みで未知の欄になり得るため、型から外さない)。
+- 書き出しを始めると `export_batch_options = Some(...)` を保存する。**旧 4 欄の値はもう更新しない**
+  (前回の設定の持ち主は新しい欄 1 つ。`write_settings_kv` は全欄を書き直すので、旧 4 欄の行は
+  最後の値のまま書かれ続ける)。
+- 旧 4 欄を型に残す理由は「`export_batch_options` が無い設定 (今のリリースで保存した設定) から読み替えるため」
+  だけ。`build_settings_from_db` は未知の欄を無視するので、欄を消しても読み込みは壊れない。ただし読み替えの
+  元が無くなるので残す。
 - 読み替え表:
 
 | 旧 | 新 |
@@ -312,9 +364,12 @@ pub export_batch_presets: Vec<BatchExportPreset>,     // 段 C
 - 今の保存先の初期値の決め方 (`export_batch_directory` が存在すればそれ、無ければ単ページの直前、
   無ければ今のフォルダ) は `Folder` の初期値にだけ使う。`export_batch_options` の `Folder` の path が
   空のときも同じ決め方で埋める。
-- 旧版へ戻した場合: v2.6.0 以降は新しい版が保存した設定を検出して保存を止め、復元を案内する
-  ([settings-sqlite-migration.md §6.4](settings-sqlite-migration.md))。新しい欄は旧版にとって
-  未知の欄で、型の値の追加ではないので、v2.5.0 以前の互換の工夫 (§10.5) も要らない。
+- 旧版へ戻した場合: (1) 新しい 2 欄は旧版にとって未知の欄で、旧版は未知の欄を無視して読める
+  (既存の enum への値の追加ではないので、`unknown variant` の非互換にはならない)。(2) それとは別に、
+  v2.6.0 以降は新しい版が保存した設定を `app_version` で検出して保存を止め、復元を案内する
+  ([settings-sqlite-migration.md §6.4](settings-sqlite-migration.md))。(3) 旧版で設定を保存し直すと
+  未知の 2 欄 (前回の設定・プリセット) は保持されない。これは既存の新欄と同じ扱いで、
+  新しい版へ戻すと旧 4 欄から読み替え直す (プリセットは失われる)。
 - 設定の持ち運び (§1.317): `export_batch_options` は既存の `export_batch_*` と同じく
   「環境設定外で管理する状態」として**除く**。`export_batch_presets` も、保存先・透かし画像の
   PC 固有のパスを含むので**除く** (`settings_transfer.rs` の分類表に足す)。
@@ -355,9 +410,17 @@ pub export_batch_presets: Vec<BatchExportPreset>,     // 段 C
 - 節は `CollapsingHeader` にしない (閉じた節の設定が効いていることに気付けないため)。見出しラベルだけ置く。
 - `default_pos()` を使い `anchor()` を使わない。ドラッグ移動・× は今と同じ。
 - テキスト欄 (保存先・サブフォルダ・ファイル名・透かしの文字・プリセット名) はすべて
-  `crate::ime_focus` の helper を通す。Enter は今と同じく `dialog_enter_pressed` で「書き出す」。
-  ただし**プリセット名の欄にフォーカスがあるときの Enter はプリセットの保存**にする (§8)。
-  Esc は今と同じく閉じる。
+  `crate::ime_focus` の helper を通す。Esc は今と同じく閉じる。
+- **Enter の持ち主は 1 つ**: Enter は描画の前に `dialog_enter_pressed` で 1 回だけ取り、その Enter で
+  実行するのは次のどれか 1 つだけにする。
+  1. ComboBox などの popup が開いているか、ボタン・チェック・ラジオ・ComboBox にキーボードの
+     フォーカスがある → **部品の操作だけ** (egui がその部品を操作する)。書き出し・保存はしない。
+  2. プリセット名の欄にフォーカスがある → **プリセットの保存だけ** (§8)。
+  3. それ以外 (フォーカスが無いか、保存先・サブフォルダ・ファイル名・透かしの文字の欄にある) →
+     今と同じく「書き出す」(開始できる状態のときだけ)。
+  判定は描画の前のフレームのフォーカスと popup の状態で行う (Enter を押したフレームの描画で部品が
+  先に反応するため)。今は Enter を無条件で開始に使っており、「変更...」ボタンにフォーカスがあると
+  フォルダ選択と書き出しが両方動き得る。これも 1 の規則で直る。
 - ComboBox は `dark_popup_style` 等の既存 helper の配色に従い、popup 内に ScrollArea を置く場合は
   wheel を消費する (coding-conventions の規則)。文字色は `ui.visuals()` の値を使う。今の
   エラー表示の固定色 `Color32::from_rgb(255, 140, 140)` は `error_fg_color` に直す (触るついで)。
@@ -446,7 +509,13 @@ struct BatchExportPreset { name: String, options: BatchExportOptions }
   結び付き (変更済みの印・自動保存) は持たない。書き出すと、その時点の値が「前回の設定」になる。
 - 削除: 選んでいるプリセットを「削除」で消す。確認は出さない (プリセットは設定の組であり、
   画像や編集は失われない)。
-- 保存先は `Settings::save()` (今の保存経路)。保存の失敗は今の設定保存と同じ扱い。
+- 保存は、利用者が保存・削除を押した時点で `Settings::save_checked()` を呼ぶ (UI スレッドで同期)。
+  これは今の一括エクスポートの開始時の保存、環境設定の OK など、利用者の明示操作で設定を保存する
+  既存の経路 (`settings.save()` の呼び出しは約 230 か所) と同じ扱いで、新しい種類の I/O ではない。
+  プリセット専用の書き込み worker を作ると、同じ `settings.db` を書く経路が 2 本になり、
+  順序の食い違いが生まれるので作らない。`save_checked()` が失敗を返したら
+  「プリセットを保存できませんでした」を通知し、ログに残す (メモリ上の一覧はそのまま。次に設定が
+  保存されたときに一緒に書かれる)。保存は `SETTINGS_WRITE_GATE` で直列化される。
 - プリセットの並びは保存した順。並べ替え・名前の変更・書き出し/読み込み・メニューからの直接実行は範囲外。
 
 ## 9. 簡素化と、まれな失敗の割り切り
@@ -483,17 +552,24 @@ CLAUDE.md「設計の簡素化」に沿って検討した結果:
 - worker:
   - `Skip` は既存ファイルの項目をデコードしない (デコード回数の計測で確かめる)。
   - `Replace` は既存ファイルを置き換え、今回の元ファイル (別名・大小文字違いのパスを含む) は置き換えない。
-  - 同一実行内の衝突は `Replace` / `Skip` でも連番。
+  - 同一実行内の衝突は `Replace` / `Skip` でも連番。別フォルダの `A.jpg` と `a.jpg`、出力先の表記違い
+    (`C:\out` と `c:\OUT\`) でも先の出力を置き換え・スキップしない。
+  - WebP で 16383px を超える項目はその項目だけ失敗し、worker は止まらず次へ進む (panic しない)。
+  - 完了処理: §4.4 の通知の表の各行、成功パスの先頭が別フォルダでも今の表示先の更新が 1 回だけ要求される。
   - 取消が合成の途中で効く (遅い消しゴム runner を注入し、取消後に書き込みが無いこと)。
-  - `keep_metadata`: 同形式で EXIF・XMP・PNG テキスト・ICC (JPEG APP2 / PNG iCCP / WebP ICCP) が残り、
-    IFD1 のサムネイルが消える (IFD0 の次 IFD が 0、元のサムネイルのバイトが残らない)。形式違いでは残らない。
+  - `keep_metadata`: 3 形式それぞれで §3.6 の表のものが残り、EXIF の Orientation が 1、IFD1 の縮小画像が
+    消える (IFD0 の次 IFD が 0、元の縮小画像のバイトが残らない)。`GRAY` / CMYK の ICC は付かない。
+    形式違いでは何も残らない。読めない EXIF は落とし、その項目は成功する。
+  - 単ページの出力が変わらない: `SaveOptions` の新しい欄が既定 OFF のとき、JPEG / PNG / WebP の
+    転記結果が今と同じバイト列 (WebP の `encode_simple` への置き換えを含む)。
   - `keep_file_time`: 出力の更新日時が元と一致する (ZIP/PDF は書庫の日時)。
   - 透かし (段 B): 9 か所の位置・余白・大きさの割合、不透明度 0 で出力が透かし無しと一致、
     透かし画像を読めないと全件失敗で何も書かない。
 - 設定: `export_batch_options` が無い設定から旧 4 欄を読み替える、ある設定では旧 4 欄を無視する、
   書き出し開始で旧 4 欄を書かない、`settings_transfer` の分類漏れ検査が通る。
-- UI: §6.2 の配置検査とスナップショット、Enter の振り分け (プリセット名の欄では保存)、
-  プリセットの保存・置き換え・呼び出し・削除 (段 C)。
+- UI: §6.2 の配置検査とスナップショット、Enter の振り分け (§6.1 の 1〜3 がそれぞれ 1 つだけ実行される。
+  ボタン・ComboBox にフォーカスがあるときは書き出さない、プリセット名の欄では保存だけ)、
+  プリセットの保存・置き換え・呼び出し・削除と、保存失敗時の通知 (段 C)。
 
 ## 11. 文書の更新 (実装と同時)
 
@@ -506,7 +582,22 @@ CLAUDE.md「設計の簡素化」に沿って検討した結果:
 
 ## 12. 独立設計レビューの記録
 
-(未記録。レビューを受けたら、担当・回・結論と主な指摘への対応をここに書く。)
+担当: Codex `gpt-6.1-sol` / `xhigh`、read-only、ソース照合のみ (製品の起動・テストはしていない)。
+
+### 1 回目 (2026-11-24、対象 1bde71a10): REVISE
+
+| 指摘 | 対応 |
+| --- | --- |
+| P1 `write_composited_page` は製本の `write_source` も使うので削除できない | 製本用に残し、一括だけ新しい関数へ (§1・§4.2) |
+| P1 予約集合が `PathBuf` 比較で、大小文字・表記違いの同じ出力を区別してしまう | `OutputKey` を定義し、判定の順を明記 (§3.5) |
+| P2 形式ごとの転記の違い (PNG `eXIf`、WebP の Orientation、XMP の縮小画像) | 形式別の転記表と EXIF の共通処理、単ページは既定 OFF で不変、Q3 を 2 択に (§1・§3.6・§13) |
+| P2 WebP 16383px 超で `unwrap()` の panic | 形式ごとの寸法の上限で項目失敗、`encode_simple` へ (§1・§3.1・§4.2) |
+| P2 RGBA 出力にグレースケール等の ICC を付けると不適合 | `RGB ` の ICC だけ転記 (§1・§3.6) |
+| P2 Enter が部品の操作と書き出しを両方動かし得る | Enter の持ち主を 1 つにする規則 (§6.1) |
+| P2 プリセットの保存が UI の同期書き込み | 既存の明示操作の保存経路と同じ扱いにする理由、`save_checked` と失敗通知 (§8) |
+| P2 一覧の更新が最初の成功パスだけを見る | 今の表示先に一致する成功パスを探す (§4.4) |
+| P2 スキップ件数が完了時に伝わらない | 進捗と完了通知の表 (§4.4) |
+| P3 未知の欄・旧欄の説明が不正確 | 書き直し (§5.2) |
 
 ## 13. 利用者の判断が要る点
 
@@ -514,11 +605,21 @@ CLAUDE.md「設計の簡素化」に沿って検討した結果:
   段ごとに出すか。推奨: まとめて (プリセットが全部の選択肢を含むため)。
 - **Q2 上書き**: 「上書き」を選択肢に入れるか (今回の元ファイルは上書きしない保護付き、置き換えたファイルは
   ごみ箱へ送らない)。推奨: 入れる。
-- **Q3 元の情報を残すときの EXIF**: 形式が同じときだけ残し、EXIF の埋め込みサムネイルは消す。
-  カメラのメーカー独自領域 (MakerNote) に含まれ得るプレビュー画像は解釈せず残る。
-  消しゴム・隠蔽を使った画像で元の絵を確実に残したくない場合は「元の情報を残す」を OFF にしてもらう
-  運用でよいか。推奨: それでよい (既定は OFF)。
+- **Q3 「元の情報を残す」に残り得る元の縮小画像**: 形式が同じときだけ残し、EXIF の埋め込みサムネイル
+  (IFD1) は消す。次の 2 つから選ぶ。
+  - (a) EXIF の縮小画像だけ消す。XMP の `xmp:Thumbnails` と MakerNote (カメラのメーカー独自の領域) に
+    含まれ得る縮小画像は残る。消しゴム・隠蔽で隠した部分を確実に残したくないときは「元の情報を残す」を
+    OFF にしてもらう (既定は OFF。ON のときダイアログに「隠した部分が元の情報の中の縮小画像に残ることが
+    あります」と書く)。費用: 小。
+  - (b) (a) に加えて XMP の `xmp:Thumbnails` も消す。XMP (XML) を解釈して書き直す処理が増える。
+    MakerNote は形式がメーカーごとに違うので (b) でも消せない。費用: 中。
+  推奨: (a)。
+  また、グレースケール・CMYK の元画像の ICC は出力 (常に RGB) に合わないので付けない (§3.6)。
+  その画像は他のソフトで色の見え方が少し変わり得る。これは既定の規則とし、質問にはしない。
 - **Q4 透かしの文字のフォント**: 注釈の既定フォント 1 本だけ (選べない) でよいか。選べるようにするなら、
   フォントの一覧作りを worker へ移す作業が増える。推奨: 1 本だけ。
+- **補足 (質問ではない、別件の報告)**: 単ページの Ctrl+E は「メタデータを保持」が既定 ON で、
+  JPEG・WebP の EXIF をそのまま転記する。消しゴム・隠蔽を焼いた出力にも、元の絵の縮小画像 (IFD1) が
+  残り得る (source inspection、実機の観測ではない)。単ページは今回の範囲外なので、別のバックログ項目として扱う。
 - **Q5 §1.177 (準備中に重い 1 件で UI が止まる)**: 今回は直さず別件のままにするか。この設計は準備に
   I/O を足さないので悪化はしない。推奨: 別件のまま。
