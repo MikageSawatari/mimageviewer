@@ -2,8 +2,9 @@
 
 最終更新: 2026-11-24
 
-状態: 設計第2版。第1版 (`7aa5c6918`) は独立設計レビュー 1 回目 (Sol / xhigh) で REVISE (P2 4 件・P3 1 件)。
-第2版はその指摘を反映したもので、まだレビューを受けていない (§9)。実装はまだしない。収録版は未定。
+状態: 設計第3版。第1版 (`7aa5c6918`) はレビュー 1 回目で REVISE、第2版 (`5fed5048d`) はレビュー 2 回目で
+REVISE (どちらも Sol / xhigh)。第3版はその指摘を、仕組みを足すのではなく状態を減らす形で直したもので、
+まだレビューを受けていない (§9)。実装はまだしない。収録版は未定。
 正本のバックログは [next-release-backlog.md](next-release-backlog.md) §1.883。
 
 ## 1. 目的と範囲
@@ -100,11 +101,17 @@
   「未取得 / 取得中 / 数えた / 失敗」の 4 つに増え、段階取得の Ready が範囲ごとである (詳細列では Ready でも
   「…」を出している) ことと組み合わさる。出さなければ「数が分かっている / いない」の 2 つで済む。**採用。**
 - **数え終わったら並びは動かさない**。バッジは表示だけで、並び順に関わらない (並べ替えは段 2)。
-- **記録 (catalog) の失効は既存のまま** (mtime・size・fingerprint の一致判定)。**メモリの値には、記録と同じ
-  identity を持たせる** (§4.3.1)。今のメモリは元ファイルの mtime / size と PDF パスワードの revision だけで照合して
-  おり、判定設定の変更や EPUB の変換の後も古い値を使い続ける (レビュー 1 回目 P2-1。詳細表示のページ数列にも
-  ある以前からの問題)。失効は「記録した identity と今の identity の比較」だけで表し、表示中・park 中の
-  context ごとに値を消して回る処理は作らない。
+- **記録 (catalog) の失効は既存のまま** (mtime・size・fingerprint の一致判定)。メモリの値には「取り直すか」を
+  決めるための最小の identity (判定設定の fingerprint と、EPUB だけ一覧の世代) を持たせる (§4.3.1)。今のメモリは
+  元ファイルの mtime / size と PDF パスワードの revision だけで照合しており、判定設定の変更や EPUB の変換の後も
+  古い値を使い続ける (レビュー 1 回目 P2-1。詳細表示のページ数列にもある以前からの問題)。
+  - 第2版では EPUB の変換キャッシュの公開・削除ごとに上げる revision を置いたが、公開は worker の中で commit され、
+    UI の受理を経ない経路 (Remote が先に owner を外す場合) や、読み取りの経路から到達する `detach_missing` まで
+    追う必要があった (レビュー 2 回目 P2-2)。**EPUB の値を一覧の世代の中だけで有効にすれば、この境界を一つも
+    追わずに済む**ので、第3版は revision を置かない。
+  - **「取り直すか」と「何を表示するか」を分ける**。取り直しの判定は identity を見るが、表示と並べ替えは
+    取り直しが終わるまで最後に数えた値を出す。identity が変わるたびにバッジが消えて出直す状態 (一覧の世代は
+    削除・名前変更でも進む) と、Ready のまま「…」が残る状態 (レビュー 2 回目 P2-1) を作らない。
 - **設定の切り替えは既存の要件の作り直し (`invalidate_details_meta_requirements`) に乗せる**。表示中の一覧を
   作り直さない。OFF にしたら描画しないだけで、メモリの値は捨てない。
 - まれな失敗 (catalog が開けない・書けない、数える途中の I/O エラー) は既定の割り切り: 既存どおり、記録を
@@ -164,28 +171,55 @@
   - EPUB: 変換世代が変わる。
 - catalog の削除・作り直し (キャッシュ管理) で記録が消えた場合は、次に見たときに数え直す。
 
-#### 4.3.1 メモリの値の identity (レビュー 1 回目 P2-1)
+#### 4.3.1 メモリの値と取り直し (レビュー 1 回目 P2-1、2 回目 P2-1・P2-2)
 
-`DetailsLazyMeta` のページ数に、数えたときの identity を足す。照合は `details_page_count_meta_satisfies_idx` の
-1 か所で行う (PDF パスワードの revision と同じ形)。
+`DetailsLazyMeta` のページ数に、数えたときの値を 2 つ足す。
 
-- **判定設定の fingerprint**: ページ数を数えた job の `DetailsPageCountConfig.fingerprint` を、結果と一緒に
-  `page_count_fingerprint` として記録する。今の fingerprint と違えば満たしていない扱いにして数え直す
-  (記録は fingerprint で引くので、設定を戻せば記録で済む)。
-  - 今の fingerprint は **1 フレームに 1 回だけ**計算して App に置く (計算するのは details-meta の poll の先頭の
-    1 か所。`image_page_recognition_fingerprint` は拡張子の列を hash するだけで I/O をしない)。セルごとに
-    計算しない。設定の変更点を全部追いかけて更新する形にはしない (書き手を 1 つにする)。
-  - 走っている job の fingerprint が今の値と違えば、その job を取り消して要件を作り直す
-    (`invalidate_details_meta_requirements`)。古い設定で数えた結果は identity が合わないので採用しても使われない。
-- **EPUB の変換の revision**: App 全体に EPUB の論理パスごとの revision (`pdf_passwords.credential_revision` と
-  同じ形の小さな map) を置き、**変換キャッシュを公開した時点と、変換キャッシュを消した時点**で上げる。
-  EPUB の結果には数えたときの revision を記録し、違えば数え直す。未変換で数えられなかった EPUB も、
-  変換を公開すれば revision が変わるので数え直される。revision を上げる箇所は実装時に列挙して検証台帳に
-  残す (起点は `ui_dialogs/epub_convert.rs` の `finish_epub_convert` 系と、変換キャッシュの管理画面の削除)。
-- revision と fingerprint は App 全体の値で、各 viewer context のメモリは自分の値と比べるだけなので、park 中の
-  context も次に表示したときに古い値を使わない。context ごとに値を消して回らない。
-- 詳細表示のページ数列・選択情報も同じ照合を通るので、以前からの同じ問題もあわせて直る。永続データは変わらない
-  (メモリの構造だけ)。
+- `page_count_fingerprint: i64`: 数えた job の `DetailsPageCountConfig.fingerprint`。
+- `page_count_generation: Option<u64>`: EPUB のときだけ、その target を計画したときの `items_generation`。
+
+**取り直しの判定** (`details_page_count_meta_satisfies_idx`、1 か所) に次を足す。
+
+1. `page_count_fingerprint` が今の判定設定の fingerprint と同じ。
+2. EPUB は `page_count_generation` が今の `items_generation` と同じ (成功・失敗とも。media の `RetryLater` と
+   同じく、一覧の世代の中だけで有効)。
+
+**表示と並べ替え** (`details_page_count_text`・`details_page_count_sort_value`・新しい
+`thumbnail_page_count_text`) は、取り直しの判定を通さず、最後に数えた値 (`page_count_checked` の値) を出す。
+取り直しが終われば値が置き換わる。3 つの consumer が別々に判定を持たないよう、値を返す accessor を 1 つにして
+全部そこを通す (`details_page_count_value(idx) -> Option<PageCountValue>`)。
+
+今の fingerprint:
+
+- **1 フレームに 1 回**、`App::update` のフレームの先頭 (どの viewer context の poll よりも前) の 1 か所で
+  `image_page_recognition_fingerprint` を計算し、App 全体の値として置く (viewer context の bundle には入れない。
+  入力の設定はお気に入り別の表示状態の切り替え対象ではない)。I/O はしない (Susie の `try_get_pool` は初期化を
+  始めない。レビュー 2 回目で確認)。details-meta の poll はサムネイル表示で 1 フレームに複数回呼ばれるので、
+  poll の中では計算しない。
+- job を始めるときの `DetailsPageCountConfig.fingerprint` もこの値を使う (同じフレームの中で 2 つの値が並ばない)。
+
+取り直しが始まる経路 (新しい再開の仕組みは足さない):
+
+- **判定設定の変更**: 判定設定 (表示する種類・隠しファイル・重複の扱い・拡張子の優先度・Susie) を変えると、
+  環境設定の適用で今の一覧を読み直す (`apply_file_type_visibility_change` /
+  `reload_current_folder_preserving_override`、`ui_dialogs/preferences.rs`)。一覧の install は details-meta の
+  状態を `NotRequested` に戻すので、段階取得も詳細表示のページ数ソートの全件取得も、新しい fingerprint で
+  取り直す。取り直しは catalog を新しい fingerprint で引くので、以前その設定で数えた本でなければ数え直しになる
+  (`container_page_meta` の主キーは `(filename, kind)` で、別の fingerprint の結果は同じ行を上書きする。
+  設定を行き来すると毎回数え直す。レビュー 2 回目 P3)。
+- **ほかの窓 (detached / park 中の context)**: その窓の一覧は読み直すまで古い規則で作られたままで、ページ数も
+  それに合う古い値を表示し続ける。段階取得の範囲に入った本は、次の段階取得 (scroll・選択の変更・読み直し) で
+  新しい fingerprint で取り直す。詳細表示のページ数ソートで Ready になっている窓は、読み直すまで古い値のまま
+  並ぶ (一覧そのものが古い規則のままなので、ページ数だけ先に変えない)。context ごとに値を消して回らない。
+- **EPUB**: 変換していない EPUB を開くと変換し、本を閉じて一覧へ戻ると一覧を install し直すので世代が進み、
+  変換キャッシュから数え直す (戻りで install し直すことは実装時に確かめる)。一覧を表示したまま別の経路
+  (Remote など) で変換・再変換・変換キャッシュの削除が起きた場合は、その一覧の世代が進む操作 (最新の情報に
+  更新・開き直し・一覧内の削除など) の後に取り直す。それまでは最後に数えた値 (または無し) を出す。
+- 世代が進むたびに EPUB は取り直すが、取り直しは変換キャッシュの解決 (stat と DB) と catalog の SELECT だけで、
+  その間も最後の値を表示するのでバッジは消えない。EPUB 以外は世代で取り直さない。
+
+詳細表示のページ数列・選択情報も同じ accessor と判定を通るので、以前からの同じ問題もあわせて直る。
+永続データは変わらない (メモリの構造だけ)。
 
 ### 4.4 段階取得への組み込み
 
@@ -287,19 +321,18 @@ fn thumbnail_page_count_enabled(&self) -> bool {
 - 描画で UI スレッドが新しく行うのは、メモリの `details_lazy_meta` を引いて文字列にすることだけ
   (`thumbnail_page_count_text(idx)`、`thumbnail_media_duration_text` と同じ形)。I/O・DB・read_dir はしない。
   [ui-responsiveness.md](ui-responsiveness.md) §4 のチェックリストに沿い、target の構築は既存の Planning を通る。
-- target の構築では、ZIP 内の書庫 (`ZipDir`) だけ UI スレッドでメモリ上の計算がある (レビュー 1 回目 P2-3):
-  `warm_page_count` は `ZipTree::page_count_for_prefix_str` で部分木の画像数を再帰で足す (`zip_tree.rs` の
-  `total_image_count`)。I/O は無く、各ノードの画像は `Vec` の長さで数えるので、費用は部分木の**ディレクトリ数**に
-  比例する。サムネイルの段階取得の Explicit plan は範囲内を同じフレームで処理するが、
-  - 1 つの一覧に並ぶ `ZipDir` は同じ親の兄弟で部分木が重ならないので、1 回の段階取得の合計は外側 ZIP の
-    ディレクトリ数以下、
-  - 数えた値はメモリに残り、満たしている間は target を作らないので、フレームごと・scroll ごとには繰り返さない。
-
-  よって新しい予算や事前集計は足さない。既存の `details_meta/target_scan_slice` の ms で確かめる。
-  ディレクトリが数万ある書庫で問題が出たら、`ZipTree` を作るときに部分木の画像数を持たせる案に替える。
+- ZIP 内の書庫 (`ZipDir`) のページ数は、今は target を作るたびに UI スレッドで部分木を再帰で足している
+  (`ZipTree::page_count_for_prefix_str` → `total_image_count`)。同じ target は Planning・worker 起動時の
+  `initial_priority_targets`・選択行の slice ごとの再作成で何度も作られ、計測の区間 (`target_scan_slice`) にも
+  全部は入っていない (レビュー 1 回目 P2-3、2 回目 P2-3)。**上限の議論と計測を足すのではなく、集計そのものを
+  UI スレッドから無くす**: `ZipTree::build` (木は作った後に変更されず `Arc` で共有される) で各ノードの
+  部分木の画像数を一度だけ数えて持たせ、`page_count_for_prefix_str` はノードを探して値を読むだけにする
+  (費用は prefix の深さ)。木を作る費用はノード数に比例して一度だけ増える。
+  - レーティング一覧などで外側 ZIP の木が無い (`zip_nav` が無い) `ZipDir` は、今と同じく値が取れずバッジを出さない。
 - 計装: 既存の `details_meta/load_done` に、ページ数の件数を足す
   (`page_targets`・`page_cache_hits`・`page_counted` を種類別 (zip / zip_nested / folder / rar / pdf / epub)・
-  `page_failed`・`page_cancelled`・`page_ms`)。1 冊に 200 ms 以上かかったものは `details_meta/page_count_slow` (種類・ms・cache の有無) を
+  `page_failed`・`page_ms`)。取り消した job は `load_done` に届かず途中で返るので、既存の
+  `details_meta/load_cancelled` にも同じ件数と経過時間を載せる (レビュー 2 回目 P3)。1 冊に 200 ms 以上かかったものは `details_meta/page_count_slow` (種類・ms・cache の有無) を
   出す (`ai_item_slow` と同じ形)。初回と 2 回目の差、ネットワーク共有での 1 冊の時間を perf ログで読めるようにする。
 - ui-responsiveness.md に §1.883 の節を足す (要約: 可視範囲だけを既存 worker で数え、記録は既存 catalog)。
 
@@ -379,9 +412,11 @@ fn thumbnail_page_count_enabled(&self) -> bool {
   段階取得を回さない (今と同じ)。再生位置メーターだけ ON・選択情報だけ・AI facet / 長さ facet の全体取得だけ、の
   ときは今の取得を保ち、本を数えない (レビュー 1 回目 P3)。可視 + 先読み範囲の外は数えない、AI facet・長さ
   facet の全体取得中も表示集合の外の本を数えない、設定の切り替えで要件を作り直す。
-- identity (§4.3.1): 判定設定を変えると数え直し、戻すと記録で済む。走っている job の fingerprint が変わると取り消す。
-  未変換の EPUB が変換の公開後に数え直される、変換キャッシュを消すと数え直す。park 中の context を表示し直したとき
-  古い値を使わない。PDF パスワードの revision の既存テストを保つ。
+- 取り直し (§4.3.1): 判定設定を変えて一覧を読み直すと新しい fingerprint で取り直し、取り直しの間も最後の値を
+  表示する (消えない)。EPUB は一覧の世代が進むと取り直し、ほかの種類は取り直さない。未変換の EPUB を開いて
+  変換し一覧へ戻るとバッジが出る。ほかの窓の値は読み直すまで変えない。表示・並べ替え・バッジが同じ accessor を
+  通る。fingerprint はフレームに 1 回だけ計算する。PDF パスワードの revision の既存テストを保つ。
+- `ZipTree`: 部分木の画像数を build で持たせ、`page_count_for_prefix_str` が再帰しない。
 - 取消 (§4.4.1): RAR とフォルダの走査が job の cancel で止まり、記録も checked も立てない。
 - 値: `page_count = None`・0・失敗でバッジなし、PDF のパスワードの revision、`ZipDir` は `ZipTree` の値、
   ドライブ一覧でバッジなし。
@@ -404,4 +439,15 @@ fn thumbnail_page_count_enabled(&self) -> bool {
   - 述語の分け方と置き換える箇所の範囲、`allow_page_count` / `whole_listing_only` の制限、配置の優先順位、
     detached の bundle に新しい field が要らないこと、Remote に変更が要らないこと、並べ替えを別項目にすることは
     妥当とされた。
-- 2 回目: 未実施。
+- 2 回目 (Sol / xhigh、同じセッション、第2版 `5fed5048d`): **REVISE**。
+  - P2-1 表示とソート値が照合を通らず、Ready の後や詳細表示のページ数ソートでは取り直しが始まらない → §4.3.1 で
+    「取り直しの判定」と「表示する値」を分け、取り直しは一覧の読み直しと既存の段階取得に乗せた。
+  - P2-2 EPUB の revision を上げる境界が UI の受理に依存し、worker の公開・Remote・`detach_missing` を追えていない
+    → revision をやめ、EPUB の値を一覧の世代の中だけで有効にした。
+  - P2-3 `ZipDir` の集計は target の再作成で繰り返され、計測の区間にも入らない。レーティング一覧の `ZipDir` は
+    兄弟とは限らない → 集計を `ZipTree::build` へ移し、UI スレッドで再帰しないようにした。
+  - P3 取消の計測は `load_done` に届かない → `load_cancelled` にも載せる。
+  - P3 「設定を戻せば記録で済む」は主キーの都合で成り立たない → 記述を直した。
+  - fingerprint を App 全体に置くこと、Susie の扱い、再開ループが無いこと、Remote / MCP に独自の EPUB 変換の
+    公開経路が無いことは確認された。
+- 3 回目: 未実施。
