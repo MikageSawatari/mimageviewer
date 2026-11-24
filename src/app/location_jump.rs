@@ -895,47 +895,52 @@ mod tests {
 
     #[test]
     fn location_and_address_plain_physical_dispatch_scan_off_caller_and_adopt_once() {
-        for address_input in [false, true] {
-            let mut app = setup_app();
-            let origin = app.tmp.path().join("plain-origin");
-            let target = app.tmp.path().join("plain-destination");
-            std::fs::create_dir_all(&origin).unwrap();
-            std::fs::create_dir_all(&target).unwrap();
-            std::fs::write(target.join("page.png"), []).unwrap();
-            app.load_folder(origin.clone());
-            app.finish_page_identity_preparation_for_test();
-            let scans = super::super::folder_scan::caller_scan_count_for_test();
-            let destination = LocationJumpTarget::Physical(target.clone());
-            if address_input {
-                app.dispatch_address_input(destination);
-            } else {
-                app.dispatch_location_jump(destination);
+        for active_slot in [None, Some(crate::settings::QuickFolderSlotId::A)] {
+            for address_input in [false, true] {
+                let mut app = setup_app();
+                app.active_quick_folder_slot = active_slot;
+                let origin = app.tmp.path().join("plain-origin");
+                let target = app.tmp.path().join("plain-destination");
+                std::fs::create_dir_all(&origin).unwrap();
+                std::fs::create_dir_all(&target).unwrap();
+                std::fs::write(target.join("page.png"), []).unwrap();
+                app.load_folder(origin.clone());
+                app.finish_page_identity_preparation_for_test();
+                let scans = super::super::folder_scan::caller_scan_count_for_test();
+                let destination = LocationJumpTarget::Physical(target.clone());
+                if address_input {
+                    app.dispatch_address_input(destination);
+                } else {
+                    app.dispatch_location_jump(destination);
+                }
+                assert_eq!(
+                    super::super::folder_scan::caller_scan_count_for_test(),
+                    scans
+                );
+                assert_eq!(app.current_folder.as_ref(), Some(&origin));
+                assert!(app.direct_navigation_scan_pending());
+                assert_eq!(
+                    app.grid_item_input_block(),
+                    Some(crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan)
+                );
+                app.finish_direct_navigation_scan_for_test();
+                assert_eq!(
+                    super::super::folder_scan::caller_scan_count_for_test(),
+                    scans
+                );
+                assert_eq!(app.current_folder.as_ref(), Some(&target));
+                assert_eq!(app.address, target.to_string_lossy());
+                assert_eq!(app.selected, Some(0));
+                assert_eq!(app.items[0].name(), "page.png");
+                assert_search_dismissed_with_history(&app, origin);
+                assert!(app.grid_item_input_allowed());
+                assert_eq!(app.active_folder_history_vectors().0.len(), 1);
+                let generation = app.items_generation;
+                let history = app.folder_nav_history_snapshot();
+                app.poll_direct_navigation_scan_for_test(&egui::Context::default());
+                assert_eq!(app.items_generation, generation);
+                assert_eq!(app.folder_nav_history_snapshot(), history);
             }
-            assert_eq!(
-                super::super::folder_scan::caller_scan_count_for_test(),
-                scans
-            );
-            assert_eq!(app.current_folder.as_ref(), Some(&origin));
-            assert!(app.direct_navigation_scan_pending());
-            assert_eq!(
-                app.grid_item_input_block(),
-                Some(crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan)
-            );
-            app.finish_direct_navigation_scan_for_test();
-            assert_eq!(
-                super::super::folder_scan::caller_scan_count_for_test(),
-                scans
-            );
-            assert_eq!(app.current_folder.as_ref(), Some(&target));
-            assert_eq!(app.address, target.to_string_lossy());
-            assert_eq!(app.selected, Some(0));
-            assert_eq!(app.items[0].name(), "page.png");
-            assert_search_dismissed_with_history(&app, origin);
-            assert!(app.grid_item_input_allowed());
-            let generation = app.items_generation;
-            app.poll_direct_navigation_scan_for_test(&egui::Context::default());
-            assert_eq!(app.items_generation, generation);
-            assert_eq!(app.folder_nav_back_stack.len(), 1);
         }
     }
 

@@ -184,6 +184,9 @@ fn startup_default_specific_worker_preserves_cursor_only_at_the_same_place() {
         });
         app.settings.last_cursor_name = Some("b".into());
         app.settings.last_cursor_rows_above = Some(1);
+        // Dispatch captures this competing hint into MainListNavigation. The resolved
+        // default cursor must replace it, or clear it when this is a different place.
+        app.select_after_load = Some(if same_place { "a" } else { "b" }.into());
         let before = folder_scan::caller_scan_count_for_test();
         app.open_default_startup_target();
         let (tx, result) = hold_result(&mut app);
@@ -198,8 +201,12 @@ fn startup_default_specific_worker_preserves_cursor_only_at_the_same_place() {
         assert_eq!(folder_scan::caller_scan_count_for_test(), before);
         assert_eq!(app.current_folder.as_ref(), Some(&target));
         assert!(app.fullscreen_idx.is_none());
+        assert_eq!(
+            app.items[app.selected.unwrap()].name(),
+            if same_place { "b" } else { "a" }
+        );
+        assert!(app.select_after_load.is_none());
         if same_place {
-            assert_eq!(app.items[app.selected.unwrap()].name(), "b");
             assert_eq!(app.grid_scroll.row_anchor(), Some(1));
         }
     }

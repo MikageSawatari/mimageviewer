@@ -1954,7 +1954,7 @@ impl App {
                     .current_folder
                     .as_ref()
                     .is_some_and(|current| crate::folder_tree::path_eq(current, &openable)));
-        let navigation = navigation
+        let mut navigation = navigation
             .or_else(|| {
                 viewer_adoption
                     .is_main_new()
@@ -2164,9 +2164,16 @@ impl App {
             .as_ref()
             .filter(|_| restore_default_cursor)
         {
-            self.select_after_load = cursor
+            let selection = cursor
                 .as_ref()
                 .map(|(name, _)| AfterLoadSelection::Name(name.clone()));
+            if let Some(navigation) = navigation.as_mut() {
+                // Adoption publishes the request-owned hint before installing the list.
+                // Writing App here would be overwritten by that earlier captured value.
+                navigation.selection_after_load = selection;
+            } else {
+                self.select_after_load = selection;
+            }
             self.grid_scroll
                 .set_row_anchor(cursor.as_ref().and_then(|(_, rows)| *rows));
         }
