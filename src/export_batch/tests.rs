@@ -815,6 +815,85 @@ fn cancellation_during_erase_uses_same_token_and_never_writes() {
 }
 
 #[test]
+fn file_time_follows_overwrite_policy_for_new_and_existing_outputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.png");
+    let pixels = image::RgbaImage::from_pixel(2, 2, image::Rgba([20, 30, 40, 255]));
+    pixels.save(&source).unwrap();
+    let source_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    let old_output_time = source_time - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_modified(source_time)
+        .unwrap();
+    for (policy, existing) in [
+        (OverwritePolicy::Rename, false),
+        (OverwritePolicy::Rename, true),
+        (OverwritePolicy::Skip, false),
+        (OverwritePolicy::Replace, false),
+        (OverwritePolicy::Replace, true),
+    ] {
+        for keep_file_time in [false, true] {
+            let out = tempfile::tempdir_in(temp.path()).unwrap();
+            let original_output = out.path().join("result.png");
+            if existing {
+                image::RgbaImage::from_pixel(2, 2, image::Rgba([180, 20, 20, 255]))
+                    .save(&original_output)
+                    .unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&original_output)
+                    .unwrap()
+                    .set_modified(old_output_time)
+                    .unwrap();
+            }
+            let mut opts = options(out.path());
+            opts.overwrite = policy;
+            opts.keep_file_time = keep_file_time;
+            // Allow filesystem timestamp rounding; no sleeps or clock changes.
+            let earliest = SystemTime::now() - std::time::Duration::from_secs(2);
+            let events = run(opts, vec![file_item(&source, "result")]);
+            let latest = SystemTime::now() + std::time::Duration::from_secs(2);
+            let expected = if policy == OverwritePolicy::Rename && existing {
+                out.path().join("result_1.png")
+            } else {
+                original_output.clone()
+            };
+            assert_eq!(
+                completed_paths(&events),
+                vec![expected.clone()],
+                "{policy:?} keep={keep_file_time} existing={existing}: {events:#?}"
+            );
+            assert_eq!(image::open(&expected).unwrap().to_rgba8(), pixels);
+            let modified = std::fs::metadata(&expected).unwrap().modified().unwrap();
+            if policy != OverwritePolicy::Replace && keep_file_time {
+                assert_eq!(modified, source_time, "{policy:?} existing={existing}");
+            } else {
+                assert_ne!(
+                    modified, source_time,
+                    "{policy:?} keep={keep_file_time} existing={existing}"
+                );
+                assert!(
+                    modified >= earliest && modified <= latest,
+                    "{policy:?} keep={keep_file_time} existing={existing}: {modified:?} outside {earliest:?}..={latest:?}"
+                );
+            }
+            if policy == OverwritePolicy::Rename && existing {
+                assert_eq!(
+                    std::fs::metadata(original_output)
+                        .unwrap()
+                        .modified()
+                        .unwrap(),
+                    old_output_time
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn file_time_uses_source_file_and_archive_time() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source.png");

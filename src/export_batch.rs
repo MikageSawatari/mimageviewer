@@ -321,9 +321,10 @@ fn run_batch_export_with_decoder(
                 }
             }
             let options = &request.options;
+            let keep_file_time = options.can_keep_file_time() && options.keep_file_time;
             let needs_datetime =
                 options.template.contains("<date>") || options.template.contains("<time>");
-            let modified = if needs_datetime || options.keep_file_time {
+            let modified = if needs_datetime || keep_file_time {
                 Some(
                     std::fs::metadata(source_path(&item.source))
                         .and_then(|m| m.modified())
@@ -412,7 +413,7 @@ fn run_batch_export_with_decoder(
                 options.overwrite == OverwritePolicy::Replace,
             )?;
             outputs.record_written(&path)?;
-            if options.keep_file_time {
+            if keep_file_time {
                 std::fs::OpenOptions::new()
                     .write(true)
                     .open(&path)

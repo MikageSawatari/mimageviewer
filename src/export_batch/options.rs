@@ -181,6 +181,11 @@ impl Default for BatchExportOptions {
 }
 
 impl BatchExportOptions {
+    /// Keep the stored choice while disabling its effect for replacement exports.
+    pub fn can_keep_file_time(&self) -> bool {
+        self.overwrite != OverwritePolicy::Replace
+    }
+
     pub fn from_legacy(
         directory: PathBuf,
         template: String,

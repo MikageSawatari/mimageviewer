@@ -343,7 +343,14 @@ fn draw_metadata_options(
         "選んだ形式で再エンコードします。元の EXIF / AI プロンプトは引き継ぎません。"
     };
     ui.add(egui::Label::new(note).wrap());
-    owner.widget(&ui.checkbox(&mut options.keep_file_time, "元の更新日時にする"));
+    let can_keep_file_time = options.can_keep_file_time();
+    owner.widget(&ui.add_enabled(
+        can_keep_file_time,
+        egui::Checkbox::new(&mut options.keep_file_time, "元の更新日時にする"),
+    ));
+    if !can_keep_file_time {
+        ui.small("上書きのときは使えません");
+    }
 }
 
 fn draw_batch_actions(

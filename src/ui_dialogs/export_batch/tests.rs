@@ -149,6 +149,75 @@ fn window_harness(size: egui::Vec2, scale: f32, expanded: bool) -> Harness<'stat
 }
 
 #[test]
+fn batch_export_replace_disables_file_time_without_changing_saved_choice() {
+    for saved in [false, true] {
+        let mut h = window_harness(egui::vec2(1093.0, 1800.0), 1.0, false);
+        h.run_steps(12);
+        assert!(
+            !h.get_by_label("元の更新日時にする")
+                .accesskit_node()
+                .is_disabled()
+        );
+        if saved {
+            h.get_by_label("元の更新日時にする").click();
+            h.run_steps(2);
+        }
+        assert_eq!(h.state().dialog.options.keep_file_time, saved);
+        h.get_by_label("上書き").click();
+        h.run_steps(2);
+        assert_eq!(h.state().dialog.options.overwrite, OverwritePolicy::Replace);
+        {
+            let checkbox = h.get_by_label("元の更新日時にする");
+            assert_eq!(
+                checkbox.accesskit_node().role(),
+                egui::accesskit::Role::CheckBox
+            );
+            assert!(checkbox.accesskit_node().is_disabled());
+            assert_eq!(
+                checkbox.accesskit_node().toggled(),
+                Some(if saved {
+                    egui::accesskit::Toggled::True
+                } else {
+                    egui::accesskit::Toggled::False
+                })
+            );
+        }
+        // Disabled pointer input must not overwrite the persisted choice.
+        h.get_by_label("元の更新日時にする").click();
+        h.run_steps(2);
+        assert_eq!(h.state().dialog.options.keep_file_time, saved);
+        let serialized = serde_json::to_string(&h.state().dialog.options).unwrap();
+        let restored: BatchExportOptions = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored.keep_file_time, saved);
+        assert_eq!(restored.overwrite, OverwritePolicy::Replace);
+        h.state_mut().dialog.options = restored;
+        h.run_steps(2);
+        assert!(
+            h.get_by_label("元の更新日時にする")
+                .accesskit_node()
+                .is_disabled()
+        );
+        for (label, policy) in [
+            ("スキップ", OverwritePolicy::Skip),
+            ("連番", OverwritePolicy::Rename),
+        ] {
+            h.get_by_label(label).click();
+            h.run_steps(2);
+            assert_eq!(h.state().dialog.options.overwrite, policy);
+            assert!(
+                !h.get_by_label("元の更新日時にする")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            assert_eq!(h.state().dialog.options.keep_file_time, saved);
+        }
+        h.get_by_label("元の更新日時にする").click();
+        h.run_steps(2);
+        assert_eq!(h.state().dialog.options.keep_file_time, !saved);
+    }
+}
+
+#[test]
 fn batch_export_conditional_fields_have_accessible_names() {
     // Keep the ordinary accessibility check enabled for every conditional field,
     // including resize modes and lossless WebP states outside the snapshot fixtures.
