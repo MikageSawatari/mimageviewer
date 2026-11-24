@@ -28310,7 +28310,8 @@ impl App {
                                     .copied()
                             },
                             page_count_fingerprint.unwrap_or_default(),
-                            |path, (mtime, size)| {
+                            |item, (mtime, size)| {
+                                let path = folder_scan::listing_page_count_path(item)?;
                                 metadata_snapshot
                                     .page_count
                                     .get(&(crate::adjustment_db::normalize_path(path), mtime, size))
@@ -32842,8 +32843,8 @@ impl App {
                     },
                     |path, stamp| self.listing_duration_for_path(path, stamp),
                     page_count_fingerprint,
-                    |path, stamp| {
-                        self.listing_page_count_for_path(path, stamp, page_count_fingerprint)
+                    |item, stamp| {
+                        self.listing_page_count_for_item(item, stamp, page_count_fingerprint)
                     },
                 )
             }

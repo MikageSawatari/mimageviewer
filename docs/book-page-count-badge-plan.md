@@ -616,9 +616,13 @@ catalog の一括読み取り (worker だけ):
 
 - catalog: schema は変えない。読み取りの API を足すだけ (`container_page_meta` / `pdf_meta` は出荷済み)。
 - settings: `SortOrder` の新しい値 (`settings.sort_order`・`FavoriteViewState.sort_order`・`toolbar_sort_items`)。
-  - **v5.6.x 以前がこの値を読むと、その版は `Incompatible` として既定設定 + 保存抑止で起動する** (DB は書き換え
-    ない。v5.7.0 に戻せば元の設定で起動する)。長さ順・サイズ順・評価順を足したときと同じ境界。ツールバーの補完に
-    よって、ページ数順を使っていない利用者もこの境界に入る。→ §7 の問 4。
+  - **v5.6.x 以前がこの値を読むと、その版は `Incompatible` として既定設定 + 保存抑止で起動する** (settings.db は
+    書き換えない)。**ただし既定設定はお気に入りが空なので、その起動時の掃除 (`App::hydrate_adjustment_favorite_params`・
+    `hydrate_favorite_view_states`) が、adjustment.db の「お気に入り別の補正の標準」と「お気に入り別の表示状態」を
+    お気に入りに無い行として消す。v5.7.0 に戻しても戻らない** (実装の独立レビュー 1 回目 P1 で判明。長さ順を
+    足した v5.5.0 から v5.4 以前へ戻す場合にも、出荷済みのコードで同じことが起きている)。ツールバーの補完に
+    よって、ページ数順を使っていない利用者もこの境界に入る。→ §7 の決定 4 (この説明で再判断)。
+    第7.1版までのこの節は「v5.7.0 に戻せば元の設定で起動する」とだけ書き、消える点を落としていた。
   - 新旧の wire (serde 文字列) と、旧版相当の enum で読んだとき DB を書き換えないことを試験する。
 
 ### 6.10 detached viewer・Remote
@@ -636,6 +640,11 @@ catalog の一括読み取り (worker だけ):
 2. 画像だけのフォルダにもバッジを出す (ページ数順でも本と並ぶ)。
 3. 表記は「123P」。
 4. ツールバーの既定にページ数順を足し、旧版へ戻したときの扱いは長さ順と同じ。
+   - **再判断 (2026-11-24、統括経由)**: 最初の判断は「戻すと既定設定で起動し、v5.7.0 に戻せば元に戻る」という
+     誤った説明に基づいていた。実装の独立レビューで、v5.6.x 以前へ戻すと全員の「お気に入り別の補正の標準」と
+     「お気に入り別の表示状態」が消え、v5.7.0 に戻しても戻らない (設定そのものは無事) と分かった。これを示し、
+     「A: 決定どおり既定に足す」「B: 既定には足さない」を問い直したところ、利用者は A (既定に足す、決定どおり) を
+     選んだ。旧版へ戻したときに消える問題そのものは、利用者の回答でバックログに記録しない。
 5. ページ数順も自動では並べ直さない。
 
 以下は判断を仰いだときの問いの記録。
@@ -650,7 +659,8 @@ catalog の一括読み取り (worker だけ):
    「画像のみのフォルダを本として扱う」が ON のときだけにするか、常に出すか (推奨: 詳細列と同じく常に出す)。
    ページ数順でも、同じ判定で画像だけのフォルダが枚数で本と一緒に並ぶ。
 3. **表記**: 「123P」「123p」「123ページ」のどれにするか (推奨: 「123P」)。
-4. **ツールバーの既定と旧版との境界** (ページ数順): 長さ順のときと同じく、ツールバーの既定の並べ替えに
+4. **ツールバーの既定と旧版との境界** (ページ数順、※この問いの「保存はしない。戻せば元に戻る」は誤りで、上の再判断で
+   直した): 長さ順のときと同じく、ツールバーの既定の並べ替えに
    ページ数順の 2 つを足し、そのため v5.6.x 以前へ戻すと既定設定で起動する (保存はしない。v5.7.0 に戻せば元に
    戻る) 扱いでよいか (推奨: 長さ順と同じ扱い)。
 5. **ページ数順でも自動では並べ直さない** (長さ順の決定 B と同じ。数え終わった後は更新・選び直し・開き直しで
@@ -1074,6 +1084,9 @@ facts / materialize / catalog (10件):
   既存3件の期待と小画面scrollを維持し、`sort_popup_actual_listing_routes_fit_all_rows_at_minimum_size_and_150_percent` (実Folder／展開／評価／bookmark、最大17行) と `sort_popup_area_height_restores_both_themes_before_contents_and_other_areas` を追加。snapshot候補は `duration_facet_bar{,_narrow}_dark` と `facet_sort{,_narrow,_edges,_edges_narrow}_dark` (現fixtureは閉状態、PNG未変更・cargo検証未実施)。
 - 設計担当の再実行2310件中2307成功・snapshot277成功後、矩形を持たないListBox役割nodeのqueryを、保持中popup IDの `memory.area_rect` 読取へ修正した。
   600×480は400pt制約解消後に収まるので全行表示を検査し、確実に内容高を下回る360×150ではoverflow・実wheelで末尾到達・scroll後の画面内保持を検査する (今回は製品コード・PNG・既定Rhai変更なし、修正後のcargo検証未実施)。
+
+- 設計担当の指示で、未完了の遅延キー取得を並べ替えpopupの補助行から既存App関数で停止・再開できるようにし、高さ計算とマニュアルへ反映した。`lazy_sort_popup_stops_resumes_and_hides_completed_loading_with_columns_off` は両表示・全遅延列OFF・両配置・長さ/ページ数/両要件の実クリック、完了後の行消滅、1093×614 / 150%で追加行まで収容することを検査する。
+- 設計担当の指示で、メモリreaderとmaterialize closureにGridItemを渡し、PDF資格情報照合をPdfFileに限定した。`page_sort_883_pdf_epub_named_image_folders_keep_memory_sort_badge_and_generation_identity` を追加し、Photos.pdf / Book.epub画像フォルダのfacts無しの並び・バッジ・世代変更後の非再取得を検査、真PDFのrevision不一致拒否も補強した (詳細側のPDF/EPUB判定は既に種類限定、cargo検証は未実施)。
 
 設計担当が実行する nextest filter (本作業では実行しない):
 

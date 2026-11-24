@@ -8906,6 +8906,138 @@ mod fixed_sort_control_tests {
     }
 
     #[test]
+    fn lazy_sort_popup_stops_resumes_and_hides_completed_loading_with_columns_off() {
+        use crate::settings::{SelectionInfoDisplayMode, SortOrder};
+
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            for placement in ["toolbar_sort_combo", "facet_sort_combo"] {
+                for (order, duration_facet, stop, resume) in [
+                    (
+                        SortOrder::DurationAsc,
+                        false,
+                        "長さの読み込みを停止",
+                        "長さの読み込みを再開",
+                    ),
+                    (
+                        SortOrder::PageCountAsc,
+                        false,
+                        "ページ数の読み込みを停止",
+                        "ページ数の読み込みを再開",
+                    ),
+                    (
+                        SortOrder::PageCountAsc,
+                        true,
+                        "読み込みを停止",
+                        "読み込みを再開",
+                    ),
+                ] {
+                    let mut app = crate::app::setup_app_for_test();
+                    app.settings.grid_view_mode = view;
+                    app.settings.sort_order = order;
+                    app.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
+                    app.settings.toolbar_sort_items = SortOrder::all().to_vec();
+                    app.settings.details_show_page_count = false;
+                    app.settings.details_show_created = false;
+                    app.settings.details_show_image_dimensions = false;
+                    app.settings.details_show_video_duration = false;
+                    app.settings.details_show_video_dimensions = false;
+                    app.settings.details_show_video_codec = false;
+                    app.settings.thumb_show_page_count = false;
+                    app.settings.thumb_show_media_duration = false;
+                    app.settings.thumb_show_resume_meter = false;
+                    app.settings.selection_info_display_mode = SelectionInfoDisplayMode::Hidden;
+                    app.settings.facet_filter = Default::default();
+                    app.ai_model_facet_requested = false;
+                    app.duration_facet_requested = duration_facet;
+                    app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 0 };
+                    // No sources are opened: the ordinary zero-target completion path
+                    // will publish proof after the popup resumes the metadata owner.
+                    assert!(app.items.is_empty());
+                    assert!(
+                        app.unproven_listing_meta_requirements()
+                            .contains(app.listing_meta_requirements())
+                    );
+                    let mut labels = SortOrder::all()
+                        .iter()
+                        .map(|&candidate| {
+                            app.sort_order_control_label(candidate, candidate == order)
+                        })
+                        .collect::<Vec<_>>();
+                    if placement == "facet_sort_combo" {
+                        labels.push("最新の情報に更新".to_owned());
+                    }
+                    labels.push(stop.to_owned());
+                    let app = Rc::new(RefCell::new(app));
+                    let render_app = Rc::clone(&app);
+                    let mut harness = crate::test_ui::builder()
+                        .with_size(egui::vec2(1093.0, 614.0))
+                        .with_context_setup(|ctx| {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            crate::settings::apply_ui_scale_factor(ctx, 1.5);
+                        })
+                        .build_ui(move |root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                super::apply_toolbar_style(ui);
+                                render_app
+                                    .borrow_mut()
+                                    .draw_grid_sort_dropdown(ui, placement);
+                            });
+                        });
+                    harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+                    harness.run();
+                    assert_eq!(harness.ctx.content_rect().size(), egui::vec2(1093.0, 614.0));
+                    assert!((harness.ctx.zoom_factor() - 1.5).abs() < 0.01);
+                    let popup_id =
+                        egui::Popup::current_open_id_for(&harness.ctx, egui::ViewportId::ROOT)
+                            .unwrap();
+                    let popup = harness
+                        .ctx
+                        .memory(|memory| memory.area_rect(popup_id))
+                        .unwrap();
+                    let margin = egui::Frame::popup(&harness.ctx.global_style()).total_margin();
+                    let viewport = egui::Rect::from_min_max(
+                        popup.min + egui::vec2(margin.left, margin.top),
+                        popup.max - egui::vec2(margin.right, margin.bottom),
+                    );
+                    assert!(harness.ctx.content_rect().expand(1.0).contains_rect(popup));
+                    for label in labels {
+                        let row = harness.get_by_label(&label).rect();
+                        assert!(
+                            viewport
+                                .expand(1.0 / harness.ctx.pixels_per_point())
+                                .contains_rect(row),
+                            "{view:?} / {placement} / {label}: row={row:?}, viewport={viewport:?}"
+                        );
+                    }
+                    harness.get_by_label(stop).click();
+                    harness.run();
+                    assert_eq!(
+                        app.borrow().details_image_dims_state,
+                        LazyColumnState::Cancelled
+                    );
+                    harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+                    harness.run();
+                    harness.get_by_label(resume).click();
+                    harness.run();
+                    assert_eq!(
+                        app.borrow().details_image_dims_state,
+                        LazyColumnState::NotRequested
+                    );
+                    for _ in 0..3 {
+                        app.borrow_mut().poll_details_meta_load(&harness.ctx);
+                    }
+                    assert!(app.borrow().unproven_listing_meta_requirements().is_empty());
+                    assert!(app.borrow().sort_loading_control_label().is_none());
+                    harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+                    harness.run();
+                    assert!(harness.query_by_label(stop).is_none());
+                    assert!(harness.query_by_label(resume).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn duration_facet_menu_stops_and_resumes_the_metadata_owner() {
         let mut app = crate::app::setup_app_for_test();
         app.duration_facet_requested = true;
@@ -9296,6 +9428,27 @@ impl App {
             }
         }
         description.to_string()
+    }
+
+    /// Use the same unfinished-metric predicate as the sort progress text.
+    fn sort_loading_control_label(&self) -> Option<&'static str> {
+        let selected = self
+            .effective_listing_sort_order(self.settings.sort_order)
+            .lazy_metric()?;
+        self.lazy_metric_loading_text(selected)?;
+        let requirements = self.listing_meta_requirements();
+        let resume = matches!(self.details_image_dims_state, LazyColumnState::Cancelled);
+        Some(
+            match (requirements.duration, requirements.page_count, resume) {
+                (true, true, false) => "読み込みを停止",
+                (true, true, true) => "読み込みを再開",
+                (true, false, false) => "長さの読み込みを停止",
+                (true, false, true) => "長さの読み込みを再開",
+                (false, true, false) => "ページ数の読み込みを停止",
+                (false, true, true) => "ページ数の読み込みを再開",
+                (false, false, _) => unreachable!("selected metric has unfinished progress"),
+            },
+        )
     }
 
     fn apply_sort_control_change(&mut self) {
@@ -14369,7 +14522,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let grouping_available =
             id_salt == "facet_sort_combo" && self.items_are_subfolder_expansion_view;
         let refresh_available = id_salt == "facet_sort_combo" && self.grid_sort_refresh_available();
-        let combo_enabled = !sort_disabled || grouping_available || refresh_available;
+        let loading_control = self.sort_loading_control_label();
+        let combo_enabled =
+            !sort_disabled || grouping_available || refresh_available || loading_control.is_some();
         let root_order = self.collection_grid_root_order().and_then(Result::ok);
         let tb_sorts = self.settings.toolbar_sort_items.clone();
         let mut sort_changed = false;
@@ -14384,8 +14539,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             root_order.is_some(),
             self.items_are_rating_view,
             self.items_are_bookmark_view,
-            2 * usize::from(grouping_available) + usize::from(refresh_available),
-            usize::from(grouping_available) + usize::from(refresh_available),
+            2 * usize::from(grouping_available)
+                + usize::from(refresh_available)
+                + usize::from(loading_control.is_some()),
+            usize::from(grouping_available)
+                + usize::from(refresh_available)
+                + usize::from(loading_control.is_some()),
         );
         let current_text = self.grid_sort_dropdown_text();
         // 場所を先に取ってから無効化する。逆順だと折り返しが子 UI の
@@ -14570,6 +14729,18 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         if ui.button("最新の情報に更新").clicked() {
                             reload_requested = true;
                         }
+                    }
+                }
+                if let Some(label) = loading_control {
+                    ui.separator();
+                    if ui.button(label).clicked() {
+                        if matches!(self.details_image_dims_state, LazyColumnState::Cancelled) {
+                            self.resume_details_meta_loading();
+                        } else {
+                            self.cancel_details_meta_loading();
+                        }
+                        ui.ctx().request_repaint();
+                        ui.close();
                     }
                 }
             },

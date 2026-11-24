@@ -453,23 +453,23 @@ fn page_sort_883_memory_and_worker_snapshot_match_stamp_fingerprint_and_folder_z
     let fingerprint = fingerprint(&app);
     for idx in [0, 1, 2, 3, 8] {
         let key = app.details_lazy_cache_key(idx).unwrap();
-        let path = Path::new(&key);
+        let item = &app.items[idx];
         let stamp = app.image_metas[idx].unwrap();
         let expected = ListingPageCount::Known((idx as u32 + 1) * 10);
         assert_eq!(
-            app.listing_page_count_for_path(path, stamp, fingerprint),
+            app.listing_page_count_for_item(item, stamp, fingerprint),
             Some(expected)
         );
         assert_eq!(
-            app.listing_page_count_for_path(path, (stamp.0 + 1, stamp.1), fingerprint),
+            app.listing_page_count_for_item(item, (stamp.0 + 1, stamp.1), fingerprint),
             None
         );
         assert_eq!(
-            app.listing_page_count_for_path(path, (stamp.0, stamp.1 + 1), fingerprint),
+            app.listing_page_count_for_item(item, (stamp.0, stamp.1 + 1), fingerprint),
             None
         );
         assert_eq!(
-            app.listing_page_count_for_path(path, stamp, fingerprint.wrapping_add(1)),
+            app.listing_page_count_for_item(item, stamp, fingerprint.wrapping_add(1)),
             None
         );
         let snapshot = app.listing_metadata_snapshot(fingerprint, LazyMetric::PageCount);
@@ -492,6 +492,117 @@ fn page_sort_883_memory_and_worker_snapshot_match_stamp_fingerprint_and_folder_z
 }
 
 #[test]
+fn page_sort_883_pdf_epub_named_image_folders_keep_memory_sort_badge_and_generation_identity() {
+    let mut app = fixture();
+    app.settings.thumb_show_page_count = true;
+    let root = app.tmp.path().join("extension-named-image-folders");
+    for (name, count) in [("Photos.pdf", 2), ("Book.epub", 3)] {
+        let folder = root.join(name);
+        std::fs::create_dir_all(&folder).unwrap();
+        for page in 0..count {
+            std::fs::write(folder.join(format!("{page}.jpg")), b"page count only").unwrap();
+        }
+        assert_eq!(
+            folder_scan::image_folder_page_count(
+                &folder,
+                &folder_scan::image_folder_page_count_options(&app.settings),
+            )
+            .unwrap(),
+            Some(count),
+        );
+    }
+    let scan = folder_scan::scan_directory_with_settings(&root, &app.settings).unwrap();
+    assert!(scan.page_count_facts.is_none());
+    let items = ["Photos.pdf", "Book.epub"]
+        .into_iter()
+        .map(|name| GridItem::Folder(root.join(name)))
+        .collect::<Vec<_>>();
+    let metas = items
+        .iter()
+        .map(|item| {
+            let entry = scan
+                .folders
+                .iter()
+                .find(|entry| &entry.item == item)
+                .unwrap();
+            assert_eq!(entry.sort_meta.file_size, None);
+            assert_eq!(entry.display_meta.unwrap().1, 0);
+            entry.display_meta
+        })
+        .collect();
+    app.install_new_items(items, metas);
+    for idx in 0..2 {
+        cache_pages(&mut app, idx, Some(idx as u32 + 2), false);
+        let meta = app.details_lazy_meta_for_idx(idx).unwrap();
+        assert_eq!(meta.page_count_pdf_password_revision, None);
+        assert_eq!(meta.page_count_generation, None);
+    }
+    let fingerprint = fingerprint(&app);
+    let ui = folder_scan::materialize_local_folder_listing_with_order_and_metadata(
+        &root,
+        scan.clone_for_projection(),
+        &app.settings,
+        crate::rating_sort::ListingOrderRequest::Standard(SortOrder::PageCountAsc),
+        |_| panic!("page sort must not read ratings"),
+        |_, _| panic!("page sort must not read media duration"),
+        fingerprint,
+        |item, stamp| app.listing_page_count_for_item(item, stamp, fingerprint),
+    );
+    let snapshot = app.listing_metadata_snapshot(fingerprint, LazyMetric::PageCount);
+    assert_eq!(snapshot.page_count.len(), 2);
+    let worker = folder_scan::materialize_local_folder_listing_with_order_and_metadata(
+        &root,
+        scan,
+        &app.settings,
+        crate::rating_sort::ListingOrderRequest::Standard(SortOrder::PageCountAsc),
+        |_| panic!("page sort must not read ratings"),
+        |_, _| panic!("page sort must not read media duration"),
+        fingerprint,
+        |item, (mtime, size)| {
+            let path = folder_scan::listing_page_count_path(item).unwrap();
+            snapshot
+                .page_count
+                .get(&(crate::adjustment_db::normalize_path(path), mtime, size))
+                .copied()
+        },
+    );
+    assert_eq!(ui.items, worker.items);
+    assert_eq!(ui.sort_metas, worker.sort_metas);
+    assert_eq!(ui.items[0], GridItem::Folder(root.join("Photos.pdf")));
+    assert_eq!(ui.sort_metas[0].page_count, ListingPageCount::Known(2));
+    assert_eq!(ui.sort_metas[1].page_count, ListingPageCount::Known(3));
+    assert!(ui.sort_metas.iter().all(|meta| meta.file_size.is_none()));
+
+    app.bump_items_generation();
+    for idx in 0..2 {
+        let count = idx as u32 + 2;
+        let stamp = app.image_metas[idx].unwrap();
+        assert_eq!(stamp.1, 0);
+        assert_eq!(
+            app.listing_page_count_for_item(&app.items[idx], stamp, fingerprint),
+            Some(ListingPageCount::Known(count))
+        );
+        assert_eq!(
+            app.details_page_count_value(idx),
+            Some(PageCountValue::Known(count))
+        );
+        assert_eq!(
+            app.thumbnail_page_count_text(idx),
+            Some(format!("{count}P"))
+        );
+        assert!(app.details_page_count_meta_satisfies_idx(
+            idx,
+            app.details_lazy_meta_for_idx(idx).unwrap()
+        ));
+        assert!(
+            app.details_meta_target_for_idx(idx, &HashSet::new(), false)
+                .is_none(),
+            "folder names never request EPUB generation refetch"
+        );
+    }
+}
+
+#[test]
 fn page_sort_883_epub_sort_ignores_generation_but_scan_requires_refetch() {
     let mut app = fixture();
     cache_pages(&mut app, 8, Some(42), false);
@@ -500,7 +611,7 @@ fn page_sort_883_epub_sort_ignores_generation_but_scan_requires_refetch() {
     let fingerprint = fingerprint(&app);
     app.bump_items_generation();
     assert_eq!(
-        app.listing_page_count_for_path(Path::new(&key), stamp, fingerprint),
+        app.listing_page_count_for_item(&app.items[8], stamp, fingerprint),
         Some(ListingPageCount::Known(42))
     );
     assert_eq!(
@@ -531,7 +642,7 @@ fn page_sort_883_memory_preserves_unavailable_and_rejects_unchecked_or_old_pdf_c
     for (count, failed) in [(None, false), (Some(19), true)] {
         cache_pages(&mut app, 0, count, failed);
         assert_eq!(
-            app.listing_page_count_for_path(Path::new(&key), stamp, fingerprint),
+            app.listing_page_count_for_item(&app.items[0], stamp, fingerprint),
             Some(ListingPageCount::Unavailable)
         );
         assert_eq!(
@@ -547,25 +658,30 @@ fn page_sort_883_memory_preserves_unavailable_and_rejects_unchecked_or_old_pdf_c
         .unwrap()
         .page_count_checked = false;
     assert_eq!(
-        app.listing_page_count_for_path(Path::new(&key), stamp, fingerprint),
+        app.listing_page_count_for_item(&app.items[0], stamp, fingerprint),
         None
     );
     cache_pages(&mut app, 1, Some(5), false);
     let key = app.details_lazy_cache_key(1).unwrap();
     let stamp = app.image_metas[1].unwrap();
-    app.details_lazy_meta
-        .get_mut(&key)
-        .unwrap()
-        .page_count_pdf_password_revision = None;
-    assert_eq!(
-        app.listing_page_count_for_path(Path::new(&key), stamp, fingerprint),
-        None
-    );
-    assert!(
-        !app.listing_metadata_snapshot(fingerprint, LazyMetric::PageCount)
-            .page_count
-            .contains_key(&(key, stamp.0, stamp.1))
-    );
+    let current_revision = app.details_lazy_meta[&key]
+        .page_count_pdf_password_revision
+        .unwrap();
+    for invalid_revision in [None, Some(current_revision.wrapping_add(1))] {
+        app.details_lazy_meta
+            .get_mut(&key)
+            .unwrap()
+            .page_count_pdf_password_revision = invalid_revision;
+        assert_eq!(
+            app.listing_page_count_for_item(&app.items[1], stamp, fingerprint),
+            None
+        );
+        assert!(
+            !app.listing_metadata_snapshot(fingerprint, LazyMetric::PageCount)
+                .page_count
+                .contains_key(&(key.clone(), stamp.0, stamp.1))
+        );
+    }
 }
 
 #[test]

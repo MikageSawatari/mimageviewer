@@ -4326,7 +4326,7 @@ mod page_count_listing_883_tests {
     fn materialize(
         input: ScannedDir,
         fingerprint: i64,
-        read_page: impl FnMut(&Path, (i64, i64)) -> Option<ListingPageCount>,
+        read_page: impl FnMut(&GridItem, (i64, i64)) -> Option<ListingPageCount>,
     ) -> MaterializedFolderListing {
         let mut settings = crate::settings::Settings::default();
         settings.skip_epub_if_pdf_exists = false;
@@ -4416,7 +4416,8 @@ mod page_count_listing_883_tests {
             ("duration-kept".into(), 7, 10),
             ListingDuration::Known(1000),
         );
-        let read = |memory: &FolderListingMetadataSnapshot, path: &Path, (mtime, size)| {
+        let read = |memory: &FolderListingMetadataSnapshot, item: &GridItem, (mtime, size)| {
+            let path = listing_page_count_path(item).unwrap();
             memory
                 .page_count
                 .get(&(crate::adjustment_db::normalize_path(path), mtime, size))
@@ -4481,7 +4482,8 @@ mod page_count_listing_883_tests {
             if stale {
                 input.page_count_facts = Some(facts());
             }
-            let listing = materialize(input, FINGERPRINT + 1, |path, stamp| {
+            let listing = materialize(input, FINGERPRINT + 1, |item, stamp| {
+                let path = listing_page_count_path(item).unwrap();
                 assert_eq!(stamp.0, 7);
                 if path.file_name().unwrap() == "images" {
                     assert_eq!(stamp.1, 0);
@@ -4508,7 +4510,8 @@ mod page_count_listing_883_tests {
     fn page_count_883_unavailable_memory_overrides_known_catalog_value() {
         let mut input = scan();
         input.page_count_facts = Some(facts());
-        let listing = materialize(input, FINGERPRINT, |path, _| {
+        let listing = materialize(input, FINGERPRINT, |item, _| {
+            let path = listing_page_count_path(item).unwrap();
             (path.file_name().unwrap() == "memory.zip").then_some(ListingPageCount::Unavailable)
         });
         let meta = listing
@@ -4574,8 +4577,8 @@ mod page_count_listing_883_tests {
                 |_| panic!("page order must not read ratings"),
                 |_, _| panic!("page order must not read duration"),
                 options.fingerprint,
-                |path, received_stamp| {
-                    assert_eq!(path, images.as_path());
+                |item, received_stamp| {
+                    assert_eq!(item, &GridItem::Folder(images.clone()));
                     assert_eq!(received_stamp, stamp);
                     from_memory.then_some(ListingPageCount::Known(2))
                 },

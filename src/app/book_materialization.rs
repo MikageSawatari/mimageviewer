@@ -511,10 +511,7 @@ pub(crate) fn materialize_local_folder_listing_with_order_and_metadata(
         crate::settings::ListingSortMetadata,
     ) -> Option<crate::settings::ListingDuration>,
     page_count_fingerprint: i64,
-    mut read_page_count: impl FnMut(
-        &std::path::Path,
-        (i64, i64),
-    ) -> Option<crate::settings::ListingPageCount>,
+    mut read_page_count: impl FnMut(&GridItem, (i64, i64)) -> Option<crate::settings::ListingPageCount>,
 ) -> MaterializedFolderListing {
     let mut scan = scan;
     let precise_stamps = std::mem::take(&mut scan.precise_stamps);
@@ -535,10 +532,10 @@ pub(crate) fn materialize_local_folder_listing_with_order_and_metadata(
     for mut entry in scan.folders {
         entry.sort_meta.page_count = crate::settings::ListingPageCount::Missing;
         if page_count_sort
-            && let Some(book_path) = super::folder_scan::listing_page_count_path(&entry.item)
+            && super::folder_scan::listing_page_count_path(&entry.item).is_some()
             && let Some(stamp) = entry.display_meta
         {
-            entry.sort_meta.page_count = read_page_count(book_path, stamp)
+            entry.sort_meta.page_count = read_page_count(&entry.item, stamp)
                 .filter(|value| *value != crate::settings::ListingPageCount::Missing)
                 .or_else(|| {
                     page_count_facts

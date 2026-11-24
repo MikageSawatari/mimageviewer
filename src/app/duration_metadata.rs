@@ -316,12 +316,13 @@ impl App {
 
     /// Sorting a new listing uses the request's identity, unlike the last-value display accessor.
     /// EPUB generation only triggers refetching; it does not invalidate a matching memory value.
-    pub(super) fn listing_page_count_for_path(
+    pub(super) fn listing_page_count_for_item(
         &self,
-        path: &Path,
+        item: &GridItem,
         stamp: (i64, i64),
         fingerprint: i64,
     ) -> Option<ListingPageCount> {
+        let path = folder_scan::listing_page_count_path(item)?;
         let key = crate::adjustment_db::normalize_path(path);
         let meta = self.details_lazy_meta.get(&key)?;
         if !meta.matches_source(Some(stamp))
@@ -330,10 +331,7 @@ impl App {
         {
             return None;
         }
-        if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf") || ext.eq_ignore_ascii_case("epub"))
+        if matches!(item, GridItem::PdfFile(_))
             && meta.page_count_pdf_password_revision
                 != Some(self.pdf_passwords.credential_revision(path))
         {
@@ -383,7 +381,7 @@ impl App {
                     _ => continue,
                 };
                 if let Some(value) =
-                    self.listing_page_count_for_path(path, (mtime, size), fingerprint)
+                    self.listing_page_count_for_item(item, (mtime, size), fingerprint)
                 {
                     values.page_count.insert(
                         (crate::adjustment_db::normalize_path(path), mtime, size),
