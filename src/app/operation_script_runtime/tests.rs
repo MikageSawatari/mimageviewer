@@ -61,6 +61,77 @@ fn script_slot_number_covers_the_twenty_global_actions_only() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn browser_repeat_main_grid_consumer_rejects_slots_but_keeps_normal_navigation() {
+    let _serial = crate::key_input::lock_test_input();
+    for forward in [false, true] {
+        for (script, repeat) in [(true, false), (true, true), (false, true)] {
+            let ctx = egui::Context::default();
+            let mut app = grid_app(r#"["GridColumnCount4"]"#);
+            let assignment = if script {
+                crate::ring_shortcut::RingActionId::ScriptSlot1
+            } else {
+                crate::ring_shortcut::RingActionId::OpenLocationDriveList
+            };
+            app.settings.ring_shortcuts.mouse_buttons_grid.back = assignment.clone();
+            app.settings.ring_shortcuts.mouse_buttons_grid.forward = assignment;
+            crate::take_pending_mouse_nav();
+            crate::inject_browser_keydown_for_test(forward, repeat);
+            let _ = ctx
+                .run_pass(egui::RawInput::default(), |ctx| {
+                    let nav = app.handle_keyboard(ctx);
+                    if script {
+                        assert!(nav.is_none());
+                    } else {
+                        assert!(matches!(
+                            nav,
+                            Some(AddressBarNav::LocationJump(
+                                crate::ui_main::LocationJumpTarget::DriveList
+                            ))
+                        ));
+                    }
+                })
+                .drop_without_applying_deltas();
+            assert_eq!(
+                app.settings.grid_cols,
+                if script && !repeat { 4 } else { 2 }
+            );
+            crate::key_input::clear_test_frame();
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn browser_mixed_batch_runs_script_once_and_later_repeats_do_not_run_it() {
+    let _serial = crate::key_input::lock_test_input();
+    for forward in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = grid_app(r#"["GridToggleDetailsView"]"#);
+        app.settings.ring_shortcuts.mouse_buttons_grid.back =
+            crate::ring_shortcut::RingActionId::ScriptSlot1;
+        app.settings.ring_shortcuts.mouse_buttons_grid.forward =
+            crate::ring_shortcut::RingActionId::ScriptSlot1;
+        crate::take_pending_mouse_nav();
+        for repeats_only in [false, true] {
+            crate::inject_browser_keydown_for_test(forward, repeats_only);
+            crate::inject_browser_keydown_for_test(forward, true);
+            let _ = ctx
+                .run_pass(egui::RawInput::default(), |ctx| {
+                    assert!(app.handle_keyboard(ctx).is_none());
+                })
+                .drop_without_applying_deltas();
+            assert_eq!(
+                app.settings.grid_view_mode,
+                crate::settings::GridViewMode::Details,
+                "mixed input toggles exactly once; a later repeat-only batch never toggles"
+            );
+            crate::key_input::clear_test_frame();
+        }
+    }
+}
+
 #[test]
 fn eligibility_prioritizes_owner_then_input_remote_and_enabled_before_loader_state() {
     let ready = ready("[]");
@@ -415,6 +486,96 @@ fn rebase_returns_to_caller_and_keeps_interruption_notice_over_script_notice() {
     ));
     assert_eq!(app.fs_transparent_bg_mode, 0);
     assert!(toast(&app).contains("残りの操作を中止"));
+}
+
+#[test]
+fn delegated_book_permission_returns_and_discards_remaining_script_actions() {
+    let mut app =
+        grid_app(r#"#{run:["FsSpreadLtr","FsBgCycle"],notice:"must not replace warning"}"#);
+    let pdf = app.tmp.path().join("permission-book.pdf");
+    app.items = (0..2)
+        .map(|page_num| GridItem::PdfPage {
+            pdf_path: pdf.clone(),
+            page_num,
+            content_type: None,
+        })
+        .collect();
+    app.fullscreen_idx = Some(1);
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    app.spread_mode = crate::settings::SpreadMode::Single;
+    let (service, owner) = crate::book_composition::BookCompositionService::spawn_at(
+        app.tmp.path().join("script-permission-data"),
+        None,
+    )
+    .unwrap();
+    let scope = crate::book_scope::BookScopeKey::document(&pdf).unwrap();
+    service
+        .prepare(scope.clone(), crate::book_composition::PageDomain::Document)
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .status
+        .unwrap();
+    let candidate = app.presentation_candidate(0).unwrap();
+    assert!(
+        crate::book_composition::permission_without_composition(&service.snapshot(), &candidate,)
+            .is_some()
+    );
+    let record = crate::book_composition::BookComposition::new(
+        crate::book_composition::ReadingDirection::Ltr,
+        (0..2)
+            .map(crate::book_composition::fixtures::document_page)
+            .collect(),
+    );
+    service
+        .save(
+            scope.clone(),
+            crate::book_composition::PageDomain::Document,
+            record,
+        )
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap()
+        .status
+        .unwrap();
+    // Ordinary lists can prove an absent composition synchronously. A stored
+    // record requires the real candidate check instead of that snapshot shortcut.
+    assert!(service.snapshot().rows.contains_key(&scope.storage_key()));
+    assert!(
+        crate::book_composition::permission_without_composition(&service.snapshot(), &candidate,)
+            .is_none()
+    );
+    app.install_book_composition_runtime(service);
+    let result = app.run_script_slot(
+        &egui::Context::default(),
+        1,
+        ScriptInputSurface::Viewer,
+        false,
+    );
+    assert!(
+        matches!(
+            result,
+            ScriptRunResult::Fullscreen {
+                rejected: false,
+                delegated: true,
+                ..
+            }
+        ),
+        "pending={}, idx={:?}, spread={:?}, feedback={:?}",
+        app.operation_script_fullscreen_transition_pending(),
+        app.fullscreen_idx,
+        app.spread_mode,
+        app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+    );
+    assert!(app.operation_script_fullscreen_transition_pending());
+    assert!(!app.pending_book_target_demand_for_test().is_empty());
+    assert_eq!(
+        app.fullscreen_idx,
+        Some(1),
+        "permission owns the pending open"
+    );
+    assert_eq!(app.fs_transparent_bg_mode, 0);
+    assert!(toast(&app).contains("残りの操作を中止"));
+    assert!(!toast(&app).contains("must not replace warning"));
+    owner.shutdown_and_join();
 }
 
 #[test]

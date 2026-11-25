@@ -8009,7 +8009,18 @@ impl App {
         surface: crate::app::ActionSurface,
         source: &'static str,
     ) -> Option<AddressBarNav> {
-        self.apply_mouse_button(
+        self.apply_mouse_back_forward_button_with_repeat(ctx, forward, surface, source, false)
+    }
+
+    pub(crate) fn apply_mouse_back_forward_button_with_repeat(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+        surface: crate::app::ActionSurface,
+        source: &'static str,
+        repeat: bool,
+    ) -> Option<AddressBarNav> {
+        self.dispatch_mouse_button_with_repeat(
             ctx,
             if forward {
                 MouseButtonSlot::Forward
@@ -8018,7 +8029,9 @@ impl App {
             },
             surface,
             source,
+            repeat,
         )
+        .navigation
     }
 
     pub(crate) fn update_mouse_middle_short_click(
@@ -8118,6 +8131,19 @@ impl App {
         surface: crate::app::ActionSurface,
         source: &'static str,
     ) -> MouseButtonDispatchResult {
+        self.dispatch_mouse_button_with_repeat(ctx, slot, surface, source, false)
+    }
+
+    /// Browser-key repeats keep their normal assignment behavior, but may not
+    /// start a script. Resolve the assignment before applying that distinction.
+    pub(crate) fn dispatch_mouse_button_with_repeat(
+        &mut self,
+        ctx: &egui::Context,
+        slot: MouseButtonSlot,
+        surface: crate::app::ActionSurface,
+        source: &'static str,
+        repeat: bool,
+    ) -> MouseButtonDispatchResult {
         self.note_input_surface(surface);
         let context = self.ring_shortcut_context_for_surface(surface);
         let action = self
@@ -8125,6 +8151,9 @@ impl App {
             .ring_shortcuts
             .mouse_button_profile(context)
             .action(slot);
+        if repeat && action.script_slot_key_action().is_some() {
+            return MouseButtonDispatchResult::default();
+        }
         if !action.is_valid_for_mouse_button_context(context) {
             crate::logger::log(format!(
                 "[input-nav] source={source} ignored invalid mouse button action={} context={context:?}",
@@ -9184,11 +9213,9 @@ impl App {
                     return None;
                 }
                 let fs_idx = self.fullscreen_idx?;
-                if let ScriptRunResult::Fullscreen { action, .. } =
-                    self.run_script_slot(ctx, slot, ScriptInputSurface::Viewer, false)
-                {
-                    self.finish_fullscreen_key_action(ctx, fs_idx, action);
-                }
+                let mut action = crate::ui_fullscreen::FsKeyAction::default();
+                self.run_fullscreen_script_slot_for_action(ctx, slot, &mut action, &mut None);
+                self.finish_fullscreen_key_action(ctx, fs_idx, action);
                 None
             }
             RingShortcutContext::VideoFullscreen => {
@@ -15282,6 +15309,102 @@ mod script_slot_assignment_stage_tests {
                 "fn slots() {{ [#{{slot:1,label:\"test\",run:\"run\"}}] }} fn run(s) {{ [\"{operation}\"] }}"
             )).unwrap(),
         ));
+    }
+
+    #[test]
+    fn browser_mouse_grid_script_assignment_rejects_only_repeat_press() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..3)
+            .map(|i| crate::grid_item::GridItem::Image(format!("C:/browser-repeat/{i}.png").into()))
+            .collect();
+        app.visible_indices = vec![0, 1, 2];
+        app.current_folder = Some("C:/browser-repeat".into());
+        install_script(&mut app, "GridMoveLast");
+        app.settings.ring_shortcuts.mouse_buttons_grid.back = RingActionId::ScriptSlot1;
+        app.settings.ring_shortcuts.mouse_buttons_grid.forward = RingActionId::ScriptSlot1;
+
+        for slot in [MouseButtonSlot::Back, MouseButtonSlot::Forward] {
+            for repeat in [true, false, true] {
+                app.selected = Some(1);
+                let result = app.dispatch_mouse_button_with_repeat(
+                    &ctx,
+                    slot,
+                    crate::app::ActionSurface::MainWindow,
+                    "browser-grid-script-repeat-test",
+                    repeat,
+                );
+                assert!(result.navigation.is_none());
+                assert_eq!(
+                    result.dispatched_action,
+                    (!repeat).then_some(RingActionId::ScriptSlot1)
+                );
+                assert_eq!(app.selected, Some(if repeat { 1 } else { 2 }));
+            }
+        }
+        app.selected = Some(1);
+        app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::ScriptSlot1,
+            "browser-grid-script-ring-test",
+        );
+        assert_eq!(app.selected, Some(2), "ring input remains an initial press");
+    }
+
+    #[test]
+    fn browser_mouse_grid_normal_assignment_keeps_repeat_navigation() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.ring_shortcuts.mouse_buttons_grid.back = RingActionId::OpenLocationDriveList;
+        app.settings.ring_shortcuts.mouse_buttons_grid.forward =
+            RingActionId::OpenLocationDriveList;
+        for forward in [false, true] {
+            for repeat in [false, true] {
+                let nav = app.apply_mouse_back_forward_button_with_repeat(
+                    &ctx,
+                    forward,
+                    crate::app::ActionSurface::MainWindow,
+                    "browser-grid-normal-repeat-test",
+                    repeat,
+                );
+                assert!(matches!(
+                    nav,
+                    Some(AddressBarNav::LocationJump(
+                        crate::ui_main::LocationJumpTarget::DriveList
+                    ))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn browser_mouse_fullscreen_script_repeat_does_not_return_a_request() {
+        let ctx = egui::Context::default();
+        let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+            &ctx,
+            crate::settings::SpreadMode::Single,
+        );
+        install_script(&mut app, "FsClose");
+        app.settings.ring_shortcuts.mouse_buttons_image.back = RingActionId::ScriptSlot1;
+        app.settings.ring_shortcuts.mouse_buttons_image.forward = RingActionId::ScriptSlot1;
+        for slot in [MouseButtonSlot::Back, MouseButtonSlot::Forward] {
+            for repeat in [true, false] {
+                let result = app.dispatch_mouse_button_with_repeat(
+                    &ctx,
+                    slot,
+                    crate::app::ActionSurface::Viewer,
+                    "browser-image-script-repeat-test",
+                    repeat,
+                );
+                assert_eq!(result.script_slot, (!repeat).then_some(1));
+                assert_eq!(
+                    result.dispatched_action,
+                    (!repeat).then_some(RingActionId::ScriptSlot1)
+                );
+                assert_eq!(app.fullscreen_idx, Some(0));
+            }
+        }
     }
 
     #[test]

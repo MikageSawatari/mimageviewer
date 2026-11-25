@@ -20482,6 +20482,66 @@ pub(crate) struct FsKeyAction {
     pub(crate) music_ctrl_wheel_gate_reached: bool,
 }
 
+impl FsKeyAction {
+    fn has_navigation_request(&self) -> bool {
+        self.close
+            || self.close_to_page_list
+            || !self.page_nav.is_none()
+            || self.ctrl_nav.is_some()
+            || self.list_order_nav.is_some()
+            || self.sibling_nav.is_some()
+            || self.mouse_nav.is_some()
+            || self.jump_to.is_some()
+    }
+
+    pub(crate) fn navigation_already_accepted(&self) -> bool {
+        self.has_navigation_request() || self.page_transition != FsKeyPageTransition::Unchanged
+    }
+
+    /// Merge only the script's postprocessing, preserving the earlier input's request
+    /// and its operation identity. Empty or rejected runs have nothing to replace.
+    pub(crate) fn merge_script_action(
+        &mut self,
+        script: Self,
+        navigation_operation: &mut Option<ViewerOperationId>,
+    ) {
+        if self.page_transition == FsKeyPageTransition::Closed {
+            *navigation_operation = None;
+            return;
+        }
+        if !self.has_navigation_request() {
+            *navigation_operation = None;
+        }
+        self.music_ctrl_wheel_gate_reached |= script.music_ctrl_wheel_gate_reached;
+        if script.page_transition != FsKeyPageTransition::Unchanged {
+            self.page_transition = script.page_transition;
+        }
+        if self.page_transition == FsKeyPageTransition::Closed {
+            // Closed is an already-completed transition, never a second close request.
+            self.close = false;
+            self.close_to_page_list = false;
+            self.page_nav = FsPageNavRequest::default();
+            self.ctrl_nav = None;
+            self.list_order_nav = None;
+            self.sibling_nav = None;
+            self.mouse_nav = None;
+            self.jump_to = None;
+            *navigation_operation = None;
+        } else if !self.has_navigation_request() && script.has_navigation_request() {
+            self.close = script.close;
+            self.close_to_page_list = script.close_to_page_list;
+            self.page_nav = script.page_nav;
+            self.ctrl_nav = script.ctrl_nav;
+            self.list_order_nav = script.list_order_nav;
+            self.sibling_nav = script.sibling_nav;
+            self.mouse_nav = script.mouse_nav;
+            self.jump_to = script.jump_to;
+            // A script request has no key/pointer operation of its own.
+            *navigation_operation = None;
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct FsSeekInfo {
     image_indices: Arc<Vec<usize>>,
@@ -34929,17 +34989,12 @@ impl App {
         );
 
         if let Some(slot) = key_action.script_slot.take() {
-            if let crate::app::operation_script_runtime::ScriptRunResult::Fullscreen {
-                action,
-                ..
-            } = self.run_script_slot(
+            self.run_fullscreen_script_slot_for_action(
                 ctx,
                 slot,
-                crate::app::operation_script_runtime::ScriptInputSurface::Viewer,
-                false,
-            ) {
-                key_action = action;
-            }
+                &mut key_action,
+                &mut navigation_operation,
+            );
         }
         self.finish_fullscreen_key_action_with_operation(
             ctx,
@@ -34948,6 +35003,32 @@ impl App {
             navigation_operation,
         );
         true
+    }
+
+    /// Shared by root fallback and other confirmed before-render script entries.
+    /// Drawing owners can use the same action merge after validating their extra
+    /// pass-local navigation facts at their own execution boundary.
+    pub(crate) fn run_fullscreen_script_slot_for_action(
+        &mut self,
+        ctx: &egui::Context,
+        slot: u8,
+        key_action: &mut FsKeyAction,
+        navigation_operation: &mut Option<ViewerOperationId>,
+    ) {
+        if key_action.page_transition == FsKeyPageTransition::Closed {
+            *navigation_operation = None;
+            return;
+        }
+        if let crate::app::operation_script_runtime::ScriptRunResult::Fullscreen {
+            action, ..
+        } = self.run_script_slot(
+            ctx,
+            slot,
+            crate::app::operation_script_runtime::ScriptInputSurface::Viewer,
+            key_action.navigation_already_accepted(),
+        ) {
+            key_action.merge_script_action(action, navigation_operation);
+        }
     }
 
     /// Finish an action collected before drawing through the ordinary root dispatcher.
@@ -36429,7 +36510,7 @@ impl App {
         // マウスドライバ / AHK 経由で積まれた進む/戻る pending は **early-return より前に
         // drain** する。フォーカス無し / モーダル表示中で早期 return すると pending が
         // 次フレームに持ち越されて誤発火するため (Codex P2)。ブロック中は count を捨てる。
-        let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
+        let (browser_back_presses, browser_forward_presses) = crate::take_pending_mouse_nav();
         let owner = self.keyboard_owner_for_pass(ctx);
         let fullscreen_raw_key_permit = owner.fullscreen_raw_key_permit();
         let input_permits = crate::keyboard_input::keyboard_input_permits(ctx);
@@ -37474,8 +37555,8 @@ impl App {
             && ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2));
         // WM_APPCOMMAND / VK_BROWSER_BACK/FORWARD 経路 (上で関数頭で drain 済み) を消費。
         // 詳細は main.rs の `install_mouse_nav_hook` 参照。
-        let browser_back = navigation_allowed && has_focus && browser_back_count > 0;
-        let browser_forward = navigation_allowed && has_focus && browser_forward_count > 0;
+        let browser_back = navigation_allowed && has_focus && browser_back_presses.count > 0;
+        let browser_forward = navigation_allowed && has_focus && browser_forward_presses.count > 0;
         // 音声も「映像なし動画」として動画と同じ前/次ファイルキー (VideoPrevFile/NextFile =
         // 既定 plain ↑↓) を共有する (ユーザー確定 2026-07-03: 操作カスタマイズ上は動画フルスクリーン
         // と音声を共通スコープ扱い)。音声は 7837 の早期 return で modal/IME/TextEdit フォーカス中は
@@ -38942,15 +39023,22 @@ impl App {
         let mouse_nav_forward = mouse_forward || browser_forward;
         let mouse_nav_back = mouse_back || browser_back;
         if mouse_nav_forward || mouse_nav_back {
-            let result = self.dispatch_mouse_button(
+            let forward = mouse_nav_forward;
+            let has_non_repeat = if forward {
+                mouse_forward || browser_forward_presses.has_non_repeat
+            } else {
+                mouse_back || browser_back_presses.has_non_repeat
+            };
+            let result = self.dispatch_mouse_button_with_repeat(
                 ctx,
-                if mouse_nav_forward {
+                if forward {
                     crate::ring_shortcut::MouseButtonSlot::Forward
                 } else {
                     crate::ring_shortcut::MouseButtonSlot::Back
                 },
                 crate::app::ActionSurface::Viewer,
                 "fullscreen-egui-mouse",
+                !has_non_repeat,
             );
             action.mouse_nav = result.navigation;
             action.script_slot = result.script_slot;
@@ -104773,3 +104861,7 @@ mod operation_script_fullscreen_tests {
 
 #[cfg(all(test, windows))]
 mod conceal_preview_tests;
+
+#[cfg(test)]
+#[path = "ui_fullscreen/operation_script_merge_tests.rs"]
+mod operation_script_merge_tests;

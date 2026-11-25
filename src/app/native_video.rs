@@ -13184,20 +13184,22 @@ impl App {
             // keystroke として届くケース (mouse driver や AutoHotkey が変換する経路)、または
             // 上で WM_APPCOMMAND を合成 KeyDown に変換した経路。マウス戻る/進む設定を通す。
             0xA6 => {
-                self.mouse_ring_nav = self.apply_mouse_back_forward_button(
+                self.mouse_ring_nav = self.apply_mouse_back_forward_button_with_repeat(
                     ctx,
                     false,
                     crate::app::ActionSurface::Viewer,
                     "native-video-key",
+                    key.repeat,
                 );
                 NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::MouseBack)
             }
             0xA7 => {
-                self.mouse_ring_nav = self.apply_mouse_back_forward_button(
+                self.mouse_ring_nav = self.apply_mouse_back_forward_button_with_repeat(
                     ctx,
                     true,
                     crate::app::ActionSurface::Viewer,
                     "native-video-key",
+                    key.repeat,
                 );
                 NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::MouseForward)
             }

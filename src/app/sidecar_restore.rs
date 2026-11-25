@@ -1685,8 +1685,32 @@ impl App {
         viewer_adoption: super::ViewerOpenAdoption,
         landing: Option<crate::ui_fullscreen::FsPageLanding>,
     ) -> bool {
+        self.defer_sidecar_restore_fullscreen_with_admission(
+            idx,
+            trigger,
+            requested_materialization,
+            load_contract,
+            metadata_boundary,
+            resume_notice,
+            viewer_adoption,
+            landing,
+        )
+        .handled
+    }
+
+    pub(super) fn defer_sidecar_restore_fullscreen_with_admission(
+        &mut self,
+        idx: usize,
+        trigger: HistoryTrigger,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
+        metadata_boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: super::ViewerOpenAdoption,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> super::ActionRouteResult {
         if self.sidecar_restore.is_none() {
-            return false;
+            return super::ActionRouteResult::new(false, super::ActionAdmission::Rejected);
         }
         let context = self.sidecar_restore_projected_context();
         let generation = self.items_generation;
@@ -1746,7 +1770,7 @@ impl App {
         }
         // Active means every fullscreen mutation is consumed. Only an exact target request is
         // retained above; an invalid/sibling request must not fall through to raw/final/video work.
-        true
+        super::ActionRouteResult::new(true, super::ActionAdmission::from_accepted(accepted))
     }
 
     /// A chosen Rating landing is the reader endpoint while its exact owner prepares it.

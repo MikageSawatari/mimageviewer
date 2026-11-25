@@ -795,8 +795,8 @@ fn tag_list_order_blocked_item_keyboard_tree_and_sibling_use_result_order() {
         app.handle_stack_refresh_keyboard(
             &ctx,
             true,
-            0,
-            0,
+            Default::default(),
+            Default::default(),
             crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan,
         );
         ctx.end_pass().drop_without_applying_deltas();

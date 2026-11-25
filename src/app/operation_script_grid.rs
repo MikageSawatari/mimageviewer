@@ -118,24 +118,21 @@ impl App {
         }
         match action {
             KeyAction::GridParentFolder => {
-                return result(
-                    if self.grid_item_input_block().is_some() {
-                        self.handle_stack_refresh_parent_action()
-                    } else {
-                        self.handle_grid_parent_folder_action()
-                    },
-                    false,
-                );
+                let (nav, admission) = if self.grid_item_input_block().is_some() {
+                    self.handle_stack_refresh_parent_action_with_admission()
+                } else {
+                    self.handle_grid_parent_folder_action_with_admission()
+                };
+                return result(nav, admission == super::ActionAdmission::Rejected);
             }
             KeyAction::GridHistoryBack | KeyAction::GridHistoryForward => {
-                return result(
-                    self.history_key_navigation(if action == KeyAction::GridHistoryBack {
-                        super::FolderHistoryDirection::Back
-                    } else {
-                        super::FolderHistoryDirection::Forward
-                    }),
-                    false,
-                );
+                let nav = self.history_key_navigation(if action == KeyAction::GridHistoryBack {
+                    super::FolderHistoryDirection::Back
+                } else {
+                    super::FolderHistoryDirection::Forward
+                });
+                let rejected = nav.is_none();
+                return result(nav, rejected);
             }
             _ => {}
         }
@@ -185,10 +182,12 @@ impl App {
                 result(None, false)
             }
             KeyAction::GridOpenSelected => {
-                if self.selected.and_then(|idx| self.items.get(idx)).is_none() {
-                    return result(None, true);
-                }
-                result(self.execute_grid_open_selected(ctx, false), false)
+                let opened = self.execute_grid_open_selected(ctx, false);
+                let nav = match opened.flow {
+                    std::ops::ControlFlow::Break(nav) => nav,
+                    std::ops::ControlFlow::Continue(()) => None,
+                };
+                result(nav, opened.admission == super::ActionAdmission::Rejected)
             }
             KeyAction::GridCopyPath | KeyAction::GridCopyFileName | KeyAction::GridCopyImage => {
                 let accepted = self.execute_copy_key_action(ctx, action);

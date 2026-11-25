@@ -269,10 +269,14 @@ mIV の外の状態の読み取り。スクリプトにできるのは「状態�
   受けたら `App::run_script_slot` を呼び、返った結果をその場所の既存の後処理へ渡す (§5.2)。
 - **自動繰り返しの押下では起動しない**。egui の経路は `consume_action_no_repeat`、native は `!key.repeat`。
   repeat の情報が入口で分かるうちに拒否し、`run_script_slot` へは渡さない。
-- native 動画のマウスの戻る/進む (VK `0xA6` / `0xA7`) は、今は repeat を拒否せずマウスの割り当てへ渡し、
-  `apply_ring_action` に着いた時点では repeat の情報が無い (`native_video.rs:13186`・`13195`、レビュー r2 P2-7)。
-  この分岐で、割り当てが `ScriptSlot*` に解決される場合だけ、repeat の押下を拒否する。通常のナビゲーションの
-  割り当ての扱いは変えない。XButton の経路 (`WM_XBUTTON`、§1.2) は押下ごとに 1 回で repeat を持たない。
+- 一覧と画像の全画面の Browser キー (VK `0xA6` / `0xA7`) は、フックで受ける
+  `WM_KEYDOWN` / `WM_SYSKEYDOWN` の lParam bit 30 から repeat を判別する。方向ごとの押下件数と
+  「繰り返しでない押下があったか」を同じ atomic に積み、一緒に取り出して割り当ての解決まで運ぶ。
+  一覧の更新中の制限付きキー処理も同じ値を使う。割り当てが `ScriptSlot*` に解決された場合だけ、
+  繰り返しの押下だけの入力を拒否する。通常の戻る/進むの割り当ては、繰り返しによる連続移動を維持する。
+  native 動画の同じ Browser キーも `key.repeat` を同じ割り当ての解決へ渡す (スクリプトの実行の配線は段 3)。
+  `WM_APPCOMMAND` は repeat のフラグを持たず、受けたメッセージごとに 1 回の押下として扱う。
+  XButton の経路 (`WM_XBUTTON`、§1.2) も押下ごとに 1 回で repeat を持たない。
   ダブルクリックが 2 回分になるのは既存の仕様で、スクリプトでも 2 回起動する (既知の制限に足す)。
   押し続けの繰り返し (`tick_native_video_mouse_seek_holds`) は動画のシークの操作だけが対象で、`ScriptSlot*` には
   働かない (`native_video.rs:16138`)。
@@ -641,6 +645,11 @@ Rust 側の表に「操作・種別・イベント可か・実行関数」を持
       拒否する** (§5.3 の 7)。A・D・E だけの並びはそのまま実行する。
     - **結果の扱い**: 返った `FsKeyAction` の移動の要求を、所有 pass のローカルの移動の要求の変数に合流させ、
       描画の後の既存の dispatcher (`31518`) が 1 回だけ処理する。
+      共通の合流は `FsKeyAction::merge_script_action`。ROOT の予備経路と描画前のリングは
+      `run_fullscreen_script_slot_for_action` から呼び、段 2b の所有 pass の末尾でも同じ合流を使う。
+      既存の移動・閉じる・`Rebased` を含む遷移は `navigation_already_accepted` で実行前に伝える。
+      拒否・空の結果は既存の要求を変えず、既存の移動があればその要求と `navigation_operation` を保つ。
+      新しくスクリプトだけが作った移動には元のキーの operation を付けない。
       - `Closed` は「既に閉じた」結果で、閉じる要求ではない (r7 レビュー P1)。レーティングの変更で表示対象が
         無くなった場合などは、専用の終了の処理を済ませてから `Closed` を返す (`ui_fullscreen.rs:37390`、
         `rating_membership_ops.rs:477`)。キー処理と ROOT 側の予備経路と同じく、そのフレームの移動の候補を捨て、
@@ -665,6 +674,9 @@ Rust 側の表に「操作・種別・イベント可か・実行関数」を持
   - 操作の結果が「何も後処理が要らない」以外 (描画の準備し直し `Rebased`、閉じた `Closed`、移動の要求、
     `AddressBarNav`、遷移を委ねた) なら、**そこで並びを終え、その結果を呼び出し元へ返す**。残りがあれば捨てて
     通知する。呼び出し元はキーのときと同じ後処理をする (最後の B/C は、既存の移動の dispatcher へ渡るだけ)。
+  - 一覧の共用の開く処理は、キー処理の早期 return (`ControlFlow`) と受付 (`ActionAdmission`) を分けて返す。
+    既存の非同期の所有者へ要求を渡せた場合は受付、履歴の guard や参照先の不存在などの即時の拒否は拒否。
+    Enter は従来の制御だけを使い、スクリプトは受付を確かめ、拒否なら完了の `notice` を出さない。
   - 後処理の要らない操作の後には、対象 (文脈・論理的な場所・表示単位または選択の型付きの識別・一覧の
     チェックした項目の集合) を写しのときの値と比べ、違えば残りを捨てて通知する。比べる値は
     `run_script_slot` の中のローカルな値で、状態としては持たない。
@@ -686,11 +698,11 @@ Rust 側の表に「操作・種別・イベント可か・実行関数」を持
 | パッド X リング: `finish_gamepad_west_release` → `trigger_gamepad_ring_action` → `execute_right_drag_command_before_fullscreen_render` | 描画前。main update または取り付け済み context の更新 | 一覧は `Grid`、画像は `Viewer` で即時実行。画像の結果は `finish_fullscreen_key_action` に渡す | 動画・音声の実行は段 3 |
 | 持ち越した別ウィンドウの右ドラッグ: `update_active_viewer_context` → `execute_pending_right_drag_command_in_mounted_context` → `execute_right_drag_command_before_fullscreen_render` | 描画前。既存の取り付け済み context | 共通の利用資格へ渡し、別ウィンドウの viewer は拒否。取り付け・寿命は変更しない | 段 2b の描画内実行には使わない |
 | 一覧の右ドラッグ: `ui_main` の `update_grid_mouse_ring_flick_at` → 位置付きリング / ジェスチャー更新 → `dispatch_right_drag_recognition` → `execute_right_drag_command` | 一覧の描画中。ROOT の一覧面 | `Grid` で即時実行し、戻った `AddressBarNav` を既存の `mouse_ring_nav` へ渡す | 一覧には全画面の後処理問題はない |
-| 一覧の戻る / 進む / 中ボタン: `handle_keyboard` (一覧更新中は `handle_stack_refresh_keyboard`) → `apply_mouse_button` / `apply_mouse_back_forward_button` → `dispatch_mouse_button` | 一覧のキー処理中。ROOT の一覧面 | `Grid` で即時実行し、戻り値の `navigation` をそのまま返す | 同上 |
-| 画像・egui メディアの戻る / 進む: `handle_fs_key_input_with_operation` → `dispatch_mouse_button` | `render_fs_body` の準備後。または ROOT の予備キー処理と共用 | `MouseButtonDispatchResult.script_slot` を `FsKeyAction.script_slot` へ返す。ROOT の予備経路だけは既存のキー要求と同じく描画前に実行して後処理する | 通常・転送の描画内キー処理は、段 2b で所有 pass のローカル要求へ合流。段 2a では実行しない |
+| 一覧の戻る / 進む / 中ボタン: `handle_keyboard` (一覧更新中は `handle_stack_refresh_keyboard`) → `apply_mouse_button` / `apply_mouse_back_forward_button_with_repeat` → `dispatch_mouse_button_with_repeat` | 一覧のキー処理中。ROOT の一覧面 | `Grid` で即時実行し、戻り値の `navigation` をそのまま返す。Browser キーの非repeatの事実を割り当ての解決まで渡す | 同上 |
+| 画像・egui メディアの戻る / 進む: `handle_fs_key_input_with_operation` → `dispatch_mouse_button_with_repeat` | `render_fs_body` の準備後。または ROOT の予備キー処理と共用 | `MouseButtonDispatchResult.script_slot` を `FsKeyAction.script_slot` へ返す (Browser キーのrepeatだけなら要求を作らない)。ROOT の予備経路だけは既存のキー要求と同じく描画前に実行して後処理する | 通常・転送の描画内キー処理は、段 2b で所有 pass のローカル要求へ合流。段 2a では実行しない |
 | 画像・egui メディアのリング / ジェスチャー: `apply_fs_secondary_input` → `execute_right_drag_command` | `render_fs_body` 内、または保留されたホイール提案の適用内 | viewer の `ScriptSlot*` は未接続のまま。その場では実行しない | 段 2b で所有 pass のローカル要求へ返す。保留提案では通知して拒否 |
 | 画像・egui メディアの中ボタン: ホイール / クリック処理 → `apply_mouse_button` → `dispatch_mouse_button` | `render_fs_body` 内 | viewer の `ScriptSlot*` は未接続のまま | 段 2b で同じローカル要求へ返す |
-| native 動画の Browser キー / XButton / 中ボタン: `native_video` → `apply_mouse_back_forward_button` / `dispatch_mouse_button` | native 入力処理。ROOT の更新 | 実行は未接続 | 段 3。Browser キーの repeat 拒否もこの入口で行う |
+| native 動画の Browser キー / XButton / 中ボタン: `native_video` → `apply_mouse_back_forward_button_with_repeat` / `dispatch_mouse_button` | native 入力処理。ROOT の更新 | 実行は未接続。Browser キーは `key.repeat` を渡し、ScriptSlot の繰り返しを拒否 | 実行の配線は段 3 |
 | native 動画のリング / ジェスチャー: 位置付き native 更新 → `dispatch_right_drag_recognition` → `execute_right_drag_command` | native 入力処理。ROOT、または既存の別ウィンドウ命令へ委譲 | 実行は未接続 | 段 3 |
 | `apply_history_clear_key_action` → `apply_ring_action` | 一覧のキー処理 | 履歴消去操作だけの対応表であり、`ScriptSlot*` は到達しない | スクリプト入口にはしない |
 
@@ -909,7 +921,13 @@ Rust 側の表に「操作・種別・イベント可か・実行関数」を持
 - 実行: 並びを同じフレームで順に実行する、受け付けない操作で残りを捨てて通知、後処理の要る結果 (見開きの
   `Rebased`・遷移を委ねた・閉じた・移動の要求) でそこで終わり結果が呼び出し元へ返る、対象 (チェックの集合を含む)
   が変わったら残りを捨てる、B/C が最後でない並びを拒否、E を 2 つ含む並びを拒否。
-- 入口の repeat: native のマウスの戻る/進むで `ScriptSlot*` に解決される repeat の押下を拒否する。
+- 既存のキーの結果との合流: ROOT の矢印によるページ移動と同時に空・A だけ・B を含む・拒否されるスロットが
+  来ても、元の移動と operation を保持する。`Rebased` も競合に含め、`Closed` は二重に終了しない。
+  本の構成の受付の確認へ実際に委譲したときも、残りを実行せず `delegated: true` を返す。
+- 一覧の開く操作: 参照先の不存在・履歴の guard・親や履歴の移動の guard による拒否では完了の `notice` を出さず、
+  非同期の開始の受付とキーの早期 return を区別する。
+- 入口の repeat: 一覧 (更新中の制限付き処理を含む)・画像の全画面・native のマウスの戻る/進むで、
+  `ScriptSlot*` に解決される repeat の押下を拒否する。通常の戻る/進むの繰り返しによる移動は維持する。
 - 共用の実行関数: 表の各操作で、キーの処理とスクリプトが同じ実行関数を呼ぶことの handler-level テスト
   (egui の経路・native 動画の経路・egui の動画/音楽の表示)。
 - 入口: 3 つの問い合わせ場所 (一覧・全画面のキー処理・native)・リング・右クリック (native と egui の両方の

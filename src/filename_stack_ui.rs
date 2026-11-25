@@ -2187,11 +2187,24 @@ impl crate::app::App {
         agg_idx: usize,
         from_double_click: bool,
     ) -> bool {
+        self.stack_try_open_from_grid_with_admission(ctx, agg_idx, from_double_click)
+            .handled
+    }
+
+    pub(crate) fn stack_try_open_from_grid_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        agg_idx: usize,
+        from_double_click: bool,
+    ) -> crate::app::ActionRouteResult {
         if !self.grid_item_input_allowed() {
-            return true;
+            return crate::app::ActionRouteResult::new(true, crate::app::ActionAdmission::Rejected);
         }
         if !self.stack_mode_aggregated() {
-            return false;
+            return crate::app::ActionRouteResult::new(
+                false,
+                crate::app::ActionAdmission::Rejected,
+            );
         }
         let flat_idx = self
             .stack_view
@@ -2199,7 +2212,10 @@ impl crate::app::App {
             .and_then(|sv| sv.flat_index_for_aggregated(agg_idx));
         let Some(flat_idx) = flat_idx else {
             // passthrough コンテナ → フルスクリーンでなく通常ナビへ。
-            return false;
+            return crate::app::ActionRouteResult::new(
+                false,
+                crate::app::ActionAdmission::Rejected,
+            );
         };
         #[cfg(not(windows))]
         let _ = ctx;
@@ -2207,8 +2223,10 @@ impl crate::app::App {
         // 判定する。別 media/still のときだけ現 active context を先に park する。
         // (review-v2.3.0 追補4: stack flat grid open)
         #[cfg(windows)]
-        if !self.prepare_detached_context_for_grid_open(ctx, agg_idx) {
-            return true;
+        if let std::ops::ControlFlow::Break(admission) =
+            self.prepare_detached_context_for_grid_open_with_admission(ctx, agg_idx)
+        {
+            return crate::app::ActionRouteResult::new(true, admission);
         }
         // 開幕ガード (通常の grid open 経路と同じ):
         // - Enter で開いた同フレームに fullscreen 側が同じ Enter を拾って即 close するのを防ぐ
@@ -2222,7 +2240,7 @@ impl crate::app::App {
         }
         self.capture_main_list_restore_cursor();
         self.stack_enter_flat_fullscreen(ctx, flat_idx);
-        true
+        crate::app::ActionRouteResult::new(true, crate::app::ActionAdmission::Accepted)
     }
 
     /// フラット読書ビュー (全画像を展開した並び) へ `self.items` を差し替え、`flat_idx` を

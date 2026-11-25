@@ -761,6 +761,8 @@ pub(crate) use external_open::{
     ExplicitOpenPath, ViewerOpenAdoption, ViewerOpenIntent, ViewerOpenRequest,
 };
 pub(crate) mod operation_script_grid;
+#[cfg(test)]
+mod operation_script_grid_admission_tests;
 pub(crate) mod operation_script_runtime;
 mod subfolder_expansion;
 mod update_phases;
@@ -2676,41 +2678,86 @@ impl DetachedImageWindowSnapshot {
     }
 }
 
+/// Admission is independent of whether an input handler must return early.
+/// Accepted includes a request handed to an existing asynchronous owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActionAdmission {
+    Accepted,
+    Rejected,
+}
+
+impl ActionAdmission {
+    pub(crate) fn from_accepted(accepted: bool) -> Self {
+        if accepted {
+            Self::Accepted
+        } else {
+            Self::Rejected
+        }
+    }
+    pub(crate) fn from_folder_open(outcome: FolderOpenOutcome) -> Self {
+        Self::from_accepted(matches!(
+            outcome,
+            FolderOpenOutcome::Loaded
+                | FolderOpenOutcome::Classifying
+                | FolderOpenOutcome::ConversionDialogOpened
+        ))
+    }
+}
+
+/// Preserve the legacy handled predicate without using it as admission evidence.
+pub(crate) struct ActionRouteResult {
+    pub(crate) handled: bool,
+    pub(crate) admission: ActionAdmission,
+}
+
+impl ActionRouteResult {
+    pub(crate) fn new(handled: bool, admission: ActionAdmission) -> Self {
+        Self { handled, admission }
+    }
+}
+
+pub(crate) struct GridOpenSelectedResult {
+    pub(crate) flow: std::ops::ControlFlow<Option<crate::ui_main::AddressBarNav>>,
+    pub(crate) admission: ActionAdmission,
+}
+
 impl App {
     /// Existing Enter / external-player key body, shared with resolved script input.
     pub(crate) fn execute_grid_open_selected(
         &mut self,
         ctx: &egui::Context,
         external_player_video: bool,
-    ) -> Option<crate::ui_main::AddressBarNav> {
-        match self.execute_grid_open_selected_with_flow(ctx, external_player_video) {
-            std::ops::ControlFlow::Break(nav) => nav,
-            std::ops::ControlFlow::Continue(()) => None,
-        }
+    ) -> GridOpenSelectedResult {
+        self.execute_grid_open_selected_with_flow(ctx, external_player_video)
     }
 
     fn execute_grid_open_selected_with_flow(
         &mut self,
         ctx: &egui::Context,
         external_player_video: bool,
-    ) -> std::ops::ControlFlow<Option<crate::ui_main::AddressBarNav>> {
+    ) -> GridOpenSelectedResult {
+        use ActionAdmission::{Accepted, Rejected};
+        use std::ops::ControlFlow::{Break, Continue};
+        let result = |flow, admission| GridOpenSelectedResult { flow, admission };
         // Shift+Enter などに割り当てた専用コマンドで動画を外部プレイヤーで開く
         // (フルスクリーン中と
         // 同じ挙動をグリッドからも使えるようにする)。
         if let Some(idx) = self.selected {
             if self.items_are_bookmark_view {
                 if let Some(row) = self.bookmark_browser_rows.get(idx).cloned() {
-                    self.open_bookmark_browser_row(ctx, &row);
+                    return result(
+                        Break(None),
+                        self.open_bookmark_browser_row_with_admission(ctx, &row),
+                    );
                 }
-                return std::ops::ControlFlow::Break(None);
+                return result(Break(None), Rejected);
             }
             if !self.guard_reading_history_open(idx) {
-                return std::ops::ControlFlow::Break(None);
+                return result(Break(None), Rejected);
             }
-            if self.activate_main_zipdir(idx, ctx)
-                != crate::app::ZipDirActivationOutcome::NotApplicable
-            {
-                return std::ops::ControlFlow::Break(None);
+            let (zipdir_outcome, admission) = self.activate_main_zipdir_with_admission(idx, ctx);
+            if zipdir_outcome != ZipDirActivationOutcome::NotApplicable {
+                return result(Break(None), admission);
             }
             self.capture_main_list_restore_cursor();
             // ファイル名スタックの集約グリッドでメディアセルを Enter したら、フラット読書
@@ -2719,21 +2766,33 @@ impl App {
             // (= 動画 + shift_enter のときは intercept をスキップして下の Video arm に流す)。
             let stack_skip_for_external_video =
                 external_player_video && matches!(self.items.get(idx), Some(GridItem::Video(_)));
-            if !stack_skip_for_external_video && self.stack_try_open_from_grid(ctx, idx, false) {
-                return std::ops::ControlFlow::Break(None);
+            if !stack_skip_for_external_video {
+                let route = self.stack_try_open_from_grid_with_admission(ctx, idx, false);
+                if route.handled {
+                    return result(Break(None), route.admission);
+                }
             }
             #[cfg(windows)]
-            if self.open_grid_container_in_detached_book_context(ctx, idx) {
-                return std::ops::ControlFlow::Break(None);
+            {
+                let route = self.open_grid_item_in_detached_book_context_with_admission(
+                    ctx,
+                    idx,
+                    self.should_auto_fullscreen_grid_container(idx),
+                );
+                if route.handled {
+                    return result(Break(None), route.admission);
+                }
             }
             match self.items.get(idx) {
                 Some(GridItem::Folder(_))
                 | Some(GridItem::ZipFile(_))
                 | Some(GridItem::PdfFile(_)) => {
-                    return std::ops::ControlFlow::Break(self.accept_grid_container_open(ctx, idx));
+                    let (nav, admission) = self.accept_grid_container_open_with_admission(ctx, idx);
+                    return result(Break(nav), admission);
                 }
                 Some(GridItem::Video(p)) if external_player_video => {
                     crate::ui_helpers::open_external_player(p);
+                    return result(Continue(()), Accepted);
                 }
                 Some(GridItem::Image(_))
                 | Some(GridItem::ZipImage { .. })
@@ -2741,8 +2800,10 @@ impl App {
                 | Some(GridItem::Video(_))
                 | Some(GridItem::Audio(_)) => {
                     #[cfg(windows)]
-                    if !self.prepare_detached_context_for_grid_open(ctx, idx) {
-                        return std::ops::ControlFlow::Break(None);
+                    if let std::ops::ControlFlow::Break(admission) =
+                        self.prepare_detached_context_for_grid_open_with_admission(ctx, idx)
+                    {
+                        return result(Break(None), admission);
                     }
                     // 動画も画像と同じくフルスクリーン化 → インライン再生。
                     // Shift+Enter は上の専用分岐で外部プレイヤーへ。
@@ -2754,28 +2815,35 @@ impl App {
                     // が拾って即 close する事故を防ぐ。詳細は
                     // `fs_suppress_enter_close_until_release` の doc 参照。
                     self.fs_suppress_enter_close_until_release = true;
-                    self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
+                    let admission =
+                        self.open_fullscreen_with_admission(idx, HistoryTrigger::UserChosen);
+                    return result(Continue(()), admission);
                 }
                 Some(GridItem::ConvertibleArchive { path, .. }) => {
                     let pf = path.clone();
                     let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
-                    if self.begin_smart_grid_container_navigation(
+                    let route = self.begin_smart_grid_container_navigation_with_admission(
                         idx,
                         pf.clone(),
                         auto_fs,
                         crate::app::StartupListIntent::container_open(auto_fs),
-                    ) {
-                        return std::ops::ControlFlow::Break(None);
+                    );
+                    if route.handled {
+                        return result(Break(None), route.admission);
                     }
                     let owner = self.main_grid_archive_open_owner(idx, &pf);
                     self.capture_main_folder_list_order(idx);
-                    let _open_outcome = self
+                    let open_outcome = self
                         .load_folder_or_convert_archive_with_auto_fullscreen_owned(
                             pf,
                             auto_fs,
                             owner,
                             crate::app::StartupListIntent::container_open(auto_fs),
                         );
+                    return result(
+                        Continue(()),
+                        ActionAdmission::from_folder_open(open_outcome),
+                    );
                 }
                 Some(GridItem::SearchContainer { path, kind, .. }) => {
                     // Ctrl+G 結果ビュー (Aggregated) でコンテナを Enter
@@ -2786,7 +2854,7 @@ impl App {
                     // フィルタを一時解除する (Codex P2)。
                     self.maybe_suppress_rating_filter_for_opened_container_path(&p);
                     self.drill_into_container(p, is_zip);
-                    return std::ops::ControlFlow::Break(None);
+                    return result(Break(None), Accepted);
                 }
                 // レーティング一覧に復元された ZipDir は zip_nav を持たないので、
                 // 外側 ZIP を開いてから該当 prefix へ入る。
@@ -2795,7 +2863,11 @@ impl App {
                     dir_prefix,
                     ..
                 }) if self.items_are_rating_view => {
-                    self.open_rating_view_zipdir(zip_path.clone(), dir_prefix.clone());
+                    let admission = self.open_rating_view_zipdir_with_admission(
+                        zip_path.clone(),
+                        dir_prefix.clone(),
+                    );
+                    return result(Continue(()), admission);
                 }
                 // ZipDir activation はマウス・パッドと同じ入口で意図を決める。
                 Some(GridItem::ZipDir { .. }) => {
@@ -2811,7 +2883,7 @@ impl App {
                 None => {}
             }
         }
-        std::ops::ControlFlow::Continue(())
+        result(Continue(()), Rejected)
     }
 }
 
@@ -41895,23 +41967,34 @@ impl App {
     /// 一覧ビューには `zip_nav` が無いので、外側 ZIP / 変換アーカイブを通常経路で開き、
     /// 列挙完了後に `dir_prefix` へ入る。
     pub(crate) fn open_rating_view_zipdir(&mut self, zip_path: PathBuf, dir_prefix: String) {
+        self.open_rating_view_zipdir_with_admission(zip_path, dir_prefix);
+    }
+
+    pub(crate) fn open_rating_view_zipdir_with_admission(
+        &mut self,
+        zip_path: PathBuf,
+        dir_prefix: String,
+    ) -> ActionAdmission {
         if dir_prefix.is_empty() {
-            return;
+            return ActionAdmission::Rejected;
         }
         if let Some(owner) = self.rating_view_physical_load_owner(&zip_path) {
-            self.start_rating_physical_zipdir_open(owner, dir_prefix);
-            return;
+            return ActionAdmission::from_accepted(
+                self.start_rating_physical_zipdir_open(owner, dir_prefix),
+            );
         }
         self.pending_rating_view_zipdir_open = Some(PendingRatingViewZipDirOpen {
             source_path: zip_path.clone(),
             dir_prefix,
         });
+        let outcome = self.load_folder_or_convert_archive(zip_path);
         if matches!(
-            self.load_folder_or_convert_archive(zip_path),
+            outcome,
             FolderOpenOutcome::Ignored | FolderOpenOutcome::Refused(_)
         ) {
             self.pending_rating_view_zipdir_open = None;
         }
+        ActionAdmission::from_folder_open(outcome)
     }
 
     fn consume_pending_rating_view_zipdir_after_open(&mut self, loaded_zip_path: &Path) -> bool {
@@ -55157,48 +55240,56 @@ impl App {
         ctx: &egui::Context,
         row: &crate::bookmark_browser::BookmarkBrowserRow,
     ) {
+        self.open_bookmark_browser_row_with_admission(ctx, row);
+    }
+
+    pub(crate) fn open_bookmark_browser_row_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        row: &crate::bookmark_browser::BookmarkBrowserRow,
+    ) -> ActionAdmission {
         if row.missing {
             self.show_feedback_warning(
                 "ブックマーク先が見つかりません（記録は保持されます）".to_string(),
             );
-            return;
+            return ActionAdmission::Rejected;
         }
         if self.document_open_modal_admission_blocked() {
-            return;
+            return ActionAdmission::Rejected;
         }
         self.admit_explicit_main_open_request();
         if let crate::bookmark_browser::BookmarkRowSource::Book(bookmark) = &row.source
             && Self::path_needs_open_classification(&bookmark.container_path)
         {
-            match self.start_open_path_classification(
+            return match self.start_open_path_classification(
                 bookmark.container_path.clone(),
                 ClassifiedOpenContinuation::BookmarkRow(Box::new(row.clone())),
             ) {
-                OpenAdmission::Accepted => {}
+                OpenAdmission::Accepted => ActionAdmission::Accepted,
                 OpenAdmission::Refused(reason) => {
                     self.show_open_admission_refusal(reason);
+                    ActionAdmission::Rejected
                 }
                 OpenAdmission::NotApplicable => {
                     unreachable!("the path was checked before classification")
                 }
-            }
-            return;
+            };
         }
-        self.open_bookmark_browser_row_classified(ctx, row);
+        self.open_bookmark_browser_row_classified(ctx, row)
     }
 
     fn open_bookmark_browser_row_classified(
         &mut self,
         ctx: &egui::Context,
         row: &crate::bookmark_browser::BookmarkBrowserRow,
-    ) {
+    ) -> ActionAdmission {
         let navigation = self.main_folder_history_available().then(|| {
             self.capture_main_list_navigation(
                 MainHistoryOperation::Direct(crate::app::DirectNavigationPurpose::Navigation),
                 self.copied_destination_source_proof(),
             )
         });
-        self.open_bookmark_browser_row_classified_with_navigation(ctx, row, navigation);
+        self.open_bookmark_browser_row_classified_with_navigation(ctx, row, navigation)
     }
 
     fn open_bookmark_browser_row_classified_with_navigation(
@@ -55206,12 +55297,12 @@ impl App {
         ctx: &egui::Context,
         row: &crate::bookmark_browser::BookmarkBrowserRow,
         navigation: Option<MainListNavigation>,
-    ) {
+    ) -> ActionAdmission {
         if navigation
             .as_ref()
             .is_some_and(|nav| !self.main_list_navigation_is_current(nav))
         {
-            return;
+            return ActionAdmission::Rejected;
         }
         self.retire_close_returns_for_main_admission();
         if let Some(previous_request_id) = self
@@ -55264,25 +55355,30 @@ impl App {
                     } else {
                         DetachedSource::Video
                     };
-                    self.start_detached_bookmark_loading_context(
-                        ctx,
-                        pending,
-                        target,
-                        source,
-                        path.clone(),
+                    return ActionAdmission::from_accepted(
+                        self.start_detached_bookmark_loading_context(
+                            ctx,
+                            pending,
+                            target,
+                            source,
+                            path.clone(),
+                        ),
                     );
-                    return;
                 }
                 self.bookmark_view_state = Some(BookmarkViewState::Opening {
                     target: target.clone(),
                     grid: return_grid,
                 });
                 self.bookmark_open_pending = Some(pending);
-                self.start_startup_open_path_resolve(
+                let admission = self.start_startup_open_path_resolve(
                     path.clone(),
                     StartupOpenPathSource::Bookmark,
                     ctx,
                 );
+                ActionAdmission::from_accepted(!matches!(
+                    admission,
+                    startup_ops::StartupOpenAdmission::Refused(_)
+                ))
             }
             crate::bookmark_browser::BookmarkRowSource::Book(bookmark) => {
                 let bookmark_source = match crate::pdf_loader::LeasedEpubPath::try_new(
@@ -55291,7 +55387,7 @@ impl App {
                     Ok(source) => source,
                     Err(reason) => {
                         self.show_open_admission_refusal(reason.into());
-                        return;
+                        return ActionAdmission::Rejected;
                     }
                 };
                 let pending = crate::bookmark_browser::PendingBookOpen {
@@ -55319,13 +55415,14 @@ impl App {
                     self.bookmark_open_pending =
                         Some(crate::bookmark_browser::PendingBookmarkOpen::Book(pending));
                     self.poll_bookmark_book_open(ctx);
+                    ActionAdmission::Accepted
                 } else {
                     self.start_qualified_bookmark_book_request(
                         ctx,
                         pending,
                         return_grid,
                         navigation,
-                    );
+                    )
                 }
             }
         }
@@ -55337,7 +55434,7 @@ impl App {
         pending: crate::bookmark_browser::PendingBookOpen,
         return_grid: BookmarkViewReturnGridState,
         navigation: Option<MainListNavigation>,
-    ) {
+    ) -> ActionAdmission {
         let bookmark = pending.bookmark.clone();
         let target = crate::bookmark_browser::BookmarkViewReturnTarget::Book(
             bookmark.container_path.clone(),
@@ -55352,14 +55449,13 @@ impl App {
         let pending = crate::bookmark_browser::PendingBookmarkOpen::Book(pending);
         #[cfg(windows)]
         if self.settings.detached_viewer_open_images_in_window {
-            self.start_detached_bookmark_loading_context(
+            return ActionAdmission::from_accepted(self.start_detached_bookmark_loading_context(
                 ctx,
                 pending,
                 target,
                 DetachedSource::Book,
                 bookmark.container_path.clone(),
-            );
-            return;
+            ));
         }
         self.bookmark_view_state = Some(BookmarkViewState::Opening {
             target: target.clone(),
@@ -55376,12 +55472,16 @@ impl App {
             navigation.source_proof = MainListSourceProof::Bookmark(owner);
             navigation
         });
-        self.start_startup_open_path_resolution_owned_with_navigation(
+        let admission = self.start_startup_open_path_resolution_owned_with_navigation(
             bookmark.container_path.clone(),
             StartupOpenPathSource::Bookmark,
             ctx,
             navigation,
         );
+        ActionAdmission::from_accepted(!matches!(
+            admission,
+            startup_ops::StartupOpenAdmission::Refused(_)
+        ))
     }
 
     pub(crate) fn poll_bookmark_browser(&mut self, ctx: &egui::Context) {
@@ -60071,8 +60171,8 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         main_has_focus: bool,
-        browser_back_count: u32,
-        browser_forward_count: u32,
+        browser_back_count: crate::MouseNavPresses,
+        browser_forward_count: crate::MouseNavPresses,
         block: crate::filename_stack_ui::GridItemInputBlock,
     ) -> Option<crate::ui_main::AddressBarNav> {
         let (mouse_back, mouse_forward) = ctx.input(|input| {
@@ -60081,14 +60181,21 @@ impl App {
                 main_has_focus && input.pointer.button_pressed(egui::PointerButton::Extra2),
             )
         });
-        let browser_back = main_has_focus && browser_back_count > 0;
-        let browser_forward = main_has_focus && browser_forward_count > 0;
+        let browser_back = main_has_focus && browser_back_count.count > 0;
+        let browser_forward = main_has_focus && browser_forward_count.count > 0;
         if mouse_back || mouse_forward || browser_back || browser_forward {
-            return self.apply_mouse_back_forward_button(
+            let forward = mouse_forward || browser_forward;
+            let non_repeat = if forward {
+                mouse_forward || browser_forward_count.has_non_repeat
+            } else {
+                mouse_back || browser_back_count.has_non_repeat
+            };
+            return self.apply_mouse_back_forward_button_with_repeat(
                 ctx,
-                mouse_forward || browser_forward,
+                forward,
                 ActionSurface::MainWindow,
                 "grid-mouse",
+                !non_repeat,
             );
         }
         if !matches!(
@@ -60218,7 +60325,7 @@ impl App {
             if self.main_keyboard_should_drain_mouse_nav(main_has_focus) {
                 crate::take_pending_mouse_nav()
             } else {
-                (0, 0)
+                Default::default()
             };
 
         // 「ページを直接開く」設定 ON の ZIP/PDF からの Esc/Enter/右クリックで立った
@@ -60479,16 +60586,22 @@ impl App {
 
         // マウスドライバが WM_APPCOMMAND / VK_BROWSER_BACK/FORWARD で送る経路 (上で
         // 関数頭で drain 済み) を消費。詳細は main.rs の `install_mouse_nav_hook` 参照。
-        let browser_back = main_has_focus && browser_back_count > 0;
-        let browser_forward = main_has_focus && browser_forward_count > 0;
+        let browser_back = main_has_focus && browser_back_count.count > 0;
+        let browser_forward = main_has_focus && browser_forward_count.count > 0;
         let mouse_nav_back = mouse_back || browser_back;
         let mouse_nav_forward = mouse_forward || browser_forward;
         if mouse_nav_back || mouse_nav_forward {
-            return self.apply_mouse_back_forward_button(
+            let non_repeat = if mouse_nav_forward {
+                mouse_forward || browser_forward_count.has_non_repeat
+            } else {
+                mouse_back || browser_back_count.has_non_repeat
+            };
+            return self.apply_mouse_back_forward_button_with_repeat(
                 ctx,
                 mouse_nav_forward,
                 ActionSurface::MainWindow,
                 "grid-mouse",
+                !non_repeat,
             );
         }
         if main_has_focus
@@ -60535,8 +60648,8 @@ impl App {
                 } else {
                     "ctrl_nav_back"
                 },
-                browser_back_count,
-                browser_forward_count
+                browser_back_count.count,
+                browser_forward_count.count
             ));
         }
         let ctrl_page_up = self
@@ -60869,8 +60982,9 @@ impl App {
                     .and_then(|idx| self.items.get(idx))
                     .is_some_and(|item| matches!(item, GridItem::Video(_)));
             if open_selected_key || external_player_video {
-                if let std::ops::ControlFlow::Break(nav) =
-                    self.execute_grid_open_selected_with_flow(ctx, external_player_video)
+                if let std::ops::ControlFlow::Break(nav) = self
+                    .execute_grid_open_selected_with_flow(ctx, external_player_video)
+                    .flow
                 {
                     return nav;
                 }
@@ -69565,22 +69679,33 @@ impl App {
         idx: usize,
         auto_fullscreen: bool,
     ) -> bool {
+        self.open_grid_item_in_detached_book_context_with_admission(ctx, idx, auto_fullscreen)
+            .handled
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn open_grid_item_in_detached_book_context_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        auto_fullscreen: bool,
+    ) -> ActionRouteResult {
         if self.remote_session_blocks_local_control() {
             crate::logger::log("remote_ipc: rejected detached viewer open outside Local phase");
-            return false;
+            return ActionRouteResult::new(false, ActionAdmission::Rejected);
         }
         if !self.settings.detached_viewer_open_images_in_window {
-            return false;
+            return ActionRouteResult::new(false, ActionAdmission::Rejected);
         }
         if self.document_open_modal_admission_blocked() {
-            return true;
+            return ActionRouteResult::new(true, ActionAdmission::Rejected);
         }
         // Resolve the accepted row's meaning before an asynchronous classifier
         // takes ownership: its continuation cannot resume the caller's drill path.
         if matches!(self.items.get(idx), Some(GridItem::Folder(path))
             if self.global_search_folder_is_branch(path))
         {
-            return false;
+            return ActionRouteResult::new(false, ActionAdmission::Rejected);
         }
         if let Some(path) = self.items.get(idx).and_then(GridItem::drag_source_path)
             && Self::path_needs_open_classification(path)
@@ -69590,7 +69715,7 @@ impl App {
                 Ok(source) => source,
                 Err(reason) => {
                     self.show_open_admission_refusal(reason.into());
-                    return true;
+                    return ActionRouteResult::new(true, ActionAdmission::Rejected);
                 }
             };
             return match self.start_open_path_classification_owned(
@@ -69601,17 +69726,22 @@ impl App {
                     auto_fullscreen,
                 },
             ) {
-                OpenAdmission::Accepted => true,
+                OpenAdmission::Accepted => ActionRouteResult::new(true, ActionAdmission::Accepted),
                 OpenAdmission::Refused(reason) => {
                     self.show_open_admission_refusal(reason);
-                    true
+                    ActionRouteResult::new(true, ActionAdmission::Rejected)
                 }
                 OpenAdmission::NotApplicable => {
                     unreachable!("the path was checked before classification")
                 }
             };
         }
-        self.open_grid_item_in_detached_book_context_classified(ctx, idx, auto_fullscreen, None)
+        self.open_grid_item_in_detached_book_context_classified_with_admission(
+            ctx,
+            idx,
+            auto_fullscreen,
+            None,
+        )
     }
 
     #[cfg(windows)]
@@ -69622,6 +69752,23 @@ impl App {
         auto_fullscreen: bool,
         classified_kind: Option<OpenPathKind>,
     ) -> bool {
+        self.open_grid_item_in_detached_book_context_classified_with_admission(
+            ctx,
+            idx,
+            auto_fullscreen,
+            classified_kind,
+        )
+        .handled
+    }
+
+    #[cfg(windows)]
+    fn open_grid_item_in_detached_book_context_classified_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        auto_fullscreen: bool,
+        classified_kind: Option<OpenPathKind>,
+    ) -> ActionRouteResult {
         let plan = if classified_kind == Some(OpenPathKind::Directory) {
             self.items
                 .get(idx)
@@ -69636,14 +69783,16 @@ impl App {
         };
         let plan = match plan {
             DetachedBuild::Built(plan) => plan,
-            DetachedBuild::NotApplicable => return false,
+            DetachedBuild::NotApplicable => {
+                return ActionRouteResult::new(false, ActionAdmission::Rejected);
+            }
             DetachedBuild::Refused(reason) => {
                 self.show_open_admission_refusal(reason);
-                return true;
+                return ActionRouteResult::new(true, ActionAdmission::Rejected);
             }
         };
 
-        self.execute_detached_grid_item_open_plan(ctx, plan, classified_kind)
+        self.execute_detached_grid_item_open_plan_with_admission(ctx, plan, classified_kind)
     }
 
     #[cfg(windows)]
@@ -69653,13 +69802,24 @@ impl App {
         plan: DetachedGridItemOpenPlan,
         classified_kind: Option<OpenPathKind>,
     ) -> bool {
+        self.execute_detached_grid_item_open_plan_with_admission(ctx, plan, classified_kind)
+            .handled
+    }
+
+    #[cfg(windows)]
+    fn execute_detached_grid_item_open_plan_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        plan: DetachedGridItemOpenPlan,
+        classified_kind: Option<OpenPathKind>,
+    ) -> ActionRouteResult {
         // Both preclassified ZipDir scopes and ordinary grid plans must admit
         // local control before parking any current reader.
         if self.remote_session_blocks_local_control()
             || self.document_open_modal_admission_blocked()
         {
             crate::logger::log("detached grid plan refused before park: admission blocked");
-            return false;
+            return ActionRouteResult::new(false, ActionAdmission::Rejected);
         }
         // An alias/direct-RAR scope must re-resolve its readable backing on the
         // existing archive worker, retaining the exact scope across conversion.
@@ -69686,7 +69846,7 @@ impl App {
                 self.show_feedback_warning(
                     "コレクションの画像を開けませんでした。一覧を更新してください".to_string(),
                 );
-                return true;
+                return ActionRouteResult::new(true, ActionAdmission::Rejected);
             }
             DetachedGridItemOpenPlan::CollectionRootImage(plan) => {
                 self.cancel_detached_grid_archive_open_for_replacement(
@@ -69699,21 +69859,22 @@ impl App {
                     self.show_feedback_warning(
                         "別ウィンドウの切り替えを完了できませんでした".to_string(),
                     );
-                    return true;
+                    return ActionRouteResult::new(true, ActionAdmission::Rejected);
                 }
                 let placement_seed = had_active_detached
                     .then(|| self.offset_detached_image_window_placement(base_placement));
-                if !self.start_active_detached_collection_root_image(
+                let started = self.start_active_detached_collection_root_image(
                     plan,
                     ctx,
                     placement_seed,
                     None,
-                ) {
+                );
+                if !started {
                     self.show_feedback_warning(
                         "コレクションの画像を別ウィンドウで開けませんでした".to_string(),
                     );
                 }
-                return true;
+                return ActionRouteResult::new(true, ActionAdmission::from_accepted(started));
             }
             DetachedGridItemOpenPlan::Descriptor {
                 descriptor,
@@ -69723,7 +69884,7 @@ impl App {
                     && let Some(reason) = self.pdf_open_refusal(path)
                 {
                     self.show_pdf_open_refusal(reason);
-                    return true;
+                    return ActionRouteResult::new(true, ActionAdmission::Rejected);
                 }
                 self.cancel_detached_grid_archive_open_for_replacement(
                     "detached_grid_archive_replaced_by_descriptor",
@@ -69743,7 +69904,7 @@ impl App {
                     self.capture_active_detached_placement_at_decision("folder_candidate_seed");
                 let had_active_detached = self.active_detached_context_exists();
                 if !self.park_and_close_current_active_detached_viewer(ctx) {
-                    return false;
+                    return ActionRouteResult::new(false, ActionAdmission::Rejected);
                 }
                 let placement_seed = had_active_detached
                     .then(|| self.offset_detached_image_window_placement(base_placement));
@@ -69765,14 +69926,14 @@ impl App {
                         DetachedLoadingContextInit::Continue
                     },
                 ) else {
-                    return false;
+                    return ActionRouteResult::new(false, ActionAdmission::Rejected);
                 };
                 self.start_grid_folder_candidate_open(
                     path,
                     collection_owner,
                     Self::detached_session_lease(window_id),
                 );
-                return true;
+                return ActionRouteResult::new(true, ActionAdmission::Accepted);
             }
             DetachedGridItemOpenPlan::ConvertibleArchiveCandidate {
                 path,
@@ -69781,13 +69942,13 @@ impl App {
             } => {
                 if self.settings.archive_file_handling_ignores_convertible() {
                     self.show_feedback_warning("設定により変換が必要な本を無視しています".into());
-                    return true;
+                    return ActionRouteResult::new(true, ActionAdmission::Rejected);
                 }
                 let base_placement =
                     self.capture_active_detached_placement_at_decision("archive_candidate_seed");
                 let had_active_detached = self.active_detached_context_exists();
                 if !self.park_and_close_current_active_detached_viewer(ctx) {
-                    return false;
+                    return ActionRouteResult::new(false, ActionAdmission::Rejected);
                 }
                 let placement_seed = had_active_detached
                     .then(|| self.offset_detached_image_window_placement(base_placement));
@@ -69806,7 +69967,7 @@ impl App {
                         DetachedLoadingContextInit::Continue
                     },
                 ) else {
-                    return false;
+                    return ActionRouteResult::new(false, ActionAdmission::Rejected);
                 };
                 let owner = self.next_detached_grid_archive_open_owner(
                     Self::detached_session_lease(window_id),
@@ -69839,7 +70000,10 @@ impl App {
                             "archive_book_scope_request_failed",
                         );
                     }
-                    return started;
+                    return ActionRouteResult::new(
+                        started,
+                        ActionAdmission::from_accepted(started),
+                    );
                 }
                 let open_owner = OpenRequestOwner::DetachedGridArchive(owner.clone());
                 let auto_fullscreen = self.settings.effective_auto_fullscreen_zip_pdf();
@@ -69866,7 +70030,7 @@ impl App {
                             &owner,
                             "archive_cache_owner_claim_failed",
                         );
-                        return true;
+                        return ActionRouteResult::new(true, ActionAdmission::Rejected);
                     }
                     #[cfg(all(windows, feature = "test-script"))]
                     self.test_script_record_folder_load_owner(&StartupListIntent::ExplicitList);
@@ -69877,7 +70041,13 @@ impl App {
                         outcome,
                         "archive_detached_cache_open_failed",
                     );
-                    return true;
+                    return ActionRouteResult::new(
+                        true,
+                        ActionAdmission::from_accepted(matches!(
+                            outcome,
+                            DetachedGridArchiveOpenOutcome::Opened
+                        )),
+                    );
                 }
 
                 let outcome = self
@@ -69911,7 +70081,7 @@ impl App {
                     );
                 }
                 ctx.request_repaint();
-                return true;
+                return ActionRouteResult::new(true, ActionAdmission::from_folder_open(outcome));
             }
         };
 
@@ -69919,16 +70089,17 @@ impl App {
         let base_placement = self.capture_active_detached_placement_at_decision("descriptor_seed");
         let had_active_detached = self.active_detached_context_exists();
         if !self.park_and_close_current_active_detached_viewer(ctx) {
-            return false;
+            return ActionRouteResult::new(false, ActionAdmission::Rejected);
         }
         let placement_seed = had_active_detached
             .then(|| self.offset_detached_image_window_placement(base_placement));
-        self.start_active_detached_book_context_from_descriptor_with_restore(
+        let started = self.start_active_detached_book_context_from_descriptor_with_restore(
             descriptor,
             ctx,
             placement_seed,
             collection_restore,
-        )
+        );
+        ActionRouteResult::new(started, ActionAdmission::from_accepted(started))
     }
 
     /// Complete a main-grid convertible archive request in a newly-created detached reader. The
@@ -72681,8 +72852,18 @@ impl App {
         ctx: &egui::Context,
         target_path: &std::path::Path,
     ) -> bool {
+        self.raise_active_detached_media_for_grid_open_with_admission(ctx, target_path)
+            .handled
+    }
+
+    #[cfg(windows)]
+    fn raise_active_detached_media_for_grid_open_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        target_path: &std::path::Path,
+    ) -> ActionRouteResult {
         let Some(active_id) = self.active_viewer_context_id() else {
-            return false;
+            return ActionRouteResult::new(false, ActionAdmission::Rejected);
         };
         let Some((window_id, presenter_target, z_order_permitted)) = self
             .with_viewer_context_ref(active_id, |context| {
@@ -72716,11 +72897,11 @@ impl App {
             })
             .flatten()
         else {
-            return false;
+            return ActionRouteResult::new(false, ActionAdmission::Rejected);
         };
         if !z_order_permitted {
             ctx.request_repaint();
-            return true;
+            return ActionRouteResult::new(true, ActionAdmission::Rejected);
         }
         if presenter_target {
             self.native_video_front_recover_after_external_foreground = true;
@@ -72743,7 +72924,7 @@ impl App {
             );
         }
         ctx.request_repaint();
-        true
+        ActionRouteResult::new(true, ActionAdmission::Accepted)
     }
 
     #[cfg(windows)]
@@ -72752,12 +72933,22 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> bool {
+        self.activate_existing_detached_viewer_for_grid_open_with_admission(ctx, idx)
+            .handled
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn activate_existing_detached_viewer_for_grid_open_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> ActionRouteResult {
         if !self
             .video_presentation_transition
             .z_order_recovery_permitted()
         {
             ctx.request_repaint();
-            return true;
+            return ActionRouteResult::new(true, ActionAdmission::Rejected);
         }
         let mounted_matches = self.viewer_session_is_detached()
             && self.fullscreen_idx == Some(idx)
@@ -72799,7 +72990,7 @@ impl App {
         }
         if mounted_matches {
             ctx.request_repaint();
-            return true;
+            return ActionRouteResult::new(true, ActionAdmission::Accepted);
         }
 
         let Some(target_path) = self
@@ -72808,13 +72999,15 @@ impl App {
             .and_then(grid_item_media_path)
             .map(std::path::Path::to_path_buf)
         else {
-            return false;
+            return ActionRouteResult::new(false, ActionAdmission::Rejected);
         };
         // context ごとに idx 空間が違うため、promote / ParkedLive 済み media は path で探す。
         // parked は窓クリックと同じ activation 経路を通してから raise する。
         // (review-v2.3.0 追補 BA-7: same-media raise)
-        if self.raise_active_detached_media_for_grid_open(ctx, &target_path) {
-            return true;
+        let route =
+            self.raise_active_detached_media_for_grid_open_with_admission(ctx, &target_path);
+        if route.handled {
+            return route;
         }
         let parked_id = self.detached_image_windows.iter().find_map(|window| {
             (self.detached_window_state_is_parked_live(window.id)
@@ -72832,9 +73025,9 @@ impl App {
             && self.activate_parked_live_media_window_snapshot(ctx, window_id)
         {
             let _ = self.raise_active_detached_media_for_grid_open(ctx, &target_path);
-            return true;
+            return ActionRouteResult::new(true, ActionAdmission::Accepted);
         }
-        false
+        ActionRouteResult::new(false, ActionAdmission::Rejected)
     }
 
     /// grid の leaf open 共通前処理。同じ active/ParkedLive メディアなら前面化して open を
@@ -72847,14 +73040,31 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> bool {
+        matches!(
+            self.prepare_detached_context_for_grid_open_with_admission(ctx, idx),
+            std::ops::ControlFlow::Continue(())
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn prepare_detached_context_for_grid_open_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> std::ops::ControlFlow<ActionAdmission> {
         if self.remote_session_blocks_local_control() {
             crate::logger::log("remote_ipc: rejected detached context open outside Local phase");
-            return false;
+            return std::ops::ControlFlow::Break(ActionAdmission::Rejected);
         }
-        if self.activate_existing_detached_viewer_for_grid_open(ctx, idx) {
-            return false;
+        let route = self.activate_existing_detached_viewer_for_grid_open_with_admission(ctx, idx);
+        if route.handled {
+            return std::ops::ControlFlow::Break(route.admission);
         }
-        self.park_active_detached_context_for_new_grid_open(ctx, idx)
+        if self.park_active_detached_context_for_new_grid_open(ctx, idx) {
+            std::ops::ControlFlow::Continue(())
+        } else {
+            std::ops::ControlFlow::Break(ActionAdmission::Rejected)
+        }
     }
 
     /// grid から別の画像/動画を明示 open するとき、独立 active context は passive /
@@ -73425,6 +73635,24 @@ impl App {
         );
     }
 
+    pub(crate) fn open_fullscreen_with_admission(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+    ) -> ActionAdmission {
+        self.open_fullscreen_with_metadata_boundary_and_adoption_and_landing_with_admission(
+            idx,
+            history_trigger,
+            FsOpenMaterialization::Eager,
+            FsPageLoadContract::Sequential,
+            None,
+            FsMetadataBoundary::Manual,
+            None,
+            ViewerOpenAdoption::ContextContinuation,
+            None,
+        )
+    }
+
     fn open_fullscreen_with_resume_notice(
         &mut self,
         idx: usize,
@@ -73647,13 +73875,38 @@ impl App {
         viewer_adoption: ViewerOpenAdoption,
         landing: Option<crate::ui_fullscreen::FsPageLanding>,
     ) {
+        self.open_fullscreen_with_metadata_boundary_and_adoption_and_landing_with_admission(
+            idx,
+            history_trigger,
+            requested_materialization,
+            load_contract,
+            perf,
+            boundary,
+            resume_notice,
+            viewer_adoption,
+            landing,
+        );
+    }
+
+    fn open_fullscreen_with_metadata_boundary_and_adoption_and_landing_with_admission(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
+        perf: Option<&mut FsOpenPerfRecorder>,
+        boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: ViewerOpenAdoption,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> ActionAdmission {
         #[cfg(windows)]
         let previous = (
             self.active_detached_window_id(),
             self.active_viewer_context_id()
                 .unwrap_or(self.projected_viewer_context_id()),
         );
-        self.open_fullscreen_with_metadata_boundary_inner(
+        let admission = self.open_fullscreen_with_metadata_boundary_inner(
             idx,
             history_trigger,
             requested_materialization,
@@ -73678,6 +73931,7 @@ impl App {
                 ));
             }
         }
+        admission
     }
 
     fn open_fullscreen_with_metadata_boundary_inner(
@@ -73691,13 +73945,13 @@ impl App {
         resume_notice: Option<BookResumeNotice>,
         viewer_adoption: ViewerOpenAdoption,
         landing: Option<crate::ui_fullscreen::FsPageLanding>,
-    ) {
+    ) -> ActionAdmission {
         if self.remote_session_blocks_local_control() {
             crate::logger::log("remote_ipc: rejected fullscreen open outside Local phase");
-            return;
+            return ActionAdmission::Rejected;
         }
         if !self.grid_item_input_allowed() {
-            return;
+            return ActionAdmission::Rejected;
         }
         if boundary == FsMetadataBoundary::Manual {
             self.finish_rating_picker_for_manual_navigation();
@@ -73705,9 +73959,9 @@ impl App {
         }
         let composition_ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
         let Some(idx) = self.poll_and_remap_book_target(&composition_ctx, idx) else {
-            return;
+            return ActionAdmission::Rejected;
         };
-        if self.defer_book_composition_fullscreen_open_with_adoption_and_landing(
+        let route = self.defer_book_composition_fullscreen_open_with_admission(
             idx,
             history_trigger,
             requested_materialization,
@@ -73717,10 +73971,11 @@ impl App {
             resume_notice.clone(),
             viewer_adoption,
             landing,
-        ) {
-            return;
+        );
+        if route.handled {
+            return route.admission;
         }
-        if self.defer_sidecar_restore_fullscreen_with_adoption_and_landing(
+        let route = self.defer_sidecar_restore_fullscreen_with_admission(
             idx,
             history_trigger,
             requested_materialization,
@@ -73729,17 +73984,18 @@ impl App {
             resume_notice.clone(),
             viewer_adoption,
             landing,
-        ) {
-            return;
+        );
+        if route.handled {
+            return route.admission;
         }
         let Some(item) = self.items.get(idx) else {
-            return;
+            return ActionAdmission::Rejected;
         };
         let prepared_source = match Self::prepare_fullscreen_epub_source(item) {
             Ok(source) => source,
             Err(reason) => {
                 self.show_open_admission_refusal(reason);
-                return;
+                return ActionAdmission::Rejected;
             }
         };
         // Browser replacement closes the old reader, whose normal teardown restores
@@ -73750,7 +74006,7 @@ impl App {
             && Self::browser_overlay_adoption(viewer_adoption)
             && !self.prepare_browser_overlay_open(&composition_ctx)
         {
-            return;
+            return ActionAdmission::Rejected;
         }
         if viewer_adoption.owns_file_selection() {
             self.move_grid_cursor(Some(idx), GridCursorIntent::Automatic);
@@ -73759,9 +74015,10 @@ impl App {
         #[cfg(windows)]
         if viewer_adoption.is_main_new() {
             if !Self::browser_overlay_adoption(viewer_adoption)
-                && !self.prepare_detached_context_for_grid_open(&composition_ctx, idx)
+                && let std::ops::ControlFlow::Break(admission) = self
+                    .prepare_detached_context_for_grid_open_with_admission(&composition_ctx, idx)
             {
-                return;
+                return admission;
             }
             self.fs_open_intent_from_grid = true;
         }
@@ -73784,7 +74041,7 @@ impl App {
         #[cfg(windows)]
         if routed_materialized_physical_still {
             finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
-            return;
+            return ActionAdmission::Accepted;
         }
 
         self.fullscreen_epub_source = prepared_source;
@@ -74237,7 +74494,7 @@ impl App {
                         self.fs_open_intent_from_grid = grid_open_intent;
                         self.vst3_deferred_media_open = Some(idx);
                         finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
-                        return;
+                        return ActionAdmission::Accepted;
                     }
                     crate::logger::log(format!("  video idx={idx} → start inline playback"));
                     self.fs_open_intent_from_grid = grid_open_intent;
@@ -74291,7 +74548,7 @@ impl App {
                         self.fs_open_intent_from_grid = grid_open_intent;
                         self.vst3_deferred_media_open = Some(idx);
                         finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
-                        return;
+                        return ActionAdmission::Accepted;
                     }
                     crate::logger::log(format!("  audio idx={idx} → start music view playback"));
                     // open_fullscreen 冒頭で take した grid/nav ワンショットを start_fs_load の
@@ -74332,6 +74589,7 @@ impl App {
         );
         self.notify_book_resume(resume_notice);
         finish_fs_open_perf_span(&mut perf, FsOpenPerfSpan::Total, total_perf_t0);
+        ActionAdmission::Accepted
     }
 
     /// メタデータ / EXIF / XMP キャッシュ用の正規化キーを返す。
