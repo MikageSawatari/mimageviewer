@@ -745,6 +745,23 @@ egui の動画キー経路で共有する。音楽表示（音声ファイルと
 描画前と確認できる入口だけが `*_before_fullscreen_render` を呼ぶ。段 2b はこの区別を引き継ぎ、
 描画中の要求を描画前の後処理へ流さない。
 
+**段 3 で見つかったリリース済みのコードの事実と、設計担当の判断 (2026-11-25)**。どちらも本機能の外の既存の経路で、
+本機能では直さない (憲法 7「ついでに直さない」)。統括へ別件として報告した。実行時の観測は無く、コードとテストの読みによる。
+
+- **native 動画の右クリックメニュー**: メインウィンドウの native 動画の全画面では、`render_fullscreen_viewport` の
+  native backdrop の分岐が、唯一の `show_fs_context_menu` の呼び出しより前に戻る。長押しで `fs_context_menu_idx` を
+  立てる経路 (`native_video.rs` の `maybe_open_native_video_secondary_long_press_menu` ほか) はあるが、表示する経路が
+  コード上見当たらない。本機能は native 動画のメニューのための新しい表示・実行の経路を作らない。共通のメニューの
+  モデルのスクリプトの行と、選んだ後にスロットを返す処理は置いておき、既存のメニューの表示の経路が直ったときに
+  そのまま出る形にする。native 動画のスクリプトは、キー・Browser キー・XButton・中ボタン・リング・ジェスチャーから使える。
+- **ROOT から転送されたキーの分岐** (`render_fs_body` の `root.context.viewport_id() != ctx.viewport_id()`、§1.341 で
+  入った分岐): egui の `Context` の clone は同じ状態を共有し、子 viewport の描画中は どちらの `viewport_id()` も子を
+  返すので、この比較は真にならない (段 3 の通しのテスト `operation_script_media_same_context_root_forwarding_reaches_child_owner_tail`
+  で確かめた)。ROOT にフォーカスがあるときの全画面のキーは、描画の前の ROOT 側の予備経路
+  (`handle_fullscreen_root_key_input`、段 2a で配線済み) が処理する。本機能はこの分岐を直さず、転送のキーを通る前提の
+  テストは置かない。2b でこの分岐に置いたスロットの収集は残す (分岐が働くようになったときに、ほかの入口と同じく
+  所有 pass の末尾へ返る)。
+
 採らなかった代案:
 
 - キーの入口へ注入して 1 フレームに 1 つずつ流す (r1 の案)。§2.1 の理由で取りやめた。
