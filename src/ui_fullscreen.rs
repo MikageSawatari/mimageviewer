@@ -27,6 +27,7 @@ pub(crate) enum SpreadPresentationPersistence {
 pub(crate) mod canonical_demand;
 mod compare_original;
 mod spread_step;
+use crate::app::operation_script_runtime::ScriptFeedback;
 use crate::app::spread_shift_owner::retire_spread_step;
 pub(crate) mod in_page_scroll;
 mod initial_placement;
@@ -20241,6 +20242,9 @@ impl PartialEq<FsPageNavRequest> for FsPageNav {
 
 #[derive(Default)]
 struct FsWheelFrameResult {
+    script_slot: Option<FsScriptRequest>,
+    script_feedback: Vec<ScriptFeedback>,
+    viewer_replaced: bool,
     page_nav: FsPageNavRequest,
     close: bool,
     primary_click_close: bool,
@@ -20356,6 +20360,45 @@ enum FsSecondaryInputOutcome {
     Continue,
     CloseRequested,
     ViewerReplaced,
+    ScriptSlot(FsScriptRequest),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FsScriptEntry {
+    ForwardedKey,
+    Key,
+    Pointer,
+    ContextMenu,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FsScriptDisplayIdentity {
+    destination: PresentationDestination,
+    items_generation: u64,
+    page: crate::app::operation_script_runtime::ScriptPageIdentity,
+}
+
+struct FsScriptRequest {
+    slot: u8,
+    entry: FsScriptEntry,
+    identity: FsScriptDisplayIdentity,
+    duplicate_slots: Vec<u8>,
+}
+
+/// One owner-pass request. A replaced input phase cannot accept later requests.
+#[derive(Default)]
+enum FsScriptRequestState {
+    #[default]
+    Empty,
+    Pending(FsScriptRequest),
+    Discarded,
+}
+
+#[derive(Default)]
+struct FsScriptFrame {
+    request: FsScriptRequestState,
+    navigation_accepted: bool,
+    notices: Vec<ScriptFeedback>,
 }
 
 impl FsSecondaryAction {
@@ -28607,6 +28650,7 @@ impl App {
         let mut jump_to: Option<usize> = None;
         let mut navigation_operation: Option<ViewerOperationId> = None;
         let mut wheel_frame_proposal: Option<FsWheelFrameProposal> = None;
+        let mut script_frame = FsScriptFrame::default();
         // 境界ヒント即時消去のため、フレーム先頭の状態を捕捉する。
         // handle_fs_navigation 実行後に、ヒントが同じ start_time のまま残って
         // いれば「このフレームで再設定されていない」= 打ち切ってよい、と判定する。
@@ -28953,6 +28997,12 @@ impl App {
                         input_spread_double,
                         &mut root_operation,
                     );
+                    script_frame.navigation_accepted |= root_action.navigation_already_accepted();
+                    self.collect_fs_script_slot(
+                        &mut script_frame,
+                        root_action.script_slot,
+                        FsScriptEntry::ForwardedKey,
+                    );
                     let input_idx = match root_action.page_transition {
                         FsKeyPageTransition::Unchanged => input_idx,
                         FsKeyPageTransition::Rebased { idx } => idx,
@@ -29193,6 +29243,8 @@ impl App {
                         let (overflow_pointer_input, overflow_touch_excluded) = self.capture_fs_front_pointer_input(ctx, full_rect);
                         let primary_suppression = self.advance_viewer_primary_pointer_frame(ctx, overflow_pointer_input.primary_owned);
                         if self.page_overview.session().is_some() {
+                            self.discard_fs_script_request(&mut script_frame,
+                                "ページ一覧へ切り替わったため実行できませんでした");
                             let key_action = self.handle_fs_key_input(ctx, fs_idx, is_spread_double);
                             let mut key_page_transition = key_action.page_transition;
                             if key_page_transition != FsKeyPageTransition::Closed {
@@ -29438,7 +29490,14 @@ impl App {
                         } else {
                             self.handle_fs_key_input_with_operation(ctx, fs_idx, is_spread_double, &mut navigation_operation)
                         };
+                        script_frame.navigation_accepted |= key_action.navigation_already_accepted();
+                        self.collect_fs_script_slot(&mut script_frame, key_action.script_slot,
+                            FsScriptEntry::Key);
                         let overview_rendered = self.page_overview.session().is_some();
+                        if overview_rendered {
+                            self.discard_fs_script_request(&mut script_frame,
+                                "ページ一覧へ切り替わったため実行できませんでした");
+                        }
                         let key_page_transition = if overview_rendered {
                             close_fs |= self.render_page_overview_surface_with_primary_frame(
                                 ui, full_rect, primary_suppression, overflow_pointer_input.clone(),
@@ -29534,6 +29593,14 @@ impl App {
                             overflow_pointer_input.clone(),
                             &overflow_touch_excluded,
                         );
+                        if let Some(request) = wheel_result.script_slot.take() {
+                            self.collect_fs_script_request_value(&mut script_frame, request);
+                        }
+                        script_frame.notices.append(&mut wheel_result.script_feedback);
+                        if wheel_result.viewer_replaced {
+                            self.discard_fs_script_request(&mut script_frame,
+                                "入力中に表示が切り替わったため実行できませんでした");
+                        }
                         if let Some(mut proposal) = wheel_result.deferred.take() {
                             proposal.frame_navigation_allowed = !continuation_committed;
                             proposal.music_ctrl_wheel_gate_reached = key_action.music_ctrl_wheel_gate_reached;
@@ -29563,6 +29630,8 @@ impl App {
                         // phase, then paint the new surface without reusing its physical edges.
                         if self.page_overview.session().is_some() {
                             // Navigation candidates belong to the replaced ordinary input phase.
+                            self.discard_fs_script_request(&mut script_frame,
+                                "ページ一覧へ切り替わったため実行できませんでした");
                             // Keep no old key/wheel/click result alive across the surface change.
                             wheel_frame_proposal = None;
                             navigation_operation = None;
@@ -29612,6 +29681,8 @@ impl App {
                         self.retire_fs_page_scroll_animation(ctx);
                         self.fullscreen_page_layout.drawn_unit = None;
                         if self.paint_viewer_presentation_interlude(ui, full_rect, ctx, detached, canvas_color) {
+                            self.discard_fs_script_request(&mut script_frame,
+                                "描画の末尾に到達しなかったため実行できませんでした");
                             return;
                         }
 
@@ -30998,7 +31069,10 @@ impl App {
                         if state.is_video {
                             self.maybe_open_native_video_secondary_long_press_menu(ctx, fs_idx);
                         }
-                        if self.show_fs_context_menu(ctx) {
+                        let menu_result = self.show_fs_context_menu(ctx);
+                        self.collect_fs_script_slot(&mut script_frame, menu_result.script_slot,
+                            FsScriptEntry::ContextMenu);
+                        if menu_result.close {
                             close_fs = true;
                         }
 
@@ -31312,6 +31386,45 @@ impl App {
                     self.claim_fs_wheel_frame_after_ui(proposal);
                 }
 
+                let mut script_action = FsKeyAction {
+                    close: close_fs,
+                    close_to_page_list,
+                    page_nav,
+                    ctrl_nav,
+                    list_order_nav,
+                    sibling_nav,
+                    mouse_nav: mouse_nav.take(),
+                    jump_to,
+                    ..Default::default()
+                };
+                self.finish_fs_script_frame(
+                    ctx,
+                    &mut script_frame,
+                    &mut script_action,
+                    &mut navigation_operation,
+                    wheel_frame_proposal.is_some(),
+                    continuation_committed,
+                );
+                close_fs = script_action.close;
+                close_to_page_list = script_action.close_to_page_list;
+                page_nav = script_action.page_nav;
+                ctrl_nav = script_action.ctrl_nav;
+                list_order_nav = script_action.list_order_nav;
+                sibling_nav = script_action.sibling_nav;
+                mouse_nav = script_action.mouse_nav;
+                jump_to = script_action.jump_to;
+                match script_action.page_transition {
+                    FsKeyPageTransition::Unchanged => {}
+                    FsKeyPageTransition::Closed => {
+                        frame_exited = true;
+                        return;
+                    }
+                    FsKeyPageTransition::Rebased { idx } => {
+                        frame_snapshot =
+                            Some((idx, matches!(self.items.get(idx), Some(GridItem::Video(_)))));
+                    }
+                }
+
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
                 fs_closure_cycles = Self::thread_cycles_now().saturating_sub(closure_cycles_t0);
@@ -31357,7 +31470,12 @@ impl App {
             fs_body_ms = fs_body_t0.elapsed().as_secs_f64() * 1000.0;
             fs_body_cycles = Self::thread_cycles_now().saturating_sub(fs_body_cycles_t0);
         }
+        self.discard_fs_script_request(
+            &mut script_frame,
+            "描画の末尾に到達しなかったため実行できませんでした",
+        );
         if frame_path_changed || frame_exited {
+            self.notify_fs_script_frame(&mut script_frame);
             finish_fs_render_perf(
                 &mut fs_render_perf,
                 self.frame_counter,
@@ -31367,6 +31485,7 @@ impl App {
             return;
         }
         let Some((fs_idx, fs_state_is_video)) = frame_snapshot else {
+            self.notify_fs_script_frame(&mut script_frame);
             return;
         };
         #[cfg(windows)]
@@ -31543,7 +31662,7 @@ impl App {
         // ── ナビゲーション & スライドショー処理 ──
         if let Some(proposal) = wheel_frame_proposal {
             let navigation_allowed = proposal.frame_navigation_allowed;
-            let result = self.apply_fs_wheel_frame_proposal(
+            let mut result = self.apply_fs_wheel_frame_proposal(
                 proposal,
                 !navigation_allowed
                     || close_fs
@@ -31555,6 +31674,7 @@ impl App {
                     || jump_to.is_some(),
                 &mut navigation_operation,
             );
+            script_frame.notices.append(&mut result.script_feedback);
             if navigation_allowed
                 && (result.wheel_navigation_produced || !result.page_nav.is_none())
             {
@@ -31592,6 +31712,7 @@ impl App {
             slideshow_timer_pass,
             &mut fs_render_perf,
         );
+        self.notify_fs_script_frame(&mut script_frame);
         #[cfg(all(windows, feature = "test-script"))]
         if let (Some(window_id), Some(output)) =
             (active_render_window_id, test_script_pointer_show_output)
@@ -35028,6 +35149,144 @@ impl App {
             key_action.navigation_already_accepted(),
         ) {
             key_action.merge_script_action(action, navigation_operation);
+        }
+    }
+
+    fn fs_script_display_identity(&self) -> FsScriptDisplayIdentity {
+        FsScriptDisplayIdentity {
+            destination: self.page_turn_destination(),
+            items_generation: self.items_generation,
+            page: self.operation_script_page_identity(),
+        }
+    }
+
+    fn collect_fs_script_slot(
+        &mut self,
+        frame: &mut FsScriptFrame,
+        slot: Option<u8>,
+        entry: FsScriptEntry,
+    ) {
+        let Some(slot) = slot else { return };
+        let identity = self.fs_script_display_identity();
+        self.collect_fs_script_request_value(
+            frame,
+            FsScriptRequest {
+                slot,
+                entry,
+                identity,
+                duplicate_slots: Vec::new(),
+            },
+        );
+    }
+
+    fn collect_fs_script_request_value(
+        &mut self,
+        frame: &mut FsScriptFrame,
+        mut request: FsScriptRequest,
+    ) {
+        let mut duplicates = std::mem::take(&mut request.duplicate_slots);
+        if matches!(frame.request, FsScriptRequestState::Empty) {
+            frame.request = FsScriptRequestState::Pending(request);
+        } else {
+            duplicates.insert(0, request.slot);
+        }
+        for slot in duplicates {
+            frame.notices.push(ScriptFeedback::Warning(format!(
+                "スクリプト操作 {slot}: 同じフレームの追加の要求を破棄しました"
+            )));
+        }
+    }
+
+    fn discard_fs_script_request(&mut self, frame: &mut FsScriptFrame, reason: &str) {
+        if let FsScriptRequestState::Pending(request) =
+            std::mem::replace(&mut frame.request, FsScriptRequestState::Discarded)
+        {
+            crate::logger::log(format!(
+                "operation script discarded entry={:?}: {reason}",
+                request.entry
+            ));
+            frame.notices.push(ScriptFeedback::Warning(format!(
+                "スクリプト操作 {}: {reason}",
+                request.slot
+            )));
+        }
+    }
+
+    fn notify_fs_script_frame(&mut self, frame: &mut FsScriptFrame) {
+        if frame.notices.is_empty() {
+            return;
+        }
+        let mut warnings = Vec::new();
+        let mut notice = None;
+        for feedback in std::mem::take(&mut frame.notices) {
+            match feedback {
+                ScriptFeedback::Warning(text) => warnings.push(text),
+                ScriptFeedback::Notice(text) => notice = Some(text),
+            }
+        }
+        if !warnings.is_empty() {
+            self.show_feedback_warning(warnings.join("\n"));
+        } else if let Some(text) = notice {
+            self.show_feedback_toast(text);
+        }
+    }
+
+    /// Runs only while the actual owner viewport is still on egui's stack.
+    /// Warnings stay local until the outer dispatcher has also finished.
+    fn finish_fs_script_frame(
+        &mut self,
+        ctx: &egui::Context,
+        frame: &mut FsScriptFrame,
+        action: &mut FsKeyAction,
+        navigation_operation: &mut Option<ViewerOperationId>,
+        wheel_deferred: bool,
+        continuation_committed: bool,
+    ) {
+        if action.page_transition == FsKeyPageTransition::Closed {
+            self.discard_fs_script_request(frame, "表示が終了したため実行できませんでした");
+            return;
+        }
+        if wheel_deferred {
+            self.discard_fs_script_request(
+                frame,
+                "ホイールの処理が保留されたため実行できませんでした",
+            );
+            return;
+        }
+        if self.page_overview.session().is_some() {
+            self.discard_fs_script_request(
+                frame,
+                "ページ一覧へ切り替わったため実行できませんでした",
+            );
+            return;
+        }
+        let FsScriptRequestState::Pending(request) = std::mem::take(&mut frame.request) else {
+            return;
+        };
+        if request.identity != self.fs_script_display_identity() {
+            frame.notices.push(ScriptFeedback::Warning(format!(
+                "スクリプト操作 {}: 表示対象が変わったため実行できませんでした",
+                request.slot
+            )));
+            return;
+        }
+        let (result, feedback) = self.run_script_slot_with_feedback(
+            ctx,
+            request.slot,
+            crate::app::operation_script_runtime::ScriptInputSurface::Viewer,
+            action.navigation_already_accepted()
+                || frame.navigation_accepted
+                || continuation_committed
+                || self.pending_return_to_parent.is_pending()
+                || self.mouse_ring_nav.is_some(),
+        );
+        frame.notices.extend(feedback);
+        if let crate::app::operation_script_runtime::ScriptRunResult::Fullscreen {
+            action: script_action,
+            ..
+        } = result
+        {
+            action.merge_script_action(script_action, navigation_operation);
         }
     }
 
@@ -42617,11 +42876,21 @@ impl App {
         {
             self.handle_middle_drag_zoom(ctx, default_image_rect, overflow_pointer_input.clone());
         }
-        if middle_short_click {
-            self.dispatch_viewer_middle_short_click(ctx);
-        }
+        let middle_script_slot = middle_short_click
+            .then(|| self.dispatch_viewer_middle_short_click(ctx))
+            .flatten()
+            .map(|slot| FsScriptRequest {
+                slot,
+                entry: FsScriptEntry::Pointer,
+                identity: self.fs_script_display_identity(),
+                duplicate_slots: Vec::new(),
+            });
         if self.page_overview.session().is_some() {
-            return FsWheelFrameResult::default();
+            return FsWheelFrameResult {
+                script_slot: middle_script_slot,
+                viewer_replaced: true,
+                ..Default::default()
+            };
         }
 
         // 動画タイルモード中でも Ctrl なし Wheel は前後アイテム移動に使う。
@@ -42915,6 +43184,9 @@ impl App {
         };
         if merge_at_frame_tail && mixed_navigation {
             FsWheelFrameResult {
+                script_slot: middle_script_slot,
+                script_feedback: Vec::new(),
+                viewer_replaced: false,
                 page_nav: pointer_nav,
                 close,
                 primary_click_close,
@@ -42922,11 +43194,15 @@ impl App {
                 deferred: Some(proposal),
             }
         } else {
-            self.apply_fs_wheel_frame_proposal(
+            let mut result = self.apply_fs_wheel_frame_proposal_in_phase(
                 proposal,
                 suppress_wheel_navigation,
                 navigation_operation,
-            )
+                true,
+            );
+            result.script_slot =
+                self.merge_fs_pointer_script_slots(middle_script_slot, result.script_slot);
+            result
         }
     }
 
@@ -43040,6 +43316,21 @@ impl App {
         proposal: FsWheelFrameProposal,
         suppress_wheel_navigation: bool,
         navigation_operation: &mut Option<ViewerOperationId>,
+    ) -> FsWheelFrameResult {
+        self.apply_fs_wheel_frame_proposal_in_phase(
+            proposal,
+            suppress_wheel_navigation,
+            navigation_operation,
+            false,
+        )
+    }
+
+    fn apply_fs_wheel_frame_proposal_in_phase(
+        &mut self,
+        proposal: FsWheelFrameProposal,
+        suppress_wheel_navigation: bool,
+        navigation_operation: &mut Option<ViewerOperationId>,
+        script_owner_available: bool,
     ) -> FsWheelFrameResult {
         let FsWheelFrameProposal {
             context,
@@ -43544,10 +43835,24 @@ impl App {
         // must run this egui block instead — otherwise right-click (close) and the right-drag
         // ring shortcut do nothing (実機 FB 2026-07). The context is `current_right_drag_context()`
         // = VideoFullscreen (item is Video), so it shows the video ring, not the image ring.
+        let mut script_slot = None;
+        let mut script_feedback = Vec::new();
+        let mut viewer_replaced = false;
         match self.apply_fs_secondary_input(ctx, secondary_action, side_panel_click_chrome) {
             FsSecondaryInputOutcome::Continue => {}
             FsSecondaryInputOutcome::CloseRequested => close = true,
+            FsSecondaryInputOutcome::ScriptSlot(request) => {
+                if script_owner_available {
+                    script_slot = Some(request);
+                } else {
+                    let slot = request.slot;
+                    script_feedback.push(ScriptFeedback::Warning(format!(
+                        "スクリプト操作 {slot}: 保留されたホイールの処理内では実行できませんでした"
+                    )));
+                }
+            }
             FsSecondaryInputOutcome::ViewerReplaced => {
+                viewer_replaced = true;
                 // A live return can retain this page until main consumes it.
                 // It still ends this input owner's navigation, just like a
                 // completed viewer or replaced destination/items.
@@ -43557,9 +43862,17 @@ impl App {
         }
 
         if self.page_overview.session().is_some() {
-            return FsWheelFrameResult::default();
+            return FsWheelFrameResult {
+                script_slot,
+                script_feedback,
+                viewer_replaced: true,
+                ..Default::default()
+            };
         }
         FsWheelFrameResult {
+            script_slot,
+            script_feedback,
+            viewer_replaced,
             page_nav,
             close,
             primary_click_close: matches!(canvas_click, FsCanvasClickAction::CloseViewer),
@@ -44161,8 +44474,18 @@ impl App {
                 if let Some(command) = recognition.command {
                     let destination = self.page_turn_destination();
                     let items = self.items_generation;
-                    if let Some(nav) = self.execute_right_drag_command(ctx, command) {
+                    let (nav, script_slot) =
+                        self.execute_right_drag_command_for_fullscreen_render(ctx, command);
+                    if let Some(nav) = nav {
                         self.mouse_ring_nav = Some(nav);
+                    }
+                    if let Some(slot) = script_slot {
+                        return FsSecondaryInputOutcome::ScriptSlot(FsScriptRequest {
+                            slot,
+                            entry: FsScriptEntry::Pointer,
+                            identity: self.fs_script_display_identity(),
+                            duplicate_slots: Vec::new(),
+                        });
                     }
                     if self.pending_return_to_parent.is_pending()
                         || self.fullscreen_idx.is_none()
@@ -44181,6 +44504,21 @@ impl App {
                         ),
                 )
             }
+        }
+    }
+
+    fn merge_fs_pointer_script_slots(
+        &mut self,
+        first: Option<FsScriptRequest>,
+        second: Option<FsScriptRequest>,
+    ) -> Option<FsScriptRequest> {
+        match (first, second) {
+            (Some(mut first), Some(mut second)) => {
+                first.duplicate_slots.push(second.slot);
+                first.duplicate_slots.append(&mut second.duplicate_slots);
+                Some(first)
+            }
+            (first, second) => first.or(second),
         }
     }
 
@@ -105106,3 +105444,6 @@ fn export_done_message(success: usize, skipped: usize) -> String {
 #[cfg(test)]
 #[path = "ui_fullscreen/operation_script_merge_tests.rs"]
 mod operation_script_merge_tests;
+
+#[cfg(test)]
+mod operation_script_owner_tests;

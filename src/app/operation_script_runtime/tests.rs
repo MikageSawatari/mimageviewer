@@ -467,7 +467,7 @@ fn rebase_returns_to_caller_and_keeps_interruption_notice_over_script_notice() {
     app.fullscreen_idx = Some(0);
     app.viewer_presentation = ViewerPresentation::Fullscreen;
     app.spread_mode = crate::settings::SpreadMode::Single;
-    let result = app.run_script_slot(
+    let (result, feedback) = app.run_script_slot_with_feedback(
         &egui::Context::default(),
         1,
         ScriptInputSurface::Viewer,
@@ -486,6 +486,7 @@ fn rebase_returns_to_caller_and_keeps_interruption_notice_over_script_notice() {
     ));
     assert_eq!(app.fs_transparent_bg_mode, 0);
     assert!(toast(&app).contains("残りの操作を中止"));
+    assert!(matches!(feedback, Some(ScriptFeedback::Warning(text)) if text == toast(&app)));
 }
 
 #[test]
@@ -544,12 +545,13 @@ fn delegated_book_permission_returns_and_discards_remaining_script_actions() {
             .is_none()
     );
     app.install_book_composition_runtime(service);
-    let result = app.run_script_slot(
+    let (result, feedback) = app.run_script_slot_with_feedback(
         &egui::Context::default(),
         1,
         ScriptInputSurface::Viewer,
         false,
     );
+    assert!(matches!(feedback, Some(ScriptFeedback::Warning(text)) if text == toast(&app)));
     assert!(
         matches!(
             result,

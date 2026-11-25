@@ -1212,7 +1212,12 @@ pub(crate) fn append_script_slot_menu(
     let children: Vec<_> = slots
         .into_iter()
         .filter(|(_, label)| !label.trim().is_empty())
-        .map(|(slot, label)| item(MenuCommand::ScriptSlot(slot), label))
+        .map(|(slot, label)| {
+            item(
+                MenuCommand::ScriptSlot(slot),
+                format!("スクリプト操作 {slot}: {label}"),
+            )
+        })
         .collect();
     if !children.is_empty() {
         push_group(
@@ -2090,8 +2095,8 @@ mod tests {
             MenuNode::Submenu {
                 label: "スクリプト".into(),
                 children: vec![
-                    item(MenuCommand::ScriptSlot(1), "最初の操作"),
-                    item(MenuCommand::ScriptSlot(9), "末尾へ"),
+                    item(MenuCommand::ScriptSlot(1), "スクリプト操作 1: 最初の操作"),
+                    item(MenuCommand::ScriptSlot(9), "スクリプト操作 9: 末尾へ"),
                 ],
             }
         );

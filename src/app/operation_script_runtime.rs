@@ -71,6 +71,13 @@ pub(crate) enum ScriptRunResult {
     },
 }
 
+/// Notification emitted by this invocation, independent of its navigation result.
+#[derive(Clone, Debug)]
+pub(crate) enum ScriptFeedback {
+    Notice(String),
+    Warning(String),
+}
+
 impl ScriptRunResult {
     fn empty(surface: ScriptInputSurface, rejected: bool) -> Self {
         match surface {
@@ -238,6 +245,14 @@ pub(crate) struct ScriptTargetIdentity {
     pairing_origins: (Option<ScriptItemIdentity>, Option<ScriptItemIdentity>),
     slice: crate::page_split::PageSlice,
     checked: Vec<(usize, ScriptItemIdentity)>,
+}
+
+/// Shared page-event identity (§3.3), independent of list generations and caches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScriptPageIdentity {
+    location: ScriptLocation,
+    head: Option<ScriptItemIdentity>,
+    slice: crate::page_split::PageSlice,
 }
 
 impl App {
@@ -491,6 +506,19 @@ impl App {
         }
     }
 
+    /// Read only accepted in-memory state; do not prepare a display unit here.
+    /// TODO(stage 2b): resolve the canonical unit head instead of a retained anchor.
+    pub(crate) fn operation_script_page_identity(&self) -> ScriptPageIdentity {
+        ScriptPageIdentity {
+            location: self.operation_script_location(),
+            head: self
+                .fullscreen_idx
+                .and_then(|idx| self.items.get(idx))
+                .map(item_identity),
+            slice: self.fullscreen_page_slice,
+        }
+    }
+
     /// レーティングの読み取り専用投影。cache missでDBへ問い合わせない。
     pub(crate) fn operation_script_cached_rating(&self, idx: usize) -> Option<u8> {
         self.rating_path_key(idx)
@@ -670,10 +698,27 @@ impl App {
         snapshot
     }
 
-    fn script_failure(&mut self, number: u8, reason: impl std::fmt::Display) {
+    fn script_failure(
+        &mut self,
+        number: u8,
+        reason: impl std::fmt::Display,
+        feedback: &mut Option<ScriptFeedback>,
+    ) {
         let message = format!("スクリプト操作 {number}: {reason}");
         crate::logger::log(&message);
-        self.show_feedback_warning(message);
+        self.publish_script_feedback(ScriptFeedback::Warning(message), feedback);
+    }
+
+    fn publish_script_feedback(
+        &mut self,
+        message: ScriptFeedback,
+        feedback: &mut Option<ScriptFeedback>,
+    ) {
+        match &message {
+            ScriptFeedback::Notice(text) => self.show_feedback_toast(text.clone()),
+            ScriptFeedback::Warning(text) => self.show_feedback_warning(text.clone()),
+        }
+        *feedback = Some(message);
     }
 
     pub(crate) fn run_script_slot(
@@ -683,14 +728,27 @@ impl App {
         surface: ScriptInputSurface,
         navigation_already_accepted: bool,
     ) -> ScriptRunResult {
+        self.run_script_slot_with_feedback(ctx, number, surface, navigation_already_accepted)
+            .0
+    }
+
+    pub(crate) fn run_script_slot_with_feedback(
+        &mut self,
+        ctx: &egui::Context,
+        number: u8,
+        surface: ScriptInputSurface,
+        navigation_already_accepted: bool,
+    ) -> (ScriptRunResult, Option<ScriptFeedback>) {
         let started = std::time::Instant::now();
         let mut operations = None;
+        let mut feedback = None;
         let result = self.run_script_slot_with_metrics(
             ctx,
             number,
             surface,
             navigation_already_accepted,
             &mut operations,
+            &mut feedback,
         );
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -713,7 +771,7 @@ impl App {
                 ],
             );
         }
-        result
+        (result, feedback)
     }
 
     fn run_script_slot_with_metrics(
@@ -723,12 +781,13 @@ impl App {
         surface: ScriptInputSurface,
         navigation_already_accepted: bool,
         operations: &mut Option<u64>,
+        feedback: &mut Option<ScriptFeedback>,
     ) -> ScriptRunResult {
         let context = match self.operation_script_eligibility(ctx, surface) {
             ScriptEligibility::Available(context) => context,
             ScriptEligibility::Silent => return ScriptRunResult::empty(surface, true),
             ScriptEligibility::Notify(reason) => {
-                self.script_failure(number, reason);
+                self.script_failure(number, reason, feedback);
                 return ScriptRunResult::empty(surface, true);
             }
         };
@@ -754,13 +813,13 @@ impl App {
         }) {
             Ok(output) => output,
             Err(error) => {
-                self.script_failure(number, error);
+                self.script_failure(number, error, feedback);
                 return ScriptRunResult::empty(surface, true);
             }
         };
         // 動画/音声の実行関数の共有は段3。評価済みの並びを一つも適用しない。
         if context == ScriptContext::FsVideo && !output.operations().is_empty() {
-            self.script_failure(number, "この画面ではまだ使用できません");
+            self.script_failure(number, "この画面ではまだ使用できません", feedback);
             return ScriptRunResult::empty(surface, true);
         }
         let mut result = ScriptRunResult::empty(surface, false);
@@ -771,6 +830,7 @@ impl App {
                 self.script_failure(
                     number,
                     format!("『{}』を実行できませんでした", operation.action.ini_name()),
+                    feedback,
                 );
                 return ScriptRunResult::empty(surface, true);
             }
@@ -792,25 +852,37 @@ impl App {
                 self.script_failure(
                     number,
                     format!("『{}』を実行できませんでした", operation.action.ini_name()),
+                    feedback,
                 );
                 return result;
             }
             let remaining = index + 1 < output.operations().len();
             if result.needs_postprocessing() {
                 if remaining {
-                    self.script_failure(number, "画面の遷移があるため残りの操作を中止しました");
+                    self.script_failure(
+                        number,
+                        "画面の遷移があるため残りの操作を中止しました",
+                        feedback,
+                    );
                 } else if let Some(notice) = output.notice() {
-                    self.show_feedback_toast(notice.to_owned());
+                    self.publish_script_feedback(
+                        ScriptFeedback::Notice(notice.to_owned()),
+                        feedback,
+                    );
                 }
                 return result;
             }
             if remaining && self.operation_script_target(surface) != target {
-                self.script_failure(number, "操作の対象が変わったため残りの操作を中止しました");
+                self.script_failure(
+                    number,
+                    "操作の対象が変わったため残りの操作を中止しました",
+                    feedback,
+                );
                 return result;
             }
         }
         if let Some(notice) = output.notice() {
-            self.show_feedback_toast(notice.to_owned());
+            self.publish_script_feedback(ScriptFeedback::Notice(notice.to_owned()), feedback);
         }
         result
     }

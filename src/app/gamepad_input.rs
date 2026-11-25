@@ -3878,7 +3878,28 @@ impl App {
         ctx: &egui::Context,
         command: RightDragCommand,
     ) -> Option<AddressBarNav> {
-        self.execute_right_drag_command_in_phase(ctx, command, RingScriptPhase::DrawOwned)
+        self.execute_right_drag_command_in_phase(
+            ctx,
+            command,
+            RingScriptPhase::DrawOwned,
+            &mut None,
+        )
+    }
+
+    /// The render owner executes viewer scripts only after its final UI has closed.
+    pub(crate) fn execute_right_drag_command_for_fullscreen_render(
+        &mut self,
+        ctx: &egui::Context,
+        command: RightDragCommand,
+    ) -> (Option<AddressBarNav>, Option<u8>) {
+        let mut slot = None;
+        let nav = self.execute_right_drag_command_in_phase(
+            ctx,
+            command,
+            RingScriptPhase::DrawOwned,
+            &mut slot,
+        );
+        (nav, slot)
     }
 
     pub(crate) fn execute_right_drag_command_before_fullscreen_render(
@@ -3886,7 +3907,12 @@ impl App {
         ctx: &egui::Context,
         command: RightDragCommand,
     ) -> Option<AddressBarNav> {
-        self.execute_right_drag_command_in_phase(ctx, command, RingScriptPhase::BeforeRender)
+        self.execute_right_drag_command_in_phase(
+            ctx,
+            command,
+            RingScriptPhase::BeforeRender,
+            &mut None,
+        )
     }
 
     fn execute_right_drag_command_in_phase(
@@ -3894,6 +3920,7 @@ impl App {
         ctx: &egui::Context,
         command: RightDragCommand,
         phase: RingScriptPhase,
+        script_slot: &mut Option<u8>,
     ) -> Option<AddressBarNav> {
         match command {
             RightDragCommand::RingShortcut {
@@ -3913,7 +3940,14 @@ impl App {
                     self.show_feedback_toast(format!("[{}: なし]", direction.label()));
                     return None;
                 }
-                self.apply_ring_action_in_phase(ctx, context, action, source, phase)
+                self.apply_right_drag_action_in_phase(
+                    ctx,
+                    context,
+                    action,
+                    source,
+                    phase,
+                    script_slot,
+                )
             }
             RightDragCommand::MouseGesture {
                 context,
@@ -3941,7 +3975,14 @@ impl App {
                         self.ring_runtime_label(action_context, &action)
                     ));
                 }
-                self.apply_ring_action_in_phase(ctx, action_context, action, "mouse-gesture", phase)
+                self.apply_right_drag_action_in_phase(
+                    ctx,
+                    action_context,
+                    action,
+                    "mouse-gesture",
+                    phase,
+                    script_slot,
+                )
             }
             RightDragCommand::ViewerShortRightClick { context, pos } => {
                 if self.page_overview.session().is_some() {
@@ -8180,7 +8221,7 @@ impl App {
             action.as_str()
         ));
         let dispatched_action = action.clone();
-        let script_slot = (context == RingShortcutContext::ImageFullscreen)
+        let script_slot = (context != RingShortcutContext::Grid)
             .then(|| action.script_slot_key_action())
             .flatten()
             .and_then(super::operation_script_runtime::script_slot_number);
@@ -9236,6 +9277,27 @@ impl App {
                 None
             }
         }
+    }
+
+    fn apply_right_drag_action_in_phase(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        action: RingActionId,
+        source: &'static str,
+        phase: RingScriptPhase,
+        script_slot: &mut Option<u8>,
+    ) -> Option<AddressBarNav> {
+        if matches!(phase, RingScriptPhase::DrawOwned)
+            && context != RingShortcutContext::Grid
+            && let Some(slot) = action
+                .script_slot_key_action()
+                .and_then(super::operation_script_runtime::script_slot_number)
+        {
+            *script_slot = Some(slot);
+            return None;
+        }
+        self.apply_ring_action_in_phase(ctx, context, action, source, phase)
     }
 
     fn apply_ring_grid_column_count(&mut self, cols: usize) {

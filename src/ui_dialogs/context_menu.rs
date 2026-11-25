@@ -378,8 +378,15 @@ enum NativeGridContextMenuOutcome {
     Consumed {
         nav: Option<ContextMenuAction>,
         close_fullscreen: bool,
+        script_slot: Option<u8>,
     },
     Fallback,
+}
+
+#[derive(Default)]
+pub(crate) struct FsContextMenuResult {
+    pub(crate) close: bool,
+    pub(crate) script_slot: Option<u8>,
 }
 
 /// このコマンドを実行する前にフルスクリーンを抜けるか。
@@ -1412,15 +1419,23 @@ impl crate::app::App {
                 NativeGridContextMenuOutcome::Consumed {
                     nav: None,
                     close_fullscreen: false,
+                    script_slot: None,
                 }
             }
             NativeContextMenuResult::MivCommand(command) => {
                 let close_fullscreen =
                     native_menu_command_closes_fullscreen(&command, target.surface);
-                let nav = self.dispatch_native_grid_context_command(ctx, command, target);
+                let script_slot =
+                    self.take_fullscreen_context_script_slot(&command, target.surface);
+                let nav = if script_slot.is_some() {
+                    None
+                } else {
+                    self.dispatch_native_grid_context_command(ctx, command, target)
+                };
                 NativeGridContextMenuOutcome::Consumed {
                     nav,
                     close_fullscreen,
+                    script_slot,
                 }
             }
             NativeContextMenuResult::Fallback { reason } => {
@@ -1735,10 +1750,9 @@ impl crate::app::App {
                 },
             );
         }
-        // Stage 2a exposes scripts only on the main grid. The bookmark browser
-        // has its own menu and deliberately never reaches this builder.
-        if target.surface == ContextMenuSurface::Grid
-            && !self.items_are_bookmark_view
+        // Both renderers and both surfaces share these dynamic slot rows.
+        // The bookmark browser deliberately has no script submenu.
+        if !(target.surface == ContextMenuSurface::Grid && self.items_are_bookmark_view)
             && self.settings.operation_script_enabled
             && let crate::operation_script::OperationScriptState::Ready(script) =
                 &self.operation_script.state
@@ -2462,27 +2476,28 @@ impl crate::app::App {
 
     /// フルスクリーン表示中のコンテキストメニューを表示する。
     /// 移動なし右クリックでトリガーされる。
-    /// アプリケーション起動によりフルスクリーンを閉じるべき場合は true を返す。
-    pub(crate) fn show_fs_context_menu(&mut self, ctx: &egui::Context) -> bool {
+    /// 閉じる要求とスクリプトのスロットを描画の所有者へ返す。
+    pub(crate) fn show_fs_context_menu(&mut self, ctx: &egui::Context) -> FsContextMenuResult {
         if !self.fs_context_menu_presented() {
             self.fs_context_menu_idx = None;
-            return false;
+            return FsContextMenuResult::default();
         }
         let idx = match self.fs_context_menu_idx {
             Some(i) => i,
-            None => return false,
+            None => return FsContextMenuResult::default(),
         };
 
         let item = match self.items.get(idx) {
             Some(item) => item.clone(),
             None => {
                 self.fs_context_menu_idx = None;
-                return false;
+                return FsContextMenuResult::default();
             }
         };
 
         let mut close = false;
         let mut close_fullscreen = false;
+        let mut script_slot = None;
         let pos = self.fs_context_menu_pos;
         let explorer_folder = context_explorer_folder(&item, false, false, None);
 
@@ -2498,11 +2513,16 @@ impl crate::app::App {
             ContextMenuSurface::Fullscreen,
         ) {
             NativeGridContextMenuOutcome::Consumed {
-                close_fullscreen, ..
+                close_fullscreen,
+                script_slot,
+                ..
             } => {
                 self.fs_context_menu_idx = None;
                 ctx.request_repaint();
-                return close_fullscreen;
+                return FsContextMenuResult {
+                    close: close_fullscreen,
+                    script_slot,
+                };
             }
             NativeGridContextMenuOutcome::Fallback => {}
         }
@@ -2547,13 +2567,34 @@ impl crate::app::App {
             // フォールバックメニューにも同じ判断が別々に書かれていた (しかも
             // OpenWithAssociation は surface を見ずに常に閉じていた)。共有の述語へ寄せる。
             close_fullscreen = native_menu_command_closes_fullscreen(&command, target.surface);
-            let _ = self.dispatch_native_grid_context_command(ctx, command, &target);
+            script_slot = self.take_fullscreen_context_script_slot(&command, target.surface);
+            if script_slot.is_none() {
+                let _ = self.dispatch_native_grid_context_command(ctx, command, &target);
+            }
             close = true;
         }
         if close || !open {
             self.fs_context_menu_idx = None;
         }
-        close_fullscreen
+        FsContextMenuResult {
+            close: close_fullscreen,
+            script_slot,
+        }
+    }
+
+    fn take_fullscreen_context_script_slot(
+        &mut self,
+        command: &MenuCommand,
+        surface: ContextMenuSurface,
+    ) -> Option<u8> {
+        if surface == ContextMenuSurface::Fullscreen
+            && let MenuCommand::ScriptSlot(slot) = command
+        {
+            self.fs_context_menu_idx = None;
+            Some(*slot)
+        } else {
+            None
+        }
     }
     /// チェック済みアイテムの Shell ファイル操作対象 (idx, path) を収集する。
     ///
@@ -4520,7 +4561,7 @@ mod operation_script_grid_menu_tests {
     }
 
     #[test]
-    fn grid_script_menu_is_shared_by_renderers_and_excludes_fullscreen_bookmarks_and_off() {
+    fn script_menu_is_shared_by_surfaces_and_renderers_and_excludes_bookmarks_and_off() {
         let mut app = app_with_script();
         let ctx = egui::Context::default();
         let grid_target = target(&app, ContextMenuSurface::Grid);
@@ -4530,17 +4571,18 @@ mod operation_script_grid_menu_tests {
             MenuNode::Submenu { label, children }
                 if label == "スクリプト" && children == &vec![MenuNode::Item {
                     command: MenuCommand::ScriptSlot(1),
-                    label: "一覧の操作".into(),
+                    label: "スクリプト操作 1: 一覧の操作".into(),
                     enabled: true,
                     disabled_reason: None,
                 }]
         )));
         let fullscreen_target = target(&app, ContextMenuSurface::Fullscreen);
-        for (bookmark, enabled, menu_target) in [
-            (false, true, &fullscreen_target),
-            (true, true, &grid_target),
-            (false, false, &grid_target),
-        ] {
+        let fullscreen_nodes = app.context_menu_nodes(&ctx, &fullscreen_target, false);
+        assert!(fullscreen_nodes.iter().any(|node| matches!(node,
+            MenuNode::Submenu { label, .. } if label == "スクリプト")));
+        for (bookmark, enabled, menu_target) in
+            [(true, true, &grid_target), (false, false, &grid_target)]
+        {
             app.items_are_bookmark_view = bookmark;
             app.settings.operation_script_enabled = enabled;
             let nodes = app.context_menu_nodes(&ctx, menu_target, false);
@@ -4580,7 +4622,8 @@ mod operation_script_grid_menu_tests {
                     ),
                     NativeGridContextMenuOutcome::Consumed {
                         nav: None,
-                        close_fullscreen: false
+                        close_fullscreen: false,
+                        script_slot: None
                     }
                 ));
             } else {
@@ -4604,6 +4647,40 @@ mod operation_script_grid_menu_tests {
                 "native={native}"
             );
             let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
+        }
+    }
+
+    #[test]
+    fn fullscreen_script_menu_native_and_egui_selection_return_slot_after_closing() {
+        for native in [false, true] {
+            let mut app = app_with_script();
+            let ctx = egui::Context::default();
+            app.fullscreen_idx = Some(0);
+            app.fs_context_menu_idx = Some(0);
+            let target = target(&app, ContextMenuSurface::Fullscreen);
+            let before = app.settings.grid_cols;
+            let slot = if native {
+                match app.dispatch_native_context_menu_result(
+                    &ctx,
+                    NativeContextMenuResult::MivCommand(MenuCommand::ScriptSlot(1)),
+                    &target,
+                ) {
+                    NativeGridContextMenuOutcome::Consumed {
+                        nav: None,
+                        close_fullscreen: false,
+                        script_slot,
+                    } => script_slot,
+                    other => panic!("unexpected result: {other:?}"),
+                }
+            } else {
+                app.take_fullscreen_context_script_slot(&MenuCommand::ScriptSlot(1), target.surface)
+            };
+            assert_eq!(slot, Some(1));
+            assert!(app.fs_context_menu_idx.is_none());
+            assert_eq!(
+                app.settings.grid_cols, before,
+                "only the drawing owner may evaluate"
+            );
         }
     }
 
@@ -4666,6 +4743,7 @@ mod operation_script_grid_menu_tests {
                     NativeGridContextMenuOutcome::Consumed {
                         nav,
                         close_fullscreen: false,
+                        script_slot: None,
                     } => nav,
                     other => panic!("unexpected menu result: {other:?}"),
                 }
@@ -7547,7 +7625,8 @@ mod search_by_name_menu_tests {
                     ),
                     NativeGridContextMenuOutcome::Consumed {
                         nav: None,
-                        close_fullscreen: false
+                        close_fullscreen: false,
+                        script_slot: None
                     }
                 ));
                 assert_draft_only(&app, kind);
