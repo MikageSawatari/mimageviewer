@@ -911,6 +911,9 @@ struct WindowState {
     /// Whole-stream `PT_TOUCH` ownership for this presenter HWND. The HUD has
     /// an independent owner set in its own per-HWND `WindowState`.
     touch_ownership: NativeTouchOwnership,
+    /// Browser key presses not yet paired with a pump-delivered OS echo (§9).
+    /// KEYUP does not retire them: the echo can arrive after release.
+    unpaired_browser_presses: [std::collections::VecDeque<u64>; 2],
     /// `NativeVideoWindowConfig.generation` の焼き込み。`WM_CLOSE` で
     /// `CloseRequested { generation }` を stamp するために保持する。
     generation: u64,
@@ -1157,6 +1160,7 @@ impl NativeVideoWindow {
                 ime_preediting: false,
                 held_mouse_buttons: NativeHeldMouseButtons::default(),
                 touch_ownership: NativeTouchOwnership::default(),
+                unpaired_browser_presses: Default::default(),
                 generation: config.generation,
             });
             let state_ptr = Box::into_raw(state);
@@ -1964,7 +1968,14 @@ fn pump_thread_messages_inner(
     let mut quit = false;
     unsafe {
         let mut msg = MSG::default();
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+        loop {
+            let has_message = {
+                let _peek = crate::mouse_seek_debug::begin_native_message_peek();
+                PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool()
+            };
+            if !has_message {
+                break;
+            }
             if msg.message == super::native_window_health::NATIVE_WINDOW_HEALTH_PING {
                 if let Some(health) = health {
                     health.acknowledge_pump_ping(msg.lParam.0 as u64, msg.wParam.0 as u64);
@@ -1975,11 +1986,21 @@ fn pump_thread_messages_inner(
                 quit = true;
                 break;
             }
-            let _ = TranslateMessage(&msg);
+            {
+                let _translate = crate::mouse_seek_debug::begin_native_message_translate(
+                    msg.hwnd.0 as usize as u64,
+                    msg.message,
+                    msg.wParam.0,
+                    msg.lParam.0,
+                );
+                let _ = TranslateMessage(&msg);
+            }
             {
                 let _dispatch = crate::mouse_seek_debug::begin_native_message_dispatch(
                     msg.hwnd.0 as usize as u64,
                     msg.message,
+                    msg.wParam.0,
+                    msg.lParam.0,
                 );
                 DispatchMessageW(&msg);
             }
@@ -2416,7 +2437,12 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let message_scope = crate::mouse_seek_debug::enter_native_wnd_proc(hwnd.0 as usize as u64, msg);
+    let message_scope = crate::mouse_seek_debug::enter_native_wnd_proc(
+        hwnd.0 as usize as u64,
+        msg,
+        wparam.0,
+        lparam.0,
+    );
     #[cfg(feature = "test-script")]
     // Capture before touch-source/debug helpers, then compare with the value read at the
     // established metadata match point. This trace is observational and covers only the
@@ -2523,9 +2549,18 @@ unsafe extern "system" fn wnd_proc(
                     .touch_ownership
                     .cancel_detached_activation(crate::key_input::NativeInputCancelReason::Escape);
             }
-            if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref())
+            if let Some(state) = window_state_mut(hwnd)
+                && let Some(sink) = state.event_sink.as_ref()
                 && let Some(key) = native_key_event(hwnd, msg, wparam, lparam)
             {
+                if matches!(key.virtual_key, 0xA6 | 0xA7) {
+                    let presses =
+                        &mut state.unpaired_browser_presses[(key.virtual_key - 0xA6) as usize];
+                    if presses.len() == 64 {
+                        presses.pop_front();
+                    }
+                    presses.push_back(key.receipt.input_receipt_id);
+                }
                 crate::key_debug::record_native_video_key(key, true);
                 sink.send(NativeVideoWindowEvent::KeyDown(key));
             }
@@ -2539,10 +2574,9 @@ unsafe extern "system" fn wnd_proc(
                 }
                 return LRESULT(0);
             }
-            // Browser Back/Forward は上で既に 1 回 enqueue 済み。この WndProc 内で
-            // DefWindowProcW 由来の WM_APPCOMMAND を追加生成しないため処理済みにする。
-            // ただし後続の実機ログでも scan 0 の別 receipt は残っており、その producer は
-            // 未確定である。この局所 ownership を reported duplicate の解決とは扱わない。
+            // Browser Back/Forward の押下は key message が所有する。OS が後から
+            // pump 内に届ける APPCOMMAND との組は §9 (next-version-mouse-seek-plan.md)
+            // の per-HWND FIFO で判定する。ここでは DefWindowProcW へ渡さない。
             if native_browser_keydown_message_handled(msg, wparam.0 as u32) {
                 return LRESULT(0);
             }
@@ -2572,16 +2606,30 @@ unsafe extern "system" fn wnd_proc(
                 _ => None,
             };
             if let Some(vk) = synth_vk
-                && let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref())
+                && let Some(state) = window_state_mut(hwnd)
+                && let Some(sink) = state.event_sink.as_ref()
             {
+                let mut delivery = message_scope.app_command_delivery(in_send_flags);
+                if cmd_word & 0xF000 == 0
+                    && wparam.0 == hwnd.0 as usize
+                    && delivery.can_pair_os_key_echo()
+                {
+                    delivery.paired_receipt =
+                        state.unpaired_browser_presses[(vk - 0xA6) as usize].pop_front();
+                }
+                let receipt = crate::mouse_seek_debug::win32_app_command_receipt(
+                    NativeVideoWindowSource::Presenter,
+                    hwnd.0 as usize as u64,
+                    wparam.0 as u64,
+                    lparam.0,
+                    delivery,
+                );
+                if delivery.paired_receipt.is_some() {
+                    crate::mouse_seek_debug::log_os_key_echo_suppressed(receipt);
+                    return LRESULT(1);
+                }
                 let key = NativeVideoKeyEvent {
-                    receipt: crate::mouse_seek_debug::win32_app_command_receipt(
-                        NativeVideoWindowSource::Presenter,
-                        hwnd.0 as usize as u64,
-                        wparam.0 as u64,
-                        lparam.0,
-                        message_scope.app_command_delivery(in_send_flags),
-                    ),
+                    receipt,
                     virtual_key: vk,
                     scan_code: 0,
                     extended: false,
@@ -3215,6 +3263,10 @@ fn signed_low_word(value: isize) -> i32 {
 fn signed_high_word(value: isize) -> i32 {
     (((value as u32 >> 16) & 0xffff) as i16) as i32
 }
+
+#[cfg(test)]
+#[path = "native_browser_key_echo_tests.rs"]
+mod browser_key_echo_tests;
 
 #[cfg(test)]
 mod tests {
