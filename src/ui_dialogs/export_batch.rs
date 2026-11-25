@@ -599,11 +599,15 @@ fn draw_thumbnail_warning_body(ui: &mut egui::Ui, pending: &crate::export_dialog
     let description = concat!(
         "元の情報を残して書き出した次のファイルに、元の絵の縮小画像が含まれている可能性があります。",
         "消しゴムや隠蔽で隠した部分が、縮小画像に残っていることがあります。",
-        "公開する前に確認するか、『元の情報を残す』をオフにして書き出し直してください。",
+        "公開する前に確認するか、元の情報を残さない設定 (一括では『元の情報を残す』、",
+        "1 枚の書き出しでは『AI プロンプト / EXIF を保持』をオフ) で書き出し直してください。",
     );
     ui.add(egui::Label::new(description).wrap());
     for notice in &pending.thumbnail_notices {
         let mut kinds = Vec::new();
+        if notice.kinds.exif_uninspectable {
+            kinds.push("EXIF (外せませんでした)");
+        }
         if notice.kinds.xmp {
             kinds.push("XMP の縮小画像");
         }

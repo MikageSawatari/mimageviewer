@@ -1,7 +1,7 @@
-//! 一括エクスポート専用の転記。元の情報は書き直さず、EXIF の向きと IFD1 だけ処理する。
+//! 単枚・一括の転記と縮小画像の検出。profile ごとの転記対象と向きの扱いを保つ。
 use super::*;
 use std::collections::{BTreeMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 
 const XMP_IMAGE_NS: &[u8] = b"http://ns.adobe.com/xap/1.0/g/img/";
 const XMP_STANDARD: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
@@ -24,44 +24,55 @@ pub(super) fn transfer(
     format: &SrcFormat,
     options: &SaveOptions,
 ) -> Result<(Vec<u8>, ThumbnailNoticeKinds), SaveError> {
+    let batch = options.metadata_profile == MetadataProfile::Batch;
     let mut notice = ThumbnailNoticeKinds::default();
     let bytes = match format {
         SrcFormat::Jpeg => {
             let mut segments = extract_jpeg_app1_segments(src)?;
             segments.retain_mut(|seg| {
                 if seg[4..].starts_with(b"Exif\0\0") {
-                    let Some((tiff, maker)) = clean_exif(&seg[10..]) else {
+                    let Some(tiff) = transfer_exif(&seg[10..], options, &mut notice) else {
                         return false;
                     };
                     seg[10..].copy_from_slice(&tiff);
-                    notice.maker_note |= maker && options.thumbnail_notice_for_hidden_edits;
+                }
+                if !batch && options.caller_applied_orientation {
+                    reset_exif_orientation_in_app1(seg);
                 }
                 true
             });
             notice.xmp = jpeg_xmp_thumbnail(&segments);
-            segments.extend(jpeg_rgb_icc_segments(src)?);
+            if batch {
+                segments.extend(jpeg_rgb_icc_segments(src)?);
+            }
             splice_jpeg_app1_segments(encoded, &segments)?
         }
         SrcFormat::Png => {
-            let mut chunks = extract_png_metadata_chunks(src)?;
+            let chunks = if batch {
+                extract_png_metadata_chunks(src)?
+            } else {
+                extract_png_text_chunks_raw(src)?
+            };
             let mut total = 0;
-            chunks.retain_mut(|chunk| {
+            let mut retained = Vec::new();
+            for mut chunk in chunks {
                 let kind = chunk[4..8].to_vec();
                 match kind.as_slice() {
                     b"eXIf" => {
-                        let Some((tiff, maker)) = clean_exif(&chunk[8..chunk.len() - 4]) else {
-                            return false;
+                        let Some((tiff, maker)) = clean_exif(&chunk[8..chunk.len() - 4], true)
+                        else {
+                            continue;
                         };
-                        *chunk = png_chunk(b"eXIf", &tiff);
+                        chunk = png_chunk(b"eXIf", &tiff);
                         notice.maker_note |= maker && options.thumbnail_notice_for_hidden_edits;
                     }
                     b"iCCP" => {
                         let data = &chunk[8..chunk.len() - 4];
                         let Some(end) = data.iter().position(|&b| b == 0) else {
-                            return false;
+                            continue;
                         };
                         if data.get(end + 1) != Some(&0) {
-                            return false;
+                            continue;
                         }
                         let mut header = [0; 20];
                         if flate2::read::ZlibDecoder::new(&data[end + 2..])
@@ -69,15 +80,18 @@ pub(super) fn transfer(
                             .is_err()
                             || !rgb_icc(&header)
                         {
-                            return false;
+                            continue;
                         }
                     }
-                    _ if !notice.xmp => inspect_png_xmp(chunk, &mut total, &mut notice),
-                    _ => {}
+                    _ => {
+                        if !process_png_text(&mut chunk, &mut total, options, &mut notice)? {
+                            continue;
+                        }
+                    }
                 }
-                true
-            });
-            splice_png_text_chunks(encoded, &chunks)?
+                retained.push(chunk);
+            }
+            splice_png_text_chunks(encoded, &retained)?
         }
         SrcFormat::Webp => {
             let (icc, exif, xmp) = extract_webp_metadata_chunks(src)?;
@@ -87,14 +101,13 @@ pub(super) fn transfer(
                 } else {
                     0
                 };
-                let (tiff, maker) = clean_exif(&payload[prefix..])?;
-                notice.maker_note |= maker && options.thumbnail_notice_for_hidden_edits;
+                let tiff = transfer_exif(&payload[prefix..], options, &mut notice)?;
                 let mut result = payload[..prefix].to_vec();
                 result.extend(tiff);
                 Some(result)
             });
             notice.xmp = xmp.as_deref().is_some_and(has_thumbnail);
-            let icc = icc.filter(|p| rgb_icc(p));
+            let icc = icc.filter(|p| !batch || rgb_icc(p));
             if icc.is_some() || exif.is_some() || xmp.is_some() {
                 inject_webp_metadata(encoded, icc, exif, xmp)?
             } else {
@@ -178,68 +191,215 @@ fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
     chunk
 }
 
-fn inspect_png_xmp(chunk: &[u8], total: &mut usize, notice: &mut ThumbnailNoticeKinds) {
-    let data = &chunk[8..chunk.len() - 4];
-    let Some(key_end) = data.iter().position(|&b| b == 0) else {
-        return;
-    };
-    if &data[..key_end] != XMP_KEY {
-        return;
-    }
-    let remaining = FILE_LIMIT.saturating_sub(*total);
-    if remaining == 0 {
-        notice.xmp_uninspectable = true;
-        return;
-    }
-    let body = &data[key_end + 1..];
-    let decoded = (|| -> Option<Vec<u8>> {
-        let (compressed, content) = match &chunk[4..8] {
-            b"tEXt" => (false, body),
-            b"zTXt" => {
-                if body.first() != Some(&0) {
-                    return None;
-                }
-                (true, &body[1..])
-            }
-            b"iTXt" => {
-                if body.len() < 2 || body[0] > 1 || body[1] != 0 {
-                    return None;
-                }
-                let mut content = &body[2..];
-                for _ in 0..2 {
-                    let end = content.iter().position(|&b| b == 0)?;
-                    content = &content[end + 1..];
-                }
-                (body[0] == 1, content)
-            }
-            _ => return None,
-        };
-        let limit = CHUNK_LIMIT.min(remaining);
-        if compressed {
-            let mut decoded = Vec::new();
-            let result = flate2::read::ZlibDecoder::new(content)
-                .take((limit + 1) as u64)
-                .read_to_end(&mut decoded);
-            *total += decoded.len().min(limit);
-            if result.is_err() || decoded.len() > limit {
-                return None;
-            }
-            Some(decoded)
-        } else {
-            *total += content.len().min(limit);
-            if content.len() > limit {
-                return None;
-            }
-            Some(content.to_vec())
-        }
-    })();
-    match decoded {
-        Some(body) => notice.xmp |= has_thumbnail(&body),
-        None => notice.xmp_uninspectable = true,
+// 読めない Single の EXIF は従来どおり残す。Batch だけが落とす。
+fn transfer_exif(
+    data: &[u8],
+    options: &SaveOptions,
+    notice: &mut ThumbnailNoticeKinds,
+) -> Option<Vec<u8>> {
+    let batch = options.metadata_profile == MetadataProfile::Batch;
+    if let Some((tiff, maker)) = clean_exif(data, batch) {
+        notice.maker_note |= maker && options.thumbnail_notice_for_hidden_edits;
+        Some(tiff)
+    } else if batch {
+        None
+    } else {
+        notice.exif_uninspectable = true;
+        Some(data.to_vec())
     }
 }
 
-// TIFF の offset はすべて TIFF 本体から。無効な領域や循環を含む EXIF は丸ごと落とす。
+// 本文の開始位置を保持し、iTXt の言語・訳語と圧縮フラグを再利用する。
+fn png_text_layout(chunk: &[u8], key_end: usize) -> Option<(usize, bool)> {
+    let data = &chunk[8..chunk.len() - 4];
+    let start = key_end + 1;
+    match &chunk[4..8] {
+        b"tEXt" => Some((start, false)),
+        b"zTXt" if data.get(start) == Some(&0) => Some((start + 1, true)),
+        b"iTXt" => {
+            let flag = *data.get(start)?;
+            if flag > 1 || data.get(start + 1) != Some(&0) {
+                return None;
+            }
+            let mut pos = start + 2;
+            for _ in 0..2 {
+                pos += data.get(pos..)?.iter().position(|&b| b == 0)? + 1;
+            }
+            Some((pos, flag == 1))
+        }
+        _ => None,
+    }
+}
+
+fn decode_png_text(content: &[u8], compressed: bool, total: &mut usize) -> Option<Vec<u8>> {
+    let limit = CHUNK_LIMIT.min(FILE_LIMIT.saturating_sub(*total));
+    if limit == 0 {
+        return None;
+    }
+    if compressed {
+        let mut decoded = Vec::new();
+        let result = flate2::read::ZlibDecoder::new(content)
+            .take((limit + 1) as u64)
+            .read_to_end(&mut decoded);
+        *total += decoded.len().min(limit);
+        if result.is_err() || decoded.len() > limit {
+            return None;
+        }
+        Some(decoded)
+    } else {
+        *total += content.len().min(limit);
+        (content.len() <= limit).then(|| content.to_vec())
+    }
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+// ImageMagick: 改行・種類名・改行・10進長・改行・空白区切りの16進。
+// 宣言より後ろのデータも含めて、桁数が厳密に一致することを確認する。
+fn raw_profile(body: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
+    let body_start = if body.starts_with(b"\r\n") {
+        2
+    } else if body.starts_with(b"\n") {
+        1
+    } else {
+        return None;
+    };
+    let type_end = body[body_start..].iter().position(|&b| b == b'\n')? + body_start;
+    if body[body_start..type_end]
+        .iter()
+        .all(u8::is_ascii_whitespace)
+    {
+        return None;
+    }
+    let length_start = type_end + 1;
+    let length_end = body[length_start..].iter().position(|&b| b == b'\n')? + length_start;
+    let length_text = std::str::from_utf8(&body[length_start..length_end])
+        .ok()?
+        .trim();
+    if length_text.is_empty() || !length_text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let length: usize = length_text.parse().ok()?;
+    let digits = length.checked_mul(2)?;
+    let positions: Vec<usize> = (length_end + 1..body.len())
+        .filter(|&i| !body[i].is_ascii_whitespace())
+        .collect();
+    if positions.len() != digits {
+        return None;
+    }
+    let bytes = positions
+        .chunks_exact(2)
+        .map(|p| Some((hex_digit(body[p[0]])? << 4) | hex_digit(body[p[1]])?))
+        .collect::<Option<Vec<_>>>()?;
+    Some((bytes, positions))
+}
+
+fn patch_raw_profile(body: &mut [u8], positions: &[usize], original: &[u8], cleaned: &[u8]) {
+    for (i, (&old, &new)) in original.iter().zip(cleaned).enumerate() {
+        if old == new {
+            continue;
+        }
+        for (pos, nibble) in [
+            (positions[i * 2], new >> 4),
+            (positions[i * 2 + 1], new & 15),
+        ] {
+            if hex_digit(body[pos]) != Some(nibble) {
+                body[pos] = if nibble < 10 {
+                    b'0' + nibble
+                } else if body[pos].is_ascii_uppercase() {
+                    b'A' + nibble - 10
+                } else {
+                    b'a' + nibble - 10
+                };
+            }
+        }
+    }
+}
+
+// Raw EXIF は XMP 検出後も必ず処理する。上限は XML XMP と Raw profile で共有する。
+fn process_png_text(
+    chunk: &mut Vec<u8>,
+    total: &mut usize,
+    options: &SaveOptions,
+    notice: &mut ThumbnailNoticeKinds,
+) -> Result<bool, SaveError> {
+    let data = &chunk[8..chunk.len() - 4];
+    let Some(key_end) = data.iter().position(|&b| b == 0) else {
+        return Ok(true);
+    };
+    let key = &data[..key_end];
+    let raw_app1 = key.eq_ignore_ascii_case(b"Raw profile type APP1");
+    let raw_exif = key.eq_ignore_ascii_case(b"Raw profile type exif") || raw_app1;
+    let raw_xmp = key.eq_ignore_ascii_case(b"Raw profile type xmp");
+    if !raw_exif && !raw_xmp && (key != XMP_KEY || notice.xmp) {
+        return Ok(true);
+    }
+    let decoded = png_text_layout(chunk, key_end).and_then(|(start, compressed)| {
+        decode_png_text(&data[start..], compressed, total).map(|body| (start, compressed, body))
+    });
+    let parsed = decoded.and_then(|(start, compressed, body)| {
+        if raw_exif || raw_xmp {
+            let (bytes, positions) = raw_profile(&body)?;
+            Some((start, compressed, body, bytes, positions))
+        } else {
+            Some((start, compressed, Vec::new(), body, Vec::new()))
+        }
+    });
+    let Some((start, compressed, mut body, bytes, positions)) = parsed else {
+        if raw_exif {
+            if options.metadata_profile == MetadataProfile::Batch {
+                return Ok(false);
+            }
+            notice.exif_uninspectable = true;
+        } else {
+            notice.xmp_uninspectable = true;
+        }
+        return Ok(true);
+    };
+    if !raw_exif
+        || (raw_app1 && (bytes.starts_with(XMP_STANDARD) || bytes.starts_with(XMP_EXTENDED)))
+    {
+        notice.xmp |= has_thumbnail(&bytes);
+        return Ok(true);
+    }
+    let prefix = usize::from(bytes.starts_with(b"Exif\0\0")) * 6;
+    let Some(cleaned) = transfer_exif(&bytes[prefix..], options, notice) else {
+        return Ok(false);
+    };
+    let mut payload = bytes[..prefix].to_vec();
+    payload.extend(cleaned);
+    if payload == bytes {
+        return Ok(true);
+    }
+    patch_raw_profile(&mut body, &positions, &bytes, &payload);
+    let mut replacement = data[..start].to_vec();
+    if compressed {
+        let encoded = (|| -> io::Result<Vec<u8>> {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&body)?;
+            encoder.finish()
+        })();
+        replacement.extend(encoded.map_err(|err| {
+            crate::logger::log(&format!("export raw profile compression: {err}"));
+            SaveError::EncodingFailed(format!("PNG raw profile: {err}"))
+        })?);
+    } else {
+        replacement.extend(body);
+    }
+    let kind: [u8; 4] = chunk[4..8].try_into().unwrap();
+    *chunk = png_chunk(&kind, &replacement);
+    Ok(true)
+}
+
+// TIFF の offset はすべて TIFF 本体から。無効な領域や循環は読めないと返す。
 struct Tiff<'a> {
     data: &'a [u8],
     little: bool,
@@ -304,7 +464,7 @@ impl Tiff<'_> {
     }
 }
 
-fn clean_exif(data: &[u8]) -> Option<(Vec<u8>, bool)> {
+fn clean_exif(data: &[u8], reset_orientation: bool) -> Option<(Vec<u8>, bool)> {
     let little = match data.get(..2)? {
         b"II" => true,
         b"MM" => false,
@@ -338,6 +498,10 @@ fn clean_exif(data: &[u8]) -> Option<(Vec<u8>, bool)> {
         let mut tile_lengths = None;
         for entry in entries {
             let tag = t.u16(entry)?;
+            // Single は不正な Orientation もそのまま残し、読めない理由にしない。
+            if tag == 0x0112 && !reset_orientation {
+                continue;
+            }
             let (kind, count, range) = t.values(entry)?;
             if range.len() > 4 {
                 retained_values.push(range);

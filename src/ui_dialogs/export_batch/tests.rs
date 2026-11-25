@@ -102,6 +102,7 @@ fn warnings() -> ExportPending {
             )
             .into(),
             kinds: crate::save_with_metadata::ThumbnailNoticeKinds {
+                exif_uninspectable: true,
                 xmp: true,
                 xmp_uninspectable: i % 2 == 0,
                 maker_note: true,
@@ -916,6 +917,70 @@ fn batch_export_endings_keep_notices_after_disconnect_and_refresh_matching_folde
                 .contains("中断")
         );
     }
+}
+
+#[test]
+fn single_export_success_with_warning_keeps_window_without_saved_output_toast() {
+    let mut app = crate::app::setup_app_for_test();
+    let (mut p, tx) = pending();
+    p.total = 1;
+    app.export_pending = Some(p);
+    app.fs_feedback_toast = None;
+    app.fs_feedback_toast_action = None;
+    let path = app.tmp.path().join("single.jpg");
+    tx.send(ExportEvent::Completed(ExportSuccess {
+        label: "single".into(),
+        path: path.clone(),
+    }))
+    .unwrap();
+    tx.send(ExportEvent::ThumbnailNotice {
+        label: "single".into(),
+        path,
+        kinds: crate::save_with_metadata::ThumbnailNoticeKinds {
+            exif_uninspectable: true,
+            ..Default::default()
+        },
+    })
+    .unwrap();
+    tx.send(ExportEvent::AllDone).unwrap();
+    drop(tx);
+    let ctx = egui::Context::default();
+    app.poll_export_pending(&ctx);
+    app.poll_export_pending(&ctx); // normal worker disconnection keeps the warning
+    let p = app.export_pending.as_ref().unwrap();
+    assert_eq!(p.end, Some(ExportEnd::Done));
+    assert_eq!(p.successes.len(), 1);
+    assert_eq!(p.thumbnail_notices.len(), 1);
+    assert!(app.fs_feedback_toast.is_none());
+    assert!(app.fs_feedback_toast_action.is_none());
+}
+
+#[test]
+fn single_export_warning_list_shows_uninspectable_exif_label() {
+    let (mut p, _) = pending();
+    p.end = Some(ExportEnd::Done);
+    p.last_message = "完了: 成功 1 / スキップ 0 / 失敗 0".into();
+    p.thumbnail_notices
+        .push(crate::export_dialog::ExportThumbnailNotice {
+            label: "single".into(),
+            path: "single.jpg".into(),
+            kinds: crate::save_with_metadata::ThumbnailNoticeKinds {
+                exif_uninspectable: true,
+                ..Default::default()
+            },
+        });
+    let mut h = crate::test_ui::builder()
+        .with_size(egui::vec2(1093.0, 614.0))
+        .with_context_setup(crate::ui_fonts::configure_fonts)
+        .build_ui_state(
+            |ui, p: &mut ExportPending| {
+                draw_progress_window(ui.ctx(), p);
+            },
+            p,
+        );
+    h.run_steps(12);
+    h.get_by_label("single.jpg: EXIF (外せませんでした)");
+    h.get_by_label("閉じる");
 }
 
 #[test]

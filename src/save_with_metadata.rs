@@ -3,16 +3,16 @@
 //! 対応フォーマット (Phase 5):
 //! - **JPEG**: turbojpeg で encode → 元 JPEG の APP1 (EXIF / XMP) を SOI 直後に挿入
 //! - **PNG**: image crate の PngEncoder で encode → 元 PNG の tEXt / iTXt / zTXt
-//!   チャンクを IHDR と IDAT の間に**生バイト**で挿入 (= AI prompt は zlib 圧縮も含めて
-//!   そのまま転記)
+//!   チャンクを IHDR と IDAT の間に挿入 (Raw profile の EXIF 以外は AI prompt の
+//!   zlib 圧縮も含めてそのまま転記)
 //! - **WebP**: webp crate で encode → 元 WebP の RIFF コンテナを解析して
 //!   ICCP / EXIF / XMP チャンクを抽出 → VP8X 拡張コンテナを構築して挿入
 //!
 //! 非対応形式 (HEIC / AVIF / JXL / TIFF / RAW) は [`SrcFormat::Other`] として扱い、
 //! 呼び出し側で JPEG / PNG にフォールバックする (この場合メタデータは失われる)。
 //!
-//! 一括の `batch_metadata` だけが EXIF の共通処理・RGB ICC (JPEG/PNG も含む)・
-//! PNG eXIf 転記と縮小画像の警告検出を有効にする。既存の保存オプションは不変。
+//! Single / Batch とも EXIF の IFD1 を外し、縮小画像の警告を検出する。
+//! Batch だけが RGB ICC (JPEG/PNG も含む)・PNG eXIf 転記を有効にする。
 //!
 //! 詳細仕様: [docs/conceal-feature-plan.md §10.5-10.7](../../docs/conceal-feature-plan.md)
 
@@ -77,6 +77,16 @@ impl SrcFormat {
     }
 }
 
+/// 元の情報の転記対象と Orientation の扱い。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MetadataProfile {
+    /// 1 枚の書き出し。従来の転記対象を保ち、EXIF の IFD1 を外す。
+    #[default]
+    Single,
+    /// 一括の書き出し。EXIF の向きを正規化し、RGB ICC も転記する。
+    Batch,
+}
+
 /// 保存オプション。
 #[derive(Clone, Debug)]
 pub struct SaveOptions {
@@ -104,8 +114,8 @@ pub struct SaveOptions {
     /// Orientation を 1 に書き換えて二重回転を防ぐ。それ以外のパスでは
     /// 二重回転を起こさないために Orientation を温存する。
     pub caller_applied_orientation: bool,
-    /// 一括用の EXIF 正規化・RGB ICC 転記・縮小画像検出。既存保存経路は OFF。
-    pub batch_metadata: bool,
+    /// 元の情報の転記規則。既定は 1 枚の書き出し。
+    pub metadata_profile: MetadataProfile,
     /// 部分を隠す保存済み編集がある場合だけ MakerNote を警告対象にする。
     pub thumbnail_notice_for_hidden_edits: bool,
 }
@@ -120,7 +130,7 @@ impl Default for SaveOptions {
             jpeg_matte: crate::capture::JpegMatte::Black,
             include_metadata: true,
             caller_applied_orientation: true,
-            batch_metadata: false,
+            metadata_profile: MetadataProfile::Single,
             thumbnail_notice_for_hidden_edits: false,
         }
     }
@@ -182,6 +192,7 @@ impl From<io::Error> for SaveError {
 /// ファイルは `OpenOptions::create_new(true)` 相当で書く (上書き禁止)。既に
 /// `dst_path` に同名ファイルがあると失敗するので、呼び出し側で連番を付ける等の
 /// 衝突回避を行うこと。
+/// 戻り値は保存した元の情報に残る縮小画像の警告。
 pub fn save_image_with_metadata(
     pixels: &ColorImage,
     src_path: Option<&Path>,
@@ -189,9 +200,11 @@ pub fn save_image_with_metadata(
     dst_path: &Path,
     src_format: SrcFormat,
     options: &SaveOptions,
-) -> Result<(), SaveError> {
-    let encoded = encode_image_with_metadata(pixels, src_path, src_bytes, src_format, options)?;
-    write_bytes_create_new(&encoded, dst_path)
+) -> Result<ThumbnailNoticeKinds, SaveError> {
+    let encoded =
+        encode_image_with_metadata_report(pixels, src_path, src_bytes, src_format, options)?;
+    write_bytes_create_new(&encoded.bytes, dst_path)?;
+    Ok(encoded.thumbnail_notice)
 }
 
 /// ColorImage を一度 straight RGBA に変換し、保存バイトと転記した情報の警告を返す。
@@ -222,6 +235,7 @@ pub fn encode_image_with_metadata_report(
 /// 転記した情報に残る元の縮小画像の警告。検出不能も警告に含める。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ThumbnailNoticeKinds {
+    pub exif_uninspectable: bool,
     pub xmp: bool,
     pub xmp_uninspectable: bool,
     pub maker_note: bool,
@@ -229,7 +243,7 @@ pub struct ThumbnailNoticeKinds {
 
 impl ThumbnailNoticeKinds {
     pub fn is_empty(self) -> bool {
-        !self.xmp && !self.xmp_uninspectable && !self.maker_note
+        !self.exif_uninspectable && !self.xmp && !self.xmp_uninspectable && !self.maker_note
     }
 }
 
@@ -303,9 +317,8 @@ pub fn encode_rgba_with_metadata(
     }
 
     let mut encoding_options = options.clone();
-    if options.batch_metadata {
-        encoding_options.include_metadata = false;
-    }
+    // 転記と検出は profile ごとの共通処理で一度だけ行う。
+    encoding_options.include_metadata = false;
     let mut bytes = match &src_format {
         SrcFormat::Jpeg => encode_jpeg_rgba(rgba, w, h, src_bytes_ref, &encoding_options),
         SrcFormat::Png => encode_png_rgba(rgba, w, h, src_bytes_ref, &encoding_options),
@@ -313,8 +326,7 @@ pub fn encode_rgba_with_metadata(
         SrcFormat::Other(_) => unreachable!("filtered above"),
     }?;
     let mut thumbnail_notice = ThumbnailNoticeKinds::default();
-    if options.batch_metadata
-        && options.include_metadata
+    if options.include_metadata
         && let Some(src) = src_bytes_ref
     {
         (bytes, thumbnail_notice) = batch_metadata::transfer(&bytes, src, &src_format, options)?;

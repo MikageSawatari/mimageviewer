@@ -59832,7 +59832,11 @@ impl App {
                 ui.add_enabled(
                     metadata_possible,
                     egui::Checkbox::new(&mut state.include_metadata, "AI プロンプト / EXIF を保持"),
-                );
+                )
+                .on_hover_text(concat!(
+                    "EXIF の縮小画像は外します。外せなかったときや、XMP などに縮小画像が残っていそうなときは、",
+                    "書き出しの後で知らせます (隠した部分が縮小画像に残ることがあります)。",
+                ));
                 if !metadata_possible {
                     ui.small("形式変換、PDF、見開き合成ではメタデータ保持は無効です");
                 }

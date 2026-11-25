@@ -16,7 +16,7 @@ use std::sync::{
 use std::time::{Instant, SystemTime};
 
 use crate::export_dialog::{ExportEvent, ExportFailure, ExportPending, ExportSuccess};
-use crate::save_with_metadata::{SaveOptions, SrcFormat, ThumbnailNoticeKinds};
+use crate::save_with_metadata::{MetadataProfile, SaveOptions, SrcFormat, ThumbnailNoticeKinds};
 use paths::{OutputReservation, Target};
 
 pub const TEMPLATE_PLACEHOLDER_HINT: &str =
@@ -398,7 +398,7 @@ fn run_batch_export_with_decoder(
                 webp_lossless: options.format.webp_lossless,
                 jpeg_matte: item.edits.jpeg_matte,
                 include_metadata: keep_metadata,
-                batch_metadata: true,
+                metadata_profile: MetadataProfile::Batch,
                 thumbnail_notice_for_hidden_edits: item.edits.erase.is_some()
                     || item.edits.conceal.is_some()
                     || item.edits.export_crop.is_some()
