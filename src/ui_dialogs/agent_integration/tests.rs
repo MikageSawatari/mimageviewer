@@ -525,6 +525,34 @@ fn agent_exposure_all_sixty_four_permission_combinations() {
 }
 
 #[test]
+fn agent_registration_local_cache_guidance_is_visible_in_the_registered_row_without_writes() {
+    let settings = Settings::default();
+    let selection = PermissionSelection::from(&settings);
+    let mut state = injected(&settings);
+    let guidance = "Claude Desktop を更新した後で mIV の tool が出ない場合は、Claude を一度起動して終了してから「再確認」を押してください";
+    if let DetectionState::Ready(_, detection) = &mut state.detection {
+        detection.apps[0].message = Some(guidance.into());
+    }
+    let mut harness = crate::test_ui::builder()
+        .with_size(egui::vec2(900.0, 600.0))
+        .with_context_setup(crate::ui_fonts::configure_fonts)
+        .build_ui_state(
+            move |ui, state| draw_app(ui, &selection, state, AppTarget::ClaudeDesktop),
+            state,
+        );
+    harness.run_steps(5);
+    let registered = harness.get_by_label("登録済み").rect();
+    let notice = harness.get_by_label(guidance).rect();
+    let register = harness.get_by_label("登録する").rect();
+    assert!(registered.bottom() <= notice.top());
+    assert!(notice.bottom() <= register.top());
+    assert!(harness.ctx.content_rect().contains_rect(notice));
+    assert!(harness.state().feedback.is_none());
+    assert!(harness.state().instructions.is_none());
+    assert_eq!(harness.state().mock_backend.as_ref().unwrap().writes, 0);
+}
+
+#[test]
 fn agent_registration_single_owner_without_preferences_draft_gating() {
     for action in [Action::Register, Action::Remove] {
         let mut state = injected(&Settings::default());

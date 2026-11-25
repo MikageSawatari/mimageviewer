@@ -275,43 +275,183 @@ fn packages(env: &RegistrationEnvironment, prefix: &str) -> io::Result<Vec<PathB
     Ok(found)
 }
 
-pub(crate) fn detect(env: &RegistrationEnvironment) -> Detection {
-    let command = env.resolve_command();
-    let apps = [AppTarget::ClaudeDesktop, AppTarget::ChatGpt].into_iter().map(|target| {
-        let mut row = AppRegistration { target, state: RegistrationState::NotFound, config_paths: Vec::new(), message: None, changes: RegistrationChanges::default() };
-        let result = (|| -> Result<(), String> {
-            match target {
-                AppTarget::ClaudeDesktop => {
-                    if let Some(local) = &env.local_app_data {
-                        if env.absolute(local)?.join("AnthropicClaude").is_dir() {
-                            row.config_paths.push(env.absolute(env.app_data.as_deref().ok_or("設定フォルダを確認できません")?)?.join("Claude/claude_desktop_config.json"));
-                        }
-                    }
-                    let packages = packages(env, "Claude_").map_err(|_| "インストール先を確認できません")?;
-                    row.config_paths.extend(packages.into_iter().map(|p| p.join("LocalCache/Roaming/Claude/claude_desktop_config.json")));
-                    if row.config_paths.len() > 1 {
-                        row.state = RegistrationState::Ambiguous;
-                        row.message = Some("Claude が複数の形で入っています。手順を見て、お使いの Claude の設定ファイルに書いてください".into());
-                        return Ok(());
-                    }
-                }
-                AppTarget::ChatGpt => {
-                    let profile_codex = env.user_profile.as_deref().map(|p| env.absolute(p).map(|p| p.join(".codex"))).transpose()?;
-                    if !packages(env, "OpenAI.Codex_").map_err(|_| "インストール先を確認できません")?.is_empty() || profile_codex.as_deref().is_some_and(Path::is_dir) {
-                        let home = match &env.codex_home { Some(p) => env.absolute(p)?, None => profile_codex.ok_or("設定フォルダを確認できません")? };
-                        row.config_paths.push(home.join("config.toml"));
+const CLAUDE_LOCAL_CACHE_GUIDANCE: &str = "Claude Desktop を更新した後で mIV の tool が出ない場合は、Claude を一度起動して終了してから「再確認」を押してください";
+
+enum RegistrationDestination {
+    Resolved {
+        path: PathBuf,
+        message: Option<&'static str>,
+    },
+    Ambiguous {
+        paths: Vec<PathBuf>,
+        message: &'static str,
+    },
+    NotFound,
+}
+
+/// Worker-only source of truth for detection and revalidation before writing.
+fn resolve_destination(
+    env: &RegistrationEnvironment,
+    target: AppTarget,
+) -> Result<RegistrationDestination, String> {
+    match target {
+        AppTarget::ClaudeDesktop => {
+            let local = env
+                .local_app_data
+                .as_deref()
+                .map(|p| env.absolute(p))
+                .transpose()?;
+            let squirrel = local
+                .as_deref()
+                .is_some_and(|p| p.join("AnthropicClaude").is_dir());
+            let mut paths = Vec::new();
+            if squirrel {
+                paths.push(
+                    env.absolute(
+                        env.app_data
+                            .as_deref()
+                            .ok_or("設定フォルダを確認できません")?,
+                    )?
+                    .join("Claude/claude_desktop_config.json"),
+                );
+            }
+            let packages =
+                packages(env, "Claude_").map_err(|_| "インストール先を確認できません")?;
+            paths.extend(
+                packages
+                    .iter()
+                    .map(|p| p.join("LocalCache/Roaming/Claude/claude_desktop_config.json")),
+            );
+            if paths.len() > 1 {
+                return Ok(RegistrationDestination::Ambiguous {
+                    paths,
+                    message: "Claude が複数の形で入っています。手順を見て、お使いの Claude の設定ファイルに書いてください",
+                });
+            }
+            if squirrel {
+                return Ok(RegistrationDestination::Resolved {
+                    path: paths.remove(0),
+                    message: None,
+                });
+            }
+            let Some(package) = packages.first() else {
+                return Ok(RegistrationDestination::NotFound);
+            };
+            let package_name = package
+                .file_name()
+                .ok_or("インストール先を確認できません")?;
+            let data_root = local
+                .ok_or("設定フォルダを確認できません")?
+                .join("Claude-Data");
+            // Use the directory entry's spelling for display, including case.
+            let entries = match fs::read_dir(&data_root) {
+                Ok(entries) => Some(entries),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(_) => return Err("設定フォルダを確認できません".into()),
+            };
+            if let Some(entries) = entries {
+                for entry in entries {
+                    let entry = entry.map_err(|_| "設定フォルダを確認できません")?;
+                    if entry
+                        .file_name()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&package_name.to_string_lossy())
+                        && entry
+                            .file_type()
+                            .map_err(|_| "設定フォルダを確認できません")?
+                            .is_dir()
+                    {
+                        return Ok(RegistrationDestination::Resolved {
+                            path: entry.path().join("claude_desktop_config.json"),
+                            message: None,
+                        });
                     }
                 }
             }
-            let Some(path) = row.config_paths.first() else { return Ok(()); };
-            let text = read_config(path)?;
-            row.state = config::state(target, &text, command.as_ref().ok())?;
-            row.changes = RegistrationChanges::from_config(target, &text, command.as_ref().ok())?;
-            Ok(())
-        })();
-        if let Err(error) = result { row.state = RegistrationState::Unreadable; row.message = Some(error); }
-        row
-    }).collect();
+            let cache_path = paths.remove(0);
+            if cache_path.parent().is_some_and(Path::is_dir) {
+                return Ok(RegistrationDestination::Resolved {
+                    path: cache_path,
+                    message: Some(CLAUDE_LOCAL_CACHE_GUIDANCE),
+                });
+            }
+            Ok(RegistrationDestination::Ambiguous {
+                paths: vec![
+                    data_root
+                        .join(package_name)
+                        .join("claude_desktop_config.json"),
+                    cache_path,
+                ],
+                message: "Claude Desktop を一度起動して終了してから「再確認」を押してください",
+            })
+        }
+        AppTarget::ChatGpt => {
+            let profile_codex = env
+                .user_profile
+                .as_deref()
+                .map(|p| env.absolute(p).map(|p| p.join(".codex")))
+                .transpose()?;
+            if packages(env, "OpenAI.Codex_")
+                .map_err(|_| "インストール先を確認できません")?
+                .is_empty()
+                && !profile_codex.as_deref().is_some_and(Path::is_dir)
+            {
+                return Ok(RegistrationDestination::NotFound);
+            }
+            let home = match &env.codex_home {
+                Some(p) => env.absolute(p)?,
+                None => profile_codex.ok_or("設定フォルダを確認できません")?,
+            };
+            Ok(RegistrationDestination::Resolved {
+                path: home.join("config.toml"),
+                message: None,
+            })
+        }
+    }
+}
+
+pub(crate) fn detect(env: &RegistrationEnvironment) -> Detection {
+    let command = env.resolve_command();
+    let apps = [AppTarget::ClaudeDesktop, AppTarget::ChatGpt]
+        .into_iter()
+        .map(|target| {
+            let mut row = AppRegistration {
+                target,
+                state: RegistrationState::NotFound,
+                config_paths: Vec::new(),
+                message: None,
+                changes: RegistrationChanges::default(),
+            };
+            let result = (|| -> Result<(), String> {
+                match resolve_destination(env, target)? {
+                    RegistrationDestination::NotFound => return Ok(()),
+                    RegistrationDestination::Ambiguous { paths, message } => {
+                        row.state = RegistrationState::Ambiguous;
+                        row.config_paths = paths;
+                        row.message = Some(message.into());
+                        return Ok(());
+                    }
+                    RegistrationDestination::Resolved { path, message } => {
+                        row.config_paths.push(path);
+                        row.message = message.map(str::to_owned);
+                    }
+                }
+                let text = read_config(&row.config_paths[0])?;
+                row.state = config::state(target, &text, command.as_ref().ok())?;
+                row.changes =
+                    RegistrationChanges::from_config(target, &text, command.as_ref().ok())?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                row.state = RegistrationState::Unreadable;
+                row.message = Some(match row.message {
+                    Some(guidance) => format!("{error}\n{guidance}"),
+                    None => error,
+                });
+            }
+            row
+        })
+        .collect();
     Detection { command, apps }
 }
 
@@ -461,6 +601,15 @@ fn write_with_processes(
     if !request.path.is_absolute() {
         return Err("設定ファイルのパスを確認できません".into());
     }
+    match resolve_destination(env, request.target) {
+        Ok(RegistrationDestination::Resolved { path, .. })
+            if normalized_components(&path) == normalized_components(&request.path) => {}
+        _ => {
+            return Err(
+                "設定ファイルの場所が確認後に変わりました。もう一度確認してください".into(),
+            );
+        }
+    }
     let original = read_config(&request.path)?;
     if config::change(request.target, &original, request.action, &request.command)?
         != request.change
@@ -473,12 +622,7 @@ fn write_with_processes(
         .parent()
         .ok_or("設定フォルダを確認できません")?;
     fs::create_dir_all(parent).map_err(|_| "設定フォルダを作れません")?;
-    if request.path.exists() {
-        let mut backup = request.path.as_os_str().to_os_string();
-        backup.push(".mimageviewer.bak");
-        fs::write(PathBuf::from(backup), original.as_bytes())
-            .map_err(|_| "設定のバックアップを作れません")?;
-    }
+    write_backups(&request.path, &original).map_err(|_| "設定のバックアップを作れません")?;
     let mut temp =
         tempfile::NamedTempFile::new_in(parent).map_err(|_| "設定の一時ファイルを作れません")?;
     temp.write_all(edited.as_bytes())
@@ -487,8 +631,43 @@ fn write_with_processes(
         .map_err(|_| "設定を書き込めません")?;
     crate::archive_converter::replace_file_atomic(temp.path(), &request.path, false)
         .map_err(|_| "設定を置き換えられません")?;
-    Ok(format!(
-        "{} を起動して、新しいチャットで mIV の tool が出るか確かめてください",
-        request.target.name()
-    ))
+    Ok(match request.action {
+        Action::Register => {
+            let mut message = format!(
+                "{} を起動して、新しいチャットで mIV の tool が出るか確かめてください",
+                request.target.name()
+            );
+            if request.target == AppTarget::ClaudeDesktop {
+                message.push_str("。出ない場合は Claude を終了して「再確認」を押し、未登録と出たら登録し直してください");
+            }
+            message
+        }
+        Action::Remove => format!(
+            "登録を外しました。{} を起動し直すと mIV の tool は出なくなります",
+            request.target.name()
+        ),
+    })
+}
+
+fn write_backups(path: &Path, original: &str) -> io::Result<()> {
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".mimageviewer.bak");
+    let backup = PathBuf::from(backup);
+    let mut oldest = path.as_os_str().to_os_string();
+    oldest.push(".mimageviewer.orig.bak");
+    let oldest = PathBuf::from(oldest);
+    if !oldest.try_exists()? {
+        let bytes = match fs::read(&backup) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => original.as_bytes().to_vec(),
+            Err(error) => return Err(error),
+        };
+        // Never truncate an existing oldest backup, even if it appears meanwhile.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(oldest)?;
+        file.write_all(&bytes)?;
+    }
+    fs::write(backup, original.as_bytes())
 }
