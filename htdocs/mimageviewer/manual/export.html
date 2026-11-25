@@ -139,7 +139,7 @@
           <tr><th>項目</th><th>説明</th></tr>
         </thead>
         <tbody>
-          <tr><td>ファイル名</td><td>拡張子を除いた名前を、下の置換子を使ったテンプレートで決めます。既定は <code>&lt;filename&gt;_edited</code> です。出力の拡張子は常に自動で付きます。<code>&lt;ext&gt;</code> は元のファイルの拡張子です</td></tr>
+          <tr><td>ファイル名</td><td>拡張子を除いた名前を、下の置換子を使ったテンプレートで決めます。既定は <code>&lt;filename&gt;_edited</code> です。出力の拡張子は常に自動で付きます。末尾の <code>.&lt;ext&gt;</code> は書き出す形式の拡張子として扱い、二重に付けません。それ以外の <code>&lt;ext&gt;</code> は元のファイルの拡張子です</td></tr>
           <tr><td>保存先</td><td>選んだフォルダ、または元と同じフォルダへ書き出します。元と同じフォルダではサブフォルダも指定できます。選んだフォルダでは、元のフォルダ構造を保てます</td></tr>
           <tr><td>形式</td><td>PNG / JPEG / WebP / 元と同じ形式から選べます。JPEG・WebP の品質は 1〜100、WebP は可逆圧縮も選べます。「元と同じ形式」で対応しない画像や PDF ページは、指定した JPEG または PNG になります</td></tr>
           <tr><td>出力サイズ</td><td>そのまま / 割合 / 長辺 / 短辺 / 幅 / 高さ / 枠に収める、から選べます。縦横比を保ち、「拡大する」がオフなら元より大きくしません。割合の 50% は 1/2、25% は 1/4 です。方式は Lanczos・バイキュービック・バイリニア・最近傍から選べます</td></tr>
@@ -182,7 +182,7 @@
           <tr><td><code>&lt;dirname&gt;</code></td><td>元があったフォルダの名前。複数のフォルダから集めるときに出所を残せます</td></tr>
           <tr><td><code>&lt;num&gt;</code></td><td>書き出し順の 4 桁連番</td></tr>
           <tr><td><code>&lt;num:N&gt;</code></td><td>N を 1〜9 にすると、その桁数の連番。例: <code>&lt;num:3&gt;</code> は 001 から始まります</td></tr>
-          <tr><td><code>&lt;ext&gt;</code></td><td>元の拡張子（小文字）。ZIP はエントリ名、PDF ページは pdf</td></tr>
+          <tr><td><code>&lt;ext&gt;</code></td><td>末尾の <code>.&lt;ext&gt;</code> は書き出す形式の拡張子として扱い、二重に付けません。それ以外は元の拡張子（小文字）。ZIP はエントリ名、PDF ページは pdf</td></tr>
           <tr><td><code>&lt;date&gt;</code> / <code>&lt;time&gt;</code></td><td>元の更新日 YYYYMMDD / 更新時刻 HHMMSS（ローカル時刻）。書き出し時に決まります</td></tr>
         </tbody>
       </table>

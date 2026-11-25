@@ -19,7 +19,7 @@ use crate::export_dialog::{ExportEvent, ExportFailure, ExportPending, ExportSucc
 use crate::save_with_metadata::{MetadataProfile, SaveOptions, SrcFormat, ThumbnailNoticeKinds};
 use paths::{OutputReservation, Target};
 
-pub const TEMPLATE_PLACEHOLDER_HINT: &str = "<filename> / <dirname> / <num> / <num:N> / <ext> / <date> / <time> が使えます。拡張子は自動で付きます (<ext> は元の拡張子)";
+pub const TEMPLATE_PLACEHOLDER_HINT: &str = "<filename> / <dirname> / <num> / <num:N> / <ext> / <date> / <time> が使えます。拡張子は自動で付きます (末尾の .<ext> は書き出す形式の拡張子、それ以外の <ext> は元の拡張子)";
 
 pub struct BatchExportItem {
     pub filename: String,
@@ -103,7 +103,8 @@ fn expand_template(
     index: usize,
     datetime: Option<&(String, String)>,
 ) -> String {
-    let mut rest = template;
+    // The caller appends the output format's extension after expanding the stem.
+    let mut rest = template.strip_suffix(".<ext>").unwrap_or(template);
     let mut output = String::with_capacity(template.len());
     while let Some(start) = rest.find('<') {
         output.push_str(&rest[..start]);
