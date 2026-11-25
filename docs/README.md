@@ -133,6 +133,7 @@
 | [local-vlm-v0-procedure.md](local-vlm-v0-procedure.md) | **手順の下書き (2026-11-02、未実行)**。ローカル AI 説明文の V0。Qwen3.5-4B/9B と Gemma 4 E4B の比較、VLM・AI 補正・表示用テクスチャの VRAM を同じ物差しで計測、利用者による目隠しの品質比較、4B 固定と U1 の判断基準 |
 | [mcp-integration-plan.md](mcp-integration-plan.md) | **段階 0 試験実装中 (2026-10-30)**。AI 連携 (MCP)。stdio の別 exe と本体の agent lane (Remote IPC とは別の pipe・版)、Remote 操作権との関係、安全性。実装・検証と未決事項は §14 |
 | [mcp-guide-settings-plan.md](mcp-guide-settings-plan.md) | **設計 (2026-11-21)、実装は未着手**。§1.843 MCP で使い方の案内と、設定の確認・変更。マニュアルを MCP exe に同梱して引かせる tool、今開いている場所、環境設定の読み書き (環境設定の OK と同じ確定処理を通す)、お気に入りの登録と索引。許可はチェック欄 2 つ (既定オフ)。書き出し・取り込みの表にある設定は AI が読めて変えられる。第 2 段はキー割り当て、第 3 段は mIV Sound。公開文書の書き換え案を含む |
+| [ask-ai-help-plan.md](ask-ai-help-plan.md) | **設計 (2026-11-25)**。§1.894 ヘルプメニューの「AI で調べる」。MCP 登録済みの AI アプリ (Claude Desktop・ChatGPT の Codex) を案内の文入りで開く、Web の AI は案内の文をコピーして入口を開く、AI 連携の始め方へのリンク。登録の検出は worker、Shell は external-open worker |
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G/R の経路、Everythingの共通Search ownership、インデクサパイプライン + DB 責任分離** |
 | [search-input-history-plan.md](search-input-history-plan.md) | §1.756 検索欄の入力履歴。4 種類各 20 件、確定・実行済み語での離脱、設定の保存・オフと全件消去、フォルダバーと共有する▼・IME-safe な固定キー、ログ・Remote・MCP の非公開境界。実装中 |
