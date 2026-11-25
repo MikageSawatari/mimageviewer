@@ -195,6 +195,38 @@ fn format_modifiers(modifiers: egui::Modifiers) -> Value {
     })
 }
 
+fn non_printable_key(key: egui::Key) -> bool {
+    use egui::Key;
+    (Key::F1..=Key::F35).contains(&key)
+        || matches!(
+            key,
+            Key::Escape
+                | Key::Enter
+                | Key::Tab
+                | Key::Backspace
+                | Key::Insert
+                | Key::Delete
+                | Key::ArrowUp
+                | Key::ArrowDown
+                | Key::ArrowLeft
+                | Key::ArrowRight
+                | Key::Home
+                | Key::End
+                | Key::PageUp
+                | Key::PageDown
+                | Key::Copy
+                | Key::Cut
+                | Key::Paste
+                | Key::BrowserBack
+                | Key::BrowserForward
+                | Key::BrowserRefresh
+                | Key::BrowserSearch
+                | Key::BrowserHome
+                | Key::BrowserFavorites
+                | Key::BrowserStop
+        )
+}
+
 fn format_event(event: &Event) -> Value {
     match event {
         Event::Key {
@@ -203,11 +235,28 @@ fn format_event(event: &Event) -> Value {
             pressed,
             repeat,
             modifiers,
-        } => json!({
-            "kind": "Key", "key": format!("{key:?}"),
-            "physical_key": physical_key.map(|key| format!("{key:?}")),
-            "pressed": pressed, "repeat": repeat, "modifiers": format_modifiers(*modifiers),
-        }),
+        } => {
+            let chord = modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd;
+            let show_key = chord || non_printable_key(*key);
+            // Redact both identities for ordinary typing, including Shift and
+            // remapped logical/physical pairs. Never infer text from the scan key.
+            let key_name = if show_key {
+                format!("{key:?}")
+            } else {
+                "printable".into()
+            };
+            let physical_name = physical_key.map(|physical| {
+                if chord || (show_key && non_printable_key(physical)) {
+                    format!("{physical:?}")
+                } else {
+                    "printable".into()
+                }
+            });
+            json!({
+                "kind": "Key", "key": key_name, "physical_key": physical_name,
+                "pressed": pressed, "repeat": repeat, "modifiers": format_modifiers(*modifiers),
+            })
+        }
         Event::PointerButton {
             pos,
             button,
@@ -261,17 +310,44 @@ fn format_line(pass: &RootPass, focus_end: Option<Id>) -> String {
 }
 
 #[cfg(windows)]
-pub(crate) fn log_main_activation(hwnd: u64, message: u32, wparam: usize, lparam: isize) {
+pub(crate) fn log_main_activation(
+    hwnd: u64,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    result: isize,
+) {
     // Caller checks the cached flag and the existing subclass's ROOT registration.
-    emit(format!(
+    emit(format_main_activation(
+        hwnd, message, wparam, lparam, result,
+    ));
+}
+
+#[cfg(windows)]
+fn format_main_activation(
+    hwnd: u64,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    result: isize,
+) -> String {
+    let mouse_activate_result = (message == 0x0021).then(|| match result {
+        1 => "MA_ACTIVATE",
+        2 => "MA_ACTIVATEANDEAT",
+        3 => "MA_NOACTIVATE",
+        4 => "MA_NOACTIVATEANDEAT",
+        _ => "unknown",
+    });
+    format!(
         "[focus-trace] {}",
         json!({
             "kind": "win32_activation", "source": "main_key_input_subclass",
             "hwnd": format!("0x{hwnd:x}"),
             "message": if message == 0x0006 { "WM_ACTIVATE" } else { "WM_MOUSEACTIVATE" },
             "wparam": format!("0x{wparam:x}"), "lparam": format!("0x{lparam:x}"),
+            "result": result, "mouse_activate_result": mouse_activate_result,
         })
-    ));
+    )
 }
 
 fn emit(line: String) {
@@ -289,6 +365,128 @@ fn emit(line: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key_fields(
+        key: egui::Key,
+        physical_key: Option<egui::Key>,
+        modifiers: egui::Modifiers,
+    ) -> Value {
+        format_event(&Event::Key {
+            key,
+            physical_key,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        })
+    }
+
+    #[test]
+    fn focus_trace_redacts_both_key_identities_for_printable_and_shift_typing() {
+        for modifiers in [egui::Modifiers::NONE, egui::Modifiers::SHIFT] {
+            for key in [
+                egui::Key::A,
+                egui::Key::Num7,
+                egui::Key::Backslash,
+                egui::Key::Space,
+            ] {
+                for physical in [key, egui::Key::Escape] {
+                    let fields = key_fields(key, Some(physical), modifiers);
+                    assert_eq!(fields["kind"], "Key");
+                    assert_eq!(fields["key"], "printable");
+                    assert_eq!(fields["physical_key"], "printable");
+                    assert_eq!(fields["pressed"], true);
+                    assert_eq!(fields["modifiers"], format_modifiers(modifiers));
+                }
+                let fields = key_fields(key, None, modifiers);
+                assert_eq!(fields["key"], "printable");
+                assert_eq!(fields["physical_key"], Value::Null);
+            }
+        }
+        // A non-printable logical key must not expose a printable physical key.
+        let fields = key_fields(egui::Key::Enter, Some(egui::Key::A), egui::Modifiers::NONE);
+        assert_eq!(fields["key"], "Enter");
+        assert_eq!(fields["physical_key"], "printable");
+    }
+
+    #[test]
+    fn focus_trace_keeps_navigation_function_browser_keys_and_shortcut_chords() {
+        use egui::Key;
+        for key in [
+            Key::Escape,
+            Key::Enter,
+            Key::Tab,
+            Key::Backspace,
+            Key::Delete,
+            Key::ArrowLeft,
+            Key::ArrowRight,
+            Key::ArrowUp,
+            Key::ArrowDown,
+            Key::Home,
+            Key::End,
+            Key::PageUp,
+            Key::PageDown,
+            Key::F1,
+            Key::F12,
+            Key::F35,
+            Key::BrowserBack,
+            Key::BrowserForward,
+            Key::BrowserRefresh,
+            Key::BrowserSearch,
+            Key::BrowserHome,
+            Key::BrowserFavorites,
+            Key::BrowserStop,
+        ] {
+            let fields = key_fields(key, Some(key), egui::Modifiers::NONE);
+            assert_eq!(fields["key"], format!("{key:?}"));
+            assert_eq!(fields["physical_key"], format!("{key:?}"));
+        }
+        for modifiers in [
+            egui::Modifiers::CTRL,
+            egui::Modifiers::ALT,
+            egui::Modifiers {
+                command: true,
+                ..egui::Modifiers::NONE
+            },
+            egui::Modifiers {
+                mac_cmd: true,
+                ..egui::Modifiers::NONE
+            },
+        ] {
+            for key in [Key::A, Key::V] {
+                let fields = key_fields(key, Some(key), modifiers);
+                assert_eq!(fields["key"], format!("{key:?}"));
+                assert_eq!(fields["physical_key"], format!("{key:?}"));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn focus_trace_mouse_activation_includes_downstream_result_and_eaten_click_label() {
+        for (result, label) in [
+            (1, "MA_ACTIVATE"),
+            (2, "MA_ACTIVATEANDEAT"),
+            (3, "MA_NOACTIVATE"),
+            (4, "MA_NOACTIVATEANDEAT"),
+            (99, "unknown"),
+        ] {
+            let line = format_main_activation(0x1234, 0x0021, 0x5678, 0x02010001, result);
+            let fields: Value =
+                serde_json::from_str(line.strip_prefix("[focus-trace] ").unwrap()).unwrap();
+            assert_eq!(fields["message"], "WM_MOUSEACTIVATE");
+            assert_eq!(fields["hwnd"], "0x1234");
+            assert_eq!(fields["wparam"], "0x5678");
+            assert_eq!(fields["lparam"], "0x2010001");
+            assert_eq!(fields["result"], json!(result));
+            assert_eq!(fields["mouse_activate_result"], label);
+        }
+        let line = format_main_activation(0x1234, 0x0006, 1, 0, 0);
+        let fields: Value =
+            serde_json::from_str(line.strip_prefix("[focus-trace] ").unwrap()).unwrap();
+        assert_eq!(fields["message"], "WM_ACTIVATE");
+        assert_eq!(fields["result"], 0);
+        assert_eq!(fields["mouse_activate_result"], Value::Null);
+    }
 
     #[test]
     fn focus_trace_line_preserves_event_order_focus_owner_hits_and_address() {

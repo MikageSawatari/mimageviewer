@@ -6622,15 +6622,12 @@ unsafe extern "system" fn main_key_input_subclass_proc(
     _ref_data: usize,
 ) -> LRESULT {
     let hwnd_raw = hwnd.0 as u64;
-    if matches!(msg, WM_ACTIVATE | WM_MOUSEACTIVATE) && crate::focus_debug::is_enabled() {
-        let is_main = state().lock().ok().is_some_and(|guard| {
+    let trace_activation = matches!(msg, WM_ACTIVATE | WM_MOUSEACTIVATE)
+        && crate::focus_debug::is_enabled()
+        && state().lock().ok().is_some_and(|guard| {
             guard.installed_hwnds.owns_subclass(hwnd_raw, id)
                 && guard.installed_hwnds.viewport_for_hwnd(hwnd_raw) == Some(egui::ViewportId::ROOT)
         });
-        if is_main {
-            crate::focus_debug::log_main_activation(hwnd_raw, msg, wparam.0, lparam.0);
-        }
-    }
     let native_interesting = native_detached_message_interesting(msg);
     let native_origin = native_mouse_origin(msg);
     let call = NativeDetachedCall::new(msg, wparam.0, native_origin);
@@ -6666,6 +6663,9 @@ unsafe extern "system" fn main_key_input_subclass_proc(
         guard.unregister_subclass(hwnd_raw, id);
     }
     let result = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+    if trace_activation {
+        crate::focus_debug::log_main_activation(hwnd_raw, msg, wparam.0, lparam.0, result.0);
+    }
     if native_interesting || msg == WM_NCDESTROY {
         finish_native_detached_dispatch(hwnd_raw, id, call);
         dispatch_native_detached_input();
