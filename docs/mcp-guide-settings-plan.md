@@ -1,6 +1,7 @@
 # MCP で使い方の案内と、設定の確認・変更 (§1.843) — 設計
 
 状態: **設計 (2026-11-21、同日に利用者の決定で改訂)。第 1 段を実装済み (2026-11-23、区切り A〜E、`stack_script` を除く。`stack_script` は §1.863 が master に入ってから、§6.9)。収録は v5.7.0 以降 (v5.6.0 には入れない)**。
+**第 1 段は v5.7.0 で出荷。第 2 段のうち操作カスタマイズ (キー割り当て・リング・マウス・ジェスチャー) の設計は §20 (2026-11-25、v5.8.0)**。
 基点は master `28f9c5a11`。行番号はこの基点のもの。実行時の挙動は誰も観測していない
 (この文書の根拠はコードと文書の参照だけ。実機で確かめる点は §14)。
 
@@ -982,6 +983,8 @@ tool を 1 本にする理由: 「登録する」と「索引を切り替える�
 
 ## 11. 第 2 段: キー割り当て・操作カスタマイズと、環境設定の外の画面が持つ設定
 
+**2026-11-25: 操作カスタマイズの部分の設計は §20** (v5.8.0)。下は第 1 段の時点の見通し。
+
 **キー割り当て・操作カスタマイズの変更は第 2 段にする** (2026-11-21 利用者決定。mIV Sound の前に 1 段はさむ。
 利用者の見立て: 要望は多そう)。今回 (第 1 段) には入れない。
 
@@ -1750,3 +1753,304 @@ P1 なし。指摘はすべて受け入れ、次の改訂 (§19.5) に入れた�
 - 拒否のうち busy (環境設定を開いたまま) が「AI による変更」に出ない: 受付で断った要求は記録しない。
   ほかの書き込み tool (`set_settings`・コレクション・レーティング) も同じで、書き手まで届いて失敗した書き込み
   (古い SHA-256・コンパイルエラー) だけを「書き込めませんでした」として残す。ログには 3 回とも残る。設計どおり。
+
+## 20. 第 2 段: 操作カスタマイズ (キー割り当て・リング・マウス・ジェスチャー) — v5.8.0
+
+状態: **設計 (2026-11-25)、独立レビュー前**。基点は master `e3c2010fc`、ブランチ `mcp-keys-843`
+(worktree `G:\home\mimageviewer-mcpkeys843`)。行番号はこの基点のもの。根拠はコードと文書の参照だけで、
+実行時の挙動は誰も観測していない。第 2 段は v5.8.0 で始める (利用者決定 2026-11-25、backlog §1.843)。
+
+### 20.1 目的と範囲
+
+きっかけ: X で「Ctrl+C で画像をクリップボードにコピーできないか」と聞かれ、利用者が AI に MCP 経由で確かめさせたが、
+キー割り当てを読む tool が無く答えられなかった (backlog §1.843)。実際は、一覧の Ctrl+C は `GridCopyFiles`
+(ファイルのコピー) で、`GridCopyImage`・`FsCopyImage` (画像のコピー) は既定でキーが無い (`docs/keymap.ini.default`)。
+
+目標: AI が「どの操作にどのキー・入力が付いているか」「そのキーは空いているか」「割り当てると何と競合するか」を答え、
+頼まれたら割り当てを変えられること。
+
+**含む** (操作カスタマイズの窓が編集し、OK で確定する値。コードで確かめた、§20.2):
+
+| 区分 | 値 (`Settings` の field) | 窓の場所 |
+| --- | --- | --- |
+| キー | `keymap.overrides` (595 操作、1 操作 3 キーまで) | キーボード・コマンド一覧 |
+| リング | `ring_shortcuts.{grid,image,video}.slots` (8 方向 × 3)。**右ドラッグのリングとゲームパッドの X リングで共用** | リングショートカット・ゲームパッド |
+| マウスボタン | `ring_shortcuts.mouse_buttons_{grid,image,video}.{back,forward,middle}` | 設定 → マウスボタン |
+| マウスジェスチャー | `ring_shortcuts.mouse_gestures_{grid,image,video,edit}.bindings` (方向 1〜4 個の並び → 操作) | マウスジェスチャ |
+| 右ドラッグ・右クリック | `ring_shortcuts.right_drag_{grid,image,video,edit}`、`short_right_click_{image,video}`、`select_grid_item_on_right_drag_start` | 設定 → 右ドラッグ・右クリック |
+| 表示の切り替え | `ring_shortcuts.mouse_ring_help_visible`・`mouse_gesture_help_visible`・`mouse_gesture_result_toast_visible` | 設定 → 動作 |
+| ゲームパッド | `gamepad_enabled` | 設定 → ゲームパッド |
+| 動画・音声のホイール | `ring_shortcuts.video_normal_wheel_action` (環境設定の動画のページにもある、§20.2) | 設定 → マウスボタン |
+
+**含まない**:
+
+- `fullscreen_primary_click` (閲覧表示の左クリック): 窓では「設定 → マウスボタン」で編集するが、書き出しの表の export 側
+  (`src/settings_transfer.rs:468`) なので**第 1 段の `set_settings` の鍵として v5.7.0 で出荷済み**。1 つの値を 2 つの tool で
+  書かない (持ち主を 1 つに保つ)。`get_operations` の説明に「`set_settings` の `fullscreen_primary_click`」と 1 語だけ書く。
+- `menu_layout`・`context_menu_layout`: 操作カスタマイズの共有ファイルには入るが、窓の OK は実行中の値で置き換える
+  (`src/ui_dialogs/preferences.rs:4182`)。持ち主は環境設定で、第 1 段の `set_settings` で扱える。
+- 互換・記録の値 (`mouse_flick_enabled`・`gamepad_ring_enabled`・`shift_wheel_pair`・`alt_wheel_pair`・
+  `mouse_back_forward_action`・`mouse_nav_prompt_done`・`x_picker_hint_shown`): 画面で変える設定ではない (§6.4 と同じ基準)。
+- ゲームパッドのボタンごとの割り当て: 保存していない (固定。X リングだけが変えられる、`src/ui_dialogs/preferences/pages.rs:2456`)。
+- 「すべて既定に戻す」・共有ファイルの書き出し / 取り込み: AI からは作らない (項目ごとに既定へ戻せる、§20.4)。
+- **環境設定の外の画面が持つほかの設定** (ツールバー・各パネル・リモート閲覧のオン / オフなど約 170、§11・U7):
+  確定の入口が画面ごとに別で、操作カスタマイズとは共有する部分が無い。この節では扱わず、第 2 段の後半として
+  別に設計する (§20.14 で統括へ確認)。
+- 操作のスクリプト (§1.363) の本文を AI に書かせること: §1.363 の設計 Q5 で「§1.843 の後の段」。スクリプト操作の
+  スロット (`ScriptSlot1..20`) へのキー割り当ては、ほかの操作と同じに扱える (§20.10)。
+
+### 20.2 持ち主と確定の経路 (コードの参照)
+
+- 操作カスタマイズの窓は、開いた最初の frame に `PreferencesState::from_settings(&self.settings)` で下書きを作り
+  (`src/ui_dialogs/preferences.rs:4024`)、OK で `apply_operation_customize_state` → `operation_customize_edited_bundle`
+  → **`apply_operation_customize_bundle`** (`:4175-4230`) を呼ぶ。
+- `apply_operation_customize_bundle` の中身は短い: `ring_shortcuts.sanitize()` → `bundle.apply_to(&mut self.settings)`
+  (6 field を代入、`src/operation_customize_share.rs:97`) → keymap が変わったら `Keymap::from_settings` で作り直して
+  `self.keymap` へ入れ、`install_global_native_video_shortcuts`、ヘルプのキャッシュを捨てる → リングが変わったら native の
+  リングの重ね表示を消す → `self.settings.save()`。
+- **設定の復元の窓の「操作カスタマイズ」の取り込みも、同じ `apply_operation_customize_bundle` を下書きなしで即時に呼ぶ**
+  (`src/ui_dialogs/settings_restore.rs:1141`。「初期値に戻す」も `:1392`)。つまり「実行中の値から bundle を作り、値を変えて、
+  この関数を呼ぶ」は既にある確定の形で、AI 専用の反映の経路にならない。
+- キーの検査は `parse_chord_for_action` (`src/keymap.rs:10691`、型の形 Press / ModifierHold / KeyHold を見る)。
+  窓のキー入力欄は空と `none` を除き、重複を除き、3 つまでにする (`pages.rs:5510-5528`)。0 個なら「割り当てなし」
+  (`disable_action`)、既定に戻すは override を消す (`remove_override`、`pages.rs:5276`)。
+- 競合は `Keymap::binding_conflicts` (`src/keymap.rs:8394`)。**窓は競合を警告として出すだけで、保存を止めない**
+  (`pages.rs:3394`)。予約キー (Esc・修飾なし矢印・一覧の Shift+矢印、`RESERVED_BINDINGS` `:7905`) との重なりも
+  競合 `Reserved` として出る。
+- リング・マウスボタン・ジェスチャー・右ドラッグに入る操作は `RingActionId` (`src/ring_shortcut.rs:537`、196 種、
+  保存は snake_case の文字列、未知は `Unknown`)。入れてよいかは `is_valid_for_context`・
+  `is_available_for_mouse_button_assignment`・`is_valid_for_right_drag_context`、候補は `available_for_context` ほか
+  (`:1847-2167`)。読み込みの正規化は `RingShortcutSettings::sanitize`。
+- キーの操作とリング側の操作の対応は `ring_bindings_for_key_action` (`pages.rs:3066`、private)。
+- `video_normal_wheel_action` は環境設定の動画のページ (`pages.rs:8969`) と操作カスタマイズの両方で編集でき、両方の確定が
+  「開いたときの値」との 3 者比較で解決する (`resolve_dialog_edited_value`、`preferences.rs:2670,4186`)。窓が閉じていれば
+  実行中の値が正。
+- 窓の外で実行中に書くのは、初回の案内の記録 (`x_picker_hint_shown`、`src/app/gamepad_input.rs:5536`) と、マウスの
+  旧設定からの移行の案内 (`src/app.rs:24494`) だけで、どちらも UI スレッド。
+- 操作カスタマイズの窓・その破棄確認・環境設定・設定の復元はモーダルの表に入っている (`src/app.rs:24278-24279` ほか)。
+
+### 20.3 状態を減らす検討
+
+| 検討 | 結果 |
+| --- | --- |
+| 操作カスタマイズの窓が開いている間の AI からの変更 | **拒む** (第 1 段と同じ受付 `admit_agent_settings_write` を使う。モーダルの表に窓が入っている)。開いている窓の下書きへ反映する処理は作らない。下書きと実行中の値が食い違う組み合わせが消える |
+| 確定の経路 | 実行中の値から `OperationCustomizeBundle::from_settings` で作り、値を変え、`apply_operation_customize_bundle` を呼ぶ (設定の復元の取り込みと同じ)。下書き (`PreferencesState`) は作らない。受け付けた frame の中で確定まで終わる |
+| 一部だけ入れる | しない。1 つでも検査を通らなければ全体を拒み、何も変えない (第 1 段 §6.6 と同じ) |
+| キーの競合 | **拒まない** (窓と同じ)。応答に「この変更に関わる競合」を返し、AI が利用者に伝えて相手側を直す (§20.5)。拒むと「画面ではできるのに AI ではできない」になる (利用者決定 (4) の趣旨に反する) |
+| 取り込みの前の退避 (設定の復元は現在値を worker で退避してから入れる) | 作らない。応答・通知・記録の変更前の値で戻せる (第 1 段 §9 と同じ)。退避の worker は非同期の状態を増やす |
+| 「すべて既定に戻す」の tool | 作らない。項目ごとに既定へ戻せる |
+| キー・リング・ボタン・ジェスチャー・オプションを別の tool に分けるか | 分けない。読み 1 本・書き 1 本にし、入力は「スロットの名前 → 値」の 1 つの map にする (§20.4)。書き込み側の分岐が値の種類ごとの検査だけになる |
+| 読みと書きを 1 本にするか | しない。読みは `readOnlyHint=true` で AI アプリが確認なしに呼べる (第 1 段と同じ分け方) |
+| 物理キー・右ドラッグの記録 | 要らない。AI は文字列で渡す (窓の記録は人の入力を文字列へ変える手段) |
+| 新しい許可 | 足さない。「設定の確認と変更を AI に任せる」に含める (§11 の想定、§20.7) |
+
+まれな失敗は割り切り (ログ + 通知)。保存に失敗したときは第 1 段と同じ警告 (`show_feedback_warning`) を出し、応答はメモリの中の値を返す。
+
+### 20.4 tool
+
+tool を 2 本足す。どちらも本体と通信し、UI スレッドで実行する。
+
+| tool | 内容 | annotation |
+| --- | --- | --- |
+| `get_operations` | 操作とキー・入力の割り当て、競合、入れられる候補を読む | `readOnlyHint=true` |
+| `set_operations` | キー・入力の割り当てを変える (確認なし) | `readOnlyHint=false`、`destructiveHint=false` (応答の変更前の値で戻せる)、`idempotentHint=true` |
+
+#### 20.4.1 スロットの名前 (入力の住所)
+
+キー以外の入力は、1 つの文字列の名前で指す。読み・書き・記録で同じ名前を使う。
+
+| 名前 | 値 | 既定に戻す (`null`) |
+| --- | --- | --- |
+| `ring.{grid,image,video}.{up,up_right,right,down_right,down,down_left,left,up_left}` | `RingActionId` の保存名、または `"none"` | その方向の既定 |
+| `mouse.{grid,image,video}.{back,forward,middle}` | 同上 | そのボタンの既定 |
+| `gesture.{grid,image,video,edit}.<並び>` (並びは `U` `R` `D` `L` の 1〜4 文字、同じ文字を隣に並べない。例 `DR`) | 同上。`"none"` はその並びの割り当てを消す | 既定の割り当てにある並びなら既定の操作、無ければ消す |
+| `right_drag.{grid,image,video,edit}` | `disabled` / `ring_shortcut` / `mouse_gesture` (`edit` は `ring_shortcut` を除く) | 既定 |
+| `short_right_click.{image,video}` | `close_fullscreen` / `none` / `context_menu` | 既定 |
+| `option.select_grid_item_on_right_drag_start`・`option.mouse_ring_help_visible`・`option.mouse_gesture_help_visible`・`option.mouse_gesture_result_toast_visible`・`option.gamepad_enabled` | 真偽 | 既定 |
+| `option.video_normal_wheel_action` | `navigate_items` / `adjust_volume` | 既定 |
+
+- 値の綴りは `settings.db` に保存している serde の形と同じ (`RingActionId::as_str`、`RightDragMode::as_str` ほか)。新しい綴りを決めない。
+- ジェスチャーの並びの文字は、保存の形 (`MouseGestureDirection` の serde) とは別の短い表記。読み書きの境界で変換する
+  (変換は 1 か所、往復のテストを置く)。入力の正規化 (隣の同じ向きをまとめる) で値が変わる並びは拒む。
+- リングの説明に「右ドラッグのリングとゲームパッドの X リングで共用」と書く (窓と同じ)。
+
+#### 20.4.2 `get_operations { view?, query?, key?, actions?, context?, slots?, slot?, page? }`
+
+`view` (既定 `keys`) ごとに使える引数が決まる。ほかの view の引数が来たら `BadRequest` (AI が直せる文にする)。
+
+- **`keys`**: キーの操作の一覧。1 行 =
+  `{ "action": "GridCopyImage", "label": "画像をコピー", "context": "Grid", "context_label": "サムネイル一覧",
+  "trigger": "press", "keys": [], "default": [], "customized": false, "inputs": ["ring.grid.up_right"] }`。
+  - `keys` は今効いているキー、`default` は既定のキー (`KeyAction::default_chords`)、`customized` は override の有無。
+    キーの綴りは保存の形 (`Chord::settings_name`、例 `Ctrl+Shift+C`)。
+  - `inputs` は、同じ操作が今割り当てられているキー以外のスロットの名前。キーの操作に対応する `RingActionId` を
+    `ring_bindings_for_key_action` (共有の場所へ移す。窓の割り当て編集の表示と同じ対応) で求め、今のリング・マウスボタン・
+    ジェスチャーのスロットのうち、その値が入っているものを返す。
+  - 絞り込み (どれか 1 つ。併用は `context` だけ):
+    - `query`: 表示名・操作名・文脈の表示名への部分一致 (空白区切りの AND)。先頭 32 件と `more`。
+    - `key`: キー 1 つ (例 `Ctrl+C`、修飾だけ `Shift` も可)。そのキーが今付いている操作を全部の文脈から返し、加えて
+      予約の割り当て (`RESERVED_BINDINGS`) に当たれば `reserved` に表示名を返す。結果が空なら、そのキーはどの操作にも
+      付いていない。**固定の入力 (IME・クリップボードの貼り付けなど、keymap の外) は返らない**ので、説明に
+      「固定の入力は get_help (ショートカット一覧)」と書く。
+    - `actions`: 操作名 32 個まで。
+    - どれも無い: 全件を 60 件ずつのページ (`page`、応答に `page`・`pages`)。
+    - `context`: 文脈の名前 (`KeyContext::ini_name`) で絞る。
+  - 利用者に見せない 4 操作 (`is_user_facing` が false) は返さない・書かせない。
+- **`inputs`**: キー以外のスロットの今の値。1 行 = `{ "slot", "label", "value", "value_label", "default" }`。
+  `slots` (名前の前方一致、例 `gesture.image`) で絞る。ジェスチャーは今の割り当てと既定の割り当ての並びを合わせて返す
+  (既定にあって今無い並びは `value: "none"`)。60 件ずつのページ。
+- **`conflicts`**: 今の競合の一覧 (`binding_conflicts`)。1 行 = `{ "key", "kind", "action", "other" }` (`other` は相手の操作名か
+  予約の表示名)。`kind` は `same_context` (Hard) / `overlap` (ActiveOverlap) / `trigger_mismatch` / `reserved`。60 件ずつ。
+- **`choices`**: `slot` 1 つ (例 `mouse.image.back`) に入れられる値と表示名。`RingActionId` のスロットは、その文脈・入力の
+  検査を通る候補 (`available_for_context` ほか、窓の候補と同じ関数)。
+
+どの形も、最終の応答の形でデータ応答の予算に収まることをテストで検査する (§4.3・§6.2 と同じ測り方)。実行は UI スレッドで
+メモリの中の値を読むだけ。
+
+#### 20.4.3 `set_operations { keys?, inputs? }`
+
+- `keys`: `{ 操作名: 値 }`。値は
+  - キーの配列 (0〜3 個): その割り当てにする。`[]` は「割り当てなし」(窓の `disable_action` と同じ)。
+  - `null`: 既定に戻す (override を消す、窓の「既定に戻す」と同じ)。
+- `inputs`: `{ スロットの名前: 値 }` (§20.4.1)。`null` は既定に戻す。
+- `keys` と `inputs` を合わせて 1〜32 項目。
+- 1 回の呼び出しが、窓で値を変えて OK を 1 回押したのと同じ (1 回の確定、1 回の保存)。
+
+### 20.5 検査
+
+1 つでも通らなければ全体を拒み、何も変えない。エラー文に操作名・スロット名を入れる (AI が直せるように)。
+
+- 操作名: `KeyAction::parse_ini_name` で引けて、利用者に見せる操作であること。
+- キー: 各要素が `parse_chord_for_action(action, s)` で `Ok(Some(_))` (空・`none` は配列に入れさせない。割り当てなしは `[]`)。
+  同じ配列の中の重複は拒む (窓は黙って除くが、AI には「言ったとおりに入った」か「何も変わらない」かにする)。4 個以上は拒む。
+- スロット: 名前の形・文脈・ボタン・方向・並びが §20.4.1 のとおりであること。`RingActionId` は `Unknown` にならず、その
+  スロットの検査 (`is_valid_for_context` / `is_available_for_mouse_button_assignment` / `is_valid_for_right_drag_context`) を通ること。
+- 変えた後の bundle に `ring_shortcuts.sanitize()` をかけ、**渡した値が正規化で変わるなら拒む** (第 1 段 §6.4.3 の
+  「正規化で値が変わる入力は拒む」と同じ)。
+- 同じ並びのジェスチャーが今のデータに 2 つ以上ある場合 (窓は重複の登録を止めず、先のものだけが効く、`ring_shortcut.rs:460`):
+  そのスロットへ書くと、その並びの割り当てを 1 つにまとめる。応答の行に「重複していた n 件をまとめた」と書く
+  (効いていない重複だけが消え、効き方は頼んだとおりになる)。
+- 第 1 段と同じく、`keymap`・`ring_shortcuts`・`gamepad_enabled` を `set_settings` に渡されたときのエラー文を
+  「`set_operations` で変えます」に変える (`src/settings_transfer/stage1.rs:260` の理由の文)。
+
+### 20.6 実行・応答・通知・取り消し
+
+UI スレッドで次を順に行う。
+
+1. 許可を見る (§20.7)、受付 (第 1 段 §6.5 と同じ `admit_agent_settings_write`)。
+2. `OperationCustomizeBundle::from_settings(&self.settings)` を作り、`before` として控える。
+3. 検査しながら bundle の写しへ値を入れる (§20.5)。
+4. **`settings_eq` で前と同じなら終わる** (確定・保存・通知をしない。全項目を `unchanged`)。
+5. 応答の全体を組み立てて予算を検査する (収まらなければ何も変えずに拒む、第 1 段 §6.4.3 と同じ)。
+6. `apply_operation_customize_bundle(bundle)`。
+7. 実行中の値から変更後を読み直して応答を作り、通知・記録・ログを出す。
+
+応答:
+
+```json
+{
+  "changed": [
+    { "name": "GridCopyImage", "label": "キー: 画像をコピー (サムネイル一覧)", "before": null, "after": ["Ctrl+C"] }
+  ],
+  "unchanged": [],
+  "conflicts": [
+    { "key": "Ctrl+C", "kind": "same_context", "action": "GridCopyImage", "other": "GridCopyFiles" }
+  ]
+}
+```
+
+- `before`・`after` は**書き込みの値と同じ形** (キーは override が無ければ `null`、あれば配列。スロットは値)。
+  `before` をそのまま `set_operations` に渡せば元に戻る (override の有無まで戻る)。往復のテストを置く。
+- `conflicts`: 変更後の競合のうち、今回変えた操作が関わるもの。競合は拒まない (§20.3)。tool の説明に
+  「競合は警告。相手の操作を別のキーにするか外すかを利用者に聞く」と書く。
+- 通知 (トースト) と「AI による変更」: 1 項目 1 行「キー: 画像をコピー (サムネイル一覧): なし → Ctrl+C」
+  「リング (画像) 右上: 拡大 → 縮小」。既存の `ChangeController::publish` と `ChangeRow` (§9 と同じ)。tool 名は `set_operations`。
+- ログ: tool 名・名前・変更前後の値。
+- 取り消し: 専用の tool は作らない (§9 と同じ)。
+
+### 20.7 許可・受付
+
+- 読み・書きとも「読み取りのみ」以上 + 「設定の確認と変更を AI に任せる」(`agent_allow_settings`)。新しい許可は足さない
+  (§11 の想定、U2「見せる / 変える を分けない」と同じ)。`agent_settings_permission` を共用する。
+- 受付は `admit_agent_settings_write` を共用する (起動処理中・モーダル・環境設定の下書き・リモート操作中は拒む)。
+  操作カスタマイズの窓・その破棄の確認・設定の復元の窓はモーダルの表に入っているので、条件を足さない。
+- 読みも、リモート操作中は第 1 段の `get_settings` と同じく `Busy` で返さない。
+- 別ウィンドウ (F12) を開いていても受け付ける。keymap は App 全体の 1 つで、確定は窓の OK と同じ関数なので、detached の
+  述語・viewport の経路に触れない (Detached リワークの凍結に当たらない)。
+
+### 20.8 IPC と tool 一覧の予算
+
+- `AGENT_PROTOCOL_VERSION` を 6 → 7。`Command` に `GetOperations`・`SetOperations` を足す (追加だけ)。版 6 の凍結 fixture を
+  今回の変更の前の型から作り、版 6 の adapter が新しい field を無視して動くことを検査する (§10 で版 5 に対して行ったのと同じ)。
+- **tool 一覧の上限 `MAX_MCP_DISCOVERY_CHARS` を 48,000 → 52,000 にする** (設計担当の決定)。今の最大は 46,530 / 47,488
+  (余裕 958、§17 の記録) で、2 本 (目標 合わせて 3,400 字以内) が入らない。48,000 は mIV が 2026-11-14 に決めた値で、
+  MCP や Claude Code の制限ではない (親文書 §15.4。client が切り詰めるのは tool 1 本の説明 4,096 字と instructions)。
+  第 1 段の 7 本で既存の説明は削り終えており (§17、契約を削らずに 958 字が限度)、これ以上削ると操作の条件が欠ける。
+  親文書 §15.4 にこの改定と理由を書く。説明 1 本 4,096 字・2,048 字の目標の検査はそのまま。
+- `INSTRUCTIONS` の「If allowed, check get_view_state/get_settings first」に `get_operations` を足す (4,096 字の検査の内)。
+
+### 20.9 公開文書・画面
+
+- 設定画面 (`src/ui_dialogs/agent_integration.rs:282,371`): 「設定の確認と変更」の説明に「キー割り当て・リング・マウスボタン・
+  ジェスチャー」を足し、「キー割り当てなど…まだ変えられません」から外す (ツールバーなど環境設定の外の画面の設定は残す)。
+  文言の変更に合わせて snapshot を目視で更新する。
+- マニュアル `manual/ai-integration.html`: 「設定やお気に入りの変更」(`#settings`) に操作カスタマイズの段落 (キーの競合は
+  画面と同じく警告で止めないこと、リングはゲームパッドの X リングと共用、固定の入力は変えられない)、
+  「AI に見せるもの」の表の設定の行、使い方の例の表に「Ctrl+C で画像をコピーできる?」の例を足す。:268 の「まだ扱えません」から
+  キー割り当てを外す。
+- `privacy.html:174,331`: 渡す情報に「操作カスタマイズの割り当て」を足す。ほかの通信・保存は増えない。
+- 製品ページ `index.html`: 「安心して使えます」と AI 連携の記述を確かめ、「〜だけ」が偽にならないかを見る (実装担当が確認して報告)。
+- 設計文書: この節、`docs/mcp-integration-plan.md` §15.4 (上限)、`docs/keymap-spec.md` (AI から変えられることを 1 行)。
+- 新しい `KeyAction` は足さない (keymap の規則の対象外)。
+
+### 20.10 §1.363 (ブランチ `script-363-impl`) との重なり
+
+2026-11-25 に `G:\home\mimageviewer-script363impl` (HEAD `cd48a44fc`、基点 master `16590597e`) を読んで確かめた。
+
+- `KeyAction::ScriptSlot1..20`、スクリプト用の `RingActionId`、設定 `operation_script_enabled` などを足している
+  (`src/keymap.rs`・`src/ring_shortcut.rs`・`src/settings.rs`・`src/settings_transfer.rs`)。`apply_operation_customize_bundle`・
+  `OperationCustomizeBundle` は変えていない。
+- この段は操作の一覧を `KeyAction::all()`・`RingActionId` の候補の関数から作り、操作ごとの表を持たないので、どちらが先に
+  master に入っても、スクリプト操作は自動で `get_operations` に出て、キー・リングへ割り当てられる。スロットの数・操作の数を
+  テストに直に書かない。
+- 触る可能性のある共有のファイル: `src/keymap.rs` (公開の helper を足す場合)、`src/ring_shortcut.rs` と
+  `src/ui_dialogs/preferences/pages.rs` (`ring_bindings_for_key_action` を共有の場所へ移す)。どちらも追加と移動で、
+  取り込みの衝突は小さい見込み。§1.363 側でキーとリングの対応 (スクリプト操作の対応) を足したら、移した関数に足す。
+- スクリプト操作をイベントから起動する・本文を AI が書く経路は、この段では作らない。
+
+### 20.11 永続データ
+
+書くのは既存の field (`keymap`・`ring_shortcuts`・`gamepad_enabled`) で、形はリリース済みのまま。新しい項目・形の変更は無く、
+移行は要らない。新しい許可も足さない。
+
+### 20.12 実装の区切りとテスト
+
+- **区切り F (中身)**: 新しい module (例 `src/operation_customize_agent.rs`) に、スロットの名前の解釈、行の組み立て、検査と
+  bundle への適用を、App に依存しない純関数で置く。`ring_bindings_for_key_action` を共有の場所へ移す (窓の表示も同じ関数を使う)。
+  テスト: スロットの種類ごとの正常・異常、キーの型の形・4 個・重複・空、未知の操作・見せない操作、正規化で変わる値の拒否、
+  ジェスチャーの並びの往復と重複のまとめ、`before` を渡すと `settings_eq` で元の bundle に戻る往復、競合の抽出。
+- **区切り G (受け口)**: App の handler (許可・受付・変更なし・予算・確定・通知・記録・ログ)、IPC 7 (版 6 の凍結 fixture)、
+  MCP の 2 本、`set_settings` のエラー文、INSTRUCTIONS、予算の上限。テスト:
+  - 状態遷移: 書いた後に `self.keymap` の実効のキーが変わる / 変更なしで保存しない (`save_generation`) / 窓を開くと新しい値が
+    下書きに出る。
+  - 受付: 操作カスタマイズの窓・破棄の確認・環境設定・設定の復元・リモート操作中に拒み、何も変わらない。許可なしで拒む。
+  - 兄弟の不変: AI の変更の後、環境設定を開いて何も変えずに OK しても、キー・リング・`gamepad_enabled`・
+    `video_normal_wheel_action` が戻らない (`overwrite_non_preferences_from` の引き継ぎと 3 者比較を通る)。
+  - IPC の互換、応答の予算、tool 一覧の予算、説明 1 本の字数。
+- **区切り H (画面・文書)**: §20.9。
+- 実装担当は cargo を流さない。ビルド・テストは設計担当が共有 runner で流す (第 1 段と同じ)。
+
+### 20.13 確かめていない点
+
+- 閲覧表示・動画の native の画面を開いたまま キーを変えたとき、次のキーから新しい割り当てで動くこと (窓の OK と同じ関数なので
+  同じになるはず)。
+- tool 一覧・応答の実測の字数。
+- AI アプリが、`key` での引き当てと `conflicts` を使って、空きと競合を正しく説明するか (AI アプリ側の動き)。
+
+### 20.14 統括・利用者への確認事項
+
+- **E1 環境設定の外の画面が持つほかの設定 (ツールバーなど約 170) を、この段 (v5.8.0) に含めるか**: 推奨は「含めない
+  (操作カスタマイズだけで v5.8.0 に出し、残りは第 2 段の後半として別に設計)」。確定の入口が画面ごとに別で、操作カスタマイズと
+  共有する部分が無く、同じ枝に入れると規模と検査の組み合わせが大きくなる。
+- 通常の使い方が不便になる変更・利用者の作ったデータが失われる点: 無い見込み (割り当ての値は応答と記録の変更前の値で戻せる。
+  ジェスチャーの重複のまとめで消えるのは効いていない重複だけ、§20.5)。
