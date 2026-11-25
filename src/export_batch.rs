@@ -19,8 +19,7 @@ use crate::export_dialog::{ExportEvent, ExportFailure, ExportPending, ExportSucc
 use crate::save_with_metadata::{SaveOptions, SrcFormat, ThumbnailNoticeKinds};
 use paths::{OutputReservation, Target};
 
-pub const TEMPLATE_PLACEHOLDER_HINT: &str =
-    "<filename> / <dirname> / <num> / <num:N> / <ext> / <date> / <time> が使えます";
+pub const TEMPLATE_PLACEHOLDER_HINT: &str = "<filename> / <dirname> / <num> / <num:N> / <ext> / <date> / <time> が使えます。拡張子は自動で付きます (<ext> は元の拡張子)";
 
 pub struct BatchExportItem {
     pub filename: String,
@@ -295,7 +294,7 @@ fn run_batch_export_with_decoder(
         Ok(assets) => assets,
         Err(message) => {
             for item in &request.items {
-                log::error!("batch export {}: {message}", item.filename);
+                crate::logger::log(format!("batch export {}: {message}", item.filename));
                 let _ = tx.send(ExportEvent::Failed(ExportFailure {
                     label: item.filename.clone(),
                     message: message.clone(),
@@ -480,11 +479,11 @@ fn run_batch_export_with_decoder(
                     path: path.clone(),
                 }));
                 if !kinds.is_empty() {
-                    log::warn!(
+                    crate::logger::log(format!(
                         "batch export thumbnail metadata: {}: {:?}",
                         path.display(),
                         kinds
-                    );
+                    ));
                     let _ = tx.send(ExportEvent::ThumbnailNotice { label, path, kinds });
                 }
                 if replaced { "replaced" } else { "written" }
@@ -494,7 +493,7 @@ fn run_batch_export_with_decoder(
                     let _ = tx.send(ExportEvent::Cancelled);
                     return;
                 }
-                log::error!("batch export {label}: {message}");
+                crate::logger::log(format!("batch export {label}: {message}"));
                 let _ = tx.send(ExportEvent::Failed(ExportFailure { label, message }));
                 "failed"
             }

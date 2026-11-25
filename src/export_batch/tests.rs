@@ -1353,6 +1353,121 @@ fn png_with_text(path: &Path, payload: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn batch_export_failures_and_thumbnail_warnings_reach_normal_log() {
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "export_batch::tests::batch_export_normal_log_sink_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("MIV_BATCH_EXPORT_LOG_TEST_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated batch export log test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[ignore = "isolated helper invoked by batch_export_failures_and_thumbnail_warnings_reach_normal_log"]
+fn batch_export_normal_log_sink_child() {
+    assert_eq!(
+        std::env::var("MIV_BATCH_EXPORT_LOG_TEST_CHILD").unwrap(),
+        "1"
+    );
+    let temp = tempfile::tempdir().unwrap();
+    assert!(
+        crate::data_dir::DATA_DIR
+            .set(temp.path().to_owned())
+            .is_ok()
+    );
+    // Initialize the product facade filter and asynchronous writer in isolation.
+    crate::logger::init();
+
+    let source = temp.path().join("source.jpg");
+    image::RgbImage::from_pixel(2, 2, image::Rgb([50, 60, 70]))
+        .save(&source)
+        .unwrap();
+    let mut jpeg = std::fs::read(&source).unwrap();
+    let xmp = b"http://ns.adobe.com/xap/1.0/\0<rdf xmlns:xmpGImg=\"http://ns.adobe.com/xap/1.0/g/img/\"/>";
+    let mut app1 = vec![0xff, 0xe1];
+    app1.extend_from_slice(&((xmp.len() + 2) as u16).to_be_bytes());
+    app1.extend_from_slice(xmp);
+    jpeg.splice(2..2, app1);
+    std::fs::write(&source, jpeg).unwrap();
+
+    let mut opts = options(&temp.path().join("out"));
+    opts.format.kind = BatchFormatKind::SameAsSource;
+    opts.keep_metadata = true;
+    let pending = spawn_batch_export_worker(BatchExportRequest {
+        options: opts,
+        items: vec![
+            file_item(&temp.path().join("missing.jpg"), "missing-source"),
+            file_item(&source, "thumbnail"),
+        ],
+        raw: None,
+        local_ai_activity: crate::app::LocalAiActivityLease::new(Arc::new(
+            std::sync::atomic::AtomicUsize::new(0),
+        )),
+    })
+    .unwrap();
+    let mut events = Vec::new();
+    loop {
+        let event = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let done = matches!(event, ExportEvent::AllDone);
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    let failure = events
+        .iter()
+        .find_map(|event| match event {
+            ExportEvent::Failed(failure) if failure.label == "missing-source" => Some(failure),
+            _ => None,
+        })
+        .expect("the missing source must fail");
+    let warning_path = events
+        .iter()
+        .find_map(|event| match event {
+            ExportEvent::ThumbnailNotice { label, path, kinds }
+                if label == "thumbnail" && kinds.xmp =>
+            {
+                Some(path)
+            }
+            _ => None,
+        })
+        .expect("the copied JPEG XMP must produce a thumbnail warning");
+    assert_eq!(completed_paths(&events), vec![warning_path.clone()]);
+
+    // flush() only requests delivery; shutdown waits for the real writer to drain.
+    assert!(crate::log_writer::shutdown_until(
+        Instant::now() + std::time::Duration::from_secs(5)
+    ));
+    let text = std::fs::read_to_string(temp.path().join("logs/mimageviewer.log")).unwrap();
+    let failure_line = format!("batch export {}: {}", failure.label, failure.message);
+    let warning_line = format!(
+        "batch export thumbnail metadata: {}:",
+        warning_path.display()
+    );
+    assert!(
+        text.lines().any(|line| line.contains(&failure_line)),
+        "batch export failure did not reach normal log:\n{text}"
+    );
+    assert!(
+        text.lines().any(|line| line.contains(&warning_line)),
+        "batch export thumbnail warning did not reach normal log:\n{text}"
+    );
+}
+
+#[test]
 fn thumbnail_notice_follows_completed_only_for_copied_metadata() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source.png");
