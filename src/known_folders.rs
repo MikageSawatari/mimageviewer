@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 
 use crate::settings::{Settings, StartupFolderMode};
 
+pub const CAPTURE_DESTINATION_NOT_FOUND: &str =
+    "保存先はまだありません。最初の保存時に作成します。";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QuickLocation {
     pub label: &'static str,
