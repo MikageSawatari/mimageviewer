@@ -1,6 +1,6 @@
 # §1.895 AI 連携の登録先を直す (Claude Desktop のパッケージ版・バックアップ・注記・ChatGPT の設定)
 
-状態: 設計の独立レビュー r3 ACCEPT (§7 の実機確認待ちを前提)、実装中 (2026-11-25)。担当: 設計・検収 ClaudeCode Opus 5.5、実装 Codex GPT-6.1 Sol / high。
+状態: 設計の独立レビュー r3 ACCEPT、サブ PC の確認で §3.1 の規則を確認済み (§1・§7)、実装中 (2026-11-25)。担当: 設計・検収 ClaudeCode Opus 5.5、実装 Codex GPT-6.1 Sol / high。
 ブランチ `agent-reg-895` (master `a57f23522` から)。正本の登録の設計は [mcp-integration-plan.md](mcp-integration-plan.md) の
 「AI アプリごとの行」の節で、本書はその変更点だけを書く。実装後に正本の該当の行を本書に合わせて直す。
 
@@ -19,9 +19,19 @@
 | ChatGPT のデスクトップアプリの `codex://` の公式一覧に MCP の一覧を開くリンクは無い。`codex://settings` は設定の最初のページを開く | 設計担当が 2026-11-25 に learn.chatgpt.com の commands / settings を読んだ |
 | `codex://settings` はアカウントのページを開き、MCP の一覧ではなかった | サブ PC 担当 (2026-11-25) |
 
-**サブ PC での確認を依頼中** (統括経由、2026-11-25)。確認する内容: Claude の「設定を編集」が開くファイル、
-Claude-Data 側に書いたときに一覧と tool に出るか、LocalCache 側を Claude が触るか、サブ PC1 の版、ChatGPT の MCP の一覧のメニュー名。
-§3.1 の規則は、この確認の結果で確定する (§7)。
+**サブ PC での確認の結果** (サブ PC 担当、2026-11-25 21:58〜22:10、サブ PC2、Claude Desktop 6.28899.6 のパッケージ版。
+記録は `C:\home\mimageviewer-subpc\agentreg895\results\notes.md`):
+
+| 事実 | 出どころ |
+| --- | --- |
+| Claude が MCP サーバーを読むのは Claude-Data 側。mIV が LocalCache 側に書いた項目と同じものを Claude-Data 側に足すと、起動後すぐ「ローカル MCP サーバー」に「mimageviewer 実行中」と出て、新しいチャットで mIV の tool が使えた (main.log `Connected to mimageviewer (27 tools)`) | サブ PC 担当 |
+| Claude は足した mcpServers を消さず、ファイルを書き直さなかった。LocalCache 側のファイルには一度も触れなかった (SHA-256 と更新時刻が同じ) | 同上 |
+| 今の版でも LocalCache\Roaming\Claude のフォルダは在る (Claude が `.user-data-left.<package>` を置く。main.log に「Filesystem virtualization active — …LocalCache\Roaming\Claude exists」)。よって今の版では両方のフォルダが在り、Claude-Data 側を取る規則で正しい | 同上 |
+| 設定の左に「開発者」は無い。MCP の一覧は 設定 →「デスクトップアプリ」→ 一番下の「拡張機能」の「管理」→「ローカル MCP サーバー」で、そこの「設定を編集」は Explorer で Claude-Data 側のファイルを開く | 同上 |
+| 5 月のログではデータの置き場が `%APPDATA%\Claude` (パッケージ版では仮想化で LocalCache)。1.6608.1 (11-22) から 6.x への更新の間に Claude-Data へ移った見込み (推測) | 同上 |
+| サブ PC (1 台目) の Claude Desktop は 7.37095.0.0 のパッケージ版で、Claude-Data が在る | 同上 |
+| ChatGPT: `codex://settings` の最初のページは「アカウント」。MCP の一覧は 設定 →「連携」→「プラグイン」→ タブ「MCP」 | 同上 |
+| `%LOCALAPPDATA%\Claude-3p` は在るが空 | 同上 |
 
 ## 2. 直すこと
 
@@ -41,7 +51,7 @@ Claude-Data 側に書いたときに一覧と tool に出るか、LocalCache 側
 
 ## 3. 設計
 
-### 3.1 Claude Desktop の登録先の決め方 (サブ PC の確認待ち)
+### 3.1 Claude Desktop の登録先の決め方
 
 検出は今と同じく worker で行う。パッケージ版の 1 つの package (`Packages\Claude_<id>`) について、次の順で 1 つの設定ファイルを決める。
 
@@ -92,9 +102,11 @@ ChatGPT (Codex) の登録先 (`CODEX_HOME` / `.codex`) も同じ関数の形で�
 ### 3.2 「手順を見る」の案内
 
 - パスは今と同じく `config_paths` (= §3.1 で決めた 1 つ) を出す。自動登録できない場合 (どちらも無い・複数) は候補を並べる。
-- Claude Desktop の案内文を、版に依らない入口へ向ける: Claude の 設定 → 開発者 → 「設定を編集」で開くファイルが、Claude が
-  読むファイル。mIV が出すパスと違う場合は Claude が開いた方に書く。(メニュー名はサブ PC の確認で確定する。)
-- ChatGPT の案内文のメニュー名も、サブ PC の確認の結果に合わせる (今は "Settings > MCP servers > Add server > STDIO")。
+- Claude Desktop の案内文を、版に依らない入口へ向ける: Claude の 設定 →「デスクトップアプリ」→「拡張機能」の「管理」→
+  「ローカル MCP サーバー」の「設定を編集」で開くファイルが、Claude が読むファイル (§1)。mIV が出すパスと違う場合は Claude が
+  開いた方に書く。
+- ChatGPT の案内文: 設定 →「連携」→「プラグイン」の「MCP」のタブでサーバーを追加し (STDIO)、再起動する (§1。今の
+  "Settings > MCP servers > Add server > STDIO" を置き換える)。
 
 ### 3.3 登録・解除の後の注記
 
@@ -138,8 +150,8 @@ ChatGPT (Codex) の登録先 (`CODEX_HOME` / `.codex`) も同じ関数の形で�
 
 ### 3.5 ChatGPT (Codex) の「設定を開く」
 
-公式に MCP の一覧を開くリンクは無い。ボタンは残し (設定を開くこと自体は役に立つ)、押したときの行の下の注記と
-「手順を見る」に、開いた後に MCP の一覧へ行くメニュー名を書く (メニュー名はサブ PC の確認で確定する)。
+公式に MCP の一覧を開くリンクは無い。ボタンは残し (設定を開くこと自体は役に立つ)、開けたときは行の下の注記に
+「設定が開いたら、左の「連携」→「プラグイン」→「MCP」のタブを選んでください」を出す。「手順を見る」にも同じメニュー名を書く (§3.2)。
 `codex://settings/...` の文書にない経路は使わない。
 
 ## 4. 状態の組み合わせを減らす検討 (CLAUDE.md の設計の簡素化)
@@ -176,12 +188,14 @@ ChatGPT (Codex) の登録先 (`CODEX_HOME` / `.codex`) も同じ関数の形で�
 - LocalCache 側を選んだ検出 (書き込みなし・既に登録済み) で、行の `message` に再確認の案内が入る。Claude-Data 側・Squirrel 版では入らない。
 - 既存の `agent_registration::tests`・`ui_dialogs::agent_integration::tests`・AI 連携の窓の ui_snapshot。
 
-## 7. 未決 (サブ PC の確認の結果で決める)
+## 7. 未決 (サブ PC の確認で解決)
 
-- §3.1 の表が正しいか (Claude-Data 側に書いて一覧と tool に出るか。今の版が LocalCache 側を作るか。今の版が初回の起動で
-  LocalCache 側の mcpServers を引き継ぐか: 引き継ぐなら §3.1 の残る場合は無くなる)。
-- Claude の「設定を編集」のメニュー名と、開くファイル。
-- ChatGPT の MCP の一覧のメニュー名。
+- §3.1 の表: Claude-Data 側に書いて一覧と tool に出ることを確かめた (§1)。今の版は LocalCache 側のフォルダも作るので、
+  両方在るときに Claude-Data 側を取る規則が要る (規則どおり)。
+- 今の版が初回の起動で LocalCache 側の mcpServers を引き継ぐかは確かめていない (新しく入れ直す確認になるため)。§3.1 の
+  「残る場合」と再確認の案内はそのまま残す。
+- メニュー名: Claude は 設定 →「デスクトップアプリ」→「拡張機能」の「管理」→「ローカル MCP サーバー」→「設定を編集」。ChatGPT は
+  設定 →「連携」→「プラグイン」→ タブ「MCP」。§3.2・§3.5 の文に使う。
 
 ## 8. 記録
 </content>
