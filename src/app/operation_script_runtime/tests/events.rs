@@ -1,6 +1,4 @@
-//! No application/viewport is launched. The identity collector below is a fixture
-//! adapter, not the future adopted-location publication boundary.
-
+//! r11 event identity, main-only ownership, validation and synchronous execution.
 use super::super::events::{EventAdmission, EventIdentity};
 use super::*;
 use crate::operation_script::{ALLOWED_OPERATIONS, ScriptEvent};
@@ -14,51 +12,82 @@ fn event_script(body: &str) -> OperationScriptState {
         .unwrap(),
     ))
 }
-
 fn identity(app: &App, surface: ScriptInputSurface) -> EventIdentity {
-    let location = app.operation_script_location();
-    EventIdentity {
-        location: location.clone(),
-        context: app.script_context(surface),
-        page: (surface == ScriptInputSurface::Viewer).then(|| app.operation_script_page_identity()),
-        selected: app
-            .selected
-            .and_then(|idx| app.items.get(idx))
-            .map(item_identity),
-    }
+    app.collect_operation_script_event_identity(surface)
+}
+fn frame(ctx: &egui::Context, mut f: impl FnMut(&egui::Context)) {
+    ctx.run_pass(egui::RawInput::default(), |ctx| f(ctx))
+        .drop_without_applying_deltas();
 }
 
 #[test]
-fn event_baseline_collects_all_changes_and_records_even_an_unchanged_frame() {
+fn event_r11_faces_reentry_and_select_baseline_survive_viewer_in_observe_and_finish() {
     let mut app = grid_app("[]");
     let mut events = OperationScriptEvents::default();
-    assert!(events.begin_frame(0));
     assert_eq!(
         events.observe(identity(&app, ScriptInputSurface::Grid)),
-        [ScriptEvent::Open, ScriptEvent::Select]
+        [ScriptEvent::View, ScriptEvent::Select]
     );
-    assert!(!events.begin_frame(0));
-    assert!(events.begin_frame(1));
     assert!(
         events
             .observe(identity(&app, ScriptInputSurface::Grid))
             .is_empty()
     );
-    // An unchanged first pass still owns the frame when the context changes.
     app.fullscreen_idx = Some(0);
-    app.viewer_presentation = ViewerPresentation::Fullscreen;
-    assert!(!events.begin_frame(1));
-    assert!(events.begin_frame(2));
     assert_eq!(
         events.observe(identity(&app, ScriptInputSurface::Viewer)),
-        [ScriptEvent::View, ScriptEvent::Page]
+        [ScriptEvent::Open, ScriptEvent::View, ScriptEvent::Page]
     );
-    app.current_folder = Some(app.tmp.path().join("next-book"));
-    app.items[0] = GridItem::Image(app.current_folder.as_ref().unwrap().join("same.jpg"));
-    assert!(events.begin_frame(3));
+    app.selected = Some(1);
+    events.finish_event(identity(&app, ScriptInputSurface::Viewer));
+    assert_eq!(
+        events.observe(identity(&app, ScriptInputSurface::Grid)),
+        [ScriptEvent::View, ScriptEvent::Select]
+    );
+    // Even finish_event on a grid clears open/page and updates its cursor baseline.
+    events.finish_event(identity(&app, ScriptInputSurface::Grid));
     assert_eq!(
         events.observe(identity(&app, ScriptInputSurface::Viewer)),
-        [ScriptEvent::Open, ScriptEvent::Page]
+        [ScriptEvent::Open, ScriptEvent::View, ScriptEvent::Page]
+    );
+    assert_eq!(
+        events.observe(identity(&app, ScriptInputSurface::Grid)),
+        [ScriptEvent::View]
+    );
+    app.selected = None;
+    assert_eq!(
+        events.observe(identity(&app, ScriptInputSurface::Grid)),
+        [ScriptEvent::Select]
+    );
+    let folder = app.current_folder.clone();
+    app.current_folder = Some(app.tmp.path().join("empty-elsewhere"));
+    assert!(
+        events
+            .observe(identity(&app, ScriptInputSurface::Grid))
+            .is_empty()
+    );
+    app.current_folder = folder;
+    assert!(
+        events
+            .observe(identity(&app, ScriptInputSurface::Grid))
+            .is_empty()
+    );
+}
+
+#[test]
+fn event_initial_empty_grid_has_only_view_and_location_changes_do_not_select() {
+    let mut app = grid_app("[]");
+    app.selected = None;
+    let mut events = OperationScriptEvents::default();
+    assert_eq!(
+        events.observe(identity(&app, ScriptInputSurface::Grid)),
+        [ScriptEvent::View]
+    );
+    app.current_folder = Some(app.tmp.path().join("elsewhere"));
+    assert!(
+        events
+            .observe(identity(&app, ScriptInputSurface::Grid))
+            .is_empty()
     );
 }
 
@@ -70,314 +99,565 @@ fn event_view_changes_grid_image_video_and_audio_shares_video_context() {
     app.fullscreen_idx = Some(0);
     assert_eq!(
         events.observe(identity(&app, ScriptInputSurface::Viewer)),
-        [ScriptEvent::View, ScriptEvent::Page]
+        [ScriptEvent::Open, ScriptEvent::View, ScriptEvent::Page]
     );
-    app.items[0] = GridItem::Video(app.current_folder.as_ref().unwrap().join("clip.mp4"));
+    let folder = app.current_folder.clone().unwrap();
+    app.items[0] = GridItem::Video(folder.join("v.mp4"));
     assert_eq!(
         events.observe(identity(&app, ScriptInputSurface::Viewer)),
         [ScriptEvent::View, ScriptEvent::Page]
     );
-    app.items[0] = GridItem::Audio(app.current_folder.as_ref().unwrap().join("song.mp3"));
+    app.items[0] = GridItem::Audio(folder.join("a.mp3"));
     assert_eq!(
         events.observe(identity(&app, ScriptInputSurface::Viewer)),
         [ScriptEvent::Page]
     );
     assert_eq!(
         events.observe(identity(&app, ScriptInputSurface::Grid)),
-        [ScriptEvent::View]
+        [ScriptEvent::View, ScriptEvent::Select]
     );
 }
 
 #[test]
-fn event_book_recipe_retains_logical_open_until_adoption_and_same_place_reload_is_quiet() {
-    use crate::app::book_materialization::{BookScope, ProjectionRecipe};
+fn event_r11_container_is_item_only_for_folders_pdf_epub_nested_and_converted_zip() {
     let mut app = grid_app("[]");
-    let old = app.tmp.path().join("accepted.zip");
-    let new = app.tmp.path().join("enumerating.zip");
-    app.projection_recipe = ProjectionRecipe::Book(BookScope::Archive {
-        logical_root: old,
-        prefix: vec!["chapter".into()],
-    });
-    let mut events = OperationScriptEvents::default();
-    events.observe(identity(&app, ScriptInputSurface::Grid));
-    app.current_folder = Some(new.clone());
-    assert!(
-        events
-            .observe(identity(&app, ScriptInputSurface::Grid))
-            .is_empty()
-    );
-    app.projection_recipe = ProjectionRecipe::Book(BookScope::Archive {
-        logical_root: new,
-        prefix: vec!["chapter".into()],
-    });
-    assert_eq!(
-        events.observe(identity(&app, ScriptInputSurface::Grid)),
-        [ScriptEvent::Open, ScriptEvent::Select]
-    );
-    app.items_generation += 1;
-    assert!(
-        events
-            .observe(identity(&app, ScriptInputSurface::Grid))
-            .is_empty()
-    );
+    app.fullscreen_idx = Some(0);
+    let root = app.tmp.path().to_path_buf();
+    let zip = root.join("cache.zip");
+    let pdf = root.join("book.pdf");
+    let epub = root.join("original.epub");
+    let cases = vec![
+        (
+            GridItem::Image(root.join("folder/a.jpg")),
+            root.join("folder"),
+            "folder",
+        ),
+        (
+            GridItem::Video(root.join("other/v.mp4")),
+            root.join("other"),
+            "folder",
+        ),
+        (
+            GridItem::Audio(root.join("other/a.mp3")),
+            root.join("other"),
+            "folder",
+        ),
+        (
+            GridItem::PdfPage {
+                pdf_path: pdf.clone(),
+                page_num: 4,
+                content_type: None,
+            },
+            pdf,
+            "pdf",
+        ),
+        (
+            GridItem::PdfPage {
+                pdf_path: epub.clone(),
+                page_num: 5,
+                content_type: None,
+            },
+            epub,
+            "epub",
+        ),
+        (
+            GridItem::ZipImage {
+                zip_path: zip.clone(),
+                entry_name: "chapter/a.jpg".into(),
+            },
+            zip.clone(),
+            "zip",
+        ),
+        (
+            GridItem::ZipImage {
+                zip_path: zip.clone(),
+                entry_name: "dir/inner.zip/chapter/a.jpg".into(),
+            },
+            zip.join("dir/inner.zip"),
+            "zip",
+        ),
+        (
+            GridItem::ZipImage {
+                zip_path: zip.clone(),
+                entry_name: "dir/inner.zip/sub/next.cbz/chapter/a.jpg".into(),
+            },
+            zip.join("dir/inner.zip/sub/next.cbz"),
+            "zip",
+        ),
+    ];
+    for (item, expected, kind) in cases {
+        app.items[0] = item;
+        // Unrelated/mid-load source state must never change the item container.
+        app.current_folder = Some(root.join("pending.zip"));
+        app.archive_source_override = Some(root.join("source.rar"));
+        let snapshot = app.collect_operation_script_snapshot(ScriptInputSurface::Viewer);
+        assert_eq!(snapshot.book.path.as_deref(), expected.to_str());
+        assert_eq!(snapshot.book.kind.as_deref(), Some(kind));
+        assert_eq!(
+            identity(&app, ScriptInputSurface::Viewer)
+                .container
+                .unwrap()
+                .path,
+            expected
+        );
+        app.current_folder = None;
+        assert_eq!(
+            app.collect_operation_script_snapshot(ScriptInputSurface::Viewer)
+                .book
+                .path,
+            snapshot.book.path
+        );
+    }
 }
 
 #[test]
-fn event_baseline_uses_typed_pdf_zip_halves_and_location_not_index_or_generation() {
+fn event_nonviewer_row_variants_have_no_fabricated_book_container() {
     let mut app = grid_app("[]");
-    let mut events = OperationScriptEvents::default();
-    let pdf = app.tmp.path().join("book.pdf");
-    app.items = vec![
-        GridItem::PdfPage {
-            pdf_path: pdf.clone(),
-            page_num: 0,
-            content_type: None,
+    app.fullscreen_idx = Some(0);
+    let path = app.tmp.path().join("container");
+    let cases = vec![
+        GridItem::Folder(path.clone()),
+        GridItem::ZipFile(path.clone()),
+        GridItem::PdfFile(path.clone()),
+        GridItem::ConvertibleArchive {
+            path: path.clone(),
+            format: crate::archive_converter::ArchiveFormat::Rar,
         },
-        GridItem::PdfPage {
-            pdf_path: pdf,
-            page_num: 1,
-            content_type: None,
+        GridItem::ZipDir {
+            zip_path: path.clone(),
+            dir_prefix: "chapter/".into(),
+            is_archive: false,
+            representative: None,
+        },
+        GridItem::Stack {
+            key: "stack".into(),
+            representative: path.clone(),
+            count: 2,
+        },
+        GridItem::SearchContainer {
+            path: path.clone(),
+            kind: crate::grid_item::SearchContainerKind::Folder,
+            hit_count: 1,
+            representative: None,
+        },
+        GridItem::CollectionPlaceholder {
+            path,
+            last_known_kind: crate::collection_store::CollectionResolvedKind::Image,
+            reason: crate::grid_item::CollectionPlaceholderReason::Missing,
         },
     ];
+    for item in cases {
+        app.items[0] = item;
+        assert!(
+            identity(&app, ScriptInputSurface::Viewer)
+                .container
+                .is_none()
+        );
+        let snapshot = app.collect_operation_script_snapshot(ScriptInputSurface::Viewer);
+        assert!(snapshot.book.path.is_none());
+        assert!(snapshot.book.kind.is_none());
+    }
+}
+
+#[test]
+fn event_r11_open_ignores_zip_subfolders_and_pending_source_but_follows_item_containers() {
+    let mut app = grid_app("[]");
     app.fullscreen_idx = Some(0);
+    let root = app.tmp.path().to_path_buf();
+    let mut events = OperationScriptEvents::default();
+    for (index, entry) in [
+        "a/one.jpg",
+        "b/two.jpg",
+        "inside.zip/a.jpg",
+        "inside.zip/deep/b.jpg",
+    ]
+    .iter()
+    .enumerate()
+    {
+        app.items[0] = GridItem::ZipImage {
+            zip_path: root.join("outer.zip"),
+            entry_name: (*entry).into(),
+        };
+        let changed = events.observe(identity(&app, ScriptInputSurface::Viewer));
+        assert_eq!(
+            changed.contains(&ScriptEvent::Open),
+            index == 0 || index == 2
+        );
+        app.current_folder = Some(root.join("enumerating-other.zip"));
+        assert!(
+            events
+                .observe(identity(&app, ScriptInputSurface::Viewer))
+                .is_empty()
+        );
+    }
+    app.items[0] = GridItem::ZipImage {
+        zip_path: root.join("replacement-cache.zip"),
+        entry_name: "page.jpg".into(),
+    };
+    assert_eq!(
+        events.observe(identity(&app, ScriptInputSurface::Viewer)),
+        [ScriptEvent::Open, ScriptEvent::Page]
+    );
+    // Search/collection/direct-media provenance does not substitute the list's location.
+    for folder in ["search-parent", "collection-parent", "direct-parent"] {
+        app.items[0] = GridItem::Image(root.join(folder).join("a.jpg"));
+        assert_eq!(
+            events.observe(identity(&app, ScriptInputSurface::Viewer)),
+            [ScriptEvent::Open, ScriptEvent::Page]
+        );
+    }
+}
+
+#[test]
+fn event_nested_container_appends_literal_entry_without_host_path_replacement() {
+    let mut app = grid_app("[]");
+    app.fullscreen_idx = Some(0);
+    let outer = app.tmp.path().join("outer.zip");
+    for prefix in ["/inner.zip", "C:/inner.zip", "//server/share/inner.zip"] {
+        app.items[0] = GridItem::ZipImage {
+            zip_path: outer.clone(),
+            entry_name: format!("{prefix}/page.jpg"),
+        };
+        let expected = format!("{}/{prefix}", outer.to_string_lossy());
+        let snapshot = app.collect_operation_script_snapshot(ScriptInputSurface::Viewer);
+        assert_eq!(snapshot.book.path.as_deref(), Some(expected.as_str()));
+        assert!(
+            snapshot
+                .book
+                .path
+                .unwrap()
+                .starts_with(outer.to_string_lossy().as_ref())
+        );
+    }
+}
+
+#[test]
+fn event_and_slot_invocations_publish_the_same_item_container_book_path() {
+    let mut app = grid_app("[]");
+    app.fullscreen_idx = Some(0);
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    let outer = app.tmp.path().join("converted-cache.zip");
+    app.items[0] = GridItem::ZipImage {
+        zip_path: outer.clone(),
+        entry_name: "nested.zip/sub/page.png".into(),
+    };
+    let expected = format!("{}/nested.zip", outer.to_string_lossy());
+    app.operation_script.state = OperationScriptState::Ready(Box::new(
+        CompiledOperationScript::compile(
+            r#"fn slots() { [#{slot:1,label:"container",run:"entry"}] }
+        fn entry(s) { #{run:[],notice:s.book.path} }
+        fn on_event(s) { #{run:[],notice:s.book.path} }"#,
+        )
+        .unwrap(),
+    ));
+    let ctx = egui::Context::default();
+    assert!(
+        !app.run_script_slot(&ctx, 1, ScriptInputSurface::Viewer, false)
+            .rejected()
+    );
+    assert_eq!(toast(&app), expected);
+    app.fs_feedback_toast = None;
+    app.detect_operation_script_events(&ctx, ScriptInputSurface::Viewer);
+    assert_eq!(toast(&app), expected);
+}
+
+#[test]
+fn event_r11_pdf_pages_halves_and_unit_scalars_fire_but_reader_order_does_not() {
+    let mut app = grid_app("[]");
+    let path = app.tmp.path().join("book.pdf");
+    app.items = (0..2)
+        .map(|page_num| GridItem::PdfPage {
+            pdf_path: path.clone(),
+            page_num,
+            content_type: None,
+        })
+        .collect();
+    app.fullscreen_idx = Some(0);
+    let mut events = OperationScriptEvents::default();
     events.observe(identity(&app, ScriptInputSurface::Viewer));
     app.fullscreen_idx = Some(1);
     assert_eq!(
         events.observe(identity(&app, ScriptInputSurface::Viewer)),
         [ScriptEvent::Page]
     );
-    app.fullscreen_page_slice = crate::page_split::PageSlice::Left;
-    assert_eq!(
-        events.observe(identity(&app, ScriptInputSurface::Viewer)),
-        [ScriptEvent::Page]
-    );
-    app.fullscreen_page_slice = crate::page_split::PageSlice::Right;
-    assert_eq!(
-        events.observe(identity(&app, ScriptInputSurface::Viewer)),
-        [ScriptEvent::Page]
-    );
-    app.items.swap(0, 1);
-    app.visible_indices = vec![1, 0];
-    app.fullscreen_idx = Some(0);
+    for slice in [
+        crate::page_split::PageSlice::Left,
+        crate::page_split::PageSlice::Right,
+    ] {
+        app.fullscreen_page_slice = slice;
+        assert_eq!(
+            events.observe(identity(&app, ScriptInputSurface::Viewer)),
+            [ScriptEvent::Page]
+        );
+    }
+    app.visible_indices.reverse();
     app.items_generation += 1;
     assert!(
         events
             .observe(identity(&app, ScriptInputSurface::Viewer))
             .is_empty()
     );
-    let zip = app.tmp.path().join("book.zip");
-    for entry in ["a/page.jpg", "b/page.jpg"] {
-        app.items[0] = GridItem::ZipImage {
-            zip_path: zip.clone(),
-            entry_name: entry.into(),
-        };
-        assert_eq!(
-            events.observe(identity(&app, ScriptInputSurface::Viewer)),
-            [ScriptEvent::Page]
-        );
-    }
+    app.items.push(GridItem::PdfPage {
+        pdf_path: path,
+        page_num: 2,
+        content_type: None,
+    });
+    assert_eq!(
+        events.observe(identity(&app, ScriptInputSurface::Viewer)),
+        [ScriptEvent::Page],
+        "automatic item count is still an O(1) unit input"
+    );
+    app.spread_mode = crate::settings::SpreadMode::Rtl;
+    assert_eq!(
+        events.observe(identity(&app, ScriptInputSurface::Viewer)),
+        [ScriptEvent::Page]
+    );
 }
 
 #[test]
-fn event_select_tracks_cursor_location_and_ignores_checks_and_same_place_reload() {
+fn event_composition_strong_arc_memo_semantics_and_equal_republication() {
     let mut app = grid_app("[]");
+    super::page_identity_perf::prepare_rows(&mut app, 4, true);
+    super::page_identity_perf::install_zip_composition(&mut app);
     let mut events = OperationScriptEvents::default();
-    events.observe(identity(&app, ScriptInputSurface::Grid));
-    app.checked.insert(1);
-    app.items_generation += 1;
+    events.observe(identity(&app, ScriptInputSurface::Viewer));
+    let old = Arc::clone(app.retained_composed_projection_input().unwrap());
+    let mut replacement = Arc::new((*old).clone());
+    Arc::make_mut(&mut replacement).token.publication_sequence += 1;
+    Arc::make_mut(&mut replacement).prepared_rotations =
+        Arc::new(std::collections::HashMap::from([(
+            "ignored-geometry".into(),
+            crate::rotation_db::Rotation::Cw90,
+        )]));
+    app.install_composition_for_test(Arc::clone(&replacement));
     assert!(
         events
-            .observe(identity(&app, ScriptInputSurface::Grid))
+            .observe(identity(&app, ScriptInputSurface::Viewer))
             .is_empty()
     );
-    app.selected = Some(1);
     assert_eq!(
-        events.observe(identity(&app, ScriptInputSurface::Grid)),
-        [ScriptEvent::Select]
+        Arc::strong_count(&old),
+        1,
+        "equal comparison adopted the new strong Arc"
     );
-    app.selected = None;
     assert_eq!(
-        events.observe(identity(&app, ScriptInputSurface::Grid)),
-        [ScriptEvent::Select]
+        Arc::strong_count(&replacement),
+        3,
+        "caller + App + event baseline"
     );
-    app.selected = Some(1);
-    events.observe(identity(&app, ScriptInputSurface::Grid));
-    let first = app.current_folder.clone();
-    app.current_folder = Some(app.tmp.path().join("different-location"));
-    assert_eq!(
-        events.observe(identity(&app, ScriptInputSurface::Grid)),
-        [ScriptEvent::Open, ScriptEvent::Select]
-    );
-    app.current_folder = first;
-    assert_eq!(
-        events.observe(identity(&app, ScriptInputSurface::Grid)),
-        [ScriptEvent::Open, ScriptEvent::Select]
-    );
-}
-
-#[test]
-fn event_empty_grid_select_keeps_location_but_initial_empty_has_only_open() {
-    let mut app = grid_app("[]");
-    let mut events = OperationScriptEvents::default();
-    app.selected = None;
-    assert_eq!(
-        events.observe(identity(&app, ScriptInputSurface::Grid)),
-        [ScriptEvent::Open]
-    );
-    app.current_folder = Some(app.tmp.path().join("another-empty-place"));
-    assert_eq!(
-        events.observe(identity(&app, ScriptInputSurface::Grid)),
-        [ScriptEvent::Open, ScriptEvent::Select]
-    );
-}
-
-#[test]
-fn event_logical_location_ratings_and_collections_are_distinct_and_reload_is_not_open() {
-    let app = grid_app("[]");
-    let mut current = identity(&app, ScriptInputSurface::Grid);
-    let mut events = OperationScriptEvents::default();
-    current.selected = None;
-    current.location = ScriptLocation::Rating(1);
-    assert_eq!(events.observe(current.clone()), [ScriptEvent::Open]);
-    assert!(events.observe(current.clone()).is_empty());
-    current.location = ScriptLocation::Rating(2);
-    assert_eq!(
-        events.observe(current.clone()),
-        [ScriptEvent::Open, ScriptEvent::Select]
-    );
-    // The identity type preserves a collection's visit-independent logical ID.
-    for collection in [
-        uuid::Uuid::from_u128(363_401),
-        uuid::Uuid::from_u128(363_402),
-    ] {
-        current.location = ScriptLocation::Collection {
-            id: super::super::super::top_level_grid_view::CollectionGridIdentity {
-                collection_id: crate::collection_store::CollectionId::from_uuid(collection),
-            },
-            child: None,
-            prefix: Vec::new(),
-        };
-        assert_eq!(
-            events.observe(current.clone()),
-            [ScriptEvent::Open, ScriptEvent::Select]
-        );
-        assert!(events.observe(current.clone()).is_empty());
-    }
-}
-
-#[test]
-fn event_unmarked_direction_and_animation_actions_really_change_page_identity() {
-    let mut app = grid_app("[]");
-    app.fullscreen_idx = Some(0);
-    app.viewer_presentation = ViewerPresentation::Fullscreen;
-    app.spread_mode = crate::settings::SpreadMode::Single;
-    let ctx = egui::Context::default();
-    for action in [
-        KeyAction::FsReadingDirectionToggle,
-        KeyAction::FsPageTurnAnimationToggle,
-    ] {
-        let before = identity(&app, ScriptInputSurface::Viewer);
-        let (_, rejected, _) = app.execute_fullscreen_script_action(&ctx, action);
-        assert!(!rejected, "{action:?}");
-        assert_ne!(
-            identity(&app, ScriptInputSurface::Viewer),
-            before,
-            "{action:?}"
-        );
-    }
-}
-
-#[test]
-fn event_unmarked_fit_cycle_reenables_split_after_free_rotation() {
-    let mut app = grid_app("[]");
-    app.fullscreen_idx = Some(0);
-    app.viewer_presentation = ViewerPresentation::Fullscreen;
-    app.spread_mode = crate::settings::SpreadMode::SplitLtr;
-    app.fs_free_rotation = 15.0;
-    assert!(app.split_direction_now().is_none());
-    let before = identity(&app, ScriptInputSurface::Viewer);
-    let (_, rejected, _) =
-        app.execute_fullscreen_script_action(&egui::Context::default(), KeyAction::FsFitModeCycle);
-    assert!(!rejected);
-    assert!(app.split_direction_now().is_some());
-    assert_ne!(identity(&app, ScriptInputSurface::Viewer), before);
-}
-
-#[test]
-fn event_unmarked_background_and_analysis_pixel_grid_can_resolve_pairing_origin() {
-    use crate::app::spread_shift_owner::ViewerShift;
-    use crate::spread_shift::{
-        ShiftPersistence, ShiftResolution, SpreadShiftPageRef, SpreadShiftState,
-    };
-    let mut app = grid_app("[]");
-    app.fullscreen_idx = Some(0);
-    app.viewer_presentation = ViewerPresentation::Fullscreen;
-    app.spread_mode = crate::settings::SpreadMode::Ltr;
-    app.ai_upscale_enabled = false;
-    app.page_identity_index = Arc::new(
-        crate::app::file_type_resume::PreparedPageIdentityIndex::prepare(
-            &app.items,
-            None,
-            app.settings.file_type_visibility.clone(),
-        ),
-    );
-    let ctx = egui::Context::default();
-    for action in [KeyAction::FsBgCycle, KeyAction::FsPixelGrid] {
-        app.spread_shift = Default::default();
-        app.spread_shift.scope = Some(
-            crate::book_scope::BookScopeKey::folder(app.current_folder.as_ref().unwrap()).unwrap(),
-        );
-        // A previously filtered-out anchor becomes visible before the next owner
-        // resolves it. Ordinary adoption invalidates the nav cache, not this ref.
-        app.spread_shift.state = ViewerShift::Book(SpreadShiftState::Adjusted {
-            anchor_ref: SpreadShiftPageRef::RelativePath("b.jpg".into()),
-            resolution: ShiftResolution::NotInView,
-            persistence: ShiftPersistence::SessionOnly,
-        });
-        app.viewer_navigation_caches.invalidate();
-        app.analysis_mode = action == KeyAction::FsPixelGrid;
-        assert_eq!(app.spread_shift.anchor_idx(), None);
-        let before = identity(&app, ScriptInputSurface::Viewer);
-        let (_, rejected, _) = app.execute_fullscreen_script_action(&ctx, action);
-        assert!(!rejected, "{action:?}");
-        assert_eq!(app.spread_shift.anchor_idx(), Some(1), "{action:?}");
-        assert_ne!(
-            identity(&app, ScriptInputSurface::Viewer),
-            before,
-            "{action:?}"
-        );
-    }
-}
-
-#[test]
-fn event_script_resnapshot_suppresses_sync_changes_but_input_changes_fire_next_frame() {
-    let mut app = grid_app(r#"["GridMoveLast"]"#);
-    let ctx = egui::Context::default();
-    let mut events = OperationScriptEvents::default();
-    events.observe(identity(&app, ScriptInputSurface::Grid));
     assert!(
-        !app.run_script_slot(&ctx, 1, ScriptInputSurface::Grid, false)
-            .rejected()
+        events
+            .observe(identity(&app, ScriptInputSurface::Viewer))
+            .is_empty()
     );
+    assert_eq!(Arc::strong_count(&replacement), 3);
+    let before = Arc::clone(&replacement);
+    Arc::make_mut(&mut replacement).resolved.complete = !replacement.resolved.complete;
+    assert!(
+        !Arc::ptr_eq(&before, &replacement),
+        "baseline strong reference forces copy on write"
+    );
+    app.install_composition_for_test(Arc::clone(&replacement));
     assert_eq!(
-        events.observe(identity(&app, ScriptInputSurface::Grid)),
-        [ScriptEvent::Select]
+        events.observe(identity(&app, ScriptInputSurface::Viewer)),
+        [ScriptEvent::Page]
+    );
+    Arc::make_mut(&mut replacement)
+        .resolved
+        .visible_pages
+        .swap(0, 1);
+    app.install_composition_for_test(Arc::clone(&replacement));
+    assert_eq!(
+        events.observe(identity(&app, ScriptInputSurface::Viewer)),
+        [ScriptEvent::Page]
+    );
+    let idx = replacement.resolved.visible_pages[0].item_index;
+    Arc::make_mut(&mut replacement)
+        .resolved
+        .page_overrides
+        .insert(idx, crate::book_composition::PageOverride::Alone);
+    app.install_composition_for_test(replacement);
+    assert_eq!(
+        events.observe(identity(&app, ScriptInputSurface::Viewer)),
+        [ScriptEvent::Page]
+    );
+    let mut replacement = Arc::clone(app.retained_composed_projection_input().unwrap());
+    Arc::make_mut(&mut replacement).resolved.cover_enabled = !replacement.resolved.cover_enabled;
+    app.install_composition_for_test(Arc::clone(&replacement));
+    assert_eq!(
+        events.observe(identity(&app, ScriptInputSurface::Viewer)),
+        [ScriptEvent::Page]
+    );
+    Arc::make_mut(&mut replacement).resolved.direction =
+        crate::book_composition::ReadingDirection::Rtl;
+    app.install_composition_for_test(replacement);
+    assert_eq!(
+        events.observe(identity(&app, ScriptInputSurface::Viewer)),
+        [ScriptEvent::Page]
+    );
+}
+
+#[test]
+fn event_runtime_grid_executes_before_keys_once_and_inputs_still_change_next_frame() {
+    let mut app = grid_app(r#"["GridMoveLast"]"#);
+    app.operation_script.state = event_script(r#"#{run:["GridColumnCount3"],notice:s.events[0]}"#);
+    let ctx = egui::Context::default();
+    frame(&ctx, |ctx| {
+        app.detect_operation_script_events(ctx, ScriptInputSurface::Grid);
+        assert_eq!(app.settings.grid_cols, 3);
+        assert_eq!(toast(&app), "view");
+        app.settings.grid_cols = 2;
+        app.detect_operation_script_events(ctx, ScriptInputSurface::Grid);
+        assert_eq!(app.settings.grid_cols, 2);
+    });
+    frame(&ctx, |ctx| {
+        app.detect_operation_script_events(ctx, ScriptInputSurface::Grid);
+        assert_eq!(
+            app.settings.grid_cols, 2,
+            "unchanged first pass still owns the frame"
+        );
+        app.selected = Some(1);
+        app.detect_operation_script_events(ctx, ScriptInputSurface::Grid);
+        assert_eq!(app.settings.grid_cols, 2);
+    });
+    frame(&ctx, |ctx| {
+        app.detect_operation_script_events(ctx, ScriptInputSurface::Grid);
+        assert_eq!(app.settings.grid_cols, 3);
+        assert_eq!(toast(&app), "select");
+    });
+}
+
+#[test]
+fn event_grid_actual_key_slot_navigation_is_observed_only_next_frame() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+    let mut app = grid_app("[]");
+    app.keymap = crate::keymap::Keymap::from_ini_str("[Global]\nScriptSlot1 = F13\n");
+    app.operation_script.state = OperationScriptState::Ready(Box::new(CompiledOperationScript::compile(
+        r#"fn slots() { [#{slot:1,label:"move",run:"entry"}] }
+        fn entry(s) { ["GridMoveLast"] }
+        fn on_event(s) { if "view" in s.events { #{run:["GridColumnCount4"],notice:"view"} } else { #{run:["GridColumnCount7"],notice:"select"} } }"#
+    ).unwrap()));
+    let ctx = egui::Context::default();
+    ctx.run_pass(
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::F13,
+                physical_key: Some(egui::Key::F13),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |ctx| {
+            app.input_update_begin(ctx);
+            assert!(app.input_main_grid_shortcuts(ctx, false).is_none());
+            assert_eq!(app.selected, Some(1));
+            assert_eq!(app.settings.grid_cols, 4);
+            app.detect_operation_script_events(ctx, ScriptInputSurface::Grid);
+            assert_eq!(
+                app.settings.grid_cols, 4,
+                "the key did not update the event baseline or run twice"
+            );
+        },
+    )
+    .drop_without_applying_deltas();
+    frame(&ctx, |ctx| {
+        app.input_update_begin(ctx);
+        assert!(app.input_main_grid_shortcuts(ctx, false).is_none());
+        assert_eq!(app.settings.grid_cols, 7);
+        assert_eq!(toast(&app), "select");
+    });
+    #[cfg(windows)]
+    crate::key_input::clear_test_frame();
+}
+
+#[test]
+fn event_runtime_rejects_entire_mixed_batch_and_never_publishes_success_notice() {
+    let mut app = grid_app("[]");
+    let ctx = egui::Context::default();
+    for forbidden in [
+        "GridMoveLast",
+        "GridOpenSelected",
+        "RatingItem3",
+        "GridCopyPath",
+    ] {
+        app.operation_script_events = Default::default();
+        app.settings.grid_cols = 2;
+        app.operation_script.state = event_script(&format!(
+            r#"#{{run:["GridColumnCount3","{forbidden}"],notice:"must not complete"}}"#
+        ));
+        app.detect_operation_script_events(&ctx, ScriptInputSurface::Grid);
+        assert_eq!(app.settings.grid_cols, 2);
+        assert!(toast(&app).contains("EventNotAllowed"), "{forbidden}");
+    }
+}
+
+#[test]
+fn event_runtime_rate_limit_drops_batches_notifies_once_and_does_not_replay() {
+    let mut app = grid_app("[]");
+    app.operation_script.state = event_script(r#"["GridColumnCount3"]"#);
+    let ctx = egui::Context::default();
+    let now = Instant::now();
+    for index in 0..10 {
+        app.selected = Some(index % 2);
+        frame(&ctx, |ctx| {
+            app.detect_operation_script_events_at(ctx, ScriptInputSurface::Grid, now)
+        });
+        assert_eq!(app.settings.grid_cols, 3);
+    }
+    app.settings.grid_cols = 2;
+    app.selected = Some(0);
+    frame(&ctx, |ctx| {
+        app.detect_operation_script_events_at(ctx, ScriptInputSurface::Grid, now)
+    });
+    assert_eq!(app.settings.grid_cols, 2);
+    assert!(toast(&app).contains("実行回数"));
+    app.fs_feedback_toast = None;
+    app.selected = Some(1);
+    frame(&ctx, |ctx| {
+        app.detect_operation_script_events_at(ctx, ScriptInputSurface::Grid, now)
+    });
+    assert!(app.fs_feedback_toast.is_none());
+    assert_eq!(app.settings.grid_cols, 2);
+    frame(&ctx, |ctx| {
+        app.detect_operation_script_events_at(
+            ctx,
+            ScriptInputSurface::Grid,
+            now + Duration::from_secs(1),
+        )
+    });
+    assert_eq!(
+        app.settings.grid_cols, 2,
+        "expired rate window does not replay dropped events"
     );
     app.selected = Some(0);
-    events.finish_event(identity(&app, ScriptInputSurface::Grid));
-    assert!(
-        events
-            .observe(identity(&app, ScriptInputSurface::Grid))
-            .is_empty()
-    );
-    // Later completion is independent of which invocation originally caused it.
-    app.selected = Some(1);
-    assert_eq!(
-        events.observe(identity(&app, ScriptInputSurface::Grid)),
-        [ScriptEvent::Select]
-    );
+    frame(&ctx, |ctx| {
+        app.detect_operation_script_events_at(
+            ctx,
+            ScriptInputSurface::Grid,
+            now + Duration::from_secs(1),
+        )
+    });
+    assert_eq!(app.settings.grid_cols, 3);
 }
 
+#[test]
+fn event_detection_cache_misses_do_not_read_rating_or_tag_databases() {
+    let mut app = grid_app("[]");
+    app.fullscreen_idx = Some(0);
+    app.operation_script.state = event_script("[]");
+    app.rating_cache.clear();
+    app.tags_cache.clear();
+    let ratings = crate::rating_db::read_operations_for_test();
+    let tags = crate::tags_db::read_operations_for_test();
+    app.detect_operation_script_events(&egui::Context::default(), ScriptInputSurface::Viewer);
+    assert_eq!(crate::rating_db::read_operations_for_test(), ratings);
+    assert_eq!(crate::tags_db::read_operations_for_test(), tags);
+}
 #[test]
 fn event_limit_is_rolling_ten_attempts_and_notification_is_lifetime_once() {
     let mut events = OperationScriptEvents::default();
@@ -611,48 +891,34 @@ fn event_detection_native_overlay_uses_existing_snapshot_and_does_not_claim_bloc
     assert!(app.fs_feedback_toast.is_none());
 }
 
+#[cfg(windows)]
 #[test]
-fn event_safe_image_actions_preserve_all_four_identity_components() {
-    let mut app = grid_app("[]");
-    let ctx = egui::Context::default();
-    app.fullscreen_idx = Some(0);
-    app.viewer_presentation = ViewerPresentation::Fullscreen;
-    app.spread_mode = crate::settings::SpreadMode::Single;
-    app.ai_upscale_enabled = false;
-    for mode in [
-        crate::settings::SpreadMode::Single,
-        crate::settings::SpreadMode::Ltr,
-        crate::settings::SpreadMode::SplitLtr,
-    ] {
-        for free_rotation in [0.0, 15.0] {
-            app.spread_mode = mode;
-            app.fs_free_rotation = free_rotation;
-            for operation in ALLOWED_OPERATIONS
-                .iter()
-                .filter(|op| op.event_allowed && op.contexts.contains(ScriptContext::FsImage))
-            {
-                let before = identity(&app, ScriptInputSurface::Viewer);
-                let (result, rejected, delegated) =
-                    app.execute_fullscreen_script_action(&ctx, operation.action);
-                assert!(!rejected, "{:?}", operation.action);
-                assert!(!delegated, "{:?}", operation.action);
-                assert!(
-                    !ScriptRunResult::Fullscreen {
-                        action: result,
-                        rejected,
-                        delegated
-                    }
-                    .needs_postprocessing(),
-                    "{:?}",
-                    operation.action
-                );
-                assert_eq!(
-                    identity(&app, ScriptInputSurface::Viewer),
-                    before,
-                    "{:?}",
-                    operation.action
-                );
-            }
+fn event_native_poll_video_hook_executes_and_overlay_snapshot_blocks_before_evaluation() {
+    for blocked in [true, false] {
+        let mut app = video_app("[]", false);
+        app.operation_script.state =
+            event_script(r#"#{run:["VideoMute"],notice:"native event complete"}"#);
+        let loaded_operations = match &app.operation_script.state {
+            OperationScriptState::Ready(script) => script.last_operation_count(),
+            _ => unreachable!(),
+        };
+        video_player(&app, 0).set_native_overlay_input_routing_for_test(
+            crate::video::native_presenter::NativeOverlayInputRouting {
+                text_input_active: blocked,
+                ..Default::default()
+            },
+        );
+        let ctx = egui::Context::default();
+        frame(&ctx, |ctx| app.poll_video(ctx));
+        if blocked {
+            assert!(app.fs_feedback_toast.is_none());
+            assert!(!video_player(&app, 0).is_muted());
+            assert!(
+                matches!(&app.operation_script.state, OperationScriptState::Ready(script) if script.last_operation_count() == loaded_operations)
+            );
+        } else {
+            assert_eq!(toast(&app), "native event complete");
+            assert!(video_player(&app, 0).is_muted());
         }
     }
 }
@@ -666,23 +932,37 @@ fn event_safe_grid_actions_preserve_all_four_identity_components_even_from_detai
         .filter(|op| op.event_allowed && op.contexts.contains(ScriptContext::Grid))
     {
         app.set_grid_view_mode(crate::settings::GridViewMode::Details);
-        let before = identity(&app, ScriptInputSurface::Grid);
-        let result = app.execute_grid_key_action(&ctx, operation.action, "script_event_audit");
-        assert!(!result.rejected(), "{:?}", operation.action);
-        assert!(!result.needs_postprocessing(), "{:?}", operation.action);
-        assert_eq!(
-            identity(&app, ScriptInputSurface::Grid),
-            before,
-            "{:?}",
-            operation.action
-        );
+        app.operation_script_events = Default::default();
+        app.operation_script.state = event_script(&format!(
+            r#"#{{run:["{}"],notice:"grid event complete"}}"#,
+            operation.action.ini_name()
+        ));
+        frame(&ctx, |ctx| {
+            app.detect_operation_script_events(ctx, ScriptInputSurface::Grid);
+            assert_eq!(toast(&app), "grid event complete", "{:?}", operation.action);
+            let immediate = identity(&app, ScriptInputSurface::Grid);
+            app.rebuild_visible_indices();
+            app.rebuild_details_order();
+            assert_eq!(
+                identity(&app, ScriptInputSurface::Grid),
+                immediate,
+                "{:?}",
+                operation.action
+            );
+        });
+        app.fs_feedback_toast = None;
+        frame(&ctx, |ctx| {
+            app.detect_operation_script_events(ctx, ScriptInputSurface::Grid)
+        });
+        assert!(app.fs_feedback_toast.is_none(), "{:?}", operation.action);
     }
 }
 
 #[cfg(windows)]
 #[test]
 fn event_safe_video_actions_preserve_all_four_identity_components_for_native_and_music() {
-    use crate::app::{VideoKeyActionResult, VideoKeyActionSurface};
+    let _serial = crate::key_input::lock_test_input();
+    use crate::app::VideoKeyActionSurface;
     for surface in [
         VideoKeyActionSurface::Native,
         VideoKeyActionSurface::EguiVideo,
@@ -692,6 +972,14 @@ fn event_safe_video_actions_preserve_all_four_identity_components_for_native_and
         // One live fixture per iteration, never acquire setup_app's mutex twice.
         let mut app = video_app("[]", music);
         let ctx = egui::Context::default();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+        crate::key_input::install_operation_input_plugin(&ctx);
+        app.settings.video_in_window_mode = true;
+        app.native_video_in_window_active = true;
+        app.viewer_presentation = ViewerPresentation::MainWindow;
+        if surface == VideoKeyActionSurface::EguiVideo {
+            video_player(&app, 0).set_native_presenter_hidden_for_test(true);
+        }
         for operation in ALLOWED_OPERATIONS
             .iter()
             .filter(|op| op.event_allowed && op.contexts.contains(ScriptContext::FsVideo))
@@ -699,17 +987,68 @@ fn event_safe_video_actions_preserve_all_four_identity_components_for_native_and
             if music && operation.action == KeyAction::VideoSeekStripToggle {
                 continue; // Released music keys do not expose the video strip.
             }
-            let before = identity(&app, ScriptInputSurface::Viewer);
-            let result = app.execute_video_key_action(&ctx, 0, operation.action, surface);
-            assert!(
-                matches!(result, VideoKeyActionResult::Accepted(_)),
-                "{:?}, music={music}",
-                operation.action
-            );
+            video_player(&app, 0).set_playing(false);
+            video_player(&app, 0).set_position_for_test(10.0);
+            video_player(&app, 0).set_volume(0.5);
+            video_player(&app, 0).set_muted(false);
+            app.settings.video_loop_mode = crate::settings::VideoLoopMode::Off;
+            app.settings.video_loop = false;
+            app.operation_script_events = Default::default();
+            app.operation_script.state = event_script(&format!(
+                r#"#{{run:["{}"],notice:"media event complete"}}"#,
+                operation.action.ini_name()
+            ));
+            let mut immediate = None;
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.detect_operation_script_events(ui.ctx(), ScriptInputSurface::Viewer);
+                    assert_eq!(
+                        toast(&app),
+                        "media event complete",
+                        "{:?}, {surface:?}",
+                        operation.action
+                    );
+                    immediate = Some(identity(&app, ScriptInputSurface::Viewer));
+                    app.poll_video(ui.ctx());
+                    if surface != VideoKeyActionSurface::Native {
+                        app.render_fullscreen_viewport(ui);
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
+            let immediate = immediate.unwrap();
             assert_eq!(
                 identity(&app, ScriptInputSurface::Viewer),
-                before,
-                "{:?}, music={music}",
+                immediate,
+                "{:?}, {surface:?}",
+                operation.action
+            );
+            app.fs_feedback_toast = None;
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.poll_video(ui.ctx());
+                if surface != VideoKeyActionSurface::Native {
+                    app.render_fullscreen_viewport(ui);
+                }
+            })
+            .drop_without_applying_deltas();
+            assert_eq!(
+                identity(&app, ScriptInputSurface::Viewer),
+                immediate,
+                "{:?}, {surface:?}",
+                operation.action
+            );
+            assert!(
+                app.fs_feedback_toast
+                    .as_ref()
+                    .is_none_or(|toast| toast.0 != "media event complete"),
+                "{:?}, {surface:?}",
                 operation.action
             );
         }

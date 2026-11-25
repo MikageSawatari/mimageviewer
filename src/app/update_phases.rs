@@ -914,6 +914,12 @@ impl App {
         ctx: &egui::Context,
         main_viewer_blocked: bool,
     ) -> Option<crate::ui_main::AddressBarNav> {
+        if !main_viewer_blocked {
+            self.detect_operation_script_events(
+                ctx,
+                super::operation_script_runtime::ScriptInputSurface::Grid,
+            );
+        }
         // Only menu/dialog ownership blocks this entire phase. Text-input
         // shortcuts retain the per-branch admission and keymap behavior below.
         if matches!(

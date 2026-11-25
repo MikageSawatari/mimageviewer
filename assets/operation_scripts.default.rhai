@@ -16,11 +16,11 @@ fn rate3_next(s) {
     ["RatingItem3", "FsPageNext"]
 }
 
-// イベントの接続と「イベント可」の操作の確定は後続の段で行います。
+// 本を開いたとき、PNG の透過部分の背景が黒なら白にします。
 fn on_event(s) {
     if s.context != "fs_image" { return []; }
-    if ("view" in s.events || "page" in s.events) && s.book.path.contains("\\manga\\") {
-        if s.view.direction != "rtl" { return ["FsReadingDirectionToggle"]; }
+    if "open" in s.events && s.item.ext == "png" {
+        if s.view.background == "black" { return ["FsBgCycle"]; }
     }
     []
 }

@@ -1,4 +1,4 @@
-//! Opt-in measurements of the page-event identity before wiring it into every frame.
+//! Opt-in full stage-2b identity and unchanged r11 event-identity measurements.
 //! Synthetic in-memory rows only: no images/archives are opened or rendered.
 
 use super::*;
@@ -16,7 +16,7 @@ const SAMPLES: usize = 257;
 const WARMUP: usize = 16;
 const NAME_LEN: usize = 200;
 
-fn prepare_rows(app: &mut App, count: usize, zip: bool) {
+pub(super) fn prepare_rows(app: &mut App, count: usize, zip: bool) {
     // Reuse the sole fixture: setup_app holds the process-wide data-dir mutex.
     app.book_composition = Default::default();
     app.spread_shift = Default::default();
@@ -64,7 +64,7 @@ fn prepare_rows(app: &mut App, count: usize, zip: bool) {
     assert_eq!(app.current_reader_order().len(), count);
 }
 
-fn install_zip_composition(app: &mut App) {
+pub(super) fn install_zip_composition(app: &mut App) {
     let raw = app
         .items
         .iter()
@@ -148,11 +148,11 @@ fn approx_owned_heap_bytes(identity: &ScriptPageIdentity) -> usize {
         panic!("measurement assumes a physical book location");
     };
     assert!(matches!(
-        identity.presentation_source,
+        identity.scalars.presentation_source,
         SpreadPresentationSource::Other
     ));
-    assert!(identity.browser_output_root.is_none());
-    assert!(identity.extracted_surface.is_none());
+    assert!(identity.scalars.browser_output_root.is_none());
+    assert!(identity.scalars.extracted_surface.is_none());
     path.as_deref().map_or(0, path_bytes)
         + prefix.capacity() * size_of::<String>()
         + prefix.iter().map(String::capacity).sum::<usize>()
@@ -162,14 +162,21 @@ fn approx_owned_heap_bytes(identity: &ScriptPageIdentity) -> usize {
             .iter()
             .map(item_heap_bytes)
             .sum::<usize>()
-        + identity.item.iter().map(item_heap_bytes).sum::<usize>()
         + identity
+            .scalars
+            .item
+            .iter()
+            .map(item_heap_bytes)
+            .sum::<usize>()
+        + identity
+            .scalars
             .pairing_origins
             .0
             .iter()
             .map(item_heap_bytes)
             .sum::<usize>()
         + identity
+            .scalars
             .pairing_origins
             .1
             .iter()
@@ -222,6 +229,28 @@ fn measure(app: &App, kind: &str, source: &str, mode: &str) {
         equality[SAMPLES / 2],
         equality[(SAMPLES * 95 - 1) / 100],
     );
+    if app.items.len() == 50_000 {
+        let mut events = OperationScriptEvents::default();
+        events.observe(app.collect_operation_script_event_identity(ScriptInputSurface::Viewer));
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..WARMUP + SAMPLES {
+            let start = Instant::now();
+            let changed = black_box(events.observe(black_box(
+                app.collect_operation_script_event_identity(ScriptInputSurface::Viewer),
+            )));
+            let elapsed = start.elapsed().as_secs_f64() * 1_000_000.0;
+            assert!(changed.is_empty());
+            if sample >= WARMUP {
+                samples.push(elapsed);
+            }
+        }
+        samples.sort_by(f64::total_cmp);
+        println!(
+            "event_identity_unchanged N=50000 kind={kind} mode={mode} source={source} construction_compare_median_us={:.3} p95_us={:.3} samples={SAMPLES} warmup={WARMUP} reader_order=excluded composition=strong_arc",
+            samples[SAMPLES / 2],
+            samples[(SAMPLES * 95 - 1) / 100]
+        );
+    }
 }
 
 #[test]

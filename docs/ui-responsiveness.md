@@ -41,18 +41,20 @@ AppのROOT passは起動要求と `try_recv`、世代の照合だけを行い、
 snapshotを読む。操作は既存のキー実行関数と保存・シーク・キャプチャworker受付を共有し、
 新しい同期I/O・デコード・GPUアップロード・待ち・常設のpendingを追加しない。
 
-段4のイベントは作業途中で、UIの毎フレーム検出にはまだ接続していない。
-main専用のbaseline・ROOT frame番号・直近10実行時刻はbundle外に置く。受付helperはOFF／on_event無しで
-利用資格の収集も識別の作成もしない。純比較の `script/event_compare` は比較とbaseline置換のms・イベント数だけを
-記録し、識別の構築・Rhai評価・操作実行の費用を含まない（実経路からは未呼出し）。
-既存page識別はreader order全件のパス／ZIPエントリ名を複製し、別allocationならcompositionの意味も全件比較する。
-SubfolderExpansionのroots複製やSearchの条件文字列化も定数費用ではない。items_generation／details_order_revision等
-だけではvisible再構成とDirectMediaの読み手順採用を覆わないため、変更なしのframeへこの処理を追加しない。
-採用ownerと軽量鍵の設計判断後にscalar／O(N)を分離・memo化し、識別構築込みの検出区間と5万件の変更なしframeを
-計測する。その未完の計測を比較helperの計時で代用しない。棚卸し・判断案は
-[段4引き継ぎ](operation-script-stage4-handoff.md) を参照。
-今回の指示書で共有された既存のrelease計測（cf1fce276、5万件）では、構築1.1〜2.2ms（p95最大3.4ms）、
-保持heap概算約15MB、比較1〜1.5msだった。本セッションでは再計測していない。
+段4のr11イベントは、一覧ROOT・viewer所有pass・native ROOTでキーより前に検出する。
+OFF／on_event無しは利用資格・native playerのsnapshot・識別の収集を行わない。main専用baseline・ROOT frame番号・
+直近10実行時刻はbundle外で、別context・利用不可のpassからは更新しない。状態が変わらないframeにも検出済み番号を記録する。
+イベント識別はtyped item由来の入れ物と共用scalar、強いcomposition Arcのみ。reader order列・Search条件・展開rootsを
+毎frame複製しない。同じcomposition allocationはO(1)、別allocationの時だけ意味の全件比較を行い、等しくても新Arcへ
+基準を進める。prepared rotationsのCOWで外側Arcが変わった場合も1回は意味の比較が必要。
+`script/event_detect` は利用資格通過後の識別構築と比較のms・eventsを記録し、Rhai評価・操作の時間は含まない。
+イベントがある時だけ既存snapshot（navigation列の複製を含む）を作って評価し、全件validate後に共用のAを実行、同frameで
+識別を取り直す。rolling 1秒10起動の超過はそのframe分を捨て、後で再生しない。新しいI/O・decode・GPU upload・待ち・timerは無い。
+既存の段2b要求照合は従来のO(N)識別を維持し、scalar生成だけ共用する。旧release計測（指示書共有cf1fce276、5万件）は
+構築1.1〜2.2ms（p95最大3.4ms）、保持heap概算約15MB、比較1〜1.5msで、イベント検出へその列を持ち込まない根拠である。
+既存ignored `perf_operation_script_page_identity` に5万件の変更なしevent識別の構築＋比較（μs）の行を追加した。
+本セッションではRustテスト・release実測・実機を実行していない。入れ物表、A監査、テスト依頼は
+[操作スクリプト計画§16](operation-script-plan.md#operation-script-stage4) を参照。
 
 ## スタック用スクリプトのファイル操作（§1.843）
 

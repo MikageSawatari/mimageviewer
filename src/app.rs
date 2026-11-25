@@ -102901,6 +102901,13 @@ impl App {
     }
 
     pub(crate) fn poll_video(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        if self.operation_script_has_events() && self.is_native_video_script_surface() {
+            self.detect_operation_script_events(
+                ctx,
+                operation_script_runtime::ScriptInputSurface::Viewer,
+            );
+        }
         let poll_started = std::time::Instant::now();
         let mut next_repaint: Option<std::time::Duration> = None;
         // 5 秒ごとに動画再生位置を settings に書き戻す (drop 漏れ救済)。

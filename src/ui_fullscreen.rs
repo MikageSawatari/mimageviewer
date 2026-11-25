@@ -28977,6 +28977,10 @@ impl App {
                     self.update_ime_state(ctx);
                     crate::touch_debug::log_egui_touch_events(ctx, self.frame_counter);
                 }
+                self.detect_operation_script_events(
+                    ctx,
+                    crate::app::operation_script_runtime::ScriptInputSurface::Viewer,
+                );
                 let entry = self.begin_page_turn_viewer_frame(ctx, embedded, root_input.as_ref());
                 let (mut frame_close_response, continuation_committed) = match entry {
                     PageTurnFrameEntry::Continue {
@@ -105827,3 +105831,6 @@ mod operation_script_owner_tests;
 
 #[cfg(all(test, windows))]
 mod operation_script_media_tests;
+
+#[cfg(test)]
+mod operation_script_event_tests;

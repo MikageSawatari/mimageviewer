@@ -88,14 +88,17 @@ macro_rules! operations {
     };
 }
 
-/// Audited against the context-specific open/view/page/select identities (§3.3).
-/// Spread/direction/animation change the page tuple; they intentionally stay input-only.
+/// r11: synchronous changes are absorbed before the remaining draw/completion.
+/// Spread/direction/fit may defer normalization or slice reconciliation.
 /// Grid actions change layout/order, but neither its location nor cursor item.
 const fn event_allowed_action(action: KeyAction) -> bool {
     use KeyAction::*;
     matches!(
         action,
-        FsZoomIn
+        FsBgCycle
+            | FsPixelGrid
+            | FsPageTurnAnimationToggle
+            | FsZoomIn
             | FsZoomOut
             | FsToggleMetadata
             | FsNavigatorToggle
@@ -604,9 +607,6 @@ mod tests {
             "FsSpreadLtr",
             "FsReadingDirectionToggle",
             "FsFitModeCycle",
-            "FsBgCycle",
-            "FsPixelGrid",
-            "FsPageTurnAnimationToggle",
             "FsPageNext",
             "FsClose",
             "RatingItem3",
@@ -646,7 +646,7 @@ mod tests {
                 .iter()
                 .filter(|op| op.event_allowed)
                 .count(),
-            38
+            41
         );
         let excluded_a = ALLOWED_OPERATIONS
             .iter()
@@ -663,10 +663,7 @@ mod tests {
                 KeyAction::FsSpreadRtl,
                 KeyAction::FsSpreadRtlCover,
                 KeyAction::FsReadingDirectionToggle,
-                KeyAction::FsBgCycle,
                 KeyAction::FsFitModeCycle,
-                KeyAction::FsPixelGrid,
-                KeyAction::FsPageTurnAnimationToggle,
             ]
         );
         for op in ALLOWED_OPERATIONS.iter().filter(|op| !op.event_allowed) {

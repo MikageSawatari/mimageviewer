@@ -258,10 +258,19 @@ pub(crate) struct ScriptTargetIdentity {
     checked: Vec<(usize, ScriptItemIdentity)>,
 }
 
-/// Shared page-event identity (§3.3), independent of list generations and caches.
+/// Stage 2b request identity retains its full semantic reader-order comparison.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ScriptPageIdentity {
     location: ScriptLocation,
+    scalars: ScriptPageScalars,
+    unit_source: ScriptUnitSourceInputs,
+    reader_order: Vec<ScriptItemIdentity>,
+}
+
+/// Shared O(1)-in-item-count inputs for stage 2b and r11 event comparison.
+/// Paths are bounded in number, not in byte length. No reader-order/location clone.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ScriptPageScalars {
     item: Option<ScriptItemIdentity>,
     spread_mode: crate::settings::SpreadMode,
     reading_flow: crate::settings::ReadingFlow,
@@ -279,8 +288,6 @@ pub(crate) struct ScriptPageIdentity {
     grid_view: crate::settings::GridViewMode,
     /// These App modes select continuous still-only versus ordinary navigation.
     continuous_view_suppression: (bool, bool, bool),
-    unit_source: ScriptUnitSourceInputs,
-    reader_order: Vec<ScriptItemIdentity>,
     endpoint_context_eligible: bool,
     split_direction: Option<crate::page_split::SplitDirection>,
 }
@@ -625,6 +632,31 @@ impl App {
     pub(crate) fn operation_script_page_identity(&self) -> ScriptPageIdentity {
         ScriptPageIdentity {
             location: self.operation_script_location(),
+            scalars: self.operation_script_page_scalars(),
+            unit_source: self.operation_script_unit_source(),
+            reader_order: self
+                .current_reader_order()
+                .iter()
+                .filter_map(|&idx| self.items.get(idx))
+                .map(item_identity)
+                .collect(),
+        }
+    }
+
+    fn operation_script_unit_source(&self) -> ScriptUnitSourceInputs {
+        self.retained_composed_projection_input().map_or_else(
+            || ScriptUnitSourceInputs::Automatic {
+                rule_total: self.smart_folder_rule_total(),
+                item_count: self.items.len(),
+            },
+            |projection| {
+                ScriptUnitSourceInputs::Composed(ScriptCompositionInputs(Arc::clone(projection)))
+            },
+        )
+    }
+
+    fn operation_script_page_scalars(&self) -> ScriptPageScalars {
+        ScriptPageScalars {
             item: self
                 .fullscreen_idx
                 .and_then(|idx| self.items.get(idx))
@@ -664,23 +696,6 @@ impl App {
                     crate::fs_exclusive_view::FsExclusiveView::Panorama(_)
                 ),
             ),
-            unit_source: self.retained_composed_projection_input().map_or_else(
-                || ScriptUnitSourceInputs::Automatic {
-                    rule_total: self.smart_folder_rule_total(),
-                    item_count: self.items.len(),
-                },
-                |projection| {
-                    ScriptUnitSourceInputs::Composed(ScriptCompositionInputs(Arc::clone(
-                        projection,
-                    )))
-                },
-            ),
-            reader_order: self
-                .current_reader_order()
-                .iter()
-                .filter_map(|&idx| self.items.get(idx))
-                .map(item_identity)
-                .collect(),
             endpoint_context_eligible: self.spread_complete_book_context_eligible(),
             split_direction: self.split_direction_now(),
         }
@@ -804,30 +819,37 @@ impl App {
                 }
             }
         }
-        let (book_path, _) = self.operation_script_physical_place();
-        snapshot.book.path = book_path
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned());
-        use super::book_materialization::{BookScope, ProjectionRecipe};
-        snapshot.book.kind = Some(
-            match &self.projection_recipe {
-                ProjectionRecipe::Book(BookScope::Document(path)) => {
-                    if path
-                        .extension()
-                        .and_then(|ext| ext.to_str())
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
-                    {
-                        "epub"
-                    } else {
-                        "pdf"
-                    }
-                }
-                ProjectionRecipe::Book(BookScope::Archive { .. }) => "zip",
-                _ if self.zip_nav.is_some() => "zip",
-                _ => "folder",
+        if viewer {
+            if let Some(container) = self.operation_script_viewer_container() {
+                snapshot.book.path = Some(container.path.to_string_lossy().into_owned());
+                snapshot.book.kind = Some(container.kind.into());
             }
-            .into(),
-        );
+        } else {
+            let (book_path, _) = self.operation_script_physical_place();
+            snapshot.book.path = book_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned());
+            use super::book_materialization::{BookScope, ProjectionRecipe};
+            snapshot.book.kind = Some(
+                match &self.projection_recipe {
+                    ProjectionRecipe::Book(BookScope::Document(path)) => {
+                        if path
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
+                        {
+                            "epub"
+                        } else {
+                            "pdf"
+                        }
+                    }
+                    ProjectionRecipe::Book(BookScope::Archive { .. }) => "zip",
+                    _ if self.zip_nav.is_some() => "zip",
+                    _ => "folder",
+                }
+                .into(),
+            );
+        }
         snapshot.view.spread = Some(
             match self.spread_mode {
                 crate::settings::SpreadMode::Single => "single",
@@ -951,6 +973,57 @@ impl App {
         (result, feedback)
     }
 
+    fn execute_operation_script_action(
+        &mut self,
+        ctx: &egui::Context,
+        surface: ScriptInputSurface,
+        key_action: KeyAction,
+        native_video: bool,
+    ) -> ScriptRunResult {
+        match surface {
+            ScriptInputSurface::Grid => {
+                self.execute_grid_key_action(ctx, key_action, "script_grid")
+            }
+            ScriptInputSurface::Viewer => {
+                #[cfg(windows)]
+                if native_video {
+                    let rejected = self.fullscreen_idx.is_none_or(|idx| {
+                        !self.is_native_video_script_surface()
+                            || !self.native_video_script_action_admitted(idx, key_action)
+                            || matches!(
+                                self.execute_video_key_action(
+                                    ctx,
+                                    idx,
+                                    key_action,
+                                    super::VideoKeyActionSurface::Native,
+                                ),
+                                super::VideoKeyActionResult::Rejected
+                            )
+                    });
+                    ScriptRunResult::NativeVideo { rejected }
+                } else {
+                    let (action, rejected, delegated) =
+                        self.execute_fullscreen_script_action(ctx, key_action);
+                    ScriptRunResult::Fullscreen {
+                        action,
+                        rejected,
+                        delegated,
+                    }
+                }
+                #[cfg(not(windows))]
+                {
+                    let (action, rejected, delegated) =
+                        self.execute_fullscreen_script_action(ctx, key_action);
+                    ScriptRunResult::Fullscreen {
+                        action,
+                        rejected,
+                        delegated,
+                    }
+                }
+            }
+        }
+    }
+
     fn run_script_slot_with_metrics(
         &mut self,
         ctx: &egui::Context,
@@ -1015,48 +1088,8 @@ impl App {
                 );
                 return ScriptRunResult::empty(surface, native_video, true);
             }
-            result = match surface {
-                ScriptInputSurface::Grid => {
-                    self.execute_grid_key_action(ctx, operation.action, "script_grid")
-                }
-                ScriptInputSurface::Viewer => {
-                    #[cfg(windows)]
-                    if native_video {
-                        let rejected = self.fullscreen_idx.is_none_or(|idx| {
-                            !self.is_native_video_script_surface()
-                                || !self.native_video_script_action_admitted(idx, operation.action)
-                                || matches!(
-                                    self.execute_video_key_action(
-                                        ctx,
-                                        idx,
-                                        operation.action,
-                                        super::VideoKeyActionSurface::Native,
-                                    ),
-                                    super::VideoKeyActionResult::Rejected
-                                )
-                        });
-                        ScriptRunResult::NativeVideo { rejected }
-                    } else {
-                        let (action, rejected, delegated) =
-                            self.execute_fullscreen_script_action(ctx, operation.action);
-                        ScriptRunResult::Fullscreen {
-                            action,
-                            rejected,
-                            delegated,
-                        }
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        let (action, rejected, delegated) =
-                            self.execute_fullscreen_script_action(ctx, operation.action);
-                        ScriptRunResult::Fullscreen {
-                            action,
-                            rejected,
-                            delegated,
-                        }
-                    }
-                }
-            };
+            result =
+                self.execute_operation_script_action(ctx, surface, operation.action, native_video);
             if result.rejected() {
                 self.script_failure(
                     number,

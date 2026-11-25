@@ -21,7 +21,11 @@ nativeのキー・Browserキー・マウス・リングはその場で実行し�
 native overlayの文字入力は保持済みの入力snapshotで判断し、動画の状態欄はplayerの保持値だけを読む。
 通常native動画の右クリックメニューの実行は設計担当の判断で段3から外し、共通モデルと選択後のスロット返却を保持する。
 ROOTにフォーカスがある全画面のキーは既存のROOT側予備経路で実行する。共有Contextの転送分岐は変更しない。
-イベントは段4で接続する。
+段4では `operation_script_runtime::events` がmain専用のbaseline・ROOT frame番号・rolling実行上限をbundle外で所有する。
+一覧ROOT、egui viewerの所有pass、native ROOTでキーより前に1frame1回検出し、利用資格を満たす時だけ評価する。
+入れ物は表示項目のtyped identityから導出し、pageは段2bと共用するscalarとstrong composition Arcを比較する。
+段2bの要求照合はreader orderを含む従来のO(N)を保つ。イベントは全件検査済みAだけをslotと同じ実行関数へ渡し、
+同frameの再snapshotを基準にする。今回のRust検証・release計測は未実施。
 詳細は [設計](operation-script-plan.md)。
 
 ## ブラウザ閲覧の保存先のページ構成（§1.870）

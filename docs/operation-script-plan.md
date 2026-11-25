@@ -31,8 +31,8 @@ NeeView のスクリプト機能 (`.nvjs`) の使われ方として挙がった�
 | 最終ページでもう一度押すと次の本へ | 状態 (最終ページか) + 条件 + 本の移動 | 最初の版 |
 | 全画面なら解除、通常なら終了確認 | 状態 (全画面か) + 条件 + 終了 | 全画面の解除だけ最初の版。終了は `KeyAction` ではなくメニューの `FileQuit` (`keymap.rs:3048`) なので後の段 |
 | 画像と動画で操作を切り替える | 状態 (種類) + 条件 | 最初の版 |
-| パス名で開き方向を自動設定 | イベント (全画面に入ったとき・ページ) + 状態 (パス) | 最初の版 (Q3) |
-| PNG なら市松背景 | イベント (ページ) + 状態 (拡張子・今の背景) + 巡回操作 | 最初の版 (巡回で書く。値の指定は §9 の後の段) |
+| パス名で開き方向を自動設定 | イベント + 状態 (パス) + 読む向きの変更 | 段4の同期完了条件を満たさずイベントでは不可。キー起動では使える (§16) |
+| PNG の黒背景を白へ | イベント (open) + 状態 (拡張子・今の背景) + 巡回操作 | 最初の版 (巡回で書く。値の指定は §9 の後の段) |
 | 決まったフォルダへワンタッチ保存 | キャプチャ保存 (保存先は環境設定のもの) | 最初の版 (Q2、押したときだけ) |
 | ★を付けて次へ | レーティング + ページ送り | 最初の版 (Q1) |
 | 閲覧中の本を移動して次の本へ | ファイル移動 | 対象外 (Q1) |
@@ -372,18 +372,11 @@ CLAUDE.md「Detached viewer リワーク中のルール」と `detached-rework-p
 | `"page"` | 全画面の表示単位が変わったとき (全画面に入った直後を含む) | r11 で改めた: (入れ物, 表示単位を決める入力のうちスカラーの部分と本の構成, 分割ページの左右)。読み手の順の列は含めない (下の r11)。項目の識別は既存のページの識別 (`edit_source.rs:369` と同じ考え方: 通常のファイルはパス、ZIP は (ZIP, エントリ)、PDF は (PDF, ページ番号)) |
 | `"select"` | 一覧の面だけ。選択中の項目 (カーソル) が変わったとき | r11 で改めた: 選択中の項目の型付きの識別 (場所は含めない) |
 
-- **論理的な場所は型付きの値**にする (レビュー r3 P2-4)。場所の種類ごとに、その場所を決める引数を持つ:
-  通常のフォルダ (パス)、ZIP・PDF 等の中 (コンテナのパス, 中の prefix)、コレクション (`collection_id`。
-  採用時は `current_folder = None` になる、`collection_grid.rs:3941`、`top_level_grid_view.rs:544`)、
-  レーティングの場所 (★の数、`top_level_grid_view.rs:1483`)、本棚・読書履歴・ドライブ一覧などの固定の場所
-  (種類だけ)、検索の結果 (検索の種類と条件の文字列)。どの種類があるかは、一覧の上位の表示の型
-  (`top_level_grid_view.rs`) を実装担当が棚卸しして全部に対応させる。値は既存のメモリ上の状態から作る。
-  一覧の世代・revision・表示位置は含めない (読み込み直しで発火させないため)。
-- 同じ場所の読み込み直し (自動更新・再読み込み) では `"open"` は発火しない (場所が同じ)。別の場所へ行って
-  戻ったときは発火する。
-- 識別を既存の状態から取る具体的な方法 (読み込み完了の印、ZIP prefix、表示単位、分割の左右) は実装担当が
-  コードで確かめ、取れない項目があれば設計担当へ返す。どれも読み込み・描画のために既にメモリ上にある値を
-  読むだけにする。
+- viewer の入れ物は、項目の型付きの識別だけから作る (r11)。書庫内のフォルダ階層は含めず、
+  入れ子の書庫は外側ファイルと最内の書庫エントリまでの論理的な結合で表す。対応表は下記。
+- 同じ入れ物の読み込み直しでは `"open"` は出ない。検出できた一覧の面を挟んで同じ本へ入り直した場合は出る。
+- 一覧では `"view"` と、型付きカーソルが変わった場合の `"select"` だけ。検索条件・collection ID・★の場所・
+  ZIP列挙途中の `current_folder` は、イベントの入れ物・選択識別の入力にしない。
 
 入れないもの (理由):
 
@@ -447,7 +440,7 @@ CLAUDE.md「Detached viewer リワーク中のルール」と `detached-rework-p
 
 #### 段 4 の確かめ直し (r10、2026-11-25、設計担当)
 
-段 4 の実装の途中で、実装担当がコードを棚卸しして次の 3 点を返した ([段 4 の引き継ぎ](operation-script-stage4-handoff.md))。
+段 4 の実装の途中で、実装担当がコードを棚卸しして次の 3 点を返した ([段4の実装記録](#operation-script-stage4))。
 コードの読みによる事実で、実行時の観測は無い。
 
 1. 読み手の順の項目の列 (`"page"` の識別の O(N) の部分) を変える producer のうち、既存の軽い鍵 (世代・revision) を
@@ -514,7 +507,7 @@ r10 の独立設計レビュー (2026-11-25、GPT-6 Astra / medium、read-only�
 イベントの識別 (どれも毎フレーム O(1)。本の構成だけ下の覚えておきを使う):
 
 - **`"view"`**: `s.context` (今までどおり)。
-- **`"open"`** (全画面の viewer の面だけ): 表示中の項目の入れ物の型付きの識別。ZIP の中の項目は (ZIP のパス, 本の prefix)、
+- **`"open"`** (全画面の viewer の面だけ): 表示中の項目の入れ物の型付きの識別。ZIP の中の項目は ZIP ファイルのパス（階層を含めない）、
   PDF のページは PDF のパス、通常の画像・動画・音声はそのフォルダのパス。そのほかの項目の種類 (EPUB から変換した本、
   ダイレクトメディア、コレクション・検索の結果の中の項目など) の入れ物は、実装担当が項目の種類を棚卸しして決め、
   一覧を設計書に書く。入れ物は項目の型付きの識別から作り、一覧の採用の状態 (`current_folder`・検索の条件・世代) は
@@ -550,6 +543,21 @@ r10 の独立設計レビュー (2026-11-25、GPT-6 Astra / medium、read-only�
   論理的なパス (外側のパス + エントリ)。通常の画像・動画・音声はそのファイルのフォルダの物理的なパス。検索の結果・
   コレクション・ダイレクトメディアの中の項目も、項目そのものの入れ物を使う (一覧の場所ではない)。実装担当は項目の種類
   ごとの対応表 (物理と論理のどちらを使うか) を設計書に書く。
+入れ物の実装対応表（r11、項目に保持されたパスだけ。ファイル確認・map/DB逆引きはしない）:
+
+| 表示項目/型 | 入れ物のpath・kind | 物理/論理の扱い |
+| --- | --- | --- |
+| Image / Video / Audio | ファイルの親folder、`folder` | typed file pathの物理親。検索/collection/directでも同じ |
+| ZipImage（通常） | `zip_path`、`zip` | typed外側ZIPファイル。entryのフォルダ階層は含めない |
+| ZipImage（nested ZIP/CBZ） | `zip_path` + entryの最内ZIP/CBZ境界まで、`zip` | 外側typed pathへraw entryを文字列として追記する論理path。hostのjoin/絶対path解釈をしない |
+| ZipImage（変換書庫） | typed `zip_path`、`zip` | 現在の型が持つ物理cache ZIP。元RAR等への逆引き無し。cache ZIP差替えならopenが出る |
+| PdfPage（PDF） | `pdf_path`、`pdf` | typed PDF path |
+| PdfPage（EPUB） | `pdf_path`、`epub` | document_page_itemが保持する元EPUBの論理path（変換PDFのcache pathではない） |
+| Folder / ZipFile / PdfFile / ConvertibleArchive / ZipDir / Stack / SearchContainer / CollectionPlaceholder | 無し（book.path/kindは`()`） | viewerの表示ページでない型。親や代表の入れ物を推測しない。通常のopen/navが除外する既存仕様を保つ |
+
+通常ZIPの下位folderを移ってもopenは出ない。nestedの境界は既存 `split_nested_zip_path` と同じsuffix判定を使うため、
+`.zip`/`.cbz`と同名のfolderを区別しない既存の曖昧さを引き継ぐ。先頭slash・drive風entryもouterを失わずliteralに保持する。
+
 - **`s.book.path` / `s.book.kind` (r11 レビュー P2)**: 全画面の viewer の面では、`"open"` の識別と同じ入れ物の導出から作る
   (§4.3)。発火の理由と雛形の条件が同じ値を見る。
 - **本の構成の覚えておき (r11 レビュー)**: 前回の構成の `Arc` を強い参照で持つ (生のポインタだけを覚えない。持っている間の
@@ -560,7 +568,7 @@ r10 の独立設計レビュー (2026-11-25、GPT-6 Astra / medium、read-only�
   `"select"` の基準を持ち越す。この面ごとの更新を、通常の比較とイベントからの実行の後の取り直しの両方に当てる (基準
   全体を置き換えない)。「同じ本へ入り直すと出る」は、間に一覧の面の検出が 1 回以上あった場合の保証 (検出と検出の間の
   往復はまとめられる、という既存の仕様どおり)。
-- 引き継ぎ文書 [operation-script-stage4-handoff.md](operation-script-stage4-handoff.md) の「必要な設計判断 1・2」は、
+- 旧引き継ぎの「必要な設計判断 1・2」は（経緯は本節と§16に保存）、
   r11 で読み手の順と採用の場所をイベントの識別から外したので、不要になった。
 
 r11 の独立設計レビュー (2026-11-25、GPT-6 Astra / medium、read-only、r10 と同じ会話の続き、対象 cef65dac0): **ACCEPT WITH CHANGES**
@@ -609,12 +617,11 @@ fn rate3_next(s) {
     ["RatingItem3", "FsPageNext"]
 }
 
-// イベント (無ければ使わない)。s.events にそのフレームで変わった種類が入る。
-// ここから返せるのは、その場で効く表示の操作のうち「イベント可」のものだけ (§5.1)。
+// 本を開いたとき、PNG の透過部分の背景が黒なら白にします。
 fn on_event(s) {
     if s.context != "fs_image" { return []; }
-    if "open" in s.events && s.book.path.contains("\\manga\\") {
-        if s.view.direction != "rtl" { return ["FsReadingDirectionToggle"]; }
+    if "open" in s.events && s.item.ext == "png" {
+        if s.view.background == "black" { return ["FsBgCycle"]; }
     }
     []
 }
@@ -624,9 +631,9 @@ fn on_event(s) {
   `()` と空配列は「何もしない」。
 - 操作名は `KeyAction::ini_name()` の文字列 (設定にも保存している安定した名前) をそのまま使う
   (例の綴りは仮。実際の綴りは `ini_name()` を正とする)。
-- 例の `on_event` は r11 で `"open"` (全画面で本を開いたとき) に読む向きを確かめる形に改めた (§3.3 の r11)。一覧では
-  全画面の操作が使えないので何もしない (§5.3 の文脈の検査)。読む向きの操作が「イベント可」かは
-  §5.1 の確認で決まる。可にならなければ、例を差し替える。
+- r11 の再監査で `FsReadingDirectionToggle` は自由回転解除後の分割sliceの再調整を残すためイベント可にしない。
+  雛形は、印を付けた背景操作へ差し替えた。黒→白はAI高画質化中の2色巡回でも通常の3色巡回でも1回で成立する。
+  不透明画像など、既存の背景操作を受け付けない表示では既存の拒否と通知を保つ。
 
 ### 4.3 公開する状態
 
@@ -699,10 +706,9 @@ VK と動画リングにも consumer が無い。共通のコピー実行関数�
 
 - **「イベント可」の印**は、A のうち「同期に終わる」(§3.3 の r11) と実装担当がコードとテストで確かめた操作にだけ付ける:
   イベントから実行し、同じフレームで基準を取り直した後、ほかの入力が無ければ後のフレームで識別が変わらない操作。
-  (r10 までの基準「識別を変えない」は r11 で置き換えた。下の段 4 の静的監査はその旧基準による。)
-  段4の静的監査では、この見込みのうち読む向き・背景・合わせ方・ピクセルグリッドにも識別を変える経路が見つかった。
-  現在の印は画像4・動画13・一覧21操作。根拠・除外理由と追加回帰（未実行）は
-  [段4引き継ぎ](operation-script-stage4-handoff.md) を参照。雛形の読む向きのイベント例との不一致も未決である。
+  (r10 までの基準「識別を変えない」は r11 で置き換えた。)
+  実装の印は画像7・動画13・一覧21の計41操作。旧基準で除外した背景・pixel grid・演出切替もr11で再監査した。
+  操作別の根拠・除外8操作・回帰の全名と未実施の検証は§16に記す。
 - **実行関数を共用にできない操作は、最初の版から外す** (§5.2)。外したら設計担当へ報告し、表を直す。
   ズーム・列数・コピー・表示の切り替えは共用が現実的。移動・閉じる・見開き・レーティング (絞った場所での
   採用し直し) は、本体に加えて呼び出し元への結果の共用が要る族 (レビュー r2 の見立て)。
@@ -755,7 +761,8 @@ VK と動画リングにも consumer が無い。共通のコピー実行関数�
       `ui_fullscreen.rs:43535`〜`43546` と同じ事実。context・窓・viewport と一覧の世代) と、(2) §3.3 の `"page"` の
       識別 (論理的な場所・表示単位を決める入力の型付きの組・分割ページの左右) の両方 (r9、r8 レビュー P1)。
       (1) だけでは同じ一覧の中のページ移動 (例: 同じフレームに中ボタンへ割り当てた `ImageHome` がその場で移動する、
-      `ui_fullscreen.rs:41994`、`gamepad_input.rs:8830`) を見分けられないため。(2) は §3.3 の検出と同じ関数で作る。
+      `ui_fullscreen.rs:41994`、`gamepad_input.rs:8830`) を見分けられないため。(2) は r11ではscalar生成を§3.3と共用し、
+      段2b側だけに従来のlocation・reader order列を足す（イベントは入れ物・scalar・composition）。
       **(2) の作り方 (2b の実装で確かめ直し、2026-11-25)**: 表示単位の先頭を、組み立て済みの単位から読むことはしない。
       `fullscreen_idx` は単位の先頭とは限らず (例: 縦長 3 枚・左→右・`fullscreen_idx` = 1・ずらしの起点 1 で単位は [1,2]、
       読み方向を変えてずらしが外れると同じ 1 のまま [0,1])、組み立て済みの単位は未準備・失効中のことがあり、組み立て直すと
@@ -1380,10 +1387,154 @@ detached の合意を得た (記録と引用は detached-rework-plan.md §11)。
 
 レビュー担当の確認: 既存の動画の操作 (照合の順序・repeat の条件・早期 return・`NativeVideoKeyOutcome` の分類・egui のシークの順序・音量の保存位置・動画の即時の終了と音楽の終了の要求の違い) に退行は見つからなかった。範囲から外した 2 点の事実認定はコードと合う。テストの修正 (準備の自己デッドロックの解消、メニューの初回の大きさの計算の pass を待つ、コピーの画像限定) は意図を弱めていない。実機 (HWND・IME・HUD、Browser キーと AppCommand の組み合わせ、スクリプト OFF のとき) は未確認で、段 1〜5 をまとめた出荷前の確認で行う。detached の合意を得た (detached-rework-plan.md §11)。
 
-## 16. 段4の作業途中の記録（2026-11-25）
+<a id="operation-script-stage4"></a>
 
-**未完・UI未接続**。on_event評価API、main専用のイベント状態と利用資格・frame受付helper、差分・頻度制限の
-純ロジック、Aの印と回帰を追加した。新しいRust回帰は未実行。既存の軽量鍵だけではreader orderの全変更を
-捕捉できず、OrdinaryListや検索の採用済み場所も既存snapshotだけでは区別できないため、毎フレームの検出・実行は
-接続していない。変更箇所、producerの棚卸し、必要な設計判断、未完事項と検証依頼は
-[段4引き継ぎ](operation-script-stage4-handoff.md) にまとめた。これは独立レビューや段4の受入完了の記録ではない。
+## 16. 段4の実装記録（2026-11-25）
+
+**r11に基づき実装済み、Rustコンパイル・テスト・release計測・実機・独立実装レビューは未実施。**
+利用者の指示によりcargo build/test/check、アプリ起動、コミットを行っていない。確認はbare cargo fmt、
+UI glyph checker、差分の空白確認だけ。新しい受入・review結果やdetachedの実装合意は記録していない。
+
+### 経緯と現在の境界
+
+旧WIPで見つかったreader orderの鍵欠落（visible再構成/DirectMedia finalize）と、current_folder/検索条件の先行更新は、
+§3.3のr10/r11に経緯を保存した。r11はreader orderと一覧の採用場所をイベントから外すため、採用ownerのリワークや
+ad hoc bumpは行わない。旧引き継ぎファイルは要点を本節へ統合して削除した。段2bの要求照合は従来のlocationとO(N)列を保持し、
+`ScriptPageScalars`の生成だけイベントと共用する。
+Automaticのrule_total/item_countも共用のunit sourceで保持し、reader order列を外す際に落とさない。
+
+`events`がbaseline、ROOT累積frame番号u64、直近10起動時刻、起動中1回の超過通知をmain用に持つ。eligible gridでは
+open/pageを無しへ、viewer中はselectを持ち越し、observeとイベント後のfinishの両方で同じ更新を行う。
+初回空一覧はviewだけ。場所を変えてもtyped cursorが同じならselect無し。viewerから戻った際は最後のgrid cursorと比べる。
+同frameの文脈変更やegui再passでも検出は1回で、イベント無しのframeも番号を記録する。利用不可のpassは基準も番号も触らない。
+
+検出は一覧ROOTのキーより前、render_fs_bodyの転送キー/ページ一覧/通常キーより前の1点、native poll_videoの入力処理前。
+既存NativeOverlayInputRoutingのsnapshotを使い、OFF/on_event無しはnative player判定も識別構築も行わない。
+Rhai評価→並び全件validate→許可されたAをslotと同じ実行関数で順に実行→同frame再snapshot。
+入力slotはイベント基準を更新しない。B〜E/印無しAが混ざればprefixも実行しない。10起動/rolling1秒の超過は捨て、予約/再生しない。
+
+構成のbaselineは強いArcを保持。同allocationは定数比較、別allocationはscope/direction/cover/complete/visible pages/overridesの
+意味で比べ、token/prepared rotationsは除く。equalでも新Arcへ進む。AcceptedCompositionProjectionのsemantic値にinterior mutationは無く、
+retained/reply/rotation更新はArc::make_mut経由なので、baseline保持中は別allocationになる（book_composition_runtime.rs:363/372/410/1374）。
+item数に比例する列の複製は検出に入れない。パス/entry文字列の長さと、composition allocationが変わった時の意味比較は別費用。
+`script/event_detect`は識別構築＋比較のms/eventsを記録する。Rhai評価/操作/再snapshotはこの検出区間に含まない。
+既存ignored性能testへN=50,000の変更なしevent識別の構築＋比較（μs）を追加した。新しい計測結果はまだ無い。
+
+### イベント可Aの再監査（41操作、回帰は未実行）
+
+| 操作 | r11の根拠と回帰の範囲 |
+| --- | --- |
+| 画像: ZoomIn/Out、ToggleMetadata、NavigatorToggle | zoom/pan/factor/panel設定だけ。実on_event→sameframe再snapshot→残り実描画→後2frameで識別と再実行無しを確認するheadless test |
+| 画像: BgCycle、PixelGrid | pairing origin解決が起きても同期に吸収。NotInViewの保存基点がget_nav_indicesでResolvedへ進む状態/analysis branchを実イベントで検証し、残りresolverと次frameで再発火無し。loading cacheの到着も別test |
+| 画像: PageTurnAnimationToggle | idleは上の実描画loop。Completing＋解決済continuationはslide既存fixtureを再利用し、no-toggle対照と同じ元operation/target2のみ1回commit、次のpageは元入力起因、その後新規continuation/イベント無しまで進めるtest |
+| 動画13: PlayPause/Mute/VolumeUp/Down/Loop、SeekStart/Back/Forward Small/Medium/Large、SeekStripToggle | cached player/再生設定/stripだけ。position10秒・pause/mute off・volume0.5・loopOffから実イベントを実行し、sameframe再snapshot→poll_video→egui描画（egui経路）→次frameを操作ごとに比較。musicのstripは既存非対応 |
+| 一覧21: ColumnCount1..20、ToggleDetailsView | gridの識別はcontextとtyped cursorのみ。Detailsから実イベントを実行し、visible/detailsの再構成と次frame検出まで確認。段3のdirect/shared parity回帰も引き継ぐ |
+
+| 印を付けないA（8） | 理由 |
+| --- | --- |
+| FsSpreadSingle | Splitのhalf→SingleのFullの再調整が同frame再snapshotより後に残る反例 |
+| FsViewSpread / FsSpreadLtr / FsSpreadLtrCover / FsSpreadRtl / FsSpreadRtlCover | normalize_spread_positionのopenが本の構成の許可へ委譲され得る。既存delegated_book_permission回帰と、各印無しAをイベントで全件拒否する回帰を維持 |
+| FsReadingDirectionToggle / FsFitModeCycle | 自由回転を0にしてSplitを復帰させた後、prepare側のreconcile_fullscreen_page_sliceでFull→halfになる反例 |
+
+1秒10回は安全根拠にしない。雛形は読む向きから、PNGの背景が黒なら白へ1回巡回する印付き例に差替えた。
+これは通常3色/AI高画質化中2色のどちらでも一致する。既存の拒否条件や操作順を変更してイベント可へ合わせることはしていない。
+
+### detached接触と未確認
+
+変更したviewport関数はrender_fullscreen_viewport_with_root_inputのrender_fs_body（検出呼出し1点）だけ。
+App::poll_videoとinput_main_grid_shortcutsに入口を加え、既存operation_script_eligibilityのmain context/表示先/遷移先/入力面の
+判定を再利用する。detached述語・viewport寿命・placement・context取り付け・bundle/swap_field・cleanupは変更していない。
+基準/強いArc/frame/timesはbundle外。既存detached専用testを弱めず、取り付け中・linked F12・遷移中skip、parked sibling、
+main一覧継続の回帰を残す。r11の独立設計合意の履歴は§3.3のまま、今回の実装review結果は未受領なので§11への追記はしない。
+§1.897の転送不具合は直さず、実行に依存するtestも追加しない。hook-before-forwardedの位置保証と、正常キーslot→次frameの
+実handler回帰を分ける。native HWND・IME実機・公開前の入力組合せは段1〜5まとめた確認待ち。
+
+### 検証依頼（ClaudeCodeのrun-heavy用）
+
+- `operation_script`：runtime/contract/loaderと既存grid/native/画像/media/owner/shared/入力phaseの回帰を含む。
+- `ui_fullscreen::page_turn::slide_tests`：今回変更したmoduleの既存演出/continuation回帰を含む。
+- `poll_video`：Appの既存resume/marker等の境界回帰。
+- `perf_operation_script_page_identity --release -- --ignored --nocapture`：旧O(N)識別の計測と、新N=50,000 unchanged event構築＋比較。
+
+全fixtureは同時にsetup_appを二重に作らない。Rust実行・build/check・release実測・実機・独立実装reviewは未実施。
+
+### 追加・更新・継続した回帰の全名（未実行）
+
+`src/app/operation_script_runtime/tests/events.rs`:
+
+- `event_r11_faces_reentry_and_select_baseline_survive_viewer_in_observe_and_finish` (`src/app/operation_script_runtime/tests/events.rs:24`)
+- `event_initial_empty_grid_has_only_view_and_location_changes_do_not_select` (`src/app/operation_script_runtime/tests/events.rs:78`)
+- `event_view_changes_grid_image_video_and_audio_shares_video_context` (`src/app/operation_script_runtime/tests/events.rs:95`)
+- `event_r11_container_is_item_only_for_folders_pdf_epub_nested_and_converted_zip` (`src/app/operation_script_runtime/tests/events.rs:122`)
+- `event_nonviewer_row_variants_have_no_fabricated_book_container` (`src/app/operation_script_runtime/tests/events.rs:214`)
+- `event_r11_open_ignores_zip_subfolders_and_pending_source_but_follows_item_containers` (`src/app/operation_script_runtime/tests/events.rs:263`)
+- `event_nested_container_appends_literal_entry_without_host_path_replacement` (`src/app/operation_script_runtime/tests/events.rs:312`)
+- `event_and_slot_invocations_publish_the_same_item_container_book_path` (`src/app/operation_script_runtime/tests/events.rs:335`)
+- `event_r11_pdf_pages_halves_and_unit_scalars_fire_but_reader_order_does_not` (`src/app/operation_script_runtime/tests/events.rs:365`)
+- `event_composition_strong_arc_memo_semantics_and_equal_republication` (`src/app/operation_script_runtime/tests/events.rs:418`)
+- `event_runtime_grid_executes_before_keys_once_and_inputs_still_change_next_frame` (`src/app/operation_script_runtime/tests/events.rs:501`)
+- `event_grid_actual_key_slot_navigation_is_observed_only_next_frame` (`src/app/operation_script_runtime/tests/events.rs:531`)
+- `event_runtime_rejects_entire_mixed_batch_and_never_publishes_success_notice` (`src/app/operation_script_runtime/tests/events.rs:579`)
+- `event_runtime_rate_limit_drops_batches_notifies_once_and_does_not_replay` (`src/app/operation_script_runtime/tests/events.rs:600`)
+- `event_detection_cache_misses_do_not_read_rating_or_tag_databases` (`src/app/operation_script_runtime/tests/events.rs:649`)
+- `event_limit_is_rolling_ten_attempts_and_notification_is_lifetime_once` (`src/app/operation_script_runtime/tests/events.rs:662`)
+- `event_rate_drop_advances_baseline_and_never_queues_a_late_replay` (`src/app/operation_script_runtime/tests/events.rs:700`)
+- `event_detection_off_absent_loading_and_failed_do_not_claim_the_frame` (`src/app/operation_script_runtime/tests/events.rs:734`)
+- `event_detection_mounted_context_and_linked_detached_skip_without_touching_main_owner` (`src/app/operation_script_runtime/tests/events.rs:759`)
+- `event_detection_linked_f12_and_transition_skip_viewer_but_main_list_continues` (`src/app/operation_script_runtime/tests/events.rs:793`)
+- `event_detection_edit_and_page_overview_coalesce_after_exit` (`src/app/operation_script_runtime/tests/events.rs:821`)
+- `event_detection_native_overlay_uses_existing_snapshot_and_does_not_claim_blocked_frame` (`src/app/operation_script_runtime/tests/events.rs:875`)
+- `event_native_poll_video_hook_executes_and_overlay_snapshot_blocks_before_evaluation` (`src/app/operation_script_runtime/tests/events.rs:896`)
+- `event_safe_grid_actions_preserve_all_four_identity_components_even_from_details` (`src/app/operation_script_runtime/tests/events.rs:927`)
+- `event_safe_video_actions_preserve_all_four_identity_components_for_native_and_music` (`src/app/operation_script_runtime/tests/events.rs:963`)
+
+`src/ui_fullscreen/operation_script_event_tests.rs`:
+
+- `operation_script_event_safe_images_resnapshot_then_real_draw_and_later_frames_stay_stable` (`src/ui_fullscreen/operation_script_event_tests.rs:58`)
+- `operation_script_event_background_and_analysis_pixel_absorb_unresolved_anchor_synchronously` (`src/ui_fullscreen/operation_script_event_tests.rs:121`)
+- `operation_script_event_loading_cache_arrival_does_not_retrigger_safe_a` (`src/ui_fullscreen/operation_script_event_tests.rs:174`)
+- `operation_script_event_direction_fit_and_single_have_late_slice_counterexamples` (`src/ui_fullscreen/operation_script_event_tests.rs:201`)
+- `operation_script_event_embedded_detection_precedes_normal_key_and_slot_change_fires_next_frame` (`src/ui_fullscreen/operation_script_event_tests.rs:245`)
+- `operation_script_event_child_pass_uses_child_text_focus_and_root_frame_number` (`src/ui_fullscreen/operation_script_event_tests.rs:281`)
+- `operation_script_event_hook_is_before_forwarded_overview_and_normal_key_paths` (`src/ui_fullscreen/operation_script_event_tests.rs:346`)
+
+`src/ui_fullscreen/page_turn/slide_tests.rs`:
+
+- `operation_script_event_animation_toggle_commits_only_original_input_once_with_control` (`src/ui_fullscreen/page_turn/slide_tests.rs:23`)
+
+`operation_script::contract::tests::validation_rejects_events_without_audited_mark`、
+`validation_event_mark_inventory_and_mixed_batches_are_atomic`、
+`operation_script::loader::tests::default_script_evaluates_slots_and_every_example`（イベント出力の検証を含む）、
+`app::operation_script_runtime::tests::page_identity_perf::perf_operation_script_page_identity`（ignoredのrelease計測）も更新した。
+
+### 変更ファイルと入口（file:line）
+
+| ファイル・行 | 変更内容 |
+| --- | --- |
+| `src/app/operation_script_runtime/events.rs:21` | typed itemだけによる入れ物導出。nested entryはhost pathのjoinを使わずliteralに連結 |
+| `src/app/operation_script_runtime/events.rs:86` | main専用owner。`observe:120` / `finish_event:150`の面別基準更新、rolling上限 |
+| `src/app/operation_script_runtime/events.rs:180` | OFF/受け口無しのcheap gate、`begin_operation_script_event_detection:219`の既存eligibility＋ROOT frame番号 |
+| `src/app/operation_script_runtime/events.rs:238` | 検出・費用記録・全件検証・同期実行・再snapshot |
+| `src/app/operation_script_runtime.rs:273` | 共用scalar型。`operation_script_page_identity:632`は段2b用O(N)列を維持、`operation_script_unit_source:646` / `operation_script_page_scalars:658`を共用 |
+| `src/app/operation_script_runtime.rs:823` | viewerのbook.path/kindをslot/event共通の入れ物へ。`execute_operation_script_action:976`は既存実行分岐を共用 |
+| `src/app/update_phases.rs:918` | 一覧ROOTのキー処理前の入口 |
+| `src/ui_fullscreen.rs:28980` | `render_fullscreen_viewport_with_root_input`内render_fs_bodyの入口1点。既存転送/overview/通常キーの順は保持 |
+| `src/app.rs:102905` | `App::poll_video`のnative入口。既存overlay snapshotによる受付を再利用 |
+| `src/operation_script/contract.rs:93` | r11イベント可41操作と印無し8操作。検証回帰は`:605` / `:643` |
+| `assets/operation_scripts.default.rhai:20` | 黒背景のPNGをopenで白へ巡回する例 |
+| `src/operation_script/loader.rs:342` | 雛形の実評価とイベント出力検証 |
+| `src/app/operation_script_runtime/tests/events.rs:24` | r11識別・実入口・上限・eligibility・detached・同期Aの回帰（各名は上記） |
+| `src/ui_fullscreen/operation_script_event_tests.rs:58` | 新規headless実描画回帰。module登録は`src/ui_fullscreen.rs:105836` |
+| `src/ui_fullscreen/page_turn/slide_tests.rs:23` | 完了待ちと元continuationのexactly-onceをno-toggle対照と比較する回帰 |
+| `src/app/operation_script_runtime/tests/page_identity_perf.rs:249` | 既存ignored性能testへ変更なしevent構築＋比較のμs行を追加 |
+| `docs/operation-script-plan.md:546` / `:1392` | 入れ物の物理/論理対応表と本実装記録。旧`docs/operation-script-stage4-handoff.md`を統合・削除 |
+| `docs/ui-responsiveness.md:44` | 検出の費用境界・既存計測と今回未計測の区別 |
+| `docs/architecture-overview.md:24` / `docs/README.md:11` | main owner/owned pass/scalar＋strong Arcの構造と段1〜4実装・段5未着手の索引 |
+
+### 実行した軽量確認
+
+- 実装担当: bare `cargo fmt`はexit 0。`--check`・build/test/checkは指示により実行していない。
+- 本セッションのソース調査担当: `python scripts/check_ui_glyphs.py`はexit 0、`ok: no dangerous glyphs found in UI strings.`。
+  結果を再利用し、その後UI文字列は変更していない。
+- `git diff --check`と新規testファイルの空白確認を実施。削除した旧handoffへの参照残りも検索した。
+  Rustの型確認・回帰の成否・実測値・実機結果・独立実装reviewはこの確認に含まれない。
