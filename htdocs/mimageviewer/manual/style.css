@@ -431,6 +431,10 @@ footer a { color: #aaa; }
   box-shadow: 0 1px 6px rgba(0,0,0,0.07);
 }
 .tut-shot img { display: block; width: 100%; height: auto; }
+/* 本文の幅より小さな切り出し (メニュー・窓など) は原寸で中央に置き、本文の幅まで引き伸ばさない。
+   枠と説明は本文の幅のままにして、説明が細い列で折り返さないようにする */
+.tut-shot.tut-shot-natural { background: #f4f4f6; }
+.tut-shot.tut-shot-natural img { width: auto; max-width: calc(100% - 2rem); margin: 1rem auto; }
 .tut-shot figcaption {
   font-size: 0.8rem;
   color: #888;
