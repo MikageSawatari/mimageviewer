@@ -563,6 +563,11 @@ r10 の独立設計レビュー (2026-11-25、GPT-6 Astra / medium、read-only�
 - 引き継ぎ文書 [operation-script-stage4-handoff.md](operation-script-stage4-handoff.md) の「必要な設計判断 1・2」は、
   r11 で読み手の順と採用の場所をイベントの識別から外したので、不要になった。
 
+r11 の独立設計レビュー (2026-11-25、GPT-6 Astra / medium、read-only、r10 と同じ会話の続き、対象 cef65dac0): **ACCEPT WITH CHANGES**
+(P1 なし)。r10 の P2 2 件は解消。P2 `s.book.path` を入れ物の導出と揃える、P3 ZIP の入れ物の規則を確定する、P3 文書の旧記述の残り。
+どれも上の箇条と §3.3 の表・§4.3・§5.1・§10 に反映した (f8da1d181)。detached の合意は保てる (レビュー担当の言葉:「機能の所有範囲を
+定める構造的な決定であり、症状パッチではないと明示的に同意します」)。
+
 ---
 
 ## 4. スクリプトの形と公開する状態
