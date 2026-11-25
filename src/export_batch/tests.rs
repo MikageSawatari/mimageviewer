@@ -542,6 +542,99 @@ fn template_ext_padding_datetime_and_unknown_tokens() {
 }
 
 #[test]
+fn filename_preview_trailing_ext_uses_output_format_once() {
+    let path = Path::new("src/01_exif_ifd1.jpg");
+    let mut source = file_item(path, &crate::capture::basename_for_path(path));
+    source.dirname = "src".into();
+    for (kind, expected) in [
+        (BatchFormatKind::SameAsSource, "src_01_exif_ifd1_001.jpg"),
+        (BatchFormatKind::Png, "src_01_exif_ifd1_001.png"),
+    ] {
+        let format = BatchFormat {
+            kind,
+            ..Default::default()
+        };
+        let name = format!(
+            "{}.{}",
+            preview_item_stem("<dirname>_<filename>_<num:3>.<ext>", &source, 1),
+            format.resolve(&source.source_ext).extension()
+        );
+        assert_eq!(name, expected);
+    }
+}
+
+#[test]
+fn worker_trailing_ext_writes_single_output_extension() {
+    let temp = tempfile::tempdir().unwrap();
+    let source_dir = temp.path().join("src");
+    std::fs::create_dir(&source_dir).unwrap();
+    let path = source_dir.join("01_exif_ifd1.jpg");
+    image::RgbImage::from_pixel(2, 2, image::Rgb([30, 60, 90]))
+        .save(&path)
+        .unwrap();
+    let mut source = file_item(&path, &crate::capture::basename_for_path(&path));
+    source.dirname = "src".into();
+    let directory = temp.path().join("out");
+    let mut options = options(&directory);
+    options.template = "<dirname>_<filename>_<num:3>.<ext>".into();
+    options.format.kind = BatchFormatKind::SameAsSource;
+    let events = run(options, vec![source]);
+    assert_eq!(
+        completed_paths(&events),
+        vec![directory.join("src_01_exif_ifd1_001.jpg")]
+    );
+    let names: Vec<_> = std::fs::read_dir(&directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(
+        names,
+        vec![std::ffi::OsString::from("src_01_exif_ifd1_001.jpg")]
+    );
+    assert!(!directory.join("src_01_exif_ifd1_001.jpg.jpg").exists());
+}
+
+#[test]
+fn template_only_strips_literal_trailing_dot_ext_before_expansion() {
+    for (template, expected) in [
+        ("<filename>.<ext>", "photo"),
+        ("<filename>.<EXT>", "photo.<EXT>"),
+        ("<filename>.<ext> ", "photo.jpg "),
+        ("<filename>.jpg", "photo.jpg"),
+    ] {
+        assert_eq!(
+            expand_template(template, "photo", "src", "jpg", 1, None),
+            expected
+        );
+    }
+    assert_eq!(
+        expand_filename_template("<dirname>_<filename>_<num:3>.<ext>", "photo", "src", 1),
+        "src_photo_001"
+    );
+    assert_eq!(
+        expand_template("<filename>", "photo.<ext>", "src", "jpg", 1, None),
+        "photo.<ext>"
+    );
+}
+
+#[test]
+fn filename_preview_nontrailing_ext_keeps_source_extension() {
+    let source = file_item(Path::new("src/photo.jpg"), "photo");
+    let format = BatchFormat {
+        kind: BatchFormatKind::Png,
+        ..Default::default()
+    };
+    assert_eq!(
+        format!(
+            "{}.{}",
+            preview_item_stem("<filename>_<ext>", &source, 1),
+            format.resolve(&source.source_ext).extension()
+        ),
+        "photo_jpg.png"
+    );
+}
+
+#[test]
 fn filename_preview_keeps_deferred_dates_without_source_io_or_marker_collisions() {
     let mut source = item("shot", "trip");
     source.source_ext = "jpg".into();

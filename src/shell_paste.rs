@@ -15,10 +15,88 @@ pub(crate) enum ShellPasteError {
 
 pub(crate) type ShellPasteResult = Result<(), ShellPasteError>;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ShellPasteCompletion {
+    pub(crate) invocation: ShellPasteResult,
+}
+
+/// Read-only foreground facts sampled immediately after InvokeCommand returns.
+pub(crate) struct ForegroundSnapshot {
+    pub(crate) main_thread: u32,
+    pub(crate) current_process: u32,
+    pub(crate) foreground_hwnd: isize,
+    pub(crate) foreground_thread: u32,
+    pub(crate) foreground_process: u32,
+    pub(crate) root_owner_hwnd: isize,
+    pub(crate) foreground_visible: bool,
+    pub(crate) main_enabled: bool,
+}
+
+/// No activation or window mutation operation is exposed by this adapter.
+pub(crate) trait ForegroundApi {
+    fn started_from_main(&self, main_hwnd: isize) -> bool;
+    fn snapshot(&self, main_hwnd: isize) -> ForegroundSnapshot;
+    fn class_name(&self, hwnd: isize) -> String;
+
+    fn diagnostics_enabled(&self) -> bool {
+        crate::perf::is_enabled()
+    }
+
+    fn emit_after_invoke(&self, kind: &'static str, fields: &[(&str, serde_json::Value)]) {
+        crate::perf::event("shell_paste", kind, None, 0, fields);
+    }
+}
+
+fn before_invoke(main_hwnd: isize, api: &dyn ForegroundApi) -> Option<bool> {
+    api.diagnostics_enabled()
+        .then(|| api.started_from_main(main_hwnd))
+}
+
+fn after_invoke(main_hwnd: isize, started_from_main: Option<bool>, api: &dyn ForegroundApi) {
+    let Some(started_from_main) = started_from_main else {
+        return;
+    };
+    let snapshot = api.snapshot(main_hwnd);
+    let has_foreground = snapshot.foreground_hwnd != 0;
+    api.emit_after_invoke(
+        "foreground_after_invoke",
+        &[
+            ("started_from_main", started_from_main.into()),
+            (
+                "foreground_class",
+                api.class_name(snapshot.foreground_hwnd).into(),
+            ),
+            (
+                "root_owner_class",
+                api.class_name(snapshot.root_owner_hwnd).into(),
+            ),
+            (
+                "root_owner_is_main",
+                (snapshot.root_owner_hwnd == main_hwnd).into(),
+            ),
+            ("foreground_visible", snapshot.foreground_visible.into()),
+            ("main_enabled", snapshot.main_enabled.into()),
+            ("foreground_is_null", (!has_foreground).into()),
+            (
+                "same_thread",
+                has_foreground
+                    .then_some(snapshot.foreground_thread == snapshot.main_thread)
+                    .into(),
+            ),
+            (
+                "same_process",
+                has_foreground
+                    .then_some(snapshot.foreground_process == snapshot.current_process)
+                    .into(),
+            ),
+        ],
+    );
+}
+
 pub(crate) struct ShellPasteService {
     state: ServiceState,
     #[cfg(test)]
-    test_invoker: Option<TestInvoker>,
+    test_invoker: Option<(TestInvoker, Box<dyn ForegroundApi + Send>)>,
 }
 
 enum ServiceState {
@@ -40,12 +118,12 @@ struct PasteRequest {
 
 /// Wake even on worker unwind/disconnection, after closing the result sender.
 struct Completion {
-    sender: Option<mpsc::Sender<ShellPasteResult>>,
+    sender: Option<mpsc::Sender<ShellPasteCompletion>>,
     ctx: egui::Context,
 }
 
 impl Completion {
-    fn finish(mut self, result: ShellPasteResult) {
+    fn finish(mut self, result: ShellPasteCompletion) {
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(result);
         }
@@ -75,7 +153,7 @@ impl ShellPasteService {
         hwnd: isize,
         folder: PathBuf,
         ctx: egui::Context,
-    ) -> Result<mpsc::Receiver<ShellPasteResult>, String> {
+    ) -> Result<mpsc::Receiver<ShellPasteCompletion>, String> {
         if matches!(self.state, ServiceState::NotStarted) {
             self.state = match self.start_worker() {
                 Ok(endpoint) => ServiceState::Running(endpoint),
@@ -105,14 +183,20 @@ impl ShellPasteService {
 
     fn start_worker(&mut self) -> Result<Endpoint, String> {
         #[cfg(test)]
-        if let Some(mut invoke) = self.test_invoker.take() {
+        if let Some((mut invoke, foreground)) = self.test_invoker.take() {
             let (sender, receiver) = mpsc::channel::<PasteRequest>();
             std::thread::Builder::new()
                 .name("shell-paste-test".into())
                 .spawn(move || {
                     while let Ok(request) = receiver.recv() {
-                        let result = invoke(request.hwnd, &request.folder);
-                        request.completion.finish(result);
+                        let result = crate::native_context_menu::with_invocation_observers(
+                            || before_invoke(request.hwnd, foreground.as_ref()),
+                            || invoke(request.hwnd, &request.folder),
+                            |started| after_invoke(request.hwnd, started, foreground.as_ref()),
+                        );
+                        request
+                            .completion
+                            .finish(ShellPasteCompletion { invocation: result });
                     }
                 })
                 .map_err(|error| format!("Could not start Shell paste worker: {error}"))?;
@@ -129,9 +213,17 @@ impl ShellPasteService {
     pub(crate) fn with_test_invoker(
         invoker: impl FnMut(isize, &std::path::Path) -> ShellPasteResult + Send + 'static,
     ) -> Self {
+        Self::with_test_invoker_and_foreground(invoker, NoDiagnosticsForTest)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_invoker_and_foreground(
+        invoker: impl FnMut(isize, &std::path::Path) -> ShellPasteResult + Send + 'static,
+        foreground: impl ForegroundApi + Send + 'static,
+    ) -> Self {
         Self {
             state: ServiceState::NotStarted,
-            test_invoker: Some(Box::new(invoker)),
+            test_invoker: Some((Box::new(invoker), Box::new(foreground))),
         }
     }
 }
@@ -152,6 +244,25 @@ impl Drop for ShellPasteService {
 
 #[cfg(test)]
 type TestInvoker = Box<dyn FnMut(isize, &std::path::Path) -> ShellPasteResult + Send + 'static>;
+
+#[cfg(test)]
+struct NoDiagnosticsForTest;
+
+#[cfg(test)]
+impl ForegroundApi for NoDiagnosticsForTest {
+    fn diagnostics_enabled(&self) -> bool {
+        false
+    }
+    fn started_from_main(&self, _: isize) -> bool {
+        panic!("diagnostics disabled")
+    }
+    fn snapshot(&self, _: isize) -> ForegroundSnapshot {
+        panic!("diagnostics disabled")
+    }
+    fn class_name(&self, _: isize) -> String {
+        panic!("diagnostics disabled")
+    }
+}
 
 #[derive(Clone)]
 struct WakeEvent {
@@ -195,16 +306,69 @@ mod native {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::sync::Arc;
     use windows::Win32::{
-        Foundation::{HANDLE, WAIT_FAILED},
+        Foundation::{HANDLE, HWND, WAIT_FAILED},
         System::{
             Ole::{OleInitialize, OleUninitialize},
-            Threading::{CreateEventW, INFINITE},
+            Threading::{CreateEventW, GetCurrentProcessId, INFINITE},
         },
-        UI::WindowsAndMessaging::{
-            DispatchMessageW, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
-            TranslateMessage, WM_QUIT,
+        UI::{
+            Input::KeyboardAndMouse::IsWindowEnabled,
+            WindowsAndMessaging::{
+                DispatchMessageW, GA_ROOTOWNER, GetAncestor, GetClassNameW, GetForegroundWindow,
+                GetWindowThreadProcessId, IsWindow, IsWindowVisible, MSG,
+                MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT, TranslateMessage,
+                WM_QUIT,
+            },
         },
     };
+
+    struct NativeForeground;
+
+    impl ForegroundApi for NativeForeground {
+        fn started_from_main(&self, main_hwnd: isize) -> bool {
+            unsafe { GetForegroundWindow() }.0 as isize == main_hwnd
+        }
+
+        fn snapshot(&self, main_hwnd: isize) -> ForegroundSnapshot {
+            let foreground = unsafe { GetForegroundWindow() };
+            let main = HWND(main_hwnd as *mut _);
+            let main_valid = unsafe { IsWindow(Some(main)) }.as_bool();
+            let main_thread = if main_valid {
+                unsafe { GetWindowThreadProcessId(main, None) }
+            } else {
+                0
+            };
+            let mut foreground_process = 0;
+            let foreground_thread = if foreground.0.is_null() {
+                0
+            } else {
+                unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_process)) }
+            };
+            ForegroundSnapshot {
+                main_thread,
+                current_process: unsafe { GetCurrentProcessId() },
+                foreground_hwnd: foreground.0 as isize,
+                foreground_thread,
+                foreground_process,
+                root_owner_hwnd: if foreground.0.is_null() {
+                    0
+                } else {
+                    unsafe { GetAncestor(foreground, GA_ROOTOWNER) }.0 as isize
+                },
+                foreground_visible: unsafe { IsWindowVisible(foreground) }.as_bool(),
+                main_enabled: unsafe { IsWindowEnabled(main) }.as_bool(),
+            }
+        }
+
+        fn class_name(&self, foreground_hwnd: isize) -> String {
+            if foreground_hwnd == 0 {
+                return "<none>".into();
+            }
+            let mut name = [0_u16; 256];
+            let len = unsafe { GetClassNameW(HWND(foreground_hwnd as *mut _), &mut name) };
+            String::from_utf16_lossy(&name[..len.max(0) as usize])
+        }
+    }
 
     struct OleSta;
 
@@ -238,9 +402,9 @@ mod native {
                 let message = format!("Shell paste OLE initialization failed: {error}");
                 // Never retry initialization, and never call Shell without OLE.
                 while let Ok(request) = receiver.recv() {
-                    request
-                        .completion
-                        .finish(Err(ShellPasteError::Start(message.clone())));
+                    request.completion.finish(ShellPasteCompletion {
+                        invocation: Err(ShellPasteError::Start(message.clone())),
+                    });
                 }
                 return;
             }
@@ -265,9 +429,13 @@ mod native {
                         request.hwnd,
                         &request.folder,
                         crate::native_context_menu::ShellClipboardVerb::Paste,
+                        || before_invoke(request.hwnd, &NativeForeground),
+                        |started| after_invoke(request.hwnd, started, &NativeForeground),
                     )
                     .map_err(ShellPasteError::Invocation);
-                    request.completion.finish(result);
+                    request
+                        .completion
+                        .finish(ShellPasteCompletion { invocation: result });
                     continue;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => return,
@@ -311,7 +479,10 @@ mod tests {
             let result = service
                 .submit(42, folder.into(), egui::Context::default())
                 .unwrap();
-            assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+            assert_eq!(
+                result.recv_timeout(Duration::from_secs(5)).unwrap(),
+                ShellPasteCompletion { invocation: Ok(()) }
+            );
         }
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
@@ -340,7 +511,31 @@ mod tests {
         release.send(()).unwrap();
         assert_eq!(
             result.recv_timeout(Duration::from_secs(5)).unwrap(),
-            Err(ShellPasteError::Invocation("expected failure".into()))
+            ShellPasteCompletion {
+                invocation: Err(ShellPasteError::Invocation("expected failure".into())),
+            }
         );
+    }
+
+    #[test]
+    fn shell_paste_has_no_foreground_mutation_path() {
+        let worker = include_str!("shell_paste.rs");
+        let handlers = include_str!("app/main_drop.rs");
+        let bridge = include_str!("native_context_menu.rs");
+        // Split tokens keep this source check from matching its own assertions.
+        for forbidden in [
+            ["Set", "ForegroundWindow"].concat(),
+            ["set_", "foreground"].concat(),
+            ["Attach", "ThreadInput"].concat(),
+            ["AllowSet", "ForegroundWindow"].concat(),
+        ] {
+            for (name, source) in [
+                ("worker", worker),
+                ("handler", handlers),
+                ("bridge", bridge),
+            ] {
+                assert!(!source.contains(&forbidden), "{name} contains {forbidden}");
+            }
+        }
     }
 }
