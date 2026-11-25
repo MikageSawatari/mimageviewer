@@ -422,7 +422,7 @@ fn operation_script_media_music_capture_refusal_stops_before_notice() {
         assert!(
             app.fs_feedback_toast
                 .as_ref()
-                .is_some_and(|(text, _)| text.contains("実行できませんでした"))
+                .is_some_and(|(text, _, _)| text.contains("実行できませんでした"))
         );
         crate::key_input::clear_test_frame();
     }
