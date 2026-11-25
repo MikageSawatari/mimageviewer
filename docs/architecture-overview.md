@@ -17,7 +17,8 @@ wire と永続形式、detached の述語・viewport・窓の寿命は変更し�
 `external_links` は型付き `AiAppLink` の固定 URL（新しい会話と Codex の設定）も既存の外部リンク worker で開く。
 Web の AI は同じ worker で案内の文をコピーし、共通の App 受信口へ結果を送ってからページを開く。
 画像コピーと共有する書き込み手順が、OpenClipboard 後・EmptyClipboard 前に mIV と OS の世代を照合する。
-自動検証・実行時の挙動は未確認。共有 runner とサブ PC で確認予定。
+項目は登録済みのアプリの分だけ出し、1 つでもあれば Web の AI と始め方は出さない (利用者の決定)。
+関連の自動テストは通過、実行時の挙動は未確認 (サブ PC で確認予定)。
 詳細は [設計書](ask-ai-help-plan.md)。
 
 ## AI による使い方案内と設定・お気に入りの変更（§1.843）
