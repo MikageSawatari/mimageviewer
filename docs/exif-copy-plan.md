@@ -1,6 +1,8 @@
 # §1.889 閲覧中の画像の EXIF をまとめてクリップボードへコピーする
 
-状態: 設計 (2026-11-25、設計担当 ClaudeCode Opus)。実装・実機確認はこれから。
+状態: 設計 (2026-11-25、設計担当 ClaudeCode Opus)。設計の独立レビュー (gpt-6.1-sol / xhigh): r1 REJECT (P1 1・P2 2) →
+r2 ACCEPT with changes (P2 1・P3 1) → r3 ACCEPT with changes (P3 1、文書の整合だけ)。各回の指摘は本書に反映済み
+(r3 の P3 は設計担当が反映し、再レビューは受けていない)。実装・実機確認はこれから。
 要件の正本は [バックログ §1.889](next-release-backlog.md)。
 
 ## 1. 範囲
@@ -86,7 +88,7 @@
   `trigger()` = `Press`、`default_chords()` = 空、`ALL_ACTIONS` に `FsCopyImage` の近くで追加。
   `docs/keymap.ini.default` に `# FsCopyExif = none ; EXIF をテキストでコピー` を足す。
 - 受付は既存のコピー 5 種と同じ位置・同じ条件 (`ui_fullscreen.rs` の `handle_copy_action_keys(ctx, true)` の呼び出しと同じ
-  `!current_item_is_video && !fs_music_view_active && fs_context_menu_idx.is_none()`) にし、`consume_action_no_repeat` で消費する。
+  `!current_item_is_video && !fs_music_view_active && fs_context_menu_idx.is_none()`) にし、`consume_action_press` で消費する (下の「OS の Copy イベントとの関係」)。
   `handle_copy_action_keys` は右クリックメニューのコマンドへ流す関数なので、そこへは混ぜず、隣に別の 1 行を置く
   (メニュー項目を持たない操作のため)。
 - 文字入力中・IME・モーダル・ページ一覧などの既存の入力所有の判定は、その位置より前の既存の gate をそのまま通る。
@@ -107,7 +109,8 @@
     新しい保持状態は足さない。ラベル選択のコピーがその pass の終わりにイベントを読む前に取り除かれることを、
     実装担当が egui のコードと pass の順序 (情報パネルの描画とキー処理の前後) で確かめる。順序の都合で取り除けない場合は、
     実装を止めて設計担当へ返す。
-  - `FsCopyExif` が Ctrl+C 以外 (例 Ctrl+Shift+E) なら `Event::Copy` は出ないので、取り除くものはない。
+  - 割り当てたキーにかかわらず (Ctrl+C・Ctrl+Insert・Ctrl+X・Shift+Delete など、どのキーが Copy / Cut を出すかに依存しない)、
+    消費した初回・repeat の pass では `Event::Copy` / `Event::Cut` を取り除く。
   - テストは、`Event::Copy` と key の押下を同じ pass に入れ、ラベル選択がある状態で、pass 全体の最終出力の `CopyText` が
     EXIF 全文の 1 つだけであることを確かめる。続けて別の pass で repeat (`Event::Copy` 付き) を入れ、`CopyText` が
     1 つも出ない (ラベルの選択文字列も出ない) こと、通知が増えないことを確かめる。Ctrl+X に割り当てて `Event::Cut` でも同じ。
