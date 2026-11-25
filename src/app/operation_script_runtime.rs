@@ -15,6 +15,9 @@ use crate::operation_script::{
 use crate::ui_fullscreen::{FsKeyAction, FsKeyPageTransition};
 use crate::ui_main::AddressBarNav;
 
+mod events;
+pub(crate) use events::OperationScriptEvents;
+
 pub(crate) const MAIN_WINDOW_ONLY_NOTICE: &str = "この操作はメインウィンドウでのみ使用できます";
 pub(crate) const SCRIPT_SLOT_ACTIONS: [KeyAction; 20] = [
     KeyAction::ScriptSlot1,

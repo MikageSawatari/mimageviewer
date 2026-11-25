@@ -3,6 +3,7 @@ use super::*;
 use crate::app::tests::phase_c_support::{AppTestEnv, setup_app};
 use crate::operation_script::CompiledOperationScript;
 
+mod events;
 mod page_identity_perf;
 
 fn ready(body: &str) -> OperationScriptState {

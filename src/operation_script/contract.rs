@@ -81,12 +81,59 @@ macro_rules! operations {
             $($(AllowedOperation {
                 action: KeyAction::$action,
                 kind: OperationKind::$kind,
-                // 段4で識別を変えないことをコードとテストで確かめてから付ける。
-                event_allowed: false,
+                event_allowed: event_allowed_action(KeyAction::$action),
                 contexts: ScriptContexts::$contexts,
             },)*)*
         ];
     };
+}
+
+/// Audited against the context-specific open/view/page/select identities (§3.3).
+/// Spread/direction/animation change the page tuple; they intentionally stay input-only.
+/// Grid actions change layout/order, but neither its location nor cursor item.
+const fn event_allowed_action(action: KeyAction) -> bool {
+    use KeyAction::*;
+    matches!(
+        action,
+        FsZoomIn
+            | FsZoomOut
+            | FsToggleMetadata
+            | FsNavigatorToggle
+            | VideoPlayPause
+            | VideoMute
+            | VideoVolumeUp
+            | VideoVolumeDown
+            | VideoLoop
+            | VideoSeekStart
+            | VideoSeekBackSmall
+            | VideoSeekForwardSmall
+            | VideoSeekBackMedium
+            | VideoSeekForwardMedium
+            | VideoSeekBackLarge
+            | VideoSeekForwardLarge
+            | VideoSeekStripToggle
+            | GridColumnCount1
+            | GridColumnCount2
+            | GridColumnCount3
+            | GridColumnCount4
+            | GridColumnCount5
+            | GridColumnCount6
+            | GridColumnCount7
+            | GridColumnCount8
+            | GridColumnCount9
+            | GridColumnCount10
+            | GridColumnCount11
+            | GridColumnCount12
+            | GridColumnCount13
+            | GridColumnCount14
+            | GridColumnCount15
+            | GridColumnCount16
+            | GridColumnCount17
+            | GridColumnCount18
+            | GridColumnCount19
+            | GridColumnCount20
+            | GridToggleDetailsView
+    )
 }
 
 // KeyAction の全件から推測して許可しない。この表への明示追加だけで公開する。
@@ -554,7 +601,12 @@ mod tests {
     #[test]
     fn validation_rejects_events_without_audited_mark() {
         for name in [
+            "FsSpreadLtr",
+            "FsReadingDirectionToggle",
+            "FsFitModeCycle",
             "FsBgCycle",
+            "FsPixelGrid",
+            "FsPageTurnAnimationToggle",
             "FsPageNext",
             "FsClose",
             "RatingItem3",
@@ -567,7 +619,83 @@ mod tests {
                 Err(ValidationError::EventNotAllowed { .. })
             ));
         }
-        assert!(ALLOWED_OPERATIONS.iter().all(|op| !op.event_allowed));
+        for operation in ALLOWED_OPERATIONS {
+            if operation.event_allowed {
+                assert_eq!(operation.kind, OperationKind::A);
+                for context in [
+                    ScriptContext::Grid,
+                    ScriptContext::FsImage,
+                    ScriptContext::FsVideo,
+                ] {
+                    if operation.contexts.contains(context) {
+                        let mut scope = scope(context);
+                        scope.invocation = ScriptInvocation::Event;
+                        assert!(
+                            validate_output(output(&[operation.action.ini_name()]), scope).is_ok()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn validation_event_mark_inventory_and_mixed_batches_are_atomic() {
+        assert_eq!(
+            ALLOWED_OPERATIONS
+                .iter()
+                .filter(|op| op.event_allowed)
+                .count(),
+            38
+        );
+        let excluded_a = ALLOWED_OPERATIONS
+            .iter()
+            .filter(|op| op.kind == OperationKind::A && !op.event_allowed)
+            .map(|op| op.action)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            excluded_a,
+            [
+                KeyAction::FsSpreadSingle,
+                KeyAction::FsViewSpread,
+                KeyAction::FsSpreadLtr,
+                KeyAction::FsSpreadLtrCover,
+                KeyAction::FsSpreadRtl,
+                KeyAction::FsSpreadRtlCover,
+                KeyAction::FsReadingDirectionToggle,
+                KeyAction::FsBgCycle,
+                KeyAction::FsFitModeCycle,
+                KeyAction::FsPixelGrid,
+                KeyAction::FsPageTurnAnimationToggle,
+            ]
+        );
+        for op in ALLOWED_OPERATIONS.iter().filter(|op| !op.event_allowed) {
+            for context in [
+                ScriptContext::Grid,
+                ScriptContext::FsImage,
+                ScriptContext::FsVideo,
+            ] {
+                if !op.contexts.contains(context) {
+                    continue;
+                }
+                let safe = match context {
+                    ScriptContext::Grid => "GridColumnCount3",
+                    ScriptContext::FsImage => "FsNavigatorToggle",
+                    ScriptContext::FsVideo => "VideoMute",
+                };
+                let mut scope = scope(context);
+                scope.invocation = ScriptInvocation::Event;
+                // Validation returns no executable prefix, even after a safe A.
+                assert!(
+                    matches!(
+                        validate_output(output(&[safe, op.action.ini_name()]), scope),
+                        Err(ValidationError::EventNotAllowed { .. })
+                    ),
+                    "{:?}",
+                    op.action
+                );
+            }
+        }
     }
 
     #[test]

@@ -41,6 +41,19 @@ AppのROOT passは起動要求と `try_recv`、世代の照合だけを行い、
 snapshotを読む。操作は既存のキー実行関数と保存・シーク・キャプチャworker受付を共有し、
 新しい同期I/O・デコード・GPUアップロード・待ち・常設のpendingを追加しない。
 
+段4のイベントは作業途中で、UIの毎フレーム検出にはまだ接続していない。
+main専用のbaseline・ROOT frame番号・直近10実行時刻はbundle外に置く。受付helperはOFF／on_event無しで
+利用資格の収集も識別の作成もしない。純比較の `script/event_compare` は比較とbaseline置換のms・イベント数だけを
+記録し、識別の構築・Rhai評価・操作実行の費用を含まない（実経路からは未呼出し）。
+既存page識別はreader order全件のパス／ZIPエントリ名を複製し、別allocationならcompositionの意味も全件比較する。
+SubfolderExpansionのroots複製やSearchの条件文字列化も定数費用ではない。items_generation／details_order_revision等
+だけではvisible再構成とDirectMediaの読み手順採用を覆わないため、変更なしのframeへこの処理を追加しない。
+採用ownerと軽量鍵の設計判断後にscalar／O(N)を分離・memo化し、識別構築込みの検出区間と5万件の変更なしframeを
+計測する。その未完の計測を比較helperの計時で代用しない。棚卸し・判断案は
+[段4引き継ぎ](operation-script-stage4-handoff.md) を参照。
+今回の指示書で共有された既存のrelease計測（cf1fce276、5万件）では、構築1.1〜2.2ms（p95最大3.4ms）、
+保持heap概算約15MB、比較1〜1.5msだった。本セッションでは再計測していない。
+
 ## スタック用スクリプトのファイル操作（§1.843）
 
 環境設定の「スクリプトを開く」「既定に戻す」は `filename_stack_script` の enqueue API だけを呼ぶ。

@@ -18651,6 +18651,8 @@ pub struct App {
     pub(crate) stack_script_pending: Option<crate::filename_stack_ui::StackPreparePending>,
     /// メイン専用の操作スクリプト。viewer contextのbundleへは移さない。
     pub(crate) operation_script: crate::operation_script::OperationScriptLoader,
+    /// Main-only script event state; excluded from viewer-context swapping.
+    pub(crate) operation_script_events: operation_script_runtime::OperationScriptEvents,
     /// Invalidates grouping and view-switch results even if the source items have not changed.
     pub(crate) stack_request_sequence: u64,
     /// スタックを ON にした瞬間のカーソル画像パス。集約完了時にこの画像を含むスタックセルへ
@@ -21971,6 +21973,7 @@ impl App {
             stack_script_error: None,
             stack_script_pending: None,
             operation_script: Default::default(),
+            operation_script_events: Default::default(),
             stack_request_sequence: 0,
             stack_selection_target: None,
             subfolder_expansion_root: None,

@@ -36,12 +36,33 @@ impl CompiledOperationScript {
             .iter()
             .find(|slot| slot.number == number)
             .ok_or_else(|| format!("スロット {number} は未登録です"))?;
+        self.evaluate_function(&slot.function, snapshot)
+    }
+
+    /// The event receiver uses the same bounded engine and output contract as a slot.
+    /// Detection/admission and execution remain the caller's responsibility.
+    pub fn evaluate_event(
+        &self,
+        snapshot: &super::StateSnapshot,
+    ) -> Result<super::ScriptOutput, String> {
+        self.operations.store(0, Ordering::Relaxed);
+        if !self.has_on_event {
+            return Err("イベントの受け口がありません".into());
+        }
+        self.evaluate_function("on_event", snapshot)
+    }
+
+    fn evaluate_function(
+        &self,
+        function: &str,
+        snapshot: &super::StateSnapshot,
+    ) -> Result<super::ScriptOutput, String> {
         let value = self
             .engine
             .call_fn::<Dynamic>(
                 &mut Scope::new(),
                 &self.ast,
-                &slot.function,
+                function,
                 (snapshot.to_dynamic(),),
             )
             .map_err(|error| {
@@ -235,6 +256,51 @@ fn ensure_user_script(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn evaluate_event_uses_bounded_engine_and_delivers_every_event_in_order() {
+        use crate::operation_script::{ScriptContext, ScriptEvent, StateSnapshot};
+        let script = super::CompiledOperationScript::compile(
+            r#"fn slots() { [] }
+            fn on_event(s) {
+                if s.events.len() == 4 && s.events[0] == "open" && s.events[1] == "view"
+                    && s.events[2] == "page" && s.events[3] == "select" {
+                    #{run:["FsBgCycle"],notice:s.context}
+                } else { [] }
+            }"#,
+        )
+        .unwrap();
+        let mut snapshot = StateSnapshot::new(ScriptContext::FsImage);
+        snapshot.events = vec![
+            ScriptEvent::Open,
+            ScriptEvent::View,
+            ScriptEvent::Page,
+            ScriptEvent::Select,
+        ];
+        let output = script.evaluate_event(&snapshot).unwrap();
+        assert_eq!(output.actions, ["FsBgCycle"]);
+        assert_eq!(output.notice.as_deref(), Some("fs_image"));
+        assert!(script.last_operation_count() > 0);
+        assert!(script.last_operation_count() <= crate::operation_script::MAX_OPERATIONS);
+
+        let absent = super::CompiledOperationScript::compile("fn slots() { [] }").unwrap();
+        assert!(
+            absent
+                .evaluate_event(&snapshot)
+                .unwrap_err()
+                .contains("受け口")
+        );
+        assert_eq!(absent.last_operation_count(), 0);
+        let infinite =
+            super::CompiledOperationScript::compile("fn slots() { [] } fn on_event(s) { loop {} }")
+                .unwrap();
+        assert!(
+            infinite
+                .evaluate_event(&snapshot)
+                .unwrap_err()
+                .contains("時間がかかりすぎた")
+        );
+    }
+
     #[test]
     fn evaluate_loaded_slot_records_operations_and_reports_budget_limit() {
         use super::*;
