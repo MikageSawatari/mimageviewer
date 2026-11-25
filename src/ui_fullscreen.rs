@@ -35160,6 +35160,8 @@ impl App {
                     crate::key_input::SyntheticNavigationKey::F12 => KeyName::F12,
                     #[cfg(any(test, feature = "test-script"))]
                     crate::key_input::SyntheticNavigationKey::G => KeyName::G,
+                    #[cfg(any(test, feature = "test-script"))]
+                    crate::key_input::SyntheticNavigationKey::V => KeyName::V,
                     #[cfg(test)]
                     crate::key_input::SyntheticNavigationKey::Tab => KeyName::Tab,
                     #[cfg(test)]

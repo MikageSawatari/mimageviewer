@@ -581,121 +581,13 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
             },
         );
         let paste_bridge = bridge.clone();
-        let key_pipe = Arc::new(Mutex::new(None));
         engine.register_fn(
             "clipboard_paste",
             move || -> Result<i64, Box<EvalAltResult>> {
-                let mut client = key_pipe
-                    .lock()
-                    .map_err(|_| rhai_error("clipboard key pipe lock poisoned"))?;
-                if client.is_none() {
-                    *client = Some(
-                        KeyPipeClient::connect(&paste_bridge)
-                            .map_err(|e| native_mouse_environment_error(&paste_bridge, e))?,
-                    );
-                }
-                real_paste(&paste_bridge, client.as_mut().unwrap())
+                synthetic_paste(&paste_bridge)
                     .map_err(|e| native_mouse_environment_error(&paste_bridge, e))
             },
         );
-    }
-}
-
-#[cfg(windows)]
-struct KeyPipeClient {
-    file: std::fs::File,
-    session: [u8; 16],
-    gesture: u64,
-}
-
-#[cfg(windows)]
-impl KeyPipeClient {
-    fn connect(bridge: &RunnerBridge) -> Result<Self, String> {
-        use std::os::windows::io::AsRawHandle;
-        let name = std::env::var("MIV_UI_SMOKE_BUTTON_PIPE")
-            .map_err(|_| "clipboard key helper pipe is missing")?;
-        if name.is_empty() || name.len() > 160 || name.contains(['\\', '/']) {
-            return Err("clipboard key helper pipe is invalid".into());
-        }
-        let session = uuid::Uuid::parse_str(
-            &std::env::var("MIV_UI_SMOKE_BUTTON_SESSION")
-                .map_err(|_| "clipboard key helper session is missing")?,
-        )
-        .map_err(|e| e.to_string())?
-        .to_bytes_le();
-        let server = std::env::var("MIV_UI_SMOKE_BUTTON_SERVER_PID")
-            .map_err(|_| "clipboard key helper server is missing")?
-            .parse::<u32>()
-            .map_err(|e| e.to_string())?;
-        if server == 0 {
-            return Err("clipboard key helper server PID is zero".into());
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let file = loop {
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(format!(r"\\.\pipe\{name}"))
-            {
-                Ok(file) => break file,
-                Err(e) if Instant::now() >= deadline => {
-                    return Err(format!("clipboard helper connection: {e}"));
-                }
-                Err(_) => super::wait_interruptibly(&bridge.interrupt, Duration::from_millis(10))
-                    .map_err(|e| e.to_string())?,
-            }
-        };
-        let mut actual = 0;
-        unsafe {
-            windows::Win32::System::Pipes::GetNamedPipeServerProcessId(
-                windows::Win32::Foundation::HANDLE(file.as_raw_handle()),
-                &mut actual,
-            )
-        }
-        .map_err(|e| e.to_string())?;
-        if actual != server {
-            return Err("clipboard helper server PID authentication failed".into());
-        }
-        Ok(Self {
-            file,
-            session,
-            gesture: 0,
-        })
-    }
-    fn command(&mut self, kind: u32, owner: &TestScriptWindowIdentity) -> Result<(), String> {
-        let mut frame = Vec::with_capacity(56);
-        frame.extend(0x4b43564d_u32.to_le_bytes());
-        frame.extend(kind.to_le_bytes());
-        frame.extend(self.gesture.to_le_bytes());
-        frame.extend(self.session);
-        frame.extend(owner.hwnd().to_le_bytes());
-        frame.extend(
-            unsafe { windows::Win32::System::Threading::GetCurrentProcessId() }.to_le_bytes(),
-        );
-        frame.extend(0_u32.to_le_bytes());
-        frame.extend(owner.backend_token().to_le_bytes());
-        self.file.write_all(&frame).map_err(|e| e.to_string())?;
-        let mut reply = [0; 16];
-        self.file
-            .read_exact(&mut reply)
-            .map_err(|e| format!("clipboard helper reply: {e}"))?;
-        if reply[0..4] != 0x4b43564d_u32.to_le_bytes()
-            || reply[4..8] != [0; 4]
-            || reply[8..16] != self.gesture.to_le_bytes()
-        {
-            return Err("clipboard helper reply identity/status mismatch".into());
-        }
-        Ok(())
-    }
-    fn begin(&mut self, owner: &TestScriptWindowIdentity) -> Result<(), String> {
-        self.gesture = self
-            .gesture
-            .checked_add(1)
-            .ok_or("clipboard gesture ID exhausted")?;
-        self.command(1, owner)
-    }
-    fn release(&mut self, owner: &TestScriptWindowIdentity) -> Result<(), String> {
-        self.command(2, owner)
     }
 }
 
@@ -731,137 +623,146 @@ fn describe_window(foreground: windows::Win32::Foundation::HWND) -> String {
     )
 }
 
+/// A complete tap at one timeline instant: no OS keys or held-key ACK obligation.
 #[cfg(windows)]
-fn real_paste(bridge: &RunnerBridge, client: &mut KeyPipeClient) -> Result<i64, String> {
-    use windows::Win32::UI::{
-        Input::KeyboardAndMouse::{
-            GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, VK_V,
-        },
-        WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, IsWindowVisible},
+fn paste_commands(
+    at: Instant,
+    owner: &TestScriptWindowIdentity,
+    routing: Result<
+        crate::key_input::SyntheticRoutingTarget,
+        crate::key_input::SyntheticRoutingTargetError,
+    >,
+) -> Result<[crate::key_input::SyntheticKeyCommand; 2], String> {
+    use crate::key_input::{SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey};
+    let target = crate::key_input::SyntheticRoutingTarget {
+        hwnd: owner.hwnd(),
+        viewport: egui::ViewportId::ROOT,
     };
-    use windows::Win32::{Foundation::HWND, System::Threading::GetCurrentProcessId};
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn GetThreadDesktop(thread: u32) -> *mut std::ffi::c_void;
-        fn OpenInputDesktop(flags: u32, inherit: i32, access: u32) -> *mut std::ffi::c_void;
-        fn CloseDesktop(desktop: *mut std::ffi::c_void) -> i32;
-        fn GetUserObjectInformationW(
-            handle: *mut std::ffi::c_void,
-            index: i32,
-            info: *mut std::ffi::c_void,
-            size: u32,
-            needed: *mut u32,
-        ) -> i32;
+    if !matches!(owner, TestScriptWindowIdentity::Root { .. }) || routing != Ok(target) {
+        return Err(format!(
+            "clipboard paste routing must match selected ROOT: owner={} routing={routing:?}",
+            owner.describe()
+        ));
     }
-    fn desktop_name(handle: *mut std::ffi::c_void) -> Result<Vec<u16>, String> {
-        let mut name = vec![0_u16; 256];
-        let mut needed = 0;
-        if handle.is_null()
-            || unsafe {
-                GetUserObjectInformationW(
-                    handle,
-                    2,
-                    name.as_mut_ptr().cast(),
-                    (name.len() * 2) as u32,
-                    &mut needed,
-                )
-            } == 0
-        {
-            return Err("clipboard input desktop name unavailable".into());
-        }
-        name.truncate((needed as usize) / 2);
-        Ok(name)
-    }
+    Ok([
+        SyntheticKeyCommand::down_for_target(
+            at,
+            SyntheticNavigationKey::V,
+            SyntheticModifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            target,
+        ),
+        SyntheticKeyCommand::up(at, SyntheticNavigationKey::V),
+    ])
+}
+
+#[cfg(windows)]
+fn synthetic_paste(bridge: &RunnerBridge) -> Result<i64, String> {
     let owner = selected_root(bridge)?;
     let deadline = Instant::now() + Duration::from_secs(5);
     bridge.validate_selected_owner_fresh(&owner, deadline)?;
-    let hwnd = HWND(owner.hwnd() as usize as *mut _);
-    let validate = |phase: &str| -> Result<(), String> {
-        bridge.validate_selected_owner_cached(&owner, deadline)?;
-        let mut process = 0;
-        let thread = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process)) };
-        let foreground = unsafe { GetForegroundWindow() };
-        // Before Ctrl/V Down the exact root must own the foreground. Once the keys are
-        // delivered, the existing Shell paste may legitimately raise its own copy progress
-        // window (OperationStatusWindow) in this process, so any window of ours is accepted,
-        // as is the brief no-foreground gap while that window closes.
-        let mut foreground_process = 0;
-        unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_process)) };
-        let foreground_ok = if phase == "before-down" {
-            foreground == hwnd
-        } else {
-            foreground == hwnd
-                || foreground.0.is_null()
-                || foreground_process == unsafe { GetCurrentProcessId() }
-        };
-        if process != unsafe { GetCurrentProcessId() }
-            || !unsafe { IsWindowVisible(hwnd).as_bool() }
-            || !foreground_ok
-        {
-            return Err(format!(
-                "clipboard paste exact root is not the visible foreground owner (phase={phase}, visible={}, foreground={})",
-                unsafe { IsWindowVisible(hwnd).as_bool() },
-                describe_window(foreground)
-            ));
-        }
-        let input = unsafe { OpenInputDesktop(0, 0, 1) };
-        if input.is_null() {
-            return Err("clipboard paste cannot open input desktop".into());
-        }
-        let input_name = desktop_name(input);
-        unsafe {
-            CloseDesktop(input);
-        }
-        let expected_name = input_name?;
-        if desktop_name(unsafe { GetThreadDesktop(thread) })? != expected_name
-            || desktop_name(unsafe {
-                GetThreadDesktop(windows::Win32::System::Threading::GetCurrentThreadId())
-            })? != expected_name
-        {
-            return Err(
-                "clipboard paste requires app, worker and input on the same desktop".into(),
-            );
-        }
-        Ok(())
-    };
-    validate("before-down")?;
-    for key in [VK_CONTROL, VK_V, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN] {
-        if unsafe { GetAsyncKeyState(i32::from(key.0)) } < 0 {
-            return Err("clipboard paste requires released user modifiers and V".into());
-        }
-    }
+    bridge.require_key_target()?;
     let initial = bridge.latest_snapshot()?.clipboard_capture.paste_count;
-    client.begin(&owner)?;
-    // The external owner holds keys until the real GetAsyncKeyState consumer ACK.
-    let accepted = (|| -> Result<i64, String> {
-        loop {
-            validate("awaiting-paste")?;
-            let count = bridge.latest_snapshot()?.clipboard_capture.paste_count;
-            if count > initial {
-                return Ok(count);
-            }
-            super::wait_interruptibly(&bridge.interrupt, Duration::from_millis(10))
-                .map_err(|e| e.to_string())?;
+    let [down, up] = paste_commands(
+        Instant::now(),
+        &owner,
+        crate::key_input::resolve_synthetic_routing_target(),
+    )?;
+    bridge.send(UiCommand::Key(down))?;
+    // Queue release even if cancellation arrives after Down. Both commands use
+    // the same timestamp, so a delayed frame cannot manufacture auto-repeat.
+    bridge.send_unchecked(UiCommand::Key(up))?;
+    loop {
+        bridge.validate_selected_owner_cached(&owner, deadline)?;
+        let count = bridge.latest_snapshot()?.clipboard_capture.paste_count;
+        if count > initial {
+            return Ok(count);
         }
-    })();
-    // Always request release after successful Down, including App guard failure.
-    // The external owner also cleans up on pipe disconnect, deadline, cancellation and death.
-    let released = client.release(&owner);
-    let count = accepted?;
-    released?;
-    let released_frame = bridge.latest_snapshot()?.snapshot_frame;
-    while bridge.latest_snapshot()?.snapshot_frame <= released_frame + 1 {
-        validate("after-release")?;
-        (bridge.wake)();
         super::wait_interruptibly(&bridge.interrupt, Duration::from_millis(10))
             .map_err(|e| e.to_string())?;
     }
-    Ok(count)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn clipboard_capture_paste_commands_are_one_released_ctrl_v_tap() {
+        use crate::key_input::{
+            SyntheticKeyCommandKind, SyntheticModifiers, SyntheticNavigationKey,
+            SyntheticRoutingTarget,
+        };
+        let at = Instant::now();
+        let owner = TestScriptWindowIdentity::Root {
+            context_serial: 1,
+            hwnd: 101,
+            backend_token: 7,
+        };
+        let target = SyntheticRoutingTarget {
+            hwnd: 101,
+            viewport: egui::ViewportId::ROOT,
+        };
+        let [down, up] = paste_commands(at, &owner, Ok(target)).unwrap();
+        assert_eq!(down.at, at);
+        assert_eq!(up.at, at);
+        assert_eq!(
+            down.kind,
+            SyntheticKeyCommandKind::DownForTarget {
+                key: SyntheticNavigationKey::V,
+                modifiers: SyntheticModifiers {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                },
+                target,
+            }
+        );
+        assert_eq!(
+            up.kind,
+            SyntheticKeyCommandKind::Up {
+                key: SyntheticNavigationKey::V
+            }
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clipboard_capture_paste_rejects_other_routing_targets_before_queueing() {
+        use crate::key_input::{SyntheticRoutingTarget, SyntheticRoutingTargetError};
+        let owner = TestScriptWindowIdentity::Root {
+            context_serial: 1,
+            hwnd: 101,
+            backend_token: 7,
+        };
+        let child = egui::ViewportId::from_hash_of("other_clipboard_target");
+        for routing in [
+            Ok(SyntheticRoutingTarget {
+                hwnd: 202,
+                viewport: child,
+            }),
+            Ok(SyntheticRoutingTarget {
+                hwnd: 202,
+                viewport: egui::ViewportId::ROOT,
+            }),
+            Ok(SyntheticRoutingTarget {
+                hwnd: 101,
+                viewport: child,
+            }),
+            Err(SyntheticRoutingTargetError::NoForegroundWindow),
+        ] {
+            let mut queued = Vec::new();
+            let result = paste_commands(Instant::now(), &owner, routing).map(|commands| {
+                queued.extend(commands);
+            });
+            assert!(result.is_err());
+            assert!(queued.is_empty(), "mismatch must not enqueue Down or Up");
+        }
+    }
+
     #[test]
     fn clipboard_capture_html_offsets_source_and_payload_combinations_are_real_formats() {
         let html = cf_html("http://127.0.0.1:1234/page.html", "<p>日本語</p>");

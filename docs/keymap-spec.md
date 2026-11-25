@@ -1024,7 +1024,11 @@ synthetic API で明示する。clear / reset 後も解放の既定値を保ち�
 明示 guard とは scope を共有するため、fixture の前後どちらで取得しても再ロックや reset は起きない。
 最後の guard の破棄で初めて reset・解放する。App を駆動する子スレッドは自身で fixture を作り、
 親はその間入力 guard を保持しない。取得順は入力 → data-dir lock、fixture の解放順はその逆とする。
-固定 Ctrl+V の transition bit の直接読取は別経路として残る（§1.814 (g) の残件）。
+固定 Ctrl+V も ROOT の配送済み key-down edge で受ける（§1.814 (g) の残件を解消）。
+現在レベルや `GetAsyncKeyState` の transition bit は読まず、フレーム前に V が解放されても
+non-repeat の押下を 1 回受ける。テストは同じ frame edge / synthetic timeline を使う。
+実行は `key_input::claim_key_down_dispatch` が dispatch owner と `KeyOperationId` で一度だけ claim する。
+claim は backend frame 内の再 pass でも保持し、edge は消費しない。次の backend frame で claim を破棄する。
 
 ## 固定入力 / KeyAction 対象外の整理
 
@@ -1054,6 +1058,7 @@ synthetic API で明示する。clear / reset 後も解放の既定値を保ち�
 | UI 表示倍率 | egui 既定の <kbd>Ctrl</kbd>+<kbd>+</kbd> / <kbd>-</kbd> / <kbd>0</kbd> | `Settings.ui_scale_factor` と main Context の `zoom_factor` を単一の正本にするため、main / native presenter の両 egui Context で `zoom_with_keyboard=false`。表示倍率は設定メニュー「スケーリング」だけから変更し、KeyAction 対象外とする |
 | サムネイル一覧の範囲選択 | <kbd>Shift</kbd>+矢印キー | グリッド選択カーソルの移動とチェック追加が一体になった固定操作。Grid 文脈で同じキーを割り当てた場合は予約キー警告を出す |
 | Shell / クリップボード / D&D | Shell 貼り付け、Shell 右クリックメニュー、外部アプリへのドラッグ送出 | Windows Shell やクリップボードイベントの経路を優先するため、入力そのものはキーボードコマンドとは分ける。コピー5種とグリッドの切り取りはKeyActionとして割り当てでき、メニューの実行経路を共有する（§1.477） |
+| 一覧の固定 Ctrl+V | Ctrl 必須、Shift / Alt 不問の貼り付け | ROOT の配送済み non-repeat key-down edge を残し、同じ operation の paste dispatch を backend frame 内で一度だけ claim する。pass 終端で unfocused でも配送済み edge は有効だが、TextInput / IME / modal / 別 owner の block を優先する。KeyAction / keymap.ini の対象外 |
 | 編集ツール内のドラッグ状態 | 消しゴム / 隠蔽加工 / 補正レイヤーの選択後の矢印 / <kbd>Ctrl</kbd>+矢印、<kbd>[</kbd> / <kbd>]</kbd>、<kbd>Ctrl</kbd>+<kbd>[</kbd> / <kbd>]</kbd>、ハンドル操作中の <kbd>Shift</kbd> / <kbd>Alt</kbd>、テキスト注釈の四隅ハンドルドラッグ中の <kbd>Ctrl</kbd> / <kbd>Shift</kbd>、切り取り / テキスト注釈のドラッグやホイールなど | 選択中オブジェクト、ドラッグ中の形状、パネルフォーカスに依存するモード内操作。テキスト注釈の <kbd>Ctrl</kbd>（中心対称）と <kbd>Shift</kbd>（縦横比固定）は離散ショートカットではなく、マウスドラッグ中だけ幾何制約を切り替える修飾なので keymap 対象外。切り取りで既存枠より新規作成を優先する修飾だけは `CropForceCreateHold` として keymap 化する。フルスクリーンキャンバスでは egui の修飾状態が stale になり得るため、ドラッグ中に使う固定修飾は各フレームで OS から直接読む。操作カスタマイズ画面では消しゴム / 隠蔽 / 切り取り / テキスト / 補正レイヤーの通常コマンドを「編集モード」としてまとめる |
 | マスク筆の半径 | 消しゴム / 隠蔽加工 / 補正レイヤーで、筆系ツール選択中のキャンバス上 <kbd>Shift</kbd>+ホイール | 1 ノッチごとに半径を約 1.1 倍 / 1.1 分の 1 とし、小さい側でも最低 1px 動かす。筆系ツールかつキャンバス上のときだけ消費し、筆以外やパネル上では従来のホイール経路へ残す。バックログ §4.1 の一般的な Shift / Alt+ホイールのペアバインド再設計はグリッド / 画像 / 動画を横断する別課題であり、今回は動画へ到達しない編集モード限定の固定入力なので `KeyAction` や `Settings.ring_shortcuts` の対象にしない |
 | 360 度パノラマ / 通常動画の拡大・縮小表示中 | 360 は左ドラッグの yaw/pitch、ホイールの FOV、上バーの解除・投影方式・視点リセット。通常動画は左ドラッグの表示位置移動、ホイールの拡大縮小、上バーの解除・位置と倍率のリセット | 表示中だけの連続操作 / ボタンなので keymap 対象外。通常動画のホイールはシークストリップ、端パネル、モーダルの領域から奪わず、タッチのピンチは使わない。<kbd>V</kbd> の表示モード切替 (`FsPanorama`) は `FsCommon` の 1 Action で、360 候補ならパノラマ、それ以外の通常動画なら拡大・縮小表示を切り替える。<kbd>Shift</kbd>+<kbd>V</kbd> の投影方式順送り (`FsPanoramaProjection`) は 360 専用。どちらも画像 / 動画のコマンド設定から変更できる |

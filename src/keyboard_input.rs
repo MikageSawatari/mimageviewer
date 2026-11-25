@@ -430,12 +430,6 @@ pub(crate) fn text_input_owns_submit(ctx: &egui::Context, widget_id: egui::Id) -
     }
 }
 
-/// Preserve Shell paste's current Win32 high-bit level plus V transition bit.
-/// This is deliberately not the text clipboard shortcut policy.
-pub(crate) const fn shell_paste_transition_requested(ctrl: i16, v: i16) -> bool {
-    ctrl < 0 && v < 0 && (v & 1) != 0
-}
-
 pub(crate) fn focused_key_state_permit(ctx: &egui::Context) -> Option<FocusedKeyStatePermit> {
     focused_key_state_permit_for_viewport(
         ctx.viewport_id(),
@@ -1366,16 +1360,7 @@ mod input_projection_tests {
     }
 
     #[test]
-    fn clipboard_shell_paste_requires_transition_and_both_held_keys() {
-        let held = 0x8000u16 as i16;
-        for ctrl in [0, 1, held, held | 1] {
-            for v in [0, 1, held, held | 1] {
-                assert_eq!(
-                    shell_paste_transition_requested(ctrl, v),
-                    ctrl < 0 && v == (held | 1)
-                );
-            }
-        }
+    fn clipboard_semantic_requests_keep_copy_cut_separate_from_paste() {
         assert_eq!(
             clipboard_semantic_requests(&[
                 egui::Event::Copy,

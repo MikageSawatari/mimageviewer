@@ -197,12 +197,17 @@ foreach ($requiredText in @(
     'MIV_UI_SMOKE_BUTTON_SERVER_PID',
     'SafeToTerminateApp',
     'button_helper_release_state',
-    "'NativeTopPanoramaClick', 'ClipboardCapture'",
-    'ClipboardKeyHelperHandle]::Start'
+    "`$Scenario -eq 'NativeTopPanoramaClick'",
+    'ButtonHelperRunnerApi]::Start'
 )) {
     if (-not $combinedSource.Contains($requiredText)) {
         throw "runner is missing required button integration text: $requiredText"
     }
+}
+
+if ($combinedSource.Contains('ClipboardKeyHelperHandle]::Start') -or
+    $combinedSource.Contains("'NativeTopPanoramaClick', 'ClipboardCapture'")) {
+    throw 'ClipboardCapture must use the synthetic key timeline without a native key helper'
 }
 
 Write-Host '[ui-smoke-button-runner-test] PASS policy=12 primary-preservation=6 cleanup-order=1 integration-contract=5 helper-load=1 child-environment=2'

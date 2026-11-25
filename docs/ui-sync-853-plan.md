@@ -835,3 +835,81 @@ startup_default_ / startup_scan / section1285_ / section1473_history_menu_ / sec
 独立レビュー (GPT-6.1 Sol / xhigh、実装とは別の会話) は ACCEPT、指摘なし。検索を開くと起動の解決待ちが退役する経路は
 `take_origin_for_search_entry` (app.rs) → `retire_main_list_requests_for_surface_switch` → `retire_replaced_main_list_requests`
 → `cancel_unresolved_open_for_navigation` (startup_ops.rs) で、追加テストが既定の起動先と明示パスの両方で確かめている。
+
+### 5.12 一覧の Ctrl+V の取りこぼし
+
+観測者はサブ PC 担当の Claude、対象は master 14a448b3a。perf ログでは一覧の Ctrl+V 5 回中 1 回だけ
+`shell_paste/submit` が出た。不発時は断りの通知もなく、V の押下と解放の間にフレームが走っていなかった。
+成功時は Ctrl 押下 88.057 → submit のフレーム 88.073 → V 解放 88.105、失敗例は Ctrl 押下 231.107 →
+次のフレームが V 解放 231.138。Ctrl+C は同じ状況で効いた。
+
+コードの原因: `grid_clipboard_requests` は `GetAsyncKeyState` の Ctrl / V の現在レベルと V の下位 bit を
+要求し、描画より先に V が離れると false になる。egui-winit は Ctrl+V を Key event にせず、ファイルだけの
+クリップボードでは代わりのイベントも出さない。Ctrl+C の keymap 経路は subclass が配送時に stamp した edge を読む。
+
+変更 (2026-11-25): 固定 Ctrl+V も ROOT の frame edge の `VK_V && ctrl && !repeat` を非消費で照合し、
+後述の dispatch claim を通す。KeyAction と keymap.ini は変更しない。既定 chord の定義と `docs/keymap.ini.default` に
+Ctrl+Shift+V / Ctrl+Alt+V の割り当ては無かったので、Shift / Alt を問わない旧来の意味を維持した。
+旧判定は repeat を明示判定せず OS の transition bit 任せだった。新判定は repeat edge を明示的に除外する
+(旧版で repeat が再発火したかの実機観測は無い)。
+
+共通の `keyboard_input_permits` に合わせ、ROOT の配送済み edge は pass 終端の unfocused でも受ける。
+TextInput / IME / modal / 別 owner、`grid_item_input_allowed` の block は優先し、固定 Ctrl+V にも
+`keymap_owner_blocks_shortcuts` を通す。copy / cut の keymap edge も同じ focus 境界へ揃えた。
+送信元の証拠が無い egui Copy / Cut semantic event は従来どおり処理時点の focus を要求する。
+copy / cut → ほかのコピー → paste の処理順、1 frame の edge 寿命を維持した。
+detached の述語・viewport 経路は変更していない。
+
+test_script の `clipboard_paste` は同一時刻の Ctrl+V down/up を既存 synthetic timeline に積み、製品と同じ
+ROOT frame edge の handler を通す形に移行。`SyntheticNavigationKey::V` は test / test-script 限定。
+選択済み exact ROOT / backend の fresh validation、target 登録・focus、受付カウンタと待機期限は維持する。
+実 OS のキー押下・GetAsyncKeyState consumer ACK・外部キー helper 接続と解放待ちは撤去し、runner の
+ClipboardCapture 用 helper 起動も外した。旧 C# helper 本体と単独テストは package に残すが使わない。
+NativeTopPanoramaClick のマウス helper と解放の interlock は変更しない。
+簡素化: 新しい押下保留状態や再試行を足さず、既存の配送 owner と frame 寿命へ合流した。操作のモーダル化は不要。
+
+回帰テストは `app::main_drop::shell_paste_tests::fixed_ctrl_v_tests` に 8 件追加:
+
+- `shell_paste_ctrl_v_released_before_frame_submits_once_and_preserves_edge`
+- `shell_paste_ctrl_v_layout_replay_after_completion_dispatches_once`
+- `shell_paste_ctrl_v_keeps_shift_alt_and_routed_ownership_after_focus_loss`
+- `shell_paste_ctrl_v_rejects_plain_v_repeat_and_key_up`
+- `shell_paste_ctrl_v_text_modal_ime_and_focused_ui_block_routed_edges`
+- `shell_paste_ctrl_v_ignores_foreign_edges_and_unfocused_egui_only_input`
+- `shell_paste_ctrl_v_synthetic_tap_submits_after_timeline_release`
+- `shell_paste_ctrl_v_keeps_copy_cut_precedence_and_semantic_focus_gate`
+
+handler の OS クリップボード照会だけを `handle_clipboard_shortcuts_with` で注入し、Shell は既存 fake worker を使う。
+最初のテストは ROOT の Ctrl down / V down / V up / Ctrl up をフレーム前に pending へ積み、処理時の V は解放のまま
+`ShellPasteOrigin::CtrlV` の要求を検査する。判定だけを旧コードへ戻すと、実 OS の現在レベルを読んで要求が出ないため
+落ちる構造 (この破壊検証は未実行)。synthetic tap のテストも V / Ctrl の現在レベル解放後の要求を検査する。
+旧 transition 関数とテストを削除し、Ctrl 必須・release 後の受付・repeat 拒否を上記へ移した。
+Copy / Cut semantic event のテストは `clipboard_semantic_requests_keep_copy_cut_separate_from_paste` として維持。
+test_script には `clipboard_capture_paste_commands_are_one_released_ctrl_v_tap` を追加した。
+
+独立レビュー (Sol / xhigh、設計担当が依頼) の 1 回目は P2 2 件で REJECT。コードで両方を確認して修正した。
+P2-1: 非消費 edge は egui の再 pass でも残り、worker 完了・回収後なら同じ押下を再投入できた。
+`key_input::claim_key_down_dispatch` に dispatch owner と既存 `KeyOperationId` の組で実行を claim する入口を追加。
+claim は既存の backend frame 境界でだけ clear し、再 pass では保持する。edge は残し、別 handler の照合・消費を変えない。
+Ctrl+V 専用の bool・時刻・App の pending field は追加しない。`request_discard` の前に初回処理を完了・poll し、
+再 pass では照会も Shell 要求も増えず、次の backend frame の新しい押下は受ける handler 回帰を追加した。
+`key_down_dispatch_claim_preserves_edges_and_other_owners` は owner / viewport の分離と edge の保持を検査する。
+Ctrl+C / Ctrl+X の `pressed_action` → `pressed_chord` も同じ非消費 query を使い、再 pass の抑止は無かった。
+既存の consume 系は frame から除去することで再発火を防ぐ。既存の copy / cut 等への横展開は今回行わない。
+
+P2-2: `require_key_target` の snapshot は現在の前面の target であり、選択 ROOT と一致する保証が無かった。
+選択 ROOT の HWND / viewport と `resolve_synthetic_routing_target` を投入前に照合し、不一致なら Down / Up を作らずエラーにする。
+Down は診断 timeline の `DownForTarget` で配送先を拘束し、materialize までに前面が変わった場合も queue を取り下げて
+`KeyTargetMismatch` にする (別 viewport へ配送せず、遅延再試行もしない)。投入前の拒否テストは
+`clipboard_capture_paste_rejects_other_routing_targets_before_queueing`、配送時の拒否テストは
+`synthetic_targeted_key_rejects_routing_changes_without_delivery_or_retry`。既存の synthetic tap handler 回帰も
+target 指定 Down を通す形へ更新した。設計担当が追加した `ui_fullscreen.rs` の V の match 腕は保持する。
+
+検証 (設計担当が run-heavy 経由で実行、2026-11-25):
+- 通常構成 `test(/shell_paste|file_operation_selection_tests|clipboard_semantic|keyboard_input::|key_input::|grid_clipboard|clipboard_shortcut|copy_key_action|cut_files|copy_files|key_down_dispatch_claim|synthetic_targeted_key/)`:
+  161 passed。
+- `--features test-script` `test(/clipboard_capture|shell_paste|synthetic|test_script::/)`: 415 passed。
+- 本体 lib の全件は未実行 (master 取り込み後に統括が流す)。旧判定へ戻して落ちることの破壊検証は未実行。
+  ui-smoke スクリプト (`scripts/ui-smoke.ps1` 等) の実走は未実施 (構文解析のみ)。
+- 独立レビュー (Sol / xhigh) の 2 回目は ACCEPT、P1〜P3 の指摘なし。
+- 実機確認は未実施。
