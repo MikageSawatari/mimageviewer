@@ -45,7 +45,7 @@ fn every_permission_combination_has_identical_full_discovery_without_core_querie
         }
     }
     let expected = json!(schema::tools());
-    assert_eq!(expected.as_array().unwrap().len(), 27);
+    assert_eq!(expected.as_array().unwrap().len(), 29);
     for version in VERSIONS {
         let backend = Arc::new(BackendState(
             Mutex::new(PermissionSnapshot::default()),

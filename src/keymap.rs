@@ -7787,7 +7787,7 @@ fn help_context_shortcuts_overlaps_scope(action: KeyAction, scope: CommandScope)
     action == KeyAction::HelpShowContextShortcuts && is_overlay_edit_scope(scope)
 }
 
-fn actions_can_overlap(first: KeyAction, second: KeyAction) -> bool {
+pub(crate) fn actions_can_overlap(first: KeyAction, second: KeyAction) -> bool {
     // Local overview actions coexist only with the finite executable set. The toggle
     // also exists in ordinary still-image viewing, but never in video or edit modes.
     if first.context() == KeyContext::FsPageOverview
@@ -7803,6 +7803,70 @@ fn actions_can_overlap(first: KeyAction, second: KeyAction) -> bool {
     command_scopes_overlap(first.context(), second.context())
         || help_context_shortcuts_overlaps_scope(first, second.context())
         || help_context_shortcuts_overlaps_scope(second, first.context())
+}
+
+/// Public screen names follow ACTIVE_SCOPE_SETS in the same order. This is a
+/// description of potential shortcuts, not a runtime viewport admission path.
+pub(crate) const OPERATION_SCREENS: &[(&str, &str)] = &[
+    ("grid", "サムネイル一覧"),
+    ("image_fullscreen", "画像フルスクリーン"),
+    ("video_fullscreen", "動画フルスクリーン"),
+    ("page_overview", "ページ一覧"),
+    ("erase", "消しゴム"),
+    ("conceal", "隠蔽加工"),
+    ("crop", "切り抜き"),
+    ("sns_split", "SNS 分割"),
+    ("text", "テキスト"),
+    ("local_adjust", "補正レイヤー"),
+];
+
+pub(crate) fn action_active_on_screen(action: KeyAction, screen: &str) -> bool {
+    let Some(index) = OPERATION_SCREENS
+        .iter()
+        .position(|(name, _)| *name == screen)
+    else {
+        return false;
+    };
+    let scopes = ACTIVE_SCOPE_SETS[index];
+    if scopes.contains(&KeyContext::FsPageOverview) {
+        return page_overview_action_allowed(action);
+    }
+    if action == KeyAction::FsPageOverviewToggle {
+        return screen == "image_fullscreen";
+    }
+    scopes.contains(&action.context())
+        || scopes
+            .iter()
+            .any(|scope| help_context_shortcuts_overlaps_scope(action, *scope))
+}
+
+pub(crate) fn reserved_labels_for_screen(chord: Chord, screen: Option<&str>) -> Vec<String> {
+    RESERVED_BINDINGS
+        .iter()
+        .filter(|binding| {
+            binding.chord == chord
+                && screen.is_none_or(|screen| {
+                    OPERATION_SCREENS
+                        .iter()
+                        .position(|(name, _)| *name == screen)
+                        .is_some_and(|index| {
+                            ACTIVE_SCOPE_SETS[index]
+                                .iter()
+                                .any(|scope| reserved_binding_overlaps_scope(*scope, binding.scope))
+                        })
+                })
+        })
+        .map(|binding| binding.kind.label().to_owned())
+        .collect()
+}
+
+/// Lookup accepts modifier-only chords too; action-specific validation is done
+/// separately for writes and conflict previews.
+pub(crate) fn parse_operation_chord(text: &str) -> Result<Chord, String> {
+    if text.trim().is_empty() || text.trim().eq_ignore_ascii_case("none") {
+        return Err("key にキーを 1 つ指定してください".into());
+    }
+    parse_chord(text)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

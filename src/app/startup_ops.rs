@@ -214,6 +214,22 @@ impl App {
                     };
                     request.complete(outcome);
                 }
+                crate::agent_ipc::open::UiRequestKind::GetOperations(args) => {
+                    let outcome = match self.agent_get_operations(args) {
+                        Ok(page) => crate::agent_ipc::open::UiOpenOutcome::Operations(page),
+                        Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                    };
+                    request.complete(outcome);
+                }
+                crate::agent_ipc::open::UiRequestKind::SetOperations { args, client_name } => {
+                    let outcome = match self.agent_set_operations(args, client_name) {
+                        Ok(result) => crate::agent_ipc::open::UiOpenOutcome::Written(Ok(
+                            mimageviewer_agent_ipc::Payload::OperationsWrite(result),
+                        )),
+                        Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                    };
+                    request.complete(outcome);
+                }
                 crate::agent_ipc::open::UiRequestKind::GetSettings { query, keys, page } => {
                     let outcome =
                         match self.agent_get_settings(query.as_deref(), keys.as_deref(), *page) {

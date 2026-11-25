@@ -47,6 +47,8 @@ mod media_read_tests;
 #[cfg(test)]
 mod open_connection_tests;
 #[cfg(test)]
+mod operations_tests;
+#[cfg(test)]
 mod permission_admission_tests;
 #[cfg(windows)]
 mod pipe;
@@ -325,7 +327,9 @@ fn check_tool_permission(
 ) -> Result<(), AgentError> {
     let denied = match command {
         Command::GetViewState if !snapshot.current_view => Some(CURRENT_VIEW_PERMISSION_MESSAGE),
-        Command::GetSettings { .. }
+        Command::GetOperations(_)
+        | Command::SetOperations(_)
+        | Command::GetSettings { .. }
         | Command::SetSettings { .. }
         | Command::SetFavorite { .. }
         | Command::StackScript { .. }
@@ -588,7 +592,8 @@ impl Connection {
                 if metadata_write::is_write(&request.command)
                     || matches!(
                         request.command,
-                        Command::SetSettings { .. }
+                        Command::SetOperations(_)
+                            | Command::SetSettings { .. }
                             | Command::SetFavorite { .. }
                             | Command::StackScript { .. }
                     )
@@ -718,6 +723,8 @@ fn tool_name(command: &Command) -> &'static str {
         Command::Hello { .. } => "hello",
         Command::Status => "miv_status",
         Command::GetViewState => "get_view_state",
+        Command::GetOperations(_) => "get_operations",
+        Command::SetOperations(_) => "set_operations",
         Command::GetSettings { .. } => "get_settings",
         Command::SetSettings { .. } => "set_settings",
         Command::SetFavorite { .. } => "set_favorite",
@@ -789,6 +796,10 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
         ),
         Ok(Payload::Opened(_)) => (1, "none"),
         Ok(Payload::ViewState(_)) => (1, "none"),
+        Ok(Payload::Operations(page)) => (page.items.len(), "none"),
+        Ok(Payload::OperationsWrite(result)) => {
+            (result.changed.len() + result.unchanged.len(), "none")
+        }
         Ok(Payload::Settings(page)) => (page.items.len(), "none"),
         Ok(Payload::SettingsWrite(result)) => {
             (result.changed.len() + result.unchanged.len(), "none")
@@ -837,6 +848,10 @@ impl Handlers {
             }
             Command::Status => self.status(ctx),
             Command::GetViewState => self.open.execute_view_state(ctx).map(Payload::ViewState),
+            Command::GetOperations(args) => self
+                .open
+                .execute_operations_read(args, ctx)
+                .map(Payload::Operations),
             Command::GetSettings { query, keys, page } => self
                 .open
                 .execute_settings_read(query, keys, page, ctx)
@@ -994,6 +1009,7 @@ impl Handlers {
             | Command::RemoveFromCollection { .. }
             | Command::AddTags { .. }
             | Command::RemoveTags { .. }
+            | Command::SetOperations(_)
             | Command::SetSettings { .. }
             | Command::SetFavorite { .. }
             | Command::StackScript { .. }

@@ -5,6 +5,90 @@ use super::*;
 mod v3_wire;
 #[path = "../../crates/agent-ipc/tests/v5_wire/mod.rs"]
 mod v5_wire;
+#[path = "../../crates/agent-ipc/tests/v6_wire/mod.rs"]
+mod v6_wire;
+
+#[test]
+fn frozen_v6_adapter_reaches_v7_settings_ui_and_projects_old_response() {
+    let fixture = Fixture::new();
+    crate::settings_db::with_db_result(|db| {
+        let mut settings = db.load_into_settings()?;
+        settings.agent_allow_settings = true;
+        db.save_full(&settings)
+    })
+    .unwrap();
+    let connection = Connection::new(fixture.handlers.clone());
+    assert_eq!(
+        handshake(
+            &connection,
+            include_bytes!("../../crates/agent-ipc/tests/v6_wire/hello.frame")
+        )
+        .result,
+        Ok(Payload::Hello { version: 6 })
+    );
+    assert!(fixture.call(&connection, 2, Command::Status).result.is_ok());
+    let ui = fixture.handlers.open.install(egui::Context::default());
+    for (name, command, payload) in [
+        (
+            "get_settings",
+            v6_wire::Command::GetSettings {
+                query: None,
+                keys: None,
+                page: None,
+            },
+            Payload::Settings(SettingsPage {
+                items: vec![],
+                page: 1,
+                pages: 1,
+                more: false,
+            }),
+        ),
+        (
+            "set_settings",
+            v6_wire::Command::SetSettings {
+                changes: serde_json::from_value(
+                    serde_json::json!({"fullscreen_wheel_action":"Zoom"}),
+                )
+                .unwrap(),
+            },
+            Payload::SettingsWrite(SettingsWriteResult {
+                changed: vec![],
+                unchanged: vec![],
+            }),
+        ),
+    ] {
+        let mut bytes = Vec::new();
+        v6_wire::write_frame(&mut bytes, &v6_wire::Request { id: 3, command }).unwrap();
+        let request: Request = read_frame(&mut bytes.as_slice()).unwrap().unwrap();
+        let (sender, replies) = crossbeam_channel::unbounded();
+        let worker = connection.request(request, sender).unwrap();
+        let request = ui.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(request.try_claim());
+        request.complete(match &payload {
+            Payload::Settings(page) => super::open::UiOpenOutcome::Settings(page.clone()),
+            _ => super::open::UiOpenOutcome::Written(Ok(payload.clone())),
+        });
+        let response = replies
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .wire();
+        worker.join().unwrap();
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        let old: v6_wire::Response = v6_wire::read_frame(&mut bytes.as_slice()).unwrap().unwrap();
+        let result = v6_wire::output::tool_result(name, old.result);
+        assert_eq!(result["isError"], false);
+        let tools = v6_wire::schema::tools();
+        assert!(v6_wire::schema_check::accepts_schema(
+            &tools.iter().find(|tool| tool["name"] == name).unwrap()["outputSchema"],
+            &result["structuredContent"]
+        ));
+        assert!(
+            v6_wire::mcp_content_chars(&result["structuredContent"]).unwrap()
+                <= v6_wire::MAX_PAGE_CHARS
+        );
+    }
+}
 
 const V3_HELLO: &[u8] = include_bytes!("../../crates/agent-ipc/tests/v3_wire/hello.frame");
 const V5_HELLO: &[u8] = include_bytes!("../../crates/agent-ipc/tests/v5_wire/hello.frame");

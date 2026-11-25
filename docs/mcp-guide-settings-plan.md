@@ -1756,7 +1756,7 @@ P1 なし。指摘はすべて受け入れ、次の改訂 (§19.5) に入れた�
 
 ## 20. 第 2 段: 操作カスタマイズ (キー割り当て・リング・マウス・ジェスチャー) — v5.8.0
 
-状態: **設計 (2026-11-25)、独立レビュー ACCEPT (r3、§20.15)。実装は未着手**。基点は master `e3c2010fc`、ブランチ `mcp-keys-843`
+状態: **F・G・H のコードとテストを追加 (2026-11-25)、未ビルド・未テスト・実装の独立レビュー未実施**。設計のレビュー履歴は §20.15。基点は master `e3c2010fc`、ブランチ `mcp-keys-843`
 (worktree `G:\home\mimageviewer-mcpkeys843`)。行番号はこの基点のもの。根拠はコードと文書の参照だけで、
 実行時の挙動は誰も観測していない。第 2 段は v5.8.0 で始める (利用者決定 2026-11-25、backlog §1.843)。
 
@@ -2091,6 +2091,143 @@ UI スレッドで次を順に行う。
   - IPC の互換、応答の予算、tool 一覧の予算、説明 1 本の字数。
 - **区切り H (画面・文書)**: §20.9。
 - 実装担当は cargo を流さない。ビルド・テストは設計担当が共有 runner で流す (第 1 段と同じ)。
+
+#### 20.12.1 実装の引き継ぎ (2026-11-25、検証未実施)
+
+- F は `operation_customize_agent` に置いた。スロットを型で列挙し、行・候補・検査を同じ列挙から作る。
+  override は現在の位置で置き換え、同値の項目は写しにも書かない。ジェスチャーの順序・重複とキー配列の重複を保つ。
+  `ring_bindings_for_key_action` とその内部 helper は `ring_shortcut` へ移し、窓も同じ関数を読む。
+  画面の投影は keymap の既存 scope・有限集合・ヘルプ例外を使い、全組一致のテストを置いた。detached の述語・viewport は変更していない。
+- G は `app/agent_operations` と既存の UI dispatch を使う。許可・Remote の読み取り拒否・書き込み受付を第 1 段と共有し、
+  変更なしは保存・通知しない。項目と応答全体の予算を確定前に検査し、既存の `apply_operation_customize_bundle` で保存する。
+  読み取りの単行・ページ合計予算は `agent-ipc::bound_page_rows` へ共通化した。
+  IPC 6 fixture は変更前の HEAD `a2d268b915e6de9e9e7df2e086c3fb1387820279` から凍結した。
+- JSON の同名の鍵は、既存の `Value` への直接解析では消えてしまうため、MCP と IPC の解析境界に共通の `parse_unique_json` を置いた。
+  操作名・スロット名の重複を失う前に拒む。配列要素の重複は残す。
+- H は AI 連携の説明、マニュアル3ページ、プライバシー、製品ページ、親設計・キー仕様・architecture を更新した。
+  製品ページの通信の説明は、許可した操作カスタマイズの割り当ても AI アプリへ渡ることを明記した。新しい通信先・保存先はない。
+- 重複起動された別の実装セッションは設計担当が停止したとの連絡を受け、この実装を正本に整理した。
+  別形式の Command・module 宣言・画面 helper は削除し、App handler・受付配線・共通予算・JSON 解析・MCP 草案は API を揃えて取り込んだ。
+  この整理自体もコンパイル・テスト未実施。
+- cargo (fmt を含む)、glyph lint、site cards、snapshot PNG 生成・目視・比較、製品起動、独立レビューは未実施。コミットしていない。
+  まれな保存失敗は既存と同じログと警告で扱い、回復処理は追加していない。
+
+共有 runner に渡すコマンド (実装担当は未実行):
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/operation_customize|agent_operations|agent_settings|agent_ipc::|keymap::|ring_shortcut::|ui_dialogs::preferences::|agent_integration::|stage1_/)'
+cargo nextest run -p mimageviewer-agent-ipc
+cargo nextest run -p mimageviewer-mcp
+python scripts/check_ui_glyphs.py
+python scripts/check_site_cards.py
+```
+
+既存の `ui_snapshot` の `agent_integration_window_{disabled,read,open,organize,records}_{light,dark}` 10枚は更新・目視・通常比較が必要。
+UI 文言の変更は AI 連携の許可補足・見せる情報・許す操作で、操作カスタマイズ窓の見た目は変更していない。
+
+
+追加テスト名 (すべて未実行):
+
+`src/operation_customize_agent/tests.rs`:
+
+```text
+operations_slots_choices_match_ui_validators_and_reject_wrong_addresses
+operations_all_slot_kinds_and_duplicate_gestures_round_trip_public_values
+operations_every_slot_restores_public_values_and_null_resets_to_its_default
+operations_gesture_notation_round_trips_and_refuses_normalization
+operations_keys_validate_trigger_shapes_names_and_array_limits
+operations_duplicate_key_arrays_restore_and_noop_preserves_override_order
+operations_right_drag_null_uses_explicit_default_without_legacy_inheritance
+operations_screens_match_overlap_for_every_action_pair_and_exceptions
+operations_screen_key_lookup_includes_global_and_fullscreen_common
+operations_conflict_preview_replaces_three_keys_and_filters_action_and_candidate
+operations_conflict_kinds_match_editor_and_default_pairs_do_not_warn
+operations_queries_use_and_matching_exact_context_names_and_page_bounds
+operations_views_paginate_keys_inputs_conflicts_and_largest_choice_inventory
+operations_single_oversized_gesture_becomes_too_long_without_losing_other_slots
+operations_long_key_page_keeps_membership_when_aggregate_budget_omits_rows
+operations_key_inputs_use_the_shared_ring_button_and_gesture_mapping
+```
+
+`src/app/agent_operations_tests.rs`:
+
+```text
+agent_operations_commit_updates_effective_keys_saves_once_and_publishes_readable_undo
+agent_operations_noop_preserves_override_order_without_saving_or_notifying
+agent_operations_refuse_permission_startup_all_drafts_modals_and_remote_without_changes
+agent_operations_reads_live_assignments_during_drafts_and_dialog_reopens_with_new_values
+agent_operations_unchanged_preferences_ok_preserves_keys_rings_gamepad_and_wheel
+agent_operations_oversized_before_after_and_conflicts_refuse_before_commit
+agent_operations_queued_requests_recheck_live_permission_and_use_root_poll_owner
+agent_operations_mouse_migration_prompt_commits_live_values_without_a_stale_draft
+agent_operations_settings_errors_route_owned_fields_to_the_operations_tool
+```
+
+`src/agent_ipc/operations_tests.rs`:
+
+```text
+operations_permission_flag_refuses_reads_and_writes_before_worker
+operations_read_uses_ui_owner_and_rechecks_epoch_before_wire
+operations_claimed_write_keeps_actual_reply_after_cancel_and_permission_revocation
+operations_pending_cancel_prevents_late_commit_and_shares_existing_ui_slot
+```
+
+`src/agent_ipc/compatibility_tests.rs`:
+
+```text
+frozen_v6_adapter_reaches_v7_settings_ui_and_projects_old_response
+```
+
+`src/ui_dialogs/settings_restore.rs`:
+
+```text
+agent_operations_closed_restore_drops_import_worker_receiver_before_ai_commit
+```
+
+`src/ui_dialogs/agent_integration/tests.rs`:
+
+```text
+agent_operations_exposure_follows_settings_permission_and_keeps_remaining_limits
+```
+
+`crates/agent-ipc/src/page_budget.rs`:
+
+```text
+operations_page_budget_omits_one_oversized_row_and_keeps_membership
+operations_page_budget_omits_largest_rows_when_only_page_sum_overflows
+```
+
+`crates/agent-ipc/src/unique_json.rs`:
+
+```text
+operations_duplicate_names_are_rejected_before_map_projection
+```
+
+`crates/agent-ipc/tests/operations_wire.rs`:
+
+```text
+operations_wire_round_trips_new_commands_and_typed_responses
+operations_query_validates_view_arguments_counts_and_pages
+operations_edits_validate_combined_limit_and_preserve_raw_values
+operations_ipc_frame_rejects_duplicate_addresses_before_map_projection
+```
+
+`crates/agent-ipc/tests/v6_compatibility.rs`:
+
+```text
+frozen_v6_hello_and_response_projection_remain_compatible_with_v7
+frozen_v6_adapter_never_receives_operations_variants_and_keeps_all_old_budgets
+```
+
+`crates/mcp-server/src/operations_tests.rs`:
+
+```text
+operations_arguments_reject_wrong_views_types_counts_and_unknown_fields
+operations_typed_projection_and_final_envelopes_fit_all_versions
+operations_discovery_keeps_annotations_safety_guidance_and_pair_budget
+operations_tools_work_on_every_mcp_version_and_permission_failure
+operations_stdio_rejects_duplicate_addresses_before_backend
+```
 
 ### 20.13 確かめていない点
 

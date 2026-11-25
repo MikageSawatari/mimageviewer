@@ -325,7 +325,7 @@ fn agent_exposure_guide_permissions_follow_checks_at_every_level() {
                 assert_eq!(
                     result
                         .hidden
-                        .contains(&"環境設定の項目と値・スタック用スクリプトの本文"),
+                        .contains(&"環境設定の項目と値・操作カスタマイズの割り当て・スタック用スクリプトの本文"),
                     !settings
                 );
                 assert_eq!(
@@ -337,6 +337,7 @@ fn agent_exposure_guide_permissions_follow_checks_at_every_level() {
                 );
                 for prefix in [
                     "環境設定の変更",
+                    "キー割り当て・リング・マウスボタン・ジェスチャーの変更",
                     "外部ツールの登録",
                     "スタック用スクリプトの書き換え",
                     "お気に入りへの登録",
@@ -358,6 +359,47 @@ fn agent_exposure_guide_permissions_follow_checks_at_every_level() {
                         .any(|line| line.contains("スタック用スクリプトの本文")),
                     settings
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn agent_operations_exposure_follows_settings_permission_and_keeps_remaining_limits() {
+    for level in [
+        AgentLevel::Disabled,
+        AgentLevel::ReadOnly,
+        AgentLevel::ReadAndOpen,
+        AgentLevel::Organize,
+    ] {
+        for settings in [false, true] {
+            let mut selection = PermissionSelection::from(&Settings::default());
+            selection.level = level;
+            selection.settings = settings;
+            let result = exposure(selection);
+            let enabled = settings && level != AgentLevel::Disabled;
+            assert_eq!(
+                result
+                    .shown
+                    .iter()
+                    .any(|line| line.contains("操作カスタマイズの割り当て")),
+                enabled
+            );
+            assert_eq!(
+                result
+                    .actions
+                    .iter()
+                    .any(|line| line.starts_with("キー割り当て・リング")),
+                enabled
+            );
+            if level != AgentLevel::Disabled {
+                let limits = result
+                    .actions
+                    .iter()
+                    .find(|line| line.contains("まだ変えられません"))
+                    .unwrap();
+                assert!(limits.contains("ツールバー"));
+                assert!(!limits.contains("キー割り当て"));
             }
         }
     }

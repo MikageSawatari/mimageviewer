@@ -107,7 +107,8 @@ pub(super) fn respond(
         Ok(
             open::UiOpenOutcome::Admitted
             | open::UiOpenOutcome::Read(_)
-            | open::UiOpenOutcome::Settings(_),
+            | open::UiOpenOutcome::Settings(_)
+            | open::UiOpenOutcome::Operations(_),
         )
         | Ok(open::UiOpenOutcome::StackScriptAdmitted { .. }) => {
             (Err(failed()), ReplyPolicy::Rejected)

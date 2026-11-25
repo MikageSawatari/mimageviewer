@@ -258,6 +258,9 @@ pub(super) fn stage1_set_video_lock(s: &mut Settings, v: &StillLock) {
 }
 
 pub(super) fn stage1_key_error(key: &str, reason: &str) -> String {
+    if matches!(key, "keymap" | "ring_shortcuts" | "gamepad_enabled") {
+        return format!("{key}: set_operations で変えます");
+    }
     if key.starts_with("agent_")
         || matches!(
             key,
@@ -1351,11 +1354,16 @@ mod tests {
             "show_grid_edge_buttons",
         ] {
             assert!(!rows.iter().any(|row| row.key == key), "{key}");
+            let expected = if matches!(key, "keymap" | "ring_shortcuts" | "gamepad_enabled") {
+                "set_operations で変えます"
+            } else {
+                "まだ AI からは変えられません"
+            };
             assert!(
                 stage1_validate(&settings, &change(key, Value::Null))
                     .err()
                     .expect("stage-2 keys must be refused")
-                    .contains("まだ AI からは変えられません"),
+                    .contains(expected),
                 "{key}"
             );
         }

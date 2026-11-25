@@ -36,9 +36,9 @@ fn only_open_activates_and_every_ui_request_wakes_without_desktop_input() {
     }
 }
 
-fn prepared_ui_requests() -> [UiRequestKind; 9] {
+fn prepared_ui_requests() -> Vec<UiRequestKind> {
     use super::super::metadata_write::{PreparedRatings, PreparedTags};
-    [
+    vec![
         UiRequestKind::Open(ActivationOpenPath::received("C:\\fixture.jpg".into(), None)),
         UiRequestKind::TagWrite(PreparedTags {
             items: Vec::new(),
@@ -79,6 +79,11 @@ fn prepared_ui_requests() -> [UiRequestKind; 9] {
             client_name: "fixture".into(),
         }),
         UiRequestKind::StackScriptAdmission,
+        UiRequestKind::GetOperations(mimageviewer_agent_ipc::OperationsQuery::default()),
+        UiRequestKind::SetOperations {
+            args: mimageviewer_agent_ipc::OperationEdits::default(),
+            client_name: "fixture".into(),
+        },
     ]
 }
 

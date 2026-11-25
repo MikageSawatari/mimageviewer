@@ -19,7 +19,11 @@ wire と永続形式、detached の述語・viewport・窓の寿命は変更し�
 表示専用の初期化を省いた下書きを既存の `apply_preferences_dialog` へ渡す。
 `app/agent_favorite` はフォルダの検査を worker に任せ、ダイアログと共有の `fav_add` の確定処理を通す。
 変更の応答は確定前に予算を検査し、通知と「AI による変更」に記録する。AI が外部ツールを起動する経路は持たない。
-IPC 版は 6。スタック用スクリプトの本文は、同じ設定許可の `stack_script` で読み書きする。
+`operation_customize_agent` は App に依存しない割り当ての投影・検査・bundle 更新を持ち、
+`app/agent_operations` は設定と共有する許可・受付を検査して `apply_operation_customize_bundle` へ渡す。
+キーとリングの対応表は `ring_shortcut::ring_bindings_for_key_action` を窓と共有し、画面の投影は keymap の scope・例外と共有する。
+`agent-ipc::bound_page_rows` は設定と操作の単行・ページ合計予算を共通化し、所属を保ったまま大きい行を省く。
+IPC 版は 7。スタック用スクリプトの本文は、同じ設定許可の `stack_script` で読み書きする。
 本文の取得・検査は agent worker、AI の照合付き書き込みと環境設定の「既定に戻す」「スクリプトを開く」は
 `filename_stack_script` の単一 FIFO worker に集約する。ボタンは enqueue だけで、UI は I/O・完了待ち・監視を行わない。
 書き込みは本文全体の SHA-256 を照合し、変更行とログには本文を出さず行数だけを残す。
