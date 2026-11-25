@@ -359,65 +359,84 @@ AHK / hook の未解決 producer 契約はこの state へ推測で合流させ�
 ### 9.1 記録
 
 サブ PC2 の Claude が master 14a448b3a の build で記録した (`MIV_MOUSE_SEEK_DEBUG=1`、
-`scripts/diag-send-browser-back.ps1` の SendInput 5 回、前面は presenter)。1 回の送信ごとに presenter の
-同じ HWND へ次の 2 receipt が届き、各々が App で 1 回ずつ `apply_mouse_back_forward_button` を実行した
-(`[native-video-key]` seq 1〜10、行き先は既定割当のフォルダ履歴)。
+`scripts/diag-send-browser-back.ps1` の写し (PowerShell 5.1 で動かない `[ushort]` を `[uint16]` に
+置き換えたもの) による SendInput 5 回、RDP 越しの画面、前面は presenter)。1 回の送信ごとに presenter の
+同じ HWND へ次の 2 receipt が届き、各々が別々に App の `apply_mouse_back_forward_button` へ進んだ
+(`[native-video-key]` seq 1〜10、行き先は既定割当のフォルダ履歴、履歴が空なので画面の変化なし)。
 
 - scan 付き `WM_KEYDOWN` (vk 0xA6、scan 0x6A、extended)
-- `WM_APPCOMMAND` command 1、device `FAPPCOMMAND_KEY`、key state 0、`in_send_flags=0`、
-  `dispatching=false`、`outer=none` (`delivery=unknown`)
+- `WM_APPCOMMAND` command 1、device `FAPPCOMMAND_KEY`、key state 0、source HWND = 受信 HWND、
+  `in_send_flags=0`、`dispatching=false`、`outer=none` (`delivery=unknown`)
 
-APPCOMMAND は presenter のポンプの `DispatchMessageW` から配られておらず、別スレッドからの送信でもなく、
-presenter / HUD の WndProc の中で入れ子に起きたものでもない。すなわち USER32 / win32k がこのスレッドへ
-自分で配った message である。設計担当の単独窓の試験 (Python ctypes、全体への入力注入なし) では、
-`DefWindowProcW(WM_KEYDOWN/WM_KEYUP, VK_BROWSER_BACK)` の直接呼び出しも、同じ key message の
-`PostMessageW` + `TranslateMessage` + `DispatchMessageW` も、同期・非同期のどちらでも WM_APPCOMMAND を
-作らなかった。presenter は 2026-09 から browser `WM_KEYDOWN` を `DefWindowProcW` へ渡していないが、
-記録でも APPCOMMAND は届いている。したがってこの APPCOMMAND は、本物の入力の app-command key から
-OS が生成する写し (Microsoft の WM_APPCOMMAND の説明の「when the user types an application command key」) で
-あり、mIV の key 処理の戻り値では止められない。Mozilla の bug 865561 の trace でも、自動 repeat の
-`WM_KEYDOWN` ごとに WM_APPCOMMAND が 1 回ずつ対になる。§1 の AHK trace (111/111) と同じ形である。
+この APPCOMMAND は、追跡中の `DispatchMessageW` の message としても、別スレッドからの送信としても、
+presenter / HUD の WndProc の入れ子としても届いていない。どの USER32 呼び出しの中で届いたかは、
+現在の計測では分からない (`PeekMessageW` / `TranslateMessage` は計測範囲の外)。
+設計担当の単独窓の試験 (Python ctypes、全体への入力注入なし) では、`DefWindowProcW(WM_KEYDOWN/WM_KEYUP,
+VK_BROWSER_BACK)` の直接呼び出しも、同じ key message の post + `TranslateMessage` + `DispatchMessageW`
+も WM_APPCOMMAND を作らなかった。ただしこの試験は本物の入力に付く OS 内部の状態を再現していない。
+Microsoft の WM_APPCOMMAND の説明は、app-command key を打ったときにも生成されるとだけ書く。
+Mozilla bug 865561 の trace では自動 repeat の `WM_KEYDOWN` ごとに WM_APPCOMMAND が 1 回ずつ対になり、
+同 bug は OS が先に WM_APPCOMMAND を送り、未処理なら key を post する順序も記録している。
+mIV の記録 (§1 の AHK 111 組、今回の 5 組) では、どれも KEYDOWN が先に presenter へ届いた。
 
-動画全画面で browser key の行き先がフォルダ履歴になるのは仕様どおり (keymap-spec の動画フルスクリーン
-「マウス戻る / 進む / ホイールクリック」: 新規環境と既定リセットは戻る / 進むがフォルダ履歴)。
+未確認: 本物の Browser キー、AHK、seek 割当での二重。動画全画面で browser key の行き先が
+フォルダ履歴になるのは仕様どおり (keymap-spec の動画フルスクリーン「マウス戻る / 進む /
+ホイールクリック」: 新規環境と既定リセットは戻る / 進むがフォルダ履歴)。
 
 ### 9.2 ownership の決定
 
-presenter では、**browser key の 1 押下は key message が持つ**。OS が key から作った写しの
-WM_APPCOMMAND は action にしない。写しの判定は時刻ではなく配送の出どころで行う:
+presenter では **browser key の 1 押下の持ち主は key message** とし、同じ押下について OS が届けた
+WM_APPCOMMAND を、その押下との組 (identity) で識別して action にしない。識別は時刻を使わず、
+次の両方がそろったときだけ成立する。
 
-- command が 1 / 2、device が `FAPPCOMMAND_KEY`、かつ
-- `InSendMessageEx` の送信 flag なし (別スレッドからの送信でない)、追跡中の `DispatchMessageW` の
-  message でない (queue に post されたものでない)、presenter / HUD の WndProc の入れ子でない
+1. **組になる press がある**: 同じ presenter HWND の WndProc が、同じ方向 (Back / Forward) の browser
+   `WM_KEYDOWN` / `WM_SYSKEYDOWN` (repeat を含む) を App route へ渡し、その press がまだ写しと組に
+   なっていない。press ごとに 1 つ、方向別の未組 press 列 (receipt id の FIFO) に積む。
+2. **OS が自分のポンプ呼び出しの中で届けた**: WM_APPCOMMAND の command が 1 / 2 で press と同じ方向、
+   device が `FAPPCOMMAND_KEY`、source HWND = 受信 HWND = その presenter、`InSendMessageEx` の送信 flag
+   なし、presenter / HUD の WndProc の入れ子でない、かつ presenter thread が自分のポンプの
+   `PeekMessageW` または `TranslateMessage` の呼び出しの中にいる (RAII の TLS frame で正に記録する。
+   `DispatchMessageW` の frame は MSG の HWND / message / wParam / lParam を持ち、その message 自身は
+   queued として扱う)。
 
-この 3 条件がそろう配送は、このスレッドの mIV のコードからは起きず、OS が配ったものに限られる。
-写しの WM_APPCOMMAND は従来どおり処理済み (TRUE) で返す。未処理で返すと OS が別の key message を
-足す実装がある (Mozilla 865561) ため、戻り値は変えない。
+成立したら、未組 press 列の先頭を 1 つ取り除き、その WM_APPCOMMAND は TRUE (処理済み) で返す。
+receipt には `delivery=os_key_echo paired_receipt=<press の receipt id>` を記録する。成立しなければ
+従来どおり action にする。したがって、対になる key のない WM_APPCOMMAND (OS が先に送る順序、
+mouse / OEM device、queue に post されたもの、別スレッドからの送信、子 HWND からの転送、
+入れ子、計測範囲外の配送) はすべて従来どおり 1 回 action になり、入力を失わない。
+OS が先に送る順序で key が後から届いた場合は、従来どおり二重が残り得る (今回の記録では未観測)。
 
-次は従来どおり action にする (§3 の不変条件 3 を保つ):
+未組 press 列は presenter の window state (HWND と generation に属する) が持ち、HWND の破棄で消える。
+key message だけを送り写しを伴わない producer では未組 press が残るが、それを消費できるのは上の 2 の
+条件を満たす配送だけで、その形の WM_APPCOMMAND を単独で送る producer は確認されていない。
+列の長さは押下数に比例するので、上限 (例: 方向ごと 64) を超えた古い press から捨てる。これは
+まれな組み合わせの割り切り (CLAUDE.md の既定方針) として扱う。
 
-- queue に post された WM_APPCOMMAND (`delivery=queued`)、別スレッドからの送信 (`sent_cross_thread`)
-- device が `FAPPCOMMAND_MOUSE` / `FAPPCOMMAND_OEM` の WM_APPCOMMAND
-- 出どころを決められない配送 (入れ子など)。二重は残り得るが、取りこぼすより安全側として、
-  ログの `delivery=` で後から特定できる
-
-HUD は `WS_EX_NOACTIVATE` で keyboard focus を取らず key message を受けないので、OS の写しも届かない。
-HUD の WM_APPCOMMAND は従来どおり全部 action にする (HUD に写しの規則を当てると唯一の入口を失う)。
+HUD は `WS_EX_NOACTIVATE` と `MA_NOACTIVATE` で通常の操作では keyboard focus を取らず、key message を
+受けない。HUD の WM_APPCOMMAND は従来どおり全部 action にする。
 
 この規則はメイン窓の現行の経路と同じ持ち主の決め方である。メイン窓の `WH_GETMESSAGE` hook は
-browser `WM_KEYDOWN` と queue の WM_APPCOMMAND を数え、OS が送った写しは queue を通らないので数えない。
+browser `WM_KEYDOWN` と queue の WM_APPCOMMAND を数え、queue を通らない WM_APPCOMMAND は数えない。
 
-不採用: (a) 時間 debounce、scan 0 / device 0 の一律破棄 — §1 のとおり。
-(b) presenter で browser key message を捨て、WM_APPCOMMAND だけを入口にする — Windows 標準の
-ブラウザやエクスプローラに近い。だが、key message だけを送る producer を壊し、§3 の不変条件 3 に反する。
-(c) KEYDOWN と APPCOMMAND を順序で組にする — 写しが KEYDOWN の前後どちらにも来るため (98 / 13 組)、
-組の未成立を扱う状態と期限が要り、状態の組み合わせを増やす。
+不採用:
+- (a) 時間 debounce、scan 0 / device 0 の一律破棄 — §1 のとおり。
+- (b) presenter で browser key message を捨て、WM_APPCOMMAND だけを入口にする — key message だけを
+  送る producer を壊し、§3 の不変条件 3 に反する。
+- (c) 配送の形だけで写しと決める (組になる press を見ない) — 対になる key のない WM_APPCOMMAND
+  (OS が先に送る順序、同スレッドの hook や子 HWND からの転送) を落とし得る (独立レビュー r6 の指摘)。
+- (d) 到着順だけの組 (配送の出どころを見ない) — 別 producer の単独 WM_APPCOMMAND を、key だけの
+  producer が残した press と組にして落とし得る。
 
 ### 9.3 確認
 
-- handler-level test: 旧コードで、写しの条件の WM_APPCOMMAND が action になることを確かめる。
-  新コードで action にならず、queued / cross-thread / mouse / OEM の WM_APPCOMMAND は従来どおり
-  1 回ずつ action になる。key message の press 1 回は action 1 回。
-- 実機: 同じ記録手順で、1 回の送信に `[native-video-key]` の action が 1 回だけになり、写しの receipt は
-  `delivery=os_key_echo` で action にならないこと。キーボードの Browser Back キーがあれば、その長押しでも
-  repeat ごとに 1 回であること。
+- handler-level test は本物の presenter WndProc (既存の hidden production HWND fixture) を
+  SendMessage / PostMessage で駆動し、event sink に届いた action 件数を固定する。旧コードで落ちること:
+  同じ方向の browser KEYDOWN の後に、ポンプの Peek / Translate frame の中で同スレッドから届いた
+  `FAPPCOMMAND_KEY` WM_APPCOMMAND は、旧 handler では 2 件、新 handler では 1 件。
+- 1 件のまま変わらないこと: 対になる press のない WM_APPCOMMAND、queued、同スレッド sent
+  (frame 外)、cross-thread sent、mouse / OEM、入れ子、子 HWND から親への転送、逆方向、別 HWND、
+  KEYUP だけ、HUD。press 2 回 + 写し 2 回は 2 件。repeat の press と写しは 1 対 1。
+- 実機: 同じ記録手順で、1 回の送信に `[native-video-key]` の action が 1 回だけになり、写しの receipt が
+  `delivery=os_key_echo paired_receipt=...` で action にならないこと。写しが Peek / Translate frame の外で
+  届いた場合は、`delivery` に届いた frame が出て二重が残る (入力は失わない)。キーボードの Browser Back
+  キーがあれば、その長押しでも repeat ごとに 1 回であること。
