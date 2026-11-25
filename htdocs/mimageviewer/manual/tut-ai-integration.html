@@ -44,7 +44,7 @@
     <h1 class="page-title">AI アプリとの連携 (MCP) を使う</h1>
     <p class="page-desc">
       同じ PC の Claude Desktop や ChatGPT (Codex) に mImageViewer を登録すると、AI アプリが mIV の使い方の説明を引けるようになります。
-      「お気に入りに登録するには？」のように AI アプリへ聞くだけで、マニュアルを探さなくても答えが返ります。
+      「お気に入りに登録するには？」のように AI アプリへ聞けば、AI アプリがその説明を調べて答えるので、マニュアルを自分で探す手間が減ります。
       許可すれば、ライブラリの検索や整理も言葉で頼めます。アプリどうしをつなぐ規格「MCP」を使います。
     </p>
     <p>このページでは、登録してから最初の依頼をするまでを順に説明します。
@@ -58,6 +58,8 @@
         通信と保存の扱いは<a href="../privacy.html">プライバシーポリシー</a>をご覧ください。
       </div>
     </div>
+
+    <p>始める前に、使う AI アプリ（Claude Desktop、または ChatGPT のデスクトップアプリ）を PC にインストールし、一度起動してサインインまで済ませておきます。</p>
 
     <h2 id="open">1. 「AI 連携」の窓を開く</h2>
     <p>mIV を起動し、メニューの<strong>「設定」→「AI 連携…」</strong>を開きます。
@@ -103,11 +105,13 @@
 
     <figure class="tut-shot">
       <div class="tut-shot-ph">画像 M4: 「AI アプリへの登録の確認」。追加する内容、終了の注意、設定ファイルの場所、「書き換える」「キャンセル」</div>
-      <figcaption>書き換える前に、変更の内容と設定ファイルの場所が表示されます。書き換え前の内容は、同じ場所にバックアップとして残ります。</figcaption>
+      <figcaption>書き換える前に、変更の内容と設定ファイルの場所が表示されます。設定ファイルがすでにある場合は、書き換え前の内容を同じ場所にバックアップとして残します。</figcaption>
     </figure>
 
     <p>状態が「登録先が違う」の場合は<strong>「登録し直す」</strong>を押します。「設定ファイルを読めない」「自動登録できません」の場合は、
-      <strong>「手順を見る」</strong>で手動の設定方法を確かめてください。詳しくは<a href="ai-integration.html#registration">登録の詳しい説明</a>をご覧ください。</p>
+      <strong>「手順を見る」</strong>で手動の設定方法を確かめてください。
+      「見つからない」の場合は、mIV がその AI アプリを見つけられていません。「登録する」は押せません。AI アプリがインストールされているか確かめ、
+      一度起動してから終了し、「再確認」を押します。それでも変わらない場合は「手順を見る」の手動の設定方法を使ってください。詳しくは<a href="ai-integration.html#registration">登録の詳しい説明</a>をご覧ください。</p>
 
     <h2 id="ask-help">4. AI アプリを起動して、使い方を聞く</h2>
     <p>AI アプリを起動し、<strong>新しい会話</strong>を始めます。ChatGPT では Codex の画面に切り替えて、新しいセッションを始めます。
@@ -115,15 +119,16 @@
       利用者のファイルやライブラリの情報は使いません。</p>
     <p>たとえば次のように頼みます。</p>
     <ul>
-      <li>「<strong>mImageViewer でフォルダをお気に入りに登録する方法を教えて</strong>」</li>
-      <li>「mImageViewer で漫画を見開きで読むには？」</li>
+      <li>「<strong>mImageViewer の MCP ツールで使い方を調べて、フォルダをお気に入りに登録する方法を教えて</strong>」</li>
+      <li>「mImageViewer の MCP ツールで、漫画を見開きで読む方法を調べて」</li>
     </ul>
-    <p>AI アプリの画面に mIV の機能を使った表示が出て、マニュアルに沿った答えが返れば、つながっています。
+    <p>AI アプリが自分の知識だけで答え、mIV の説明を調べないことがあります。「mImageViewer の MCP ツールで」と書き添えると、mIV の説明を使うよう頼めます。
+      AI アプリの画面に mIV の機能を使った表示が出て、マニュアルに沿った答えが返れば、つながっています。
       AI アプリが mIV の機能を使ってよいか確認を求めた場合は、許可してください。</p>
 
     <figure class="tut-shot">
       <div class="tut-shot-ph">画像 C4: Claude Desktop で使い方を聞いた会話。mIV の機能を使った表示と答え</div>
-      <figcaption>Claude Desktop の例。答えの前に、mIV の機能を使った表示が出ます。</figcaption>
+      <figcaption>Claude Desktop の例。</figcaption>
     </figure>
 
     <figure class="tut-shot">
@@ -152,12 +157,12 @@
       <figcaption>許可の範囲の中で、AI アプリが mIV からフォルダの内容を受け取って答えます。</figcaption>
     </figure>
 
-    <p>AI アプリから呼び出されると、「AI 連携」の窓の<strong>「最近使った AI アプリ」</strong>に、AI アプリが名乗った名前と直近の利用状況が並びます。
-      どの AI アプリがつながっているかは、ここでも確かめられます。mIV を終了すると消えます。</p>
+    <p>AI アプリがファイルやライブラリについて mIV を呼び出すと、「AI 連携」の窓の<strong>「最近使った AI アプリ」</strong>に、AI アプリが名乗った名前・版と最後に使われた時刻が並びます。
+      これは呼び出しの記録で、許可がなくて断った呼び出しも含みます。使い方の説明を引いただけでは並びません。mIV を終了すると消えます。</p>
 
     <figure class="tut-shot">
       <div class="tut-shot-ph">画像 M5: 登録後の「AI 連携」の窓の下部。「登録済み」と「最近使った AI アプリ」の行</div>
-      <figcaption>登録の行が「登録済み」になり、「最近使った AI アプリ」に呼び出した AI アプリが表示されます。</figcaption>
+      <figcaption>登録の行が「登録済み」になり、「最近使った AI アプリ」に、mIV を呼び出した AI アプリが表示されます。</figcaption>
     </figure>
 
     <h2 id="troubleshooting">6. うまくいかないとき</h2>
