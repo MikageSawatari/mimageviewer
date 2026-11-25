@@ -464,6 +464,126 @@ fn codex_removal_deletes_empty_explicit_implicit_inline_and_dotted_parents() {
 }
 
 #[test]
+fn codex_registration_preserves_empty_explicit_parent_comments() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for parent in [
+        "# MCP の運用メモ\n[mcp_servers]\n",
+        "[mcp_servers] # 利用者が残した説明\n",
+        "# MCP の運用メモ\n[mcp_servers] # 利用者が残した説明\n",
+    ] {
+        for newline in ["\n", "\r\n"] {
+            let original = format!("model = 'x'\n{parent}").replace('\n', newline);
+            let registered =
+                config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+            let removed =
+                config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+            assert_eq!(removed.as_bytes(), original.as_bytes(), "parent={parent:?}");
+        }
+    }
+}
+
+fn assert_codex_inline_parent_comments_round_trip(parent: &str) {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for newline in ["\n", "\r\n"] {
+        let original = format!("model = 'x'\n{parent}").replace('\n', newline);
+        let registered =
+            config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+        // Observe the ownership after serialization and parsing, as removal does.
+        // A final byte comparison alone would not locate an ownership regression.
+        let before: toml_edit::DocumentMut = original.replace("\r\n", "\n").parse().unwrap();
+        let after: toml_edit::DocumentMut = registered.replace("\r\n", "\n").parse().unwrap();
+        let before_parent = before["mcp_servers"].as_inline_table().unwrap();
+        let after_parent = after["mcp_servers"].as_inline_table().unwrap();
+        assert_eq!(
+            after_parent.trailing().as_str(),
+            before_parent.trailing().as_str(),
+            "parent={parent:?}"
+        );
+        // Re-registering must preserve the same ownership and output too.
+        assert_eq!(
+            config::edit(AppTarget::ChatGpt, &registered, Action::Register, &command).unwrap(),
+            registered
+        );
+        let removed =
+            config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+        assert_eq!(removed.as_bytes(), original.as_bytes(), "parent={parent:?}");
+    }
+}
+
+#[test]
+fn codex_registration_preserves_empty_inline_parent_comments() {
+    for parent in [
+        "# MCP の運用メモ\nmcp_servers = {}\n",
+        "mcp_servers = {} # 利用者が残した説明\n",
+        "# MCP の運用メモ\nmcp_servers = {} # 利用者が残した説明\n",
+    ] {
+        assert_codex_inline_parent_comments_round_trip(parent);
+    }
+}
+
+#[test]
+fn codex_registration_preserves_multiline_inline_parent_comment_after_reparse() {
+    assert_codex_inline_parent_comments_round_trip("mcp_servers = {\n  # 表の中の運用メモ\n}\n");
+}
+
+#[test]
+fn codex_registration_preserves_inline_parent_opening_line_comment_after_reparse() {
+    assert_codex_inline_parent_comments_round_trip("mcp_servers = { # 表の中の行末の説明\n}\n");
+}
+
+#[test]
+fn codex_registration_keeps_toml10_inline_tables_without_trailing_commas() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    let with_other = "mcp_servers = { other = { command = 'other' } }\n";
+    for (parent, expected_parent) in [
+        ("mcp_servers = { }\n", ""),
+        ("mcp_servers = {}\n", ""),
+        (with_other, with_other),
+    ] {
+        for newline in ["\n", "\r\n"] {
+            let original = format!("model = 'x'\n{parent}").replace('\n', newline);
+            let registered =
+                config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+            let normalized = registered.replace("\r\n", "\n");
+            let parsed: toml_edit::DocumentMut = normalized.parse().unwrap();
+            assert!(
+                !parsed["mcp_servers"]
+                    .as_inline_table()
+                    .unwrap()
+                    .trailing_comma(),
+                "parent={parent:?}, registered={registered}"
+            );
+            for trailing_comma in [", }", ",}", ",\n}"] {
+                assert!(!normalized.contains(trailing_comma), "{registered}");
+            }
+            let removed =
+                config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+            let expected = format!("model = 'x'\n{expected_parent}").replace('\n', newline);
+            assert_eq!(removed.as_bytes(), expected.as_bytes(), "parent={parent:?}");
+        }
+    }
+}
+
+#[test]
+fn codex_registration_removes_uncommented_empty_explicit_parent() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for newline in ["\n", "\r\n"] {
+        // A '#' inside an unrelated string is not a comment on the parent.
+        let prefix = "model = 'x#y'\n".replace('\n', newline);
+        let original = format!("{prefix}[mcp_servers]{newline}");
+        let registered =
+            config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+        let removed =
+            config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+        assert_eq!(removed.as_bytes(), prefix.as_bytes());
+    }
+}
+
+#[test]
 fn codex_removal_keeps_other_servers_and_existing_parent_forms() {
     let (_temp, env) = fixture();
     let command = env.resolve_command().unwrap();

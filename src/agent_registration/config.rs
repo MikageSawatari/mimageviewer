@@ -170,6 +170,33 @@ fn parse_toml(text: &str) -> Result<toml_edit::DocumentMut, String> {
     Ok(doc)
 }
 
+fn toml_has_comment(raw: Option<&toml_edit::RawString>) -> bool {
+    // These raw strings contain only decoration, so '#' cannot be part of a
+    // quoted key or value. DocumentMut has already resolved their source spans.
+    raw.and_then(toml_edit::RawString::as_str)
+        .is_some_and(|text| text.contains('#'))
+}
+
+fn toml_parent_has_comments(doc: &toml_edit::DocumentMut) -> bool {
+    let decor_has_comment = |decor: &toml_edit::Decor| {
+        toml_has_comment(decor.prefix()) || toml_has_comment(decor.suffix())
+    };
+    doc.as_table().key("mcp_servers").is_some_and(|key| {
+        decor_has_comment(key.leaf_decor()) || decor_has_comment(key.dotted_decor())
+    }) || doc.get("mcp_servers").is_some_and(|item| {
+        item.as_table()
+            .is_some_and(|table| decor_has_comment(table.decor()))
+            || item.as_value().is_some_and(|value| {
+                decor_has_comment(value.decor())
+                    || value.as_inline_table().is_some_and(|table| {
+                        // Empty inline tables, and content after a trailing
+                        // comma, keep their inner comments in trailing.
+                        toml_has_comment(Some(table.trailing()))
+                    })
+            })
+    })
+}
+
 pub(super) fn state(
     target: AppTarget,
     text: &str,
@@ -279,13 +306,14 @@ pub(super) fn edit(
             let mut doc = parse_toml(text)?;
             match action {
                 Action::Remove => {
-                    if let Some(servers) = doc
+                    let empty_parent = doc
                         .get_mut("mcp_servers")
                         .and_then(toml_edit::Item::as_table_like_mut)
-                    {
-                        if servers.remove("mimageviewer").is_some() && servers.is_empty() {
-                            doc.remove("mcp_servers");
-                        }
+                        .is_some_and(|servers| {
+                            servers.remove("mimageviewer").is_some() && servers.is_empty()
+                        });
+                    if empty_parent && !toml_parent_has_comments(&doc) {
+                        doc.remove("mcp_servers");
                     }
                 }
                 Action::Register => {
@@ -302,7 +330,16 @@ pub(super) fn edit(
                     }
                     server["args"] = toml_edit::value(args);
                     server["default_tools_approval_mode"] = toml_edit::value("approve");
-                    let server = if doc["mcp_servers"].is_inline_table() {
+                    let server = if let Some(servers) = doc["mcp_servers"].as_inline_table_mut() {
+                        // Without a comma, reparsing the output attaches this
+                        // parent-owned content to the new server's value suffix.
+                        // A comma keeps it in the parent's trailing instead;
+                        // serialization omits the comma once the table is empty.
+                        // Inner comments already require TOML 1.1. Whitespace
+                        // alone must not introduce its trailing-comma syntax.
+                        if toml_has_comment(Some(servers.trailing())) {
+                            servers.set_trailing_comma(true);
+                        }
                         toml_edit::Item::Value(toml_edit::Value::InlineTable(
                             server.into_inline_table(),
                         ))
