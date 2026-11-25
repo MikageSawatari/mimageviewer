@@ -2,7 +2,7 @@
 
 状態: 設計 (2026-11-25、設計担当 ClaudeCode Opus)。設計の独立レビュー (gpt-6.1-sol / xhigh): r1 REJECT (P1 1・P2 2) →
 r2 ACCEPT with changes (P2 1・P3 1) → r3 ACCEPT with changes (P3 1、文書の整合だけ)。各回の指摘は本書に反映済み
-(r3 の P3 は設計担当が反映し、再レビューは受けていない)。実装済み (Codex Sol / high)、関連テスト成功 (設計担当が実行)。実装の独立レビュー・実機確認は未実施。
+(r3 の P3 は設計担当が反映し、再レビューは受けていない)。実装済み (Codex Sol / high)、関連テスト成功 (設計担当が実行)、実装の独立レビュー (実装者とは別の gpt-6.1-sol / xhigh、コミット 1ef996a16) ACCEPT・指摘なし。実機確認は未実施。
 要件の正本は [バックログ §1.889](next-release-backlog.md)。
 
 ## 1. 範囲
