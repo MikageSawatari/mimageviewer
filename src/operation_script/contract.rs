@@ -2,7 +2,7 @@ use rhai::{AST, Array, Dynamic, Map};
 
 use crate::keymap::{KeyAction, KeyContext};
 
-use super::{MAX_ACTIONS, MAX_STRING_BYTES, SLOT_COUNT};
+use super::{MAX_ACTIONS, MAX_STRING_BYTES, SLOT_COUNT, ScriptEvent};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScriptContext {
@@ -68,10 +68,27 @@ impl ScriptContexts {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventPermission {
+    Forbidden,
+    Synchronous,
+    OpenOnly,
+}
+
+impl EventPermission {
+    fn accepts(self, events: &[ScriptEvent]) -> bool {
+        match self {
+            Self::Forbidden => false,
+            Self::Synchronous => true,
+            Self::OpenOnly => events.contains(&ScriptEvent::Open),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AllowedOperation {
     pub action: KeyAction,
     pub kind: OperationKind,
-    pub event_allowed: bool,
+    pub event_permission: EventPermission,
     pub contexts: ScriptContexts,
 }
 
@@ -81,19 +98,22 @@ macro_rules! operations {
             $($(AllowedOperation {
                 action: KeyAction::$action,
                 kind: OperationKind::$kind,
-                event_allowed: event_allowed_action(KeyAction::$action),
+                event_permission: event_permission(KeyAction::$action),
                 contexts: ScriptContexts::$contexts,
             },)*)*
         ];
     };
 }
 
-/// r11: synchronous changes are absorbed before the remaining draw/completion.
-/// Spread/direction/fit may defer normalization or slice reconciliation.
+/// r12: direction/fit may reconcile a slice later, but never create another open.
+/// Other audited changes are absorbed before the remaining draw/completion.
 /// Grid actions change layout/order, but neither its location nor cursor item.
-const fn event_allowed_action(action: KeyAction) -> bool {
+const fn event_permission(action: KeyAction) -> EventPermission {
     use KeyAction::*;
-    matches!(
+    if matches!(action, FsReadingDirectionToggle | FsFitModeCycle) {
+        return EventPermission::OpenOnly;
+    }
+    if matches!(
         action,
         FsBgCycle
             | FsPixelGrid
@@ -136,7 +156,11 @@ const fn event_allowed_action(action: KeyAction) -> bool {
             | GridColumnCount19
             | GridColumnCount20
             | GridToggleDetailsView
-    )
+    ) {
+        EventPermission::Synchronous
+    } else {
+        EventPermission::Forbidden
+    }
 }
 
 // KeyAction の全件から推測して許可しない。この表への明示追加だけで公開する。
@@ -295,15 +319,16 @@ pub fn parse_output(value: Dynamic) -> Result<ScriptOutput, String> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ScriptInvocation {
+pub enum ScriptInvocation<'a> {
     Input,
-    Event,
+    /// Detector-owned events, never reconstructed from the script's output.
+    Event(&'a [ScriptEvent]),
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ValidationContext {
+pub struct ValidationContext<'a> {
     pub context: ScriptContext,
-    pub invocation: ScriptInvocation,
+    pub invocation: ScriptInvocation<'a>,
     /// 段2の所有passが既存の移動・終了・帰還を集めて渡す (§5.3-7)。
     pub navigation_already_accepted: bool,
 }
@@ -338,7 +363,7 @@ impl ValidatedScriptOutput {
 
 pub fn validate_output(
     output: ScriptOutput,
-    scope: ValidationContext,
+    scope: ValidationContext<'_>,
 ) -> Result<ValidatedScriptOutput, ValidationError> {
     if output.actions.len() > MAX_ACTIONS {
         return Err(ValidationError::TooManyActions {
@@ -385,9 +410,9 @@ pub fn validate_output(
     {
         return Err(ValidationError::MultipleExternalResults);
     }
-    if scope.invocation == ScriptInvocation::Event {
+    if let ScriptInvocation::Event(events) = scope.invocation {
         for (index, op) in operations.iter().enumerate() {
-            if op.kind != OperationKind::A || !op.event_allowed {
+            if op.kind != OperationKind::A || !op.event_permission.accepts(events) {
                 return Err(ValidationError::EventNotAllowed {
                     index,
                     action: op.action,
@@ -514,7 +539,7 @@ mod tests {
         );
     }
 
-    fn scope(context: ScriptContext) -> ValidationContext {
+    fn scope<'a>(context: ScriptContext) -> ValidationContext<'a> {
         ValidationContext {
             context,
             invocation: ScriptInvocation::Input,
@@ -613,14 +638,14 @@ mod tests {
             "FsCapture",
         ] {
             let mut context = scope(ScriptContext::FsImage);
-            context.invocation = ScriptInvocation::Event;
+            context.invocation = ScriptInvocation::Event(&[]);
             assert!(matches!(
                 validate_output(output(&[name]), context),
                 Err(ValidationError::EventNotAllowed { .. })
             ));
         }
         for operation in ALLOWED_OPERATIONS {
-            if operation.event_allowed {
+            if operation.event_permission == EventPermission::Synchronous {
                 assert_eq!(operation.kind, OperationKind::A);
                 for context in [
                     ScriptContext::Grid,
@@ -629,7 +654,7 @@ mod tests {
                 ] {
                     if operation.contexts.contains(context) {
                         let mut scope = scope(context);
-                        scope.invocation = ScriptInvocation::Event;
+                        scope.invocation = ScriptInvocation::Event(&[]);
                         assert!(
                             validate_output(output(&[operation.action.ini_name()]), scope).is_ok()
                         );
@@ -644,13 +669,26 @@ mod tests {
         assert_eq!(
             ALLOWED_OPERATIONS
                 .iter()
-                .filter(|op| op.event_allowed)
+                .filter(|op| op.event_permission == EventPermission::Synchronous)
                 .count(),
             41
         );
+        assert_eq!(
+            ALLOWED_OPERATIONS
+                .iter()
+                .filter(|op| op.event_permission == EventPermission::OpenOnly)
+                .map(|op| op.action)
+                .collect::<Vec<_>>(),
+            [
+                KeyAction::FsReadingDirectionToggle,
+                KeyAction::FsFitModeCycle
+            ]
+        );
         let excluded_a = ALLOWED_OPERATIONS
             .iter()
-            .filter(|op| op.kind == OperationKind::A && !op.event_allowed)
+            .filter(|op| {
+                op.kind == OperationKind::A && op.event_permission == EventPermission::Forbidden
+            })
             .map(|op| op.action)
             .collect::<Vec<_>>();
         assert_eq!(
@@ -662,11 +700,12 @@ mod tests {
                 KeyAction::FsSpreadLtrCover,
                 KeyAction::FsSpreadRtl,
                 KeyAction::FsSpreadRtlCover,
-                KeyAction::FsReadingDirectionToggle,
-                KeyAction::FsFitModeCycle,
             ]
         );
-        for op in ALLOWED_OPERATIONS.iter().filter(|op| !op.event_allowed) {
+        for op in ALLOWED_OPERATIONS
+            .iter()
+            .filter(|op| op.event_permission == EventPermission::Forbidden)
+        {
             for context in [
                 ScriptContext::Grid,
                 ScriptContext::FsImage,
@@ -681,7 +720,7 @@ mod tests {
                     ScriptContext::FsVideo => "VideoMute",
                 };
                 let mut scope = scope(context);
-                scope.invocation = ScriptInvocation::Event;
+                scope.invocation = ScriptInvocation::Event(&[]);
                 // Validation returns no executable prefix, even after a safe A.
                 assert!(
                     matches!(
@@ -690,6 +729,47 @@ mod tests {
                     ),
                     "{:?}",
                     op.action
+                );
+                scope.invocation = ScriptInvocation::Event(&[ScriptEvent::Open, ScriptEvent::Page]);
+                assert!(
+                    matches!(
+                        validate_output(output(&[safe, op.action.ini_name()]), scope),
+                        Err(ValidationError::EventNotAllowed { .. })
+                    ),
+                    "open must not admit forbidden operations: {:?}",
+                    op.action
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validation_open_only_uses_detector_events_and_rejects_the_whole_mixed_batch() {
+        for name in ["FsReadingDirectionToggle", "FsFitModeCycle"] {
+            // Input invocations do not acquire an event restriction.
+            assert!(validate_output(output(&[name]), scope(ScriptContext::FsImage)).is_ok());
+            for events in [
+                &[ScriptEvent::Open][..],
+                &[ScriptEvent::Open, ScriptEvent::Page][..],
+            ] {
+                let mut context = scope(ScriptContext::FsImage);
+                context.invocation = ScriptInvocation::Event(events);
+                assert!(validate_output(output(&["FsZoomIn", name, "FsZoomOut"]), context).is_ok());
+            }
+            for events in [
+                &[][..],
+                &[ScriptEvent::Page][..],
+                &[ScriptEvent::View][..],
+                &[ScriptEvent::Page, ScriptEvent::View][..],
+            ] {
+                let mut context = scope(ScriptContext::FsImage);
+                context.invocation = ScriptInvocation::Event(events);
+                assert_eq!(
+                    validate_output(output(&["FsZoomIn", name, "FsZoomOut"]), context),
+                    Err(ValidationError::EventNotAllowed {
+                        index: 1,
+                        action: KeyAction::from_ini_name(name).unwrap(),
+                    })
                 );
             }
         }

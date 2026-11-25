@@ -315,7 +315,8 @@ impl App {
         let native_video =
             surface == ScriptInputSurface::Viewer && self.operation_script_uses_native_video();
         let mut snapshot = self.collect_operation_script_snapshot(surface);
-        snapshot.events = events;
+        // Validation borrows the detector's set. The script only receives a copy.
+        snapshot.events = events.clone();
         let result = match &self.operation_script.state {
             OperationScriptState::Ready(script) => script.evaluate_event(&snapshot),
             _ => return,
@@ -325,7 +326,7 @@ impl App {
                 output,
                 ValidationContext {
                     context: snapshot.context,
-                    invocation: ScriptInvocation::Event,
+                    invocation: ScriptInvocation::Event(&events),
                     navigation_already_accepted: false,
                 },
             )

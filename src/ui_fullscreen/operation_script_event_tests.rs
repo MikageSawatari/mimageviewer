@@ -62,10 +62,10 @@ fn operation_script_event_safe_images_resnapshot_then_real_draw_and_later_frames
     // Settle pre-existing material/adoption before attributing a change to the A.
     ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
         .drop_without_applying_deltas();
-    for operation in ALLOWED_OPERATIONS
-        .iter()
-        .filter(|op| op.event_allowed && op.contexts.contains(ScriptContext::FsImage))
-    {
+    for operation in ALLOWED_OPERATIONS.iter().filter(|op| {
+        op.event_permission == crate::operation_script::EventPermission::Synchronous
+            && op.contexts.contains(ScriptContext::FsImage)
+    }) {
         event(&mut app, operation.action);
         let mut immediate = None;
         ctx.run_ui(raw(), |ui| {
@@ -231,13 +231,427 @@ fn operation_script_event_direction_fit_and_single_have_late_slice_counterexampl
             "{action:?}"
         );
         assert!(
-            !ALLOWED_OPERATIONS
+            ALLOWED_OPERATIONS
                 .iter()
                 .find(|op| op.action == action)
                 .unwrap()
-                .event_allowed
+                .event_permission
+                != crate::operation_script::EventPermission::Synchronous
         );
     }
+}
+
+fn landscape_page(app: &mut App, ctx: &egui::Context) {
+    let image = egui::ColorImage::filled([240, 120], egui::Color32::TRANSPARENT);
+    let tex = ctx.load_texture(
+        "open-only-landscape",
+        image.clone(),
+        egui::TextureOptions::LINEAR,
+    );
+    if let Some(FsCacheEntry::Static {
+        tex: cached,
+        pixels,
+        source_dims,
+        ..
+    }) = app.fs_cache.get_mut(&0)
+    {
+        *cached = tex;
+        *pixels = Arc::new(image);
+        *source_dims = Some([240, 120]);
+    }
+    app.record_page_dims_for_spread(0, (240, 120));
+}
+
+fn open_only_ready(
+    ctx: &egui::Context,
+    action: KeyAction,
+    split: bool,
+    rotated: bool,
+) -> crate::app::AppTestEnvForTest {
+    let mut app = ready(ctx);
+    landscape_page(&mut app, ctx);
+    app.reading_direction = ReadingDirection::Ltr;
+    app.spread_mode = if split {
+        SpreadMode::SplitLtr
+    } else {
+        SpreadMode::Single
+    };
+    app.fs_free_rotation = if rotated { 15.0 } else { 0.0 };
+    app.fullscreen_page_slice = if split && !rotated {
+        crate::page_split::PageSlice::Left
+    } else {
+        crate::page_split::PageSlice::Full
+    };
+    app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+    app.settings.fullscreen_fit_cycle_excluded = Default::default();
+    event(&mut app, action);
+    app
+}
+
+fn assert_event_rejected(app: &App, action: KeyAction) {
+    let warning = &app
+        .fs_feedback_toast
+        .as_ref()
+        .expect("event rejection notification")
+        .0;
+    assert!(warning.contains("EventNotAllowed"), "{warning}");
+    assert!(warning.contains(action.ini_name()), "{warning}");
+}
+
+#[cfg(windows)]
+#[test]
+fn operation_script_event_open_only_split_rotation_reconciles_once_then_rejects_page() {
+    let _serial = crate::key_input::lock_test_input();
+    for action in [
+        KeyAction::FsReadingDirectionToggle,
+        KeyAction::FsFitModeCycle,
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = open_only_ready(&ctx, action, true, true);
+        // This receiver insists that the delayed invocation contains exactly page.
+        app.operation_script.state = OperationScriptState::Ready(Box::new(
+            CompiledOperationScript::compile(&format!(
+                r#"fn slots() {{ [] }} fn on_event(s) {{
+                if "open" in s.events {{ #{{run:["{}"],notice:"open accepted"}} }}
+                else if s.events == ["page"] {{ ["{}"] }}
+                else {{ ["unexpected event set"] }}
+            }}"#,
+                action.ini_name(),
+                action.ini_name()
+            ))
+            .unwrap(),
+        ));
+        let before = (app.reading_direction, app.effective_fullscreen_fit_mode());
+        let mut immediate = None;
+        ctx.run_ui(raw(), |ui| {
+            app.detect_operation_script_events(ui.ctx(), ScriptInputSurface::Viewer);
+            assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, "open accepted");
+            assert_eq!(app.fs_free_rotation, 0.0);
+            assert_eq!(
+                app.fullscreen_page_slice,
+                crate::page_split::PageSlice::Full
+            );
+            immediate =
+                Some(app.collect_operation_script_event_identity(ScriptInputSurface::Viewer));
+            // The real remaining draw prepares the slice, polls pending work and
+            // runs the normal page-turn completion path after finish_event.
+            app.render_fullscreen_viewport(ui);
+        })
+        .drop_without_applying_deltas();
+        assert_ne!(
+            (app.reading_direction, app.effective_fullscreen_fit_mode()),
+            before
+        );
+        assert!(app.fullscreen_page_slice.is_half());
+        assert_ne!(
+            app.collect_operation_script_event_identity(ScriptInputSurface::Viewer),
+            immediate.unwrap()
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+        let after = (app.reading_direction, app.effective_fullscreen_fit_mode());
+        app.fs_feedback_toast = None;
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert_event_rejected(&app, action);
+        assert_eq!(
+            (app.reading_direction, app.effective_fullscreen_fit_mode()),
+            after
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+        app.fs_feedback_toast = None;
+        for _ in 0..2 {
+            ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+                .drop_without_applying_deltas();
+            assert!(
+                app.fs_feedback_toast.is_none(),
+                "no event after the single delayed page: {action:?}"
+            );
+            assert_eq!(
+                (app.reading_direction, app.effective_fullscreen_fit_mode()),
+                after
+            );
+            assert!(!app.commit_page_turn_continuation(&ctx));
+        }
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[cfg(windows)]
+#[test]
+fn operation_script_event_open_only_without_split_rotation_has_no_extra_page() {
+    let _serial = crate::key_input::lock_test_input();
+    for action in [
+        KeyAction::FsReadingDirectionToggle,
+        KeyAction::FsFitModeCycle,
+    ] {
+        for (split, rotated) in [(false, true), (true, false), (false, false)] {
+            let ctx = egui::Context::default();
+            let mut app = open_only_ready(&ctx, action, split, rotated);
+            let mut immediate = None;
+            ctx.run_ui(raw(), |ui| {
+                app.detect_operation_script_events(ui.ctx(), ScriptInputSurface::Viewer);
+                assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, "event complete");
+                immediate =
+                    Some(app.collect_operation_script_event_identity(ScriptInputSurface::Viewer));
+                app.render_fullscreen_viewport(ui);
+            })
+            .drop_without_applying_deltas();
+            assert_eq!(
+                app.collect_operation_script_event_identity(ScriptInputSurface::Viewer),
+                immediate.unwrap()
+            );
+            app.fs_feedback_toast = None;
+            for _ in 0..2 {
+                ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+                    .drop_without_applying_deltas();
+                assert!(
+                    app.fs_feedback_toast.is_none(),
+                    "{action:?}, split={split}, rotated={rotated}"
+                );
+            }
+        }
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[cfg(windows)]
+#[test]
+fn operation_script_event_open_only_late_page_can_run_synchronous_a_without_another_event() {
+    let _serial = crate::key_input::lock_test_input();
+    for action in [
+        KeyAction::FsReadingDirectionToggle,
+        KeyAction::FsFitModeCycle,
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = open_only_ready(&ctx, action, true, true);
+        app.operation_script.state = OperationScriptState::Ready(Box::new(CompiledOperationScript::compile(&format!(
+            r#"fn slots() {{ [] }} fn on_event(s) {{
+                if "open" in s.events {{ ["{}"] }}
+                else if s.events == ["page"] {{ #{{run:["FsZoomIn"],notice:"late page synchronous"}} }}
+                else {{ ["unexpected event set"] }}
+            }}"#, action.ini_name()
+        )).unwrap()));
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert!(app.fullscreen_page_slice.is_half());
+        let zoom = app.fs_zoom;
+        app.fs_feedback_toast = None;
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "late page synchronous"
+        );
+        assert!(app.fs_zoom > zoom);
+        let stable = app.collect_operation_script_event_identity(ScriptInputSurface::Viewer);
+        app.fs_feedback_toast = None;
+        for _ in 0..2 {
+            ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+                .drop_without_applying_deltas();
+            assert!(app.fs_feedback_toast.is_none());
+            assert_eq!(
+                app.collect_operation_script_event_identity(ScriptInputSurface::Viewer),
+                stable
+            );
+        }
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[cfg(windows)]
+#[test]
+fn operation_script_event_open_only_grid_reentry_allows_the_same_container_again() {
+    let _serial = crate::key_input::lock_test_input();
+    for action in [
+        KeyAction::FsReadingDirectionToggle,
+        KeyAction::FsFitModeCycle,
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = open_only_ready(&ctx, action, false, false);
+        app.operation_script.state = OperationScriptState::Ready(Box::new(
+            CompiledOperationScript::compile(&format!(
+                r#"fn slots() {{ [] }} fn on_event(s) {{
+                if s.context == "grid" {{ [] }}
+                else if "open" in s.events {{ #{{run:["{}"],notice:"reentry open"}} }}
+                else {{ ["unexpected event set"] }}
+            }}"#,
+                action.ini_name()
+            ))
+            .unwrap(),
+        ));
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, "reentry open");
+        let first = (app.reading_direction, app.effective_fullscreen_fit_mode());
+        let original_item = app.items[0].clone();
+        app.fullscreen_idx = None;
+        ctx.run_ui(raw(), |ui| {
+            app.detect_operation_script_events(ui.ctx(), ScriptInputSurface::Grid)
+        })
+        .drop_without_applying_deltas();
+        app.fullscreen_idx = Some(0);
+        app.fs_feedback_toast = None;
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert_eq!(app.items[0].display_path(), original_item.display_path());
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, "reentry open");
+        assert_ne!(
+            (app.reading_direction, app.effective_fullscreen_fit_mode()),
+            first
+        );
+        app.fs_feedback_toast = None;
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert!(app.fs_feedback_toast.is_none());
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[cfg(windows)]
+#[test]
+fn operation_script_event_open_only_container_change_accepts_open_page_without_view() {
+    let _serial = crate::key_input::lock_test_input();
+    for action in [
+        KeyAction::FsReadingDirectionToggle,
+        KeyAction::FsFitModeCycle,
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = open_only_ready(&ctx, action, false, false);
+        app.operation_script.state = OperationScriptState::Ready(Box::new(
+            CompiledOperationScript::compile("fn slots() { [] } fn on_event(s) { [] }").unwrap(),
+        ));
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        app.items[0] = GridItem::Image(PathBuf::from("c:/another-book/0.png"));
+        app.operation_script.state = OperationScriptState::Ready(Box::new(
+            CompiledOperationScript::compile(&format!(
+                r#"fn slots() {{ [] }} fn on_event(s) {{
+                if s.events == ["open","page"] {{ #{{run:["{}"],notice:"open page accepted"}} }}
+                else {{ ["unexpected event set"] }}
+            }}"#,
+                action.ini_name()
+            ))
+            .unwrap(),
+        ));
+        let before = (app.reading_direction, app.effective_fullscreen_fit_mode());
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "open page accepted"
+        );
+        assert_ne!(
+            (app.reading_direction, app.effective_fullscreen_fit_mode()),
+            before
+        );
+        app.fs_feedback_toast = None;
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert!(app.fs_feedback_toast.is_none());
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[cfg(windows)]
+#[test]
+fn operation_script_event_open_only_unknown_dimensions_coalesce_page_without_another_open() {
+    let _serial = crate::key_input::lock_test_input();
+    for action in [
+        KeyAction::FsReadingDirectionToggle,
+        KeyAction::FsFitModeCycle,
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = open_only_ready(&ctx, action, true, true);
+        let mut loaded = Some(app.fs_cache.remove(&0).unwrap());
+        app.page_dims_cache = Default::default();
+        assert_eq!(app.known_page_dims_for_idx(0), None);
+        let mut immediate = None;
+        ctx.run_ui(raw(), |ui| {
+            app.detect_operation_script_events(ui.ctx(), ScriptInputSurface::Viewer);
+            assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, "event complete");
+            assert_eq!(app.fs_free_rotation, 0.0);
+            immediate =
+                Some(app.collect_operation_script_event_identity(ScriptInputSurface::Viewer));
+            app.render_fullscreen_viewport(ui);
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(
+            app.collect_operation_script_event_identity(ScriptInputSurface::Viewer),
+            immediate.unwrap()
+        );
+        app.fs_feedback_toast = None;
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert!(app.fs_feedback_toast.is_none());
+        ctx.run_ui(raw(), |ui| {
+            // Arrival after the detector is coalesced into the next eligible pass.
+            app.detect_operation_script_events(ui.ctx(), ScriptInputSurface::Viewer);
+            assert!(app.fs_feedback_toast.is_none());
+            app.fs_cache.insert(0, loaded.take().unwrap());
+            app.render_fullscreen_viewport(ui);
+        })
+        .drop_without_applying_deltas();
+        assert!(app.fullscreen_page_slice.is_half());
+        let after = (app.reading_direction, app.effective_fullscreen_fit_mode());
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert_event_rejected(&app, action);
+        assert_eq!(
+            (app.reading_direction, app.effective_fullscreen_fit_mode()),
+            after
+        );
+        app.fs_feedback_toast = None;
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert!(app.fs_feedback_toast.is_none());
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[cfg(windows)]
+#[test]
+fn operation_script_event_open_only_detection_pause_resumes_with_page_without_open() {
+    let _serial = crate::key_input::lock_test_input();
+    for action in [
+        KeyAction::FsReadingDirectionToggle,
+        KeyAction::FsFitModeCycle,
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = open_only_ready(&ctx, action, true, true);
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, "event complete");
+        assert!(app.fullscreen_page_slice.is_half());
+        let after = (app.reading_direction, app.effective_fullscreen_fit_mode());
+        app.fs_feedback_toast = None;
+        app.erase_mode = true;
+        for _ in 0..2 {
+            ctx.run_ui(raw(), |ui| {
+                assert!(
+                    !app.begin_operation_script_event_detection(
+                        ui.ctx(),
+                        ScriptInputSurface::Viewer
+                    )
+                );
+                app.detect_operation_script_events(ui.ctx(), ScriptInputSurface::Viewer);
+            })
+            .drop_without_applying_deltas();
+            assert!(app.fs_feedback_toast.is_none());
+        }
+        app.erase_mode = false;
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert_event_rejected(&app, action);
+        assert_eq!(
+            (app.reading_direction, app.effective_fullscreen_fit_mode()),
+            after
+        );
+        app.fs_feedback_toast = None;
+        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
+            .drop_without_applying_deltas();
+        assert!(app.fs_feedback_toast.is_none());
+    }
+    crate::key_input::clear_test_frame();
 }
 
 #[cfg(windows)]

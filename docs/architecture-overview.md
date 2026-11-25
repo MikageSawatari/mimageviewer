@@ -25,7 +25,8 @@ ROOTにフォーカスがある全画面のキーは既存のROOT側予備経路
 一覧ROOT、egui viewerの所有pass、native ROOTでキーより前に1frame1回検出し、利用資格を満たす時だけ評価する。
 入れ物は表示項目のtyped identityから導出し、pageは段2bと共用するscalarとstrong composition Arcを比較する。
 段2bの要求照合はreader orderを含む従来のO(N)を保つ。イベントは全件検査済みAだけをslotと同じ実行関数へ渡し、
-同frameの再snapshotを基準にする。今回のRust検証・release計測は未実施。
+同frameの再snapshotを基準にする。r12の方向/合わせ方は検出側のopenを含む回だけ許し、イベント集合を並び全体の事前検査へ渡す。
+今回r12差分のRust検証・release計測は未実施。
 詳細は [設計](operation-script-plan.md)。
 
 ## ブラウザ閲覧の保存先のページ構成（§1.870）

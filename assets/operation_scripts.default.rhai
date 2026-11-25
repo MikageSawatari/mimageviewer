@@ -16,11 +16,11 @@ fn rate3_next(s) {
     ["RatingItem3", "FsPageNext"]
 }
 
-// 本を開いたとき、PNG の透過部分の背景が黒なら白にします。
+// 本を開いたとき、パスに \manga\ を含むなら読む向きを右→左にします。
 fn on_event(s) {
     if s.context != "fs_image" { return []; }
-    if "open" in s.events && s.item.ext == "png" {
-        if s.view.background == "black" { return ["FsBgCycle"]; }
+    if "open" in s.events && s.book.path.contains("\\manga\\") {
+        if s.view.direction != "rtl" { return ["FsReadingDirectionToggle"]; }
     }
     []
 }

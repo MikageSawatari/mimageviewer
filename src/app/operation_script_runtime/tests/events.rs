@@ -21,6 +21,62 @@ fn frame(ctx: &egui::Context, mut f: impl FnMut(&egui::Context)) {
 }
 
 #[test]
+fn event_open_only_cannot_forge_open_or_execute_a_mixed_prefix() {
+    for action in [
+        KeyAction::FsReadingDirectionToggle,
+        KeyAction::FsFitModeCycle,
+    ] {
+        for view_only in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = grid_app("[]");
+            app.fullscreen_idx = Some(0);
+            let mut previous = identity(&app, ScriptInputSurface::Viewer);
+            if view_only {
+                // Isolate the view-only event set at the detector boundary.
+                previous.context = ScriptContext::FsVideo;
+            }
+            app.operation_script_events.finish_event(previous);
+            if !view_only {
+                app.fullscreen_page_slice = crate::page_split::PageSlice::Right;
+            }
+            app.operation_script.state = event_script(&format!(
+                r#"s.events = ["open"];
+                #{{run:["FsZoomIn","{}","FsNavigatorToggle"],events:["open"],notice:"forged open accepted"}}"#,
+                action.ini_name()
+            ));
+            let before = (
+                app.fs_zoom,
+                app.settings.fullscreen_navigator_visible,
+                app.reading_direction,
+                app.settings.fullscreen_fit_mode,
+            );
+            frame(&ctx, |ctx| {
+                app.detect_operation_script_events(ctx, ScriptInputSurface::Viewer)
+            });
+            assert!(toast(&app).contains("EventNotAllowed"), "{}", toast(&app));
+            assert!(toast(&app).contains(action.ini_name()), "{}", toast(&app));
+            assert_eq!(
+                (
+                    app.fs_zoom,
+                    app.settings.fullscreen_navigator_visible,
+                    app.reading_direction,
+                    app.settings.fullscreen_fit_mode
+                ),
+                before
+            );
+            app.fs_feedback_toast = None;
+            frame(&ctx, |ctx| {
+                app.detect_operation_script_events(ctx, ScriptInputSurface::Viewer)
+            });
+            assert!(
+                app.fs_feedback_toast.is_none(),
+                "rejected invocation must still resnapshot"
+            );
+        }
+    }
+}
+
+#[test]
 fn event_r11_faces_reentry_and_select_baseline_survive_viewer_in_observe_and_finish() {
     let mut app = grid_app("[]");
     let mut events = OperationScriptEvents::default();
@@ -951,10 +1007,10 @@ fn event_native_poll_video_hook_executes_and_overlay_snapshot_blocks_before_eval
 fn event_safe_grid_actions_preserve_all_four_identity_components_even_from_details() {
     let mut app = grid_app("[]");
     let ctx = egui::Context::default();
-    for operation in ALLOWED_OPERATIONS
-        .iter()
-        .filter(|op| op.event_allowed && op.contexts.contains(ScriptContext::Grid))
-    {
+    for operation in ALLOWED_OPERATIONS.iter().filter(|op| {
+        op.event_permission == crate::operation_script::EventPermission::Synchronous
+            && op.contexts.contains(ScriptContext::Grid)
+    }) {
         app.set_grid_view_mode(crate::settings::GridViewMode::Details);
         app.operation_script_events = Default::default();
         app.operation_script.state = event_script(&format!(
@@ -1004,10 +1060,10 @@ fn event_safe_video_actions_preserve_all_four_identity_components_for_native_and
         if surface == VideoKeyActionSurface::EguiVideo {
             video_player(&app, 0).set_native_presenter_hidden_for_test(true);
         }
-        for operation in ALLOWED_OPERATIONS
-            .iter()
-            .filter(|op| op.event_allowed && op.contexts.contains(ScriptContext::FsVideo))
-        {
+        for operation in ALLOWED_OPERATIONS.iter().filter(|op| {
+            op.event_permission == crate::operation_script::EventPermission::Synchronous
+                && op.contexts.contains(ScriptContext::FsVideo)
+        }) {
             if music && operation.action == KeyAction::VideoSeekStripToggle {
                 continue; // Released music keys do not expose the video strip.
             }

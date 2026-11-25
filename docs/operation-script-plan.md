@@ -31,7 +31,7 @@ NeeView のスクリプト機能 (`.nvjs`) の使われ方として挙がった�
 | 最終ページでもう一度押すと次の本へ | 状態 (最終ページか) + 条件 + 本の移動 | 最初の版 |
 | 全画面なら解除、通常なら終了確認 | 状態 (全画面か) + 条件 + 終了 | 全画面の解除だけ最初の版。終了は `KeyAction` ではなくメニューの `FileQuit` (`keymap.rs:3048`) なので後の段 |
 | 画像と動画で操作を切り替える | 状態 (種類) + 条件 | 最初の版 |
-| パス名で開き方向を自動設定 | イベント + 状態 (パス) + 読む向きの変更 | 段4の同期完了条件を満たさずイベントでは不可。キー起動では使える (§16) |
+| パス名で開き方向を自動設定 | イベント + 状態 (パス) + 読む向きの変更 | r12でopenを含む回だけ可。遅れたpageを1回出す場合がある (§16) |
 | PNG の黒背景を白へ | イベント (open) + 状態 (拡張子・今の背景) + 巡回操作 | 最初の版 (巡回で書く。値の指定は §9 の後の段) |
 | 決まったフォルダへワンタッチ保存 | キャプチャ保存 (保存先は環境設定のもの) | 最初の版 (Q2、押したときだけ) |
 | ★を付けて次へ | レーティング + ページ送り | 最初の版 (Q1) |
@@ -751,11 +751,12 @@ egui の動画キー経路で共有する。音楽表示（音声ファイルと
 VK と動画リングにも consumer が無い。共通のコピー実行関数が動画のパスを扱えることだけでは
 動画のキー操作にならないため、スクリプトの許可表も画像だけに保つ。動画のコピーは段3から外す。
 
-- **「イベント可」の印**は、A のうち「同期に終わる」(§3.3 の r11) と実装担当がコードとテストで確かめた操作にだけ付ける:
+- **「イベント可」の印**は3種類: 不可・同期可・OpenOnly (§3.3のr12)。A のうち「同期に終わる」(r11) 操作を同期可とする:
   イベントから実行し、同じフレームで基準を取り直した後、ほかの入力が無ければ後のフレームで識別が変わらない操作。
   (r10 までの基準「識別を変えない」は r11 で置き換えた。)
-  実装の印は画像7・動画13・一覧21の計41操作。旧基準で除外した背景・pixel grid・演出切替もr11で再監査した。
-  操作別の根拠・除外8操作・回帰の全名と未実施の検証は§16に記す。
+  同期可は画像7・動画13・一覧21の計41操作。旧基準で除外した背景・pixel grid・演出切替もr11で再監査した。
+  r12のOpenOnlyは読む向き・合わせ方の2操作。検出側が確定した集合にopenがある回だけ全件事前検査を通す。
+  見開き6操作は不可のまま。操作別の根拠・回帰の全名と未実施の検証は§16に記す。
 - **実行関数を共用にできない操作は、最初の版から外す** (§5.2)。外したら設計担当へ報告し、表を直す。
   ズーム・列数・コピー・表示の切り替えは共用が現実的。移動・閉じる・見開き・レーティング (絞った場所での
   採用し直し) は、本体に加えて呼び出し元への結果の共用が要る族 (レビュー r2 の見立て)。
@@ -985,7 +986,8 @@ native 動画の右クリックメニューからのスクリプトの実行は�
 2. 操作の文脈 (`KeyAction::context()`、Rating など共通の文脈を含む) が今の画面で有効
 3. B と C は合わせて 1 つまでで、並びの最後
 4. E は並び全体で 1 つまで
-5. イベントからの実行では、「イベント可」の印のある A だけ
+5. イベントからの実行では、「同期可」の A、または検出側が確定したイベント集合にopenがある回のOpenOnlyの A だけ。
+   Rhaiに渡すs.eventsや戻り値から権限を作らず、操作の実行前に並び全体で検査する
 6. 並びの長さが上限 (§7) 以内
 7. 全画面 (egui) の描画の所有 pass の末尾で実行するとき (§5.2): そのフレームで既に移動・閉じる・帰還の継続・
    main への移動 (`mouse_ring_nav`) が受け付けられていれば、B・C を含まない
@@ -1198,7 +1200,7 @@ native 動画の右クリックメニューからのスクリプトの実行は�
   並びは実行される。同じフレームに中ボタンの `ImageHome` 等でページが変わると (表示の識別 (2) の変化)、レーティング
   を含む並びも実行されない (r9)。ホイールの提案が保留されたフレームではスクリプトの要求が捨てられ、保留された
   提案の中で `ScriptSlot*` に解決されたジェスチャーは実行されない (r9)。
-- イベント (r11): 識別の各要素で発火する/しない (一覧の面では `open`・`page` が出ない、全画面で入れ物が変わると `open` が出る、
+- イベント (r11/r12): 識別の各要素で発火する/しない (一覧の面では `open`・`page` が出ない、全画面で入れ物が変わると `open` が出る、
   入れ物の違う項目を順に見ると入れ物が変わるたびに `open` が出る、一覧の検出を挟んで同じ本へ入り直すと `open`・`page` が出る、
   全画面の間は `select` の基準を持ち越す、同じ項目のままの一覧の読み込み直しで `select` が出ない、分割ページの左右で
   `page` が出る、同じ PDF の別のページで `page` が出る、本の構成の編集 (単独ページ・ページの順) で `page` が出て、同じ内容の
@@ -1208,8 +1210,12 @@ native 動画の右クリックメニューからのスクリプトの実行は�
   右クリックからのキャプチャがメニューを閉じてから実行され拒否されない、1 フレーム 1 回で `events` に変わった種類が全部入る、
   キー起動の移動で次のフレームに発火する、イベント起動の同期の変化で発火しない、イベントから B〜E と
   「イベント可」でない A を拒否、1 秒あたりの上限で捨てる。
-- 「イベント可」の印を付けた A の各操作が、イベントからの実行と同じフレームの取り直しの後、後のフレームで識別を変えないこと
+- 「同期可」の印を付けた A の各操作が、イベントからの実行と同じフレームの取り直しの後、後のフレームで識別を変えないこと
   (印の根拠のテスト。§3.3 の r11 の形)。
+- r12のOpenOnlyは、Split＋自由回転の実イベント→同frame取り直し→残り実描画/保留/完了→遅れたPage一回の拒否→以後無しを両操作で通す。
+  非Split/自由回転無しでは余分Page無し。Open+Page許可、Page単独/View単独と前後同期Aのmixedは全件拒否。
+  s.eventsと戻り値のeventsを偽装しても拒否する。遅れPageで同期Aを実行しても再発火せず、一覧を挟む同じ本への再入場は再Openを許す。
+  寸法未判明や検出休止から戻った場合も、独立した移動が無ければOpenを増やさない。
 - 割り当て: `KeyAction` / `RingActionId` の対応の恒久テスト (既存のパリティテストへ追加)。
 - 別ウィンドウ・編集モード・ページ一覧・Remote の取得中・読み込み中・OFF で動かないこと。
 - 別ウィンドウ (r6・r7): 別ウィンドウの context を取り付けた状態で、キー・リング・メニューから起動しても実行されず
@@ -1438,9 +1444,9 @@ detached の合意を得た (記録と引用は detached-rework-plan.md §11)。
 
 ## 16. 段4の実装記録（2026-11-25）
 
-以下は11月25日時点の記録。後続のClaudeCode実行結果とnested表記修正は末尾の11月26日追記を参照。
+11月25日の実装にr12を反映した。既存r11のClaudeCode実行結果・nested表記修正と今回r12差分の引継ぎは末尾の11月26日追記を参照。
 
-**r11に基づき実装済み、Rustコンパイル・テスト・release計測・実機・独立実装レビューは未実施。**
+**r11識別＋r12のイベント権限を実装済み。今回r12差分のRustコンパイル・テスト・release計測・実機・独立実装レビューは未実施。**
 利用者の指示によりcargo build/test/check、アプリ起動、コミットを行っていない。確認はbare cargo fmt、
 UI glyph checker、差分の空白確認だけ。新しい受入・review結果やdetachedの実装合意は記録していない。
 
@@ -1461,6 +1467,8 @@ open/pageを無しへ、viewer中はselectを持ち越し、observeとイベン�
 既存NativeOverlayInputRoutingのsnapshotを使い、OFF/on_event無しはnative player判定も識別構築も行わない。
 Rhai評価→並び全件validate→許可されたAをslotと同じ実行関数で順に実行→同frame再snapshot。
 入力slotはイベント基準を更新しない。B〜E/印無しAが混ざればprefixも実行しない。10起動/rolling1秒の超過は捨て、予約/再生しない。
+イベント権限はEventPermissionの3種。ScriptInvocation::Eventが検出Vecのtyped sliceを借り、Rhaiへはsnapshot.eventsの写しを渡す。
+OpenOnlyの判定は全件validateに含め、s.eventsの改変や戻り値によって検出済み集合を変更できない。slot Inputにはこの制約を足さない。
 
 構成のbaselineは強いArcを保持。同allocationは定数比較、別allocationはscope/direction/cover/complete/visible pages/overridesの
 意味で比べ、token/prepared rotationsは除く。equalでも新Arcへ進む。AcceptedCompositionProjectionのsemantic値にinterior mutationは無く、
@@ -1469,24 +1477,24 @@ item数に比例する列の複製は検出に入れない。パス/entry文字�
 `script/event_detect`は識別構築＋比較のms/eventsを記録する。Rhai評価/操作/再snapshotはこの検出区間に含まない。
 既存ignored性能testへN=50,000の変更なしevent識別の構築＋比較（μs）を追加した。新しい計測結果はまだ無い。
 
-### イベント可Aの再監査（41操作、回帰は未実行）
+### イベント可Aの再監査（同期可41＋OpenOnly2、今回r12回帰は未実行）
 
-| 操作 | r11の根拠と回帰の範囲 |
+| 操作 | r11/r12の根拠と回帰の範囲 |
 | --- | --- |
 | 画像: ZoomIn/Out、ToggleMetadata、NavigatorToggle | zoom/pan/factor/panel設定だけ。実on_event→sameframe再snapshot→残り実描画→後2frameで識別と再実行無しを確認するheadless test |
 | 画像: BgCycle、PixelGrid | pairing origin解決が起きても同期に吸収。NotInViewの保存基点がget_nav_indicesでResolvedへ進む状態/analysis branchを実イベントで検証し、残りresolverと次frameで再発火無し。loading cacheの到着も別test |
 | 画像: PageTurnAnimationToggle | idleは上の実描画loop。Completing＋解決済continuationはslide既存fixtureを再利用し、no-toggle対照と同じ元operation/target2のみ1回commit、次のpageは元入力起因、その後新規continuation/イベント無しまで進めるtest |
 | 動画13: PlayPause/Mute/VolumeUp/Down/Loop、SeekStart/Back/Forward Small/Medium/Large、SeekStripToggle | cached player/再生設定/stripだけ。position10秒・pause/mute off・volume0.5・loopOffから実イベントを実行し、sameframe再snapshot→poll_video→egui描画（egui経路）→次frameを操作ごとに比較。musicのstripは既存非対応 |
 | 一覧21: ColumnCount1..20、ToggleDetailsView | gridの識別はcontextとtyped cursorのみ。Detailsから実イベントを実行し、visible/detailsの再構成と次frame検出まで確認。段3のdirect/shared parity回帰も引き継ぐ |
+| OpenOnly2: ReadingDirectionToggle / FitModeCycle | r12。自由回転を0にしてSplitを復帰させた後、prepare側でFull→halfが遅れPageを一回起こし得る。ただし入れ物移動/一覧復帰を起こさず、新Openを自作しない。Open無し回では全件事前検査で拒否。実イベント/実描画、寸法待ち/休止/再入場等の回帰は末尾追記 |
 
-| 印を付けないA（8） | 理由 |
+| 不可のA（6） | 理由 |
 | --- | --- |
 | FsSpreadSingle | Splitのhalf→SingleのFullの再調整が同frame再snapshotより後に残る反例 |
 | FsViewSpread / FsSpreadLtr / FsSpreadLtrCover / FsSpreadRtl / FsSpreadRtlCover | normalize_spread_positionのopenが本の構成の許可へ委譲され得る。既存delegated_book_permission回帰と、各印無しAをイベントで全件拒否する回帰を維持 |
-| FsReadingDirectionToggle / FsFitModeCycle | 自由回転を0にしてSplitを復帰させた後、prepare側のreconcile_fullscreen_page_sliceでFull→halfになる反例 |
 
-1秒10回は安全根拠にしない。雛形は読む向きから、PNGの背景が黒なら白へ1回巡回する印付き例に差替えた。
-これは通常3色/AI高画質化中2色のどちらでも一致する。既存の拒否条件や操作順を変更してイベント可へ合わせることはしていない。
+1秒10回は安全根拠にしない。r11ではPNG黒背景を白へ巡回する例だったが、r12でopen＋book.pathの条件で読む向きをRTLへ合わせる雛形に戻した。
+既存の拒否条件や操作順を変更してイベント可へ合わせることはしていない。
 
 ### detached接触と未確認
 
@@ -1511,31 +1519,31 @@ main一覧継続の回帰を残す。r11の独立設計合意の履歴は§3.3�
 
 `src/app/operation_script_runtime/tests/events.rs`:
 
-- `event_r11_faces_reentry_and_select_baseline_survive_viewer_in_observe_and_finish` (`src/app/operation_script_runtime/tests/events.rs:24`)
-- `event_initial_empty_grid_has_only_view_and_location_changes_do_not_select` (`src/app/operation_script_runtime/tests/events.rs:78`)
-- `event_view_changes_grid_image_video_and_audio_shares_video_context` (`src/app/operation_script_runtime/tests/events.rs:95`)
-- `event_r11_container_is_item_only_for_folders_pdf_epub_nested_and_converted_zip` (`src/app/operation_script_runtime/tests/events.rs:122`)
-- `event_nonviewer_row_variants_have_no_fabricated_book_container` (`src/app/operation_script_runtime/tests/events.rs:228`)
-- `event_r11_open_ignores_zip_subfolders_and_pending_source_but_follows_item_containers` (`src/app/operation_script_runtime/tests/events.rs:277`)
-- `event_nested_container_appends_literal_entry_without_host_path_replacement` (`src/app/operation_script_runtime/tests/events.rs:326`)
-- `event_and_slot_invocations_publish_the_same_item_container_book_path` (`src/app/operation_script_runtime/tests/events.rs:359`)
-- `event_r11_pdf_pages_halves_and_unit_scalars_fire_but_reader_order_does_not` (`src/app/operation_script_runtime/tests/events.rs:389`)
-- `event_composition_strong_arc_memo_semantics_and_equal_republication` (`src/app/operation_script_runtime/tests/events.rs:442`)
-- `event_runtime_grid_executes_before_keys_once_and_inputs_still_change_next_frame` (`src/app/operation_script_runtime/tests/events.rs:525`)
-- `event_grid_actual_key_slot_navigation_is_observed_only_next_frame` (`src/app/operation_script_runtime/tests/events.rs:555`)
-- `event_runtime_rejects_entire_mixed_batch_and_never_publishes_success_notice` (`src/app/operation_script_runtime/tests/events.rs:603`)
-- `event_runtime_rate_limit_drops_batches_notifies_once_and_does_not_replay` (`src/app/operation_script_runtime/tests/events.rs:624`)
-- `event_detection_cache_misses_do_not_read_rating_or_tag_databases` (`src/app/operation_script_runtime/tests/events.rs:673`)
-- `event_limit_is_rolling_ten_attempts_and_notification_is_lifetime_once` (`src/app/operation_script_runtime/tests/events.rs:686`)
-- `event_rate_drop_advances_baseline_and_never_queues_a_late_replay` (`src/app/operation_script_runtime/tests/events.rs:724`)
-- `event_detection_off_absent_loading_and_failed_do_not_claim_the_frame` (`src/app/operation_script_runtime/tests/events.rs:758`)
-- `event_detection_mounted_context_and_linked_detached_skip_without_touching_main_owner` (`src/app/operation_script_runtime/tests/events.rs:783`)
-- `event_detection_linked_f12_and_transition_skip_viewer_but_main_list_continues` (`src/app/operation_script_runtime/tests/events.rs:817`)
-- `event_detection_edit_and_page_overview_coalesce_after_exit` (`src/app/operation_script_runtime/tests/events.rs:845`)
-- `event_detection_native_overlay_uses_existing_snapshot_and_does_not_claim_blocked_frame` (`src/app/operation_script_runtime/tests/events.rs:899`)
-- `event_native_poll_video_hook_executes_and_overlay_snapshot_blocks_before_evaluation` (`src/app/operation_script_runtime/tests/events.rs:920`)
-- `event_safe_grid_actions_preserve_all_four_identity_components_even_from_details` (`src/app/operation_script_runtime/tests/events.rs:951`)
-- `event_safe_video_actions_preserve_all_four_identity_components_for_native_and_music` (`src/app/operation_script_runtime/tests/events.rs:987`)
+- `event_r11_faces_reentry_and_select_baseline_survive_viewer_in_observe_and_finish` (`src/app/operation_script_runtime/tests/events.rs:80`)
+- `event_initial_empty_grid_has_only_view_and_location_changes_do_not_select` (`src/app/operation_script_runtime/tests/events.rs:134`)
+- `event_view_changes_grid_image_video_and_audio_shares_video_context` (`src/app/operation_script_runtime/tests/events.rs:151`)
+- `event_r11_container_is_item_only_for_folders_pdf_epub_nested_and_converted_zip` (`src/app/operation_script_runtime/tests/events.rs:178`)
+- `event_nonviewer_row_variants_have_no_fabricated_book_container` (`src/app/operation_script_runtime/tests/events.rs:284`)
+- `event_r11_open_ignores_zip_subfolders_and_pending_source_but_follows_item_containers` (`src/app/operation_script_runtime/tests/events.rs:333`)
+- `event_nested_container_appends_literal_entry_without_host_path_replacement` (`src/app/operation_script_runtime/tests/events.rs:382`)
+- `event_and_slot_invocations_publish_the_same_item_container_book_path` (`src/app/operation_script_runtime/tests/events.rs:415`)
+- `event_r11_pdf_pages_halves_and_unit_scalars_fire_but_reader_order_does_not` (`src/app/operation_script_runtime/tests/events.rs:445`)
+- `event_composition_strong_arc_memo_semantics_and_equal_republication` (`src/app/operation_script_runtime/tests/events.rs:498`)
+- `event_runtime_grid_executes_before_keys_once_and_inputs_still_change_next_frame` (`src/app/operation_script_runtime/tests/events.rs:581`)
+- `event_grid_actual_key_slot_navigation_is_observed_only_next_frame` (`src/app/operation_script_runtime/tests/events.rs:611`)
+- `event_runtime_rejects_entire_mixed_batch_and_never_publishes_success_notice` (`src/app/operation_script_runtime/tests/events.rs:659`)
+- `event_runtime_rate_limit_drops_batches_notifies_once_and_does_not_replay` (`src/app/operation_script_runtime/tests/events.rs:680`)
+- `event_detection_cache_misses_do_not_read_rating_or_tag_databases` (`src/app/operation_script_runtime/tests/events.rs:729`)
+- `event_limit_is_rolling_ten_attempts_and_notification_is_lifetime_once` (`src/app/operation_script_runtime/tests/events.rs:742`)
+- `event_rate_drop_advances_baseline_and_never_queues_a_late_replay` (`src/app/operation_script_runtime/tests/events.rs:780`)
+- `event_detection_off_absent_loading_and_failed_do_not_claim_the_frame` (`src/app/operation_script_runtime/tests/events.rs:814`)
+- `event_detection_mounted_context_and_linked_detached_skip_without_touching_main_owner` (`src/app/operation_script_runtime/tests/events.rs:839`)
+- `event_detection_linked_f12_and_transition_skip_viewer_but_main_list_continues` (`src/app/operation_script_runtime/tests/events.rs:873`)
+- `event_detection_edit_and_page_overview_coalesce_after_exit` (`src/app/operation_script_runtime/tests/events.rs:901`)
+- `event_detection_native_overlay_uses_existing_snapshot_and_does_not_claim_blocked_frame` (`src/app/operation_script_runtime/tests/events.rs:955`)
+- `event_native_poll_video_hook_executes_and_overlay_snapshot_blocks_before_evaluation` (`src/app/operation_script_runtime/tests/events.rs:976`)
+- `event_safe_grid_actions_preserve_all_four_identity_components_even_from_details` (`src/app/operation_script_runtime/tests/events.rs:1007`)
+- `event_safe_video_actions_preserve_all_four_identity_components_for_native_and_music` (`src/app/operation_script_runtime/tests/events.rs:1043`)
 
 `src/ui_fullscreen/operation_script_event_tests.rs`:
 
@@ -1543,9 +1551,9 @@ main一覧継続の回帰を残す。r11の独立設計合意の履歴は§3.3�
 - `operation_script_event_background_and_analysis_pixel_absorb_unresolved_anchor_synchronously` (`src/ui_fullscreen/operation_script_event_tests.rs:121`)
 - `operation_script_event_loading_cache_arrival_does_not_retrigger_safe_a` (`src/ui_fullscreen/operation_script_event_tests.rs:174`)
 - `operation_script_event_direction_fit_and_single_have_late_slice_counterexamples` (`src/ui_fullscreen/operation_script_event_tests.rs:201`)
-- `operation_script_event_embedded_detection_precedes_normal_key_and_slot_change_fires_next_frame` (`src/ui_fullscreen/operation_script_event_tests.rs:245`)
-- `operation_script_event_child_pass_uses_child_text_focus_and_root_frame_number` (`src/ui_fullscreen/operation_script_event_tests.rs:281`)
-- `operation_script_event_hook_is_before_forwarded_overview_and_normal_key_paths` (`src/ui_fullscreen/operation_script_event_tests.rs:346`)
+- `operation_script_event_embedded_detection_precedes_normal_key_and_slot_change_fires_next_frame` (`src/ui_fullscreen/operation_script_event_tests.rs:659`)
+- `operation_script_event_child_pass_uses_child_text_focus_and_root_frame_number` (`src/ui_fullscreen/operation_script_event_tests.rs:695`)
+- `operation_script_event_hook_is_before_forwarded_overview_and_normal_key_paths` (`src/ui_fullscreen/operation_script_event_tests.rs:760`)
 
 `src/ui_fullscreen/page_turn/slide_tests.rs`:
 
@@ -1569,14 +1577,14 @@ main一覧継続の回帰を残す。r11の独立設計合意の履歴は§3.3�
 | `src/app/update_phases.rs:918` | 一覧ROOTのキー処理前の入口 |
 | `src/ui_fullscreen.rs:28980` | `render_fullscreen_viewport_with_root_input`内render_fs_bodyの入口1点。既存転送/overview/通常キーの順は保持 |
 | `src/app.rs:102905` | `App::poll_video`のnative入口。既存overlay snapshotによる受付を再利用 |
-| `src/operation_script/contract.rs:93` | r11イベント可41操作と印無し8操作。検証回帰は`:605` / `:643` |
-| `assets/operation_scripts.default.rhai:20` | 黒背景のPNGをopenで白へ巡回する例 |
+| `src/operation_script/contract.rs:71` / `:111` | r12イベント権限enum。同期可41・OpenOnly2・不可の見開き6。検証回帰は`:630` / `:668` / `:747` |
+| `assets/operation_scripts.default.rhai:20` | open＋book.pathの条件で読む向きをRTLへ合わせる例 |
 | `src/operation_script/loader.rs:342` | 雛形の実評価とイベント出力検証 |
 | `src/app/operation_script_runtime/tests/events.rs:24` | r11識別・実入口・上限・eligibility・detached・同期Aの回帰（各名は上記） |
 | `src/ui_fullscreen/operation_script_event_tests.rs:58` | 新規headless実描画回帰。module登録は`src/ui_fullscreen.rs:105836` |
 | `src/ui_fullscreen/page_turn/slide_tests.rs:23` | 完了待ちと元continuationのexactly-onceをno-toggle対照と比較する回帰 |
 | `src/app/operation_script_runtime/tests/page_identity_perf.rs:249` | 既存ignored性能testへ変更なしevent構築＋比較のμs行を追加 |
-| `docs/operation-script-plan.md:546` / `:1392` | 入れ物の物理/論理対応表と本実装記録。旧`docs/operation-script-stage4-handoff.md`を統合・削除 |
+| `docs/operation-script-plan.md:546` / `:1445` | 入れ物の物理/論理対応表と本実装記録。旧`docs/operation-script-stage4-handoff.md`を統合・削除 |
 | `docs/ui-responsiveness.md:44` | 検出の費用境界・既存計測と今回未計測の区別 |
 | `docs/architecture-overview.md:24` / `docs/README.md:11` | main owner/owned pass/scalar＋strong Arcの構造と段1〜4実装・段5未着手の索引 |
 
@@ -1617,3 +1625,51 @@ raw prefix内部の`/`と大文字小文字は維持し、hostのjoin/pushへraw
 再検証filterは上記3 test名、まとめて`operation_script`（変更moduleの既存testも含む）。
 この修正後のbare `cargo fmt`・`git diff --check`はexit 0。UI文字列の変更は無い。
 cargo build/test/check・実機・独立実装reviewは未実施。回帰の実行結果は確認後に追記する。
+
+### 2026-11-26追記: r12のOpenOnly実装（今回のRust検証は未実施）
+
+EventPermissionをForbidden / Synchronous / OpenOnlyの3種類へ統一し、従来のoperation_scriptのevent_allowed boolは撤去。
+同期可41操作の範囲は維持。ReadingDirectionToggle / FitModeCycleだけをOpenOnlyへ移し、見開き6はForbiddenのまま。
+検出側が確定したVecを保持し、ScriptInvocation::Eventのtyped sliceをvalidate_outputへ渡す。
+Rhaiへ渡すsnapshot.eventsは別の写しであり、s.events改変・戻り値のeventsフィールドから権限を得られない。
+全件の検査が成功して初めて共用実行関数へ渡すので、Open無しのmixedは同期Aのprefixもsuffixも実行しない。
+Inputは従来の制約を維持し、イベント権限でキー起動を狭めない。実行済み操作を追う新状態や症状guardは足していない。
+
+両OpenOnly操作について実on_event→sameframe finish_event→残り実描画（通常の準備・pending poll・page-turn完了処理）→
+遅れたPage一回の拒否通知→後2frameでイベント無しをheadless回帰にした。
+非Split/自由回転無しでは余分Page無し。遅れPageの同期Aも後のイベントを作らない。
+Open+Pageだけの実検出は受け付け、Page単独/View単独ではスクリプトがopenを偽装してもmixedを全件拒否する。
+View単独は前baselineの文脈だけを変えて検出境界の集合を分離するfixtureで、実際のimage/video移動の観測とは区別する。
+一覧検出を挟んだ同じ本への再入場は新しいOpenとして許可する。寸法待ち/編集による検出休止でも、独立移動無しにOpenを増やさない。
+どの起動が原因かを追う仕組みや10回/秒を安全根拠にせず、操作が新しい入れ物/一覧移動を作らない境界で止める。
+拒否するのはopenを含まない遅れPageであり、独立した移動によるOpen+Pageは新しいOpenへの実行として許す。
+
+今回の変更ファイル・入口:
+
+- `src/operation_script/contract.rs:71` / `:111` / `:322` / `:365` / `:413`: 権限enum、分類、typed invocation、全件事前検査。
+- `src/app/operation_script_runtime/events.rs:319`: 検出VecとRhaiへ渡す写しを分離し、検出集合を検査へ渡す。
+- `src/app/operation_script_runtime/tests/events.rs:24`: 偽装とmixed拒否。既存grid/video同期Aの棚卸しはenumのSynchronousだけを選ぶ。
+- `src/ui_fullscreen/operation_script_event_tests.rs:58`: 既存同期A回帰のenum化と、下表のOpenOnly実描画回帰。
+- `assets/operation_scripts.default.rhai:20` / `src/operation_script/loader.rs:342`: 設計§4.2どおりのRTL例に戻し、Open/方向/path/文脈の評価を確認する回帰。
+- 本書§0/§5.1/§5.3/§10/§16、`docs/architecture-overview.md:28`、`docs/ui-responsiveness.md:44`、`docs/README.md:11`: r12権限と同期/遅れPageの費用・境界を記録。
+
+detached述語・viewport・context lifecycle・bundle・cleanup・既存入力順/検出位置には触れていない。
+既存のr11検証とseparator修正の証拠は上の追記を再利用。今回のRust build/test/check・release実測・アプリ起動・commit・独立実装reviewは未実施。
+bare cargo fmt、UI glyph checker、git diff --checkはexit 0。UI文字列の危険なglyphは0件。
+
+今回追加したテスト名・file:line（未実行）:
+
+| テスト | file:line |
+| --- | --- |
+| `validation_open_only_uses_detector_events_and_rejects_the_whole_mixed_batch` | `src/operation_script/contract.rs:747` |
+| `event_open_only_cannot_forge_open_or_execute_a_mixed_prefix` | `src/app/operation_script_runtime/tests/events.rs:24` |
+| `operation_script_event_open_only_split_rotation_reconciles_once_then_rejects_page` | `src/ui_fullscreen/operation_script_event_tests.rs:303` |
+| `operation_script_event_open_only_without_split_rotation_has_no_extra_page` | `src/ui_fullscreen/operation_script_event_tests.rs:381` |
+| `operation_script_event_open_only_late_page_can_run_synchronous_a_without_another_event` | `src/ui_fullscreen/operation_script_event_tests.rs:419` |
+| `operation_script_event_open_only_grid_reentry_allows_the_same_container_again` | `src/ui_fullscreen/operation_script_event_tests.rs:463` |
+| `operation_script_event_open_only_container_change_accepts_open_page_without_view` | `src/ui_fullscreen/operation_script_event_tests.rs:512` |
+| `operation_script_event_open_only_unknown_dimensions_coalesce_page_without_another_open` | `src/ui_fullscreen/operation_script_event_tests.rs:557` |
+| `operation_script_event_open_only_detection_pause_resumes_with_page_without_open` | `src/ui_fullscreen/operation_script_event_tests.rs:613` |
+
+ClaudeCodeへの検証filterは`operation_script`（変更moduleの既存contract/loader/runtime/画像実描画回帰を含む）。
+今回追加分だけを先に絞るなら`open_only`。既存slide/poll_video/ignored性能testの依頼は上の検証節を維持する。

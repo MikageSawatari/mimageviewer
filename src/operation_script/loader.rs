@@ -370,23 +370,29 @@ mod tests {
         assert_eq!(call("rate3_next", &snapshot), ["RatingItem3", "FsPageNext"]);
         snapshot.book.path = Some(r"C:\manga\book".into());
         snapshot.view.direction = Some("ltr".into());
-        snapshot.item.ext = Some("png".into());
-        snapshot.view.background = Some("black".into());
-        assert_eq!(call("on_event", &snapshot), ["FsBgCycle"]);
+        assert_eq!(call("on_event", &snapshot), ["FsReadingDirectionToggle"]);
         let output = script.evaluate_event(&snapshot).unwrap();
         assert!(
             crate::operation_script::validate_output(
                 output,
                 crate::operation_script::ValidationContext {
                     context: ScriptContext::FsImage,
-                    invocation: crate::operation_script::ScriptInvocation::Event,
+                    invocation: crate::operation_script::ScriptInvocation::Event(&snapshot.events),
                     navigation_already_accepted: false,
                 }
             )
             .is_ok(),
             "the shipped example must pass event admission, not just evaluate"
         );
-        snapshot.view.background = Some("checker".into());
+        snapshot.view.direction = Some("rtl".into());
+        assert!(call("on_event", &snapshot).is_empty());
+        snapshot.view.direction = Some("ltr".into());
+        snapshot.events = vec![ScriptEvent::Page];
+        assert!(call("on_event", &snapshot).is_empty());
+        snapshot.events = vec![ScriptEvent::View];
+        assert!(call("on_event", &snapshot).is_empty());
+        snapshot.events = vec![ScriptEvent::Open];
+        snapshot.book.path = Some(r"C:\other\book".into());
         assert!(call("on_event", &snapshot).is_empty());
         for context in [ScriptContext::Grid, ScriptContext::FsVideo] {
             snapshot.context = context;
