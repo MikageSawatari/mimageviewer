@@ -707,16 +707,17 @@ Ctrl+S空クエリの空列だけは定数サイズの準備を同期実行す�
 本棚パスの `book_root_path()` は既定で同期の既知フォルダ解決へ到達するため、毎 pass の述語・行の形・「貼り付け」の有効判定には含めない。利用者決定により、転送の投入時とツリーの「貼り付け」を押した時だけ、既存の操作境界と同じ関数を一回呼んで本棚自身・配下を拒否する。起動前 pin・resolver の共有・受付の保留は作らない。Ctrl+V は既存の `current_favorite_target()` で確認済みなので共通貼り付け関数から繰り返さない。
 ツリーの右クリック「貼り付け」・一覧の Ctrl+V・一覧メニューの「貼り付け」は `start_shell_paste` に集約し、Shell の bind・query・`InvokeCommand` を常駐 `shell-paste` STA thread へ投入する。`OleInitialize` とメッセージポンプを保ち、呼び出しが戻った後も Shell の転送 proxy が使う apartment を生かす。UI は初期化・呼び出し・終了を待たない。worker が Shell に渡す時点のクリップボードを使い、読み取り・照合はしない。貼り付け中の追加要求と整理・D&D 転送の受付、mIV 自身のファイルの切り取り・コピーは通知して断る。画像・テキストのコピー、外部アプリのクリップボード変更は止めない。完了は転送完了ではなく動詞の呼び出しの完了で、root poll で修飾キーを同期し、失敗時は自分の番号の選択要求だけを取り下げる。ツリーの形式照会は従来どおりメニューを開いた時だけ行う。[設計 §2・§5.13](ui-sync-853-plan.md) と [ツリー設計 §7](folder-tree-dnd-plan.md) を参照。コンパイル・Rust テスト・実 Shell 検証は未実施。
 
-呼び出しの成功・失敗どちらでも、worker は完了送信前に main へ前面を返す判定を一度行う。
-`InvokeCommand` 直前に main が前面で、終了時の前面が同じ process・main と別 thread、かつ
-root owner が main (`GetAncestor(fg, GA_ROOTOWNER) == main`) の場合だけが復帰対象。
-前面 NULL、owner の異なる窓、main と同じ UI thread の別窓や別アプリの前面は保つ。
-Windows が自然に activation を返さなかった理由は未特定であり、[設計 §5.13](ui-sync-853-plan.md) の
-診断をサブ PC で採取し、自然に戻す形にできると分かればこの処理を外す。復帰に待ち・再試行・追加 repaint は使わない。
-`shell_paste/end` の `outcome=invoked` は呼び出し成功のみを表し、転送成功・完了・中止を判定しない。
-ほかは `failed|start_failed|disconnected`。同じ end に `focus_return`、worker の
-`shell_paste/focus_return` に開始時の前面、終了時の前面と root owner のクラス名・根が main か、
-前面の visible・main の enabled、thread/process の比較を記録する。追加分の検証は未実施。
+Shell 貼り付け完了時の前面の返却は独立レビューの P2-1・P2-2 を受けて外し、R3-3 は未修正。
+root owner が main でも操作の由来は示せず、`InvokeCommand` の戻りも Shell UI 終了・転送完了の証拠にはならない。
+`0a065beed`・`e0036a17a` の復帰判定は試して外した案で、現在は前面を変えない診断だけを持つ。
+main HWND は bind と invocation の owner に渡すが、サブ PC 担当の Claude の perf ログでは戻り時にも
+`focused:false` で約 0.9 秒戻らなかった。理由は未特定で、(a) 進捗窓が残る、(b) main が disabled、(c) その他を
+サブ PC の再確認で判別してから構造的な直し方を決める。[設計 §5.13](ui-sync-853-plan.md) を参照。
+perf 有効時だけ、本物の `InvokeCommand` 直前と戻り直後 (計測出力・menu 破棄より前) に読み取り、
+`shell_paste/foreground_after_invoke` へ開始時の前面、終了時の前面/root owner のクラス名と根が main か、
+visible/enabled・process/thread 比較・前面 NULL かを一行で出す。未呼び出し時の診断 event は無い。
+`shell_paste/end` の `focus_return` は削除し、R3-2 の `outcome=invoked|failed|start_failed|disconnected` は維持する。
+`invoked` は呼び出し成功のみで転送の成否・中止を含まない。今回のコンパイル・テスト・レビュー・実機確認は未実施。
 
 文字起こし表示（T1区切り3）のDB SELECTと署名取得は単一readerで行い、UI/presenterは不変のsnapshotとArc本文だけを使う。
 再生原点は既存decoderから取得し、描画で再probeしない。nativeとmusicは可変高一覧rendererを共有する。

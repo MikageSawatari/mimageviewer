@@ -5,7 +5,7 @@ use crate::app::{AppTestEnvForTest, NormalFolderOmittedEntries, setup_app_for_te
 use crate::post_operation_selection::ExpectedOutputs;
 use crate::shell_file_ops::{ShellTransferOperation, ShellTransferRequest};
 use crate::shell_paste::{
-    FocusApi, FocusSnapshot, ShellPasteError, ShellPasteResult, ShellPasteService,
+    ForegroundApi, ForegroundSnapshot, ShellPasteError, ShellPasteResult, ShellPasteService,
 };
 use crate::ui_dialogs::file_organize::{
     FileOrganizeRequest, FileOrganizeRunning, FileOrganizeSelection,
@@ -72,65 +72,82 @@ fn finish_paste(app: &mut App, ctx: &egui::Context, worker: &PasteWorker, succee
     }
 }
 
-type FocusTrace =
+type ForegroundTrace =
     std::sync::Arc<std::sync::Mutex<Vec<(&'static str, isize, std::thread::ThreadId)>>>;
 
-struct HandlerFocus {
-    foreign_process: bool,
+struct HandlerForeground {
+    diagnostics_enabled: bool,
     started_from_main: bool,
-    owned_by_main: bool,
-    trace: FocusTrace,
+    foreground_hwnd: isize,
+    main_enabled: bool,
+    trace: ForegroundTrace,
+    events: mpsc::Sender<serde_json::Value>,
 }
 
-impl FocusApi for HandlerFocus {
-    fn started_from_main(&mut self, main_hwnd: isize) -> bool {
+impl HandlerForeground {
+    fn record(&self, operation: &'static str, hwnd: isize) {
         self.trace
             .lock()
             .unwrap()
-            .push(("start", main_hwnd, std::thread::current().id()));
+            .push((operation, hwnd, std::thread::current().id()));
+    }
+}
+
+impl ForegroundApi for HandlerForeground {
+    fn diagnostics_enabled(&self) -> bool {
+        self.diagnostics_enabled
+    }
+
+    fn started_from_main(&self, main_hwnd: isize) -> bool {
+        self.record("start", main_hwnd);
         self.started_from_main
     }
 
-    fn snapshot(&mut self, main_hwnd: isize) -> FocusSnapshot {
-        self.trace
-            .lock()
-            .unwrap()
-            .push(("snapshot", main_hwnd, std::thread::current().id()));
-        FocusSnapshot {
-            main_valid: true,
+    fn snapshot(&self, main_hwnd: isize) -> ForegroundSnapshot {
+        self.record("snapshot", main_hwnd);
+        ForegroundSnapshot {
             main_thread: 10,
             current_process: 100,
-            foreground_hwnd: 2,
+            foreground_hwnd: self.foreground_hwnd,
             foreground_thread: 11,
-            foreground_process: if self.foreign_process { 101 } else { 100 },
-            root_owner_hwnd: if self.owned_by_main { main_hwnd } else { 3 },
-            foreground_visible: true,
-            main_enabled: true,
+            foreground_process: 100,
+            root_owner_hwnd: if self.foreground_hwnd == 0 {
+                0
+            } else {
+                main_hwnd
+            },
+            foreground_visible: self.foreground_hwnd != 0,
+            main_enabled: self.main_enabled,
         }
     }
 
-    fn set_foreground(&mut self, main_hwnd: isize) -> bool {
-        self.trace
-            .lock()
-            .unwrap()
-            .push(("restore", main_hwnd, std::thread::current().id()));
-        true
+    fn class_name(&self, hwnd: isize) -> String {
+        self.record("class", hwnd);
+        if hwnd == 0 {
+            "<none>".into()
+        } else {
+            format!("fake-{hwnd}")
+        }
     }
 
-    fn class_name(&self, _: isize) -> String {
-        "<fake-shell-dialog>".into()
+    fn emit_after_invoke(&self, kind: &'static str, fields: &[(&str, serde_json::Value)]) {
+        self.record("emit", 0);
+        let fields = fields
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        self.events
+            .send(serde_json::json!({"kind": kind, "fields": fields}))
+            .unwrap();
     }
 }
 
-fn assert_handler_focus_completion(foreign_process: bool, invocation: ShellPasteResult) {
-    assert_handler_focus_completion_with(foreign_process, true, true, invocation);
-}
-
-fn assert_handler_focus_completion_with(
-    foreign_process: bool,
-    started_from_main: bool,
-    owned_by_main: bool,
+fn assert_handler_foreground_diagnostics(
     invocation: ShellPasteResult,
+    diagnostics_enabled: bool,
+    foreground_hwnd: isize,
+    started_from_main: bool,
+    main_enabled: bool,
 ) {
     for origin in [
         ShellPasteOrigin::Tree,
@@ -139,10 +156,11 @@ fn assert_handler_focus_completion_with(
     ] {
         let mut app = ready();
         let ctx = egui::Context::default();
-        let trace = FocusTrace::default();
+        let trace = ForegroundTrace::default();
         let invoked_trace = trace.clone();
         let result = invocation.clone();
-        app.shell_paste_service = ShellPasteService::with_test_invoker_and_focus(
+        let (event_tx, event_rx) = mpsc::channel();
+        app.shell_paste_service = ShellPasteService::with_test_invoker_and_foreground(
             move |hwnd, _| {
                 invoked_trace
                     .lock()
@@ -150,11 +168,13 @@ fn assert_handler_focus_completion_with(
                     .push(("invoke", hwnd, std::thread::current().id()));
                 result.clone()
             },
-            HandlerFocus {
-                foreign_process,
+            HandlerForeground {
+                diagnostics_enabled,
                 started_from_main,
-                owned_by_main,
+                foreground_hwnd,
+                main_enabled,
                 trace: trace.clone(),
+                events: event_tx,
             },
         );
         SHELL_PASTE_END_FIELDS.with_borrow_mut(Vec::clear);
@@ -164,98 +184,94 @@ fn assert_handler_focus_completion_with(
             app.poll_shell_paste(&ctx);
             assert!(
                 Instant::now() < deadline,
-                "fake focus completion was not consumed"
+                "fake paste completion was not consumed"
             );
             std::thread::yield_now();
         }
-        let start_failed = matches!(invocation, Err(ShellPasteError::Start(_)));
-        let expected_calls: &[&str] = if start_failed {
-            &["start", "invoke"] // fake invoker simulates failing before Shell was called
-        } else if foreign_process || !started_from_main || !owned_by_main {
-            &["start", "invoke", "snapshot"]
-        } else {
-            &["start", "invoke", "snapshot", "restore"]
-        };
         let calls = trace.lock().unwrap().clone();
+        let expected: &[&str] = if diagnostics_enabled {
+            &["start", "invoke", "snapshot", "class", "class", "emit"]
+        } else {
+            &["invoke"]
+        };
         assert_eq!(
             calls.iter().map(|call| call.0).collect::<Vec<_>>(),
-            expected_calls
-        );
-        assert!(
-            calls.iter().all(|call| call.1 == 1),
-            "only main's HWND is used"
+            expected
         );
         assert!(calls.iter().all(|call| call.2 == calls[0].2));
         assert_ne!(calls[0].2, std::thread::current().id());
+        if diagnostics_enabled {
+            let is_null = foreground_hwnd == 0;
+            let event = event_rx
+                .try_recv()
+                .expect("one foreground_after_invoke event");
+            assert_eq!(event["kind"], "foreground_after_invoke");
+            assert_eq!(
+                event["fields"],
+                serde_json::json!({
+                    "started_from_main": started_from_main,
+                    "foreground_class": if is_null { "<none>" } else { "fake-2" },
+                    "root_owner_class": if is_null { "<none>" } else { "fake-1" },
+                    "root_owner_is_main": !is_null,
+                    "foreground_visible": !is_null,
+                    "main_enabled": main_enabled,
+                    "foreground_is_null": is_null,
+                    "same_thread": if is_null { None } else { Some(false) },
+                    "same_process": if is_null { None } else { Some(true) },
+                })
+            );
+        }
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         SHELL_PASTE_END_FIELDS.with_borrow(|events| {
             assert_eq!(events.len(), 1);
             assert_eq!(events[0]["origin"], origin.perf_tag());
             assert_eq!(
                 events[0]["outcome"],
-                if start_failed {
-                    "start_failed"
-                } else if invocation.is_ok() {
+                if invocation.is_ok() {
                     "invoked"
                 } else {
                     "failed"
                 }
             );
-            assert_eq!(
-                events[0]["focus_return"],
-                if start_failed {
-                    "not_invoked"
-                } else if !started_from_main {
-                    "not_started_from_main"
-                } else if foreign_process {
-                    "other_process"
-                } else if !owned_by_main {
-                    "unowned_window"
-                } else {
-                    "restored"
-                }
-            );
+            assert_eq!(events[0].as_object().unwrap().len(), 3);
+            assert!(events[0].get("focus_return").is_none());
+            assert!(events[0].get("started_from_main").is_none());
         });
         assert_eq!(app.post_operation_selection.is_some(), invocation.is_ok());
         app.poll_shell_paste(&ctx);
-        assert_eq!(trace.lock().unwrap().len(), expected_calls.len());
+        assert_eq!(trace.lock().unwrap().len(), expected.len());
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         SHELL_PASTE_END_FIELDS.with_borrow(|events| assert_eq!(events.len(), 1));
     }
 }
 
 #[test]
-fn shell_paste_handler_restores_main_once_after_invocation_and_records_end() {
-    assert_handler_focus_completion(false, Ok(()));
+fn shell_paste_handler_records_read_only_diagnostics_once_separately_from_end() {
+    for (hwnd, started, enabled) in [(2, true, true), (2, false, false), (0, true, false)] {
+        assert_handler_foreground_diagnostics(Ok(()), true, hwnd, started, enabled);
+    }
 }
 
 #[test]
-fn shell_paste_handler_preserves_foreign_foreground_and_records_end() {
-    assert_handler_focus_completion(true, Ok(()));
-}
-
-#[test]
-fn shell_paste_handler_failed_invocation_still_returns_focus_and_records_end() {
-    assert_handler_focus_completion(
-        false,
+fn shell_paste_handler_failed_invocation_records_diagnostics_and_failed_outcome() {
+    assert_handler_foreground_diagnostics(
         Err(ShellPasteError::Invocation("fake failure".into())),
+        true,
+        2,
+        true,
+        true,
     );
 }
 
 #[test]
-fn shell_paste_handler_start_failure_records_not_invoked_without_focus_return_query() {
-    assert_handler_focus_completion(
-        false,
-        Err(ShellPasteError::Start("fake OLE failure".into())),
-    );
-}
-
-#[test]
-fn shell_paste_handler_does_not_restore_if_not_started_from_main() {
-    assert_handler_focus_completion_with(false, false, true, Ok(()));
-}
-
-#[test]
-fn shell_paste_handler_does_not_restore_unowned_worker_window() {
-    assert_handler_focus_completion_with(false, true, false, Ok(()));
+fn shell_paste_handler_disabled_diagnostics_do_not_query_foreground() {
+    assert_handler_foreground_diagnostics(Ok(()), false, 2, true, true);
 }
 
 #[test]
@@ -900,7 +916,7 @@ fn shell_paste_disconnected_completion_warns_and_retires_its_selection() {
     SHELL_PASTE_END_FIELDS.with_borrow(|events| {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["outcome"], "disconnected");
-        assert_eq!(events[0]["focus_return"], "not_invoked");
+        assert!(events[0].get("focus_return").is_none());
     });
     // Release the detached fake worker; it still never reaches the real Shell.
     worker.finish.send(Ok(())).unwrap();

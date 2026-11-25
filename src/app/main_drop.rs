@@ -8,7 +8,7 @@ use eframe::egui;
 use super::App;
 use crate::main_drop_target::{DropGeometry, DropPlace, DropRequest, DropRow};
 use crate::shell_file_ops::{ShellTransferRequest, ShellTransferResult};
-use crate::shell_paste::{FocusReturn, ShellPasteCompletion, ShellPasteError};
+use crate::shell_paste::{ShellPasteCompletion, ShellPasteError};
 use crate::ui_dialogs::file_organize::{FileOrganizeRequest, FileOrganizeRunning};
 
 pub(crate) const SHELL_PASTE_BUSY_MESSAGE: &str = "貼り付けが完了するまでお待ちください";
@@ -451,7 +451,6 @@ impl App {
                     started_at,
                     perf_seq,
                     ShellPasteOutcome::StartFailed,
-                    FocusReturn::NotInvoked,
                     Some(SHELL_PASTE_START_FAILURE),
                 );
             }
@@ -473,9 +472,6 @@ impl App {
             }
             Ok(completion) => Some(completion),
         };
-        let focus_return = completion
-            .as_ref()
-            .map_or(FocusReturn::NotInvoked, |c| c.focus_return);
         let (outcome, warning) = match completion.map(|c| c.invocation) {
             None => (
                 ShellPasteOutcome::Disconnected,
@@ -503,7 +499,6 @@ impl App {
             running.started_at,
             running.perf_seq,
             outcome,
-            focus_return,
             warning,
         );
     }
@@ -517,7 +512,6 @@ impl App {
         started_at: std::time::Instant,
         perf_seq: u64,
         outcome: ShellPasteOutcome,
-        focus_return: FocusReturn,
         warning: Option<&str>,
     ) {
         let retire_selection = match outcome {
@@ -549,10 +543,6 @@ impl App {
                     serde_json::Value::from(started_at.elapsed().as_secs_f64() * 1000.0),
                 ),
                 ("outcome", serde_json::Value::from(outcome.perf_tag())),
-                (
-                    "focus_return",
-                    serde_json::Value::from(focus_return.perf_tag()),
-                ),
             ];
             #[cfg(test)]
             SHELL_PASTE_END_FIELDS.with_borrow_mut(|events| {

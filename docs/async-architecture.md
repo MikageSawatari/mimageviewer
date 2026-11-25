@@ -36,37 +36,37 @@ App は `ShellPasteService` 一つと実行中要求一つを持つ。3 入口�
 ファイルの切り取り・コピーは共通入口の先頭で、書き込みの予約と `begin_local_write` より前に断る。
 完了受信は root の `poll_file_organize` の隣、early return 前で行い、修飾キーを OS に合わせる。
 完了は動詞の呼び出しの完了であり、転送の完了は Shell が管理する。
-呼び出しが成功・失敗で戻った直後、完了を送る前に、同じ worker が main への前面の返却を一度だけ判定する。
-bind の `CreateViewObject(hwnd)` と `CMINVOKECOMMANDINFO.hwnd` には main HWND を渡している。
-通常は Shell の画面を閉じると Windows が owner の main へ activation を返すはずだが、
-サブ PC 担当の Claude の perf ログ (master 38e8e43c5 の build-dev) では呼び出しの戻り時も
-`focused:false` で、約 0.9 秒 (2 回とも 890〜897 ms) 戻らなかった。理由は未特定。
-候補は (a) Shell の進捗窓 (置換の画面の owner) が残って前面を持つ、(b) main がまだ disabled で返せない、の二つ。
-開始時の前面は bind/query 後の `InvokeCommand` 直前のコールバックで worker が採取する。
-**main が前面の状態で開始し、終了時の前面が同じ process・main と別 thread、かつ
-`GetAncestor(fg, GA_ROOTOWNER) == main` のときだけ** `SetForegroundWindow(main)` を一度呼ぶ。
-開始時に main が前面でなければ `not_started_from_main`、前面 NULL は `no_foreground`、
-同じ process・別 thread でも root owner が main でなければ `unowned_window` として操作しない。
-main 無効、既に main、同じ UI thread の別窓、別 process の前面も従来どおり操作しない。
-別アプリへ移った利用者、mIV の他の窓、前面の無い状態を奪わないため、この貼り付けの Shell の画面の系列に限定する。
-サブ PC の再確認で診断から理由を確かめ、Windows が自然に戻す形にできると分かれば、この処理を外す。
-thread の比較元は main HWND の `GetWindowThreadProcessId`、process は `GetCurrentProcessId`。
-復帰失敗はログで終え、待ち・再試行・入力の偽装はしない。`ShellPasteCompletion` は呼び出しの `Result` と
-typed `FocusReturn` を併せて返す。開始・OLE 初期化・bind/query の失敗など `InvokeCommand` を呼んでいない経路は `not_invoked`。
-`PostOperationSelection` の番号は `request_post_operation_selection` 一か所で発行し、失敗時は一致する要求だけを取り下げる。
-take / 戻しでは番号を保ち、後から作られた新規フォルダ・別の操作の選択要求を取り下げない。
-`shell_paste/submit` の `origin`、`shell_paste/end` の `origin`・`ms`・`outcome`・`focus_return` は perf 有効時だけ記録する。
-`outcome` は typed enum の `invoked|failed|start_failed|disconnected`。
-`invoked` は `InvokeCommand` が成功で戻った意味だけで、転送の成否・利用者の中止を含まない。
-Shell の paste 動詞からは中止を取得できず、`IFileOperation` への置換は行わない。
-worker の `shell_paste/focus_return` は、開始時の前面が main か (`started_from_main`)、
-終了時の前面と root owner のクラス名 (`foreground_class`・`root_owner_class`)、根が main か (`root_owner_is_main`)、
-`IsWindowVisible(fg)` (`foreground_visible`)・`IsWindowEnabled(main)` (`main_enabled`)、
-main と同じ thread か (`same_thread`)・同じ process か (`same_process`)、`focus_return` を一行に記録する。
-すべて復帰操作前の値で、候補 (a)(b) の判別に使う。
-前面 NULL の比較値は null。前面の返却の追加分はコンパイル・テスト・レビュー・実機確認とも未実施。
-通常の呼び出し失敗はログ、開始失敗と受信口切断はログと通知で終端し、再試行しない。
-詳細は [設計書 §2・実装の記録](ui-sync-853-plan.md)。コンパイル・Rust テスト・実 Shell 検証は未実施。
+bind の `CreateViewObject(hwnd)` と `CMINVOKECOMMANDINFO.hwnd` には main HWND を渡す。
+通常は画面を閉じると Windows が owner へ activation を返すはずだが、サブ PC 担当の Claude の
+perf ログ (master 38e8e43c5 の build-dev) では戻り時も `focused:false` で、約 0.9 秒
+(2 回とも 890〜897 ms) 戻らなかった。理由は未特定で、R3-3 は未修正。
+候補は (a) Shell の進捗窓が残る、(b) main がまだ disabled、(c) その他。
+
+前面の強制返却は独立レビュー (別担当、GPT-6.1 Sol / xhigh、利用者から共有された REJECT) の
+P2-1 (root owner が main でも操作の由来を示さず、native 動画の全画面窓等から奪い得る) と
+P2-2 (呼び出しの戻りは Shell UI 終了・転送完了の証拠ではない) を受けて削除した。
+`0a065beed` の process/thread/NULL 判定、`e0036a17a` の開始時の前面と root owner を加えた判定は
+試して外した案で、現行経路に `SetForegroundWindow`・設定 API・復帰判定は無い。
+サブ PC の再確認で下記の診断から (a)(b)(c) を判別してから構造的な直し方を決める。
+
+perf 有効時だけ、本物の `invoke_canonical_verb` の `before_invoke` で開始時の前面が main かを読み、
+`after_invoke` で戻り直後の読み取り専用診断を worker から一行の `shell_paste/foreground_after_invoke` に出す。
+後者は呼び出しの成功・失敗どちらでも、エラーの整形・計測出力・menu 破棄より前に行う。
+値は `started_from_main`、前面と root owner のクラス名 (`foreground_class`・`root_owner_class`)、
+根が main か (`root_owner_is_main`)、`IsWindowVisible(fg)` (`foreground_visible`)、
+`IsWindowEnabled(main)` (`main_enabled`)、同じ process/thread か (`same_process`・`same_thread`)、
+前面 NULL か (`foreground_is_null`)。NULL の process/thread 比較は null。
+perf 無効時は前面を問い合わせず、bind/query の失敗で未呼び出しなら前後の callback と診断 event は無い。
+テストは実処理と共有する bind/query helper と `InvokeCommand` closure の最小 seam を通し、
+前後一回ずつの順序と未呼び出し時の callback 不在を検査する (追加後のテスト実行は未実施)。
+
+`ShellPasteCompletion` は呼び出し結果のみ。`PostOperationSelection` の番号は共通受付で発行し、
+失敗時は一致する要求だけを取り下げる。後の新規フォルダ・別操作の選択要求は取り下げない。
+`shell_paste/submit` の `origin`、`shell_paste/end` の `origin`・`ms`・`outcome` は perf 有効時だけ記録する。
+end の `focus_return` は削除。R3-2 の outcome は typed enum の `invoked|failed|start_failed|disconnected` を維持する。
+`invoked` は呼び出し成功だけで転送の成否・中止を含まない。Shell の paste 動詞からは中止を取得できず、
+`IFileOperation` への置換は行わない。通常の呼び出し失敗はログ、開始失敗・切断はログと通知で終端する。
+詳細は [設計書 §2・§5.13](ui-sync-853-plan.md)。今回のコンパイル・Rust テスト・独立レビュー・実機確認は未実施。
 
 ## 一括エクスポートの透かし（§1.362 段 B、検証待ち）
 
