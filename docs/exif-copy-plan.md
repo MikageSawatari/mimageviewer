@@ -99,13 +99,18 @@
   `CopyText` も積まれ、EXIF 全文を上書きし得る。
   - 優先順位: **TextEdit にフォーカスがある (文字入力中) なら、既存の gate で `FsCopyExif` は受け付けず、TextEdit の
     通常のコピーが働く。それ以外で `FsCopyExif` を受け付けた押下では、操作が勝つ** (利用者がそのキーを割り当てたため)。
-  - 実装: `FsCopyExif` を受け付けた pass では、その viewport の入力から `Event::Copy` を取り除く
-    (`ctx.input_mut(|i| i.events.retain(..))`)。ラベル選択のコピーがその pass の終わりにイベントを読む前に取り除かれることを、
+  - **操作の実行と入力の所有を分ける** (r2 P2)。消費は `consume_action_no_repeat` ではなく既存の
+    `Keymap::consume_action_press` で行い、初回の押下と長押しの repeat を区別する。既存 gate を通って消費した押下は、
+    初回・repeat のどちらでも、その viewport のその pass の入力から `Event::Copy` と `Event::Cut` を取り除く
+    (`ctx.input_mut(|i| i.events.retain(..))`)。Ctrl+C の長押しは repeat でも `Event::Copy` を出し、Ctrl+X に割り当てると
+    `Event::Cut` が出てラベルはこれにもコピーとして反応するため。EXIF の組み立て・コピー・通知・読み込み要求は初回だけ行う。
+    新しい保持状態は足さない。ラベル選択のコピーがその pass の終わりにイベントを読む前に取り除かれることを、
     実装担当が egui のコードと pass の順序 (情報パネルの描画とキー処理の前後) で確かめる。順序の都合で取り除けない場合は、
     実装を止めて設計担当へ返す。
   - `FsCopyExif` が Ctrl+C 以外 (例 Ctrl+Shift+E) なら `Event::Copy` は出ないので、取り除くものはない。
   - テストは、`Event::Copy` と key の押下を同じ pass に入れ、ラベル選択がある状態で、pass 全体の最終出力の `CopyText` が
-    EXIF 全文の 1 つだけであることを確かめる。
+    EXIF 全文の 1 つだけであることを確かめる。続けて別の pass で repeat (`Event::Copy` 付き) を入れ、`CopyText` が
+    1 つも出ない (ラベルの選択文字列も出ない) こと、通知が増えないことを確かめる。Ctrl+X に割り当てて `Event::Cut` でも同じ。
 - キーの変更・解除・競合は既存の操作カスタマイズの仕組み (競合検出・保存・`parse_ini_name`) に乗るだけで、専用処理は足さない。
 
 ## 6. 複数ウィンドウ (メイン / F12 / 独立窓)
@@ -139,7 +144,10 @@
 ## 9. テスト (実装担当が足す)
 
 - 書式の純関数: 節の順・表示名・空行・改行の正規化・空なら `None`・GPS 節を含む/含まない入力。
-- 非表示: `read_exif_from_bytes` に非表示タグを渡した結果を整形し、隠したタグ (GPS を含む) が出ないこと。
+- 非表示 (r2 P3): 新しい利用境界で検査する。絞らずに読む (`&[]`) → `visible(&hidden)` → 表示・整形 の順で、
+  隠したタグ (GPS を含む) が出ないこと、全部隠すと `None` になること。GPS は「緯度か経度を隠すと地図ボタンも出ない」
+  「参照タグ (`GPSLatitudeRef` 等) だけを隠しても座標と地図ボタンは保つ」を新しい経路で確かめる。読み取り時の絞り込みを
+  前提にした既存の検査 (`exif_reader.rs`・`ui_metadata_panel.rs` の GPS 周り) は新しい経路へ移す。
 - 折りたたみ: `exif_sections_open` で節を閉じてもボタン/キーの出力が変わらないこと。
 - 同じ文字列: 同じ fixture で、パネルのボタンを押したときとキー (`FsCopyExif` を割り当て) のときのクリップボード出力
   (egui の `OutputCommand::CopyText`) が一致すること。
