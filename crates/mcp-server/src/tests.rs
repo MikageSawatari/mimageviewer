@@ -90,6 +90,26 @@ fn client_text_limits_server_instructions() {
     );
 }
 
+#[test]
+fn settings_guidance_routes_on_screen_display_options_to_manual() {
+    let guidance = INSTRUCTIONS.lines().nth(2).unwrap();
+    for text in [
+        "Display settings changed only on screen (toolbar, list/detail columns, buttons, panels)",
+        "are not in get_settings/get_operations: say so",
+        "then use search_help/get_help to find where to change them",
+        "(often a right-click menu) and guide the user.",
+    ] {
+        assert!(guidance.contains(text), "{text}");
+    }
+    let tool = schema::tools()
+        .into_iter()
+        .find(|tool| tool["name"] == "get_settings")
+        .unwrap();
+    assert!(tool["description"].as_str().unwrap().contains(
+        "On-screen display options (toolbar, columns, buttons) are absent: guide via get_help."
+    ));
+}
+
 struct Input {
     receiver: mpsc::Receiver<Vec<u8>>,
     current: io::Cursor<Vec<u8>>,
