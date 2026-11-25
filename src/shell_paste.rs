@@ -15,10 +15,137 @@ pub(crate) enum ShellPasteError {
 
 pub(crate) type ShellPasteResult = Result<(), ShellPasteError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FocusReturn {
+    AlreadyMain,
+    Restored,
+    OtherMivWindow,
+    OtherProcess,
+    MainGone,
+    RestoreFailed,
+    NotInvoked,
+}
+
+impl FocusReturn {
+    pub(crate) fn perf_tag(self) -> &'static str {
+        match self {
+            Self::AlreadyMain => "already_main",
+            Self::Restored => "restored",
+            Self::OtherMivWindow => "other_miv_window",
+            Self::OtherProcess => "other_process",
+            Self::MainGone => "main_gone",
+            Self::RestoreFailed => "restore_failed",
+            Self::NotInvoked => "not_invoked",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ShellPasteCompletion {
+    pub(crate) invocation: ShellPasteResult,
+    pub(crate) focus_return: FocusReturn,
+}
+
+/// One snapshot at the invocation's return edge; no UI-thread state is consulted.
+pub(crate) struct FocusSnapshot {
+    pub(crate) main_valid: bool,
+    pub(crate) main_thread: u32,
+    pub(crate) current_process: u32,
+    pub(crate) foreground_hwnd: isize,
+    pub(crate) foreground_thread: u32,
+    pub(crate) foreground_process: u32,
+}
+
+pub(crate) trait FocusApi {
+    fn snapshot(&mut self, main_hwnd: isize) -> FocusSnapshot;
+    fn set_foreground(&mut self, main_hwnd: isize) -> bool;
+    fn class_name(&self, foreground_hwnd: isize) -> String;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FocusDecision {
+    Keep(FocusReturn),
+    Restore,
+}
+
+fn decide_focus_return(main_hwnd: isize, snapshot: &FocusSnapshot) -> FocusDecision {
+    if !snapshot.main_valid {
+        FocusDecision::Keep(FocusReturn::MainGone)
+    } else if snapshot.foreground_hwnd == main_hwnd {
+        FocusDecision::Keep(FocusReturn::AlreadyMain)
+    } else if snapshot.foreground_hwnd == 0 {
+        FocusDecision::Restore
+    } else if snapshot.foreground_process != snapshot.current_process {
+        FocusDecision::Keep(FocusReturn::OtherProcess)
+    } else if snapshot.foreground_thread == snapshot.main_thread {
+        FocusDecision::Keep(FocusReturn::OtherMivWindow)
+    } else {
+        FocusDecision::Restore
+    }
+}
+
+fn return_focus(main_hwnd: isize, api: &mut dyn FocusApi) -> FocusReturn {
+    let snapshot = api.snapshot(main_hwnd);
+    let class_name = crate::perf::is_enabled().then(|| api.class_name(snapshot.foreground_hwnd));
+    let result = match decide_focus_return(main_hwnd, &snapshot) {
+        FocusDecision::Keep(result) => result,
+        FocusDecision::Restore => {
+            if api.set_foreground(main_hwnd) {
+                FocusReturn::Restored
+            } else {
+                crate::logger::log("shell_paste: SetForegroundWindow(main) failed; not retrying");
+                FocusReturn::RestoreFailed
+            }
+        }
+    };
+    if let Some(class_name) = class_name {
+        let has_foreground = snapshot.foreground_hwnd != 0;
+        crate::perf::event(
+            "shell_paste",
+            "focus_return",
+            None,
+            0,
+            &[
+                ("focus_return", result.perf_tag().into()),
+                ("foreground_class", class_name.into()),
+                (
+                    "same_thread",
+                    has_foreground
+                        .then_some(snapshot.foreground_thread == snapshot.main_thread)
+                        .into(),
+                ),
+                (
+                    "same_process",
+                    has_foreground
+                        .then_some(snapshot.foreground_process == snapshot.current_process)
+                        .into(),
+                ),
+            ],
+        );
+    }
+    result
+}
+
+fn complete_invocation(
+    main_hwnd: isize,
+    invocation: ShellPasteResult,
+    focus: &mut dyn FocusApi,
+) -> ShellPasteCompletion {
+    let focus_return = if matches!(invocation, Err(ShellPasteError::Start(_))) {
+        FocusReturn::NotInvoked
+    } else {
+        return_focus(main_hwnd, focus)
+    };
+    ShellPasteCompletion {
+        invocation,
+        focus_return,
+    }
+}
+
 pub(crate) struct ShellPasteService {
     state: ServiceState,
     #[cfg(test)]
-    test_invoker: Option<TestInvoker>,
+    test_invoker: Option<(TestInvoker, Box<dyn FocusApi + Send>)>,
 }
 
 enum ServiceState {
@@ -40,12 +167,12 @@ struct PasteRequest {
 
 /// Wake even on worker unwind/disconnection, after closing the result sender.
 struct Completion {
-    sender: Option<mpsc::Sender<ShellPasteResult>>,
+    sender: Option<mpsc::Sender<ShellPasteCompletion>>,
     ctx: egui::Context,
 }
 
 impl Completion {
-    fn finish(mut self, result: ShellPasteResult) {
+    fn finish(mut self, result: ShellPasteCompletion) {
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(result);
         }
@@ -75,7 +202,7 @@ impl ShellPasteService {
         hwnd: isize,
         folder: PathBuf,
         ctx: egui::Context,
-    ) -> Result<mpsc::Receiver<ShellPasteResult>, String> {
+    ) -> Result<mpsc::Receiver<ShellPasteCompletion>, String> {
         if matches!(self.state, ServiceState::NotStarted) {
             self.state = match self.start_worker() {
                 Ok(endpoint) => ServiceState::Running(endpoint),
@@ -105,14 +232,15 @@ impl ShellPasteService {
 
     fn start_worker(&mut self) -> Result<Endpoint, String> {
         #[cfg(test)]
-        if let Some(mut invoke) = self.test_invoker.take() {
+        if let Some((mut invoke, mut focus)) = self.test_invoker.take() {
             let (sender, receiver) = mpsc::channel::<PasteRequest>();
             std::thread::Builder::new()
                 .name("shell-paste-test".into())
                 .spawn(move || {
                     while let Ok(request) = receiver.recv() {
                         let result = invoke(request.hwnd, &request.folder);
-                        request.completion.finish(result);
+                        let completion = complete_invocation(request.hwnd, result, focus.as_mut());
+                        request.completion.finish(completion);
                     }
                 })
                 .map_err(|error| format!("Could not start Shell paste worker: {error}"))?;
@@ -129,9 +257,17 @@ impl ShellPasteService {
     pub(crate) fn with_test_invoker(
         invoker: impl FnMut(isize, &std::path::Path) -> ShellPasteResult + Send + 'static,
     ) -> Self {
+        Self::with_test_invoker_and_focus(invoker, NoMainForTest)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_invoker_and_focus(
+        invoker: impl FnMut(isize, &std::path::Path) -> ShellPasteResult + Send + 'static,
+        focus: impl FocusApi + Send + 'static,
+    ) -> Self {
         Self {
             state: ServiceState::NotStarted,
-            test_invoker: Some(Box::new(invoker)),
+            test_invoker: Some((Box::new(invoker), Box::new(focus))),
         }
     }
 }
@@ -152,6 +288,31 @@ impl Drop for ShellPasteService {
 
 #[cfg(test)]
 type TestInvoker = Box<dyn FnMut(isize, &std::path::Path) -> ShellPasteResult + Send + 'static>;
+
+#[cfg(test)]
+struct NoMainForTest;
+
+#[cfg(test)]
+impl FocusApi for NoMainForTest {
+    fn snapshot(&mut self, _: isize) -> FocusSnapshot {
+        FocusSnapshot {
+            main_valid: false,
+            main_thread: 0,
+            current_process: 0,
+            foreground_hwnd: 0,
+            foreground_thread: 0,
+            foreground_process: 0,
+        }
+    }
+
+    fn set_foreground(&mut self, _: isize) -> bool {
+        panic!("a headless test must never activate a native window")
+    }
+
+    fn class_name(&self, _: isize) -> String {
+        "<headless>".into()
+    }
+}
 
 #[derive(Clone)]
 struct WakeEvent {
@@ -195,16 +356,59 @@ mod native {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::sync::Arc;
     use windows::Win32::{
-        Foundation::{HANDLE, WAIT_FAILED},
+        Foundation::{HANDLE, HWND, WAIT_FAILED},
         System::{
             Ole::{OleInitialize, OleUninitialize},
-            Threading::{CreateEventW, INFINITE},
+            Threading::{CreateEventW, GetCurrentProcessId, INFINITE},
         },
         UI::WindowsAndMessaging::{
-            DispatchMessageW, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
-            TranslateMessage, WM_QUIT,
+            DispatchMessageW, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
+            IsWindow, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+            SetForegroundWindow, TranslateMessage, WM_QUIT,
         },
     };
+
+    struct NativeFocus;
+
+    impl FocusApi for NativeFocus {
+        fn snapshot(&mut self, main_hwnd: isize) -> FocusSnapshot {
+            let main = HWND(main_hwnd as *mut _);
+            let main_valid = unsafe { IsWindow(Some(main)) }.as_bool();
+            let main_thread = if main_valid {
+                unsafe { GetWindowThreadProcessId(main, None) }
+            } else {
+                0
+            };
+            let foreground = unsafe { GetForegroundWindow() };
+            let mut foreground_process = 0;
+            let foreground_thread = if foreground.0.is_null() {
+                0
+            } else {
+                unsafe { GetWindowThreadProcessId(foreground, Some(&mut foreground_process)) }
+            };
+            FocusSnapshot {
+                main_valid,
+                main_thread,
+                current_process: unsafe { GetCurrentProcessId() },
+                foreground_hwnd: foreground.0 as isize,
+                foreground_thread,
+                foreground_process,
+            }
+        }
+
+        fn set_foreground(&mut self, main_hwnd: isize) -> bool {
+            unsafe { SetForegroundWindow(HWND(main_hwnd as *mut _)) }.as_bool()
+        }
+
+        fn class_name(&self, foreground_hwnd: isize) -> String {
+            if foreground_hwnd == 0 {
+                return "<none>".into();
+            }
+            let mut name = [0_u16; 256];
+            let len = unsafe { GetClassNameW(HWND(foreground_hwnd as *mut _), &mut name) };
+            String::from_utf16_lossy(&name[..len.max(0) as usize])
+        }
+    }
 
     struct OleSta;
 
@@ -238,9 +442,10 @@ mod native {
                 let message = format!("Shell paste OLE initialization failed: {error}");
                 // Never retry initialization, and never call Shell without OLE.
                 while let Ok(request) = receiver.recv() {
-                    request
-                        .completion
-                        .finish(Err(ShellPasteError::Start(message.clone())));
+                    request.completion.finish(ShellPasteCompletion {
+                        invocation: Err(ShellPasteError::Start(message.clone())),
+                        focus_return: FocusReturn::NotInvoked,
+                    });
                 }
                 return;
             }
@@ -267,7 +472,8 @@ mod native {
                         crate::native_context_menu::ShellClipboardVerb::Paste,
                     )
                     .map_err(ShellPasteError::Invocation);
-                    request.completion.finish(result);
+                    let completion = complete_invocation(request.hwnd, result, &mut NativeFocus);
+                    request.completion.finish(completion);
                     continue;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => return,
@@ -311,7 +517,13 @@ mod tests {
             let result = service
                 .submit(42, folder.into(), egui::Context::default())
                 .unwrap();
-            assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+            assert_eq!(
+                result.recv_timeout(Duration::from_secs(5)).unwrap(),
+                ShellPasteCompletion {
+                    invocation: Ok(()),
+                    focus_return: FocusReturn::MainGone,
+                }
+            );
         }
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
@@ -340,7 +552,123 @@ mod tests {
         release.send(()).unwrap();
         assert_eq!(
             result.recv_timeout(Duration::from_secs(5)).unwrap(),
-            Err(ShellPasteError::Invocation("expected failure".into()))
+            ShellPasteCompletion {
+                invocation: Err(ShellPasteError::Invocation("expected failure".into())),
+                focus_return: FocusReturn::MainGone,
+            }
         );
+    }
+
+    struct FakeFocus {
+        main_valid: bool,
+        foreground: (isize, u32, u32),
+        restore_succeeds: bool,
+        snapshots: usize,
+        restored: Vec<isize>,
+    }
+
+    impl FocusApi for FakeFocus {
+        fn snapshot(&mut self, main_hwnd: isize) -> FocusSnapshot {
+            assert_eq!(main_hwnd, 42);
+            self.snapshots += 1;
+            FocusSnapshot {
+                main_valid: self.main_valid,
+                main_thread: 10,
+                current_process: 100,
+                foreground_hwnd: self.foreground.0,
+                foreground_thread: self.foreground.1,
+                foreground_process: self.foreground.2,
+            }
+        }
+
+        fn set_foreground(&mut self, main_hwnd: isize) -> bool {
+            self.restored.push(main_hwnd);
+            self.restore_succeeds
+        }
+
+        fn class_name(&self, _: isize) -> String {
+            "<fake>".into()
+        }
+    }
+
+    #[test]
+    fn shell_paste_focus_return_decision_table() {
+        use FocusDecision::{Keep, Restore};
+        use FocusReturn::*;
+        // HWND, thread, process. Main is HWND 42, thread 10, process 100.
+        let cases = [
+            (true, (42, 10, 100), true, Keep(AlreadyMain), AlreadyMain, 0),
+            (true, (0, 0, 0), true, Restore, Restored, 1),
+            (true, (43, 11, 100), true, Restore, Restored, 1),
+            (
+                true,
+                (43, 10, 100),
+                true,
+                Keep(OtherMivWindow),
+                OtherMivWindow,
+                0,
+            ),
+            (
+                true,
+                (43, 11, 101),
+                true,
+                Keep(OtherProcess),
+                OtherProcess,
+                0,
+            ),
+            // Main validity takes precedence even when it is the foreground HWND.
+            (false, (42, 10, 100), true, Keep(MainGone), MainGone, 0),
+            (true, (43, 11, 100), false, Restore, RestoreFailed, 1),
+        ];
+        for (main_valid, foreground, restore_succeeds, decision, expected, attempts) in cases {
+            let mut api = FakeFocus {
+                main_valid,
+                foreground,
+                restore_succeeds,
+                snapshots: 0,
+                restored: Vec::new(),
+            };
+            let snapshot = api.snapshot(42);
+            assert_eq!(decide_focus_return(42, &snapshot), decision);
+            api.snapshots = 0;
+            assert_eq!(return_focus(42, &mut api), expected);
+            assert_eq!(api.snapshots, 1);
+            assert_eq!(api.restored, vec![42; attempts]);
+        }
+    }
+
+    #[test]
+    fn shell_paste_not_invoked_skips_focus_queries_and_restore() {
+        let mut api = FakeFocus {
+            main_valid: true,
+            foreground: (43, 11, 100),
+            restore_succeeds: true,
+            snapshots: 0,
+            restored: Vec::new(),
+        };
+        let completion = complete_invocation(
+            42,
+            Err(ShellPasteError::Start("OLE failed".into())),
+            &mut api,
+        );
+        assert_eq!(completion.focus_return, FocusReturn::NotInvoked);
+        assert_eq!(completion.focus_return.perf_tag(), "not_invoked");
+        assert_eq!(api.snapshots, 0);
+        assert!(api.restored.is_empty());
+    }
+
+    #[test]
+    fn shell_paste_focus_return_perf_tags() {
+        for (result, tag) in [
+            (FocusReturn::AlreadyMain, "already_main"),
+            (FocusReturn::Restored, "restored"),
+            (FocusReturn::OtherMivWindow, "other_miv_window"),
+            (FocusReturn::OtherProcess, "other_process"),
+            (FocusReturn::MainGone, "main_gone"),
+            (FocusReturn::RestoreFailed, "restore_failed"),
+            (FocusReturn::NotInvoked, "not_invoked"),
+        ] {
+            assert_eq!(result.perf_tag(), tag);
+        }
     }
 }

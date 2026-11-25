@@ -4,7 +4,9 @@ use super::*;
 use crate::app::{AppTestEnvForTest, NormalFolderOmittedEntries, setup_app_for_test};
 use crate::post_operation_selection::ExpectedOutputs;
 use crate::shell_file_ops::{ShellTransferOperation, ShellTransferRequest};
-use crate::shell_paste::{ShellPasteError, ShellPasteService};
+use crate::shell_paste::{
+    FocusApi, FocusSnapshot, ShellPasteError, ShellPasteResult, ShellPasteService,
+};
 use crate::ui_dialogs::file_organize::{
     FileOrganizeRequest, FileOrganizeRunning, FileOrganizeSelection,
 };
@@ -67,6 +69,166 @@ fn finish_paste(app: &mut App, ctx: &egui::Context, worker: &PasteWorker, succee
             "fake paste completion was not consumed"
         );
         std::thread::yield_now();
+    }
+}
+
+type FocusTrace =
+    std::sync::Arc<std::sync::Mutex<Vec<(&'static str, isize, std::thread::ThreadId)>>>;
+
+struct HandlerFocus {
+    foreign_process: bool,
+    trace: FocusTrace,
+}
+
+impl FocusApi for HandlerFocus {
+    fn snapshot(&mut self, main_hwnd: isize) -> FocusSnapshot {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(("snapshot", main_hwnd, std::thread::current().id()));
+        FocusSnapshot {
+            main_valid: true,
+            main_thread: 10,
+            current_process: 100,
+            foreground_hwnd: 2,
+            foreground_thread: 11,
+            foreground_process: if self.foreign_process { 101 } else { 100 },
+        }
+    }
+
+    fn set_foreground(&mut self, main_hwnd: isize) -> bool {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(("restore", main_hwnd, std::thread::current().id()));
+        true
+    }
+
+    fn class_name(&self, _: isize) -> String {
+        "<fake-shell-dialog>".into()
+    }
+}
+
+fn assert_handler_focus_completion(foreign_process: bool, invocation: ShellPasteResult) {
+    for origin in [
+        ShellPasteOrigin::Tree,
+        ShellPasteOrigin::CtrlV,
+        ShellPasteOrigin::GridMenu,
+    ] {
+        let mut app = ready();
+        let ctx = egui::Context::default();
+        let trace = FocusTrace::default();
+        let invoked_trace = trace.clone();
+        let result = invocation.clone();
+        app.shell_paste_service = ShellPasteService::with_test_invoker_and_focus(
+            move |hwnd, _| {
+                invoked_trace
+                    .lock()
+                    .unwrap()
+                    .push(("invoke", hwnd, std::thread::current().id()));
+                result.clone()
+            },
+            HandlerFocus {
+                foreign_process,
+                trace: trace.clone(),
+            },
+        );
+        SHELL_PASTE_END_FIELDS.with_borrow_mut(Vec::clear);
+        enter(&mut app, &ctx, origin);
+        let deadline = Instant::now() + WAIT;
+        while app.shell_paste_request.is_some() {
+            app.poll_shell_paste(&ctx);
+            assert!(
+                Instant::now() < deadline,
+                "fake focus completion was not consumed"
+            );
+            std::thread::yield_now();
+        }
+        let start_failed = matches!(invocation, Err(ShellPasteError::Start(_)));
+        let expected_calls: &[&str] = if start_failed {
+            &["invoke"] // fake invoker simulates failing before Shell was called
+        } else if foreign_process {
+            &["invoke", "snapshot"]
+        } else {
+            &["invoke", "snapshot", "restore"]
+        };
+        let calls = trace.lock().unwrap().clone();
+        assert_eq!(
+            calls.iter().map(|call| call.0).collect::<Vec<_>>(),
+            expected_calls
+        );
+        assert!(
+            calls.iter().all(|call| call.1 == 1),
+            "only main's HWND is used"
+        );
+        assert!(calls.iter().all(|call| call.2 == calls[0].2));
+        assert_ne!(calls[0].2, std::thread::current().id());
+        SHELL_PASTE_END_FIELDS.with_borrow(|events| {
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["origin"], origin.perf_tag());
+            assert_eq!(
+                events[0]["outcome"],
+                if start_failed {
+                    "start_failed"
+                } else if invocation.is_ok() {
+                    "invoked"
+                } else {
+                    "failed"
+                }
+            );
+            assert_eq!(
+                events[0]["focus_return"],
+                if start_failed {
+                    "not_invoked"
+                } else if foreign_process {
+                    "other_process"
+                } else {
+                    "restored"
+                }
+            );
+        });
+        assert_eq!(app.post_operation_selection.is_some(), invocation.is_ok());
+        app.poll_shell_paste(&ctx);
+        assert_eq!(trace.lock().unwrap().len(), expected_calls.len());
+        SHELL_PASTE_END_FIELDS.with_borrow(|events| assert_eq!(events.len(), 1));
+    }
+}
+
+#[test]
+fn shell_paste_handler_restores_main_once_after_invocation_and_records_end() {
+    assert_handler_focus_completion(false, Ok(()));
+}
+
+#[test]
+fn shell_paste_handler_preserves_foreign_foreground_and_records_end() {
+    assert_handler_focus_completion(true, Ok(()));
+}
+
+#[test]
+fn shell_paste_handler_failed_invocation_still_returns_focus_and_records_end() {
+    assert_handler_focus_completion(
+        false,
+        Err(ShellPasteError::Invocation("fake failure".into())),
+    );
+}
+
+#[test]
+fn shell_paste_handler_start_failure_records_not_invoked_without_focus_query() {
+    assert_handler_focus_completion(
+        false,
+        Err(ShellPasteError::Start("fake OLE failure".into())),
+    );
+}
+
+#[test]
+fn shell_paste_outcome_perf_tags_describe_invocation() {
+    for (outcome, expected) in [
+        (ShellPasteOutcome::Invoked, "invoked"),
+        (ShellPasteOutcome::Failed, "failed"),
+        (ShellPasteOutcome::StartFailed, "start_failed"),
+        (ShellPasteOutcome::Disconnected, "disconnected"),
+    ] {
+        assert_eq!(outcome.perf_tag(), expected);
     }
 }
 
@@ -687,6 +849,7 @@ fn shell_paste_disconnected_completion_warns_and_retires_its_selection() {
     let (_tx, disconnected) = mpsc::channel();
     drop(_tx);
     app.shell_paste_request.as_mut().unwrap().rx = disconnected;
+    SHELL_PASTE_END_FIELDS.with_borrow_mut(Vec::clear);
     super::take_modifier_resync_calls_for_test();
     app.poll_shell_paste(&ctx);
     assert!(app.shell_paste_request.is_none());
@@ -696,6 +859,11 @@ fn shell_paste_disconnected_completion_warns_and_retires_its_selection() {
         "貼り付けを完了できませんでした"
     );
     assert_eq!(super::take_modifier_resync_calls_for_test(), 1);
+    SHELL_PASTE_END_FIELDS.with_borrow(|events| {
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["outcome"], "disconnected");
+        assert_eq!(events[0]["focus_return"], "not_invoked");
+    });
     // Release the detached fake worker; it still never reaches the real Shell.
     worker.finish.send(Ok(())).unwrap();
 }

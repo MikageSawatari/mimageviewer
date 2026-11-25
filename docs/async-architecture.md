@@ -36,9 +36,21 @@ App は `ShellPasteService` 一つと実行中要求一つを持つ。3 入口�
 ファイルの切り取り・コピーは共通入口の先頭で、書き込みの予約と `begin_local_write` より前に断る。
 完了受信は root の `poll_file_organize` の隣、early return 前で行い、修飾キーを OS に合わせる。
 完了は動詞の呼び出しの完了であり、転送の完了は Shell が管理する。
+呼び出しが成功・失敗で戻った直後、完了を送る前に、同じ worker が main への前面の返却を一度だけ判定する。
+main が無効なら操作せず、前面が NULL または同じ process の main と別 thread の窓なら
+`SetForegroundWindow(main)` を一度呼ぶ。既に main、同じ UI thread の別窓、別 process の前面は保つ。
+thread の比較元は main HWND の `GetWindowThreadProcessId`、process は `GetCurrentProcessId`。
+復帰失敗はログで終え、待ち・再試行・入力の偽装はしない。`ShellPasteCompletion` は呼び出しの `Result` と
+typed `FocusReturn` を併せて返す。開始・OLE 初期化の失敗など呼び出していない経路は `not_invoked`。
 `PostOperationSelection` の番号は `request_post_operation_selection` 一か所で発行し、失敗時は一致する要求だけを取り下げる。
 take / 戻しでは番号を保ち、後から作られた新規フォルダ・別の操作の選択要求を取り下げない。
-`shell_paste/submit` の `origin`、`shell_paste/end` の `origin`・`ms`・`outcome` は perf 有効時だけ記録する。
+`shell_paste/submit` の `origin`、`shell_paste/end` の `origin`・`ms`・`outcome`・`focus_return` は perf 有効時だけ記録する。
+`outcome` は typed enum の `invoked|failed|start_failed|disconnected`。
+`invoked` は `InvokeCommand` が成功で戻った意味だけで、転送の成否・利用者の中止を含まない。
+Shell の paste 動詞からは中止を取得できず、`IFileOperation` への置換は行わない。
+worker の `shell_paste/focus_return` は、判定時の前面のクラス名 (`foreground_class`) と
+main と同じ thread か (`same_thread`)・同じ process か (`same_process`)、`focus_return` を一行に記録する。
+前面 NULL の比較値は null。前面の返却の追加分はコンパイル・テスト・レビュー・実機確認とも未実施。
 通常の呼び出し失敗はログ、開始失敗と受信口切断はログと通知で終端し、再試行しない。
 詳細は [設計書 §2・実装の記録](ui-sync-853-plan.md)。コンパイル・Rust テスト・実 Shell 検証は未実施。
 

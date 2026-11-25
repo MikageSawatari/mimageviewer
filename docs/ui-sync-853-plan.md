@@ -913,3 +913,71 @@ target 指定 Down を通す形へ更新した。設計担当が追加した `ui
   ui-smoke スクリプト (`scripts/ui-smoke.ps1` 等) の実走は未実施 (構文解析のみ)。
 - 独立レビュー (Sol / xhigh) の 2 回目は ACCEPT、P1〜P3 の指摘なし。
 - 実機確認は未実施。
+
+### 5.13 置換の画面を閉じた後の → と、中止の outcome
+
+観測者はサブ PC 担当の Claude。master 38e8e43c5 の build-dev と perf ログによる報告:
+一覧の Ctrl+V → Shell の「ファイルの置換またはスキップ」→「スキップ」の後、0.3 秒後の → が
+2 回とも効かず、約 2 秒後の → は効いた。`native_menu/verb_invoke` (paste) は 167.573 に戻り、
+167.576 の `input/modifier_probe` は `focused:false, permit:false`。
+167.612〜168.503 は 890 ms フレームが無く (2 回目も 896 ms)、その間の → の key event は記録されず、
+次の → (173.7) は `focused:true` で届いて選択が動いた。
+同じ担当から、60 GB の貼り付けを進捗画面の × で中止しても `shell_paste/end` が `outcome:"ok"` だったと報告された。
+
+原因と境界: source inspection では Shell UI は main HWND を持ち主にするが、呼び出しは別の常駐 STA 上で行い、
+戻り時に main へ activation を返す処理が無かった。モーダル UI が閉じると持ち主へ前面を返す契約を、
+thread が分かれた呼び出しの終了 edge で明示する (R3-3)。この変更による実機での改善は未確認。
+`"ok"` は `InvokeCommand` の成功を転送成功と読み違えられる名前だった (R3-2)。Shell は利用者の中止でも
+成功を返し、paste 動詞から mIV が転送の成否・中止を取得する手段は無い。§2.2 の invocation 完了の契約を維持する。
+`IFileOperation` への置換は、Shell の対応形式や切り取りの完了通知の退行を避けるため行わない。
+
+変更:
+
+- `src/shell_paste.rs`: native 呼び出しが成功・失敗で戻った直後、同じ worker で前面を一度判定し、
+  `ShellPasteCompletion { invocation, focus_return }` を送る。純粋な判定関数と `FocusApi` の問い合わせ・設定を分離し、
+  test invoker の worker も偽物で同じ判定を通す。開始・OLE 初期化の失敗は `not_invoked`。
+- 判定は下表。thread は main HWND の thread と比較し、process は現在 process と比較する。
+  `SetForegroundWindow(main)` 以外の回避策、待ち、再試行、追加 repaint は使わない。
+- perf 有効時の worker の `shell_paste/focus_return` は `focus_return`・`foreground_class`・
+  `same_thread`・`same_process` を一行に出す (前面 NULL の比較は null)。クラス名は前面を戻す前に取得する。
+- `src/app/main_drop.rs`: `ShellPasteOutcome` の match で選択要求の取り下げを決め、通知は従来どおり。
+  end の値は `invoked|failed|start_failed|disconnected` とし、`focus_return` を併記する。
+  `invoked` は呼び出し成功であって転送の成否・中止を含まない。受信口切断の前面結果は取得不能のため `not_invoked`。
+- `src/shell_paste_native_tests.rs`: ignored 2 件は完了型の `.invocation` を参照する変更だけで、
+  前面操作や実機シナリオを追加しない。
+
+| 条件 (main の無効を最優先) | 操作 | `focus_return` |
+| --- | --- | --- |
+| main HWND が無効 | 無し | `main_gone` |
+| 前面が main | 無し | `already_main` |
+| 前面 NULL | main へ一度復帰 | `restored` (失敗は下段) |
+| 同じ process、main と別 thread | main へ一度復帰 | `restored` (失敗は下段) |
+| 同じ process、main と同じ thread の別窓 | 無し | `other_miv_window` |
+| 別 process | 無し | `other_process` |
+| 復帰の `SetForegroundWindow` が失敗 | ログのみ | `restore_failed` |
+| Shell を呼んでいない | 無し | `not_invoked` |
+
+簡素化: 前面を返す責務を呼び出し終了の一か所に置くため、タイマー・入力の保留・再試行・新しいモーダル状態は不要。
+3 入口の受付・選択・通知と、detached の述語や viewport 経路は変えない。
+
+追加テスト (コードを追加した記録であり、結果ではない):
+
+```text
+shell_paste_focus_return_decision_table
+shell_paste_not_invoked_skips_focus_queries_and_restore
+shell_paste_focus_return_perf_tags
+shell_paste_handler_restores_main_once_after_invocation_and_records_end
+shell_paste_handler_preserves_foreign_foreground_and_records_end
+shell_paste_handler_failed_invocation_still_returns_focus_and_records_end
+shell_paste_handler_start_failure_records_not_invoked_without_focus_query
+shell_paste_outcome_perf_tags_describe_invocation
+```
+
+表のテストは復帰成功・失敗を偽 API で通し、試行回数も検査する。handler-level は 3 入口それぞれで
+invoke → snapshot → restore の順序・同じ worker thread・main HWND への一度だけの復帰を検査し、
+同じ end の実データに `focus_return=restored`・`outcome=invoked` が載ることを検査する。
+別 process、呼び出し失敗、開始失敗も分けて検査する。既存の受信口切断テストは
+`outcome=disconnected`・`focus_return=not_invoked` の期待を追加した。
+
+未実施: コンパイル・Rust テスト・旧コードへ戻して落ちる破壊検証・独立レビュー・実 Shell / 製品での実機確認。
+cargo・製品起動・コミットは依頼に従って実行していない。テスト結果・レビュー・実機確認は設計担当が追記する。
