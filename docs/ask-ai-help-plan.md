@@ -239,7 +239,7 @@ mIV 自身は通信しないが、利用者が開いた AI の提供元へ文が
   - `ai-integration.html`: 使い方を聞く入口として 1 段落 (登録すると「Claude で調べる」等が出る)。
   - `tut-ai-integration.html` は aidoc-tut ブランチで作り直し中なので、**このブランチでは触らない**。
     「ヘルプの『AI で調べる』から使い方を聞ける」を足すかは aidoc-tut の担当へ統括から伝えてもらう (§11 U4)。
-- 設計文書: `docs/architecture-overview.md` の外部リンク・AI 連携の行、`docs/ui-responsiveness.md` 冒頭の §1.861 の節に
+- 設計文書: `docs/spec.md` のメニューの表 (ヘルプの行の下に説明。実装レビュー r1 P3)、`docs/architecture-overview.md` の外部リンク・AI 連携の行、`docs/ui-responsiveness.md` 冒頭の §1.861 の節に
   AI アプリの URL も同じ worker に乗ることと、登録の検出がメニューの描画から worker で走ることを 1〜2 文。
   `docs/README.md` にこの文書の行。
 - CHANGELOG は統括の取り込み時の方針に従う (このブランチでは書かず、下書きを統括へ渡す)。
@@ -319,3 +319,8 @@ B 案・App の検出の cache・検出と MockBackend の共通化・型付き 
 
 指摘なし。r2 の 3 点 (OS の世代の照合、結果ごとの通知、`scope_id`) は既存のコード (`context_menu.rs:2804`・`:3195`、
 `vendor/egui/src/ui.rs:256`) と整合するとされた。
+
+### 13.4 実装の独立レビュー 1 巡目 (2026-11-25、対象 `3e3007dc0..043045dbb`、別の gpt-6.1-sol / xhigh / read-only) — ACCEPT WITH CHANGES
+
+P1・P2 なし。UI スレッドの境界・URL とログ・画像コピーの既存の動作・検出の周期・固定の ID・通知の対応・テストの差し込みに
+欠陥は見つからなかったとされた。P3 1 件 (`docs/spec.md` のヘルプメニューの一覧に「AI で調べる」が無い) を受け入れて直した。
