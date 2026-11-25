@@ -291,8 +291,9 @@
     </div>
     <div class="info-box">
       AI アプリへの登録・登録解除は、その AI アプリの設定ファイルを書き換えます。
-      既存の設定ファイルを書き換える前に、同じ場所へファイル名の末尾が <code>.mimageviewer.bak</code> のバックアップを 1 つ保存し、次の書き換え時には上書きします。
-      mIV のアンインストールやポータブル版のフォルダ削除では、AI アプリ側の登録やバックアップは削除しません。不要なら先に「登録を外す」を使い、バックアップは手動で削除してください。
+      書き換える前に、同じ場所へ 2 つのバックアップを保存します。ファイル名の末尾が <code>.mimageviewer.bak</code> のものは直前の書き換えの前の内容で、次の書き換え時には上書きします。
+      末尾が <code>.mimageviewer.orig.bak</code> のものは mIV が最初に書き換える前の内容で、mIV は上書きも削除もしません。
+      mIV のアンインストールやポータブル版のフォルダ削除では、AI アプリ側の登録やバックアップは削除しません。不要なら先に「登録を外す」を使い、2 つのバックアップは手動で削除してください。
       AI アプリ側の会話履歴・ログ・保存した結果は、そのアプリと提供元の設定・方針に従って扱われます。
     </div>
     <div class="info-box">
@@ -587,10 +588,11 @@
     </div>
     <div class="info-box">
       Registering or unregistering an AI app changes that app's settings file.
-      Before changing an existing file, the App saves one backup alongside it with <code>.mimageviewer.bak</code>
-      appended to the filename. The next change overwrites that backup.
-      Uninstalling mIV or deleting its portable folder does not remove the registration or backup in the AI app's settings folder.
-      If you no longer need them, use the unregister button first and delete the backup manually.
+      Before each change, the App saves two backups alongside it. The file with <code>.mimageviewer.bak</code> appended holds the
+      content before the latest change, and the next change overwrites it. The file with <code>.mimageviewer.orig.bak</code> appended
+      holds the content before the App first changed the file, and the App never overwrites or deletes it.
+      Uninstalling mIV or deleting its portable folder does not remove the registration or backups in the AI app's settings folder.
+      If you no longer need them, use the unregister button first and delete both backups manually.
       Conversation history, logs, and saved results in the AI app are handled according to that app's
       and its provider's settings and policies.
     </div>
