@@ -48,7 +48,7 @@
       許可すれば、ライブラリの検索や整理も言葉で頼めます。アプリどうしをつなぐ規格「MCP」を使います。
     </p>
     <p>このページでは、登録してから最初の依頼をするまでを順に説明します。
-      ChatGPT では、デスクトップアプリの <strong>Codex の画面</strong>（または Codex CLI・IDE の拡張）から使います。通常のチャットからは使えません。</p>
+      ChatGPT では、デスクトップアプリの <strong>Codex の画面</strong>（または Codex CLI・IDE の拡張）から使います。ChatGPT の通常のチャットからは使えません。</p>
 
     <div class="box warn">
       <div class="box-body">
@@ -66,7 +66,7 @@
       登録・許可・記録の確認は、すべてこの窓で行います。</p>
 
     <figure class="tut-shot">
-      <div class="tut-shot-ph">画像 M1: 「設定」メニューを開き「AI 連携…」が見えているメイン画面</div>
+      <img src="images/tut-ai-integration-1.webp" alt="メイン画面でメニューの「設定」を開いたところ。項目の下のほうに「リモート接続…」「AI 連携…」が並んでいる">
       <figcaption>「設定」メニューの「AI 連携…」から開きます。</figcaption>
     </figure>
 
@@ -78,13 +78,13 @@
     <p>登録では AI アプリの設定ファイルを書き換えるので、先に AI アプリを終了します。</p>
     <ul>
       <li><strong>Claude Desktop</strong>: ウィンドウを閉じても、通知領域（タスクトレイ）に残っていることがあります。
-        トレイの Claude のアイコンを右クリックし、メニューから終了してください。</li>
-      <li><strong>ChatGPT (Codex)</strong>: ChatGPT のデスクトップアプリを終了します。Codex CLI や IDE の拡張も同じ設定ファイルを使うので、使っている場合はそれらも終了します。</li>
+        トレイの Claude のアイコンを右クリックし、メニューの<strong>「終了」</strong>を選んでください。</li>
+      <li><strong>ChatGPT (Codex)</strong>: ChatGPT のデスクトップアプリを、メニューの<strong>「ファイル」→「ChatGPTを終了」</strong>（Ctrl+Q）で終了します。Codex CLI や IDE の拡張も同じ設定ファイルを使うので、使っている場合はそれらも終了します。</li>
     </ul>
 
     <figure class="tut-shot">
-      <div class="tut-shot-ph">画像 C1: 通知領域の Claude のアイコンを右クリックしたメニュー</div>
-      <figcaption>Claude Desktop はトレイのアイコンから終了します。ウィンドウを閉じただけでは終了しないことがあります。</figcaption>
+      <img src="images/tut-ai-integration-2.webp" alt="通知領域の隠れているアイコンの一覧で Claude のアイコンを右クリックしたメニュー。「アプリを表示」と「終了」がある">
+      <figcaption>Claude Desktop はトレイのアイコンの「終了」で終了します。ウィンドウを閉じただけでは終了しないことがあります（画像では、メニューのプランの表示を伏せています）。</figcaption>
     </figure>
 
     <h2 id="registration">3. mIV から登録する</h2>
@@ -99,13 +99,13 @@
       これはファイルやライブラリの情報についての表示で、次の手順の使い方の説明は「無効」のままでも引けます。</p>
 
     <figure class="tut-shot">
-      <div class="tut-shot-ph">画像 M3: 「AI 連携」の窓の一番下。Claude Desktop と ChatGPT (Codex) の行に「未登録」「登録する」</div>
+      <img src="images/tut-ai-integration-3.webp" alt="「AI 連携」の窓を一番下までスクロールしたところ。「最近使った AI アプリ」「AI による変更」の下に、Claude Desktop と ChatGPT (Codex) の行があり、どちらも「未登録」で、「登録する」「登録を外す」「再確認」「手順を見る」が並ぶ。ChatGPT (Codex) の行には「設定を開く」もある">
       <figcaption>登録の行は窓の一番下にあります。状態の表示と「登録する」「登録を外す」「再確認」「手順を見る」が並びます。</figcaption>
     </figure>
 
     <figure class="tut-shot">
-      <div class="tut-shot-ph">画像 M4: 「AI アプリへの登録の確認」。追加する内容、終了の注意、設定ファイルの場所、「書き換える」「キャンセル」</div>
-      <figcaption>書き換える前に、変更の内容と設定ファイルの場所が表示されます。設定ファイルがすでにある場合は、書き換え前の内容を同じ場所にバックアップとして残します。</figcaption>
+      <img src="images/tut-ai-integration-4.webp" alt="「AI アプリへの登録の確認」の窓。mIV の登録項目を追加することと、ほかの設定の値は変えないこと、ChatGPT (Codex) を終了してから進める注意、設定ファイルの場所、「コピー」、書き換え前の内容を残すこと、「書き換える」「キャンセル」のボタン">
+      <figcaption>ChatGPT (Codex) の行で「登録する」を押したところ。書き換える前に、変更の内容と設定ファイルの場所が表示されます。設定ファイルがすでにある場合は、書き換え前の内容を同じ場所にバックアップとして残します（画像では、場所に含まれる利用者名を伏せています）。</figcaption>
     </figure>
 
     <p>状態が「登録先が違う」の場合は<strong>「登録し直す」</strong>を押します。「設定ファイルを読めない」「自動登録できません」の場合は、
@@ -114,7 +114,7 @@
       一度起動してから終了し、「再確認」を押します。それでも変わらない場合は「手順を見る」の手動の設定方法を使ってください。詳しくは<a href="ai-integration.html#registration">登録の詳しい説明</a>をご覧ください。</p>
 
     <h2 id="ask-help">4. AI アプリを起動して、使い方を聞く</h2>
-    <p>AI アプリを起動し、<strong>新しい会話</strong>を始めます。ChatGPT では Codex の画面に切り替えて、新しいセッションを始めます。
+    <p>AI アプリを起動し、<strong>新しい会話</strong>を始めます。ChatGPT のデスクトップアプリでは、左上の切り替えで<strong>「Codex」</strong>を選び、新しいチャットを始めます。
       最初は mIV の使い方を聞いてみましょう。<strong>使い方の説明は、許可の範囲が「無効」のままでも、mIV を起動していなくても引けます</strong>。
       利用者のファイルやライブラリの情報は使いません。</p>
     <p>たとえば次のように頼みます。</p>
@@ -132,8 +132,13 @@
     </figure>
 
     <figure class="tut-shot">
-      <div class="tut-shot-ph">画像 X3: ChatGPT デスクトップアプリの Codex の画面で、同じ質問をした答え</div>
-      <figcaption>ChatGPT (Codex) の例。通常のチャットではなく、Codex の画面で聞きます。</figcaption>
+      <img src="images/tut-ai-integration-5.webp" alt="ChatGPT のデスクトップアプリの左上の切り替えを開いたところ。「ChatGPT（作成、学習、探索）」と「Codex（ビルド、デバッグ、リリース）」があり、Codex が選ばれている">
+      <figcaption>ChatGPT のデスクトップアプリでは、左上の切り替えで「Codex」を選びます。</figcaption>
+    </figure>
+
+    <figure class="tut-shot">
+      <img src="images/tut-ai-integration-6.webp" alt="Codex の画面で、mImageViewer の MCP ツールでお気に入りの登録方法を調べるよう頼んだ会話。「Mimageviewerの連携を使用しました」と表示され、メニューの「お気に入り」から追加する手順が番号付きで答えられている">
+      <figcaption>ChatGPT (Codex) の例。mIV の機能を使ったときは「Mimageviewerの連携を使用しました」のように表示されます。</figcaption>
     </figure>
 
     <h2 id="library">5. 許可を選んで、ライブラリを見せる</h2>
@@ -145,7 +150,7 @@
     </ol>
 
     <figure class="tut-shot">
-      <div class="tut-shot-ph">画像 M2: 「AI 連携」の窓の上部。許可の範囲が「読み取りのみ」で、チェックはすべてオフ</div>
+      <img src="images/tut-ai-integration-7.webp" alt="「AI 連携」の窓の上部。「許可の範囲」が「読み取りのみ」で、「AI に渡す情報・任せる操作」のチェックはすべてオフ。下に「AI に見せる範囲」のまとめがある">
       <figcaption>まずは「読み取りのみ」で始めます。追加のチェックはオフのままで構いません。</figcaption>
     </figure>
 
@@ -157,26 +162,37 @@
       <figcaption>許可の範囲の中で、AI アプリが mIV からフォルダの内容を受け取って答えます。</figcaption>
     </figure>
 
+    <figure class="tut-shot">
+      <img src="images/tut-ai-integration-8.webp" alt="Codex の画面で、mImageViewer の MCP ツールで写真のフォルダの画像を一覧して枚数を教えるよう頼んだ会話。「List folder」と表示され、画像が 8 枚あることと 8 個のファイル名が答えられている">
+      <figcaption>ChatGPT (Codex) の例。許可の範囲の中で、mIV からフォルダの内容を受け取って答えます。</figcaption>
+    </figure>
+
     <p>AI アプリがファイルやライブラリについて mIV を呼び出すと、「AI 連携」の窓の<strong>「最近使った AI アプリ」</strong>に、AI アプリが名乗った名前・版と最後に使われた時刻が並びます。
       これは呼び出しの記録で、許可がなくて断った呼び出しも含みます。使い方の説明を引いただけでは並びません。mIV を終了すると消えます。</p>
 
     <figure class="tut-shot">
-      <div class="tut-shot-ph">画像 M5: 登録後の「AI 連携」の窓の下部。「登録済み」と「最近使った AI アプリ」の行</div>
-      <figcaption>登録の行が「登録済み」になり、「最近使った AI アプリ」に、mIV を呼び出した AI アプリが表示されます。</figcaption>
+      <img src="images/tut-ai-integration-9.webp" alt="登録後の「AI 連携」の窓の下部。「最近使った AI アプリ」の表に名前「codex-mcp-client」と版、最後に使われた時刻が 1 行あり、Claude Desktop と ChatGPT (Codex) の行は「登録済み」">
+      <figcaption>登録の行が「登録済み」になり、「最近使った AI アプリ」に、mIV を呼び出した AI アプリが表示されます。この例では ChatGPT (Codex) が「codex-mcp-client」と名乗っています。</figcaption>
     </figure>
 
     <h2 id="troubleshooting">6. うまくいかないとき</h2>
     <p>次の順に確かめてください。</p>
     <ol class="step-list">
-      <li><strong>ChatGPT の場合、Codex の画面で使っているか</strong>: 通常のチャットからは使えません。デスクトップアプリの Codex の画面（または Codex CLI・IDE の拡張）で、新しいセッションを始めます。</li>
+      <li><strong>ChatGPT の場合、Codex の画面で使っているか</strong>: ChatGPT の通常のチャットからは使えません。デスクトップアプリの左上の切り替えで「Codex」を選び（または Codex CLI・IDE の拡張で）、新しいチャットを始めます。</li>
       <li><strong>登録の後に AI アプリを起動し直したか</strong>: 登録の前から起動していた AI アプリには、登録が伝わりません。Claude Desktop はトレイからも終了して、起動し直してください。</li>
-      <li><strong>登録の状態</strong>: 「AI 連携」の窓の一番下で「再確認」を押し、「登録済み」になっているか見ます。「登録先が違う」なら「登録し直す」を押します。</li>
+      <li><strong>登録の状態</strong>: 「AI 連携」の窓の一番下で「再確認」を押し、「登録済み」になっているか見ます。「登録先が違う」なら「登録し直す」を押します。
+        ChatGPT (Codex) では、AI アプリの側でも確かめられます。mIV の ChatGPT (Codex) の行の「設定を開く」を押すと ChatGPT の設定が開くので、左上の検索欄に「MCP」と入れて「MCP サーバー」を選びます。「サーバー」の下に mimageviewer が並び、スイッチがオンになっていれば登録されています。</li>
       <li><strong>許可の範囲と mIV の起動</strong>: 使い方の説明は「無効」でも引けますが、ファイルやライブラリの情報には「読み取りのみ」以上と、mIV の起動が必要です。
         AI アプリが「許可がない」と答えた場合は、伝えられた許可を「AI 連携」で選びます。</li>
       <li><strong>AI アプリが mIV の機能を使わない</strong>: AI アプリが画面操作など別の方法を選んでいることがあります。
         頼む文に「<strong>mImageViewer の MCP ツールを使って</strong>」と書き添えてください。</li>
       <li><strong>mIV を更新した後</strong>: それまで使えていた機能はそのまま使えます。更新で新しく増えた機能を使うには、AI アプリを再起動するか、MCP に再接続してください。</li>
     </ol>
+    <figure class="tut-shot">
+      <img src="images/tut-ai-integration-10.webp" alt="ChatGPT の設定で「MCP」を検索し、「MCP サーバー」を開いたところ。「プラグイン」の画面の「MCP」の「サーバー」の下に mimageviewer があり、スイッチがオンになっている">
+      <figcaption>ChatGPT (Codex) の設定の「MCP サーバー」。mimageviewer のスイッチがオンなら登録されています（画像では、mIV 以外の項目を写していません）。</figcaption>
+    </figure>
+
     <p>ほかの場合は<a href="ai-integration.html#troubleshooting">使えないときは</a>をご覧ください。</p>
 
     <h2 id="next">7. 次の一歩: 開く・整理を頼む</h2>
