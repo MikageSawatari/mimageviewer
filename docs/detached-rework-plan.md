@@ -1458,9 +1458,9 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
-### 2026-11-25: 取り込み系の場所の未作成保存先の通知 (§1.862、実装・検証待ち)
+### 2026-11-25: 取り込み系の場所の未作成保存先の通知 (§1.862、ブランチ prefs-890)
 
-- [設計 C](prefs-890-857-862-plan.md#c-1862-取り込み系の場所で保存先がまだ無いときの表示) に従い、走査 purpose に `CaptureDestinationNavigation` を追加した。`poll_detached_physical_folder_open` の exhaustive match では既存 `PaneNavigation` と同じ arm に含めただけで、成功時の処理を維持する。detached の述語・viewport・窓の寿命は変えない。要求が文言の意図を所有する変更で、症状パッチではないという実装担当の判断。独立実装レビュー・コンパイル・Rust テストは未実施。
+- [設計 C](prefs-890-857-862-plan.md#c-1862-取り込み系の場所で保存先がまだ無いときの表示) に従い、走査 purpose に `CaptureDestinationNavigation` を追加した。`poll_detached_physical_folder_open` の exhaustive match では既存 `PaneNavigation` と同じ arm に含めただけで、成功時の処理を維持する。detached の述語・viewport・窓の寿命は変えない。要求が文言の意図を所有する変更で、症状パッチではない。設計担当 (ClaudeCode) と独立実装レビュー (Codex gpt-6.1-sol / xhigh、r1 で明示的に同意、r2 ACCEPT) の双方がこの判断に合意した。関連テストは設計担当が実行して成功。
 
 ### 2026-11-25: 起動 resolver の main 走査の段階（§1.853、実装・検証待ち）
 
