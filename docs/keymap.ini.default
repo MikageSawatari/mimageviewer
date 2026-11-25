@@ -448,6 +448,7 @@
 # FsCopyPath = none ; パスをコピー
 # FsCopyFileName = none ; ファイル名をコピー
 # FsCopyImage = none ; 画像をクリップボードにコピー
+# FsCopyExif = none ; EXIF をテキストでコピー
 # FsCompareToggle = X ; 現在の画像を比較スロットに固定または解除する
 # FsCompareCycle = C ; 比較スロットのピン画像と現在画像を切り替えて表示する
 # FsCompareWipe = Shift+C ; ワイプ比較を切り替える

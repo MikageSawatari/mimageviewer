@@ -1803,6 +1803,7 @@ pub enum KeyAction {
     FsCopyPath,
     FsCopyFileName,
     FsCopyImage,
+    FsCopyExif,
     FsCompareToggle,
     FsCompareCycle,
     FsCompareWipe,
@@ -2449,6 +2450,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsCopyPath,
     KeyAction::FsCopyFileName,
     KeyAction::FsCopyImage,
+    KeyAction::FsCopyExif,
     KeyAction::FsCompareToggle,
     KeyAction::FsCompareCycle,
     KeyAction::FsCompareWipe,
@@ -4747,6 +4749,7 @@ impl KeyAction {
             FsCopyPath => "FsCopyPath",
             FsCopyFileName => "FsCopyFileName",
             FsCopyImage => "FsCopyImage",
+            FsCopyExif => "FsCopyExif",
             FsCompareToggle => "FsCompareToggle",
             FsCompareCycle => "FsCompareCycle",
             FsCompareWipe => "FsCompareWipe",
@@ -5558,6 +5561,7 @@ impl KeyAction {
             FsCopyPath => "パスをコピー",
             FsCopyFileName => "ファイル名をコピー",
             FsCopyImage => "画像をクリップボードにコピー",
+            FsCopyExif => "EXIF をテキストでコピー",
             FsCompareToggle => "現在の画像を比較スロットに固定または解除する",
             FsCompareCycle => "比較スロットのピン画像と現在画像を切り替えて表示する",
             FsCompareWipe => "ワイプ比較を切り替える",
@@ -6186,6 +6190,7 @@ impl KeyAction {
             | FsCopyPath
             | FsCopyFileName
             | FsCopyImage
+            | FsCopyExif
             | FsCompareToggle
             | FsCompareCycle
             | FsCompareWipe
@@ -6781,6 +6786,7 @@ impl KeyAction {
             | FsCopyPath
             | FsCopyFileName
             | FsCopyImage
+            | FsCopyExif
             | FsCompareToggle
             | FsCompareCycle
             | FsCompareWipe
@@ -7387,6 +7393,7 @@ impl KeyAction {
             FsCopyPath => ChordList::EMPTY,
             FsCopyFileName => ChordList::EMPTY,
             FsCopyImage => ChordList::EMPTY,
+            FsCopyExif => ChordList::EMPTY,
             FsCompareToggle => ChordList::one(Chord::key(X)),
             FsCompareCycle => ChordList::one(Chord::key(C)),
             FsCompareWipe => ChordList::one(Chord::shift(C)),
@@ -12530,6 +12537,30 @@ mod tests {
         assert_eq!(
             Keymap::from_settings(&settings).effective_chords(action),
             vec![rebound]
+        );
+    }
+
+    #[test]
+    fn exif_copy_is_an_unbound_rebindable_fullscreen_press_action() {
+        let action = KeyAction::FsCopyExif;
+        assert!(KeyAction::all().contains(&action));
+        assert_eq!(action.context(), KeyContext::FsImage);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(action.ini_name(), "FsCopyExif");
+        assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+        assert!(action.default_chords().iter().next().is_none());
+        let rebound = Chord::ctrl(KeyName::C);
+        let mut settings = KeymapSettings::default();
+        settings.set_override_chords(action, vec![rebound]);
+        assert_eq!(
+            Keymap::from_settings(&settings).effective_chords(action),
+            vec![rebound]
+        );
+        settings.disable_action(action);
+        assert!(
+            Keymap::from_settings(&settings)
+                .effective_chords(action)
+                .is_empty()
         );
     }
 

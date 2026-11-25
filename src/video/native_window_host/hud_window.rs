@@ -767,7 +767,12 @@ unsafe extern "system" fn hud_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let message_scope = crate::mouse_seek_debug::enter_native_wnd_proc(hwnd.0 as usize as u64, msg);
+    let message_scope = crate::mouse_seek_debug::enter_native_wnd_proc(
+        hwnd.0 as usize as u64,
+        msg,
+        wparam.0,
+        lparam.0,
+    );
     log_win32_message(TouchDebugWindow::Hud, hwnd, msg, wparam, lparam);
     if let Some(state) = window_state(hwnd) {
         let WindowState {

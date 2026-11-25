@@ -4677,6 +4677,9 @@ fn describe_issue(issue: &SyntheticInputIssue) -> String {
             "synthetic routing target is not focused: viewport={:?} hwnd=0x{:x}",
             target.viewport, target.hwnd
         ),
+        SyntheticInputIssue::KeyTargetMismatch { expected, actual } => format!(
+            "synthetic key target changed before delivery: expected={expected:?} actual={actual:?}"
+        ),
         SyntheticInputIssue::FocusLost { viewport } => {
             format!("synthetic key hold lost focus: viewport={viewport:?}")
         }

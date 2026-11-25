@@ -20,7 +20,7 @@
 | S2 | 静止画の列の押下・ドラッグ・release | egui pointer timeline、描画ownerの名前付き矩形、frame acknowledgment |
 | S3 | 動画canvasのzoomとstrip/panel/modalとの入力優先順位 | 実OSマウス入力、exact native target/矩形、実配送と処理の観測 |
 | AudioTracks | 再生中・一時停止中の音声切り替え、保存・F12・音声モード HUD | native Response の有効性と入力前の同一性、desired/applied と pump 周波数 |
-| ClipboardCapture | 実クリップボードの手動貼り付け、監視の除外、Excel 2 段書き込み、S1 PNG 保存 | 実 OS Ctrl+V、loopback HTTP、取り込み reader 開封・通知処理完了・小窓表示の診断、worker のファイル検査 |
+| ClipboardCapture | 実クリップボードの手動貼り付け、監視の除外、Excel 2 段書き込み、S1 PNG 保存 | 合成 Ctrl+V の ROOT frame edge、loopback HTTP、取り込み reader 開封・通知処理完了・小窓表示の診断、worker のファイル検査 |
 | GamepadBasic | 一覧の右移動、A/B の全画面開閉、X リングで親フォルダへ移動 | gilrs と同じキューへの PadEvent 差し込み、App drain の ack、OS 前面の観測、通常のパッド consumer と描画結果 |
 
 ### GamepadBasic (2026-11-11)
@@ -120,17 +120,17 @@ runner の了承 guard はビルド・ディレクトリ作成・アプリ起動
 停止・join する。本番の取得先規則に例外を加えない。UI thread は設定操作と診断の公開を担当し、
 クリップボード書き込み・HTTP・ファイル読取・待機を行わない。
 
-`clipboard_paste` は選択済みの exact root HWND／backend／foreground／process／入力 desktop と
-利用者の modifier・V の解放を検査し、既存 `button-helper` package の runner 所有
-`ClipboardKeyHelperHandle` へ、認証済み current-SID local pipe で Down を要求する。
-外部 helper だけが実 OS `SendInput` で Ctrl と V を押す。製品の
-`GetAsyncKeyState` の Ctrl+V consumer 受付カウンタが進むまで保持する。固定 down/up timeline や
-synthetic egui key event を配送の証拠にしない。成功後も release を UI pass が観測できるまで待ち、
-途中失敗・timeout・App 異常終了・pipe 切断では外部 helper が自身の Down 挿入分だけを解放する。
-cleanup の desktop 検査も維持する。runner は helper の cleanup／read・reply task の停止／join と
-キー解放の確認後にだけ exact App を終了できる。解放不明・未 join の場合は既存の
-`SafeToTerminateApp` interlock を閉じ、App の失敗を cleanup の成功で上書きしない。
-別 HWND の前面への強制移動は行わない。
+`clipboard_paste` は選択済みの exact root HWND／backend を新しい UI pass で検証し、
+synthetic target の登録と focus を要求する。既存の合成入力 timeline に同一時刻の Ctrl+V down/up を
+積み、ROOT の frame edge を通して製品の固定 Ctrl+V handler へ配送する。受付の証拠は従来どおり
+paste consumer の受付カウンタで、単なる enqueue 成功や egui key event の有無ではない。
+投入前に実際の合成配送先の HWND / viewport が選択 ROOT と一致することも要求し、不一致なら Down / Up を
+投入せずエラーにする。Down は `DownForTarget` でその配送先に拘束する。投入後に前面が変わった場合も
+materialize 時点の不一致をエラーとして queue から取り下げ、別 viewport へ配送したり後で再試行したりしない。
+待ち中も選択 owner／backend の有効性と 5 秒の期限を検査する。cancel は既存の timeline cleanup が扱う。
+実 OS のキーは押さず、`GetAsyncKeyState` の下位 bit、外部キー helper、押下保持中の ACK・解放待ちには
+依存しない。ClipboardCapture では runner もキー helper を起動しない。入力 desktop の事前検査は維持する。
+NativeTopPanoramaClick の外部マウス helper と cleanup / join interlock は従来どおり。
 
 シナリオは監視 OFF で HTML の選択ダイアログ・現在フォルダへの保存、PNG の現在フォルダへの保存、
 CF_HDROP の既存 Shell 貼り付けを確認する。選択保存には実ボタンの `click_widget` を使う。
@@ -156,11 +156,11 @@ Set 失敗時も開いた Clipboard を閉じることを検査する。最後�
 
 非対話の追加検証は `scripts/test-ui-smoke-approval.ps1`（未了承 guard）、
 `scripts/test-ui-smoke-clipboard-guard.ps1`（別 mIV の起動前拒否・失敗時の案内、プロセス列挙は fake）、
-`scripts/test-ui-smoke-button-runner.ps1`（helper 登録・終了順・環境復元）、
-`scripts/test-ui-smoke-button-helper.ps1 -ClipboardOnly`（fake key owner 7 件、OS 入力なし）、
+`scripts/test-ui-smoke-button-runner.ps1`（マウス helper の登録・終了順・環境復元、ClipboardCapture が外部キー helper を起動しないこと）、
 `python -B scripts/ui-smoke/test_clipboard_capture_fixture.py`（PNG 構成・同一内容・非空先拒否）を使う。
 Rust fixture test は本番の CF_HTML 解析・DIB decoding、分割 TCP request の loopback HTTP と server join、
-確定 PNG のみのファイル検査を確認する。
+確定 PNG のみのファイル検査と合成 Ctrl+V down/up の組を確認する。handler 側には解放後の ROOT edge と
+synthetic tap が CtrlV の Shell 要求になる回帰テストがある。
 
 既存 run directory の manifest／SHA256 証跡へ scenario、settings override、fixture generator、
 fixture API source、Shell コピー元、手動・監視の保存ファイル、各 checkpoint screenshot と app log を保存する。

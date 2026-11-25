@@ -1,8 +1,9 @@
-//! Opt-in, behavior-neutral provenance trace for native video Back/Forward input.
+//! Native pump-call ownership and opt-in provenance trace for video Back/Forward.
 //!
 //! This trace is intentionally narrow and bounded. It records only Browser
 //! Back/Forward, comparison Left/Right keys, and XButton1/XButton2. Enabling it
 //! must not change dispatch, repeat, generation, overlay, or App decisions.
+//! Pump/wndproc scopes always run; echo classification never consults trace flags.
 
 use std::cell::Cell;
 use std::marker::PhantomData;
@@ -85,30 +86,88 @@ pub(crate) struct NativeAppCommandDelivery {
     pub(crate) in_send_flags: u32,
     pub(crate) dispatching: bool,
     pub(crate) outer: Option<NativeWindowMessage>,
+    pub(crate) pump_frame: Option<NativePumpFrameKind>,
+    pub(crate) paired_receipt: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativePumpFrameKind {
+    Peek,
+    Translate,
+    Dispatch,
 }
 
 #[derive(Clone, Copy)]
-struct DispatchingMessage {
+struct NativePumpMessage {
     message: NativeWindowMessage,
+    wparam: usize,
+    lparam: isize,
+}
+
+#[derive(Clone, Copy)]
+struct NativePumpFrame {
+    kind: NativePumpFrameKind,
+    message: Option<NativePumpMessage>,
     entered: bool,
 }
 
 thread_local! {
-    static DISPATCHING_MESSAGE: Cell<Option<DispatchingMessage>> = const { Cell::new(None) };
+    static PUMP_FRAME: Cell<Option<NativePumpFrame>> = const { Cell::new(None) };
     static WNDPROC_MESSAGE: Cell<Option<NativeWindowMessage>> = const { Cell::new(None) };
 }
 
-/// Diagnostic scopes only: restore the previous frame even through a nested pump.
+/// Positive pump-call ownership, independent of tracing and its line limit.
+/// Restore the previous frame even through a nested pump.
 /// Thread-bound guards must not restore another thread's TLS.
 pub(crate) struct NativeMessageDispatchScope {
-    previous: Option<DispatchingMessage>,
+    previous: Option<NativePumpFrame>,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
-pub(crate) fn begin_native_message_dispatch(hwnd: u64, message: u32) -> NativeMessageDispatchScope {
-    NativeMessageDispatchScope {
-        previous: DISPATCHING_MESSAGE.replace(Some(DispatchingMessage {
+pub(crate) fn begin_native_message_peek() -> NativeMessageDispatchScope {
+    begin_native_pump_frame(NativePumpFrameKind::Peek, None)
+}
+
+pub(crate) fn begin_native_message_translate(
+    hwnd: u64,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> NativeMessageDispatchScope {
+    begin_native_pump_frame(
+        NativePumpFrameKind::Translate,
+        Some(NativePumpMessage {
             message: NativeWindowMessage { hwnd, message },
+            wparam,
+            lparam,
+        }),
+    )
+}
+
+pub(crate) fn begin_native_message_dispatch(
+    hwnd: u64,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> NativeMessageDispatchScope {
+    begin_native_pump_frame(
+        NativePumpFrameKind::Dispatch,
+        Some(NativePumpMessage {
+            message: NativeWindowMessage { hwnd, message },
+            wparam,
+            lparam,
+        }),
+    )
+}
+
+fn begin_native_pump_frame(
+    kind: NativePumpFrameKind,
+    message: Option<NativePumpMessage>,
+) -> NativeMessageDispatchScope {
+    NativeMessageDispatchScope {
+        previous: PUMP_FRAME.replace(Some(NativePumpFrame {
+            kind,
+            message,
             entered: false,
         })),
         _thread_bound: PhantomData,
@@ -117,23 +176,34 @@ pub(crate) fn begin_native_message_dispatch(hwnd: u64, message: u32) -> NativeMe
 
 impl Drop for NativeMessageDispatchScope {
     fn drop(&mut self) {
-        DISPATCHING_MESSAGE.set(self.previous);
+        PUMP_FRAME.set(self.previous);
     }
 }
 
 pub(crate) struct NativeWndProcScope {
     outer: Option<NativeWindowMessage>,
     dispatching: bool,
+    pump_frame: Option<NativePumpFrameKind>,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
-pub(crate) fn enter_native_wnd_proc(hwnd: u64, message: u32) -> NativeWndProcScope {
+pub(crate) fn enter_native_wnd_proc(
+    hwnd: u64,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> NativeWndProcScope {
     let current = NativeWindowMessage { hwnd, message };
-    let dispatching = DISPATCHING_MESSAGE.with(|slot| {
+    let dispatching = PUMP_FRAME.with(|slot| {
         let Some(mut dispatch) = slot.get() else {
             return false;
         };
-        if dispatch.message != current || dispatch.entered {
+        if dispatch.kind != NativePumpFrameKind::Dispatch
+            || dispatch.entered
+            || !dispatch.message.is_some_and(|msg| {
+                msg.message == current && msg.wparam == wparam && msg.lparam == lparam
+            })
+        {
             return false;
         }
         // A synchronous reentry with the same HWND/message is a separate receipt,
@@ -145,6 +215,7 @@ pub(crate) fn enter_native_wnd_proc(hwnd: u64, message: u32) -> NativeWndProcSco
     NativeWndProcScope {
         outer: WNDPROC_MESSAGE.replace(Some(current)),
         dispatching,
+        pump_frame: PUMP_FRAME.get().map(|frame| frame.kind),
         _thread_bound: PhantomData,
     }
 }
@@ -155,6 +226,8 @@ impl NativeWndProcScope {
             in_send_flags,
             dispatching: self.dispatching,
             outer: self.outer,
+            pump_frame: self.pump_frame,
+            paired_receipt: None,
         }
     }
 }
@@ -166,17 +239,34 @@ impl Drop for NativeWndProcScope {
 }
 
 fn app_command_delivery_label(delivery: NativeAppCommandDelivery) -> &'static str {
-    if delivery.dispatching {
+    if delivery.paired_receipt.is_some() {
+        "os_key_echo"
+    } else if delivery.dispatching {
         "queued"
     } else if delivery.in_send_flags & 0x000F != 0 {
         // ISMEX_SEND / NOTIFY / CALLBACK / REPLIED report a cross-thread send.
         "sent_cross_thread"
-    } else if delivery.in_send_flags == 0 && delivery.outer.is_some() {
+    } else if delivery.outer.is_some() {
         // Either a same-thread synchronous call or a queued message dispatched
         // by an untracked USER32 modal loop can arrive inside an outer wndproc.
-        "nested_untracked_during"
+        "nested"
     } else {
-        "unknown"
+        match delivery.pump_frame {
+            Some(NativePumpFrameKind::Peek) => "during_peek",
+            Some(NativePumpFrameKind::Translate) => "during_translate",
+            _ => "unknown",
+        }
+    }
+}
+
+impl NativeAppCommandDelivery {
+    pub(crate) fn can_pair_os_key_echo(self) -> bool {
+        self.in_send_flags & 0x000F == 0
+            && self.outer.is_none()
+            && matches!(
+                self.pump_frame,
+                Some(NativePumpFrameKind::Peek | NativePumpFrameKind::Translate)
+            )
     }
 }
 
@@ -394,6 +484,16 @@ fn format_origin(origin: NativeVideoInputOrigin) -> String {
             delivery,
         } => {
             let delivery_label = app_command_delivery_label(delivery);
+            let frame = match delivery.pump_frame {
+                Some(NativePumpFrameKind::Peek) => "peek",
+                Some(NativePumpFrameKind::Translate) => "translate",
+                Some(NativePumpFrameKind::Dispatch) => "dispatch",
+                None => "none",
+            };
+            let paired = delivery
+                .paired_receipt
+                .map(|id| format!(" paired_receipt={id}"))
+                .unwrap_or_default();
             let outer = match delivery.outer {
                 Some(outer) => format!(
                     "outer_hwnd=0x{:X} outer_message=0x{:04X}",
@@ -402,7 +502,7 @@ fn format_origin(origin: NativeVideoInputOrigin) -> String {
                 None => "outer_hwnd=none outer_message=none".to_owned(),
             };
             format!(
-                "origin=win32_appcommand window_source={window_source:?} receiver_hwnd=0x{receiver_hwnd:X} command_source_hwnd=0x{command_source_hwnd:X} raw_command_word=0x{raw_command_word:04X} command={command} device_flags=0x{device_flags:04X} key_state=0x{key_state:04X} in_send_flags=0x{:08X} dispatching={} {outer} delivery={delivery_label}",
+                "origin=win32_appcommand window_source={window_source:?} receiver_hwnd=0x{receiver_hwnd:X} command_source_hwnd=0x{command_source_hwnd:X} raw_command_word=0x{raw_command_word:04X} command={command} device_flags=0x{device_flags:04X} key_state=0x{key_state:04X} in_send_flags=0x{:08X} dispatching={} {outer} pump_frame={frame} delivery={delivery_label}{paired}",
                 delivery.in_send_flags, delivery.dispatching
             )
         }
@@ -427,6 +527,16 @@ fn format_origin(origin: NativeVideoInputOrigin) -> String {
         NativeVideoInputOrigin::Gamepad => "origin=gamepad".to_string(),
         #[cfg(test)]
         NativeVideoInputOrigin::Test => "origin=test".to_string(),
+    }
+}
+
+pub(crate) fn log_os_key_echo_suppressed(receipt: NativeVideoInputReceipt) {
+    if should_prepare_record() {
+        emit(format_args!(
+            "stage=producer_receipt input_receipt_id={} {} outcome=os_key_echo_suppressed",
+            receipt.input_receipt_id,
+            format_origin(receipt.origin),
+        ));
     }
 }
 
@@ -746,6 +856,8 @@ mod tests {
             in_send_flags: 0,
             dispatching: true,
             outer: None,
+            pump_frame: Some(NativePumpFrameKind::Dispatch),
+            paired_receipt: None,
         };
         let receipt = win32_app_command_receipt(
             NativeVideoWindowSource::Presenter,
@@ -782,20 +894,22 @@ mod tests {
         for (in_send_flags, dispatching, outer, expected) in [
             (0, true, None, "queued"),
             (0, true, outer, "queued"),
-            (0, false, outer, "nested_untracked_during"),
-            (0, false, modal_outer, "nested_untracked_during"),
+            (0, false, outer, "nested"),
+            (0, false, modal_outer, "nested"),
             (1, false, None, "sent_cross_thread"),
             (2, false, outer, "sent_cross_thread"),
             (4, false, None, "sent_cross_thread"),
             (8, false, None, "sent_cross_thread"),
             (9, false, outer, "sent_cross_thread"),
             (0, false, None, "unknown"),
-            (0x8000_0000, false, outer, "unknown"),
+            (0x8000_0000, false, outer, "nested"),
         ] {
             let delivery = NativeAppCommandDelivery {
                 in_send_flags,
                 dispatching,
                 outer,
+                pump_frame: None,
+                paired_receipt: None,
             };
             assert_eq!(
                 app_command_delivery_label(delivery),
@@ -823,12 +937,14 @@ mod tests {
                         hwnd: 0x1111,
                         message: 0x0101,
                     }),
+                    pump_frame: None,
+                    paired_receipt: None,
                 },
             );
             assert_eq!(
                 format_origin(receipt.origin),
                 format!(
-                    "origin=win32_appcommand window_source={source:?} receiver_hwnd=0x2222 command_source_hwnd=0x3333 raw_command_word=0x8001 command=1 device_flags=0x8000 key_state=0x0005 in_send_flags=0x00000000 dispatching=false outer_hwnd=0x1111 outer_message=0x0101 delivery=nested_untracked_during"
+                    "origin=win32_appcommand window_source={source:?} receiver_hwnd=0x2222 command_source_hwnd=0x3333 raw_command_word=0x8001 command=1 device_flags=0x8000 key_state=0x0005 in_send_flags=0x00000000 dispatching=false outer_hwnd=0x1111 outer_message=0x0101 pump_frame=none delivery=nested"
                 )
             );
             let receipt = win32_app_command_receipt(
@@ -840,10 +956,12 @@ mod tests {
                     in_send_flags: 0x8000_0001,
                     dispatching: false,
                     outer: None,
+                    pump_frame: None,
+                    paired_receipt: None,
                 },
             );
             assert!(format_origin(receipt.origin).ends_with(
-                "in_send_flags=0x80000001 dispatching=false outer_hwnd=none outer_message=none delivery=sent_cross_thread"
+                "in_send_flags=0x80000001 dispatching=false outer_hwnd=none outer_message=none pump_frame=none delivery=sent_cross_thread"
             ));
         }
     }
@@ -855,17 +973,19 @@ mod tests {
             message: 0x0101,
         };
         {
-            let _dispatch = begin_native_message_dispatch(outer.hwnd, outer.message);
-            let key_up = enter_native_wnd_proc(outer.hwnd, outer.message);
+            let _dispatch = begin_native_message_dispatch(outer.hwnd, outer.message, 0, 0);
+            let key_up = enter_native_wnd_proc(outer.hwnd, outer.message, 0, 0);
             assert!(key_up.dispatching);
             {
-                let nested = enter_native_wnd_proc(0x2222, 0x0319);
+                let nested = enter_native_wnd_proc(0x2222, 0x0319, 0, 0);
                 assert_eq!(
                     nested.app_command_delivery(0),
                     NativeAppCommandDelivery {
                         in_send_flags: 0,
                         dispatching: false,
                         outer: Some(outer),
+                        pump_frame: Some(NativePumpFrameKind::Dispatch),
+                        paired_receipt: None,
                     }
                 );
             }
@@ -873,11 +993,11 @@ mod tests {
             {
                 // A nested pump can dispatch another queued command while KEYUP
                 // remains on the stack. That command still owns its queue entry.
-                let _nested_dispatch = begin_native_message_dispatch(0x2222, 0x0319);
-                let queued = enter_native_wnd_proc(0x2222, 0x0319);
+                let _nested_dispatch = begin_native_message_dispatch(0x2222, 0x0319, 0, 0);
+                let queued = enter_native_wnd_proc(0x2222, 0x0319, 0, 0);
                 assert!(queued.dispatching);
                 assert_eq!(queued.outer, Some(outer));
-                let reentry = enter_native_wnd_proc(0x2222, 0x0319);
+                let reentry = enter_native_wnd_proc(0x2222, 0x0319, 0, 0);
                 assert!(!reentry.dispatching);
                 assert_eq!(
                     reentry.outer,
@@ -889,12 +1009,12 @@ mod tests {
             }
             assert_eq!(WNDPROC_MESSAGE.get(), Some(outer));
             // The outer DispatchMessage has already entered KEYUP once.
-            let reentry = enter_native_wnd_proc(outer.hwnd, outer.message);
+            let reentry = enter_native_wnd_proc(outer.hwnd, outer.message, 0, 0);
             assert!(!reentry.dispatching);
         }
         assert_eq!(WNDPROC_MESSAGE.get(), None);
-        assert!(DISPATCHING_MESSAGE.get().is_none());
-        let outside = enter_native_wnd_proc(0x2222, 0x0319);
+        assert!(PUMP_FRAME.get().is_none());
+        let outside = enter_native_wnd_proc(0x2222, 0x0319, 0, 0);
         assert_eq!(
             app_command_delivery_label(outside.app_command_delivery(0)),
             "unknown"
@@ -903,17 +1023,113 @@ mod tests {
 
     #[test]
     fn native_dispatch_identity_requires_both_hwnd_and_message() {
-        let _dispatch = begin_native_message_dispatch(0x1111, 0x0319);
+        let _dispatch = begin_native_message_dispatch(0x1111, 0x0319, 0, 0);
         {
-            let wrong_window = enter_native_wnd_proc(0x2222, 0x0319);
+            let wrong_window = enter_native_wnd_proc(0x2222, 0x0319, 0, 0);
             assert!(!wrong_window.dispatching);
         }
         {
-            let wrong_message = enter_native_wnd_proc(0x1111, 0x0101);
+            let wrong_message = enter_native_wnd_proc(0x1111, 0x0101, 0, 0);
             assert!(!wrong_message.dispatching);
         }
-        let matching = enter_native_wnd_proc(0x1111, 0x0319);
+        let matching = enter_native_wnd_proc(0x1111, 0x0319, 0, 0);
         assert!(matching.dispatching);
+    }
+
+    #[test]
+    fn browser_key_echo_frames_restore_and_ignore_debug_setting_and_cap() {
+        // Each setting gets a fresh OnceLock without mutating this process's
+        // environment or logger state alongside unrelated parallel tests.
+        const CHILD: &str = "MIV_BROWSER_KEY_ECHO_FRAME_TEST";
+        if let Ok(setting) = std::env::var(CHILD) {
+            assert_eq!(is_enabled(), setting != "off");
+            if setting == "capped" {
+                TRACE_CAP_REPORTED.store(true, Ordering::Release);
+            }
+            let observe = || {
+                let scope = enter_native_wnd_proc(0x1111, 0x0319, 0x1111, 1 << 16);
+                scope.app_command_delivery(0)
+            };
+            assert!(!observe().can_pair_os_key_echo());
+            {
+                let _peek = begin_native_message_peek();
+                assert_eq!(app_command_delivery_label(observe()), "during_peek");
+                assert!(observe().can_pair_os_key_echo());
+                {
+                    let _translate =
+                        begin_native_message_translate(0x1111, 0x0100, 0xA6, 0x016A0001);
+                    assert_eq!(app_command_delivery_label(observe()), "during_translate");
+                    assert!(observe().can_pair_os_key_echo());
+                    let message = PUMP_FRAME.get().unwrap().message.unwrap();
+                    assert_eq!(
+                        (
+                            message.message.hwnd,
+                            message.message.message,
+                            message.wparam,
+                            message.lparam
+                        ),
+                        (0x1111, 0x0100, 0xA6, 0x016A0001)
+                    );
+                }
+                {
+                    let _dispatch = begin_native_message_dispatch(0x1111, 0x0319, 0x1111, 1 << 16);
+                    {
+                        let wrong_params = enter_native_wnd_proc(0x1111, 0x0319, 0x2222, 1 << 16);
+                        assert!(!wrong_params.dispatching);
+                        assert!(!wrong_params.app_command_delivery(0).can_pair_os_key_echo());
+                    }
+                    let queued = observe();
+                    assert!(queued.dispatching);
+                    assert_eq!(app_command_delivery_label(queued), "queued");
+                    assert!(!queued.can_pair_os_key_echo());
+                    assert!(!observe().dispatching, "same message reentry is not queued");
+                }
+                assert_eq!(app_command_delivery_label(observe()), "during_peek");
+                assert!(observe().can_pair_os_key_echo());
+            }
+            assert!(PUMP_FRAME.get().is_none());
+            assert!(WNDPROC_MESSAGE.get().is_none());
+            assert!(!observe().can_pair_os_key_echo());
+            return;
+        }
+        for setting in ["off", "on", "capped"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "mouse_seek_debug::tests::browser_key_echo_frames_restore_and_ignore_debug_setting_and_cap", "--nocapture"])
+                .env(CHILD, setting)
+                .env(TRACE_ENV, if setting == "off" { "0" } else { "1" })
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{setting}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "child test must actually run"
+            );
+        }
+    }
+
+    #[test]
+    fn browser_key_echo_log_keeps_paired_receipt_and_frame() {
+        let receipt = win32_app_command_receipt(
+            NativeVideoWindowSource::Presenter,
+            0x1111,
+            0x1111,
+            1 << 16,
+            NativeAppCommandDelivery {
+                in_send_flags: 0,
+                dispatching: false,
+                outer: None,
+                pump_frame: Some(NativePumpFrameKind::Peek),
+                paired_receipt: Some(42),
+            },
+        );
+        assert!(
+            format_origin(receipt.origin)
+                .ends_with("pump_frame=peek delivery=os_key_echo paired_receipt=42")
+        );
     }
 
     #[test]

@@ -7534,6 +7534,23 @@ pub(crate) struct MetadataLoadPending {
 }
 
 impl MetadataLoadPending {
+    #[cfg(test)]
+    pub(crate) fn controlled_for_test(
+        key: String,
+    ) -> (Self, Arc<AtomicBool>, mpsc::Sender<MetadataLoadResult>) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        (
+            Self {
+                key,
+                cancel: Arc::clone(&cancel),
+                rx,
+            },
+            cancel,
+            tx,
+        )
+    }
+
     pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -7553,6 +7570,20 @@ pub(crate) struct MetadataLoadResult {
     /// 外部メタデータサイドカー (同名 JSON/TXT) の右パネル表示用内容 (FS 画像のみ)。
     /// docs/sidecar-metadata-ingest.md §11。
     sidecar: Option<crate::external_metadata::SidecarDisplay>,
+}
+
+#[cfg(test)]
+impl MetadataLoadResult {
+    pub(crate) fn exif_for_test(key: String, exif: Option<crate::exif_reader::ExifInfo>) -> Self {
+        Self {
+            key,
+            metadata: None,
+            exif,
+            xmp: None,
+            panorama: None,
+            sidecar: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17581,6 +17612,7 @@ pub struct App {
         std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
     /// EXIF キャッシュ: 正規化キー → パース結果 (None = EXIF なし)
     /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
+    /// 非表示では絞らず保持し、表示・コピー時に最新設定で `ExifInfo::visible` を通す。
     pub(crate) exif_cache: std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
     /// XMP (mXD X/Twitter メタデータ) キャッシュ: 正規化キー → パース結果。
     /// mXD 以外のファイルには値が入らない前提なので None は「xtw:* なし」。
@@ -64931,14 +64963,17 @@ impl App {
         let _ = ctx;
     }
 
-    /// Sample this root pass's clipboard requests before any Shell I/O.
-    /// The Win32 transition bit, keymap and semantic events keep their old order.
+    /// Sample clipboard requests and claim paste dispatch before any Shell I/O.
+    /// Routed key-down edges survive release/focus loss before this pass runs.
     fn grid_clipboard_requests(
         &self,
         ctx: &egui::Context,
     ) -> Option<(Option<crate::native_context_menu::ShellClipboardVerb>, bool)> {
         let main_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        if !main_focused
+        if ctx.viewport_id() != egui::ViewportId::ROOT
+            || crate::keyboard_input::keyboard_input_permits(ctx)
+                .discrete
+                .is_none()
             || self.shortcuts_blocked_by_text_input(ctx)
             || !self.grid_item_input_allowed()
         {
@@ -64951,14 +64986,15 @@ impl App {
         let ctrl_v = {
             #[cfg(windows)]
             {
-                // Clipboard paste depends on GetAsyncKeyState's transition low
-                // bit, which the keyboard level chokepoint intentionally does
-                // not model. Synthetic clipboard input is outside S1.
-                let ctrl =
-                    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x11) };
-                let v =
-                    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x56) };
-                crate::keyboard_input::shell_paste_transition_requested(ctrl, v)
+                // Fixed Ctrl+V keeps its old Shift/Alt-insensitive meaning.
+                // Claim this dispatch once across layout replay, while leaving
+                // the edges available to later handlers.
+                !crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx)
+                    && crate::key_input::claim_key_down_dispatch(
+                        egui::ViewportId::ROOT,
+                        egui::Id::unique("grid_clipboard_paste"),
+                        |edge| edge.virtual_key == 0x56 && edge.ctrl && !edge.repeat,
+                    )
             }
             #[cfg(not(windows))]
             false
@@ -64973,9 +65009,9 @@ impl App {
             .effective_chords(KeyAction::GridCutFiles)
             .contains(&crate::keymap::Chord::ctrl(crate::keymap::KeyName::X));
         let copy_requested = self.keymap.pressed_action(ctx, KeyAction::GridCopyFiles)
-            || (egui_copy && copy_accepts_semantic_event);
+            || (main_focused && egui_copy && copy_accepts_semantic_event);
         let cut_requested = self.keymap.pressed_action(ctx, KeyAction::GridCutFiles)
-            || (egui_cut && cut_accepts_semantic_event);
+            || (main_focused && egui_cut && cut_accepts_semantic_event);
 
         let verb = if cut_requested {
             Some(crate::native_context_menu::ShellClipboardVerb::Cut)
@@ -64989,6 +65025,14 @@ impl App {
 
     /// Dispatch copy/cut before paste, at the original root UI checkpoint.
     fn handle_clipboard_shortcuts(&mut self, ctx: &egui::Context) {
+        self.handle_clipboard_shortcuts_with(ctx, crate::clipboard_capture::manual_kind);
+    }
+
+    fn handle_clipboard_shortcuts_with(
+        &mut self,
+        ctx: &egui::Context,
+        query: impl FnOnce() -> Result<crate::clipboard_capture::data::ClipboardKind, String>,
+    ) {
         let Some((verb, ctrl_v)) = self.grid_clipboard_requests(ctx) else {
             return;
         };
@@ -65004,7 +65048,7 @@ impl App {
         if ctrl_v {
             self.handle_clipboard_paste_with(
                 ctx,
-                crate::clipboard_capture::manual_kind,
+                query,
                 |app, ctx, kind, _hwnd, folder| match kind {
                     crate::clipboard_capture::data::ClipboardKind::Image
                     | crate::clipboard_capture::data::ClipboardKind::Html => {
@@ -74867,7 +74911,6 @@ impl App {
             None => return,
         };
         let relative_page_provenance = self.relative_page_provenance_for_idx(idx);
-        let hidden: Vec<String> = self.settings.exif_hidden_tags.clone();
         let key_owned = key.clone();
         let repaint = self.edit_preview_repaint_ctx.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -74877,13 +74920,8 @@ impl App {
         std::thread::Builder::new()
             .name(format!("metadata-load-{idx}"))
             .spawn(move || {
-                let result = run_metadata_load(
-                    key_owned,
-                    item,
-                    relative_page_provenance,
-                    &hidden,
-                    &cancel_w,
-                );
+                let result =
+                    run_metadata_load(key_owned, item, relative_page_provenance, &cancel_w);
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }

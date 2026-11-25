@@ -389,6 +389,7 @@ fn key_entry(action: KeyAction) -> Entry {
         | FsCopyPath
         | FsCopyFileName
         | FsCopyImage
+        | FsCopyExif
         | FsCompareToggle
         | FsCompareCycle
         | FsCompareWipe

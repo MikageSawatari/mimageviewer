@@ -2720,7 +2720,7 @@ impl App {
                 // ページ★とコンテナ★を両方出す (コンテナ行があるときはページを明記)。
                 // Every page-specific section and action uses one target in this pass.
                 // Tags, Similar, container stars and book captions keep their existing owners.
-                let (anchor, spread_pages, target_changed) = self.resolve_metadata_info_target();
+                let (mut info_idx, target_changed) = self.metadata_info_target_idx();
                 let selector_changed = self
                     .similar_panel
                     .info_target
@@ -2729,12 +2729,9 @@ impl App {
                     .is_some_and(|spread| {
                         draw_metadata_info_target_selector(ui, &mut spread.selected)
                     });
-                let info_idx = anchor.map(|anchor| {
-                    self.similar_panel
-                        .info_target
-                        .as_ref()
-                        .map_or(anchor, |target| target.idx(anchor, spread_pages))
-                });
+                if selector_changed {
+                    info_idx = self.metadata_info_target_idx().0;
+                }
                 if (target_changed || selector_changed)
                     && let Some(idx) = info_idx
                 {
@@ -2941,8 +2938,13 @@ impl App {
                         ui.separator();
                         ui.add_space(8.0);
                     }
-                    if let Some(url) = draw_exif_panel(ui, exif, &mut self.exif_sections_open) {
+                    let (map_request, copy_requested) =
+                        draw_exif_panel(ui, exif, &mut self.exif_sections_open);
+                    if let Some(url) = map_request {
                         self.open_google_maps(ctx, url);
+                    }
+                    if copy_requested {
+                        self.copy_exif_info_to_clipboard(ctx, exif);
                     }
                 }
 
@@ -3224,6 +3226,64 @@ impl App {
         )
     }
 
+    /// One target owner for panel rendering and EXIF keyboard actions, even with the panel closed.
+    fn metadata_info_target_idx(&mut self) -> (Option<usize>, bool) {
+        let (anchor, pages, changed) = self.resolve_metadata_info_target();
+        let idx = anchor.map(|anchor| {
+            self.similar_panel
+                .info_target
+                .as_ref()
+                .map_or(anchor, |target| target.idx(anchor, pages))
+        });
+        (idx, changed)
+    }
+
+    pub(crate) fn handle_exif_copy_key(&mut self, ctx: &egui::Context) {
+        let Some(input) = self
+            .keymap
+            .consume_action_press(ctx, crate::keymap::KeyAction::FsCopyExif)
+        else {
+            return;
+        };
+        // Label selection copies at egui's end-pass. Own semantic Copy/Cut on repeats too.
+        ctx.input_mut(|i| {
+            i.events
+                .retain(|event| !matches!(event, egui::Event::Copy | egui::Event::Cut));
+        });
+        if input.kind == crate::keymap::PageTurnPressKind::InitialPress {
+            self.copy_current_exif_to_clipboard(ctx);
+        }
+    }
+
+    fn copy_current_exif_to_clipboard(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.metadata_info_target_idx().0 else {
+            return;
+        };
+        let Some(key) = self.metadata_cache_key(idx) else {
+            return;
+        };
+        if !self.exif_cache.contains_key(&key) {
+            self.ensure_metadata_load(idx);
+            self.show_feedback_toast_on(
+                "EXIF を読み込んでいます。少し待ってからもう一度実行してください".into(),
+                crate::app::ActionSurface::Viewer,
+            );
+            return;
+        }
+        let exif = self.get_exif_for_idx(Some(idx)).unwrap_or_default();
+        self.copy_exif_info_to_clipboard(ctx, &exif);
+    }
+
+    fn copy_exif_info_to_clipboard(&mut self, ctx: &egui::Context, exif: &ExifInfo) {
+        let message = if let Some(text) = exif_reader::exif_clipboard_text(exif) {
+            ctx.copy_text(text);
+            "EXIF をコピーしました"
+        } else {
+            "この画像にはコピーできる EXIF がありません"
+        };
+        self.show_feedback_toast_on(message.into(), crate::app::ActionSurface::Viewer);
+    }
+
     /// 選択した情報対象の AI メタデータを取得する。
     fn get_ai_metadata_for_idx(&self, idx: Option<usize>) -> Option<AiMetadata> {
         let idx = idx?;
@@ -3244,7 +3304,10 @@ impl App {
     fn get_exif_for_idx(&self, idx: Option<usize>) -> Option<ExifInfo> {
         let idx = idx?;
         let key = self.metadata_cache_key(idx)?;
-        self.exif_cache.get(&key).cloned().flatten()
+        self.exif_cache
+            .get(&key)?
+            .as_ref()?
+            .visible(&self.settings.exif_hidden_tags)
     }
 
     /// 現在のフルスクリーン画像の XMP (X/Twitter) 情報を取得する。
@@ -6210,7 +6273,7 @@ mod metadata_info_target_tests {
     use crate::settings::SpreadMode;
     use egui_kittest::kittest::Queryable;
 
-    fn spread_app(mode: SpreadMode) -> AppTestEnv {
+    pub(super) fn spread_app(mode: SpreadMode) -> AppTestEnv {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         app.current_folder = Some(app.tmp.path().to_path_buf());
@@ -6291,18 +6354,12 @@ mod metadata_info_target_tests {
     }
 
     fn target_idx(app: &mut App) -> (usize, Option<VisibleSpreadEditPages>) {
-        let (anchor, pages, _) = app.resolve_metadata_info_target();
-        (
-            app.similar_panel
-                .info_target
-                .as_ref()
-                .unwrap()
-                .idx(anchor.unwrap(), pages),
-            pages,
-        )
+        let idx = app.metadata_info_target_idx().0.unwrap();
+        let anchor = app.fullscreen_idx.unwrap();
+        (idx, app.resolve_visible_spread_edit_pages(anchor))
     }
 
-    fn select(app: &mut App, side: AdjustSpreadTarget) {
+    pub(super) fn select(app: &mut App, side: AdjustSpreadTarget) {
         app.similar_panel
             .info_target
             .as_mut()
@@ -6342,7 +6399,7 @@ mod metadata_info_target_tests {
                             return;
                         }
                         let (app, opened) = state;
-                        let (anchor, pages, _) = app.resolve_metadata_info_target();
+                        app.metadata_info_target_idx();
                         if let Some(spread) = app
                             .similar_panel
                             .info_target
@@ -6351,16 +6408,10 @@ mod metadata_info_target_tests {
                         {
                             draw_metadata_info_target_selector(ui, &mut spread.selected);
                         }
-                        let idx = anchor.map(|anchor| {
-                            app.similar_panel
-                                .info_target
-                                .as_ref()
-                                .unwrap()
-                                .idx(anchor, pages)
-                        });
+                        let idx = app.metadata_info_target_idx().0;
                         if let Some(exif) = app.get_exif_for_idx(idx)
                             && let Some(url) =
-                                draw_exif_panel(ui, &exif, &mut app.exif_sections_open)
+                                draw_exif_panel(ui, &exif, &mut app.exif_sections_open).0
                         {
                             opened.push(url);
                         }
@@ -6419,8 +6470,14 @@ mod metadata_info_target_tests {
         for exif in [
             ExifInfo::default(),
             exif_reader::read_exif_from_bytes(&invalid, &[]).unwrap(),
-            exif_reader::read_exif_from_bytes(&valid, &["GPSLatitude".into()]).unwrap(),
-            exif_reader::read_exif_from_bytes(&valid, &["GPSLongitude".into()]).unwrap(),
+            exif_reader::read_exif_from_bytes(&valid, &[])
+                .unwrap()
+                .visible(&["GPSLatitude".into()])
+                .unwrap(),
+            exif_reader::read_exif_from_bytes(&valid, &[])
+                .unwrap()
+                .visible(&["GPSLongitude".into()])
+                .unwrap(),
         ] {
             let mut fonts_ready = false;
             let mut harness = crate::test_ui::builder().build_ui(move |ui| {
@@ -6430,7 +6487,11 @@ mod metadata_info_target_tests {
                     ui.ctx().request_repaint();
                     return;
                 }
-                assert!(draw_exif_panel(ui, &exif, &mut Default::default()).is_none());
+                assert!(
+                    draw_exif_panel(ui, &exif, &mut Default::default())
+                        .0
+                        .is_none()
+                );
             });
             harness.run();
             assert!(harness.query_by_label("Google マップで開く").is_none());
@@ -6928,6 +6989,10 @@ mod metadata_info_target_tests {
     }
 }
 
+#[cfg(all(test, windows))]
+#[path = "ui_metadata_panel/exif_copy_tests.rs"]
+mod exif_copy_tests;
+
 #[cfg(test)]
 mod caption_panel_tests {
     use super::*;
@@ -7321,14 +7386,21 @@ fn draw_exif_panel(
     ui: &mut egui::Ui,
     exif: &ExifInfo,
     sections_open: &mut std::collections::HashMap<String, bool>,
-) -> Option<String> {
+) -> (Option<String>, bool) {
     let mut map_request = None;
-    ui.label(
-        egui::RichText::new("EXIF")
-            .color(egui::Color32::WHITE)
-            .size(16.0)
-            .strong(),
-    );
+    let copy_requested = ui
+        .horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("EXIF")
+                    .color(egui::Color32::WHITE)
+                    .size(16.0)
+                    .strong(),
+            );
+            ui.small_button("Copy")
+                .on_hover_text("表示中の EXIF をまとめてテキストでコピー")
+                .clicked()
+        })
+        .inner;
     ui.add_space(6.0);
 
     for (group, fields) in &exif.sections {
@@ -7373,7 +7445,7 @@ fn draw_exif_panel(
             ui.add_space(4.0);
         }
     }
-    map_request
+    (map_request, copy_requested)
 }
 
 #[doc(hidden)]

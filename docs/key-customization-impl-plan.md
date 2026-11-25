@@ -855,6 +855,12 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
   Ctrl+E と同じページ／見開き対象に、`bake_stage_clipboard` の段までを原寸で反映する。
 - FsCopyFiles / FsCopyPath / FsCopyFileName / FsCopyImage は既定なしのPress（§1.477）。
   コピー5種は画像FSとGridのring候補にも対応し、動画・音声FSには追加しない。
+- FsCopyExif (P、既定未割り当て): 「EXIF をテキストでコピー」。情報パネルと共有する対象の
+  最新の非表示設定を反映した EXIF を、見出しの Copy ボタンと同じ処理でコピーする。
+  FsImage 専用でリング・ジェスチャ・ゲームパッド・右クリックメニューには追加しない。
+  既存コピー操作と同じ gate で `consume_action_press` し、初回・repeat とも同じ pass の
+  Copy/Cut を取り除く。コピー・通知・読込要求は初回だけ。TextEdit の通常コピーを優先し、
+  読込後の自動コピーは予約しない。詳細は [EXIF コピー設計](exif-copy-plan.md)。
 - FsCompareToggle `X` ★ / FsCompareCycle `C` ★ / FsCompareWipe `Shift+C` ★ / FsCompareDiff `Alt+C` ★
 - FsSpreadSingle/L/LCover/R/RCover `1`..`5` (P) ★
 - FsReadingFlowCycle `6` (P) ★ / FsReadingDirectionToggle `7` (P) ★ / FsFitModeCycle `0` (P) ★

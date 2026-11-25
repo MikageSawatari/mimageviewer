@@ -41,7 +41,7 @@ impl ExportBatchDialogState {
                     }) {
                     Ok(_) => LogoCheckResult::Pending(rx),
                     Err(error) => {
-                        log::error!("cannot start export logo check: {error}");
+                        crate::logger::log(format!("cannot start export logo check: {error}"));
                         LogoCheckResult::Missing
                     }
                 }

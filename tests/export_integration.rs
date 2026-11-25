@@ -974,3 +974,210 @@ fn batch_export_keeps_going_after_a_missing_source() {
     assert!(output.join("source.jpg").exists());
     assert!(!output.join("missing.jpg").exists());
 }
+
+fn thumbnail_jpeg(with_xmp: bool) -> Vec<u8> {
+    fn put_entry(t: &mut [u8], pos: usize, tag: u16, kind: u16, count: u32, value: u32) {
+        t[pos..pos + 2].copy_from_slice(&tag.to_le_bytes());
+        t[pos + 2..pos + 4].copy_from_slice(&kind.to_le_bytes());
+        t[pos + 4..pos + 8].copy_from_slice(&count.to_le_bytes());
+        t[pos + 8..pos + 12].copy_from_slice(&value.to_le_bytes());
+    }
+    let mut t = vec![0; 94];
+    t[..8].copy_from_slice(b"II*\0\x08\0\0\0");
+    t[8..10].copy_from_slice(&2u16.to_le_bytes());
+    put_entry(&mut t, 10, 0x0112, 3, 1, 1);
+    put_entry(&mut t, 22, 0x8769, 4, 1, 38);
+    t[34..38].copy_from_slice(&56u32.to_le_bytes());
+    t[38..40].copy_from_slice(&1u16.to_le_bytes());
+    put_entry(&mut t, 40, 0x927c, 7, 4, 0x12345678);
+    t[56..58].copy_from_slice(&2u16.to_le_bytes());
+    put_entry(&mut t, 58, 0x0201, 4, 1, 86);
+    put_entry(&mut t, 70, 0x0202, 4, 1, 8);
+    t[86..].copy_from_slice(b"OLDIMAGE");
+    let mut payload = b"Exif\0\0".to_vec();
+    payload.extend(t);
+    let mut jpeg = jpeg_with_app1(&payload);
+    if with_xmp {
+        let payload = b"http://ns.adobe.com/xap/1.0/\0<x xmlns:xmpGImg='http://ns.adobe.com/xap/1.0/g/img/'/>";
+        let mut segment = vec![0xff, 0xe1];
+        segment.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+        segment.extend_from_slice(payload);
+        jpeg.splice(2..2, segment);
+    }
+    jpeg
+}
+
+fn assert_jpeg_thumbnail_removed(path: &std::path::Path) {
+    let bytes = std::fs::read(path).unwrap();
+    let start = bytes.windows(6).position(|b| b == b"Exif\0\0").unwrap() + 6;
+    assert_eq!(&bytes[start + 34..start + 38], &[0; 4]);
+    assert_eq!(&bytes[start + 86..start + 94], &[0; 8]);
+}
+
+fn single_jpeg_request(
+    source: &std::path::Path,
+    output: &std::path::Path,
+    basename: &str,
+) -> ExportRequest {
+    let mut export = request(
+        source,
+        output,
+        basename,
+        ExportComposite::Single(page(source, edits(BakeStage::Edits), [4, 4])),
+        vec![entry("current", 0)],
+    );
+    export.original_format = SrcFormat::Jpeg;
+    export.output_format = ExportFormat::Jpeg95;
+    export.include_metadata = true;
+    export
+}
+
+#[test]
+fn single_export_thumbnail_notice_follows_completed_and_removes_ifd1() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.jpg");
+    std::fs::write(&source, thumbnail_jpeg(true)).unwrap();
+    let events =
+        collect(spawn_export_worker(single_jpeg_request(&source, temp.path(), "notice")).unwrap());
+    assert_eq!(completed(&events), 1);
+    let index = events
+        .iter()
+        .position(|e| matches!(e, ExportEvent::Completed(_)))
+        .unwrap();
+    let ExportEvent::Completed(success) = &events[index] else {
+        unreachable!()
+    };
+    let ExportEvent::ThumbnailNotice { kinds, path, label } = &events[index + 1] else {
+        panic!("notice must follow Completed: {events:?}");
+    };
+    assert_eq!(path, &success.path);
+    assert_eq!(label, &success.label);
+    assert!(kinds.xmp);
+    assert!(!kinds.maker_note && !kinds.exif_uninspectable);
+    assert_jpeg_thumbnail_removed(path);
+}
+
+#[test]
+fn single_export_maker_note_uses_snapshot_and_per_entry_sns_crop() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.jpg");
+    std::fs::write(&source, thumbnail_jpeg(false)).unwrap();
+    let mut export = single_jpeg_request(&source, temp.path(), "conceal");
+    let ExportComposite::Single(page) = &mut export.composite else {
+        unreachable!()
+    };
+    let mut preset = mimageviewer::conceal::ConcealPreset::default();
+    preset.conceal_type = mimageviewer::conceal::ConcealType::BlackFill;
+    page.edits.conceal = Some(BookConcealSnapshot {
+        mask: BookMaskSnapshot {
+            bitmap: vec![true; 16],
+            shapes: vec![],
+            size: [4, 4],
+        },
+        preset: preset.clone(),
+    });
+    page.has_conceal_mask = true;
+    export.entries.push(ExportEntry {
+        conceal_preset: Some(preset),
+        ..entry("preset", 1)
+    });
+    let events = collect(spawn_export_worker(export).unwrap());
+    assert_eq!(completed(&events), 2);
+    let notices: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            ExportEvent::ThumbnailNotice { kinds, path, .. } => Some((kinds, path)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 2);
+    for (kinds, path) in notices {
+        assert!(kinds.maker_note && !kinds.xmp);
+        assert_jpeg_thumbnail_removed(path);
+    }
+
+    let mut export = single_jpeg_request(&source, temp.path(), "sns");
+    let mut cropped = entry("SNS", 1);
+    cropped.crop_override = Some((
+        mimageviewer::export_crop::CropRect {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: 2.0,
+            max_y: 4.0,
+        },
+        [4, 4],
+    ));
+    // A preset without a snapshot mask is not itself a hidden-edit condition.
+    export.entries[0].conceal_preset = Some(Default::default());
+    export.entries.push(cropped);
+    let events = collect(spawn_export_worker(export).unwrap());
+    assert_eq!(completed(&events), 2);
+    let notices: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            ExportEvent::ThumbnailNotice { kinds, label, .. } => Some((kinds, label)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].0.maker_note);
+    assert_eq!(notices[0].1, "SNS");
+}
+
+#[test]
+fn single_export_zip_thumbnail_cleanup_and_notice_use_entry_bytes() {
+    use std::io::Write;
+    let temp = tempfile::tempdir().unwrap();
+    let zip_path = temp.path().join("source.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    zip.start_file("image.jpg", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zip.write_all(&thumbnail_jpeg(true)).unwrap();
+    zip.finish().unwrap();
+    let mut export = single_jpeg_request(&zip_path, temp.path(), "zip-thumbnail");
+    export.source = ExportSource::ZipEntry {
+        zip_path: zip_path.clone(),
+        entry_name: "image.jpg".into(),
+    };
+    export.composite = ExportComposite::Single(page_from_source(
+        CompositeSource::ZipEntry {
+            zip_path,
+            entry_name: "image.jpg".into(),
+        },
+        edits(BakeStage::Edits),
+        [4, 4],
+    ));
+    let events = collect(spawn_export_worker(export).unwrap());
+    assert_eq!(completed(&events), 1);
+    assert!(events.windows(2).any(|pair| matches!(
+        (&pair[0], &pair[1]),
+        (ExportEvent::Completed(_), ExportEvent::ThumbnailNotice { kinds, .. }) if kinds.xmp
+    )));
+    assert_jpeg_thumbnail_removed(&temp.path().join("zip-thumbnail_0.jpg"));
+}
+
+#[test]
+fn single_export_disabled_metadata_and_format_conversion_emit_no_notice() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source.jpg");
+    std::fs::write(&source, thumbnail_jpeg(true)).unwrap();
+    for convert in [false, true] {
+        let mut export = single_jpeg_request(
+            &source,
+            temp.path(),
+            if convert { "converted" } else { "off" },
+        );
+        if convert {
+            export.output_format = ExportFormat::Png;
+        } else {
+            export.include_metadata = false;
+        }
+        let events = collect(spawn_export_worker(export).unwrap());
+        assert_eq!(completed(&events), 1);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ExportEvent::ThumbnailNotice { .. }))
+        );
+    }
+}

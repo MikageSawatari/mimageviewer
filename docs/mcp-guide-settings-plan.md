@@ -2346,8 +2346,42 @@ MCP経由のヘルプでは、そのあたりをユーザにうまく説明し�
 - **E1 環境設定の外の画面が持つほかの設定 (ツールバーなど約 170) を、この段 (v5.8.0) に含めるか**: 推奨は「含めない
   (操作カスタマイズだけで v5.8.0 に出し、残りは第 2 段の後半として別に設計)」。確定の入口が画面ごとに別で、操作カスタマイズと
   共有する部分が無く、同じ枝に入れると規模と検査の組み合わせが大きくなる。
+  **2026-11-25 利用者決定 (統括経由、master の backlog `d1eb95220`): 含めない**。一覧の見た目・詳細一覧の列・ボタンの表示は
+  「今後、優先度は低め」。利用者の言葉:「1,2，３は今後で良さそうです。ユーザが画面を見てすぐに把握できそうな項目は、AIに画面右クリック
+  してメニューから設定できます、と案内させることができれば一旦は十分かとおもい、優先度を低くしても良いと考えています。」
+  利用者のデータ (スマートフォルダ・クイックフォルダ・ピン留めなど) は「後々早めに」、ツールバーの並びは次の段 (backlog §1.843)。
+  これに合わせ、設定の tool に無い表示の項目を AI がマニュアルで画面の場所を調べて案内するよう、instructions と `get_settings` の
+  説明に一言足す (§20.16)。
 - 通常の使い方が不便になる変更・利用者の作ったデータが失われる点: 無い見込み (割り当ての値は応答と記録の変更前の値で戻せる。
   ジェスチャーは列全体で戻せる、§20.4.1)。
+
+### 20.16 設定の tool に無い表示の項目の案内 (2026-11-25、E1 の決定を受けて)
+
+**確かめたこと (master `d1eb95220` のコード)**:
+
+- INSTRUCTIONS (`crates/mcp-server/src/lib.rs:28-32`) は「機能・操作・設定の質問はまず search_help / get_help」「許可があれば
+  get_view_state / get_settings / get_operations を先に見る」と書くだけで、**設定の tool に無い項目 (環境設定の外の画面で変える表示の
+  設定) をどう扱うか**は書いていない。`get_settings` の説明も同じ。AI が `get_settings` で見つからない項目を「mIV では変えられない」と
+  答えてしまう余地がある。
+- `set_settings` にその鍵を渡せば「この設定は、まだ AI からは変えられません (理由)」が返る (`src/settings_transfer/stage1.rs:260`) が、
+  AI はふつう鍵の名前を知らないので、そこまで届かない。
+- INSTRUCTIONS は client が渡さないことがある (親文書 §15.4) ので、tool の説明にも短く書く。
+- マニュアルには、利用者が挙げた 3 つの画面の場所が書かれている: ツールバーのセクション・並び・表示形式 (`manual/grid.html:93`、
+  `manual/settings.html#toolbar`)、詳細表示の列 (`manual/grid.html:264`、列ヘッダの右クリック)、一覧の先頭 / 末尾のボタン
+  (`manual/grid.html:339`、右クリックのメニュー。どこを右クリックするかは `manual/settings.html:268`・`:637` に具体的にある:
+  ツールバーの空き領域・上部の「ソート:」・絞り込みバーの「ソート:」・ボタン自体)。絞り込みバーの表示 (`grid.html:311`) も同様。
+  足りない記述は見つからなかった (3 つの例と、その周りの節を読んだ範囲。約 170 項目を全部突き合わせてはいない)。
+
+**足すもの** (文言は英語の短文。予算の内):
+
+- INSTRUCTIONS の 3 行目に 1 文:「Display settings changed only on screen (toolbar, list/detail columns, buttons, panels) are not in
+  get_settings/get_operations: say so, then use search_help/get_help to find where to change them (often a right-click menu) and guide
+  the user.」
+- `get_settings` の説明に 1 句:「On-screen display options (toolbar, columns, buttons) are absent: guide via get_help.」
+- テスト: INSTRUCTIONS と `get_settings` の説明にこの案内が入っていることを確かめる 1 件 (既存の字数・予算の検査はそのまま)。
+- **第 1 段の「INSTRUCTIONS に足す案内は 300 字まで」(§4.4、テスト `settings_instructions_keep_the_total_guide_addition_within_budget`)
+  を 520 字までに改める** (独立レビューの指摘。この一文で「For questions」以降が 490 字になる)。300 字は第 1 段で足す分の目安で、
+  client の上限 (INSTRUCTIONS 全体で UTF-16 4,096) から来た値ではない。全体は 1,342 で、4,096 の検査はそのまま残す。
 
 ### 20.15 独立レビューの記録
 
@@ -2396,3 +2430,11 @@ r1 の対象外だった追記 (`823d33328` の §20.14a、`d6b7696f0` の §20.
 **実装の独立レビュー r2** (同じ thread、対象 `08209211b..8aa8bad91`) — **ACCEPT**。r1 の 2 件の解消を確認。override の索引
 (後の行が勝つ・今の位置で置き換え・`null` で同じ操作の行を全部消す・未知の行を保つ) と画面の表に退行なし。検証記録 §20.12.2 も
 提示内容と一致と確認 (レビュー担当は cargo・製品を実行していない。53 秒の値は残っていた JUnit では裏付けられないと付記)。
+
+**§20.16 の追加 (設定の tool に無い表示の項目の案内) の独立レビュー** (同じ thread):
+- r3 (対象 `d1eb95220..9ae9abda3`) — ACCEPT WITH CHANGES。P2: 第 1 段のテストが INSTRUCTIONS の案内部分を 300 字までにしており、
+  今回の一文 (490 字) で落ちる → 上限を 520 に改め理由を §20.16 に記録 (`4e24c1155`)。あわせて先頭・末尾ボタンの右クリックの入口の参照
+  (`manual/settings.html:268,637`) を §20.16 に足した。案内の流れ・ほかの tool の説明との矛盾なし・新しいテストの有効性は確認された。
+- r4 (対象 `4e24c1155`) — ACCEPT。
+- 検証 (設計担当、共有 runner、`4e24c1155`): mimageviewer-mcp + mimageviewer-agent-ipc 177/177 成功。tool 一覧の最大 50,010 字
+  (+512 = 50,522 / 52,000)。INSTRUCTIONS は UTF-16 1,342 (実装担当の静的な数え)。

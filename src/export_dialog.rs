@@ -874,7 +874,7 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
         && request.original_format.supports_metadata_writeback()
         && request.original_format == output_src_format
         && (source_path.is_some() || source_bytes.is_some());
-    let options = SaveOptions {
+    let mut options = SaveOptions {
         jpeg_quality: 95,
         include_metadata,
         // source compositor の decode は通常ファイルも ZIP 内画像も EXIF Orientation を
@@ -882,6 +882,20 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
         // 外部ビューアでの二重回転を避ける。
         caller_applied_orientation: true,
         ..Default::default()
+    };
+    let page_has_hidden_edits = |page: &ExportPageComposite| {
+        let edits = &page.edits;
+        edits.erase.is_some()
+            || edits.conceal.is_some()
+            || edits.export_crop.is_some()
+            || edits.comic.is_some()
+            || edits.local_adjust.is_some()
+    };
+    let composite_has_hidden_edits = match &request.composite {
+        ExportComposite::Single(page) => page_has_hidden_edits(page),
+        ExportComposite::Spread { left, right } => {
+            page_has_hidden_edits(left) || page_has_hidden_edits(right)
+        }
     };
     let extension = request.output_format.extension();
     let decoded = match decode_export_composite(&request.composite, &cancel, request.raw.as_ref()) {
@@ -978,6 +992,8 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
             let _ = tx.send(ExportEvent::Cancelled);
             return;
         }
+        options.thumbnail_notice_for_hidden_edits =
+            composite_has_hidden_edits || entry.crop_override.is_some();
         match save_image_with_metadata(
             pixels.as_ref(),
             source_path,
@@ -986,11 +1002,22 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
             output_src_format.clone(),
             &options,
         ) {
-            Ok(()) => {
+            Ok(kinds) => {
                 let _ = tx.send(ExportEvent::Completed(ExportSuccess {
-                    label: entry.label,
-                    path,
+                    label: entry.label.clone(),
+                    path: path.clone(),
                 }));
+                if !kinds.is_empty() {
+                    let _ = tx.send(ExportEvent::ThumbnailNotice {
+                        label: entry.label,
+                        path: path.clone(),
+                        kinds,
+                    });
+                    crate::logger::log(&format!(
+                        "export thumbnail metadata: {}: {kinds:?}",
+                        path.display(),
+                    ));
+                }
             }
             Err(SaveError::IoError(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let _ = tx.send(ExportEvent::Failed(ExportFailure {

@@ -247,6 +247,26 @@ pub(crate) struct GpsCoordinates {
 }
 
 impl ExifInfo {
+    /// Apply the current display settings at the consumer boundary, keeping the raw cache intact.
+    pub fn visible(&self, hidden: &[String]) -> Option<ExifInfo> {
+        let sections: Vec<_> = self
+            .sections
+            .iter()
+            .filter_map(|(group, fields)| {
+                let fields: Vec<_> = fields
+                    .iter()
+                    .filter(|(tag, _)| !hidden.contains(tag))
+                    .cloned()
+                    .collect();
+                (!fields.is_empty()).then_some((*group, fields))
+            })
+            .collect();
+        (!sections.is_empty()).then_some(ExifInfo {
+            sections,
+            gps: self.gps,
+        })
+    }
+
     /// Respect the display filter without parsing localized/rounded display strings.
     pub(crate) fn gps_coordinates(&self) -> Option<GpsCoordinates> {
         let visible = |tag: &str| {
@@ -258,6 +278,26 @@ impl ExifInfo {
             .then_some(self.gps)
             .flatten()
     }
+}
+
+/// Format the visible EXIF in panel order, independently of section folding.
+pub(crate) fn exif_clipboard_text(info: &ExifInfo) -> Option<String> {
+    let sections: Vec<_> = info
+        .sections
+        .iter()
+        .filter(|(_, fields)| !fields.is_empty())
+        .map(|(group, fields)| {
+            let mut text = format!("[{}]", group.display_name());
+            for (tag, value) in fields {
+                text.push('\n');
+                text.push_str(tag_display_name(tag));
+                text.push_str(": ");
+                text.push_str(&value.replace("\r\n", "\n").replace('\r', "\n"));
+            }
+            text
+        })
+        .collect();
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
 
 fn gps_coordinates(entries: &[rexif::ExifEntry]) -> Option<GpsCoordinates> {
@@ -1599,7 +1639,7 @@ pub(crate) mod tests {
         );
         for hidden in ["GPSLatitude", "GPSLongitude"] {
             assert!(
-                read_exif_from_bytes(&bytes, &[hidden.into()])
+                info.visible(&[hidden.into()])
                     .unwrap()
                     .gps_coordinates()
                     .is_none()
@@ -1607,10 +1647,109 @@ pub(crate) mod tests {
         }
         // Hiding reference rows does not erase the source direction tags.
         assert_eq!(
-            read_exif_from_bytes(&bytes, &["GPSLatitudeRef".into(), "GPSLongitudeRef".into()])
+            info.visible(&["GPSLatitudeRef".into(), "GPSLongitudeRef".into()])
                 .unwrap()
                 .gps_coordinates(),
             info.gps_coordinates()
+        );
+    }
+
+    #[test]
+    fn exif_clipboard_format_preserves_order_names_spacing_and_normalizes_newlines() {
+        let info = ExifInfo {
+            sections: vec![
+                (
+                    TagGroup::Shooting,
+                    vec![("ExposureTime".into(), "1/200 秒".into())],
+                ),
+                (TagGroup::Image, vec![]),
+                (
+                    TagGroup::Camera,
+                    vec![
+                        ("Make".into(), "Canon".into()),
+                        ("Model".into(), "EOS R5".into()),
+                    ],
+                ),
+                (
+                    TagGroup::Other,
+                    vec![("UnknownTag".into(), "a\r\nb\rc\nd".into())],
+                ),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            exif_clipboard_text(&info).as_deref(),
+            Some(
+                "[撮影設定]\n露出時間: 1/200 秒\n\n[カメラ]\nカメラ メーカー: Canon\nカメラ モデル: EOS R5\n\n[その他 / 拡張]\nUnknownTag: a\nb\nc\nd"
+            )
+        );
+    }
+
+    #[test]
+    fn exif_clipboard_empty_sections_have_no_output() {
+        for info in [
+            ExifInfo::default(),
+            ExifInfo {
+                sections: vec![(TagGroup::Camera, vec![])],
+                ..Default::default()
+            },
+        ] {
+            assert!(exif_clipboard_text(&info).is_none());
+            assert!(info.visible(&[]).is_none());
+        }
+    }
+
+    #[test]
+    fn exif_clipboard_visible_drops_empty_sections_and_keeps_source_unchanged() {
+        let raw = ExifInfo {
+            sections: vec![
+                (TagGroup::Camera, vec![("Make".into(), "Canon".into())]),
+                (TagGroup::Image, vec![]),
+                (
+                    TagGroup::Shooting,
+                    vec![("ExposureTime".into(), "1/200 秒".into())],
+                ),
+            ],
+            ..Default::default()
+        };
+        let visible = raw.visible(&["Make".into()]).unwrap();
+        assert_eq!(visible.sections.len(), 1);
+        assert_eq!(visible.sections[0].0, TagGroup::Shooting);
+        assert_eq!(
+            exif_clipboard_text(&visible).as_deref(),
+            Some("[撮影設定]\n露出時間: 1/200 秒")
+        );
+        assert_eq!(raw.sections.len(), 3);
+        assert_eq!(raw.sections[0].1[0].1, "Canon");
+    }
+
+    #[test]
+    fn exif_clipboard_visible_filters_raw_gps_and_can_restore_without_reading() {
+        let raw = read_exif_from_bytes(&gps_fixture_bytes(35, 139), &[]).unwrap();
+        let original = exif_clipboard_text(&raw).unwrap();
+        assert!(original.starts_with("[GPS]\n"));
+        for tag in ["GPSLatitude", "GPSLongitude"] {
+            let visible = raw.visible(&[tag.into()]).unwrap();
+            assert!(visible.gps_coordinates().is_none());
+            assert!(
+                !exif_clipboard_text(&visible)
+                    .unwrap()
+                    .contains(&format!("{}: ", tag_display_name(tag)))
+            );
+        }
+        let refs_hidden = raw
+            .visible(&["GPSLatitudeRef".into(), "GPSLongitudeRef".into()])
+            .unwrap();
+        assert_eq!(refs_hidden.gps_coordinates(), raw.gps_coordinates());
+        let all: Vec<_> = raw
+            .sections
+            .iter()
+            .flat_map(|(_, fields)| fields.iter().map(|(tag, _)| tag.clone()))
+            .collect();
+        assert!(raw.visible(&all).is_none());
+        assert_eq!(
+            exif_clipboard_text(&raw.visible(&[]).unwrap()).unwrap(),
+            original
         );
     }
 

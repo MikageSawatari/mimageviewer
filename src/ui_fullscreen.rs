@@ -35540,6 +35540,8 @@ impl App {
                     crate::key_input::SyntheticNavigationKey::F12 => KeyName::F12,
                     #[cfg(any(test, feature = "test-script"))]
                     crate::key_input::SyntheticNavigationKey::G => KeyName::G,
+                    #[cfg(any(test, feature = "test-script"))]
+                    crate::key_input::SyntheticNavigationKey::V => KeyName::V,
                     #[cfg(test)]
                     crate::key_input::SyntheticNavigationKey::Tab => KeyName::Tab,
                     #[cfg(test)]
@@ -37971,6 +37973,7 @@ impl App {
             && self.keymap.consume_action(ctx, KeyAction::FsExport);
         if !current_item_is_video && !fs_music_view_active && self.fs_context_menu_idx.is_none() {
             self.handle_copy_action_keys(ctx, true);
+            self.handle_exif_copy_key(ctx);
         }
         let key_sns_split = !is_video_fs
             && !fs_music_view_active
@@ -60808,7 +60811,11 @@ impl App {
                 ui.add_enabled(
                     metadata_possible,
                     egui::Checkbox::new(&mut state.include_metadata, "AI プロンプト / EXIF を保持"),
-                );
+                )
+                .on_hover_text(concat!(
+                    "EXIF の縮小画像は外します。外せなかったときや、XMP などに縮小画像が残っていそうなときは、",
+                    "書き出しの後で知らせます (隠した部分が縮小画像に残ることがあります)。",
+                ));
                 if !metadata_possible {
                     ui.small("形式変換、PDF、見開き合成ではメタデータ保持は無効です");
                 }
