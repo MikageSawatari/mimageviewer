@@ -320,14 +320,10 @@ fn json_registration_preserves_pretty_indentation_line_endings_and_other_bytes()
                 )
                 .unwrap();
                 assert_eq!(edited, render(&added_parent));
-                let empty_parent = no_parent.replace(
-                    "  \"tail\": true\n}",
-                    "  \"tail\": true,\n  \"mcpServers\": {}\n}",
-                );
                 assert_eq!(
                     config::edit(AppTarget::ClaudeDesktop, &edited, Action::Remove, &command)
                         .unwrap(),
-                    render(&empty_parent)
+                    render(&no_parent)
                 );
             }
         }
@@ -341,6 +337,288 @@ fn json_registration_preserves_pretty_indentation_line_endings_and_other_bytes()
         config::edit(AppTarget::ClaudeDesktop, "{}", Action::Register, &command).unwrap();
     assert!(minified.starts_with("{\n  \"mcpServers\""));
     assert!(!minified.ends_with('\n'));
+}
+
+#[test]
+fn claude_registration_removes_new_empty_parent_and_restores_pretty_bytes() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for indent in ["  ", "    ", "\t"] {
+        for newline in ["\n", "\r\n"] {
+            for trailing in [false, true] {
+                let mut original = format!(
+                    "{{{newline}{indent}\"other\": 1,{newline}{indent}\"tail\": true{newline}}}"
+                );
+                if trailing {
+                    original.push_str(newline);
+                }
+                let registered = config::edit(
+                    AppTarget::ClaudeDesktop,
+                    &original,
+                    Action::Register,
+                    &command,
+                )
+                .unwrap();
+                assert!(registered.contains("\"mcpServers\""));
+                let removed = config::edit(
+                    AppTarget::ClaudeDesktop,
+                    &registered,
+                    Action::Remove,
+                    &command,
+                )
+                .unwrap();
+                assert_eq!(removed.as_bytes(), original.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+fn claude_removal_deletes_preexisting_parent_only_after_removing_registration() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    let empty_parent = "{\n  \"other\": 1,\n  \"mcpServers\": {}\n}\n";
+    assert_eq!(
+        config::edit(
+            AppTarget::ClaudeDesktop,
+            empty_parent,
+            Action::Remove,
+            &command
+        )
+        .unwrap(),
+        empty_parent
+    );
+    assert_eq!(
+        config::change(
+            AppTarget::ClaudeDesktop,
+            empty_parent,
+            Action::Remove,
+            &command
+        )
+        .unwrap(),
+        RegistrationChange::Unchanged
+    );
+    let registered = config::edit(
+        AppTarget::ClaudeDesktop,
+        empty_parent,
+        Action::Register,
+        &command,
+    )
+    .unwrap();
+    assert_eq!(
+        config::edit(
+            AppTarget::ClaudeDesktop,
+            &registered,
+            Action::Remove,
+            &command
+        )
+        .unwrap(),
+        "{\n  \"other\": 1\n}\n"
+    );
+}
+
+#[test]
+fn codex_registration_uses_implicit_new_parent_and_restores_original_bytes() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for original in ["", "model = 'x'\n", "# keep\nmodel = 'x' # model\n\n"] {
+        for newline in ["\n", "\r\n"] {
+            let original = original.replace('\n', newline);
+            let registered =
+                config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+            assert!(!registered.contains("[mcp_servers]"), "{registered}");
+            assert!(
+                registered.contains("[mcp_servers.mimageviewer]"),
+                "{registered}"
+            );
+            let removed =
+                config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+            assert_eq!(removed.as_bytes(), original.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn codex_removal_deletes_empty_explicit_implicit_inline_and_dotted_parents() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for parent in [
+        "[mcp_servers]\n[mcp_servers.mimageviewer]\ncommand = 'old'\nargs = []\n",
+        "[mcp_servers.mimageviewer]\ncommand = 'old'\nargs = []\n",
+        "mcp_servers = { mimageviewer = { command = 'old', args = [] } }\n",
+        "mcp_servers.mimageviewer.command = 'old'\nmcp_servers.mimageviewer.args = []\n",
+    ] {
+        for newline in ["\n", "\r\n"] {
+            let prefix = "# keep\nmodel = 'x' # model\n".replace('\n', newline);
+            let suffix = "[other]\nvalue = 42 # tail\n".replace('\n', newline);
+            let original = format!("{prefix}{}{suffix}", parent.replace('\n', newline));
+            let removed =
+                config::edit(AppTarget::ChatGpt, &original, Action::Remove, &command).unwrap();
+            assert_eq!(removed, format!("{prefix}{suffix}"), "parent={parent:?}");
+            assert_eq!(
+                config::change(AppTarget::ChatGpt, &original, Action::Remove, &command).unwrap(),
+                RegistrationChange::Remove
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_registration_preserves_empty_explicit_parent_comments() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for parent in [
+        "# MCP の運用メモ\n[mcp_servers]\n",
+        "[mcp_servers] # 利用者が残した説明\n",
+        "# MCP の運用メモ\n[mcp_servers] # 利用者が残した説明\n",
+    ] {
+        for newline in ["\n", "\r\n"] {
+            let original = format!("model = 'x'\n{parent}").replace('\n', newline);
+            let registered =
+                config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+            let removed =
+                config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+            assert_eq!(removed.as_bytes(), original.as_bytes(), "parent={parent:?}");
+        }
+    }
+}
+
+fn assert_codex_inline_parent_comments_round_trip(parent: &str) {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for newline in ["\n", "\r\n"] {
+        let original = format!("model = 'x'\n{parent}").replace('\n', newline);
+        let registered =
+            config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+        // Observe the ownership after serialization and parsing, as removal does.
+        // A final byte comparison alone would not locate an ownership regression.
+        let before: toml_edit::DocumentMut = original.replace("\r\n", "\n").parse().unwrap();
+        let after: toml_edit::DocumentMut = registered.replace("\r\n", "\n").parse().unwrap();
+        let before_parent = before["mcp_servers"].as_inline_table().unwrap();
+        let after_parent = after["mcp_servers"].as_inline_table().unwrap();
+        assert_eq!(
+            after_parent.trailing().as_str(),
+            before_parent.trailing().as_str(),
+            "parent={parent:?}"
+        );
+        // Re-registering must preserve the same ownership and output too.
+        assert_eq!(
+            config::edit(AppTarget::ChatGpt, &registered, Action::Register, &command).unwrap(),
+            registered
+        );
+        let removed =
+            config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+        assert_eq!(removed.as_bytes(), original.as_bytes(), "parent={parent:?}");
+    }
+}
+
+#[test]
+fn codex_registration_preserves_empty_inline_parent_comments() {
+    for parent in [
+        "# MCP の運用メモ\nmcp_servers = {}\n",
+        "mcp_servers = {} # 利用者が残した説明\n",
+        "# MCP の運用メモ\nmcp_servers = {} # 利用者が残した説明\n",
+    ] {
+        assert_codex_inline_parent_comments_round_trip(parent);
+    }
+}
+
+#[test]
+fn codex_registration_preserves_multiline_inline_parent_comment_after_reparse() {
+    assert_codex_inline_parent_comments_round_trip("mcp_servers = {\n  # 表の中の運用メモ\n}\n");
+}
+
+#[test]
+fn codex_registration_preserves_inline_parent_opening_line_comment_after_reparse() {
+    assert_codex_inline_parent_comments_round_trip("mcp_servers = { # 表の中の行末の説明\n}\n");
+}
+
+#[test]
+fn codex_registration_keeps_toml10_inline_tables_without_trailing_commas() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    let with_other = "mcp_servers = { other = { command = 'other' } }\n";
+    for (parent, expected_parent) in [
+        ("mcp_servers = { }\n", ""),
+        ("mcp_servers = {}\n", ""),
+        (with_other, with_other),
+    ] {
+        for newline in ["\n", "\r\n"] {
+            let original = format!("model = 'x'\n{parent}").replace('\n', newline);
+            let registered =
+                config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+            let normalized = registered.replace("\r\n", "\n");
+            let parsed: toml_edit::DocumentMut = normalized.parse().unwrap();
+            assert!(
+                !parsed["mcp_servers"]
+                    .as_inline_table()
+                    .unwrap()
+                    .trailing_comma(),
+                "parent={parent:?}, registered={registered}"
+            );
+            for trailing_comma in [", }", ",}", ",\n}"] {
+                assert!(!normalized.contains(trailing_comma), "{registered}");
+            }
+            let removed =
+                config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+            let expected = format!("model = 'x'\n{expected_parent}").replace('\n', newline);
+            assert_eq!(removed.as_bytes(), expected.as_bytes(), "parent={parent:?}");
+        }
+    }
+}
+
+#[test]
+fn codex_registration_removes_uncommented_empty_explicit_parent() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for newline in ["\n", "\r\n"] {
+        // A '#' inside an unrelated string is not a comment on the parent.
+        let prefix = "model = 'x#y'\n".replace('\n', newline);
+        let original = format!("{prefix}[mcp_servers]{newline}");
+        let registered =
+            config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+        let removed =
+            config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+        assert_eq!(removed.as_bytes(), prefix.as_bytes());
+    }
+}
+
+#[test]
+fn codex_removal_keeps_other_servers_and_existing_parent_forms() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for original in [
+        "# keep\n[mcp_servers.other]\ncommand = 'keep' # other\n",
+        "[mcp_servers]\n# keep\n[mcp_servers.other]\ncommand = 'keep'\n",
+        "mcp_servers = { other = { command = 'keep' } } # keep\n",
+        "mcp_servers.other.command = 'keep' # keep\n",
+    ] {
+        let registered =
+            config::edit(AppTarget::ChatGpt, original, Action::Register, &command).unwrap();
+        let removed =
+            config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+        assert_eq!(removed, original);
+    }
+}
+
+#[test]
+fn codex_removal_without_registration_preserves_empty_parent_and_is_unchanged() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for original in [
+        "# keep\nmodel = 'x'\n",
+        "[mcp_servers]\n",
+        "mcp_servers = {} # keep\n",
+    ] {
+        assert_eq!(
+            config::edit(AppTarget::ChatGpt, original, Action::Remove, &command).unwrap(),
+            original
+        );
+        assert_eq!(
+            config::change(AppTarget::ChatGpt, original, Action::Remove, &command).unwrap(),
+            RegistrationChange::Unchanged
+        );
+    }
 }
 
 /// Independent fixture scanner: neither RawValue nor serde_json::Value is used
@@ -619,9 +897,10 @@ fn registration_preservation_deep_large_string_keeps_exact_bytes() {
     );
     let removed =
         config::edit(AppTarget::ClaudeDesktop, &edited, Action::Remove, &command).unwrap();
+    let without_parent = original.replace(",\n  \"mcpServers\": {}", "");
     assert!(
-        removed.as_bytes() == original.as_bytes(),
-        "removing the registration must restore the exact deep input"
+        removed.as_bytes() == without_parent.as_bytes(),
+        "removing the empty parent must preserve all other deep input bytes"
     );
 }
 
