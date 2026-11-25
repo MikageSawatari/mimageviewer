@@ -127,8 +127,8 @@
       AI アプリが mIV の機能を使ってよいか確認を求めた場合は、許可してください。</p>
 
     <figure class="tut-shot">
-      <div class="tut-shot-ph">画像 C4: Claude Desktop で使い方を聞いた会話。mIV の機能を使った表示と答え</div>
-      <figcaption>Claude Desktop の例。</figcaption>
+      <img src="images/tut-ai-integration-11.webp" alt="Claude Desktop で、mImageViewer の MCP ツールでお気に入りの登録方法を調べるよう頼んだ会話。「mimageviewer: Search help」と表示され、メニューの「お気に入り」から登録する手順が番号付きで答えられている">
+      <figcaption>Claude Desktop の例。mIV の機能を使ったときは「mimageviewer: Search help」のように表示されます（画像では、答えの中の版の表示を伏せています）。</figcaption>
     </figure>
 
     <figure class="tut-shot">
@@ -158,8 +158,8 @@
       実際のフォルダの場所に置き換えてください。「さっきのフォルダ」「画像フォルダ」だけでは、新しい会話で場所が分からなくなることがあります。</p>
 
     <figure class="tut-shot">
-      <div class="tut-shot-ph">画像 C5: 「読み取りのみ」でフォルダの画像を一覧させた会話</div>
-      <figcaption>許可の範囲の中で、AI アプリが mIV からフォルダの内容を受け取って答えます。</figcaption>
+      <img src="images/tut-ai-integration-12.webp" alt="Claude Desktop で、mImageViewer の MCP ツールで写真のフォルダの画像を一覧して枚数を教えるよう頼んだ会話。「mimageviewer: List folder」と表示され、画像が 8 枚あることと 8 個のファイル名が答えられている">
+      <figcaption>Claude Desktop の例。許可の範囲の中で、AI アプリが mIV からフォルダの内容を受け取って答えます。</figcaption>
     </figure>
 
     <figure class="tut-shot">
@@ -181,13 +181,18 @@
       <li><strong>ChatGPT の場合、Codex の画面で使っているか</strong>: ChatGPT の通常のチャットからは使えません。デスクトップアプリの左上の切り替えで「Codex」を選び（または Codex CLI・IDE の拡張で）、新しいチャットを始めます。</li>
       <li><strong>登録の後に AI アプリを起動し直したか</strong>: 登録の前から起動していた AI アプリには、登録が伝わりません。Claude Desktop はトレイからも終了して、起動し直してください。</li>
       <li><strong>登録の状態</strong>: 「AI 連携」の窓の一番下で「再確認」を押し、「登録済み」になっているか見ます。「登録先が違う」なら「登録し直す」を押します。
-        ChatGPT (Codex) では、AI アプリの側でも確かめられます。mIV の ChatGPT (Codex) の行の「設定を開く」を押すと ChatGPT の設定が開くので、左上の検索欄に「MCP」と入れて「MCP サーバー」を選びます。「サーバー」の下に mimageviewer が並び、スイッチがオンになっていれば登録されています。</li>
+        ChatGPT (Codex) では、AI アプリの側でも確かめられます。mIV の ChatGPT (Codex) の行の「設定を開く」を押すと ChatGPT の設定が開くので、左上の検索欄に「MCP」と入れて「MCP サーバー」を選びます。「サーバー」の下に mimageviewer が並び、スイッチがオンになっていれば登録されています。
+        Claude Desktop では、設定（Ctrl+,）の「デスクトップアプリ」を選び、一番下の「拡張機能」の「管理」を押します。「ローカル MCP サーバー」に mimageviewer が並び、「実行中」になっていれば、mIV とつながっています。</li>
       <li><strong>許可の範囲と mIV の起動</strong>: 使い方の説明は「無効」でも引けますが、ファイルやライブラリの情報には「読み取りのみ」以上と、mIV の起動が必要です。
         AI アプリが「許可がない」と答えた場合は、伝えられた許可を「AI 連携」で選びます。</li>
       <li><strong>AI アプリが mIV の機能を使わない</strong>: AI アプリが画面操作など別の方法を選んでいることがあります。
         頼む文に「<strong>mImageViewer の MCP ツールを使って</strong>」と書き添えてください。</li>
       <li><strong>mIV を更新した後</strong>: それまで使えていた機能はそのまま使えます。更新で新しく増えた機能を使うには、AI アプリを再起動するか、MCP に再接続してください。</li>
     </ol>
+    <figure class="tut-shot">
+      <img src="images/tut-ai-integration-13.webp" alt="Claude Desktop の設定の「デスクトップアプリ」の「拡張機能」の画面。「ローカル MCP サーバー」に mimageviewer があり、「実行中」と表示され、コマンドと引数が並んでいる">
+      <figcaption>Claude Desktop の設定の「ローカル MCP サーバー」。mimageviewer が「実行中」ならつながっています（画像では、引数に含まれる利用者名を伏せています）。</figcaption>
+    </figure>
     <figure class="tut-shot">
       <img src="images/tut-ai-integration-10.webp" alt="ChatGPT の設定で「MCP」を検索し、「MCP サーバー」を開いたところ。「プラグイン」の画面の「MCP」の「サーバー」の下に mimageviewer があり、スイッチがオンになっている">
       <figcaption>ChatGPT (Codex) の設定の「MCP サーバー」。mimageviewer のスイッチがオンなら登録されています（画像では、mIV 以外の項目を写していません）。</figcaption>
