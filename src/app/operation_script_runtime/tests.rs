@@ -3,6 +3,8 @@ use super::*;
 use crate::app::tests::phase_c_support::{AppTestEnv, setup_app};
 use crate::operation_script::CompiledOperationScript;
 
+mod page_identity_perf;
+
 fn ready(body: &str) -> OperationScriptState {
     let source = format!(
         "fn slots() {{ [#{{slot:1,label:\"test\",run:\"entry\"}}] }}\nfn entry(s) {{ {body} }}"
