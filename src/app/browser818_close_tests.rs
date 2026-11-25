@@ -450,7 +450,9 @@ fn browser818_toggle_main_viewer_remapping_and_gamepad_share_the_browser_refusal
             let output = ctx.run_pass(input, |ctx| {
                 app.input_begin_key_frame(ctx);
                 match route {
-                    "main" => app.input_main_grid_shortcuts(ctx, false),
+                    "main" => {
+                        let _ = app.input_main_grid_shortcuts(ctx, false);
+                    }
                     "viewer" => {
                         app.handle_fs_key_input(ctx, 0, false);
                     }

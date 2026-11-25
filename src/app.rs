@@ -760,6 +760,8 @@ mod startup_ops;
 pub(crate) use external_open::{
     ExplicitOpenPath, ViewerOpenAdoption, ViewerOpenIntent, ViewerOpenRequest,
 };
+pub(crate) mod operation_script_grid;
+pub(crate) mod operation_script_runtime;
 mod subfolder_expansion;
 mod update_phases;
 pub(crate) use close_return::{
@@ -2674,6 +2676,145 @@ impl DetachedImageWindowSnapshot {
     }
 }
 
+impl App {
+    /// Existing Enter / external-player key body, shared with resolved script input.
+    pub(crate) fn execute_grid_open_selected(
+        &mut self,
+        ctx: &egui::Context,
+        external_player_video: bool,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        match self.execute_grid_open_selected_with_flow(ctx, external_player_video) {
+            std::ops::ControlFlow::Break(nav) => nav,
+            std::ops::ControlFlow::Continue(()) => None,
+        }
+    }
+
+    fn execute_grid_open_selected_with_flow(
+        &mut self,
+        ctx: &egui::Context,
+        external_player_video: bool,
+    ) -> std::ops::ControlFlow<Option<crate::ui_main::AddressBarNav>> {
+        // Shift+Enter などに割り当てた専用コマンドで動画を外部プレイヤーで開く
+        // (フルスクリーン中と
+        // 同じ挙動をグリッドからも使えるようにする)。
+        if let Some(idx) = self.selected {
+            if self.items_are_bookmark_view {
+                if let Some(row) = self.bookmark_browser_rows.get(idx).cloned() {
+                    self.open_bookmark_browser_row(ctx, &row);
+                }
+                return std::ops::ControlFlow::Break(None);
+            }
+            if !self.guard_reading_history_open(idx) {
+                return std::ops::ControlFlow::Break(None);
+            }
+            if self.activate_main_zipdir(idx, ctx)
+                != crate::app::ZipDirActivationOutcome::NotApplicable
+            {
+                return std::ops::ControlFlow::Break(None);
+            }
+            self.capture_main_list_restore_cursor();
+            // ファイル名スタックの集約グリッドでメディアセルを Enter したら、フラット読書
+            // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常へ。
+            // ただし Shift+Enter で動画を外部プレイヤーに渡す経路は intercept より優先する
+            // (= 動画 + shift_enter のときは intercept をスキップして下の Video arm に流す)。
+            let stack_skip_for_external_video =
+                external_player_video && matches!(self.items.get(idx), Some(GridItem::Video(_)));
+            if !stack_skip_for_external_video && self.stack_try_open_from_grid(ctx, idx, false) {
+                return std::ops::ControlFlow::Break(None);
+            }
+            #[cfg(windows)]
+            if self.open_grid_container_in_detached_book_context(ctx, idx) {
+                return std::ops::ControlFlow::Break(None);
+            }
+            match self.items.get(idx) {
+                Some(GridItem::Folder(_))
+                | Some(GridItem::ZipFile(_))
+                | Some(GridItem::PdfFile(_)) => {
+                    return std::ops::ControlFlow::Break(self.accept_grid_container_open(ctx, idx));
+                }
+                Some(GridItem::Video(p)) if external_player_video => {
+                    crate::ui_helpers::open_external_player(p);
+                }
+                Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+                | Some(GridItem::Video(_))
+                | Some(GridItem::Audio(_)) => {
+                    #[cfg(windows)]
+                    if !self.prepare_detached_context_for_grid_open(ctx, idx) {
+                        return std::ops::ControlFlow::Break(None);
+                    }
+                    // 動画も画像と同じくフルスクリーン化 → インライン再生。
+                    // Shift+Enter は上の専用分岐で外部プレイヤーへ。
+                    // Phase 7.J: Enter からの open はグリッド意図扱い。
+                    self.bump_input_seq_for_item("grid_enter", idx);
+                    self.fs_open_intent_from_grid = true;
+                    // P10-1 follow-up: Enter で open した直後、同フレームの
+                    // input queue に残った Enter event を `handle_fullscreen_root_key_input`
+                    // が拾って即 close する事故を防ぐ。詳細は
+                    // `fs_suppress_enter_close_until_release` の doc 参照。
+                    self.fs_suppress_enter_close_until_release = true;
+                    self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
+                }
+                Some(GridItem::ConvertibleArchive { path, .. }) => {
+                    let pf = path.clone();
+                    let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
+                    if self.begin_smart_grid_container_navigation(
+                        idx,
+                        pf.clone(),
+                        auto_fs,
+                        crate::app::StartupListIntent::container_open(auto_fs),
+                    ) {
+                        return std::ops::ControlFlow::Break(None);
+                    }
+                    let owner = self.main_grid_archive_open_owner(idx, &pf);
+                    self.capture_main_folder_list_order(idx);
+                    let _open_outcome = self
+                        .load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                            pf,
+                            auto_fs,
+                            owner,
+                            crate::app::StartupListIntent::container_open(auto_fs),
+                        );
+                }
+                Some(GridItem::SearchContainer { path, kind, .. }) => {
+                    // Ctrl+G 結果ビュー (Aggregated) でコンテナを Enter
+                    // → drill-down view に切り替え (v1: 1 階層のみ, docs §10.3)
+                    let p = path.clone();
+                    let is_zip = matches!(kind, crate::grid_item::SearchContainerKind::Zip);
+                    // ★コンテナを開いた時、内部画像が未評価で空表示にならないよう
+                    // フィルタを一時解除する (Codex P2)。
+                    self.maybe_suppress_rating_filter_for_opened_container_path(&p);
+                    self.drill_into_container(p, is_zip);
+                    return std::ops::ControlFlow::Break(None);
+                }
+                // レーティング一覧に復元された ZipDir は zip_nav を持たないので、
+                // 外側 ZIP を開いてから該当 prefix へ入る。
+                Some(GridItem::ZipDir {
+                    zip_path,
+                    dir_prefix,
+                    ..
+                }) if self.items_are_rating_view => {
+                    self.open_rating_view_zipdir(zip_path.clone(), dir_prefix.clone());
+                }
+                // ZipDir activation はマウス・パッドと同じ入口で意図を決める。
+                Some(GridItem::ZipDir { .. }) => {
+                    // Main activation was consumed before the generic detached router.
+                }
+                // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の
+                // stack_try_open_from_grid で処理済み (フラットフルスクリーンへ)。
+                // 非スタックモードでは Stack セルは存在しないので網羅性のため no-op。
+                Some(GridItem::Stack { .. }) => {}
+                Some(GridItem::CollectionPlaceholder { .. }) => {
+                    self.show_feedback_warning("この参照は現在見つからないため開けません".into());
+                }
+                None => {}
+            }
+        }
+        std::ops::ControlFlow::Continue(())
+    }
+}
+
 #[cfg(windows)]
 impl App {
     #[cfg(all(windows, feature = "test-script"))]
@@ -3571,7 +3712,7 @@ impl App {
              mounted_window_id={:?}",
             self.detached_viewer_window_id()
         ));
-        if let Some(nav) = self.execute_right_drag_command(ctx, command) {
+        if let Some(nav) = self.execute_right_drag_command_before_fullscreen_render(ctx, command) {
             self.mouse_ring_nav = Some(nav);
         }
         true
@@ -60050,16 +60191,7 @@ impl App {
             ),
         ] {
             if self.keymap.consume_action(ctx, action) {
-                if self.is_snapshot_active() {
-                    let _ = self.snapshot_navigate_grid(forward);
-                } else if self.route_tag_view_grid_book_navigation(ctx, forward) {
-                } else if self.items_are_subfolder_expansion_view {
-                    self.cancel_pending_folder_nav();
-                } else if self.start_list_origin_grid_navigation(ctx, forward, mode.sibling_only())
-                {
-                } else if let Some(folder) = self.effective_folder() {
-                    self.start_folder_nav(folder, forward, mode);
-                }
+                self.execute_grid_refresh_book_navigation(ctx, forward, mode);
                 return None;
             }
         }
@@ -60536,7 +60668,17 @@ impl App {
 
             let new_sel = new_vis_pos.and_then(|vp| vi.get(vp).copied());
 
-            if let Some(s) = new_sel {
+            if cursor_direction.is_none() && (home || end) && !shift {
+                self.move_grid_selection_to_edge(
+                    ctx,
+                    if home {
+                        gamepad_input::GridSelectionEdge::First
+                    } else {
+                        gamepad_input::GridSelectionEdge::Last
+                    },
+                    "grid_key",
+                );
+            } else if let Some(s) = new_sel {
                 let movement = if shift {
                     GridCursorMove::Extend {
                         anchor: grid_selection_anchor(
@@ -60727,126 +60869,10 @@ impl App {
                     .and_then(|idx| self.items.get(idx))
                     .is_some_and(|item| matches!(item, GridItem::Video(_)));
             if open_selected_key || external_player_video {
-                // Shift+Enter などに割り当てた専用コマンドで動画を外部プレイヤーで開く
-                // (フルスクリーン中と
-                // 同じ挙動をグリッドからも使えるようにする)。
-                if let Some(idx) = self.selected {
-                    if self.items_are_bookmark_view {
-                        if let Some(row) = self.bookmark_browser_rows.get(idx).cloned() {
-                            self.open_bookmark_browser_row(ctx, &row);
-                        }
-                        return None;
-                    }
-                    if !self.guard_reading_history_open(idx) {
-                        return None;
-                    }
-                    if self.activate_main_zipdir(idx, ctx)
-                        != crate::app::ZipDirActivationOutcome::NotApplicable
-                    {
-                        return None;
-                    }
-                    self.capture_main_list_restore_cursor();
-                    // ファイル名スタックの集約グリッドでメディアセルを Enter したら、フラット読書
-                    // フルスクリーンへ (スタック/単独画像/動画を直接開く)。コンテナは false で通常へ。
-                    // ただし Shift+Enter で動画を外部プレイヤーに渡す経路は intercept より優先する
-                    // (= 動画 + shift_enter のときは intercept をスキップして下の Video arm に流す)。
-                    let stack_skip_for_external_video = external_player_video
-                        && matches!(self.items.get(idx), Some(GridItem::Video(_)));
-                    if !stack_skip_for_external_video
-                        && self.stack_try_open_from_grid(ctx, idx, false)
-                    {
-                        return None;
-                    }
-                    #[cfg(windows)]
-                    if self.open_grid_container_in_detached_book_context(ctx, idx) {
-                        return None;
-                    }
-                    match self.items.get(idx) {
-                        Some(GridItem::Folder(_))
-                        | Some(GridItem::ZipFile(_))
-                        | Some(GridItem::PdfFile(_)) => {
-                            return self.accept_grid_container_open(ctx, idx);
-                        }
-                        Some(GridItem::Video(p)) if external_player_video => {
-                            crate::ui_helpers::open_external_player(p);
-                        }
-                        Some(GridItem::Image(_))
-                        | Some(GridItem::ZipImage { .. })
-                        | Some(GridItem::PdfPage { .. })
-                        | Some(GridItem::Video(_))
-                        | Some(GridItem::Audio(_)) => {
-                            #[cfg(windows)]
-                            if !self.prepare_detached_context_for_grid_open(ctx, idx) {
-                                return None;
-                            }
-                            // 動画も画像と同じくフルスクリーン化 → インライン再生。
-                            // Shift+Enter は上の専用分岐で外部プレイヤーへ。
-                            // Phase 7.J: Enter からの open はグリッド意図扱い。
-                            self.bump_input_seq_for_item("grid_enter", idx);
-                            self.fs_open_intent_from_grid = true;
-                            // P10-1 follow-up: Enter で open した直後、同フレームの
-                            // input queue に残った Enter event を `handle_fullscreen_root_key_input`
-                            // が拾って即 close する事故を防ぐ。詳細は
-                            // `fs_suppress_enter_close_until_release` の doc 参照。
-                            self.fs_suppress_enter_close_until_release = true;
-                            self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
-                        }
-                        Some(GridItem::ConvertibleArchive { path, .. }) => {
-                            let pf = path.clone();
-                            let auto_fs = self.settings.effective_auto_fullscreen_zip_pdf();
-                            if self.begin_smart_grid_container_navigation(
-                                idx,
-                                pf.clone(),
-                                auto_fs,
-                                crate::app::StartupListIntent::container_open(auto_fs),
-                            ) {
-                                return None;
-                            }
-                            let owner = self.main_grid_archive_open_owner(idx, &pf);
-                            self.capture_main_folder_list_order(idx);
-                            let _open_outcome = self
-                                .load_folder_or_convert_archive_with_auto_fullscreen_owned(
-                                    pf,
-                                    auto_fs,
-                                    owner,
-                                    crate::app::StartupListIntent::container_open(auto_fs),
-                                );
-                        }
-                        Some(GridItem::SearchContainer { path, kind, .. }) => {
-                            // Ctrl+G 結果ビュー (Aggregated) でコンテナを Enter
-                            // → drill-down view に切り替え (v1: 1 階層のみ, docs §10.3)
-                            let p = path.clone();
-                            let is_zip = matches!(kind, crate::grid_item::SearchContainerKind::Zip);
-                            // ★コンテナを開いた時、内部画像が未評価で空表示にならないよう
-                            // フィルタを一時解除する (Codex P2)。
-                            self.maybe_suppress_rating_filter_for_opened_container_path(&p);
-                            self.drill_into_container(p, is_zip);
-                            return None;
-                        }
-                        // レーティング一覧に復元された ZipDir は zip_nav を持たないので、
-                        // 外側 ZIP を開いてから該当 prefix へ入る。
-                        Some(GridItem::ZipDir {
-                            zip_path,
-                            dir_prefix,
-                            ..
-                        }) if self.items_are_rating_view => {
-                            self.open_rating_view_zipdir(zip_path.clone(), dir_prefix.clone());
-                        }
-                        // ZipDir activation はマウス・パッドと同じ入口で意図を決める。
-                        Some(GridItem::ZipDir { .. }) => {
-                            // Main activation was consumed before the generic detached router.
-                        }
-                        // ファイル名スタック (v2.0.0): 集約グリッドのセルは上の
-                        // stack_try_open_from_grid で処理済み (フラットフルスクリーンへ)。
-                        // 非スタックモードでは Stack セルは存在しないので網羅性のため no-op。
-                        Some(GridItem::Stack { .. }) => {}
-                        Some(GridItem::CollectionPlaceholder { .. }) => {
-                            self.show_feedback_warning(
-                                "この参照は現在見つからないため開けません".into(),
-                            );
-                        }
-                        None => {}
-                    }
+                if let std::ops::ControlFlow::Break(nav) =
+                    self.execute_grid_open_selected_with_flow(ctx, external_player_video)
+                {
+                    return nav;
                 }
             }
         }
@@ -60887,6 +60913,23 @@ impl App {
         );
 
         None
+    }
+
+    fn execute_grid_refresh_book_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+        mode: FolderNavMode,
+    ) {
+        if self.is_snapshot_active() {
+            let _ = self.snapshot_navigate_grid(forward);
+        } else if self.route_tag_view_grid_book_navigation(ctx, forward) {
+        } else if self.items_are_subfolder_expansion_view {
+            self.cancel_pending_folder_nav();
+        } else if self.start_list_origin_grid_navigation(ctx, forward, mode.sibling_only()) {
+        } else if let Some(folder) = self.effective_folder() {
+            self.start_folder_nav(folder, forward, mode);
+        }
     }
 
     /// Resolved key actions only: this dispatch never probes native key state.
@@ -103457,7 +103500,7 @@ impl App {
             self.consume_video_thumb_overrides_dirty();
         }
 
-        self.input_main_grid_shortcuts(ctx, main_viewer_blocked);
+        let script_grid_nav = self.input_main_grid_shortcuts(ctx, main_viewer_blocked);
         let t_toolbar_input = frame_t0.elapsed();
         mark_update_perf(&mut update_perf, UpdatePerfStage::ToolbarAndInput);
 
@@ -103551,7 +103594,7 @@ impl App {
                 fav_nav,
                 toolbar_fav_nav,
                 fullscreen_close_nav,
-                keyboard_nav,
+                keyboard_nav: script_grid_nav.or(keyboard_nav),
                 keyboard_nav_from_fullscreen_close,
                 gamepad_nav,
                 address_nav,

@@ -911,14 +911,14 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         main_viewer_blocked: bool,
-    ) {
+    ) -> Option<crate::ui_main::AddressBarNav> {
         // Only menu/dialog ownership blocks this entire phase. Text-input
         // shortcuts retain the per-branch admission and keymap behavior below.
         if matches!(
             self.keyboard_owner_for_pass(ctx),
             crate::keyboard_input::KeyboardOwner::Modal
         ) {
-            return;
+            return None;
         }
         // ── F12: 画像・動画ビューア別ウィンドウモード ───────────────
         if !self.address_has_focus
@@ -944,6 +944,33 @@ impl App {
                 .consume_action_no_repeat(ctx, KeyAction::ToggleAlwaysOnTop)
         {
             self.toggle_always_on_top(ctx, ActionSurface::MainWindow);
+        }
+
+        if !self.address_has_focus
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+            && !self.global_search.has_focus
+            && !self.tag_view.has_focus
+            && !main_viewer_blocked
+            && !self.any_dialog_open()
+        {
+            for (index, action) in super::operation_script_runtime::SCRIPT_SLOT_ACTIONS
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                if self.keymap.consume_action_no_repeat(ctx, action) {
+                    return match self.run_script_slot(
+                        ctx,
+                        index as u8 + 1,
+                        super::operation_script_runtime::ScriptInputSurface::Grid,
+                        false,
+                    ) {
+                        super::operation_script_runtime::ScriptRunResult::Grid { nav, .. } => nav,
+                        _ => None,
+                    };
+                }
+            }
         }
 
         if !self.address_has_focus
@@ -1151,7 +1178,7 @@ impl App {
                 .keymap
                 .pressed_action(ctx, KeyAction::GridToggleDetailsView)
             {
-                self.toggle_grid_details_view();
+                self.execute_grid_view_key_action(KeyAction::GridToggleDetailsView);
             }
             let selected_cols = [
                 (KeyAction::GridColumnCount1, 1),
@@ -1177,15 +1204,12 @@ impl App {
             ]
             .into_iter()
             .find(|(action, _)| self.keymap.pressed_action(ctx, *action))
-            .map(|(_, cols)| cols);
-            if let Some(cols) = selected_cols {
-                self.set_grid_view_mode(crate::settings::GridViewMode::Thumbnail);
-                if cols != self.settings.grid_cols {
-                    self.settings.grid_cols = cols;
-                    self.settings.save();
-                }
+            .map(|(action, _)| action);
+            if let Some(action) = selected_cols {
+                self.execute_grid_view_key_action(action);
             }
         }
+        None
     }
 
     pub(super) fn post_render_main_navigation(
@@ -1503,12 +1527,15 @@ impl App {
                     crate::ui_dialogs::context_menu::ContextMenuAction::JumpToFolder(request) => {
                         self.begin_context_jump_to_folder(request)
                     }
-                    crate::ui_dialogs::context_menu::ContextMenuAction::OpenGridContainer {
-                        idx,
-                        mode,
-                    } => self
-                        .open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
-                        .and_then(|nav| match nav {
+                    action => {
+                        let nav = match action {
+                            crate::ui_dialogs::context_menu::ContextMenuAction::ScriptNavigation(nav) => Some(nav),
+                            crate::ui_dialogs::context_menu::ContextMenuAction::OpenGridContainer { idx, mode } => {
+                                self.open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
+                            }
+                            crate::ui_dialogs::context_menu::ContextMenuAction::JumpToFolder(_) => unreachable!(),
+                        };
+                        nav.and_then(|nav| match nav {
                             crate::ui_main::AddressBarNav::WorkerFavorite(path) => {
                                 navigate_scan_route = DirectoryScanRoute::Worker;
                                 self.dispatch_favorite_navigation(path)
@@ -1612,10 +1639,18 @@ impl App {
                                 self.dispatch_drive_jump_input(input);
                                 None
                             }
-                            crate::ui_main::AddressBarNav::HistoryBack
-                            | crate::ui_main::AddressBarNav::HistoryForward
-                            | crate::ui_main::AddressBarNav::SavedGroupReady(_) => None,
-                        }),
+                            crate::ui_main::AddressBarNav::HistoryBack => self
+                                .dispatch_main_folder_history_input(FolderHistoryDirection::Back),
+                            crate::ui_main::AddressBarNav::HistoryForward => self
+                                .dispatch_main_folder_history_input(
+                                    FolderHistoryDirection::Forward,
+                                ),
+                            crate::ui_main::AddressBarNav::SavedGroupReady(id) => {
+                                self.adopt_saved_group_ready(id);
+                                None
+                            }
+                        })
+                    }
                 }
             } else if let Some(activation) = folder_pane_nav {
                 // フォルダツリーペインのクリック/Enter ナビは worker で scan_directory を
@@ -2511,6 +2546,64 @@ impl App {
         self.spread_shift
             .confirm_retained_readoption_modal_paint(ctx);
         self.poll_sidecar_restore(ctx);
+    }
+}
+
+#[cfg(test)]
+mod operation_script_grid_key_tests {
+    use super::*;
+
+    #[test]
+    fn grid_script_shortcut_uses_global_assignment_and_ignores_repeat_and_blocked_viewer() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.operation_script_enabled = true;
+        app.keymap = crate::keymap::Keymap::from_ini_str("[Global]\nScriptSlot1 = F13\n");
+        app.operation_script.state = crate::operation_script::OperationScriptState::Ready(Box::new(
+            crate::operation_script::CompiledOperationScript::compile(
+                r#"fn slots() { [#{slot:1,label:"キー",run:"entry"}] }
+                   fn entry(s) { if s.context == "grid" { #{run:[],notice:"一覧キーから実行"} } else { [] } }"#,
+            )
+            .unwrap(),
+        ));
+        let ctx = egui::Context::default();
+        for (repeat, blocked, expected) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            app.fs_feedback_toast = None;
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::F13,
+                    physical_key: Some(egui::Key::F13),
+                    pressed: true,
+                    repeat,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            app.input_update_begin(&ctx);
+            assert!(app.input_main_grid_shortcuts(&ctx, blocked).is_none());
+            assert_eq!(
+                app.fs_feedback_toast.is_some(),
+                expected,
+                "repeat={repeat} blocked={blocked}"
+            );
+            if expected {
+                assert!(
+                    app.fs_feedback_toast
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .contains("一覧キーから実行")
+                );
+            }
+            let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
+        }
     }
 }
 

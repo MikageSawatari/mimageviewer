@@ -674,6 +674,31 @@ Rust 側の表に「操作・種別・イベント可か・実行関数」を持
   本機能はそれらを待ったり、結果を見て続けたりしない。
 - 押したときに保存されるもの (見開きの設定など) はスクリプトでも保存される。
 
+#### リング実行の呼び出し元と段 2a / 2b の境界 (2026-11-25)
+
+製品コードの共通実行境界 `apply_ring_action` / `apply_ring_action_in_phase` の直接の呼び出し元は
+`execute_right_drag_command_in_phase` のリング・ジェスチャーの 2 分岐、`dispatch_mouse_button`、
+履歴消去キーの共用入口 `apply_history_clear_key_action`。
+テストからの直接呼び出しは下表の入力入口に数えない。各入口を所有者までたどった結果:
+
+| 入力と呼び出しの列 | 時点 / 所有者 | 段 2a のスクリプト操作 | 後続の段 |
+| --- | --- | --- | --- |
+| パッド X リング: `finish_gamepad_west_release` → `trigger_gamepad_ring_action` → `execute_right_drag_command_before_fullscreen_render` | 描画前。main update または取り付け済み context の更新 | 一覧は `Grid`、画像は `Viewer` で即時実行。画像の結果は `finish_fullscreen_key_action` に渡す | 動画・音声の実行は段 3 |
+| 持ち越した別ウィンドウの右ドラッグ: `update_active_viewer_context` → `execute_pending_right_drag_command_in_mounted_context` → `execute_right_drag_command_before_fullscreen_render` | 描画前。既存の取り付け済み context | 共通の利用資格へ渡し、別ウィンドウの viewer は拒否。取り付け・寿命は変更しない | 段 2b の描画内実行には使わない |
+| 一覧の右ドラッグ: `ui_main` の `update_grid_mouse_ring_flick_at` → 位置付きリング / ジェスチャー更新 → `dispatch_right_drag_recognition` → `execute_right_drag_command` | 一覧の描画中。ROOT の一覧面 | `Grid` で即時実行し、戻った `AddressBarNav` を既存の `mouse_ring_nav` へ渡す | 一覧には全画面の後処理問題はない |
+| 一覧の戻る / 進む / 中ボタン: `handle_keyboard` (一覧更新中は `handle_stack_refresh_keyboard`) → `apply_mouse_button` / `apply_mouse_back_forward_button` → `dispatch_mouse_button` | 一覧のキー処理中。ROOT の一覧面 | `Grid` で即時実行し、戻り値の `navigation` をそのまま返す | 同上 |
+| 画像・egui メディアの戻る / 進む: `handle_fs_key_input_with_operation` → `dispatch_mouse_button` | `render_fs_body` の準備後。または ROOT の予備キー処理と共用 | `MouseButtonDispatchResult.script_slot` を `FsKeyAction.script_slot` へ返す。ROOT の予備経路だけは既存のキー要求と同じく描画前に実行して後処理する | 通常・転送の描画内キー処理は、段 2b で所有 pass のローカル要求へ合流。段 2a では実行しない |
+| 画像・egui メディアのリング / ジェスチャー: `apply_fs_secondary_input` → `execute_right_drag_command` | `render_fs_body` 内、または保留されたホイール提案の適用内 | viewer の `ScriptSlot*` は未接続のまま。その場では実行しない | 段 2b で所有 pass のローカル要求へ返す。保留提案では通知して拒否 |
+| 画像・egui メディアの中ボタン: ホイール / クリック処理 → `apply_mouse_button` → `dispatch_mouse_button` | `render_fs_body` 内 | viewer の `ScriptSlot*` は未接続のまま | 段 2b で同じローカル要求へ返す |
+| native 動画の Browser キー / XButton / 中ボタン: `native_video` → `apply_mouse_back_forward_button` / `dispatch_mouse_button` | native 入力処理。ROOT の更新 | 実行は未接続 | 段 3。Browser キーの repeat 拒否もこの入口で行う |
+| native 動画のリング / ジェスチャー: 位置付き native 更新 → `dispatch_right_drag_recognition` → `execute_right_drag_command` | native 入力処理。ROOT、または既存の別ウィンドウ命令へ委譲 | 実行は未接続 | 段 3 |
+| `apply_history_clear_key_action` → `apply_ring_action` | 一覧のキー処理 | 履歴消去操作だけの対応表であり、`ScriptSlot*` は到達しない | スクリプト入口にはしない |
+
+`RingScriptPhase` は呼び出し時の区別だけで、App の状態ではない。既存の `apply_ring_action` /
+`execute_right_drag_command` は描画内からも呼ばれるため、viewer のスクリプトを即時実行しない。
+描画前と確認できる入口だけが `*_before_fullscreen_render` を呼ぶ。段 2b はこの区別を引き継ぎ、
+描画中の要求を描画前の後処理へ流さない。
+
 採らなかった代案:
 
 - キーの入口へ注入して 1 フレームに 1 つずつ流す (r1 の案)。§2.1 の理由で取りやめた。

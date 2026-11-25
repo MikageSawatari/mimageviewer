@@ -209,6 +209,7 @@ fn menu_key_frame(key: egui::Key) -> (FsKeyAction, bool) {
         egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup"),
     );
     let mut action = FsKeyAction {
+        script_slot: None,
         page_transition: Default::default(),
         close: false,
         close_to_page_list: false,

@@ -290,6 +290,7 @@ impl ContextMenuItemId {
             MenuCommand::EditBookComposition
             | MenuCommand::SpecifyCoverCrop
             | MenuCommand::ConvertEpubToPdf
+            | MenuCommand::ScriptSlot(_)
             | MenuCommand::ExternalTool(_)
             | MenuCommand::OpenWithAssociation { .. } => return None,
         })
@@ -861,6 +862,8 @@ pub enum MenuNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuCommand {
+    /// A named operation-script slot. Its label is supplied by the loaded script.
+    ScriptSlot(u8),
     /// Context-menu-only representative operation; deliberately has no key binding.
     SpecifyCoverCrop,
     /// Dynamic current-book operation; it has no application key binding.
@@ -1198,6 +1201,28 @@ fn push_group(nodes: &mut Vec<MenuNode>, group: impl IntoIterator<Item = MenuNod
         nodes.push(MenuNode::Separator);
     }
     nodes.append(&mut group);
+}
+
+/// Dynamic script entries are shared by the native and egui menu renderers.
+/// Keep them outside the saved static-item layout, like the script's slot names.
+pub(crate) fn append_script_slot_menu(
+    nodes: &mut Vec<MenuNode>,
+    slots: impl IntoIterator<Item = (u8, String)>,
+) {
+    let children: Vec<_> = slots
+        .into_iter()
+        .filter(|(_, label)| !label.trim().is_empty())
+        .map(|(slot, label)| item(MenuCommand::ScriptSlot(slot), label))
+        .collect();
+    if !children.is_empty() {
+        push_group(
+            nodes,
+            [MenuNode::Submenu {
+                label: "スクリプト".to_owned(),
+                children,
+            }],
+        );
+    }
 }
 
 pub(crate) const CAPTION_NO_TARGET_REASON: &str = "AI 説明文を作れる画像ファイルや本がありません。書庫内の画像・フォルダ、本のページ、動画・音声などは対象外です";
@@ -2046,6 +2071,39 @@ pub fn normalize_menu(nodes: Vec<MenuNode>) -> Vec<MenuNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_slot_menu_contains_only_named_slots_and_keeps_slot_numbers() {
+        let mut nodes = vec![item(MenuCommand::CopyPath, "既存の操作")];
+        append_script_slot_menu(
+            &mut nodes,
+            [
+                (1, "最初の操作".into()),
+                (2, "".into()),
+                (9, "末尾へ".into()),
+            ],
+        );
+        assert_eq!(nodes[0], item(MenuCommand::CopyPath, "既存の操作"));
+        assert_eq!(nodes[1], MenuNode::Separator);
+        assert_eq!(
+            nodes[2],
+            MenuNode::Submenu {
+                label: "スクリプト".into(),
+                children: vec![
+                    item(MenuCommand::ScriptSlot(1), "最初の操作"),
+                    item(MenuCommand::ScriptSlot(9), "末尾へ"),
+                ],
+            }
+        );
+        assert!(ContextMenuItemId::from_command(&MenuCommand::ScriptSlot(9)).is_none());
+
+        let before = nodes.clone();
+        append_script_slot_menu(&mut nodes, [(3, "  ".into())]);
+        assert_eq!(nodes, before);
+        let mut empty = Vec::new();
+        append_script_slot_menu(&mut empty, []);
+        assert!(empty.is_empty());
+    }
 
     #[test]
     fn context_menu_musicvideo_only_single_real_audio_on_both_surfaces() {

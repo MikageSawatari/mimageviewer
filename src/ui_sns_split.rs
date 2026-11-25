@@ -825,6 +825,7 @@ impl App {
             return Default::default();
         }
         let action = crate::ui_fullscreen::FsKeyAction {
+            script_slot: None,
             page_transition: Default::default(),
             close: false,
             close_to_page_list: false,

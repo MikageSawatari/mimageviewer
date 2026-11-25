@@ -2,6 +2,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use rhai::{AST, Dynamic, Engine, Scope};
 
@@ -15,12 +19,59 @@ pub struct CompiledOperationScript {
     pub(super) ast: AST,
     pub slots: Vec<ScriptSlot>,
     pub has_on_event: bool,
+    operations: Arc<AtomicU64>,
 }
 
 impl CompiledOperationScript {
+    /// コンパイル済みのスロットを、その入力面で捕捉した状態だけで評価する。
+    /// ファイル・DB・Appには触れない。
+    pub fn evaluate_slot(
+        &self,
+        number: u8,
+        snapshot: &super::StateSnapshot,
+    ) -> Result<super::ScriptOutput, String> {
+        self.operations.store(0, Ordering::Relaxed);
+        let slot = self
+            .slots
+            .iter()
+            .find(|slot| slot.number == number)
+            .ok_or_else(|| format!("スロット {number} は未登録です"))?;
+        let value = self
+            .engine
+            .call_fn::<Dynamic>(
+                &mut Scope::new(),
+                &self.ast,
+                &slot.function,
+                (snapshot.to_dynamic(),),
+            )
+            .map_err(|error| {
+                if matches!(
+                    error.unwrap_inner(),
+                    rhai::EvalAltResult::ErrorTooManyOperations(_)
+                        | rhai::EvalAltResult::ErrorStackOverflow(_)
+                        | rhai::EvalAltResult::ErrorDataTooLarge(..)
+                ) {
+                    "時間がかかりすぎたため中止".to_owned()
+                } else {
+                    format!("スクリプトの実行に失敗: {error}")
+                }
+            })?;
+        super::parse_output(value)
+    }
+
+    pub fn last_operation_count(&self) -> u64 {
+        self.operations.load(Ordering::Relaxed)
+    }
+
     /// 読み込みworker上でだけ呼ぶ。UIでのコンパイルし直しは行わない。
     pub fn compile(source: &str) -> Result<Self, String> {
-        let engine = build_engine();
+        let mut engine = build_engine();
+        let operations = Arc::new(AtomicU64::new(0));
+        let progress = operations.clone();
+        engine.on_progress(move |count| {
+            progress.store(count, Ordering::Relaxed);
+            None
+        });
         let ast = super::syntax::compile_checked(&engine, source)?;
         let has_on_event = ast
             .iter_functions()
@@ -34,6 +85,7 @@ impl CompiledOperationScript {
             ast,
             slots,
             has_on_event,
+            operations,
         })
     }
 }
@@ -183,6 +235,40 @@ fn ensure_user_script(path: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn evaluate_loaded_slot_records_operations_and_reports_budget_limit() {
+        use super::*;
+        let script = CompiledOperationScript::compile(
+            r#"
+            fn slots() { [#{slot:1,label:"test",run:"entry"}, #{slot:2,label:"limit",run:"limit"}] }
+            fn entry(s) { #{run:[],notice:s.context} }
+            fn limit(s) { loop {} }
+        "#,
+        )
+        .unwrap();
+        let snapshot = crate::operation_script::StateSnapshot::new(
+            crate::operation_script::ScriptContext::Grid,
+        );
+        assert_eq!(
+            script
+                .evaluate_slot(1, &snapshot)
+                .unwrap()
+                .notice
+                .as_deref(),
+            Some("grid")
+        );
+        assert!(script.last_operation_count() > 0);
+        assert!(script.last_operation_count() <= crate::operation_script::MAX_OPERATIONS);
+        assert!(
+            script
+                .evaluate_slot(2, &snapshot)
+                .unwrap_err()
+                .contains("時間がかかりすぎた")
+        );
+        assert!(script.evaluate_slot(20, &snapshot).is_err());
+        assert_eq!(script.last_operation_count(), 0);
+    }
+
     use super::*;
     use crate::operation_script::{ScriptContext, ScriptEvent, StateSnapshot, parse_output};
 

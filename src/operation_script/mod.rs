@@ -1,4 +1,5 @@
-//! 操作スクリプトの土台。入力・操作の実行・イベントの検出はまだ接続しない。
+//! 操作スクリプトのサンドボックス・読み込み・契約・状態の写し。
+//! 入力と同期実行の所有境界は app::operation_script_runtime に置く。
 //! 正本: docs/operation-script-plan.md (§1.363)。
 
 mod contract;
