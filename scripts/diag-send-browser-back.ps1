@@ -96,9 +96,9 @@ namespace MivBrowserKeyDiagnostic {
 '@
 }
 
-$browserVk = if ($Forward) { [ushort]0xA7 } else { [ushort]0xA6 }
+$browserVk = if ($Forward) { [uint16]0xA7 } else { [uint16]0xA6 }
 $browserName = if ($Forward) { 'Browser Forward' } else { 'Browser Back' }
-$browserScan = [ushort]([MivBrowserKeyDiagnostic.Native]::MapVirtualKeyW($browserVk, 0) -band 0xFF)
+$browserScan = [uint16]([MivBrowserKeyDiagnostic.Native]::MapVirtualKeyW($browserVk, 0) -band 0xFF)
 if ($browserScan -eq 0) {
     throw 'MapVirtualKeyW could not map the Browser key; nothing was sent.'
 }
