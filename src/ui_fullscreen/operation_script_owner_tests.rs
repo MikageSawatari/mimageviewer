@@ -6,10 +6,17 @@ use crate::ring_shortcut::{
 };
 
 fn ready(ctx: &egui::Context, operations: &str) -> crate::app::AppTestEnvForTest {
+    install_fs_navigator_input_tracking(ctx);
+    crate::key_input::install_operation_input_plugin(ctx);
     let mut app = page_turn_submission_tests::ready_app(ctx, SpreadMode::Single);
     app.settings.operation_script_enabled = true;
     app.settings.page_turn_animation_enabled = false;
+    app.settings.video_in_window_mode = true;
     app.viewer_presentation = crate::app::ViewerPresentation::MainWindow;
+    #[cfg(windows)]
+    {
+        app.native_video_in_window_active = true;
+    }
     app.keymap = crate::keymap::Keymap::from_ini_str("[Global]\nScriptSlot1 = F16\n");
     let source = format!(
         "fn slots() {{ [#{{slot:1,label:\"owner\",run:\"entry\"}}] }}\nfn entry(s) {{ {operations} }}"
@@ -121,6 +128,7 @@ fn operation_script_owner_real_embedded_render_runs_key_at_tail_and_rejects_repe
     let _serial = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
     let mut app = ready(&ctx, r#"["FsSpreadRtl"]"#);
+    assert!(app.fullscreen_embedded_still_active());
     for repeat in [false, true] {
         if repeat {
             app.spread_mode = SpreadMode::Single;
@@ -166,7 +174,10 @@ fn operation_script_owner_real_child_render_runs_in_owning_pass_and_navigates_on
             .drop_without_applying_deltas();
     });
     let mut app = ready(&ctx, r#"["FsPageNext"]"#);
+    app.settings.video_in_window_mode = false;
+    app.native_video_in_window_active = false;
     app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+    assert!(!app.fullscreen_embedded_still_active());
     ctx.run_ui(input(vec![]), |ui| app.render_fullscreen_viewport(ui))
         .drop_without_applying_deltas();
     assert_ne!(child_id.get(), egui::ViewportId::ROOT);
@@ -421,6 +432,15 @@ fn operation_script_owner_discard_conditions_do_not_run_or_retain_requests() {
     for reason in 0..7 {
         let ctx = egui::Context::default();
         let mut app = ready(&ctx, r#"["FsZoomIn"]"#);
+        if reason == 2 {
+            app.page_identity_index = Arc::new(
+                crate::app::file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &app.items,
+                    None,
+                    app.settings.file_type_visibility.clone(),
+                ),
+            );
+        }
         ctx.run_pass(input(vec![]), |ctx| {
             let mut frame = FsScriptFrame::default();
             app.collect_fs_script_slot(&mut frame, Some(1), FsScriptEntry::Key);
@@ -429,6 +449,7 @@ fn operation_script_owner_discard_conditions_do_not_run_or_retain_requests() {
                 1 => app.fullscreen_page_slice = crate::page_split::PageSlice::Left,
                 2 => {
                     assert!(app.open_page_overview_for_viewer(ctx));
+                    assert!(app.page_overview.session().is_some());
                 }
                 3 => app.discard_fs_script_request(&mut frame, "ViewerReplaced"),
                 4 => app.discard_fs_script_request(&mut frame, "frame_exited"),
@@ -556,40 +577,48 @@ fn operation_script_owner_discard_and_rejected_notices_survive_existing_navigati
 
 #[test]
 fn operation_script_owner_rebased_interruption_warning_survives_existing_navigation() {
-    let ctx = egui::Context::default();
-    let mut app = ready(&ctx, r#"["FsSpreadRtl","FsZoomIn"]"#);
-    app.adjustment_page_params
-        .insert(2, crate::adjustment::AdjustParams::default());
-    ctx.run_pass(input(vec![]), |ctx| {
-        let mut frame = FsScriptFrame::default();
-        app.collect_fs_script_slot(&mut frame, Some(1), FsScriptEntry::ContextMenu);
-        let mut action = FsKeyAction {
-            page_nav: FsPageNav::Delta(1).into(),
-            ..Default::default()
-        };
-        let zoom = app.fs_zoom;
-        finish(&mut app, ctx, &mut frame, &mut action);
-        assert!(matches!(
-            action.page_transition,
-            FsKeyPageTransition::Rebased { .. }
-        ));
-        assert_eq!(
-            app.fs_zoom, zoom,
-            "Rebased ends the script before its zoom action"
-        );
-        assert!(frame.notices.iter().any(|feedback| matches!(feedback,
-            ScriptFeedback::Warning(text) if text.contains("残りの操作を中止"))));
-        app.finish_fullscreen_key_action(ctx, 0, action);
-        assert_eq!(app.fullscreen_idx, Some(2));
-        assert_eq!(toast(&app), "ページ補正適用");
-        app.notify_fs_script_frame(&mut frame);
-        assert!(toast(&app).contains("残りの操作を中止"));
-        assert_eq!(
-            app.feedback_toasts_for_test.last().map(|(_, kind)| *kind),
-            Some(crate::feedback::FeedbackKind::Warning)
-        );
-    })
-    .drop_without_applying_deltas();
+    // Both requests were accepted before the script changes the spread mode.
+    for (accepted_nav, destination) in [(FsPageNav::Delta(1), 1), (FsPageNav::Target(2), 2)] {
+        let ctx = egui::Context::default();
+        let mut app = ready(&ctx, r#"["FsSpreadRtl","FsZoomIn"]"#);
+        app.adjustment_page_params
+            .insert(destination, crate::adjustment::AdjustParams::default());
+        ctx.run_pass(input(vec![]), |ctx| {
+            let mut frame = FsScriptFrame::default();
+            app.collect_fs_script_slot(&mut frame, Some(1), FsScriptEntry::ContextMenu);
+            let mut action = FsKeyAction {
+                page_nav: accepted_nav.into(),
+                ..Default::default()
+            };
+            let zoom = app.fs_zoom;
+            finish(&mut app, ctx, &mut frame, &mut action);
+            assert!(matches!(
+                action.page_transition,
+                FsKeyPageTransition::Rebased { .. }
+            ));
+            assert_eq!(app.spread_mode, SpreadMode::Rtl);
+            assert_eq!(
+                action.page_nav, accepted_nav,
+                "Rebased must retain the already accepted navigation"
+            );
+            assert_eq!(
+                app.fs_zoom, zoom,
+                "Rebased ends the script before its zoom action"
+            );
+            assert!(frame.notices.iter().any(|feedback| matches!(feedback,
+                ScriptFeedback::Warning(text) if text.contains("残りの操作を中止"))));
+            app.finish_fullscreen_key_action(ctx, 0, action);
+            assert_eq!(app.fullscreen_idx, Some(destination));
+            assert_eq!(toast(&app), "ページ補正適用");
+            app.notify_fs_script_frame(&mut frame);
+            assert!(toast(&app).contains("残りの操作を中止"));
+            assert_eq!(
+                app.feedback_toasts_for_test.last().map(|(_, kind)| *kind),
+                Some(crate::feedback::FeedbackKind::Warning)
+            );
+        })
+        .drop_without_applying_deltas();
+    }
 }
 
 #[test]
@@ -718,11 +747,20 @@ fn operation_script_owner_rebased_result_is_returned_without_preparing_again() {
 fn operation_script_owner_closed_is_terminal_and_keeps_rating_undo() {
     let ctx = egui::Context::default();
     let mut app = ready(&ctx, r#"["FsZoomIn"]"#);
+    let changes = vec![crate::undo_stack::RatingChange {
+        path_key: "c:/page-turn/0.png".into(),
+        source_path: PathBuf::from("c:/page-turn/0.png"),
+        meta: None,
+        xmp_target: None,
+        before: 3,
+        after: 0,
+    }];
     app.meta_undo.push(crate::undo_stack::UndoEntry::Rating {
-        changes: vec![],
+        changes: changes.clone(),
         origin: None,
         summary: "rating close".into(),
     });
+    assert_eq!(app.meta_undo.undo_len(), 1);
     let mut frame = FsScriptFrame::default();
     app.collect_fs_script_slot(&mut frame, Some(1), FsScriptEntry::Key);
     app.fullscreen_idx = None;
@@ -736,6 +774,9 @@ fn operation_script_owner_closed_is_terminal_and_keeps_rating_undo() {
     assert_eq!(action.page_transition, FsKeyPageTransition::Closed);
     assert!(!action.close);
     assert_eq!(app.meta_undo.undo_len(), 1);
+    assert!(matches!(app.meta_undo.peek_undo(),
+        Some(crate::undo_stack::UndoEntry::Rating { changes: actual, origin: None, summary })
+            if actual == &changes && summary == "rating close"));
 }
 
 #[cfg(windows)]
@@ -744,6 +785,7 @@ fn operation_script_owner_real_rating_closed_exits_render_without_clearing_undo(
     let _serial = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
     let mut app = ready(&ctx, r#"["RatingItemClear"]"#);
+    assert!(app.fullscreen_embedded_still_active());
     let folder = app.tmp.path().join("script-rating-close");
     std::fs::create_dir_all(&folder).unwrap();
     for idx in 0..app.items.len() {
@@ -829,6 +871,11 @@ fn operation_script_owner_child_text_gate_uses_child_pass_instead_of_root() {
     let ctx = egui::Context::default();
     crate::ime_focus::install_ime_input_policy(&ctx);
     let mut app = ready(&ctx, r#"["FsZoomIn"]"#);
+    app.settings.video_in_window_mode = false;
+    #[cfg(windows)]
+    {
+        app.native_video_in_window_active = false;
+    }
     app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
     let mut frame = FsScriptFrame::default();
     app.collect_fs_script_slot(&mut frame, Some(1), FsScriptEntry::Pointer);
