@@ -1895,6 +1895,65 @@ mod tests {
     }
 
     #[test]
+    fn favorite_cover_auto_crop_image_folder_zip_actual_copy_preserves_preference() {
+        use crate::cover_auto_crop::{AutoCropIdentity, CoverAutoCropScope};
+        use crate::settings::{
+            FavoriteCoverAutoCropPreference as Preference, FavoriteEntry, ReadingDirection,
+        };
+
+        for preference in [Preference::On, Preference::Off] {
+            let mut app = setup_app_for_test();
+            let source = app.tmp.path().join("book");
+            let destination = source.with_extension("zip");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("a.jpg"), b"image").unwrap();
+            let mut favorite = FavoriteEntry::new("私の本".into(), source.clone());
+            favorite.cover_auto_crop = preference;
+            let old_id = favorite.id;
+            app.settings.thumb_cover_auto_crop = preference == Preference::Off;
+            app.settings.thumb_cover_auto_crop_binding = ReadingDirection::Ltr;
+            app.settings.thumb_cover_auto_crop_folders = true;
+            app.settings.favorites.push(favorite);
+            crate::settings_db::with_db_result(|db| db.save_full(&app.settings)).unwrap();
+
+            let ctx = egui::Context::default();
+            finish_actual_worker(&mut app, &ctx, source.clone(), false);
+            app.poll_image_folder_zip(&ctx);
+            let copied = app
+                .settings
+                .favorites
+                .iter()
+                .find(|favorite| favorite.path == destination)
+                .unwrap();
+            assert_ne!(copied.id, old_id);
+            assert_eq!(copied.cover_auto_crop, preference);
+            let loaded = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+            let stored_copy = loaded
+                .favorites
+                .iter()
+                .find(|favorite| favorite.id == copied.id)
+                .unwrap();
+            assert_eq!(stored_copy.path, destination);
+            assert_eq!(stored_copy.cover_auto_crop, preference);
+            assert_eq!(
+                loaded.favorite_by_id(old_id).unwrap().cover_auto_crop,
+                preference
+            );
+            let expected = (preference == Preference::On).then_some(AutoCropIdentity {
+                binding: ReadingDirection::Ltr,
+                folders: true,
+            });
+            for scope in [
+                CoverAutoCropScope::from_settings(&app.settings),
+                CoverAutoCropScope::from_settings(&loaded),
+            ] {
+                assert_eq!(scope.identity_for(&source), expected);
+                assert_eq!(scope.identity_for(&destination), expected);
+            }
+        }
+    }
+
+    #[test]
     fn image_folder_zip_main_selects_only_visible_destination_for_all_policies() {
         for policy in [
             SameNameFolderBook::PreferBook,

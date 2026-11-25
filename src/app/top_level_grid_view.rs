@@ -749,7 +749,7 @@ pub(crate) struct CollectionGridPreparedInstall {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CollectionGridThumbnailSources {
-    pub(crate) auto_cover_crop: Option<crate::cover_auto_crop::AutoCropIdentity>,
+    pub(crate) cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope,
     pub(crate) video_sidecars: std::collections::HashMap<String, PathBuf>,
     pub(crate) video_pin_blobs: std::sync::Arc<std::collections::HashMap<PathBuf, Vec<u8>>>,
     pub(crate) folder_pin_map:
@@ -805,7 +805,7 @@ pub(crate) fn collection_pin_blob_sizes_fit_retention_budget(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CollectionGridPrepareReuseKey {
-    pub(crate) auto_cover_crop: Option<crate::cover_auto_crop::AutoCropIdentity>,
+    pub(crate) cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope,
     pub(crate) file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     pub(crate) order: crate::collection_store::CollectionPrepareReuseKey,
     pub(crate) sidecar_scan_fingerprint: i64,
@@ -828,7 +828,9 @@ impl CollectionGridPrepareReuseKey {
         thumbnail_source_epoch: u64,
     ) -> Self {
         Self {
-            auto_cover_crop: super::configured_thumbnail_auto_crop(settings),
+            cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope::from_settings(
+                settings,
+            ),
             file_type_visibility: settings.file_type_visibility.clone(),
             order: crate::collection_store::CollectionPrepareReuseKey::new(
                 collection_id,

@@ -155,6 +155,7 @@ mod tests {
         let mut env = crate::app::setup_app_for_test();
         let destination = env.tmp.path().join("favorite");
         env.settings.favorites = vec![crate::settings::FavoriteEntry {
+            cover_auto_crop: Default::default(),
             id: uuid::Uuid::new_v4(),
             name: "modal test favorite".into(),
             path: destination.clone(),

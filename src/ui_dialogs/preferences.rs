@@ -24,8 +24,8 @@ thread_local! {
 }
 
 fn cover_auto_crop_changed(before: &Settings, after: &Settings) -> bool {
-    crate::app::configured_thumbnail_auto_crop(before)
-        != crate::app::configured_thumbnail_auto_crop(after)
+    crate::cover_auto_crop::CoverAutoCropScope::from_settings(before)
+        != crate::cover_auto_crop::CoverAutoCropScope::from_settings(after)
 }
 
 pub(crate) fn draw_same_name_folder_book_settings(
@@ -3073,7 +3073,6 @@ impl App {
             let old_show_hidden_files = self.settings.show_hidden_files;
             let file_type_visibility_changed =
                 self.settings.file_type_visibility != state.settings.file_type_visibility;
-            let cover_auto_crop_changed = cover_auto_crop_changed(&self.settings, &state.settings);
             let old_exif = self.settings.exif_hidden_tags.clone();
 
             let old_susie = (
@@ -3170,6 +3169,7 @@ impl App {
                 self.advance_media_memory_clear_generation();
             }
             prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
+            let cover_auto_crop_changed = cover_auto_crop_changed(&self.settings, &state.settings);
             self.install_preferences_settings(state.settings);
             if old_thumb_container_icon_kinds != self.settings.thumb_container_icon_kinds {
                 let new = self.settings.thumb_container_icon_kinds;
@@ -6767,6 +6767,25 @@ mod tests {
             );
             probe = Some(assert_grid_background(&harness, probe));
         }
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_preferences_reload_uses_live_favorite_on_scope() {
+        use crate::settings::{FavoriteCoverAutoCropPreference, FavoriteEntry};
+        let mut before = Settings::default();
+        before.thumb_cover_auto_crop = false;
+        let mut favorite = FavoriteEntry::new("books".into(), PathBuf::from(r"C:\books"));
+        favorite.cover_auto_crop = FavoriteCoverAutoCropPreference::On;
+        before.favorites.push(favorite);
+        let mut after = before.clone();
+        after.thumb_cover_auto_crop_binding = crate::settings::ReadingDirection::Ltr;
+        assert!(cover_auto_crop_changed(&before, &after));
+        after = before.clone();
+        after.thumb_cover_auto_crop_folders = !before.thumb_cover_auto_crop_folders;
+        assert!(cover_auto_crop_changed(&before, &after));
+        after = before.clone();
+        after.favorites[0].cover_auto_crop = FavoriteCoverAutoCropPreference::Off;
+        assert!(cover_auto_crop_changed(&before, &after));
     }
 
     #[test]

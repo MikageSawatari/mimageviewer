@@ -177,7 +177,8 @@ fn cover_crop_png_orientation6_auto_accept_reload_keeps_legacy_manual_pixels_in_
         assert_eq!(sample, Ok(0.7));
         let catalog =
             Arc::new(crate::catalog::CatalogDb::open(&root.join("cache"), &root).unwrap());
-        let mut auto_request = request(&book, folder, env.auto_cover_crop);
+        let mut auto_request =
+            request(&book, folder, env.cover_auto_crop_scope.identity_for(&book));
         let auto = super::rotation_tests::worker(&mut auto_request, &catalog, &pins);
         assert_eq!(
             auto.iter()
@@ -274,7 +275,7 @@ fn cover_crop_worker_and_dialog_continue_for_transposed_page_dimensions_at_every
             };
             let env = BookCoverEnv {
                 books_root: Some(root.to_owned()),
-                auto_cover_crop: crate::app::configured_thumbnail_auto_crop(&settings),
+                cover_auto_crop_scope: CoverAutoCropScope::from_settings(&settings),
                 ..Default::default()
             };
             let container = BookCoverContainer {
@@ -320,7 +321,7 @@ fn cover_crop_worker_and_dialog_continue_for_transposed_page_dimensions_at_every
                 crate::folder_thumb_pins::FolderThumbPinDb::open_at(&root.join("pins.db")).unwrap();
             let catalog =
                 Arc::new(crate::catalog::CatalogDb::open(&root.join("cache"), root).unwrap());
-            let mut req = request(&book, folder, env.auto_cover_crop);
+            let mut req = request(&book, folder, env.cover_auto_crop_scope.identity_for(&book));
             let messages = super::rotation_tests::worker(&mut req, &catalog, &pins);
             let pixels = messages.iter().find_map(ThumbMsg::pixels).unwrap();
             assert_eq!(

@@ -29,10 +29,12 @@ fn cover_crop_dialog_reads_saved_body_rotations_with_worker_sample_keys() {
     for is_folder in [false, true] {
         let env = BookCoverEnv {
             books_root: Some(data.path().join("unused-books")),
-            auto_cover_crop: Some(crate::cover_auto_crop::AutoCropIdentity {
-                binding: crate::settings::ReadingDirection::Rtl,
-                folders: is_folder,
-            }),
+            cover_auto_crop_scope: CoverAutoCropScope::for_identity(Some(
+                crate::cover_auto_crop::AutoCropIdentity {
+                    binding: crate::settings::ReadingDirection::Rtl,
+                    folders: is_folder,
+                },
+            )),
             ..Default::default()
         };
         let container = BookCoverContainer {
@@ -278,7 +280,7 @@ fn cover_crop_worker_and_dialog_match_all_four_angles_for_png_jpeg_and_binding()
                     };
                     let env = BookCoverEnv {
                         books_root: Some(temp.path().to_owned()),
-                        auto_cover_crop: crate::app::configured_thumbnail_auto_crop(&settings),
+                        cover_auto_crop_scope: CoverAutoCropScope::from_settings(&settings),
                         ..Default::default()
                     };
                     let dialog = prepare_cover(
@@ -325,7 +327,7 @@ fn cover_crop_worker_and_dialog_match_all_four_angles_for_png_jpeg_and_binding()
                         source_policy: crate::thumb_loader::LoadSourcePolicy::SourceOnly,
                         ..Default::default()
                     };
-                    req.set_auto_cover_crop(env.auto_cover_crop);
+                    req.set_auto_cover_crop(env.cover_auto_crop_scope.identity_for(&req.path));
                     let (tx, rx) = mpsc::channel();
                     let done = Arc::new(AtomicUsize::new(0));
                     let catalog = Arc::new(
