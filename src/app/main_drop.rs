@@ -8,6 +8,7 @@ use eframe::egui;
 use super::App;
 use crate::main_drop_target::{DropGeometry, DropPlace, DropRequest, DropRow};
 use crate::shell_file_ops::{ShellTransferRequest, ShellTransferResult};
+use crate::shell_paste::{ShellPasteCompletion, ShellPasteError};
 use crate::ui_dialogs::file_organize::{FileOrganizeRequest, FileOrganizeRunning};
 
 pub(crate) const SHELL_PASTE_BUSY_MESSAGE: &str = "貼り付けが完了するまでお待ちください";
@@ -32,17 +33,37 @@ impl ShellPasteOrigin {
 }
 
 pub(crate) struct ShellPasteRunning {
-    pub(crate) rx: mpsc::Receiver<Result<(), crate::shell_paste::ShellPasteError>>,
+    pub(crate) rx: mpsc::Receiver<ShellPasteCompletion>,
     pub(crate) selection_id: Option<crate::post_operation_selection::PostOperationSelectionId>,
     pub(crate) origin: ShellPasteOrigin,
     pub(crate) started_at: std::time::Instant,
     pub(crate) perf_seq: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellPasteOutcome {
+    Invoked,
+    Failed,
+    StartFailed,
+    Disconnected,
+}
+
+impl ShellPasteOutcome {
+    fn perf_tag(self) -> &'static str {
+        match self {
+            Self::Invoked => "invoked",
+            Self::Failed => "failed",
+            Self::StartFailed => "start_failed",
+            Self::Disconnected => "disconnected",
+        }
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static BOOKS_ROOT_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static MODIFIER_RESYNC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SHELL_PASTE_END_FIELDS: std::cell::RefCell<Vec<serde_json::Value>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -429,7 +450,7 @@ impl App {
                     origin,
                     started_at,
                     perf_seq,
-                    "start_failed",
+                    ShellPasteOutcome::StartFailed,
                     Some(SHELL_PASTE_START_FAILURE),
                 );
             }
@@ -440,25 +461,35 @@ impl App {
         let Some(running) = self.shell_paste_request.take() else {
             return;
         };
-        let (outcome, warning) = match running.rx.try_recv() {
+        let completion = match running.rx.try_recv() {
             Err(mpsc::TryRecvError::Empty) => {
                 self.shell_paste_request = Some(running);
                 return;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 crate::logger::log("shell_paste: invocation worker disconnected");
-                ("disconnected", Some(SHELL_PASTE_COMPLETION_FAILURE))
+                None
             }
-            Ok(Ok(())) => ("ok", None),
-            Ok(Err(crate::shell_paste::ShellPasteError::Start(error))) => {
+            Ok(completion) => Some(completion),
+        };
+        let (outcome, warning) = match completion.map(|c| c.invocation) {
+            None => (
+                ShellPasteOutcome::Disconnected,
+                Some(SHELL_PASTE_COMPLETION_FAILURE),
+            ),
+            Some(Ok(())) => (ShellPasteOutcome::Invoked, None),
+            Some(Err(ShellPasteError::Start(error))) => {
                 crate::logger::log(format!(
                     "shell_paste: invocation worker unavailable: {error}"
                 ));
-                ("start_failed", Some(SHELL_PASTE_START_FAILURE))
+                (
+                    ShellPasteOutcome::StartFailed,
+                    Some(SHELL_PASTE_START_FAILURE),
+                )
             }
-            Ok(Err(crate::shell_paste::ShellPasteError::Invocation(error))) => {
+            Some(Err(ShellPasteError::Invocation(error))) => {
                 crate::logger::log(format!("shell_paste: invocation failed: {error}"));
-                ("failed", None)
+                (ShellPasteOutcome::Failed, None)
             }
         };
         self.finish_shell_paste_invocation(
@@ -480,10 +511,16 @@ impl App {
         origin: ShellPasteOrigin,
         started_at: std::time::Instant,
         perf_seq: u64,
-        outcome: &'static str,
+        outcome: ShellPasteOutcome,
         warning: Option<&str>,
     ) {
-        if outcome != "ok"
+        let retire_selection = match outcome {
+            ShellPasteOutcome::Invoked => false,
+            ShellPasteOutcome::Failed
+            | ShellPasteOutcome::StartFailed
+            | ShellPasteOutcome::Disconnected => true,
+        };
+        if retire_selection
             && let Some(id) = selection_id
             && self
                 .post_operation_selection
@@ -498,21 +535,26 @@ impl App {
         Self::resync_egui_modifiers_from_os(ctx);
         self.refresh_main_drop_admission(ctx);
         ctx.request_repaint_of(egui::ViewportId::ROOT);
-        if crate::perf::is_enabled() {
-            crate::perf::event(
-                "shell_paste",
-                "end",
-                None,
-                perf_seq,
-                &[
-                    ("origin", serde_json::Value::from(origin.perf_tag())),
-                    (
-                        "ms",
-                        serde_json::Value::from(started_at.elapsed().as_secs_f64() * 1000.0),
-                    ),
-                    ("outcome", serde_json::Value::from(outcome)),
-                ],
-            );
+        if cfg!(test) || crate::perf::is_enabled() {
+            let fields = [
+                ("origin", serde_json::Value::from(origin.perf_tag())),
+                (
+                    "ms",
+                    serde_json::Value::from(started_at.elapsed().as_secs_f64() * 1000.0),
+                ),
+                ("outcome", serde_json::Value::from(outcome.perf_tag())),
+            ];
+            #[cfg(test)]
+            SHELL_PASTE_END_FIELDS.with_borrow_mut(|events| {
+                events.push(
+                    fields
+                        .iter()
+                        .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                        .collect::<serde_json::Map<_, _>>()
+                        .into(),
+                );
+            });
+            crate::perf::event("shell_paste", "end", None, perf_seq, &fields);
         }
     }
 }

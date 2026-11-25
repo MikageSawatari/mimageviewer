@@ -7,6 +7,31 @@ use std::path::PathBuf;
 
 use crate::context_menu_model::{MenuCommand, MenuNode};
 
+/// Shared by the real background verb and headless boundary tests. Preparation
+/// errors must never run either invocation callback.
+fn with_background_menu<M, E>(
+    bind: impl FnOnce() -> Result<M, E>,
+    query: impl FnOnce(&M) -> Result<(), E>,
+    invoke: impl FnOnce(&M) -> Result<(), E>,
+) -> Result<(), E> {
+    let menu = bind()?;
+    query(&menu)?;
+    invoke(&menu)
+}
+
+/// Keep the observers immediately adjacent to the actual InvokeCommand call,
+/// including its error return, before timing output or menu destruction.
+pub(crate) fn with_invocation_observers<S, R>(
+    before: impl FnOnce() -> S,
+    invoke: impl FnOnce() -> R,
+    after: impl FnOnce(S),
+) -> R {
+    let state = before();
+    let result = invoke();
+    after(state);
+    result
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellClipboardVerb {
     Copy,
@@ -165,12 +190,20 @@ pub(crate) fn invoke_shell_file_verb(
 }
 
 #[cfg(windows)]
-pub fn invoke_shell_folder_background_verb(
+pub fn invoke_shell_folder_background_verb<S>(
     hwnd: isize,
     folder: &std::path::Path,
     verb: ShellClipboardVerb,
+    before_invoke: impl FnOnce() -> S,
+    after_invoke: impl FnOnce(S),
 ) -> Result<(), String> {
-    windows_impl::invoke_shell_folder_background_verb(hwnd, folder, verb)
+    windows_impl::invoke_shell_folder_background_verb(
+        hwnd,
+        folder,
+        verb,
+        before_invoke,
+        after_invoke,
+    )
 }
 
 #[cfg(not(windows))]
@@ -196,10 +229,12 @@ pub(crate) fn invoke_shell_file_verb(
 }
 
 #[cfg(not(windows))]
-pub fn invoke_shell_folder_background_verb(
+pub fn invoke_shell_folder_background_verb<S>(
     hwnd: isize,
     folder: &std::path::Path,
     verb: ShellClipboardVerb,
+    _before_invoke: impl FnOnce() -> S,
+    _after_invoke: impl FnOnce(S),
 ) -> Result<(), String> {
     let _ = (hwnd, folder, verb);
     Err("Shell clipboard verbs are available only on Windows".to_string())
@@ -1031,48 +1066,64 @@ mod windows_impl {
         }
     }
 
-    pub(super) fn invoke_shell_folder_background_verb(
+    pub(super) fn invoke_shell_folder_background_verb<S>(
         hwnd: isize,
         folder: &std::path::Path,
         verb: ShellClipboardVerb,
+        before_invoke: impl FnOnce() -> S,
+        after_invoke: impl FnOnce(S),
     ) -> Result<(), String> {
         if hwnd == 0 {
             return Err("main HWND is not available".to_string());
         }
         let _com = ComStaGuard::new()?;
         let hwnd = HWND(hwnd as *mut core::ffi::c_void);
-        let stage_t0 = Instant::now();
-        let menu_result = shell_context_menu_for_folder_background(hwnd, folder);
-        let ms = elapsed_ms(stage_t0);
-        emit_shell_verb_timing(
-            "verb_shell_bind",
-            "background",
-            verb,
-            ms,
-            1,
-            menu_result.is_ok(),
-        );
-        let menu = menu_result?;
-        let popup = MenuGuard::new(
-            unsafe { CreatePopupMenu() }.map_err(|e| format!("CreatePopupMenu failed: {e}"))?,
-        );
-        let stage_t0 = Instant::now();
-        let query_result = query_shell_context_menu(&menu, popup.handle(), 0);
-        let ms = elapsed_ms(stage_t0);
-        emit_shell_verb_timing(
-            "verb_query_shell",
-            "background",
-            verb,
-            ms,
-            1,
-            query_result.is_ok(),
-        );
-        query_result?;
-        let stage_t0 = Instant::now();
-        let result = invoke_canonical_verb(&menu, hwnd, verb);
-        let ms = elapsed_ms(stage_t0);
-        emit_shell_verb_timing("verb_invoke", "background", verb, ms, 1, result.is_ok());
-        result
+        with_background_menu(
+            || {
+                let stage_t0 = Instant::now();
+                let menu_result = shell_context_menu_for_folder_background(hwnd, folder);
+                let ms = elapsed_ms(stage_t0);
+                emit_shell_verb_timing(
+                    "verb_shell_bind",
+                    "background",
+                    verb,
+                    ms,
+                    1,
+                    menu_result.is_ok(),
+                );
+                let menu = menu_result?;
+                let popup = MenuGuard::new(
+                    unsafe { CreatePopupMenu() }
+                        .map_err(|e| format!("CreatePopupMenu failed: {e}"))?,
+                );
+                // Preserve destruction order: popup first, then Shell interfaces.
+                Ok((popup, menu))
+            },
+            |(popup, menu)| {
+                let stage_t0 = Instant::now();
+                let result = query_shell_context_menu(menu, popup.handle(), 0);
+                let ms = elapsed_ms(stage_t0);
+                emit_shell_verb_timing(
+                    "verb_query_shell",
+                    "background",
+                    verb,
+                    ms,
+                    1,
+                    result.is_ok(),
+                );
+                result
+            },
+            |(_, menu)| {
+                let stage_t0 = Instant::now();
+                let result =
+                    invoke_canonical_verb(hwnd, verb, before_invoke, after_invoke, |info| unsafe {
+                        menu.InvokeCommand(info)
+                    });
+                let ms = elapsed_ms(stage_t0);
+                emit_shell_verb_timing("verb_invoke", "background", verb, ms, 1, result.is_ok());
+                result
+            },
+        )
     }
 
     fn append_root_separator(menu: HMENU, needed: bool) -> Result<(), String> {
@@ -1193,10 +1244,12 @@ mod windows_impl {
         unsafe { AppendMenuW(menu, flags, id as usize, PCWSTR(wide.as_ptr())) }
     }
 
-    fn invoke_canonical_verb(
-        shell_menu: &IContextMenu,
+    fn invoke_canonical_verb<S>(
         hwnd: HWND,
         verb: ShellClipboardVerb,
+        before_invoke: impl FnOnce() -> S,
+        after_invoke: impl FnOnce(S),
+        invoke_command: impl FnOnce(&CMINVOKECOMMANDINFO) -> windows::core::Result<()>,
     ) -> Result<(), String> {
         let verb_name = verb.canonical_name();
         let verb_cstr = CString::new(verb_name).expect("static Shell verb has no NUL");
@@ -1208,8 +1261,106 @@ mod windows_impl {
             hIcon: HANDLE::default(),
             ..Default::default()
         };
-        unsafe { shell_menu.InvokeCommand(&invoke) }
+        with_invocation_observers(before_invoke, || invoke_command(&invoke), after_invoke)
             .map_err(|e| format!("IContextMenu::InvokeCommand({verb_name}) failed: {e}"))
+    }
+
+    #[cfg(test)]
+    mod invocation_boundary_tests {
+        use super::*;
+
+        #[test]
+        fn shell_paste_real_invocation_boundary_orders_observers_on_success_and_failure() {
+            for fail in [false, true] {
+                let events = RefCell::new(Vec::new());
+                let result = invoke_canonical_verb(
+                    HWND::default(),
+                    ShellClipboardVerb::Paste,
+                    || {
+                        events.borrow_mut().push("before");
+                        42
+                    },
+                    |state| {
+                        assert_eq!(state, 42);
+                        events.borrow_mut().push("after");
+                    },
+                    |info| {
+                        assert_eq!(info.hwnd, HWND::default());
+                        assert_eq!(unsafe { info.lpVerb.to_string() }.unwrap(), "paste");
+                        events.borrow_mut().push("invoke");
+                        if fail {
+                            Err(windows::core::Error::from_hresult(
+                                windows::Win32::Foundation::E_FAIL,
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                assert_eq!(result.is_err(), fail);
+                assert_eq!(*events.borrow(), ["before", "invoke", "after"]);
+            }
+        }
+
+        #[test]
+        fn shell_paste_real_background_boundary_skips_observers_on_bind_and_query_failure() {
+            for failure in ["bind", "query", "none"] {
+                let events = RefCell::new(Vec::new());
+                struct Menu<'a>(&'a RefCell<Vec<&'static str>>);
+                impl Drop for Menu<'_> {
+                    fn drop(&mut self) {
+                        self.0.borrow_mut().push("drop_menu");
+                    }
+                }
+                let result = with_background_menu(
+                    || {
+                        events.borrow_mut().push("bind");
+                        if failure == "bind" {
+                            Err("bind failed".to_owned())
+                        } else {
+                            Ok(Menu(&events))
+                        }
+                    },
+                    |_| {
+                        events.borrow_mut().push("query");
+                        if failure == "query" {
+                            Err("query failed".to_owned())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    |_| {
+                        let result = invoke_canonical_verb(
+                            HWND::default(),
+                            ShellClipboardVerb::Paste,
+                            || events.borrow_mut().push("before"),
+                            |()| events.borrow_mut().push("after"),
+                            |_| {
+                                events.borrow_mut().push("invoke");
+                                Ok(())
+                            },
+                        );
+                        events.borrow_mut().push("timing_output");
+                        result
+                    },
+                );
+                assert_eq!(result.is_err(), failure != "none");
+                let expected: &[&str] = match failure {
+                    "bind" => &["bind"],
+                    "query" => &["bind", "query", "drop_menu"],
+                    _ => &[
+                        "bind",
+                        "query",
+                        "before",
+                        "invoke",
+                        "after",
+                        "timing_output",
+                        "drop_menu",
+                    ],
+                };
+                assert_eq!(*events.borrow(), expected);
+            }
+        }
     }
 
     fn query_shell_context_menu(

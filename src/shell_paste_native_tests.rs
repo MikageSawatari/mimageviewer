@@ -252,6 +252,7 @@ fn shell_paste_native_hdrop_copy_uses_resident_sta() {
     invocation
         .recv_timeout(NATIVE_TIMEOUT)
         .expect("copy InvokeCommand timed out")
+        .invocation
         .expect("copy InvokeCommand failed");
     // Keep both apartments alive after InvokeCommand; Shell owns transfer completion.
     assert!(
@@ -292,6 +293,7 @@ fn shell_paste_native_local_cut_completes_on_original_sta() {
     invocation
         .recv_timeout(NATIVE_TIMEOUT)
         .expect("cut InvokeCommand timed out")
+        .invocation
         .expect("cut InvokeCommand failed");
     // A fast Shell may already have notified during InvokeCommand. Do not require a
     // race-dependent callback ordering; continue pumping both STAs until transfer and
