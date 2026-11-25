@@ -37121,6 +37121,7 @@ impl App {
             && self.keymap.consume_action(ctx, KeyAction::FsExport);
         if !current_item_is_video && !fs_music_view_active && self.fs_context_menu_idx.is_none() {
             self.handle_copy_action_keys(ctx, true);
+            self.handle_exif_copy_key(ctx);
         }
         let key_sns_split = !is_video_fs
             && !fs_music_view_active

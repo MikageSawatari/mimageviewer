@@ -2,7 +2,7 @@
 
 状態: 設計 (2026-11-25、設計担当 ClaudeCode Opus)。設計の独立レビュー (gpt-6.1-sol / xhigh): r1 REJECT (P1 1・P2 2) →
 r2 ACCEPT with changes (P2 1・P3 1) → r3 ACCEPT with changes (P3 1、文書の整合だけ)。各回の指摘は本書に反映済み
-(r3 の P3 は設計担当が反映し、再レビューは受けていない)。実装・実機確認はこれから。
+(r3 の P3 は設計担当が反映し、再レビューは受けていない)。実装済み (Codex Sol / high)、関連テスト成功 (設計担当が実行)。実装の独立レビュー・実機確認は未実施。
 要件の正本は [バックログ §1.889](next-release-backlog.md)。
 
 ## 1. 範囲
@@ -180,3 +180,31 @@ r2 ACCEPT with changes (P2 1・P3 1) → r3 ACCEPT with changes (P3 1、文書�
 - MCP の操作一覧 (§1.843 第 2 段、ブランチ `mcp-keys-843`) は `KeyAction::all()` (= `ALL_ACTIONS`) を
   `is_user_facing()` と画面の scope (`FsImage` を含む `image_fullscreen`) で絞って作るので、`FsCopyExif` は取り込み後に自動で出る
   (コード読み)。§1.363 のブランチの `KeyAction` 追加とは取り込み時に統括が合わせる。
+
+## 11. 実装の引き継ぎ（2026-11-25）
+
+- 設計どおり、worker の非表示フィルターと設定変更時の cache clear を外し、
+  `ExifInfo::visible` を現在設定で通す利用境界へ移した。`exif_cache` の内容を読む製品経路は
+  `get_exif_for_idx` だけで、他は採用・clear・context 交換。MCP や検索の独立した読み取りは変更しない。
+- `metadata_info_target_idx` をパネルとキーで共有し、Copy ボタンと `FsCopyExif` は
+  共通の整形・コピー・Viewer 通知へ接続した。新規の予約・worker・保持状態はない。
+- 入力の前提はソースで照合した。`handle_fs_key_input` の既存 gate と
+  `consume_action_press` の keyboard owner が TextEdit 等を優先する。
+  egui の `ViewportLabelSelectionState::on_end_pass` は、その時点の Copy/Cut を確認して
+  選択文字列を出力するため、既存ハンドラ内での除去はパネル描画の前後によらず間に合う。
+- §9 の純関数・worker・headless handler / renderer・複数 context のテストを追加し、
+  既存 GPS フィルターの検査を利用時の `visible` 経由に移した。すべて未実行。
+- 利用者の指示により cargo（整形を含む）・製品起動・検証ビルド・コミット・
+  スナップショット更新は実施しない。実装の独立レビューも後続担当へ引き継ぐ。
+  `tests/ui_snapshot.rs::exif_gps_maps_dark` は Copy ボタン追加に合わせた再生成・目視・通常比較が必要。
+  製品ページの EXIF 表示欄・紹介画像・検索カードを確認し、説明の矛盾はないため変更しなかった。
+- 実装担当が実行した静的チェックは `python scripts/check_ui_glyphs.py`（違反0件）、
+  `python scripts/check_site_cards.py`（53カード、違反0件）、`git diff --check`（問題なし）。
+  Rust のコンパイル・テスト成功を示す証拠ではない。
+- 設計担当の検証 (2026-11-25、run-heavy 経由、`cargo fmt` 後): 関連 filter
+  `test(/exif_(clipboard|copy)_|keymap::tests::|metadata_info_target_tests::|gps_maps_panel_|exif_reader::tests::/)` で
+  246 件成功 (新規 18 件を含むことを `nextest list` で確認)。`cargo check -p mimageviewer --bin mimageviewer-core` 成功。
+  `exif_gps_maps_dark` を `UPDATE_SNAPSHOTS=1` で再生成し、EXIF 見出しの Copy ボタンに欠け・重なりがないことを目視、通常比較 1/1 成功。
+  キー・操作カスタマイズ・設定の引き継ぎ・EXIF・情報パネル・入力周りの広めの filter
+  (`keymap|key_custom|operation_customize|search_nav_entry_inventory|ring_action|ring_shortcut|copy_key|shell_paste|settings_transfer|exif|metadata_info|keyboard_input|preferences`)
+  で 874 件成功。本体 lib 全件は統括が master で流す。

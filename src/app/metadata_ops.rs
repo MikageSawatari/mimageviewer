@@ -293,11 +293,11 @@ pub(super) fn is_ai_metadata_path(path: &std::path::Path) -> bool {
 /// ZipImage は ZIP エントリを 1 回だけ開いて 3 パーサー間で bytes を共有する。
 /// それ以外 (Image / Video) はファイルを直接パーサーに渡す。パーサー側で
 /// 必要に応じて I/O を行う。XMP の JPEG/PNG/WebP は見出し・payload の部分読み。
+/// EXIF は非表示で絞らない。表示・コピー側が利用時の設定で絞る。
 pub(super) fn run_metadata_load(
     key: String,
     item: GridItem,
     relative_page_provenance: Option<crate::book_bookmarks::RelativePageProvenance>,
-    hidden: &[String],
     cancel: &AtomicBool,
 ) -> Option<MetadataLoadResult> {
     // 各段で cancel チェック。ZIP の bytes 読み → AI → EXIF → XMP の順で重い。
@@ -329,8 +329,8 @@ pub(super) fn run_metadata_load(
                 return None;
             }
             let exif = match verified_bytes.as_ref() {
-                Some(bytes) => crate::exif_reader::read_exif_from_bytes(bytes, hidden),
-                None => crate::exif_reader::read_exif(p, hidden),
+                Some(bytes) => crate::exif_reader::read_exif_from_bytes(bytes, &[]),
+                None => crate::exif_reader::read_exif(p, &[]),
             };
             if cancel.load(Ordering::Relaxed) {
                 return None;
@@ -367,7 +367,7 @@ pub(super) fn run_metadata_load(
             }
             let exif = bytes
                 .as_ref()
-                .and_then(|b| crate::exif_reader::read_exif_from_bytes(b, hidden));
+                .and_then(|b| crate::exif_reader::read_exif_from_bytes(b, &[]));
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
@@ -1295,7 +1295,6 @@ mod relative_page_tests {
             "safe".to_string(),
             item.clone(),
             Some(provenance.clone()),
-            &[],
             &cancel,
         )
         .unwrap();
@@ -1310,8 +1309,7 @@ mod relative_page_tests {
             return;
         }
         let rejected =
-            run_metadata_load("rejected".to_string(), item, Some(provenance), &[], &cancel)
-                .unwrap();
+            run_metadata_load("rejected".to_string(), item, Some(provenance), &cancel).unwrap();
         assert!(rejected.metadata.is_none());
         assert!(rejected.exif.is_none());
         assert!(rejected.xmp.is_none());
@@ -2944,6 +2942,54 @@ pub(super) fn exif_hay(info: &crate::exif_reader::ExifInfo, skip_user_comment: b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exif_copy_worker_keeps_raw_tags_for_file_and_zip_and_pdf_has_no_exif() {
+        use std::io::Write as _;
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = crate::exif_reader::tests::gps_fixture_bytes(35, 139);
+        let image = temp.path().join("photo.tiff");
+        std::fs::write(&image, &bytes).unwrap();
+        let zip_path = temp.path().join("photos.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        zip.start_file("photo.tiff", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&bytes).unwrap();
+        zip.finish().unwrap();
+        let cancel = AtomicBool::new(false);
+        for item in [
+            GridItem::Image(image),
+            GridItem::ZipImage {
+                zip_path,
+                entry_name: "photo.tiff".into(),
+            },
+        ] {
+            let info = run_metadata_load("photo".into(), item, None, &cancel)
+                .unwrap()
+                .exif
+                .unwrap();
+            assert!(info.gps_coordinates().is_some());
+            let visible = info.visible(&["GPSLatitude".into()]).unwrap();
+            assert!(visible.gps_coordinates().is_none());
+            assert!(
+                !crate::exif_reader::exif_clipboard_text(&visible)
+                    .unwrap()
+                    .contains("緯度: ")
+            );
+            assert!(info.visible(&[]).unwrap().gps_coordinates().is_some());
+        }
+        let pdf = GridItem::PdfPage {
+            pdf_path: temp.path().join("book.pdf"),
+            page_num: 0,
+            content_type: None,
+        };
+        assert!(
+            run_metadata_load("pdf".into(), pdf, None, &cancel)
+                .unwrap()
+                .exif
+                .is_none()
+        );
+    }
 
     #[test]
     fn ctrl_f_transcript_media_only_and_source_filters_share_async_caption_path() {
