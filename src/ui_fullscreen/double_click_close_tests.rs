@@ -41,6 +41,7 @@ struct Options {
     side_chrome: bool,
     seek_interactive: bool,
     suppressed: bool,
+    focus_restore: bool,
     navigator: Option<egui::Rect>,
     hud: Option<egui::Rect>,
 }
@@ -148,7 +149,17 @@ impl Canvas {
                         zoom,
                         pan,
                         Some(&front),
-                        options.suppressed,
+                        if options.suppressed {
+                            FullscreenPrimarySuppressionDecision::Suppress(
+                                FullscreenPrimarySuppressionReason::Other,
+                            )
+                        } else if options.focus_restore {
+                            FullscreenPrimarySuppressionDecision::Suppress(
+                                FullscreenPrimarySuppressionReason::FocusRestore,
+                            )
+                        } else {
+                            FullscreenPrimarySuppressionDecision::Allow
+                        },
                     )
                     .into();
             },
@@ -158,6 +169,31 @@ impl Canvas {
     }
 
     fn merge(&mut self, events: Vec<egui::Event>) -> (bool, bool) {
+        self.merge_using(events, true, None, |app, ui| {
+            let (result, _) = super::wheel_frame_tests::actual_merge(app, ui, false);
+            (result.close, !result.page_nav.is_none())
+        })
+    }
+
+    #[cfg(windows)]
+    fn for_focus_restore() -> Self {
+        let mut canvas = Self::new();
+        // Establish the real handler's fs_click widget before pointer input,
+        // including PageTurn's Response-based click recognition.
+        assert_eq!(
+            canvas.merge(vec![egui::Event::PointerMoved(canvas_pos())]),
+            (false, false)
+        );
+        canvas
+    }
+
+    fn merge_using(
+        &mut self,
+        events: Vec<egui::Event>,
+        focused: bool,
+        hud: Option<egui::Rect>,
+        mut run: impl FnMut(&mut App, &mut egui::Ui) -> (bool, bool),
+    ) -> (bool, bool) {
         self.time += 0.04;
         let mut facts = (false, false);
         let ctx = self.ctx.clone();
@@ -165,17 +201,74 @@ impl Canvas {
             egui::RawInput {
                 screen_rect: Some(viewport()),
                 time: Some(self.time),
-                focused: true,
+                focused,
                 events,
                 ..Default::default()
             },
             |ui| {
-                let (result, _) = super::wheel_frame_tests::actual_merge(&mut self.app, ui, false);
-                facts = (result.close, !result.page_nav.is_none());
+                if let Some(hud) = hud {
+                    egui::Area::new(egui::Id::new("restore-close-test-hud"))
+                        .order(egui::Order::Foreground)
+                        .fixed_pos(hud.min)
+                        .default_size(hud.size())
+                        .movable(false)
+                        .show(&ctx, |ui| {
+                            let _ = ui.allocate_exact_size(hud.size(), egui::Sense::click());
+                        });
+                }
+                facts = run(&mut self.app, ui);
             },
         )
         .drop_without_applying_deltas();
         facts
+    }
+
+    fn split_click(&mut self, modifiers: egui::Modifiers) -> (bool, bool) {
+        self.split_click_at(canvas_pos(), modifiers)
+    }
+
+    fn split_click_at(&mut self, pos: egui::Pos2, modifiers: egui::Modifiers) -> (bool, bool) {
+        assert_eq!(
+            self.merge(vec![
+                egui::Event::PointerMoved(pos),
+                button(pos, true, modifiers),
+            ]),
+            (false, false)
+        );
+        self.merge(vec![button(pos, false, modifiers)])
+    }
+
+    #[cfg(windows)]
+    fn merge_window(
+        &mut self,
+        context: crate::app::ViewerContextId,
+        window: u64,
+        events: Vec<egui::Event>,
+        finish: bool,
+    ) -> (bool, bool) {
+        self.merge_using(events, true, None, |app, ui| {
+            app.with_window_context_for_test(context, |owner| {
+                owner.begin_active_detached_session(window, crate::app::DetachedSource::Image);
+                let (result, operation) = super::wheel_frame_tests::actual_merge(owner, ui, false);
+                if finish {
+                    let idx = owner.fullscreen_idx.unwrap();
+                    owner.handle_fs_navigation_with_operation(
+                        ui.ctx(),
+                        result.close,
+                        false,
+                        None,
+                        None,
+                        None,
+                        result.page_nav,
+                        None,
+                        idx,
+                        operation,
+                    );
+                    assert!(owner.fullscreen_idx.is_none());
+                }
+                (result.close, !result.page_nav.is_none())
+            })
+        })
     }
 
     fn raw_click_counts(&self) -> Vec<u32> {
@@ -1029,7 +1122,13 @@ fn fold_frame(
                 egui::Id::new("close-fold-canvas"),
                 egui::Sense::click_and_drag(),
             );
-            facts = owner.accept_close_mode_clicks(ctx, &response, &front, false, &candidate);
+            facts = owner.accept_close_mode_clicks(
+                ctx,
+                &response,
+                &front,
+                FullscreenPrimarySuppressionDecision::Allow,
+                &candidate,
+            );
         },
     )
     .drop_without_applying_deltas();
@@ -1163,4 +1262,693 @@ fn close_mode_focus_loss_after_a_release_clears_the_persistent_candidate() {
     events.extend(click(canvas_pos(), egui::Modifiers::NONE));
     let facts = fold_frame(&ctx, &mut owner, 0.08, events, &[], |_, _| true);
     assert!(!facts.close_double_clicked);
+}
+
+// §1.899: these use the production capture, suppression and merge handlers.
+// F1 split frames and both F2 deliveries fail on the pre-fix implementation.
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_f1_split_frames_close_on_second_click() {
+    let _input = crate::key_input::lock_test_input();
+    let mut canvas = Canvas::for_focus_restore();
+    canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+    assert_eq!(canvas.split_click(egui::Modifiers::NONE), (false, false));
+    assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, 1);
+    assert!(canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+    assert_eq!(
+        canvas.app.fs_primary_suppression,
+        FullscreenPrimarySuppression::Idle
+    );
+    assert!(canvas.app.fs_pan_drag_start.is_none());
+    assert_eq!(canvas.app.fullscreen_idx, Some(0));
+    assert_eq!(canvas.split_click(egui::Modifiers::NONE), (true, false));
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_f1_expired_and_same_frame_controls() {
+    let _input = crate::key_input::lock_test_input();
+    for split in [false, true] {
+        let mut canvas = Canvas::for_focus_restore();
+        canvas.app.fs_focus_regained_at = Some(if split {
+            std::time::Instant::now() - std::time::Duration::from_secs(1)
+        } else {
+            std::time::Instant::now()
+        });
+        let first = if split {
+            assert_eq!(
+                canvas.merge(vec![button(canvas_pos(), true, egui::Modifiers::NONE)]),
+                (false, false)
+            );
+            assert!(canvas.app.fs_focus_regained_at.is_none());
+            assert_eq!(
+                canvas.app.fs_primary_suppression,
+                FullscreenPrimarySuppression::Idle
+            );
+            canvas.merge(vec![button(canvas_pos(), false, egui::Modifiers::NONE)])
+        } else {
+            canvas.merge(click(canvas_pos(), egui::Modifiers::NONE))
+        };
+        assert_eq!(first, (false, false));
+        assert_eq!(
+            canvas.app.fs_primary_suppression,
+            FullscreenPrimarySuppression::Idle
+        );
+        assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, 1);
+        assert_eq!(
+            canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)),
+            (true, false)
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_f2_split_and_same_frames_close_on_second_click() {
+    let _input = crate::key_input::lock_test_input();
+    for split in [false, true] {
+        let mut canvas = Canvas::for_focus_restore();
+        canvas.app.settings.vst3_enabled = true;
+        canvas.app.settings.vst3_gui_visible = true;
+        let first = if split {
+            canvas.split_click(egui::Modifiers::NONE)
+        } else {
+            canvas.merge(click(canvas_pos(), egui::Modifiers::NONE))
+        };
+        assert_eq!(first, (false, false));
+        assert_eq!(canvas.app.fullscreen_idx, Some(0));
+        assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, 1);
+        assert!(canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+        let second = if split {
+            canvas.split_click(egui::Modifiers::NONE)
+        } else {
+            canvas.merge(click(canvas_pos(), egui::Modifiers::NONE))
+        };
+        assert_eq!(second, (true, false), "split={split}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_f2_then_normal_and_two_releases_in_one_pass() {
+    let _input = crate::key_input::lock_test_input();
+    for same_pass in [false, true] {
+        let mut canvas = Canvas::for_focus_restore();
+        canvas.app.settings.vst3_enabled = true;
+        canvas.app.settings.vst3_gui_visible = true;
+        if same_pass {
+            assert_eq!(canvas.merge(double_click(canvas_pos())), (true, false));
+            assert_eq!(canvas.raw_click_counts(), [1, 2]);
+        } else {
+            assert_eq!(
+                canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)),
+                (false, false)
+            );
+            canvas.app.settings.vst3_gui_visible = false;
+            assert_eq!(canvas.split_click(egui::Modifiers::NONE), (true, false));
+        }
+    }
+    // F1 also folds a restoring release followed by a whole click in one pass.
+    let mut canvas = Canvas::for_focus_restore();
+    canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+    assert_eq!(
+        canvas.merge(vec![button(canvas_pos(), true, egui::Modifiers::NONE)]),
+        (false, false),
+    );
+    let mut events = vec![button(canvas_pos(), false, egui::Modifiers::NONE)];
+    events.extend(click(canvas_pos(), egui::Modifiers::NONE));
+    assert_eq!(canvas.merge(events), (true, false));
+    assert_eq!(canvas.raw_click_counts(), [1, 2]);
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_other_cancellation_and_terminal_priority() {
+    let _input = crate::key_input::lock_test_input();
+    for terminal_f2 in [false, true] {
+        let mut canvas = Canvas::for_focus_restore();
+        canvas.app.settings.ring_shortcuts.set_right_drag_mode(
+            crate::ring_shortcut::RightDragContext::ImageFullscreen,
+            crate::ring_shortcut::RightDragMode::RingShortcut,
+        );
+        let mut secondary = button(canvas_pos(), true, egui::Modifiers::NONE);
+        if let egui::Event::PointerButton { button, .. } = &mut secondary {
+            *button = egui::PointerButton::Secondary;
+        }
+        assert_eq!(canvas.merge(vec![secondary]), (false, false));
+        assert!(canvas.app.mouse_ring_flick.is_some());
+        if terminal_f2 {
+            canvas.app.settings.vst3_enabled = true;
+            canvas.app.settings.vst3_gui_visible = true;
+        } else {
+            canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+        }
+        assert_eq!(
+            canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)),
+            (false, false)
+        );
+        assert!(canvas.app.mouse_ring_flick.is_none());
+        assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, 0);
+        assert!(!canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+        // The next release may be focus-only; it still cannot pair with Other.
+        assert_eq!(
+            canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)),
+            (false, false)
+        );
+    }
+    let mut canvas = Canvas::for_focus_restore();
+    canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+    assert_eq!(
+        canvas.merge(vec![button(canvas_pos(), true, egui::Modifiers::NONE)]),
+        (false, false),
+    );
+    assert_eq!(
+        canvas.app.fs_primary_suppression,
+        FullscreenPrimarySuppression::PointerStream(
+            FullscreenPrimarySuppressionReason::FocusRestore
+        ),
+    );
+    // Another producer takes over the in-flight focus stream before its release.
+    canvas.app.fs_primary_suppression.arm_pointer_stream();
+    assert_eq!(
+        canvas.merge(vec![button(canvas_pos(), false, egui::Modifiers::NONE)]),
+        (false, false),
+    );
+    assert_eq!(
+        canvas.app.fs_primary_suppression,
+        FullscreenPrimarySuppression::Idle
+    );
+    assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, 0);
+    assert_eq!(
+        canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)),
+        (false, false)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_f2_modal_cannot_close_or_reset() {
+    let _input = crate::key_input::lock_test_input();
+    for zoom in [1.0, 2.0] {
+        let mut canvas = Canvas::for_focus_restore();
+        canvas.app.settings.vst3_enabled = true;
+        canvas.app.settings.vst3_gui_visible = true;
+        canvas.app.show_context_shortcuts_help = true;
+        canvas.app.fs_zoom = zoom;
+        let pan = if zoom == 1.0 {
+            egui::Vec2::ZERO
+        } else {
+            egui::vec2(12.0, 8.0)
+        };
+        canvas.app.fs_pan = pan;
+        assert!(canvas.app.any_modal_dialog_open_for_fullscreen_keys());
+        assert_eq!(canvas.merge(double_click(canvas_pos())), (false, false));
+        assert_eq!(canvas.app.fs_zoom, zoom);
+        assert_eq!(canvas.app.fs_pan, pan);
+        assert_eq!(canvas.app.fullscreen_idx, Some(0));
+        assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, 0);
+        assert!(!canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_no_single_click_use_and_reset_keeps_priority() {
+    let _input = crate::key_input::lock_test_input();
+    for f2 in [false, true] {
+        let mut canvas = Canvas::for_focus_restore();
+        canvas.app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+        if f2 {
+            canvas.app.settings.vst3_enabled = true;
+            canvas.app.settings.vst3_gui_visible = true;
+        } else {
+            canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+        }
+        assert_eq!(
+            canvas.split_click_at(egui::pos2(100.0, 180.0), egui::Modifiers::NONE),
+            (false, false),
+        );
+        assert_eq!(
+            canvas.app.fs_overflow_panel_state,
+            FsOverflowPanelState::Root
+        );
+        assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, 1);
+        assert!(!canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+        // App fixtures hold the non-reentrant data-dir test lock until drop.
+        drop(canvas);
+
+        let mut canvas = Canvas::for_focus_restore();
+        canvas.app.fs_zoom = 2.0;
+        canvas.app.fs_pan = egui::vec2(30.0, 15.0);
+        canvas.app.fs_free_rotation = 0.2;
+        if f2 {
+            canvas.app.settings.vst3_enabled = true;
+            canvas.app.settings.vst3_gui_visible = true;
+        } else {
+            canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+        }
+        assert_eq!(canvas.split_click(egui::Modifiers::NONE), (false, false));
+        assert_eq!(
+            canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)),
+            (false, false)
+        );
+        assert_eq!(canvas.app.fs_zoom, 1.0);
+        assert_eq!(canvas.app.fs_pan, egui::Vec2::ZERO);
+        assert_eq!(canvas.app.fs_free_rotation, 0.0);
+        assert!(canvas.app.fs_automatic_initial_view.is_none());
+        assert_eq!(canvas.app.fullscreen_idx, Some(0));
+        // §12.7: end egui's triple-click sequence before the closing pair.
+        canvas.time += 1.0;
+        assert_eq!(canvas.merge(double_click(canvas_pos())), (true, false));
+    }
+    // Planner observes last_click directly: Ctrl focus must not be produced.
+    let mut canvas = Canvas::for_focus_restore();
+    canvas.app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(
+        crate::depth_parallax::DepthViewState::new(canvas.app.edit_request_owner_context()),
+    );
+    assert_eq!(
+        canvas.plan(
+            click(canvas_pos(), egui::Modifiers::CTRL),
+            Options {
+                focus_restore: true,
+                ..Default::default()
+            }
+        ),
+        Outcome::None
+    );
+    assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, 1);
+    assert!(!canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+    canvas.time += 1.0;
+    assert_eq!(
+        canvas.plan(
+            click(canvas_pos(), egui::Modifiers::CTRL),
+            Options::default()
+        ),
+        Outcome::Depth(canvas_pos()),
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_front_layers_and_top_bar_do_not_seed_pair() {
+    let _input = crate::key_input::lock_test_input();
+    for f2 in [false, true] {
+        for front in ["layer", "top_bar", "menu"] {
+            let mut canvas = Canvas::for_focus_restore();
+            let pos = if front == "top_bar" {
+                egui::pos2(300.0, 12.0)
+            } else {
+                canvas_pos()
+            };
+            let hud = (front == "layer")
+                .then(|| egui::Rect::from_center_size(pos, egui::vec2(40.0, 40.0)));
+            if front == "menu" {
+                canvas.app.fs_context_menu_idx = Some(0);
+            }
+            let run = |app: &mut App, ui: &mut egui::Ui| {
+                let (result, _) = super::wheel_frame_tests::actual_merge(app, ui, false);
+                (result.close, !result.page_nav.is_none())
+            };
+            // egui resolves foreground areas from their established layer geometry.
+            canvas.merge_using(vec![egui::Event::PointerMoved(pos)], true, hud, run);
+            if f2 {
+                canvas.app.settings.vst3_enabled = true;
+                canvas.app.settings.vst3_gui_visible = true;
+            } else {
+                canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+            }
+            assert_eq!(
+                canvas.merge_using(
+                    vec![button(pos, true, egui::Modifiers::NONE)],
+                    true,
+                    hud,
+                    run
+                ),
+                (false, false),
+            );
+            assert_eq!(
+                canvas.merge_using(
+                    vec![button(pos, false, egui::Modifiers::NONE)],
+                    true,
+                    hud,
+                    run
+                ),
+                (false, false),
+            );
+            assert!(!canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+            assert_eq!(
+                canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)),
+                (false, false)
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_list_open_carryover_remains_capped() {
+    let _input = crate::key_input::lock_test_input();
+    for f2 in [false, true] {
+        let mut canvas = Canvas::for_focus_restore();
+        canvas.merge(click(canvas_pos(), egui::Modifiers::NONE));
+        // Same egui sequence, new canvas owner after opening from the list.
+        canvas.app.fs_front_pointer = FsFrontPointerOwnership::default();
+        if f2 {
+            canvas.app.settings.vst3_enabled = true;
+            canvas.app.settings.vst3_gui_visible = true;
+        } else {
+            canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+        }
+        assert_eq!(canvas.split_click(egui::Modifiers::NONE), (false, false));
+        assert_eq!(canvas.raw_click_counts(), [2]);
+        assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, 1);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_page_turn_still_suppresses_restoring_click() {
+    let _input = crate::key_input::lock_test_input();
+    for f2 in [false, true] {
+        for split in [false, true] {
+            let mut canvas = Canvas::for_focus_restore();
+            canvas.app.settings.fullscreen_primary_click = FullscreenPrimaryClickMode::PageTurn;
+            if f2 {
+                canvas.app.settings.vst3_enabled = true;
+                canvas.app.settings.vst3_gui_visible = true;
+            } else {
+                canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+            }
+            let first = if split {
+                canvas.split_click(egui::Modifiers::NONE)
+            } else {
+                canvas.merge(click(canvas_pos(), egui::Modifiers::NONE))
+            };
+            // F1 has never suppressed a press+release delivered in one frame.
+            assert_eq!(first, (false, !f2 && !split));
+            if f2 || split {
+                assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, 0);
+            }
+            canvas.app.settings.vst3_gui_visible = false;
+            canvas.app.fs_focus_regained_at = None;
+            if f2 && !split {
+                // F2 still leaves its owner armed after a same-frame release;
+                // the next click is also suppressed in the released PageTurn policy.
+                assert_eq!(
+                    canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)),
+                    (false, false)
+                );
+            }
+            assert_eq!(
+                canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)),
+                (false, true)
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_focus_loss_event_and_level_retire_candidate() {
+    let _input = crate::key_input::lock_test_input();
+    for event in [false, true] {
+        let mut canvas = Canvas::for_focus_restore();
+        canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+        assert_eq!(canvas.split_click(egui::Modifiers::NONE), (false, false));
+        assert!(canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+        let events = if event {
+            vec![egui::Event::WindowFocused(false)]
+        } else {
+            vec![]
+        };
+        canvas.merge_using(events, false, None, |app, ui| {
+            let (result, _) = super::wheel_frame_tests::actual_merge(app, ui, false);
+            (result.close, !result.page_nav.is_none())
+        });
+        assert!(!canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+        assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, 0);
+        canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+        assert_eq!(
+            canvas.merge(vec![egui::Event::WindowFocused(true)]),
+            (false, false)
+        );
+        assert_eq!(canvas.split_click(egui::Modifiers::NONE), (false, false));
+    }
+}
+
+#[test]
+fn close_mode_focus_restore_899_reason_priority_and_terminal_idle() {
+    use FullscreenPrimarySuppressionDecision::{Allow, Preserve, Suppress};
+    use FullscreenPrimarySuppressionReason::{FocusRestore, Other};
+    let mut suppression = FullscreenPrimarySuppression::Idle;
+    assert_eq!(
+        suppression.arm_focus_restore_pointer_stream(),
+        Suppress(FocusRestore)
+    );
+    assert!(suppression.is_active());
+    suppression.arm_pointer_stream();
+    assert_eq!(
+        suppression.arm_focus_restore_pointer_stream(),
+        Suppress(Other)
+    );
+    let terminal =
+        suppression.apply(FullscreenPrimarySuppressionEvent::PointerFrame { released: true });
+    assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
+    assert!(!suppression.is_active());
+    assert_eq!(terminal, Suppress(Other));
+    assert_eq!(
+        terminal.overridden_by(suppression.arm_focus_restore_pointer_stream()),
+        Suppress(Other),
+    );
+    assert_eq!(
+        Suppress(FocusRestore).overridden_by(Suppress(Other)),
+        Suppress(Other)
+    );
+    assert_eq!(Suppress(Other).overridden_by(Preserve), Suppress(Other));
+    assert_eq!(
+        Suppress(Other).overridden_by(Allow),
+        Allow,
+        "touch Allow remains authoritative"
+    );
+    assert!(Suppress(FocusRestore).suppresses_current_frame());
+    assert!(Suppress(Other).suppresses_current_frame());
+    assert_eq!(
+        suppression.apply(FullscreenPrimarySuppressionEvent::PointerFrame { released: true }),
+        Suppress(FocusRestore),
+    );
+    assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
+    let _ = suppression.apply(FullscreenPrimarySuppressionEvent::TouchFrame {
+        suppresses_current_frame: true,
+        active: true,
+        completed: false,
+        cancelled: false,
+    });
+    assert_eq!(
+        suppression.arm_focus_restore_pointer_stream(),
+        Suppress(Other)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_navigator_owns_restoring_release() {
+    let _input = crate::key_input::lock_test_input();
+    for f2 in [false, true] {
+        // Build the navigator fixture as the only live App: App fixtures hold
+        // the non-reentrant data-dir test lock until drop.
+        let ctx = egui::Context::default();
+        page_turn::install(&ctx);
+        install_fs_navigator_input_tracking(&ctx);
+        let (app, _, idx) = super::tests::setup_flat_navigator_input_test();
+        let mut canvas = Canvas {
+            ctx,
+            app,
+            time: 0.0,
+        };
+        canvas.app.fs_focus_regained_at = None;
+        canvas.app.settings.fullscreen_primary_click = FullscreenPrimaryClickMode::DoubleClickClose;
+        canvas.app.settings.fullscreen_side_panel_mode =
+            crate::settings::FsSidePanelMode::ClickToShow;
+        canvas.app.settings.touch_still_chrome_learned = true;
+        canvas.app.fs_zoom = 1.0;
+        crate::app::source_texture_test_support::seed(&mut canvas.app, &canvas.ctx, idx);
+        let media = canvas.app.fullscreen_media_rect_with_geometry(
+            viewport(),
+            idx,
+            false,
+            StillSeekGeometry::bar_only(),
+        );
+        let layout = canvas
+            .app
+            .fs_navigator_layout(media)
+            .expect("navigator fixture");
+        let pos = layout.canvas_rect.left_center() + egui::vec2(1.0, 0.0);
+        let blank = layout.canvas_rect.left_center() - egui::vec2(2.0, 0.0);
+        assert!(!layout.panel_rect.contains(blank));
+        canvas.merge(vec![egui::Event::PointerMoved(blank)]);
+        canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+        canvas.app.settings.vst3_enabled = f2;
+        canvas.app.settings.vst3_gui_visible = f2;
+        assert_eq!(
+            canvas.split_click_at(pos, egui::Modifiers::NONE),
+            (false, false)
+        );
+        assert!(!canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+        canvas.app.settings.fullscreen_navigator_visible = false;
+        // Still close enough for egui to report a double click. The navigator
+        // release must not become the first candidate of that pair.
+        assert_eq!(
+            canvas.merge(click(blank, egui::Modifiers::NONE)),
+            (false, false)
+        );
+        canvas.time += 1.0;
+        assert_eq!(canvas.merge(double_click(blank)), (true, false));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_window_context_closes_only_its_viewer() {
+    let _input = crate::key_input::lock_test_input();
+    for f2 in [false, true] {
+        let mut canvas = Canvas::for_focus_restore();
+        let main_items = canvas.app.items.clone();
+        let main_generation = canvas.app.items_generation;
+        let sibling = canvas.app.build_window_context_for_test(18992, |owner| {
+            owner.items = vec![GridItem::Image(PathBuf::from("c:/899/sibling.png"))];
+            owner.fullscreen_idx = Some(0);
+            owner.fs_zoom = 2.5;
+            owner.fs_pan = egui::vec2(10.0, 20.0);
+            owner.items_generation = 8992;
+        });
+        let closing = canvas.app.build_window_context_for_test(18991, |owner| {
+            owner.items = vec![GridItem::Image(PathBuf::from("c:/899/closing.png"))];
+            owner.visible_indices = vec![0];
+            owner.fullscreen_idx = Some(0);
+            owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+            owner.fs_zoom = 1.0;
+            owner.fs_pan = egui::Vec2::ZERO;
+        });
+        canvas.merge_window(
+            closing,
+            18991,
+            vec![egui::Event::PointerMoved(canvas_pos())],
+            false,
+        );
+        canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+        canvas.app.settings.vst3_enabled = f2;
+        canvas.app.settings.vst3_gui_visible = f2;
+        assert_eq!(
+            canvas.merge_window(
+                closing,
+                18991,
+                vec![button(canvas_pos(), true, egui::Modifiers::NONE)],
+                false,
+            ),
+            (false, false),
+        );
+        assert_eq!(
+            canvas.merge_window(
+                closing,
+                18991,
+                vec![button(canvas_pos(), false, egui::Modifiers::NONE)],
+                false,
+            ),
+            (false, false),
+        );
+        assert!(canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+        assert_eq!(
+            canvas.merge_window(
+                closing,
+                18991,
+                click(canvas_pos(), egui::Modifiers::NONE),
+                true
+            ),
+            (true, false),
+        );
+        assert_eq!(canvas.app.items, main_items);
+        assert_eq!(canvas.app.items_generation, main_generation);
+        assert_eq!(canvas.app.fullscreen_idx, Some(0));
+        canvas.app.with_window_context_for_test(sibling, |owner| {
+            assert_eq!(owner.fullscreen_idx, Some(0));
+            assert_eq!(owner.items_generation, 8992);
+            assert_eq!(owner.fs_zoom, 2.5);
+            assert_eq!(owner.fs_pan, egui::vec2(10.0, 20.0));
+            assert_eq!(
+                owner.items,
+                vec![GridItem::Image(PathBuf::from("c:/899/sibling.png"))]
+            );
+        });
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn close_mode_focus_restore_899_context_focus_roundtrip_does_not_reuse_pair() {
+    let _input = crate::key_input::lock_test_input();
+    let mut canvas = Canvas::for_focus_restore();
+    let build = |owner: &mut App| {
+        owner.items = vec![GridItem::Image(PathBuf::from("c:/899/page.png"))];
+        owner.visible_indices = vec![0];
+        owner.fullscreen_idx = Some(0);
+        owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+        owner.fs_zoom = 1.0;
+        owner.fs_pan = egui::Vec2::ZERO;
+    };
+    let a = canvas.app.build_window_context_for_test(18993, build);
+    let b = canvas.app.build_window_context_for_test(18994, build);
+    canvas.app.with_window_context_for_test(b, |owner| {
+        owner.fs_zoom = 2.5;
+        owner.fs_pan = egui::vec2(10.0, 20.0);
+    });
+    canvas.merge_window(
+        a,
+        18993,
+        vec![egui::Event::PointerMoved(canvas_pos())],
+        false,
+    );
+    canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
+    // Leave A with a candidate and a focus-only stream still armed (F2's
+    // same-frame terminal delivery); focus loss must retire the candidate.
+    canvas.app.settings.vst3_enabled = true;
+    canvas.app.settings.vst3_gui_visible = true;
+    assert_eq!(
+        canvas.merge_window(a, 18993, click(canvas_pos(), egui::Modifiers::NONE), false),
+        (false, false),
+    );
+    assert!(canvas.app.fs_primary_suppression.is_active());
+    assert!(canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+    for (context, window) in [(b, 18994), (a, 18993)] {
+        assert_eq!(
+            canvas.merge_window(
+                context,
+                window,
+                vec![
+                    egui::Event::WindowFocused(false),
+                    egui::Event::WindowFocused(true)
+                ],
+                false,
+            ),
+            (false, false),
+        );
+        assert!(!canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+        assert_eq!(
+            canvas.merge_window(
+                context,
+                window,
+                click(canvas_pos(), egui::Modifiers::NONE),
+                false
+            ),
+            (false, false),
+        );
+        assert!(canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+    }
+    for (context, zoom, pan) in [(a, 1.0, egui::Vec2::ZERO), (b, 2.5, egui::vec2(10.0, 20.0))] {
+        canvas.app.with_window_context_for_test(context, |owner| {
+            assert_eq!(owner.fullscreen_idx, Some(0));
+            assert_eq!(owner.fs_zoom, zoom);
+            assert_eq!(owner.fs_pan, pan);
+        });
+    }
+    assert_eq!(canvas.app.fullscreen_idx, Some(0));
 }

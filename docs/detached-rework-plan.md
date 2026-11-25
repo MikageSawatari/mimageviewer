@@ -1458,6 +1458,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-25: 閉じるモードのフォーカス復帰クリック (§1.899)
+
+- 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §12。共有 viewer 入力の
+  `FullscreenPrimarySuppression` とフレーム判定に抑制理由を持たせ、閉じるモードだけ、フォーカス復帰のみで
+  止めた離しを通常と同じに数える。F2 の早期 return も通常経路と候補面・受付・作用の適用を共有する。
+- detached の述語・viewport の経路・窓の所有は変更しない。既存の抑制の寿命を維持し、抑制理由を区別せず
+  候補から外していた入力所有境界を直す構造的修正であり、guard・遅延・再試行による症状パッチではない。
+- 構造的修正であることの合意: Codex 独立設計レビュー r1・r2 (GPT-6.1 Sol / xhigh) と ClaudeCode (設計担当)。
+  実装の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh、`39ae1d3c6..207f247b6`) も ACCEPT で、構造的修正であることに合意。
+
 ### 2026-11-25: browser key と OS AppCommand の二重 (§1.864)
 
 - 正本: [次版マウスシーク計画](next-version-mouse-seek-plan.md) §9。全画面と F12 で共有する
