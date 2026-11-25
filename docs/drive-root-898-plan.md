@@ -27,7 +27,7 @@
 - 外部へのドラッグは `DROPEFFECT_COPY` だけで、移動にならない。
 - MCP と mIV Remote には、ファイルを削除・名前変更・移動する操作が無い (タグ・評価・コレクションなどだけ)。対象外。
 - Windows の Shell の右クリックメニュー (Explorer の削除など) は、mIV の確認を通らない。ドライブ一覧では右クリック自体を
-  開かない既存の分岐があり、他の場所にはルートの項目が出ない。下の §3.3 で渡すパスからも外す。
+  開かない既存の分岐がある。閲覧履歴など他の一覧にルートが現れる場合も、§3.3 の要求の組立で外す。
 
 ## 3. 設計
 
@@ -51,8 +51,12 @@ pub(crate) fn structural_file_operation_path_refusal(path: &Path) -> Option<File
 - `VirtualLocation`: 整えたパスで `App::is_synthetic_view_path(path)` (`%APPDATA%\mimageviewer\__drive_list__` などの合成パス)。
   閲覧履歴などから合成パスが `Folder` 項目として出た場合も、実ファイルとして扱わない。
   (`is_synthetic_view_path` は今 `app.rs` の自由関数。判定の持ち主を変えずに呼べるよう `pub(crate)` のまま使う。
-  比較は既存の `folder_tree::path_eq` (大文字小文字・区切りの表記を同一視) に任せる。合成パスは mIV 自身が
-  `data_dir` から作る表記だけを対象とし、`\\?\` の別名まではテストで保証しない。)
+  比較は既存の `folder_tree::path_eq` (大文字小文字・区切りの表記を同一視) を使い、**比べる両側に同じ
+  `lexical_normalize` をかける**。`--data-dir .\target\dev-runtime\data` のように `data_dir` 自体が `.`・`..` を含むと、
+  比較先の合成パスもその表記で作られるため。`is_synthetic_view_path` とスマートフォルダーの合成パスの判定
+  (`smart_folder::is_smart_folder_synthetic_path`) を、両側を整えて比べる形に変える。一致の範囲が広がる方向だけの
+  変更で、既存の利用箇所 (実在パスを要求する汎用ガード) にとっても正しい。合成パスは mIV 自身が `data_dir` から作る
+  表記だけを対象とし、`\\?\` の別名まではテストで保証しない。)
 
 `FileOperationRefusal` に `VolumeRoot` と `VirtualLocation` を足し、文言もここで持つ
 (「ドライブや共有のルートは{action}できません」「仮想の場所は{action}できません」)。
@@ -122,7 +126,7 @@ handler-level (App のテスト環境):
 
 unit: `structural_file_operation_path_refusal` に `C:\`、`C:`、`\\?\C:\`、`\\server\share`、`\\server\share\`、
 `\\?\UNC\server\share\`、`\\?\Volume{GUID}\`、`X:\`、`C:\photos\..`、`\\server\share\dir\..` → `VolumeRoot`、
-`C:\foo`、`C:\foo\..\bar`、`\\server\share\dir` → `None`、合成パス (末尾区切りあり・大文字小文字違い) → `VirtualLocation`。
+`C:\foo`、`C:\foo\..\bar`、`\\server\share\dir` → `None`、合成パス (末尾区切りあり・大文字小文字違い) → `VirtualLocation`。`data_dir` 自体が `.`・`..` を含むとき (例 `.\data`、`C:\x\..\data`) の合成パスも、入力の表記によらず `VirtualLocation`。スマートフォルダーの合成パスも同じ。
 
 worker 側 (単なる `Err` ではなく、ルートを理由に断ったことを確かめる): `start_delete_files` にルートを直接渡すと
 worker を起こさない、`validate_transfer_request` が移動のルートをルートの理由で `Err` (コピーは通る)、
