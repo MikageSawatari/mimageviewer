@@ -227,6 +227,16 @@ fn non_printable_key(key: egui::Key) -> bool {
         )
 }
 
+fn diagnostic_chord(key: egui::Key, modifiers: egui::Modifiers) -> bool {
+    use egui::Key;
+    !modifiers.alt
+        && (modifiers.ctrl || modifiers.command || modifiers.mac_cmd)
+        && matches!(
+            key,
+            Key::A | Key::C | Key::V | Key::X | Key::Z | Key::Y | Key::F | Key::L
+        )
+}
+
 fn format_event(event: &Event) -> Value {
     match event {
         Event::Key {
@@ -236,17 +246,18 @@ fn format_event(event: &Event) -> Value {
             repeat,
             modifiers,
         } => {
-            let chord = modifiers.ctrl || modifiers.alt || modifiers.command || modifiers.mac_cmd;
-            let show_key = chord || non_printable_key(*key);
-            // Redact both identities for ordinary typing, including Shift and
-            // remapped logical/physical pairs. Never infer text from the scan key.
+            let show_key = diagnostic_chord(*key, *modifiers) || non_printable_key(*key);
+            // Only the explicit diagnostic chords may reveal printable keys.
+            // Alt character entry and remapped physical keys stay redacted too.
             let key_name = if show_key {
                 format!("{key:?}")
             } else {
                 "printable".into()
             };
             let physical_name = physical_key.map(|physical| {
-                if chord || (show_key && non_printable_key(physical)) {
+                if show_key
+                    && (non_printable_key(physical) || diagnostic_chord(physical, *modifiers))
+                {
                     format!("{physical:?}")
                 } else {
                     "printable".into()
@@ -442,7 +453,6 @@ mod tests {
         }
         for modifiers in [
             egui::Modifiers::CTRL,
-            egui::Modifiers::ALT,
             egui::Modifiers {
                 command: true,
                 ..egui::Modifiers::NONE
@@ -452,12 +462,72 @@ mod tests {
                 ..egui::Modifiers::NONE
             },
         ] {
-            for key in [Key::A, Key::V] {
+            for key in [
+                Key::A,
+                Key::C,
+                Key::V,
+                Key::X,
+                Key::Z,
+                Key::Y,
+                Key::F,
+                Key::L,
+            ] {
                 let fields = key_fields(key, Some(key), modifiers);
                 assert_eq!(fields["key"], format!("{key:?}"));
                 assert_eq!(fields["physical_key"], format!("{key:?}"));
             }
         }
+    }
+
+    #[test]
+    fn focus_trace_redacts_alt_numpad_character_entry() {
+        // egui represents both numpad and main-row digits as Num0..Num9.
+        for key in [
+            egui::Key::Num0,
+            egui::Key::Num1,
+            egui::Key::Num2,
+            egui::Key::Num3,
+            egui::Key::Num4,
+            egui::Key::Num5,
+            egui::Key::Num6,
+            egui::Key::Num7,
+            egui::Key::Num8,
+            egui::Key::Num9,
+        ] {
+            let fields = key_fields(key, Some(key), egui::Modifiers::ALT);
+            assert_eq!(fields["key"], "printable");
+            assert_eq!(fields["physical_key"], "printable");
+        }
+    }
+
+    #[test]
+    fn focus_trace_redacts_non_diagnostic_printable_chords_and_shift_letters() {
+        for modifiers in [
+            egui::Modifiers::SHIFT,
+            egui::Modifiers::ALT,
+            egui::Modifiers {
+                ctrl: true,
+                alt: true,
+                ..egui::Modifiers::NONE
+            },
+            egui::Modifiers {
+                command: true,
+                alt: true,
+                ..egui::Modifiers::NONE
+            },
+        ] {
+            let fields = key_fields(egui::Key::A, Some(egui::Key::A), modifiers);
+            assert_eq!(fields["key"], "printable");
+            assert_eq!(fields["physical_key"], "printable");
+        }
+        for key in [egui::Key::B, egui::Key::Num1, egui::Key::Backslash] {
+            let fields = key_fields(key, Some(egui::Key::A), egui::Modifiers::CTRL);
+            assert_eq!(fields["key"], "printable");
+            assert_eq!(fields["physical_key"], "printable");
+        }
+        let fields = key_fields(egui::Key::A, Some(egui::Key::Num1), egui::Modifiers::CTRL);
+        assert_eq!(fields["key"], "A");
+        assert_eq!(fields["physical_key"], "printable");
     }
 
     #[cfg(windows)]
