@@ -347,11 +347,11 @@ fn video_native_eligibility_uses_overlay_focus_instead_of_root_text_focus() {
 
 #[cfg(windows)]
 #[test]
-fn video_media_modals_reject_even_empty_and_throwing_scripts_before_evaluation() {
+fn video_media_modals_reject_even_empty_and_runtime_error_scripts_before_evaluation() {
     for music in [false, true] {
-        for body in [
-            r#"#{run:[],notice:"must not evaluate"}"#,
-            r#"throw "must not evaluate";"#,
+        for (body, evaluation_fails) in [
+            (r#"#{run:[],notice:"must not evaluate"}"#, false),
+            ("s.api / 0", true),
         ] {
             let mut app = video_app(body, music);
             app.normalize_state = Some(crate::app::normalize::NormalizeScanState {
@@ -389,10 +389,18 @@ fn video_media_modals_reject_even_empty_and_throwing_scripts_before_evaluation()
                 app.operation_script_eligibility(&ctx, ScriptInputSurface::Viewer),
                 ScriptEligibility::Available(ScriptContext::FsVideo)
             );
+            if evaluation_fails {
+                let (_, feedback) =
+                    app.run_script_slot_with_feedback(&ctx, 1, ScriptInputSurface::Viewer, false);
+                assert!(
+                    matches!(feedback, Some(ScriptFeedback::Warning(_))),
+                    "the same compiled script must fail once evaluation is allowed"
+                );
+            }
         }
     }
     for title_editor in [false, true] {
-        let mut app = video_app(r#"throw "must not evaluate";"#, true);
+        let mut app = video_app("s.api / 0", true);
         if title_editor {
             app.music_bookmark_title_edit =
                 Some(crate::video::native_presenter::NativeBookmarkTitleEdit {

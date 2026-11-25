@@ -55,7 +55,6 @@ impl ScriptContexts {
     pub const GRID: Self = Self(1);
     pub const IMAGE: Self = Self(2);
     pub const VIDEO: Self = Self(4);
-    pub const VIEWER: Self = Self(6);
     pub const ALL: Self = Self(7);
 
     pub fn contains(self, context: ScriptContext) -> bool {
@@ -150,8 +149,7 @@ operations! {
         GridTogglePinnedTag13, GridTogglePinnedTag14, GridTogglePinnedTag15, GridTogglePinnedTag16,
         GridTogglePinnedTag17, GridTogglePinnedTag18, GridTogglePinnedTag19, GridTogglePinnedTag20,
     ];
-    E, IMAGE => [FsCapture, FsCopyImage];
-    E, VIEWER => [FsCopyPath, FsCopyFileName];
+    E, IMAGE => [FsCapture, FsCopyPath, FsCopyFileName, FsCopyImage];
     E, VIDEO => [VideoCapture];
     E, GRID => [GridCopyPath, GridCopyFileName, GridCopyImage];
 }
@@ -513,19 +511,15 @@ mod tests {
 
     #[test]
     fn validation_video_copy_contexts_follow_released_copy_support() {
-        for name in ["FsCopyPath", "FsCopyFileName"] {
-            for context in [ScriptContext::FsImage, ScriptContext::FsVideo] {
-                assert!(validate_output(output(&[name]), scope(context)).is_ok());
+        for name in ["FsCopyPath", "FsCopyFileName", "FsCopyImage"] {
+            assert!(validate_output(output(&[name]), scope(ScriptContext::FsImage)).is_ok());
+            for context in [ScriptContext::Grid, ScriptContext::FsVideo] {
+                assert!(matches!(
+                    validate_output(output(&[name]), scope(context)),
+                    Err(ValidationError::WrongContext { .. })
+                ));
             }
-            assert!(matches!(
-                validate_output(output(&[name]), scope(ScriptContext::Grid)),
-                Err(ValidationError::WrongContext { .. })
-            ));
         }
-        assert!(matches!(
-            validate_output(output(&["FsCopyImage"]), scope(ScriptContext::FsVideo)),
-            Err(ValidationError::WrongContext { .. })
-        ));
     }
 
     #[test]

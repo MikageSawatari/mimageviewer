@@ -19,7 +19,8 @@ Closedは既に終了した結果としてdispatcherを通さず、Rebasedは番
 nativeは実行完了の受付可否だけを返し、eguiの動画・音楽は既存の `FsKeyAction` を返す。
 nativeのキー・Browserキー・マウス・リングはその場で実行し、音楽表示は描画の所有passの経路を保つ。
 native overlayの文字入力は保持済みの入力snapshotで判断し、動画の状態欄はplayerの保持値だけを読む。
-通常native動画の右クリックメニューの表示・実行位置には現行描画経路との相違があり、設計担当の判断待ち。
+通常native動画の右クリックメニューの実行は設計担当の判断で段3から外し、共通モデルと選択後のスロット返却を保持する。
+ROOTにフォーカスがある全画面のキーは既存のROOT側予備経路で実行する。共有Contextの転送分岐は変更しない。
 イベントは段4で接続する。
 詳細は [設計](operation-script-plan.md)。
 

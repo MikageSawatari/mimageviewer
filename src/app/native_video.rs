@@ -12830,19 +12830,6 @@ impl App {
                 rejected()
             };
         }
-        if matches!(
-            action,
-            KeyAction::FsCopyPath | KeyAction::FsCopyFileName | KeyAction::FsCopyImage
-        ) {
-            return if self.fs_context_menu_idx.is_none()
-                && self.grid_item_input_allowed()
-                && self.execute_copy_key_action(ctx, action)
-            {
-                accepted(FsKeyAction::default())
-            } else {
-                rejected()
-            };
-        }
         // Navigation and close do not require an already-decoded player.
         match action {
             KeyAction::VideoCapture => {
@@ -17377,53 +17364,45 @@ mod configurable_video_seek_dispatch_tests {
             KeyAction::VideoLoop,
             KeyAction::VideoSeekStart,
         ] {
-            let (mut key_app, idx) = setup_seek_app();
-            let (mut shared_app, shared_idx) = setup_seek_app();
-            let (mut script_app, script_idx) = setup_seek_app();
-            for (app, index) in [
-                (&mut *key_app, idx),
-                (&mut *shared_app, shared_idx),
-                (&mut *script_app, script_idx),
-            ] {
-                set_native_script_action(app, index, action);
+            let mut results = Vec::new();
+            // AppTestEnv owns the global data-dir override lock until drop. Compare
+            // captured observations, keeping only one fixture alive at a time.
+            for route in ["key", "shared", "script"] {
+                let (mut app, idx) = setup_seek_app();
+                set_native_script_action(&mut app, idx, action);
                 app.settings.audio_normalize_enabled = false;
+                app.keymap = crate::keymap::Keymap::from_ini_str(&format!(
+                    "[FsVideo]\n{} = F16\n",
+                    action.ini_name()
+                ));
+                let ctx = egui::Context::default();
+                match route {
+                    "key" => assert_eq!(
+                        app.dispatch_native_video_key_event(
+                            &ctx,
+                            idx,
+                            native_key(0x7f, false, false)
+                        ),
+                        NativeVideoKeyOutcome::Action(action)
+                    ),
+                    "shared" => assert!(matches!(
+                        app.execute_video_key_action(
+                            &ctx,
+                            idx,
+                            action,
+                            VideoKeyActionSurface::Native
+                        ),
+                        VideoKeyActionResult::Accepted(_)
+                    )),
+                    _ => assert!(run_native_action_script(&mut app, &ctx), "{action:?}"),
+                }
+                results.push(native_control_state(&app, idx));
+                if action == KeyAction::VideoSeekStart {
+                    assert_eq!(player_seek_base(&app, idx), 0.0);
+                }
             }
-            key_app.keymap = crate::keymap::Keymap::from_ini_str(&format!(
-                "[FsVideo]\n{} = F16\n",
-                action.ini_name()
-            ));
-            let ctx = egui::Context::default();
-            assert_eq!(
-                key_app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7f, false, false)),
-                NativeVideoKeyOutcome::Action(action)
-            );
-            assert!(matches!(
-                shared_app.execute_video_key_action(
-                    &ctx,
-                    shared_idx,
-                    action,
-                    VideoKeyActionSurface::Native
-                ),
-                VideoKeyActionResult::Accepted(_)
-            ));
-            assert!(
-                run_native_action_script(&mut script_app, &ctx),
-                "{action:?}"
-            );
-            assert_eq!(
-                native_control_state(&key_app, idx),
-                native_control_state(&shared_app, shared_idx),
-                "{action:?}"
-            );
-            assert_eq!(
-                native_control_state(&key_app, idx),
-                native_control_state(&script_app, script_idx),
-                "{action:?}"
-            );
-            if action == KeyAction::VideoSeekStart {
-                assert_eq!(player_seek_base(&key_app, idx), 0.0);
-                assert_eq!(player_seek_base(&script_app, script_idx), 0.0);
-            }
+            assert_eq!(results[0], results[1], "{action:?}");
+            assert_eq!(results[0], results[2], "{action:?}");
         }
     }
 
@@ -17435,59 +17414,50 @@ mod configurable_video_seek_dispatch_tests {
             KeyAction::VideoPrevFile,
             KeyAction::VideoNextFile,
         ] {
-            let (mut key_app, idx) = setup_seek_app();
-            let (mut shared_app, shared_idx) = setup_seek_app();
-            let (mut script_app, script_idx) = setup_seek_app();
-            for (app, index) in [
-                (&mut *key_app, idx),
-                (&mut *shared_app, shared_idx),
-                (&mut *script_app, script_idx),
-            ] {
-                set_native_script_action(app, index, action);
+            for route in ["key", "shared", "script"] {
+                let (mut app, idx) = setup_seek_app();
+                set_native_script_action(&mut app, idx, action);
                 if action == KeyAction::VideoCapture {
                     app.capture_pending = Some(super::super::CapturePending {
                         rx: std::sync::mpsc::channel().1,
                     });
                 } else if action == KeyAction::VideoSeekStripToggle {
-                    app.fs_video_player(index).unwrap().set_seek_strip_material_availability(
+                    app.fs_video_player(idx).unwrap().set_seek_strip_material_availability(
                         crate::video::seek_strip::SeekStripMaterialAvailability::Unavailable(
                             crate::video::seek_strip::StripAxisUnavailableReason::KeyframesTooSparse));
                 } else {
                     app.fs_nav_locked_gen = Some(app.items_generation);
                 }
-            }
-            key_app.keymap = crate::keymap::Keymap::from_ini_str(&format!(
-                "[FsVideo]\n{} = F16\n",
-                action.ini_name()
-            ));
-            let ctx = egui::Context::default();
-            assert_eq!(
-                key_app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7f, false, false)),
-                NativeVideoKeyOutcome::Action(action)
-            );
-            assert!(
-                matches!(
-                    shared_app.execute_video_key_action(
-                        &ctx,
-                        shared_idx,
-                        action,
-                        VideoKeyActionSurface::Native
+                app.keymap = crate::keymap::Keymap::from_ini_str(&format!(
+                    "[FsVideo]\n{} = F16\n",
+                    action.ini_name()
+                ));
+                let ctx = egui::Context::default();
+                match route {
+                    "key" => assert_eq!(
+                        app.dispatch_native_video_key_event(
+                            &ctx,
+                            idx,
+                            native_key(0x7f, false, false)
+                        ),
+                        NativeVideoKeyOutcome::Action(action)
                     ),
-                    VideoKeyActionResult::Rejected
-                ),
-                "{action:?}"
-            );
-            assert!(
-                !run_native_action_script(&mut script_app, &ctx),
-                "{action:?}"
-            );
-            for (app, index) in [
-                (&*key_app, idx),
-                (&*shared_app, shared_idx),
-                (&*script_app, script_idx),
-            ] {
-                assert_eq!(app.fullscreen_idx, Some(index));
-                assert_eq!(player_seek_base(app, index), 100.0);
+                    "shared" => assert!(
+                        matches!(
+                            app.execute_video_key_action(
+                                &ctx,
+                                idx,
+                                action,
+                                VideoKeyActionSurface::Native
+                            ),
+                            VideoKeyActionResult::Rejected
+                        ),
+                        "{action:?}"
+                    ),
+                    _ => assert!(!run_native_action_script(&mut app, &ctx), "{action:?}"),
+                }
+                assert_eq!(app.fullscreen_idx, Some(idx));
+                assert_eq!(player_seek_base(&app, idx), 100.0);
                 assert_eq!(
                     app.capture_pending.is_some(),
                     action == KeyAction::VideoCapture
@@ -17590,39 +17560,40 @@ mod configurable_video_seek_dispatch_tests {
     }
 
     #[test]
-    fn operation_script_native_path_copies_match_existing_key_executor_and_script() {
-        for action in [KeyAction::FsCopyPath, KeyAction::FsCopyFileName] {
-            let mut results = Vec::new();
-            for route in ["key-executor", "shared", "script"] {
-                let (mut app, idx) = setup_seek_app();
-                set_native_script_action(&mut app, idx, action);
-                let ctx = egui::Context::default();
-                match route {
-                    "key-executor" => assert!(app.execute_copy_key_action(&ctx, action)),
-                    "shared" => assert!(matches!(
-                        app.execute_video_key_action(
-                            &ctx,
-                            idx,
-                            action,
-                            VideoKeyActionSurface::Native
-                        ),
-                        VideoKeyActionResult::Accepted(_)
-                    )),
-                    _ => assert!(run_native_action_script(&mut app, &ctx)),
-                }
-                let text: Vec<_> = ctx
-                    .output_mut(|output| std::mem::take(&mut output.commands))
-                    .into_iter()
-                    .filter_map(|command| match command {
-                        egui::OutputCommand::CopyText(text) => Some(text),
-                        _ => None,
-                    })
-                    .collect();
-                assert_eq!(text.len(), 1);
-                results.push(text);
-            }
-            assert_eq!(results[0], results[1], "{action:?}");
-            assert_eq!(results[0], results[2], "{action:?}");
+    fn operation_script_native_image_scoped_copies_are_rejected_before_any_script_effect() {
+        use crate::operation_script::{CompiledOperationScript, OperationScriptState};
+        for action in [
+            KeyAction::FsCopyPath,
+            KeyAction::FsCopyFileName,
+            KeyAction::FsCopyImage,
+        ] {
+            let (mut app, idx) = setup_seek_app();
+            enable_native_seek_script(&mut app, idx);
+            let source = format!(
+                "fn slots() {{ [#{{slot:1,label:\"scope\",run:\"entry\"}}] }}\nfn entry(s) {{ [\"VideoMute\",\"{}\"] }}",
+                action.ini_name(),
+            );
+            app.operation_script.state = OperationScriptState::Ready(Box::new(
+                CompiledOperationScript::compile(&source).unwrap(),
+            ));
+            let muted = app.fs_video_player(idx).unwrap().is_muted();
+            let settings_muted = app.settings.video_muted;
+            let ctx = egui::Context::default();
+            assert!(!run_native_action_script(&mut app, &ctx), "{action:?}");
+            assert_eq!(app.fs_video_player(idx).unwrap().is_muted(), muted);
+            assert_eq!(app.settings.video_muted, settings_muted);
+            assert!(ctx.output(|output| output.commands.is_empty()));
+            assert!(
+                app.fs_feedback_toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.0.contains(action.ini_name())),
+                "scope refusal must identify {action:?}"
+            );
+            assert!(matches!(
+                app.execute_video_key_action(&ctx, idx, action, VideoKeyActionSurface::Native),
+                VideoKeyActionResult::Rejected
+            ));
+            assert!(ctx.output(|output| output.commands.is_empty()));
         }
     }
 
@@ -17837,33 +17808,33 @@ mod configurable_video_seek_dispatch_tests {
             (KeyAction::VideoSeekForwardLarge, 0x27, false, true),
             (KeyAction::VideoSeekStart, 0x57, false, false),
         ] {
-            let (mut key_app, idx) = setup_seek_app();
-            let (mut shared_app, other_idx) = setup_seek_app();
-            let (mut script_app, script_idx) = setup_seek_app();
-            set_native_script_action(&mut script_app, script_idx, action);
-            let ctx = egui::Context::default();
-            assert_eq!(
-                key_app.dispatch_native_video_key_event(&ctx, idx, native_key(vk, shift, ctrl)),
-                NativeVideoKeyOutcome::Action(action)
-            );
-            assert!(matches!(
-                shared_app.execute_video_key_action(
-                    &ctx,
-                    other_idx,
-                    action,
-                    VideoKeyActionSurface::Native
-                ),
-                VideoKeyActionResult::Accepted(_)
-            ));
-            assert_eq!(
-                player_seek_base(&key_app, idx),
-                player_seek_base(&shared_app, other_idx)
-            );
-            assert!(run_native_action_script(&mut script_app, &ctx));
-            assert_eq!(
-                player_seek_base(&key_app, idx),
-                player_seek_base(&script_app, script_idx)
-            );
+            let mut positions = Vec::new();
+            for route in ["key", "shared", "script"] {
+                let (mut app, idx) = setup_seek_app();
+                let ctx = egui::Context::default();
+                match route {
+                    "key" => assert_eq!(
+                        app.dispatch_native_video_key_event(&ctx, idx, native_key(vk, shift, ctrl)),
+                        NativeVideoKeyOutcome::Action(action)
+                    ),
+                    "shared" => assert!(matches!(
+                        app.execute_video_key_action(
+                            &ctx,
+                            idx,
+                            action,
+                            VideoKeyActionSurface::Native
+                        ),
+                        VideoKeyActionResult::Accepted(_)
+                    )),
+                    _ => {
+                        set_native_script_action(&mut app, idx, action);
+                        assert!(run_native_action_script(&mut app, &ctx));
+                    }
+                }
+                positions.push(player_seek_base(&app, idx));
+            }
+            assert_eq!(positions[0], positions[1], "{action:?}");
+            assert_eq!(positions[0], positions[2], "{action:?}");
         }
         let (mut app, idx) = setup_seek_app();
         assert!(matches!(

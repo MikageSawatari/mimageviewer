@@ -4716,7 +4716,7 @@ mod operation_script_grid_menu_tests {
                 crate::operation_script::OperationScriptState::Ready(Box::new(
                     crate::operation_script::CompiledOperationScript::compile(
                         r#"fn slots() { [#{slot:1,label:"再生音",run:"entry"}] }
-                       fn entry(s) { if s.context != "fs_video" { throw "wrong surface"; }
+                       fn entry(s) { if s.context != "fs_video" { s.api / 0; }
                          #{run:["VideoMute"],notice:"menu video done"} }"#,
                     )
                     .unwrap(),

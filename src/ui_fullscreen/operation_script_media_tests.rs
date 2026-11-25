@@ -135,10 +135,22 @@ fn operation_script_media_actual_menu_choice_reaches_owner_tail_after_menu_close
         }
         let before = app.settings.video_muted;
         // No registered HWND: the normal menu entry selects its egui fallback.
+        assert!(app.main_hwnd.is_none());
         app.fs_context_menu_idx = Some(0);
         app.fs_context_menu_pos = egui::pos2(30.0, 20.0);
+        // A newly-created egui Window is invisible during its first sizing pass.
+        // Settle the real menu, as the other fullscreen popup tests do, before
+        // inspecting painted labels or sending input to its interactive rows.
+        for _ in 0..4 {
+            frame(&mut app, &ctx, vec![]);
+        }
+        assert!(app.fs_context_menu_idx.is_some());
+        let area = egui::AreaState::load(&ctx, egui::Id::unique("fs_ctx_menu"))
+            .expect("the production context-menu Window must be laid out");
+        assert!(area.interactable && area.rect().is_positive());
         let output = paint(&mut app, &ctx, vec![]);
         let header = text_center(&output, "スクリプト");
+        assert!(area.rect().contains(header));
         output.drop_without_applying_deltas();
         click(&mut app, &ctx, header);
         for _ in 0..20 {
@@ -147,6 +159,15 @@ fn operation_script_media_actual_menu_choice_reaches_owner_tail_after_menu_close
         let output = paint(&mut app, &ctx, vec![]);
         let row = text_center(&output, "スクリプト操作 1: owner-media");
         output.drop_without_applying_deltas();
+        let area = egui::AreaState::load(&ctx, egui::Id::unique("fs_ctx_menu")).unwrap();
+        assert!(area.interactable && area.rect().contains(row));
+        assert_eq!(
+            ctx.layer_id_at(row),
+            Some(egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::unique("fs_ctx_menu")
+            ))
+        );
         assert!(app.fs_context_menu_idx.is_some());
         assert_eq!(app.spread_mode, SpreadMode::Single);
         assert_eq!(app.settings.video_muted, before);
@@ -160,6 +181,7 @@ fn operation_script_media_actual_menu_choice_reaches_owner_tail_after_menu_close
             "press alone must not execute the row"
         );
         assert_eq!(app.settings.video_muted, before);
+        assert_eq!(app.spread_mode, SpreadMode::Single);
         frame(&mut app, &ctx, vec![button(row, false)]);
         assert!(
             app.fs_context_menu_idx.is_none(),
@@ -202,117 +224,132 @@ fn operation_script_media_actual_owner_keys_execute_for_audio_and_video_music_vi
 }
 
 #[test]
-fn operation_script_media_real_forwarded_keys_reach_child_owner_tail() {
+fn operation_script_media_root_fallback_runs_script_and_postprocessing_for_unfocused_child() {
     let _input = crate::key_input::lock_test_input();
     for media in [None, Some(true), Some(false)] {
         let ctx = egui::Context::default();
-        let root = egui::Context::default();
-        crate::key_input::install_operation_input_plugin(&root);
-        ctx.set_embed_viewports(false);
-        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let observed_passes = observed.clone();
-        ctx.on_begin_pass(
-            "script_forwarded_owner_probe",
-            Arc::new(move |ui| {
-                observed_passes.lock().unwrap().push(ui.ctx().viewport_id());
-            }),
-        );
-        egui::Context::set_immediate_viewport_renderer(|ctx, mut viewport| {
-            let mut input = raw(vec![]);
-            input.viewport_id = viewport.ids.this;
-            input.viewports.insert(
-                viewport.ids.this,
-                egui::ViewportInfo {
-                    parent: Some(egui::ViewportId::ROOT),
-                    focused: Some(true),
-                    ..Default::default()
-                },
-            );
-            ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui))
-                .drop_without_applying_deltas();
-        });
         let commands = if media.is_some() {
-            r#"["VideoMute"]"#
+            // Media file navigation uses an asynchronous resolver. Close instead
+            // exercises its ordinary finisher without needing a decode/worker fixture.
+            r#"["VideoMute","VideoCloseFullscreen"]"#
         } else {
-            r#"["FsSpreadRtl"]"#
+            r#"["FsNavigatorToggle","FsPageNext"]"#
         };
         let mut app = ready(&ctx, media, commands);
         app.settings.video_in_window_mode = false;
         app.native_video_in_window_active = false;
         app.viewer_presentation = ViewerPresentation::Fullscreen;
-        let before = app.settings.video_muted;
-        root.run_pass(raw(vec![key(true)]), |source| {
-            // The production forwarding value carries the source pass and recipient.
-            let forwarded = FullscreenRootFrameInput {
-                context: source.clone(),
-                destination: app.page_turn_destination(),
-            };
-            let mut forwarded = Some(forwarded);
-            ctx.run_ui(raw(vec![]), |ui| {
-                app.render_fullscreen_viewport_with_root_input(ui, forwarded.take());
+        assert!(!app.fullscreen_embedded_still_active());
+        assert!(!app.page_turn_barrier_active());
+        ctx.set_embed_viewports(false);
+        let child_passes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = child_passes.clone();
+        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+            let mut input = raw(vec![]);
+            input.focused = false;
+            input.viewport_id = viewport.ids.this;
+            input.viewports.insert(
+                viewport.ids.this,
+                egui::ViewportInfo {
+                    parent: Some(egui::ViewportId::ROOT),
+                    focused: Some(false),
+                    ..Default::default()
+                },
+            );
+            input
+                .viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .focused = Some(true);
+            ctx.run_ui(input, |ui| {
+                assert_ne!(ui.ctx().viewport_id(), egui::ViewportId::ROOT);
+                assert_eq!(ui.input(|input| input.viewport().focused), Some(false));
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                (viewport.viewport_ui_cb)(ui);
             })
             .drop_without_applying_deltas();
+        });
+        // Establish the actual child fullscreen before the key arrives in ROOT.
+        frame(&mut app, &ctx, vec![]);
+        assert!(child_passes.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        let before_mute = app.settings.video_muted;
+        let before_navigator = app.settings.fullscreen_navigator_visible;
+        let before_passes = child_passes.load(std::sync::atomic::Ordering::Relaxed);
+        let mut input = raw(vec![key(true)]);
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .focused = Some(true);
+        ctx.run_ui(input, |ui| {
+            assert_eq!(ui.ctx().viewport_id(), egui::ViewportId::ROOT);
+            assert_eq!(ui.input(|input| input.viewport().focused), Some(true));
+            // This is the update path's real ingress. No forwarding value is constructed:
+            // without a page-turn barrier, ROOT runs the slot and existing postprocessing.
+            let (handled, forwarded) = app.fullscreen_root_input_for_frame(ui.ctx());
+            assert!(handled);
+            assert!(
+                forwarded.is_none(),
+                "ROOT fallback completes before drawing the child"
+            );
+            assert_eq!(
+                app.fullscreen_idx,
+                if media.is_some() { None } else { Some(1) },
+                "the script's final close/move reaches the ordinary finisher"
+            );
+            assert_eq!(
+                app.settings.video_muted,
+                if media.is_some() {
+                    !before_mute
+                } else {
+                    before_mute
+                }
+            );
+            assert_eq!(
+                app.settings.fullscreen_navigator_visible,
+                if media.is_none() {
+                    !before_navigator
+                } else {
+                    before_navigator
+                }
+            );
+            app.render_fullscreen_viewport_with_root_input(ui, forwarded);
         })
         .drop_without_applying_deltas();
-        assert!(
-            observed
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|id| *id != egui::ViewportId::ROOT)
-        );
+        let after_passes = child_passes.load(std::sync::atomic::Ordering::Relaxed);
         if media.is_some() {
-            assert_eq!(app.settings.video_muted, !before);
+            assert_eq!(
+                after_passes, before_passes,
+                "closed media must not redraw its child"
+            );
         } else {
-            assert_eq!(app.spread_mode, SpreadMode::Rtl);
+            assert!(after_passes > before_passes);
         }
+        assert_eq!(
+            app.fullscreen_idx,
+            if media.is_some() { None } else { Some(1) },
+            "rendering must not redispatch ROOT's key or close/move a second time"
+        );
+        assert_eq!(
+            app.settings.video_muted,
+            if media.is_some() {
+                !before_mute
+            } else {
+                before_mute
+            }
+        );
+        assert_eq!(
+            app.settings.fullscreen_navigator_visible,
+            if media.is_none() {
+                !before_navigator
+            } else {
+                before_navigator
+            }
+        );
         assert_eq!(ctx.viewport_id(), egui::ViewportId::ROOT);
         crate::key_input::clear_test_frame();
     }
-}
-
-#[test]
-fn operation_script_media_same_context_root_forwarding_reaches_child_owner_tail() {
-    let _input = crate::key_input::lock_test_input();
-    let ctx = egui::Context::default();
-    let mut app = ready(&ctx, None, r#"["FsNavigatorToggle"]"#);
-    app.settings.video_in_window_mode = false;
-    app.native_video_in_window_active = false;
-    app.viewer_presentation = ViewerPresentation::Fullscreen;
-    page_turn_submission_tests::seed_leaf(&ctx, &mut app);
-    assert!(app.page_turn_barrier_active());
-    ctx.set_embed_viewports(false);
-    egui::Context::set_immediate_viewport_renderer(|ctx, mut viewport| {
-        let mut input = raw(vec![]);
-        input.viewport_id = viewport.ids.this;
-        input.viewports.insert(
-            viewport.ids.this,
-            egui::ViewportInfo {
-                parent: Some(egui::ViewportId::ROOT),
-                focused: Some(true),
-                ..Default::default()
-            },
-        );
-        ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui))
-            .drop_without_applying_deltas();
-    });
-    let before = app.settings.fullscreen_navigator_visible;
-    ctx.run_ui(raw(vec![key(true)]), |ui| {
-        let (handled, forwarded) = app.fullscreen_root_input_for_frame(ui.ctx());
-        assert!(handled);
-        let forwarded = forwarded.expect("a page-turn barrier forwards ROOT's input to the viewer");
-        assert_eq!(
-            app.settings.fullscreen_navigator_visible, before,
-            "ROOT only forwards"
-        );
-        app.render_fullscreen_viewport_with_root_input(ui, Some(forwarded));
-    })
-    .drop_without_applying_deltas();
-    assert_eq!(
-        app.settings.fullscreen_navigator_visible, !before,
-        "the genuine shared-Context ROOT input must reach the child drawing owner's tail"
-    );
-    crate::key_input::clear_test_frame();
 }
 
 #[test]

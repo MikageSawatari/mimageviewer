@@ -569,8 +569,10 @@ Rust 側の表に「操作・種別・イベント可か・実行関数」を持
 
 段3の切り出しで確かめた適用範囲: `VideoSeekStripToggle` と `VideoCapture` は native 動画と
 egui の動画キー経路で共有する。音楽表示（音声ファイルと動画の音声モード）には既存の同操作のキー処理が
-無いため、この表示では受け付けない。動画・音声で共有するコピーは `FsCopyPath` と `FsCopyFileName`。
-`FsCopyImage` は既存のコピー受付が動画・音声を対象にしていないため、画像だけに保つ。
+無いため、この表示では受け付けない。`FsCopyPath`・`FsCopyFileName`・`FsCopyImage` は
+`KeyAction` の文脈が `FsImage` で、egui のキー受付も動画・音楽表示では呼ばれず、native の
+VK と動画リングにも consumer が無い。共通のコピー実行関数が動画のパスを扱えることだけでは
+動画のキー操作にならないため、スクリプトの許可表も画像だけに保つ。動画のコピーは段3から外す。
 
 - **「イベント可」の印**は、A のうち「識別 (§3.3) を変えない」と実装担当がコードとテストで確かめた操作にだけ付ける。
   見開きの形の切り替えは `normalize_spread_position` で表示単位の先頭を動かす (§1.3) ので、印は付かない見込み。
@@ -737,7 +739,7 @@ egui の動画キー経路で共有する。音楽表示（音声ファイルと
 | 画像・egui メディアの中ボタン: ホイール / クリック処理 → `dispatch_viewer_middle_short_click` → `dispatch_mouse_button` | `render_fs_body` 内 | その場では実行しない | `FsWheelFrameResult.script_slot` から同じ所有者へ返す。ページ一覧の呼び出し元は実行しない | 同じ所有 pass の実行からメディアの共用関数へ接続 |
 | native 動画の Browser キー / XButton / 中ボタン: `native_video` → `apply_mouse_back_forward_button_with_repeat` / `dispatch_mouse_button` | native 入力処理。ROOT の更新 | 実行は未接続。Browser キーは `key.repeat` を渡し、ScriptSlot の繰り返しを拒否 | 返却欄のみ。native 側の実行は接続しない | native 出力の所有を確認し、`apply_ring_script_slot` → `run_script_slot` で実行完了。描画用 `script_slot` は返さない。Browser の押下所有は §1.864 をそのまま使う |
 | native 動画のリング / ジェスチャー: 位置付き native 更新 → `dispatch_right_drag_recognition` → `execute_right_drag_command` | native 入力処理。ROOT、または既存の別ウィンドウ命令へ委譲 | 実行は未接続 | 変更なし | native は描画要求にせず同じ `apply_ring_script_slot` で実行完了。別ウィンドウ命令は既存の取り付けと共通利用資格を通す |
-| native 動画の右クリックメニュー | 通常の main 動画では描画先の確定が必要 | 共通メニューモデルのスクリプト行と、選択後のスロット返却は接続済み | egui の所有 pass への返却 | 現行 main 動画は `render_fullscreen_viewport_with_root_input` の native backdrop 分岐で、唯一の `show_fs_context_menu` 呼出しより前に戻る。native 用の表示・実行位置は設計担当の判断待ち。新しい描画経路は追加していない |
+| native 動画の右クリックメニュー | 現行 main 動画は native backdrop 分岐でメニュー描画より前に戻る | 共通メニューモデルのスクリプト行と、選択後のスロット返却は接続済み | 共通のスロット返却を保持 | 設計担当の判断で段3の実行対象から除外。新しい表示・実行経路は作らず、既存メニューの表示経路が直ったときに使える共通モデルと返却処理を残す |
 | `apply_history_clear_key_action` → `apply_ring_action` | 一覧のキー処理 | 履歴消去操作だけの対応表であり、`ScriptSlot*` は到達しない | 変更なし | スクリプト入口にはしない |
 
 `RingScriptPhase` は呼び出し時の区別だけで、App の状態ではない。既存の `apply_ring_action` /
