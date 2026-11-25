@@ -742,3 +742,9 @@ waiting_does_not_expire_while_files_keep_arriving
 - 設計担当が run-heavy で流した関連の filter: 最終 818 件すべて成功。本体 lib 全件は流していない (統括が master で流す)。
   ignored の実 Shell テスト 2 件 (`shell_paste_native_*`) はデスクトップのクリップボードを置き換えるため、メイン PC では
   流していない。
+
+### 5.9 実 Shell テスト (2026-11-25、統括の依頼)
+
+ignored の `shell_paste_native_hdrop_copy_uses_resident_sta` と `shell_paste_native_local_cut_completes_on_original_sta` を、
+設計担当が開発機 (メイン PC) で run-heavy 経由・1 件ずつ (`--run-ignored only --test-threads 1`) 流し、2 件とも成功した
+(c89d38eb0)。製品は起動していない。衝突・取消の Windows の画面の確認 (§2.6 の実機で見る項目) は未実施。
