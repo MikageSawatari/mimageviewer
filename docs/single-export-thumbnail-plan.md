@@ -1,6 +1,6 @@
 # 1 枚の書き出し (Ctrl+E) の元の縮小画像の扱い 設計 (§1.888)
 
-状態: export-888 ブランチで実装済み、master 未統合・実機未確認 (2026-11-25)。ad7b47611 の関連テストは設計担当が共有 runner で lib の `save_with_metadata::` / `export_batch::tests::` / `ui_dialogs::export_batch::tests::` / `export_dialog::` (133 件) と `export_integration` (23 件) の成功を確認。警告画面のスナップショットは再生成・目視確認済み。今回の追補差分は未テスト。
+状態: export-888 ブランチで実装済み、master 未統合・実機未確認 (2026-11-25)。44dcac70f の関連テストは設計担当が共有 runner で lib の `save_with_metadata::` / `export_batch::tests::` / `ui_dialogs::export_batch::tests::` / `export_dialog::` (139 件) と `export_integration` (23 件) の成功を確認。警告画面のスナップショットは再生成・目視確認済み。独立実装レビュー 3 回目 ACCEPT (§8)。
 関連: [一括エクスポートの設計](batch-export-plan.md) §3.6 (EXIF の共通処理)・§3.7 (縮小画像の警告)・§13 Q3、
 [バックログ §1.888](next-release-backlog.md)。
 
@@ -209,3 +209,11 @@ pub enum MetadataProfile {
 ### 3 回目 (2026-11-25、対象 1ca147ab2、同じ会話の続き): ACCEPT
 
 - 指摘なし。2 回目の 2 件は解消と判断。
+
+## 8. 独立実装レビューの記録 (gpt-6.1-sol / xhigh、実装担当とは別の会話)
+
+- 1 回目 (ad7b47611): REVISE。P2 Raw APP1 の拡張 XMP の断片をまたぐ名前空間を見落とす、P2 長さの合わない Raw APP1 の
+  XMP を EXIF 扱いにする、P3 到達しない旧転記分岐とそれだけを通るテスト、P3 文書の検証状態。→ b4b30e865 で対応。
+- 2 回目 (b4b30e865): REVISE。1 回目の 4 件は解消。P2 上限を超えた Raw APP1 の XMP を EXIF 扱いにする。→ 44dcac70f で対応
+  (分類だけに先頭 1 KiB を raw deflate で展開する。zlib のままだと小さい流れでは checksum の誤りで先頭も得られない)。
+- 3 回目 (44dcac70f): ACCEPT、指摘なし。
