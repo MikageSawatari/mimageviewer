@@ -134,6 +134,10 @@ pub(crate) struct DeleteTarget {
 }
 
 impl DeleteTarget {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn from_grid_item(item: &GridItem) -> Option<Self> {
         Some(Self {
             path: item.drag_source_path()?.to_path_buf(),
@@ -458,6 +462,20 @@ const COLLECTION_JUMP_NO_PARENT_MESSAGE: &str =
     "ドライブまたは共有ルートには親フォルダがありません";
 
 impl NativeGridContextMenuTarget {
+    /// Only the Windows menu request is restricted; clipboard copy retains shell_paths.
+    fn native_menu_paths(&self) -> Vec<PathBuf> {
+        let paths = self.shell_paths.as_deref().unwrap_or_default();
+        if self.is_folder_context
+            || paths.iter().any(|path| {
+                crate::grid_item::structural_file_operation_path_refusal(path).is_some()
+            })
+        {
+            Vec::new()
+        } else {
+            paths.to_vec()
+        }
+    }
+
     fn copy_command(&self, requested: MenuCommand) -> Option<MenuCommand> {
         match &self.copy_subject {
             ItemCopyMenuSubject::BookmarkSource(_) => {
@@ -1368,11 +1386,7 @@ impl crate::app::App {
             hwnd,
             screen_pos: (pos.x.round() as i32, pos.y.round() as i32),
             background_folder,
-            paths: if target.is_folder_context {
-                Vec::new()
-            } else {
-                shell_paths
-            },
+            paths: target.native_menu_paths(),
             miv_items,
             shell_menu_placement: native_grid_shell_menu_placement(
                 &target,
@@ -2544,6 +2558,12 @@ impl crate::app::App {
     }
 
     pub(crate) fn request_delete_confirm(&mut self, targets: Vec<DeleteTarget>) {
+        if let Some(reason) = targets.iter().find_map(|target| {
+            crate::grid_item::structural_file_operation_path_refusal(target.path())
+        }) {
+            self.show_feedback_warning(reason.message("削除"));
+            return;
+        }
         self.delete_targets = targets;
         self.delete_confirm_label = None;
         self.show_delete_confirm = true;
@@ -2739,6 +2759,10 @@ impl crate::app::App {
             let Some(item) = self.items.get(idx) else {
                 return;
             };
+            if let Some(reason) = item.structural_file_operation_refusal() {
+                self.show_feedback_warning(reason.message("削除"));
+                return;
+            }
             let Some(target) = DeleteTarget::from_grid_item(item) else {
                 if let Some(reason) = item.file_operation_refusal() {
                     self.show_feedback_warning(reason.message("削除"));
@@ -4459,6 +4483,41 @@ mod raw_clipboard_tests {
 
 #[cfg(test)]
 mod delete_confirm_tests {
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_native_menu_omits_structural_paths_but_keeps_clipboard_sources() {
+        // 旧コードはルート／合成パスも NativeContextMenuRequest.paths に入れ、空の要求パス検査が落ちる。
+        let app = crate::app::setup_app_for_test();
+        let ordinary = PathBuf::from(r"C:\foo");
+        for path in [
+            PathBuf::from(r"C:\"),
+            crate::app::drive_list_synthetic_path(),
+        ] {
+            for mixed in [false, true] {
+                let mut target = target(
+                    &app,
+                    GridItem::Folder(path.clone()),
+                    ContextMenuSurface::Grid,
+                );
+                if mixed {
+                    target.shell_paths.as_mut().unwrap().push(ordinary.clone());
+                }
+                let original = target.shell_paths.clone();
+                assert!(target.native_menu_paths().is_empty());
+                assert_eq!(
+                    target.shell_paths, original,
+                    "copy retains the complete selection"
+                );
+            }
+        }
+        let target = target(
+            &app,
+            GridItem::Folder(ordinary.clone()),
+            ContextMenuSurface::Grid,
+        );
+        assert_eq!(target.native_menu_paths(), vec![ordinary]);
+    }
+
     fn delete_file_target(path: impl Into<std::path::PathBuf>) -> super::DeleteTarget {
         super::DeleteTarget::from_grid_item(&crate::grid_item::GridItem::Image(path.into()))
             .unwrap()

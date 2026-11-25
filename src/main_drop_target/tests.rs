@@ -676,6 +676,58 @@ fn main_drop_internal_request_uses_all_original_paths_without_querying_data_obje
     assert_eq!(data.queries.get(), 0);
 }
 
+#[cfg(windows)]
+#[test]
+fn drive_root_898_drop_shift_move_refuses_root_and_copy_remains_available() {
+    // 旧コードは別ドライブへの Shift 移動を FolderTransfer にし、拒否通知／非受理の検査が落ちる。
+    let data = Rc::new(FakeData::default());
+    let session = DragSession::new(data.clone(), true, true);
+    let source = internal(&[r"C:\"]);
+    // D: is outside C:, so the pre-existing ancestor guard cannot cause this refusal.
+    let decision = tree(r"D:\destination", Some(&source), SHIFT);
+    assert!(!decision.accepted());
+    let Some(DropRequest::Failed(message)) =
+        session.drop_request(&decision, Some(&source)).unwrap()
+    else {
+        panic!("a visible refusal is required")
+    };
+    let mut app = crate::app::setup_app_for_test();
+    app.main_drop
+        .borrow_mut()
+        .drops
+        .push(DropRequest::Failed(message));
+    app.consume_main_drops(&egui::Context::default());
+    assert_eq!(
+        app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+        Some(
+            crate::grid_item::FileOperationRefusal::VolumeRoot
+                .message("移動")
+                .as_str()
+        )
+    );
+    let copy = tree(r"D:\destination", Some(&source), CONTROL);
+    assert!(copy.accepted());
+    let Some(DropRequest::FolderTransfer(request)) =
+        session.drop_request(&copy, Some(&source)).unwrap()
+    else {
+        panic!("copy must remain available")
+    };
+    assert_eq!(request.operation, ShellTransferOperation::Copy);
+    assert_eq!(request.sources, source.paths);
+    for path in [r"C:\foo", r"C:\foo\..\bar", r"C:\foo.jpg"] {
+        let source = internal(&[path]);
+        for keys in [SHIFT, CONTROL] {
+            let decision = tree(r"D:\destination", Some(&source), keys);
+            assert!(decision.accepted(), "{path}");
+            assert!(matches!(
+                session.drop_request(&decision, Some(&source)).unwrap(),
+                Some(DropRequest::FolderTransfer(_))
+            ));
+        }
+    }
+    assert_eq!(data.reads.get(), 0);
+}
+
 #[test]
 fn main_drop_external_requests_copy_or_grid_and_only_description_writes_change() {
     let shared = Rc::new(RefCell::new(MainDropShared::default()));

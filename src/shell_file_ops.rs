@@ -649,6 +649,15 @@ impl ValidatedTransfer {
 }
 
 fn validate_transfer_request(request: ShellTransferRequest) -> Result<ValidatedTransfer, String> {
+    if request.operation == ShellTransferOperation::Move {
+        if let Some(reason) = request
+            .sources
+            .iter()
+            .find_map(|path| crate::grid_item::structural_file_operation_path_refusal(path))
+        {
+            return Err(reason.message("移動"));
+        }
+    }
     if request.sources.is_empty() {
         return Err("移動／コピーする対象がありません".into());
     }
@@ -908,6 +917,12 @@ pub fn rename_item_async(
     new_name: String,
 ) -> mpsc::Receiver<ShellRenameResult> {
     let (tx, rx) = mpsc::channel();
+    if let Some(reason) = crate::grid_item::structural_file_operation_path_refusal(&target) {
+        let message = reason.message("名前の変更");
+        crate::logger::log(format!("shell_rename: rejected: {message}"));
+        let _ = tx.send(Err(message));
+        return rx;
+    }
     let spawn_target = target.clone();
     let spawn_name = new_name.clone();
     let tx_on_spawn_error = tx.clone();
@@ -1933,6 +1948,50 @@ mod transfer_tests {
             default_move_needs_volume_check: false,
             sources,
             destination,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_transfer_move_refuses_roots_and_copy_keeps_existing_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        for source in [r"C:\", r"C:", r"\\server\share", r"C:\photos\.."] {
+            let error = validate_transfer_request(request(
+                ShellTransferOperation::Move,
+                vec![source.into()],
+                temp.path().to_owned(),
+            ))
+            .unwrap_err();
+            assert_eq!(
+                error,
+                crate::grid_item::FileOperationRefusal::VolumeRoot.message("移動")
+            );
+        }
+        // With only one volume, copying a root into temp is still rejected by the existing
+        // ancestor rule. Reaching that rule proves Copy passed the new structural guard.
+        let root = temp.path().ancestors().last().unwrap().to_owned();
+        let error = validate_transfer_request(request(
+            ShellTransferOperation::Copy,
+            vec![root],
+            temp.path().to_owned(),
+        ))
+        .unwrap_err();
+        assert!(error.contains("フォルダ自身またはその配下"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_rename_async_refuses_root_with_structural_reason() {
+        let _guard = crate::data_dir::TestDataDirGuard::new();
+        for target in [r"C:\", r"C:", r"\\server\share", r"C:\photos\.."] {
+            let error = rename_item_async(None, target.into(), "renamed".into())
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                error,
+                crate::grid_item::FileOperationRefusal::VolumeRoot.message("名前の変更")
+            );
         }
     }
 

@@ -43,6 +43,10 @@ impl App {
     }
 
     pub(crate) fn request_rename_dialog(&mut self, target: PathBuf, target_is_file: bool) {
+        if let Some(reason) = crate::grid_item::structural_file_operation_path_refusal(&target) {
+            self.show_feedback_warning(reason.message("名前の変更"));
+            return;
+        }
         if self.rename_pending.is_some() {
             self.show_feedback_warning("名前の変更が完了するまでお待ちください".to_owned());
             return;

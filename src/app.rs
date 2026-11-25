@@ -13721,13 +13721,19 @@ fn main_window_title(location_label: Option<&str>, indexing_active: bool) -> Str
 /// 検索固有の分岐には使わず、`delete_missing` / `last_folder` 保存 / コンテナ★など
 /// 「実在パスを要求する汎用ガード」で使う。
 pub(crate) fn is_synthetic_view_path(path: &Path) -> bool {
-    crate::folder_tree::path_eq(path, &search_results_synthetic_path())
-        || crate::folder_tree::path_eq(path, &reading_history_synthetic_path())
-        || crate::folder_tree::path_eq(path, &bookmark_view_synthetic_path())
-        || crate::folder_tree::path_eq(path, &rating_view_synthetic_path())
-        || crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path())
-        || smart_folder::is_smart_folder_synthetic_path(path)
-        || crate::folder_tree::path_eq(path, &drive_list_synthetic_path())
+    let path = crate::path_key::lexical_normalize(path);
+    [
+        search_results_synthetic_path(),
+        reading_history_synthetic_path(),
+        bookmark_view_synthetic_path(),
+        rating_view_synthetic_path(),
+        subfolder_expansion_synthetic_path(),
+        drive_list_synthetic_path(),
+    ]
+    .iter()
+    .any(|synthetic| {
+        crate::folder_tree::path_eq(&path, &crate::path_key::lexical_normalize(synthetic))
+    }) || smart_folder::is_smart_folder_synthetic_path(&path)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53005,6 +53011,14 @@ impl App {
         ctx: &egui::Context,
         targets: Vec<crate::ui_dialogs::context_menu::DeleteTarget>,
     ) {
+        if let Some(reason) = targets.iter().find_map(|target| {
+            crate::grid_item::structural_file_operation_path_refusal(target.path())
+        }) {
+            let message = reason.message("削除");
+            crate::logger::log(format!("delete: rejected: {message}"));
+            self.show_feedback_error(message);
+            return;
+        }
         if targets.is_empty()
             || self.delete_pending.is_some()
             || self.metadata_cleanup_pending.is_some()
@@ -64690,6 +64704,15 @@ impl App {
             Option<crate::cut_clipboard::LocalCutDataObject>,
         ) -> Result<u32, String>,
     ) {
+        if verb == crate::native_context_menu::ShellClipboardVerb::Cut {
+            if let Some(reason) = paths
+                .iter()
+                .find_map(|path| crate::grid_item::structural_file_operation_path_refusal(path))
+            {
+                self.show_feedback_warning(reason.message("切り取り"));
+                return;
+            }
+        }
         if self.shell_paste_request.is_some()
             && matches!(
                 verb,
@@ -107465,6 +107488,10 @@ mod still_seek_thumbnail_ownership;
 #[cfg(test)]
 #[path = "app/clear_history_tests.rs"]
 mod clear_history_tests;
+
+#[cfg(all(test, windows))]
+#[path = "app/drive_root_898_tests.rs"]
+mod drive_root_898_tests;
 
 /// Crate-wide `App` test fixture.
 ///

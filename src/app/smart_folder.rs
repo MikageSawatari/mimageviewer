@@ -5072,7 +5072,14 @@ pub(crate) fn smart_folder_id_from_synthetic_path(path: &Path) -> Option<uuid::U
 }
 
 pub(crate) fn is_smart_folder_synthetic_path(path: &Path) -> bool {
-    smart_folder_id_from_synthetic_path(path).is_some()
+    let path = crate::path_key::lexical_normalize(path);
+    let root = crate::path_key::lexical_normalize(&smart_folder_root());
+    path.parent()
+        .is_some_and(|parent| crate::folder_tree::path_eq(parent, &root))
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| uuid::Uuid::parse_str(name).is_ok())
 }
 
 fn path_depth(path: &Path) -> usize {

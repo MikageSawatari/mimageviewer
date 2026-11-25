@@ -16,6 +16,34 @@ pub fn is_drive_or_share_root(path: &Path) -> bool {
     path.parent().is_none()
 }
 
+/// Resolve dot components without filesystem I/O. Verbatim Windows paths retain their spelling.
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    if matches!(path.components().next(), Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim())
+    {
+        return path.to_path_buf();
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !path.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 /// ドライブ文字を除いて小文字化・スラッシュ統一したパス文字列を返す。
 pub fn normalize(path: &Path) -> String {
     let s = path.to_string_lossy();
@@ -269,6 +297,37 @@ fn existing_component_name(path: &Path) -> Option<std::ffi::OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_lexical_normalize_dot_components_and_verbatim_paths() {
+        for (input, expected) in [
+            (r"C:\photos\..", r"C:\"),
+            (r"C:\foo\..\bar", r"C:\bar"),
+            (r"C:\..\..\bar", r"C:\bar"),
+            (r"\\server\share\dir\..", r"\\server\share\"),
+            (r".\data\child\..", r"data"),
+            (r"..\..\data\child\..", r"..\..\data"),
+            (r"C:", r"C:"),
+        ] {
+            assert_eq!(
+                lexical_normalize(Path::new(input)),
+                Path::new(expected),
+                "{input}"
+            );
+        }
+        for path in [
+            r"\\?\C:\foo\..",
+            r"\\?\UNC\server\share\dir\..",
+            r"\\?\C:\.\foo",
+        ] {
+            // Verbatim paths must retain even the dot components and separators byte-for-byte.
+            assert_eq!(
+                lexical_normalize(Path::new(path)).as_os_str(),
+                Path::new(path).as_os_str()
+            );
+        }
+    }
 
     #[test]
     #[cfg(windows)]

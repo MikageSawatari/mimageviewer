@@ -454,6 +454,18 @@ impl App {
             egui::Context,
         ) -> mpsc::Receiver<ShellTransferResult>,
     ) {
+        if operation == ShellTransferOperation::Move {
+            if let FileOrganizeRequest::Selecting(selection) = &self.file_organize_request {
+                if let Some(reason) = selection
+                    .sources
+                    .iter()
+                    .find_map(|path| crate::grid_item::structural_file_operation_path_refusal(path))
+                {
+                    self.show_feedback_warning(reason.message("移動"));
+                    return;
+                }
+            }
+        }
         // Consume Selecting once, then use the same admission and execution owner as tree drops.
         match self
             .file_organize_request
