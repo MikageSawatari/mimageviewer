@@ -522,3 +522,51 @@ fn startup_default_late_tree_favorite_and_dfs_requests_retire_the_old_default() 
         assert_ne!(app.current_folder.as_ref(), Some(&stale));
     }
 }
+
+#[test]
+fn startup_default_and_explicit_global_search_entry_retire_pending_main_open() {
+    for explicit in [false, true] {
+        let mut app = fixture();
+        let ctx = egui::Context::default();
+        let origin = folder(&app, "search-origin");
+        app.load_folder(origin.clone());
+        settle(&mut app);
+        let stale = folder(&app, "stale-startup-target");
+        if explicit {
+            assert!(matches!(
+                app.start_startup_open_path_resolve(
+                    stale.clone(),
+                    StartupOpenPathSource::InitialStartup,
+                    &ctx,
+                ),
+                StartupOpenAdmission::Admitted
+            ));
+        } else {
+            specific(&mut app, &stale);
+            app.open_default_startup_target();
+        }
+        let (old_tx, old_result) = hold_result(&mut app);
+        let cancel = app
+            .startup_open_path_resolve_pending
+            .as_ref()
+            .unwrap()
+            .cancel
+            .clone();
+
+        // Opening the bar already passes the shared main-request retirement boundary;
+        // submitting a query or installing its result rows is not required.
+        app.open_global_search();
+        assert!(app.global_search.active);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.startup_open_path.is_none());
+        assert!(app.startup_open_path_resolve_pending.is_none());
+        assert!(old_tx.send(old_result).is_err());
+        let generation = app.items_generation;
+        let items = app.items.clone();
+        app.poll_startup_open_path_resolve(&ctx);
+        assert!(app.global_search.active);
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
+        assert_eq!(app.items, items);
+        assert_eq!(app.items_generation, generation);
+    }
+}

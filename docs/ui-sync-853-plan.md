@@ -776,3 +776,62 @@ merge 後 (3d85f11fa) の検証は設計担当がメイン PC で run-heavy 経�
 `InvokeCommand` が 30 秒で返らず失敗した。merge は shell_paste 系のファイルに触れておらず、merge 前のコミットでも
 同じ失敗になるので、merge による退行ではなく開発機側の状態の変化と見ている。クリップボードを開いている窓・所有者は無く、
 explorer は応答し、画面のロックも無かった。原因は未特定。
+
+#### 実 Shell テストのタイムアウトの原因 (2026-11-25 14:00 頃の観測)
+
+設計担当が、ビルド済みのテスト実行体を直接動かし、待っている間に cdb を非侵襲で attach して観測した
+(エクスプローラーへは、スレッドを止めない `-pvr` でスタックとハンドルだけを読んだ)。
+
+- テストの `shell-paste` スレッドが止まっていたのは `InvokeCommand` ではなく、その前の `QueryContextMenu`
+  (`invoke_shell_folder_background_verb` → `query_shell_context_menu`)。SHELL32 が項目のアイコンを引く途中、
+  thumbcache の中で mutex `...\Explorer\iconcache_idx.db!IconCacheInit` を待っていた。
+- この mutex の持ち主は explorer.exe (11-23 起動) のスレッド 0x5b98。このスレッドは別の mutex
+  `iconcache_16.db!dfMaintainer` を待っている。その持ち主の explorer のスレッド 0x5cc4 は、event
+  `iconcache_idx.db!rwWriterEvent` (アイコンキャッシュの読み書き錠) の解放を待ったまま止まっている。
+- つまり、エクスプローラーのアイコンキャッシュの錠が解けない状態にある。アイコンを引くプロセスは、どれもここで待つ。
+  10:37 の成功から 13:30 の失敗までの間に、この状態になったと見ている。読み手を握っているプロセスは特定していない。
+  クリップボード (所有者・開いている窓とも無し) は関係しない。
+- 製品への含意: この状態では、mIV の貼り付けも `QueryContextMenu` で返らない。§1.859 で worker に移したので
+  UI は止まらないが、その後の貼り付け・ファイルの切り取り/コピーは「貼り付けが完了するまでお待ちください」で断られ続ける。
+  §1.859 より前は、UI スレッドごと止まっていた。OS 側の異常なので、割り切りの方針どおり回避の仕組みは足さない。
+- 失敗した実行では、テストの panic の後もプロセスが終わらなかった (Shell の中で止まったスレッドが残るため)。
+  直接起動した分は設計担当が止めた。
+
+### 5.11 master 取り込み後の 9 件
+
+Remote 返却の 1 件は非同期完了前の参照だったため、既存の
+`finish_startup_open_path_resolve_for_test` で完了後に検査する。RAR ナビゲーション 7 件の共通組み立てと
+検索画像の sidecar シナリオは、Specific の一時フォルダで実際の初回フレームを通し、resolver と一覧の
+hydration が終わってから detached 操作・検索一覧を組み立てる。本物の Desktop を走査しない。
+
+検索入口の退役漏れは確認されなかった。`open_global_search` は `take_origin_for_search_entry` →
+`retire_main_list_requests_for_surface_switch` → `retire_replaced_main_list_requests` →
+`cancel_unresolved_open_for_navigation` を既に通る。検索前に resolver が保留されている場合の既定先・明示パスの
+両方について、検索バーを開くだけで取消・pending 破棄・遅延結果の送信拒否・main 不変を確かめる状態遷移テストを追加。
+今回の検索シナリオは resolver の受付より前に検索一覧を作っていたため、その退役境界では防げなかった。
+
+設計担当から、fmt 後の関連 156 件では検索画像の sidecar シナリオだけが失敗したと報告を受けた。
+1 回目は起動の list hydration、設計担当が起動を sidecar 有効化の前へ移した後の 2 回目は親の Checking relay の待ちで
+10 秒の期限に達した。前回の「9 件ともテスト側」という記述は、この残件の解消を確認した結果ではなかった。
+
+追補のコード調査: sidecar が有効なら空の実フォルダも `PreparingPageIndex` → `Quiescing` → `Checking` を通る。
+無効なら空一覧は即時に表示を再開するため、設定順の変更で起動側の待ちを迂回できることは確認した。
+一方、`poll_sidecar_restore` だけのループは Quiescing が待つ別 owner の完了回収を進めない。通常フレームには
+spread-shift／bookmark の service、local-adjust／tag／rating 等の完了回収がある。
+当該 2 実行で残っていた phase・writer は既存の失敗ログに無く、特定していない。
+
+起動と検索一覧の hydration、親の relay 捕捉待ちを、既存 `ScenarioDriver::root` で実際の logic／UI フレームを回す形へ修正。
+sidecar は起動前から有効に戻し、設定順で待ちを迂回しない。親の走査後、最初の sidecar poll より前に relay を取り付ける
+順序は保持し、その restore の target context／generation が detached 親フォルダと一致すること、main の検索 origin・
+一覧・generation が最後まで保たれることを追加検査する。起動時の restore は検索を開く前に終端を検査する。
+再び期限に達した場合に phase／owner／writer の状態を残す診断もテストに加えた。親の relay の 10 秒は延長していない。
+
+製品コード・detached 述語・viewport 経路は変更していない。今回の追補差分のコンパイル・テスト・独立レビューは未実施。
+製品側の停止を確認した結果ではなく、修正後の通常フレーム進行での結果は設計担当の検証待ち。
+今回も cargo・rustfmt・製品起動・git index 操作・コミットは行っていない。
+
+d0bb9fa16 の検証: 設計担当がメイン PC で run-heavy 経由で流し、関連 156 件 (remote_return / multiwindow_ /
+startup_default_ / startup_scan / section1285_ / section1473_history_menu_ / section1853) がすべて成功した。
+独立レビュー (GPT-6.1 Sol / xhigh、実装とは別の会話) は ACCEPT、指摘なし。検索を開くと起動の解決待ちが退役する経路は
+`take_origin_for_search_entry` (app.rs) → `retire_main_list_requests_for_surface_switch` → `retire_replaced_main_list_requests`
+→ `cancel_unresolved_open_for_navigation` (startup_ops.rs) で、追加テストが既定の起動先と明示パスの両方で確かめている。

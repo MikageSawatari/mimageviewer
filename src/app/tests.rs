@@ -79912,6 +79912,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.current_folder.is_none());
         handle.local_disconnect();
         app.poll_remote_session(&ctx);
+        app.finish_startup_open_path_resolve_for_test();
         assert!(crate::folder_tree::path_eq(
             app.current_folder.as_deref().unwrap(),
             &target
