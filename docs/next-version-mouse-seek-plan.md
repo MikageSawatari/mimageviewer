@@ -60,15 +60,13 @@ close 契約では stale event を捨てる下限である。テスト fixture �
 
 ### 2.1 presenter / HUD の native route
 
-AppCommand receipt は `in_send_flags`（`InSendMessageEx` の生値）、`dispatching`（追跡中の DispatchMessage と一致）、`outer_hwnd` / `outer_message`（入れ子の外側の wndproc）を記録する。
-`delivery=queued` は追跡したポンプからの配送、`sent_cross_thread` は ISMEX の送信フラグで確認した別スレッドからの送信を示す。
-`in_send_flags=0`・`dispatching=false`・外側ありは `nested_untracked_during` とする。`outer_message=0x0101` でも WM_KEYUP 中の同期呼出しか、USER32 のモーダルループが配送した posted message かは区別できない。
-一致も送信フラグも外側もない場合は `unknown` とする。presenter と HUD の TLS scope は入れ子を復元するが、追跡外の配送は断定しない。生成元は次の実ログで判断する。
+AppCommand receipt は `in_send_flags`（`InSendMessageEx` の生値）、`dispatching`（追跡中の DispatchMessage と一致）、`outer_hwnd` / `outer_message`（入れ子の外側の wndproc）、`pump_frame`（`peek` / `translate` / `dispatch` / `none`）を記録する。
+`delivery` は `queued`、`sent_cross_thread`、`nested`、`during_peek`、`during_translate`、`unknown` で配送の形を示し、§9 の条件で押下と組になったものは `os_key_echo paired_receipt=<id>` とする。presenter と HUD の TLS scope は入れ子を復元するが、追跡外の配送は断定しない。
 
 `src/video/native_window.rs::wnd_proc` は presenter HWND の `WM_KEYDOWN/WM_SYSKEYDOWN` を
 `NativeVideoKeyEvent` に変換し、lossless route へ送る。browser key は enqueue 後に
 `DefWindowProcW` へ渡さない。`WM_APPCOMMAND` の command 1 / 2 は、それぞれ scan 0 の
-browser back / forward keydown に変換して同じ route へ送る。raw XButton の
+browser back / forward keydown に変換して同じ route へ送る。ただし presenter 自身の browser key 押下に伴う OS AppCommand は、§9 の条件で同じ HWND・同方向の未組 press と組になれば処理済みで返し、event を送らない。raw XButton の
 DOWN / UP / DBLCLK は `NativeVideoMouseButtonEvent` に変換し、全て処理済みで返す。
 
 `src/video/native_window_host/hud_window.rs::hud_wnd_proc` も raw XButton を同じ mouse event に
