@@ -4483,6 +4483,8 @@ mod raw_clipboard_tests {
 
 #[cfg(test)]
 mod delete_confirm_tests {
+    // §1.898: 実ドライブのルートは判定・実行しない入口だけに渡す。
+    // 本物の Shell を実パスに呼ばせず、実行経路は一時フォルダ内の偽パスと差し替えを使う。
     #[cfg(windows)]
     #[test]
     fn drive_root_898_native_menu_omits_structural_paths_but_keeps_clipboard_sources() {

@@ -289,9 +289,14 @@ impl FileOperationRefusal {
 /// String/component operations only: junctions and mounted folders remain ordinary items.
 pub(crate) fn structural_file_operation_path_refusal(path: &Path) -> Option<FileOperationRefusal> {
     let path = crate::path_key::lexical_normalize(path);
-    if crate::path_key::is_drive_or_share_root(&path) {
+    let rooted_or_prefixed = path.has_root()
+        || matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(_))
+        );
+    if rooted_or_prefixed && crate::path_key::is_drive_or_share_root(&path) {
         Some(FileOperationRefusal::VolumeRoot)
-    } else if crate::app::is_synthetic_view_path(&path) {
+    } else if crate::app::is_synthetic_view_path_normalized(&path) {
         Some(FileOperationRefusal::VirtualLocation)
     } else {
         None
@@ -1092,6 +1097,8 @@ pub(crate) fn grid_item_checkable(item: &GridItem, folders_allowed: bool) -> boo
 
 #[cfg(test)]
 mod tests {
+    // §1.898: 実ドライブのルートは判定だけに渡す。本物の Shell を実パスに呼ばせない。
+    // 実行経路のテストは一時フォルダ内の偽パスと差し替えを使う。
     use super::*;
 
     #[cfg(windows)]
@@ -1145,6 +1152,23 @@ mod tests {
             .structural_file_operation_refusal(),
             Some(FileOperationRefusal::VirtualPage)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_relative_paths_are_not_volume_roots() {
+        // 911284580 は . と foo\.. を空に正規化し、VolumeRoot と誤判定する。
+        for path in ["", ".", r"foo\..", "foo"] {
+            assert_eq!(
+                structural_file_operation_path_refusal(Path::new(path)),
+                None,
+                "{path}"
+            );
+            assert_eq!(
+                GridItem::Folder(path.into()).structural_file_operation_refusal(),
+                None
+            );
+        }
     }
 
     #[cfg(windows)]

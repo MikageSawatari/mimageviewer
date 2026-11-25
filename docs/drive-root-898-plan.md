@@ -43,7 +43,9 @@ pub(crate) fn structural_file_operation_path_refusal(path: &Path) -> Option<File
 - 判定の前に、パスを**ファイルシステムに問い合わせずに**整える (`lexical_normalize`)。`\\?\` で始まらないパスは
   `.` を除き、`..` で直前の通常成分を取り除く (ルートより上へは上がらない)。`\\?\` 形式は Windows が `.`・`..` を
   解釈しない約束なので、そのまま使う。リンク先・ジャンクションの実体は調べない (普通のジャンクションを断らない)。
-- `VolumeRoot`: 整えたパスで `path_key::is_drive_or_share_root` (= `parent().is_none()`)。`C:\`、`\\?\C:\`、
+- `VolumeRoot`: 整えたパスにドライブ指定 (prefix) またはルートがあり、かつ
+  `path_key::is_drive_or_share_root` (= `parent().is_none()`)。空・相対パス (`.`、`foo\..`、`foo` など) は
+  `VolumeRoot` にしない。`C:\`、`\\?\C:\`、
   `\\server\share`、`\\?\UNC\server\share\`、`\\?\Volume{...}\`、subst のドライブ (`X:\`)、`C:\photos\..`、
   `\\server\share\dir\..` が当たる。`C:` (ドライブ相対の指定) も当たるが、実ルートと断定するのではなく
   「どこを指すか決まらない指定」として断る。`C:\foo\..\bar` は通常のフォルダなので通す。
@@ -57,6 +59,11 @@ pub(crate) fn structural_file_operation_path_refusal(path: &Path) -> Option<File
   (`smart_folder::is_smart_folder_synthetic_path`) を、両側を整えて比べる形に変える。一致の範囲が広がる方向だけの
   変更で、既存の利用箇所 (実在パスを要求する汎用ガード) にとっても正しい。合成パスは mIV 自身が `data_dir` から作る
   表記だけを対象とし、`\\?\` の別名まではテストで保証しない。)
+
+入力は 1 回だけ正規化し、正規化済み入力用の共通判定へ渡す。`data_dir` も 1 回だけ正規化し、
+親と既知の合成名を比べる。合成パス 6 個を先に作らない。スマートフォルダーは ID 解析を
+唯一の解析関数とし、真偽判定もその結果から導く。正規化済み入力と `data_dir` を受け取る内部解析を
+汎用の合成パス判定とも共有する (2026-11-25 利用者の修正依頼による追補)。
 
 `FileOperationRefusal` に `VolumeRoot` と `VirtualLocation` を足し、文言もここで持つ
 (「ドライブや共有のルートは{action}できません」「仮想の場所は{action}できません」)。
@@ -111,26 +118,36 @@ UI の入口を後から足しても漏れないよう、Shell を呼ぶ直前�
 
 ## 4. テスト (旧コードで落ちるもの)
 
+破壊的な操作のテストでは、本物の Shell を実パスに呼ばせない。実ドライブのルートは判定の関数にだけ渡し、
+実行経路は一時フォルダ内の偽パスと差し替え関数で確かめる。確認・窓の要求だけの handler はルートを使ってよいが、
+拒否が常に None でも実行へ進まない作りを保つ。差し替えがあっても実行関数にはルートを渡さない。
+最後の防ぎの配線は `<temp>/__drive_list__` の `VirtualLocation` 拒否理由と偽 worker 呼出ゼロで検査する。
+通常項目・コピーの受理も一時フォルダ内のパスと偽 worker で検査する。
+スマートフォルダーは表記違いで判定と ID が一致し、resident root の復元と open が通ることも検査する。
+
 handler-level (App のテスト環境):
 
 1. ドライブ一覧 (`install_drive_list` 相当で `Folder("C:\\")` を並べ、カーソルを置く) で Delete キー →
    `show_delete_confirm == false`、`VolumeRoot` の文言の通知 (旧: 確認が開く)。
-2. 同じ状態で Ctrl+X → テスト用の有効な HWND と差し替え関数を用意し、呼出回数ゼロと `VolumeRoot` の文言の通知
-   (旧: 呼ばれる。HWND が無いと旧コードでも呼ばれないので、HWND を必ず用意する)。同じ状態の Ctrl+C は今までどおり 1 回呼ばれる。
+2. 同じ状態で Ctrl+X → キー要求と純粋な受付で `VolumeRoot` を検査する。Ctrl+C は純粋な受付で通る。
+   実行経路の通知と呼出回数は、一時フォルダの合成パス (Cut: 0 / Copy: 1) と通常項目で検査する。
 3. `request_rename_dialog(C:\)` → 窓が開かず、`VolumeRoot` の文言の通知 (旧: 「この項目は名前を変更できません」)。
-4. ファイル整理先でドライブを「移動」で実行 → Shell の転送を起こさず `VolumeRoot` の通知。「コピー」は今までどおり受け付ける。
+4. ファイル整理先でドライブを選び、純粋な移動受付で `VolumeRoot` を検査する (コピー受付は通る)。
+   submit の配線は一時フォルダの合成パスで拒否理由・偽転送の呼出ゼロ・選択保持を検査し、コピーは偽転送 1 回を検査する。
 5. ドラッグのドロップ: 既存の祖先関係の検査では通る**別ドライブへの Shift 移動**で、ルートを断り通知が出る。同じ組み合わせのコピーは通る。
 6. 合成パス (`__drive_list__`) の `Folder` 項目で Delete → 確認が開かず `VirtualLocation` の通知。
 7. ルートと通常のフォルダの混在を `request_delete_confirm` へ渡す → 全体を断る。
-8. 普通のフォルダ (`C:\foo`)・`C:\foo\..\bar`・普通のファイルでは、上のどれも今までどおり確認・窓が開く (退行が無いこと)。
+8. 普通のフォルダ・`foo\..\bar`・普通のファイルを一時フォルダ内に置き、確認・窓の要求と
+   差し替え先の呼出で従来の受付を検査する。`C:\foo` 等の表記は純粋なパス判定だけで検査する。
 
 unit: `structural_file_operation_path_refusal` に `C:\`、`C:`、`\\?\C:\`、`\\server\share`、`\\server\share\`、
 `\\?\UNC\server\share\`、`\\?\Volume{GUID}\`、`X:\`、`C:\photos\..`、`\\server\share\dir\..` → `VolumeRoot`、
 `C:\foo`、`C:\foo\..\bar`、`\\server\share\dir` → `None`、合成パス (末尾区切りあり・大文字小文字違い) → `VirtualLocation`。`data_dir` 自体が `.`・`..` を含むとき (例 `.\data`、`C:\x\..\data`) の合成パスも、入力の表記によらず `VirtualLocation`。スマートフォルダーの合成パスも同じ。
 
-worker 側 (単なる `Err` ではなく、ルートを理由に断ったことを確かめる): `start_delete_files` にルートを直接渡すと
-worker を起こさない、`validate_transfer_request` が移動のルートをルートの理由で `Err` (コピーは通る)、
-`rename_item_async` がルートを理由に断る。
+worker 側: ルートの拒否理由は上の純粋なパス判定で検査する。実行の最後の防ぎは一時フォルダ内の
+合成パスで検査し、`start_delete_files_with` / `rename_item_async_with` の偽 worker が呼ばれず、
+`VirtualLocation` の理由になることを確かめる。`validate_transfer_request` も一時フォルダ内の合成パスを
+移動で拒否し、コピーでは通す。通常の一時フォルダ／ファイルの worker 受付は差し替えで計数する。
 
 ## 5. 文書
 

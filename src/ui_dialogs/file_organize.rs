@@ -30,6 +30,23 @@ pub(crate) struct FileOrganizeRunning {
 }
 
 impl FileOrganizeRequest {
+    /// Pure admission check; do not consume the selection or start a transfer.
+    pub(crate) fn structural_submission_refusal(
+        &self,
+        operation: ShellTransferOperation,
+    ) -> Option<crate::grid_item::FileOperationRefusal> {
+        if operation != ShellTransferOperation::Move {
+            return None;
+        }
+        let Self::Selecting(selection) = self else {
+            return None;
+        };
+        selection
+            .sources
+            .iter()
+            .find_map(|path| crate::grid_item::structural_file_operation_path_refusal(path))
+    }
+
     // Consume the selected request once. In particular, a duplicate cannot retire Running.
     pub(crate) fn take_for_submission(
         &mut self,
@@ -454,17 +471,12 @@ impl App {
             egui::Context,
         ) -> mpsc::Receiver<ShellTransferResult>,
     ) {
-        if operation == ShellTransferOperation::Move {
-            if let FileOrganizeRequest::Selecting(selection) = &self.file_organize_request {
-                if let Some(reason) = selection
-                    .sources
-                    .iter()
-                    .find_map(|path| crate::grid_item::structural_file_operation_path_refusal(path))
-                {
-                    self.show_feedback_warning(reason.message("移動"));
-                    return;
-                }
-            }
+        if let Some(reason) = self
+            .file_organize_request
+            .structural_submission_refusal(operation)
+        {
+            self.show_feedback_warning(reason.message("移動"));
+            return;
         }
         // Consume Selecting once, then use the same admission and execution owner as tree drops.
         match self

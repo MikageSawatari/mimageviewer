@@ -1,4 +1,5 @@
-//! Headless handler tests. Shell calls are replaced; no product UI or file operation is started.
+//! 破壊的な操作のテストでは、本物の Shell を実パスに呼ばせない。
+//! 実ドライブのルートは判定・実行しない入口だけに渡し、実行経路は一時フォルダの偽パスと差し替えで確かめる。
 use super::*;
 use crate::grid_item::FileOperationRefusal;
 use crate::native_context_menu::ShellClipboardVerb;
@@ -72,10 +73,11 @@ fn drive_root_898_delete_key_refuses_root_and_preserves_ordinary_items() {
     assert!(app.delete_pending.is_none());
     assert_notice(&app, FileOperationRefusal::VolumeRoot, "削除");
     app.items_are_drive_list = false;
+    let root = app.tmp.path().to_owned();
     for item in [
-        GridItem::Folder(r"C:\foo".into()),
-        GridItem::Folder(r"C:\foo\..\bar".into()),
-        GridItem::Image(r"C:\foo.jpg".into()),
+        GridItem::Folder(root.join("foo")),
+        GridItem::Folder(root.join(r"foo\..\bar")),
+        GridItem::Image(root.join("foo.jpg")),
     ] {
         app.items = vec![item];
         app.fs_feedback_toast = None;
@@ -88,15 +90,44 @@ fn drive_root_898_delete_key_refuses_root_and_preserves_ordinary_items() {
 }
 
 #[test]
-fn drive_root_898_ctrl_x_refuses_root_but_ctrl_c_and_ordinary_cut_invoke_shell() {
-    // 旧コードは有効な HWND があるとルートの Cut を Shell 差し替え関数へ渡し、呼出回数ゼロ検査が落ちる。
+fn drive_root_898_ctrl_x_root_admission_and_temporary_clipboard_execution() {
+    // 拒否無効の変異ではルートの純粋受付と、合成パスの呼出ゼロ／拒否理由の検査が落ちる。
     let mut app = drive_list();
+    for cut in [true, false] {
+        let ctx = egui::Context::default();
+        begin_grid_key_pass(
+            &ctx,
+            if cut { 0x58 } else { 0x43 },
+            if cut { 0x2D } else { 0x2E },
+            true,
+        );
+        let _owner = app.keyboard_owner_for_pass(&ctx);
+        let (verb, _) = app.grid_clipboard_requests(&ctx).unwrap();
+        let verb = verb.unwrap();
+        assert_eq!(
+            verb,
+            if cut {
+                ShellClipboardVerb::Cut
+            } else {
+                ShellClipboardVerb::Copy
+            }
+        );
+        let paths = app.collect_shell_clipboard_paths().unwrap();
+        // Roots never enter invoke_shell_clipboard_verb_for_paths_with, including Copy.
+        assert_eq!(
+            App::shell_clipboard_paths_refusal(&paths, verb),
+            cut.then_some(FileOperationRefusal::VolumeRoot)
+        );
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+    let root = app.tmp.path().to_owned();
+    app.items_are_drive_list = false;
     for (item, cut, expected) in [
-        (GridItem::Folder(r"C:\".into()), true, 0),
-        (GridItem::Folder(r"C:\".into()), false, 1),
-        (GridItem::Folder(r"C:\foo".into()), true, 1),
-        (GridItem::Folder(r"C:\foo\..\bar".into()), true, 1),
-        (GridItem::Image(r"C:\foo.jpg".into()), true, 1),
+        (GridItem::Folder(root.join("__drive_list__")), true, 0),
+        (GridItem::Folder(root.join("__drive_list__")), false, 1),
+        (GridItem::Folder(root.join("foo")), true, 1),
+        (GridItem::Folder(root.join(r"foo\..\bar")), true, 1),
+        (GridItem::Image(root.join("foo.jpg")), true, 1),
     ] {
         app.items = vec![item];
         app.fs_feedback_toast = None;
@@ -134,7 +165,7 @@ fn drive_root_898_ctrl_x_refuses_root_but_ctrl_c_and_ordinary_cut_invoke_shell()
         );
         assert_eq!(calls, expected);
         if expected == 0 {
-            assert_notice(&app, FileOperationRefusal::VolumeRoot, "切り取り");
+            assert_notice(&app, FileOperationRefusal::VirtualLocation, "切り取り");
         } else {
             assert!(app.fs_feedback_toast.is_none());
         }
@@ -150,15 +181,16 @@ fn drive_root_898_rename_refuses_root_and_preserves_ordinary_dialogs() {
     assert!(!app.show_rename_dialog);
     assert!(app.rename_target.is_none());
     assert_notice(&app, FileOperationRefusal::VolumeRoot, "名前の変更");
+    let root = app.tmp.path().to_owned();
     for (path, is_file) in [
-        (r"C:\foo", false),
-        (r"C:\foo\..\bar", false),
-        (r"C:\foo.jpg", true),
+        (root.join("foo"), false),
+        (root.join(r"foo\..\bar"), false),
+        (root.join("foo.jpg"), true),
     ] {
         app.fs_feedback_toast = None;
-        app.request_rename_dialog(path.into(), is_file);
+        app.request_rename_dialog(path.clone(), is_file);
         assert!(app.show_rename_dialog);
-        assert_eq!(app.rename_target.as_deref(), Some(Path::new(path)));
+        assert_eq!(app.rename_target.as_deref(), Some(path.as_path()));
         assert!(app.fs_feedback_toast.is_none());
         app.show_rename_dialog = false;
         app.rename_target = None;
@@ -166,9 +198,10 @@ fn drive_root_898_rename_refuses_root_and_preserves_ordinary_dialogs() {
 }
 
 #[test]
-fn drive_root_898_organize_refuses_move_keeps_selection_and_accepts_copy() {
-    // 旧コードはルートの移動を転送差し替え関数へ渡し、呼出ゼロ／Selecting 維持の検査が落ちる。
+fn drive_root_898_organize_root_admission_and_temporary_move_copy_execution() {
+    // 拒否無効の変異ではルートの純粋受付と、合成パスの呼出ゼロ／Selecting 維持の検査が落ちる。
     let mut app = drive_list();
+    let root = app.tmp.path().to_owned();
     let destination = app.tmp.path().join("destination");
     app.settings.file_organize_destinations = vec![crate::settings::FileOrganizeDestination {
         name: "destination".into(),
@@ -177,6 +210,22 @@ fn drive_root_898_organize_refuses_move_keeps_selection_and_accepts_copy() {
     let ctx = egui::Context::default();
     app.request_file_organize_dialog(None);
     assert!(app.file_organize_dialog_visible());
+    // The drive selection is inspected only; never submit it to the execution method.
+    assert_eq!(
+        app.file_organize_request
+            .structural_submission_refusal(ShellTransferOperation::Move),
+        Some(FileOperationRefusal::VolumeRoot)
+    );
+    assert_eq!(
+        app.file_organize_request
+            .structural_submission_refusal(ShellTransferOperation::Copy),
+        None
+    );
+    app.file_organize_request = FileOrganizeRequest::Hidden;
+    let synthetic = root.join("__drive_list__");
+    app.items_are_drive_list = false;
+    app.items = vec![GridItem::Folder(synthetic.clone())];
+    app.request_file_organize_dialog(None);
     let mut calls = 0;
     app.submit_file_organize_with(
         &ctx,
@@ -192,9 +241,9 @@ fn drive_root_898_organize_refuses_move_keeps_selection_and_accepts_copy() {
     let FileOrganizeRequest::Selecting(selection) = &app.file_organize_request else {
         panic!("selection must remain")
     };
-    assert_eq!(selection.sources, vec![PathBuf::from(r"C:\")]);
+    assert_eq!(selection.sources, vec![synthetic.clone()]);
     assert_eq!(selection.destinations[0].path, destination);
-    assert_notice(&app, FileOperationRefusal::VolumeRoot, "移動");
+    assert_notice(&app, FileOperationRefusal::VirtualLocation, "移動");
     app.fs_feedback_toast = None;
     app.submit_file_organize_with(
         &ctx,
@@ -203,7 +252,7 @@ fn drive_root_898_organize_refuses_move_keeps_selection_and_accepts_copy() {
         App::book_root_path,
         |hwnd, request, _| {
             assert_eq!(hwnd, Some(1));
-            assert_eq!(request.sources, vec![PathBuf::from(r"C:\")]);
+            assert_eq!(request.sources, vec![synthetic]);
             assert_eq!(request.operation, ShellTransferOperation::Copy);
             calls += 1;
             mpsc::channel().1
@@ -216,9 +265,9 @@ fn drive_root_898_organize_refuses_move_keeps_selection_and_accepts_copy() {
     ));
     assert!(app.fs_feedback_toast.is_none());
     for item in [
-        GridItem::Folder(r"C:\foo".into()),
-        GridItem::Folder(r"C:\foo\..\bar".into()),
-        GridItem::Image(r"C:\foo.jpg".into()),
+        GridItem::Folder(root.join("foo")),
+        GridItem::Folder(root.join(r"foo\..\bar")),
+        GridItem::Image(root.join("foo.jpg")),
     ] {
         app.file_organize_request = FileOrganizeRequest::Hidden;
         app.items = vec![item.clone()];
@@ -259,9 +308,10 @@ fn drive_root_898_delete_synthetic_folder_refuses_virtual_location() {
 fn drive_root_898_mixed_delete_request_refuses_every_target() {
     // 旧コードはルートと通常フォルダの全体を削除確認へ登録し、確認なし／対象未登録の検査が落ちる。
     let mut app = drive_list();
+    let folder = app.tmp.path().join("foo");
     for root_first in [false, true] {
         let mut items = vec![
-            GridItem::Folder(r"C:\foo".into()),
+            GridItem::Folder(folder.clone()),
             GridItem::Folder(r"C:\".into()),
         ];
         if root_first {
@@ -280,13 +330,54 @@ fn drive_root_898_mixed_delete_request_refuses_every_target() {
 }
 
 #[test]
-fn drive_root_898_start_delete_files_refuses_before_worker_and_invalidation() {
-    // 旧コードは直接渡したルートで worker を開始し、delete_pending.is_none() の検査が落ちる。
+fn drive_root_898_delete_virtual_guard_before_worker_and_invalidation() {
+    // 拒否が壊れた旧コード相当では偽 worker の呼出が 1 回になり、ゼロの検査が落ちる。
     let mut app = drive_list();
+    let root = app.tmp.path().to_owned();
+    app.items_are_drive_list = false;
+    app.items = vec![GridItem::Folder(root.join("__drive_list__"))];
     let generation = app.items_generation;
     let targets = vec![DeleteTarget::from_grid_item(&app.items[0]).unwrap()];
-    app.start_delete_files(&egui::Context::default(), targets);
+    let mut calls = 0;
+    app.start_delete_files_with(&egui::Context::default(), targets, |paths, scopes, _, _| {
+        calls += 1;
+        fake_delete_pending(paths, scopes)
+    });
+    assert_eq!(calls, 0);
     assert!(app.delete_pending.is_none());
     assert_eq!(app.items_generation, generation);
-    assert_notice(&app, FileOperationRefusal::VolumeRoot, "削除");
+    assert_notice(&app, FileOperationRefusal::VirtualLocation, "削除");
+    for item in [
+        GridItem::Folder(root.join("foo")),
+        GridItem::Folder(root.join(r"foo\..\bar")),
+        GridItem::Image(root.join("foo.jpg")),
+    ] {
+        let targets = vec![DeleteTarget::from_grid_item(&item).unwrap()];
+        app.delete_pending = None;
+        app.fs_feedback_toast = None;
+        let mut calls = 0;
+        app.start_delete_files_with(&egui::Context::default(), targets, |paths, scopes, _, _| {
+            calls += 1;
+            assert_eq!(paths, vec![item.drag_source_path().unwrap().to_owned()]);
+            fake_delete_pending(paths, scopes)
+        });
+        assert_eq!(calls, 1);
+        assert!(app.fs_feedback_toast.is_none());
+    }
+}
+
+fn fake_delete_pending(
+    paths: Vec<PathBuf>,
+    source_scopes: Vec<crate::delete_worker::DeleteSourceScope>,
+) -> crate::delete_worker::DeletePending {
+    crate::delete_worker::DeletePending {
+        cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        rx: mpsc::channel().1,
+        total: paths.len(),
+        succeeded: Vec::new(),
+        failed: Vec::new(),
+        purged_pdf_password_paths: Vec::new(),
+        purge_deferred: false,
+        source_scopes,
+    }
 }

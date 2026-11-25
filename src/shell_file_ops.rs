@@ -916,13 +916,31 @@ pub fn rename_item_async(
     target: PathBuf,
     new_name: String,
 ) -> mpsc::Receiver<ShellRenameResult> {
-    let (tx, rx) = mpsc::channel();
+    rename_item_async_with(hwnd, target, new_name, spawn_rename_item)
+}
+
+fn rename_item_async_with(
+    hwnd: Option<isize>,
+    target: PathBuf,
+    new_name: String,
+    spawn: impl FnOnce(Option<isize>, PathBuf, String) -> mpsc::Receiver<ShellRenameResult>,
+) -> mpsc::Receiver<ShellRenameResult> {
     if let Some(reason) = crate::grid_item::structural_file_operation_path_refusal(&target) {
+        let (tx, rx) = mpsc::channel();
         let message = reason.message("名前の変更");
         crate::logger::log(format!("shell_rename: rejected: {message}"));
         let _ = tx.send(Err(message));
         return rx;
     }
+    spawn(hwnd, target, new_name)
+}
+
+fn spawn_rename_item(
+    hwnd: Option<isize>,
+    target: PathBuf,
+    new_name: String,
+) -> mpsc::Receiver<ShellRenameResult> {
+    let (tx, rx) = mpsc::channel();
     let spawn_target = target.clone();
     let spawn_name = new_name.clone();
     let tx_on_spawn_error = tx.clone();
@@ -1951,47 +1969,79 @@ mod transfer_tests {
         }
     }
 
+    // §1.898: 本物の Shell を実パスに呼ばせない。実ドライブのルートは判定だけに渡す。
+    // 実行経路は一時フォルダ内の偽パスと差し替えで確かめる。
     #[cfg(windows)]
     #[test]
-    fn drive_root_898_transfer_move_refuses_roots_and_copy_keeps_existing_validation() {
-        let temp = tempfile::tempdir().unwrap();
-        for source in [r"C:\", r"C:", r"\\server\share", r"C:\photos\.."] {
-            let error = validate_transfer_request(request(
-                ShellTransferOperation::Move,
-                vec![source.into()],
-                temp.path().to_owned(),
-            ))
-            .unwrap_err();
-            assert_eq!(
-                error,
-                crate::grid_item::FileOperationRefusal::VolumeRoot.message("移動")
-            );
-        }
-        // With only one volume, copying a root into temp is still rejected by the existing
-        // ancestor rule. Reaching that rule proves Copy passed the new structural guard.
-        let root = temp.path().ancestors().last().unwrap().to_owned();
+    fn drive_root_898_transfer_virtual_guard_and_copy_validation() {
+        let temp = crate::data_dir::TestDataDirGuard::new();
+        let synthetic = temp.path().join("__drive_list__");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir(&synthetic).unwrap();
+        std::fs::create_dir(&destination).unwrap();
         let error = validate_transfer_request(request(
-            ShellTransferOperation::Copy,
-            vec![root],
-            temp.path().to_owned(),
+            ShellTransferOperation::Move,
+            vec![synthetic.clone()],
+            destination.clone(),
         ))
         .unwrap_err();
-        assert!(error.contains("フォルダ自身またはその配下"), "{error}");
+        assert_eq!(
+            error,
+            crate::grid_item::FileOperationRefusal::VirtualLocation.message("移動")
+        );
+        validate_transfer_request(request(
+            ShellTransferOperation::Copy,
+            vec![synthetic],
+            destination.clone(),
+        ))
+        .unwrap();
+        let folder = temp.path().join("folder");
+        let file = temp.path().join("file.jpg");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&file, b"fake").unwrap();
+        validate_transfer_request(request(
+            ShellTransferOperation::Move,
+            vec![folder, file],
+            destination,
+        ))
+        .unwrap();
     }
 
     #[cfg(windows)]
     #[test]
-    fn drive_root_898_rename_async_refuses_root_with_structural_reason() {
-        let _guard = crate::data_dir::TestDataDirGuard::new();
-        for target in [r"C:\", r"C:", r"\\server\share", r"C:\photos\.."] {
-            let error = rename_item_async(None, target.into(), "renamed".into())
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap()
-                .unwrap_err();
+    fn drive_root_898_rename_async_virtual_guard_and_temporary_sources() {
+        let temp = crate::data_dir::TestDataDirGuard::new();
+        for target in [temp.path().join("__drive_list__")] {
+            let mut calls = 0;
+            let error = rename_item_async_with(None, target, "renamed".into(), |_, _, _| {
+                calls += 1;
+                let (tx, rx) = mpsc::channel();
+                let _ = tx.send(Err("fake worker was called".into()));
+                rx
+            })
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(calls, 0);
             assert_eq!(
                 error,
-                crate::grid_item::FileOperationRefusal::VolumeRoot.message("名前の変更")
+                crate::grid_item::FileOperationRefusal::VirtualLocation.message("名前の変更")
             );
+        }
+        for target in [
+            temp.path().join("foo"),
+            temp.path().join(r"foo\..\bar"),
+            temp.path().join("foo.jpg"),
+        ] {
+            let mut calls = 0;
+            let _rx =
+                rename_item_async_with(None, target.clone(), "renamed".into(), |_, path, name| {
+                    calls += 1;
+                    assert_eq!(path, target);
+                    assert_eq!(name, "renamed");
+                    mpsc::channel().1
+                });
+            assert_eq!(calls, 1);
         }
     }
 

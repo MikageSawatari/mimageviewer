@@ -13722,18 +13722,38 @@ fn main_window_title(location_label: Option<&str>, indexing_active: bool) -> Str
 /// 「実在パスを要求する汎用ガード」で使う。
 pub(crate) fn is_synthetic_view_path(path: &Path) -> bool {
     let path = crate::path_key::lexical_normalize(path);
-    [
-        search_results_synthetic_path(),
-        reading_history_synthetic_path(),
-        bookmark_view_synthetic_path(),
-        rating_view_synthetic_path(),
-        subfolder_expansion_synthetic_path(),
-        drive_list_synthetic_path(),
-    ]
-    .iter()
-    .any(|synthetic| {
-        crate::folder_tree::path_eq(&path, &crate::path_key::lexical_normalize(synthetic))
-    }) || smart_folder::is_smart_folder_synthetic_path(&path)
+    is_synthetic_view_path_normalized(&path)
+}
+
+/// The caller has already lexically normalized the input. Normalize data_dir only once,
+/// and compare path components instead of constructing every possible synthetic path.
+pub(crate) fn is_synthetic_view_path_normalized(path: &Path) -> bool {
+    let data_dir = crate::path_key::lexical_normalize(&crate::data_dir::get());
+    let known_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            [
+                "__search_results__",
+                "__reading_history__",
+                "__bookmarks__",
+                "__rating_view__",
+                "__subfolder_expansion__",
+                "__drive_list__",
+            ]
+            .iter()
+            .any(|known| synthetic_view_name_eq(name, known))
+        });
+    (known_name
+        && path
+            .parent()
+            .is_some_and(|parent| crate::folder_tree::path_eq(parent, &data_dir)))
+        || smart_folder::smart_folder_id_from_normalized_synthetic_path(path, &data_dir).is_some()
+}
+
+/// Match path_eq's lowercase comparison, without allocating for the usual ASCII names.
+fn synthetic_view_name_eq(name: &str, expected: &str) -> bool {
+    name.eq_ignore_ascii_case(expected) || (!name.is_ascii() && name.to_lowercase() == expected)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53011,6 +53031,20 @@ impl App {
         ctx: &egui::Context,
         targets: Vec<crate::ui_dialogs::context_menu::DeleteTarget>,
     ) {
+        self.start_delete_files_with(ctx, targets, crate::delete_worker::spawn_with_stack);
+    }
+
+    pub(crate) fn start_delete_files_with(
+        &mut self,
+        ctx: &egui::Context,
+        targets: Vec<crate::ui_dialogs::context_menu::DeleteTarget>,
+        spawn: impl FnOnce(
+            Vec<PathBuf>,
+            Vec<crate::delete_worker::DeleteSourceScope>,
+            Option<isize>,
+            Option<crate::filename_stack_ui::StackDeletionSource>,
+        ) -> crate::delete_worker::DeletePending,
+    ) {
         if let Some(reason) = targets.iter().find_map(|target| {
             crate::grid_item::structural_file_operation_path_refusal(target.path())
         }) {
@@ -53051,12 +53085,7 @@ impl App {
         }
         self.global_search.pending = None;
         let stack = self.capture_stack_deletion();
-        self.delete_pending = Some(crate::delete_worker::spawn_with_stack(
-            paths,
-            source_scopes,
-            self.main_hwnd,
-            stack,
-        ));
+        self.delete_pending = Some(spawn(paths, source_scopes, self.main_hwnd, stack));
     }
 
     /// 毎フレーム `delete_pending` の進捗メッセージを受信する。
@@ -64692,6 +64721,19 @@ impl App {
         );
     }
 
+    /// Pure admission check shared by the clipboard handler and root-path tests.
+    fn shell_clipboard_paths_refusal(
+        paths: &[PathBuf],
+        verb: crate::native_context_menu::ShellClipboardVerb,
+    ) -> Option<crate::grid_item::FileOperationRefusal> {
+        if verb != crate::native_context_menu::ShellClipboardVerb::Cut {
+            return None;
+        }
+        paths
+            .iter()
+            .find_map(|path| crate::grid_item::structural_file_operation_path_refusal(path))
+    }
+
     pub(crate) fn invoke_shell_clipboard_verb_for_paths_with(
         &mut self,
         ctx: &egui::Context,
@@ -64704,14 +64746,9 @@ impl App {
             Option<crate::cut_clipboard::LocalCutDataObject>,
         ) -> Result<u32, String>,
     ) {
-        if verb == crate::native_context_menu::ShellClipboardVerb::Cut {
-            if let Some(reason) = paths
-                .iter()
-                .find_map(|path| crate::grid_item::structural_file_operation_path_refusal(path))
-            {
-                self.show_feedback_warning(reason.message("切り取り"));
-                return;
-            }
+        if let Some(reason) = Self::shell_clipboard_paths_refusal(paths, verb) {
+            self.show_feedback_warning(reason.message("切り取り"));
+            return;
         }
         if self.shell_paste_request.is_some()
             && matches!(

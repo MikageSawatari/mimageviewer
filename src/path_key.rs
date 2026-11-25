@@ -296,6 +296,8 @@ fn existing_component_name(path: &Path) -> Option<std::ffi::OsString> {
 
 #[cfg(test)]
 mod tests {
+    // §1.898: 実ドライブのルートは判定だけに渡す。本物の Shell を実パスに呼ばせない。
+    // 実行経路のテストは一時フォルダ内の偽パスと差し替えを使う。
     use super::*;
 
     #[cfg(windows)]
