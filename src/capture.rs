@@ -287,32 +287,73 @@ pub fn reveal_path_async(path: PathBuf) {
 }
 
 #[cfg(windows)]
+fn shell_path_text(path: &Path) -> String {
+    let absolute = if path.is_relative() {
+        std::path::absolute(path).ok()
+    } else {
+        None
+    };
+    let text = absolute.as_deref().unwrap_or(path).to_string_lossy();
+    let text = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(drive) = text.strip_prefix(r"\\?\").filter(|drive| {
+        let bytes = drive.as_bytes();
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+    }) {
+        drive.to_string()
+    } else {
+        // Other verbatim namespaces (such as Volume GUIDs) retain their prefix.
+        text.into_owned()
+    };
+    crate::ui_dialogs::context_menu::native_path_text(Path::new(&text))
+}
+
+#[cfg(windows)]
 fn reveal_path_wide(path: &Path) -> Vec<u16> {
-    crate::ui_dialogs::context_menu::native_path_text(path)
+    shell_path_text(path)
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect()
 }
 
 #[cfg(windows)]
+struct ShellPidl(std::ptr::NonNull<windows::Win32::UI::Shell::Common::ITEMIDLIST>);
+
+#[cfg(windows)]
+impl ShellPidl {
+    /// The caller initializes COM and keeps it initialized until this PIDL is dropped.
+    fn from_path(path: &Path) -> windows::core::Result<Self> {
+        use windows::Win32::Foundation::E_FAIL;
+        use windows::Win32::UI::Shell::ILCreateFromPathW;
+        use windows::core::{Error, PCWSTR};
+
+        let wide = reveal_path_wide(path);
+        let pidl = unsafe { ILCreateFromPathW(PCWSTR(wide.as_ptr())) };
+        // This API returns no HRESULT; identify its null result explicitly.
+        std::ptr::NonNull::new(pidl)
+            .map(Self)
+            .ok_or_else(|| Error::new(E_FAIL, "ILCreateFromPathW returned null"))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ShellPidl {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::UI::Shell::ILFree(Some(self.0.as_ptr())) };
+    }
+}
+
+#[cfg(windows)]
 fn reveal_path_in_shell(path: &Path) -> windows::core::Result<()> {
-    use windows::Win32::Foundation::E_FAIL;
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
-    use windows::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
-    use windows::core::{Error, PCWSTR};
+    use windows::Win32::UI::Shell::SHOpenFolderAndSelectItems;
 
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok()?;
-    let wide = reveal_path_wide(path);
-    let pidl = unsafe { ILCreateFromPathW(PCWSTR(wide.as_ptr())) };
-    let result = if pidl.is_null() {
-        // This API returns no HRESULT; identify its null result explicitly.
-        Err(Error::new(E_FAIL, "ILCreateFromPathW returned null"))
-    } else {
+    let result = (|| {
+        let pidl = ShellPidl::from_path(path)?;
         // With no child list, the absolute PIDL names the item to select.
-        let result = unsafe { SHOpenFolderAndSelectItems(pidl, None, 0) };
-        unsafe { ILFree(Some(pidl)) };
-        result
-    };
+        unsafe { SHOpenFolderAndSelectItems(pidl.0.as_ptr(), None, 0) }
+    })();
     unsafe { CoUninitialize() };
     result
 }
@@ -872,6 +913,79 @@ pub(crate) fn flatten_rgba_to_rgb(rgba: &[u8], width: u32, matte: JpegMatte) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_path_text_strips_verbatim_disk_prefix() {
+        assert_eq!(shell_path_text(Path::new(r"\\?\C:\a\b.jpg")), r"C:\a\b.jpg");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_path_text_strips_verbatim_unc_prefix() {
+        assert_eq!(
+            shell_path_text(Path::new(r"\\?\UNC\srv\sh\a.jpg")),
+            r"\\srv\sh\a.jpg"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_path_text_preserves_other_verbatim_namespaces() {
+        let path = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\a.jpg";
+        assert_eq!(shell_path_text(Path::new(path)), path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_path_text_normalizes_slashes() {
+        assert_eq!(shell_path_text(Path::new("C:/a/b.jpg")), r"C:\a\b.jpg");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_path_text_makes_relative_paths_absolute() {
+        let current_dir = std::env::current_dir().unwrap();
+        let path = PathBuf::from(shell_path_text(Path::new(r"out\a.jpg")));
+        assert!(path.is_absolute());
+        assert!(path.starts_with(&current_dir));
+        assert_eq!(path, current_dir.join(r"out\a.jpg"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_pidl_from_path_accepts_absolute_and_verbatim_files() {
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize,
+        };
+
+        struct ComApartment;
+        impl Drop for ComApartment {
+            fn drop(&mut self) {
+                unsafe { CoUninitialize() };
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::path::absolute(dir.path().join("shell-pidl.txt")).unwrap();
+        std::fs::write(&path, b"shell PIDL test").unwrap();
+        let text = path.to_str().unwrap();
+        let verbatim = if let Some(unc) = text.strip_prefix(r"\\") {
+            PathBuf::from(format!(r"\\?\UNC\{unc}"))
+        } else {
+            PathBuf::from(format!(r"\\?\{text}"))
+        };
+
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+            .ok()
+            .unwrap();
+        let _com = ComApartment;
+        for path in [&path, &verbatim] {
+            // A successful result owns a non-null PIDL; no Explorer API is called.
+            let _pidl = ShellPidl::from_path(path)
+                .unwrap_or_else(|err| panic!("PIDL creation failed for {}: {err}", path.display()));
+        }
+    }
 
     #[cfg(windows)]
     #[test]
