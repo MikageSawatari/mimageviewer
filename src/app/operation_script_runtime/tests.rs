@@ -441,6 +441,194 @@ fn image_target_ignores_cache_availability_but_tracks_pairing_origin_reset() {
 }
 
 #[test]
+fn page_identity_tracks_in_memory_unit_policy_inputs() {
+    let cases: &[(&str, fn(&mut App))] = &[
+        ("mode", |app| {
+            app.spread_mode = crate::settings::SpreadMode::LtrCover
+        }),
+        ("flow", |app| {
+            app.reading_flow = crate::settings::ReadingFlow::Horizontal
+        }),
+        ("direction", |app| {
+            app.reading_direction = crate::settings::ReadingDirection::Rtl
+        }),
+        ("shift", |app| app.set_spread_shift_anchor_for_test(Some(1))),
+        ("step", |app| app.set_spread_step(1)),
+        ("slice", |app| {
+            app.fullscreen_page_slice = crate::page_split::PageSlice::Left
+        }),
+        ("page alone", |app| {
+            app.settings.page_after_cover_alone_enabled =
+                !app.settings.page_after_cover_alone_enabled
+        }),
+        ("singleton", |app| {
+            app.settings.singleton_spread_first_enabled =
+                !app.settings.singleton_spread_first_enabled
+        }),
+        ("animation", |app| {
+            app.settings.page_turn_animation_enabled = !app.settings.page_turn_animation_enabled
+        }),
+        ("book final cover", |app| {
+            app.final_cover_spread_preference = crate::settings::FinalCoverSpreadPreference::On
+        }),
+        ("global final cover", |app| {
+            app.settings.final_cover_spread_enabled = !app.settings.final_cover_spread_enabled
+        }),
+        ("source", |app| {
+            app.spread_presentation_source =
+                super::super::SpreadPresentationSource::PhysicalDirectory {
+                    key: "C:/browser".into(),
+                }
+        }),
+        ("browser root", |app| {
+            app.settings.browser_view_output_dir = Some("C:/browser".into())
+        }),
+        ("extracted", |app| {
+            app.projection_recipe =
+                super::super::book_materialization::ProjectionRecipe::ExtractedResult(
+                    super::super::book_materialization::ExtractedSurface::Snapshot,
+                )
+        }),
+        ("grid mode", |app| {
+            app.settings.grid_view_mode = crate::settings::GridViewMode::Details
+        }),
+        ("analysis", |app| app.analysis_mode = true),
+        ("comparison", |app| {
+            app.compare_view_mode = super::super::CompareViewMode::PinnedNormal
+        }),
+        ("panorama", |app| {
+            app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Panorama(
+                crate::panorama::PanoramaState::new(
+                    0.0,
+                    0.0,
+                    crate::panorama::PanoProjection::Perspective,
+                ),
+            )
+        }),
+        ("endpoint search", |app| app.show_search_bar = true),
+        ("endpoint stack", |app| app.stack_mode_requested = true),
+    ];
+    for &(name, change) in cases {
+        let mut app = grid_app("[]");
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        let before = app.operation_script_page_identity();
+        change(&mut app);
+        assert_ne!(app.operation_script_page_identity(), before, "{name}");
+    }
+}
+
+#[test]
+fn page_identity_reader_order_and_origins_use_typed_items_not_row_numbers() {
+    let mut app = grid_app("[]");
+    app.fullscreen_idx = Some(0);
+    app.set_spread_shift_anchor_for_test(Some(1));
+    app.set_spread_step(0);
+    let before = app.operation_script_page_identity();
+    app.items.swap(0, 1);
+    app.visible_indices = vec![1, 0];
+    app.fullscreen_idx = Some(1);
+    app.set_spread_shift_anchor_for_test(Some(0));
+    app.set_spread_step(1);
+    app.items_generation += 1;
+    assert_eq!(
+        app.operation_script_page_identity(),
+        before,
+        "same typed item order after reindexing"
+    );
+    app.visible_indices.reverse();
+    assert_ne!(
+        app.operation_script_page_identity(),
+        before,
+        "same-size reader reordering changes unit inputs"
+    );
+    app.visible_indices.reverse();
+    app.items[0] = GridItem::Video("C:/different-neighbor.mp4".into());
+    assert_ne!(
+        app.operation_script_page_identity(),
+        before,
+        "neighbor kind/path is part of the input"
+    );
+}
+
+#[test]
+fn page_identity_uses_canonical_mode_direction_and_only_the_split_rotation_boundary() {
+    use crate::settings::{ReadingDirection, SpreadMode};
+    let mut app = grid_app("[]");
+    app.fullscreen_idx = Some(0);
+    for mode in [
+        SpreadMode::Ltr,
+        SpreadMode::Rtl,
+        SpreadMode::SplitLtr,
+        SpreadMode::SplitRtl,
+    ] {
+        app.spread_mode = mode;
+        app.reading_direction = ReadingDirection::Ltr;
+        let before = app.operation_script_page_identity();
+        app.reading_direction = ReadingDirection::Rtl;
+        assert_eq!(
+            app.operation_script_page_identity(),
+            before,
+            "{mode:?} owns direction"
+        );
+    }
+    app.spread_mode = SpreadMode::Single;
+    let rtl = app.operation_script_page_identity();
+    app.reading_direction = ReadingDirection::Ltr;
+    assert_ne!(app.operation_script_page_identity(), rtl);
+    app.spread_mode = SpreadMode::SplitLtr;
+    app.fs_free_rotation = 0.0;
+    let split = app.operation_script_page_identity();
+    app.fs_free_rotation = 0.0005;
+    assert_eq!(app.operation_script_page_identity(), split);
+    app.fs_free_rotation = 0.002;
+    let unsplit = app.operation_script_page_identity();
+    assert_ne!(unsplit, split);
+    app.fs_free_rotation = 1.0;
+    assert_eq!(
+        app.operation_script_page_identity(),
+        unsplit,
+        "continuous rotation does not emit page changes"
+    );
+}
+
+#[test]
+fn page_identity_is_stable_without_changes_and_ignores_late_material_and_preparation() {
+    let mut app = grid_app("[]");
+    app.fullscreen_idx = Some(0);
+    app.spread_mode = crate::settings::SpreadMode::Ltr;
+    let before = app.operation_script_page_identity();
+    assert_eq!(app.operation_script_page_identity(), before);
+    app.record_page_dims_for_spread(0, (2000, 1000));
+    app.rotation_cache
+        .insert(0, crate::rotation_db::Rotation::Cw90);
+    app.rating_cache.insert(0, 3);
+    app.fs_cache.clear();
+    app.thumbnails.clear();
+    app.viewer_navigation_caches.invalidate();
+    assert_eq!(app.operation_script_page_identity(), before);
+}
+
+#[test]
+fn page_identity_effective_page_alone_and_singleton_preferences_ignore_masked_defaults() {
+    let mut app = grid_app("[]");
+    app.fullscreen_idx = Some(0);
+    app.page_alone_preferences.after_cover = crate::settings::PageAlonePreference::On;
+    app.singleton_spread_endpoint_preferences.first =
+        crate::settings::SingletonSpreadPlacementPreference::Place;
+    let before = app.operation_script_page_identity();
+    app.settings.page_after_cover_alone_enabled = !app.settings.page_after_cover_alone_enabled;
+    app.settings.singleton_spread_first_enabled = !app.settings.singleton_spread_first_enabled;
+    assert_eq!(
+        app.operation_script_page_identity(),
+        before,
+        "per-book choices mask these global defaults"
+    );
+    app.page_alone_preferences.after_cover = crate::settings::PageAlonePreference::Off;
+    assert_ne!(app.operation_script_page_identity(), before);
+}
+
+#[test]
 fn run_validates_the_whole_sequence_before_first_side_effect() {
     let mut app = grid_app(r#"["GridColumnCount7","FsPageNext"]"#);
     let result = app.run_script_slot(

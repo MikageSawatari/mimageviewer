@@ -1,6 +1,6 @@
 //! 操作スクリプトの同期実行境界。所有passの入力面を使い、実行状態を持ち越さない。
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use eframe::egui;
 
@@ -239,7 +239,7 @@ pub(crate) struct ScriptTargetIdentity {
     context_id: super::viewer_context_registry::ViewerContextId,
     context: ScriptContext,
     location: ScriptLocation,
-    /// The navigation-owned head, rather than cache availability or screen order.
+    /// Accepted anchor items, independent of cache availability or screen order.
     pages: Vec<ScriptItemIdentity>,
     /// Accepted pairing origins can change the unit without moving fullscreen_idx.
     pairing_origins: (Option<ScriptItemIdentity>, Option<ScriptItemIdentity>),
@@ -248,12 +248,70 @@ pub(crate) struct ScriptTargetIdentity {
 }
 
 /// Shared page-event identity (§3.3), independent of list generations and caches.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ScriptPageIdentity {
     location: ScriptLocation,
-    head: Option<ScriptItemIdentity>,
+    item: Option<ScriptItemIdentity>,
+    spread_mode: crate::settings::SpreadMode,
+    reading_flow: crate::settings::ReadingFlow,
+    reading_direction: crate::settings::ReadingDirection,
+    pairing_origins: (Option<ScriptItemIdentity>, Option<ScriptItemIdentity>),
     slice: crate::page_split::PageSlice,
+    page_alone: crate::settings::PageAloneSettings,
+    singleton_endpoints: crate::settings::SingletonSpreadEndpointSettings,
+    page_turn_animation: bool,
+    /// Keep the raw inputs: the effective getter can consult the composition service.
+    final_cover: (crate::settings::FinalCoverSpreadPreference, bool),
+    presentation_source: super::SpreadPresentationSource,
+    browser_output_root: Option<PathBuf>,
+    extracted_surface: Option<super::book_materialization::ExtractedSurface>,
+    grid_view: crate::settings::GridViewMode,
+    /// These App modes select continuous still-only versus ordinary navigation.
+    continuous_view_suppression: (bool, bool, bool),
+    unit_source: ScriptUnitSourceInputs,
+    reader_order: Vec<ScriptItemIdentity>,
+    endpoint_context_eligible: bool,
+    split_direction: Option<crate::page_split::SplitDirection>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScriptUnitSourceInputs {
+    Automatic {
+        rule_total: usize,
+        item_count: usize,
+    },
+    Composed(ScriptCompositionInputs),
+}
+
+/// Share adopted composition inputs. Compare semantic pages/directives only when
+/// adoption changed the allocation; publication tokens and prepared geometry are not inputs.
+#[derive(Clone, Debug)]
+struct ScriptCompositionInputs(Arc<crate::book_composition::AcceptedCompositionProjection>);
+
+impl PartialEq for ScriptCompositionInputs {
+    fn eq(&self, other: &Self) -> bool {
+        if Arc::ptr_eq(&self.0, &other.0) {
+            return true;
+        }
+        let a = &self.0.resolved;
+        let b = &other.0.resolved;
+        self.0.scope == other.0.scope
+            && a.direction == b.direction
+            && a.cover_enabled == b.cover_enabled
+            && a.complete == b.complete
+            && a.visible_pages.len() == b.visible_pages.len()
+            && a.visible_pages
+                .iter()
+                .zip(&b.visible_pages)
+                .all(|(a_page, b_page)| {
+                    a_page.page == b_page.page
+                        && a.page_overrides.get(&a_page.item_index)
+                            == b.page_overrides.get(&b_page.item_index)
+                })
+    }
+}
+
+impl Eq for ScriptCompositionInputs {}
 
 impl App {
     /// An already satisfied rating command is accepted, like the ordinary key.
@@ -506,16 +564,71 @@ impl App {
         }
     }
 
-    /// Read only accepted in-memory state; do not prepare a display unit here.
-    /// TODO(stage 2b): resolve the canonical unit head instead of a retained anchor.
+    /// The page-event/request identity is the input tuple, not a resolved unit head.
+    /// Read only App-owned values. Do not consult navigation/material caches or the
+    /// composition service, build topology, or include publication/generation tokens.
+    /// Adopted composition inputs share their immutable allocation; late geometry is omitted.
     pub(crate) fn operation_script_page_identity(&self) -> ScriptPageIdentity {
         ScriptPageIdentity {
             location: self.operation_script_location(),
-            head: self
+            item: self
                 .fullscreen_idx
                 .and_then(|idx| self.items.get(idx))
                 .map(item_identity),
+            spread_mode: self.spread_mode,
+            reading_flow: self.reading_flow,
+            reading_direction: self
+                .spread_mode
+                .canonical_reading_direction()
+                .unwrap_or(self.reading_direction),
+            pairing_origins: (
+                self.spread_shift
+                    .anchor_idx()
+                    .and_then(|idx| self.items.get(idx))
+                    .map(item_identity),
+                self.spread_step
+                    .and_then(|step| self.items.get(step.start_idx))
+                    .map(item_identity),
+            ),
             slice: self.fullscreen_page_slice,
+            page_alone: self.page_alone_enabled_for_current_book(),
+            singleton_endpoints: self.singleton_spread_placement_enabled_for_current_book(),
+            page_turn_animation: self.settings.page_turn_animation_enabled,
+            final_cover: (
+                self.final_cover_spread_preference,
+                self.settings.final_cover_spread_enabled,
+            ),
+            presentation_source: self.spread_presentation_source.clone(),
+            browser_output_root: self.settings.browser_view_output_dir.clone(),
+            extracted_surface: self.extracted_result_surface(),
+            grid_view: self.settings.grid_view_mode,
+            continuous_view_suppression: (
+                self.analysis_mode,
+                !matches!(self.compare_view_mode, super::CompareViewMode::Off),
+                matches!(
+                    self.fs_exclusive_view,
+                    crate::fs_exclusive_view::FsExclusiveView::Panorama(_)
+                ),
+            ),
+            unit_source: self.retained_composed_projection_input().map_or_else(
+                || ScriptUnitSourceInputs::Automatic {
+                    rule_total: self.smart_folder_rule_total(),
+                    item_count: self.items.len(),
+                },
+                |projection| {
+                    ScriptUnitSourceInputs::Composed(ScriptCompositionInputs(Arc::clone(
+                        projection,
+                    )))
+                },
+            ),
+            reader_order: self
+                .current_reader_order()
+                .iter()
+                .filter_map(|&idx| self.items.get(idx))
+                .map(item_identity)
+                .collect(),
+            endpoint_context_eligible: self.spread_complete_book_context_eligible(),
+            split_direction: self.split_direction_now(),
         }
     }
 

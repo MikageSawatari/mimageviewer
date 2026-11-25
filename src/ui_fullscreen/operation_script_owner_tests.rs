@@ -239,6 +239,182 @@ fn operation_script_owner_same_list_home_invalidates_earlier_request() {
 }
 
 #[test]
+fn operation_script_owner_shift_reset_changes_unit_identity_without_moving_anchor() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let mut app = ready(&ctx, r#"["FsZoomIn"]"#);
+    app.items.truncate(3);
+    app.visible_indices = vec![0, 1, 2];
+    app.spread_mode = SpreadMode::Ltr;
+    app.reading_direction = ReadingDirection::Ltr;
+    app.fullscreen_idx = Some(1);
+    app.set_spread_shift_anchor_for_test(Some(1));
+    ctx.run_pass(input(vec![]), |ctx| {
+        let pages = |app: &mut App| {
+            app.spread_display_composition_for_anchor(1)
+                .pages_in_reading_order()
+                .iter()
+                .filter(|page| page.role == SpreadPageRole::Navigation)
+                .map(|page| page.idx)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pages(&mut app), vec![1, 2]);
+        let before = app.operation_script_page_identity();
+        let mut frame = FsScriptFrame::default();
+        app.collect_fs_script_slot(&mut frame, Some(1), FsScriptEntry::Key);
+        let (_, rejected, delegated) =
+            app.execute_fullscreen_script_action(ctx, KeyAction::FsReadingDirectionToggle);
+        assert!(!rejected && !delegated);
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert_eq!(app.spread_shift.anchor_idx(), None);
+        assert_eq!(pages(&mut app), vec![0, 1]);
+        assert_ne!(app.operation_script_page_identity(), before);
+        let zoom = app.fs_zoom;
+        finish(&mut app, ctx, &mut frame, &mut FsKeyAction::default());
+        assert_eq!(app.fs_zoom, zoom);
+        app.notify_fs_script_frame(&mut frame);
+        assert!(toast(&app).contains("表示対象が変わった"));
+    })
+    .drop_without_applying_deltas();
+}
+
+#[test]
+fn operation_script_page_composition_inputs_share_arc_and_ignore_publication_and_geometry() {
+    let book = crate::book_composition::fixtures::four_page_book(
+        crate::book_composition::ReadingDirection::Ltr,
+    );
+    let mut app = book_composition_tests::composed_app(&book);
+    app.fullscreen_idx = Some(1);
+    let before = app.operation_script_page_identity();
+    let original = Arc::clone(app.retained_composed_projection_input().unwrap());
+    let mut republished = original.as_ref().clone();
+    republished.token.service_epoch += 1;
+    republished.token.publication_sequence += 1;
+    republished.resolved.revision += 1;
+    republished.prepared_rotations = Arc::new(HashMap::from([(
+        "late rotation".into(),
+        crate::rotation_db::Rotation::Cw90,
+    )]));
+    app.install_composition_for_test(Arc::new(republished.clone()));
+    assert_eq!(
+        app.operation_script_page_identity(),
+        before,
+        "semantic inputs survive republishing and late rotation"
+    );
+    let mut overridden = republished.clone();
+    overridden
+        .resolved
+        .page_overrides
+        .insert(0, crate::book_composition::PageOverride::Alone);
+    app.install_composition_for_test(Arc::new(overridden));
+    assert_ne!(
+        app.operation_script_page_identity(),
+        before,
+        "a preceding directive can change pairing at the same anchor"
+    );
+    app.install_composition_for_test(Arc::new(republished.clone()));
+    let mut reordered = republished.clone();
+    reordered.resolved.visible_pages.swap(0, 1);
+    app.install_composition_for_test(Arc::new(reordered));
+    assert_ne!(app.operation_script_page_identity(), before);
+    let mut renamed_slots = republished.clone();
+    for page in &mut renamed_slots.resolved.visible_pages {
+        page.item_index += 1;
+    }
+    renamed_slots.resolved.page_overrides = renamed_slots
+        .resolved
+        .page_overrides
+        .into_iter()
+        .map(|(idx, value)| (idx + 1, value))
+        .collect();
+    app.items
+        .insert(0, GridItem::Folder("C:/non-reader-row".into()));
+    app.visible_indices = vec![1, 2, 3, 4];
+    app.details_order = app.visible_indices.clone();
+    app.fullscreen_idx = Some(2);
+    app.install_composition_for_test(Arc::new(renamed_slots));
+    assert_eq!(
+        app.operation_script_page_identity(),
+        before,
+        "typed page order and directives ignore row reindexing"
+    );
+}
+
+#[test]
+fn operation_script_page_composition_identity_retains_input_through_pending_refresh() {
+    use crate::app::book_composition_runtime::{
+        BookCompositionSource, ProjectionOrigin, ViewerBookComposition,
+    };
+    let book = crate::book_composition::fixtures::four_page_book(
+        crate::book_composition::ReadingDirection::Ltr,
+    );
+    let mut app = book_composition_tests::composed_app(&book);
+    app.fullscreen_idx = Some(1);
+    let before = app.operation_script_page_identity();
+    let projection = Arc::clone(app.retained_composed_projection_input().unwrap());
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    app.book_composition = ViewerBookComposition::Preparing {
+        scope: projection.scope.clone(),
+        receiver,
+        origin: Box::new(ProjectionOrigin::Refresh {
+            source: BookCompositionSource::Unavailable,
+            previous: Some(Arc::clone(&projection)),
+            anchor: None,
+            previous_order: Arc::from(Vec::new()),
+        }),
+    };
+    assert!(Arc::ptr_eq(
+        app.retained_composed_projection_input().unwrap(),
+        &projection
+    ));
+    assert_eq!(
+        app.operation_script_page_identity(),
+        before,
+        "preparation state alone is not a page change"
+    );
+}
+
+#[test]
+fn operation_script_page_identity_tracks_hidden_row_removal_that_changes_complete_book() {
+    let ctx = egui::Context::default();
+    let mut app = ready(&ctx, "[]");
+    app.current_folder = Some(app.tmp.path().join("complete-book"));
+    app.spread_mode = SpreadMode::LtrCover;
+    app.settings.page_after_cover_alone_enabled = false;
+    app.settings.last_page_alone_enabled = true;
+    app.settings.final_cover_spread_enabled = false;
+    app.settings.singleton_spread_first_enabled = false;
+    app.settings.singleton_spread_last_enabled = false;
+    app.visible_indices = vec![0, 1, 2];
+    app.fullscreen_idx = Some(1);
+    let pages = |app: &mut App| {
+        app.spread_display_composition_for_anchor(1)
+            .pages_in_reading_order()
+            .iter()
+            .filter(|page| page.role == SpreadPageRole::Navigation)
+            .map(|page| page.idx)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        pages(&mut app),
+        vec![1, 2],
+        "a hidden fourth row makes the reader incomplete"
+    );
+    let before = app.operation_script_page_identity();
+    app.items.pop();
+    app.items_generation += 1;
+    app.viewer_navigation_caches.invalidate();
+    assert_eq!(
+        pages(&mut app),
+        vec![1],
+        "the complete three-page book has a forced last singleton"
+    );
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_ne!(app.operation_script_page_identity(), before);
+}
+
+#[test]
 fn operation_script_owner_discard_conditions_do_not_run_or_retain_requests() {
     #[cfg(windows)]
     let _serial = crate::key_input::lock_test_input();

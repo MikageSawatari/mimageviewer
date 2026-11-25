@@ -20371,7 +20371,7 @@ enum FsScriptEntry {
     ContextMenu,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct FsScriptDisplayIdentity {
     destination: PresentationDestination,
     items_generation: u64,
@@ -21632,7 +21632,7 @@ impl App {
 
     /// Transient surface state remains a cheap per-frame gate. The complete-list proof above is
     /// owned by the same cached navigation token used to compose the visible unit.
-    fn spread_complete_book_context_eligible(&self) -> bool {
+    pub(crate) fn spread_complete_book_context_eligible(&self) -> bool {
         if !matches!(
             self.top_level_grid_view.surface(),
             crate::app::top_level_grid_view::TopLevelGridSurface::Folder
@@ -22447,7 +22447,7 @@ impl App {
     ///   分割したまま描くと左右が同じ絵になる。保存しない一時値なので戻せば分割も戻る。
     ///
     /// 連結読み中も分割する。同じステップ列から段を組むので、送りと並びが食い違わない。
-    fn split_direction_now(&self) -> Option<crate::page_split::SplitDirection> {
+    pub(crate) fn split_direction_now(&self) -> Option<crate::page_split::SplitDirection> {
         let direction = crate::page_split::SplitDirection::from_spread_mode(self.spread_mode)?;
         if self.fs_free_rotation.abs() > TRANSFORM_EPSILON {
             return None;
