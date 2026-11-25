@@ -1321,9 +1321,13 @@ portable zip実物の生成・内容確認、署名あり配布とVirusTotal (�
   SoundFont Note Playerの旧公開URL、歌詞・Counter、既存フラグメントを維持する。
   privacyの日英に通信の契機・取得先・送信内容と、測定カーブの保存を追記する。
   製品ページの「安心して使えます」は今回も成立するため、カードは変更しない。
-- 候補: **候補・ctest・承認は設計担当が記録する (未記入)**。
-- ctest: **候補・ctest・承認は設計担当が記録する (未記入)**。
-- 承認: **候補・ctest・承認は設計担当が記録する (未記入)**。
+- 派生版の後続修正 (設計担当の実ビルドで判明): `801ca2a` (WebView smoke の `--distortion-measurement` の引数を派生版の解析へ戻す)。
+- 候補: `b903e76a6b68f785aa3a96cb2b6b88eda34323305a918565bf65607d9f5e7334` (派生版 `801ca2a`、`scripts/build-miv-sound.ps1`、設計担当)。
+- ctest: 139 件すべて成功 (同じ候補、設計担当が run-heavy 経由で実行)。
+- 独立レビュー (gpt-6.1-sol / xhigh): 1 回目 REJECT (P1 lifecycle テストの残った assertion、P2 15Band PEQ の旧プリセット (上の 4 で受け入れ)、
+  P3 CSP の置換が replace-once でない)。修正後の 2 回目は派生版の修正と本書・説明書・privacy を対象にし、説明書の目次の版番号の指摘
+  (公開文書の規則と §1.737 の既存設計の食い違い、v5.7.0 から出荷済み) を別件に分けて ACCEPT。
+- 承認: 未承認。サブ PC の実機確認 (`C:\home\mimageviewer-subpc\deps903\README.md`) と利用者の採用判断の後に `-Approve` する。
   本作業ではRust/C++のビルド・テスト、製品起動、コミットは行っていない。
 - 文書の検証: `test_gen_effetune_docs.py` **44件成功**、生成器 `--check` **139ファイル＋301一致**、
   sitemap `--check` **220 URL一致**、`check_site_cards.py` **53枚・超過0**、`git diff --check` **成功**。
