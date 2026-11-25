@@ -700,7 +700,9 @@ mod native_video;
 #[cfg(windows)]
 mod presentation_transition;
 #[cfg(windows)]
-pub(crate) use native_video::{VideoAdjustSlotInputSource, VideoAudioEnterSource};
+pub(crate) use native_video::{
+    VideoAdjustSlotInputSource, VideoAudioEnterSource, VideoKeyActionResult, VideoKeyActionSurface,
+};
 #[cfg(windows)]
 use presentation_transition::{
     DetachedHostLease, PresentationCandidate, PresentationEffectsOutcome,

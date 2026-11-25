@@ -4684,6 +4684,96 @@ mod operation_script_grid_menu_tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn native_media_script_menu_uses_named_rows_and_evaluates_only_after_selection_closes() {
+        for music in [false, true] {
+            let mut app = app_with_script();
+            let path = PathBuf::from(if music {
+                r"C:\script-menu\audio.mp3"
+            } else {
+                r"C:\script-menu\video.mp4"
+            });
+            app.items = vec![if music {
+                GridItem::Audio(path.clone())
+            } else {
+                GridItem::Video(path.clone())
+            }];
+            app.visible_indices = vec![0];
+            app.current_folder = Some(r"C:\script-menu".into());
+            app.fullscreen_idx = Some(0);
+            app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+            app.fs_cache.insert(
+                0,
+                crate::fs_animation::FsCacheEntry::Video {
+                    player: Box::new(
+                        crate::video::VideoPlayer::stream_ready_disconnected_for_test(path),
+                    ),
+                    load_seq: 0,
+                },
+            );
+            app.operation_script.state =
+                crate::operation_script::OperationScriptState::Ready(Box::new(
+                    crate::operation_script::CompiledOperationScript::compile(
+                        r#"fn slots() { [#{slot:1,label:"再生音",run:"entry"}] }
+                       fn entry(s) { if s.context != "fs_video" { throw "wrong surface"; }
+                         #{run:["VideoMute"],notice:"menu video done"} }"#,
+                    )
+                    .unwrap(),
+                ));
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput::default());
+            app.fs_context_menu_idx = Some(0);
+            let menu_target = target(&app, ContextMenuSurface::Fullscreen);
+            let nodes = app.context_menu_nodes(&ctx, &menu_target, false);
+            assert!(nodes.iter().any(|node| matches!(node,
+                MenuNode::Submenu { label, children }
+                    if label == "スクリプト" && children.iter().any(|node| matches!(node,
+                        MenuNode::Item { command: MenuCommand::ScriptSlot(1), label, .. }
+                            if label.contains("再生音"))))));
+            let _ = app.keyboard_owner_for_pass(&ctx);
+            let slot = match app.dispatch_native_context_menu_result(
+                &ctx,
+                NativeContextMenuResult::MivCommand(MenuCommand::ScriptSlot(1)),
+                &menu_target,
+            ) {
+                NativeGridContextMenuOutcome::Consumed {
+                    script_slot: Some(slot),
+                    close_fullscreen: false,
+                    nav: None,
+                } => slot,
+                other => panic!("unexpected selection: {other:?}"),
+            };
+            assert!(app.fs_context_menu_idx.is_none());
+            assert!(!app.video_session_muted, "selection only returns a request");
+            let result = app.run_script_slot(
+                &ctx,
+                slot,
+                crate::app::operation_script_runtime::ScriptInputSurface::Viewer,
+                false,
+            );
+            if music {
+                assert!(matches!(
+                    result,
+                    crate::app::operation_script_runtime::ScriptRunResult::Fullscreen {
+                        rejected: false,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    crate::app::operation_script_runtime::ScriptRunResult::NativeVideo {
+                        rejected: false
+                    }
+                ));
+            }
+            assert!(app.video_session_muted);
+            assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, "menu video done");
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
     #[test]
     fn shared_copy_dispatch_reports_accepted_and_unsupported_targets() {
         let mut app = app_with_script();

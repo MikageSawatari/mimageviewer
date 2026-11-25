@@ -7979,7 +7979,44 @@ fn native_video_shortcut_action(action: KeyAction) -> bool {
                 | KeyAction::ToggleAlwaysOnTop
                 | KeyAction::ClearVideoMediaMemory
                 | KeyAction::ClearBookResumePositions
+        ) || matches!(
+            action,
+            KeyAction::ScriptSlot1
+                | KeyAction::ScriptSlot2
+                | KeyAction::ScriptSlot3
+                | KeyAction::ScriptSlot4
+                | KeyAction::ScriptSlot5
+                | KeyAction::ScriptSlot6
+                | KeyAction::ScriptSlot7
+                | KeyAction::ScriptSlot8
+                | KeyAction::ScriptSlot9
+                | KeyAction::ScriptSlot10
+                | KeyAction::ScriptSlot11
+                | KeyAction::ScriptSlot12
+                | KeyAction::ScriptSlot13
+                | KeyAction::ScriptSlot14
+                | KeyAction::ScriptSlot15
+                | KeyAction::ScriptSlot16
+                | KeyAction::ScriptSlot17
+                | KeyAction::ScriptSlot18
+                | KeyAction::ScriptSlot19
+                | KeyAction::ScriptSlot20
         ))
+}
+
+#[test]
+fn operation_script_slots_are_native_shortcuts_without_expanding_other_globals() {
+    for action in KeyAction::all()
+        .iter()
+        .copied()
+        .filter(|action| action.ini_name().starts_with("ScriptSlot"))
+    {
+        assert!(native_video_shortcut_action(action), "{action:?}");
+    }
+    assert!(!native_video_shortcut_action(KeyAction::GlobalLocalSearch));
+    assert!(!native_video_shortcut_action(
+        KeyAction::FsPageOverviewToggle
+    ));
 }
 
 fn is_overlay_edit_scope(scope: CommandScope) -> bool {

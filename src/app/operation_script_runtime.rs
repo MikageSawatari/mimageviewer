@@ -69,6 +69,8 @@ pub(crate) enum ScriptRunResult {
         rejected: bool,
         delegated: bool,
     },
+    /// Native input completes the ordinary operation before returning.
+    NativeVideo { rejected: bool },
 }
 
 /// Notification emitted by this invocation, independent of its navigation result.
@@ -79,7 +81,10 @@ pub(crate) enum ScriptFeedback {
 }
 
 impl ScriptRunResult {
-    fn empty(surface: ScriptInputSurface, rejected: bool) -> Self {
+    fn empty(surface: ScriptInputSurface, native_video: bool, rejected: bool) -> Self {
+        if native_video {
+            return Self::NativeVideo { rejected };
+        }
         match surface {
             ScriptInputSurface::Grid => Self::Grid {
                 nav: None,
@@ -95,12 +100,15 @@ impl ScriptRunResult {
 
     fn rejected(&self) -> bool {
         match self {
-            Self::Grid { rejected, .. } | Self::Fullscreen { rejected, .. } => *rejected,
+            Self::Grid { rejected, .. }
+            | Self::Fullscreen { rejected, .. }
+            | Self::NativeVideo { rejected } => *rejected,
         }
     }
 
     fn needs_postprocessing(&self) -> bool {
         match self {
+            Self::NativeVideo { .. } => false,
             Self::Grid { nav, .. } => nav.is_some(),
             Self::Fullscreen {
                 action, delegated, ..
@@ -314,6 +322,17 @@ impl PartialEq for ScriptCompositionInputs {
 impl Eq for ScriptCompositionInputs {}
 
 impl App {
+    pub(crate) fn operation_script_uses_native_video(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.is_native_video_script_surface()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     /// An already satisfied rating command is accepted, like the ordinary key.
     /// This is an execution check, never a snapshot read: existing rating actions
     /// use the same cache/DB read boundary before changing a value.
@@ -394,7 +413,8 @@ impl App {
                 blocked_input: self.is_overlay_edit_mode_active()
                     || self.page_overview.session().is_some()
                     || self.common_modal_dialog_open()
-                    || self.keyboard_ownership_snapshot(ctx).text_input.is_some(),
+                    || self.operation_script_media_modal_blocked(surface)
+                    || self.operation_script_text_input_blocked(ctx, surface),
                 remote: self.remote_session_blocks_local_control(),
                 enabled: self.settings.operation_script_enabled,
             },
@@ -402,6 +422,37 @@ impl App {
             self.script_context(surface),
             &self.operation_script.state,
         )
+    }
+
+    fn operation_script_media_modal_blocked(&self, surface: ScriptInputSurface) -> bool {
+        #[cfg(windows)]
+        if surface == ScriptInputSurface::Viewer
+            && let Some(idx) = self.fullscreen_idx
+        {
+            return self.normalize_scan_is_modal_for_current_player(idx)
+                || (self.fs_music_view_active(idx) && self.music_bookmark_modal_open())
+                || self
+                    .music_vst_shell
+                    .as_ref()
+                    .is_some_and(|shell| shell.fs_idx == idx);
+        }
+        let _ = surface;
+        false
+    }
+
+    fn operation_script_text_input_blocked(
+        &self,
+        ctx: &egui::Context,
+        surface: ScriptInputSurface,
+    ) -> bool {
+        #[cfg(windows)]
+        if surface == ScriptInputSurface::Viewer && self.is_native_video_script_surface() {
+            // The overlay owns a separate egui Context. ROOT keyboard focus does
+            // not describe text/IME input in that native window.
+            return self.native_video_script_input_blocked();
+        }
+        let _ = surface;
+        self.keyboard_ownership_snapshot(ctx).text_input.is_some()
     }
 
     pub(crate) fn operation_script_location(&self) -> ScriptLocation {
@@ -808,6 +859,16 @@ impl App {
                     .len() as i64,
             );
         }
+        if context == ScriptContext::FsVideo
+            && let Some(super::FsCacheEntry::Video { player, .. }) =
+                idx.and_then(|idx| self.fs_cache.get(&idx))
+        {
+            snapshot.video.playing = Some(player.is_playing());
+            snapshot.video.position_sec = Some(player.position());
+            // A loading player has no duration yet; zero is a legitimate cached
+            // duration only once metadata has arrived.
+            snapshot.video.duration_sec = player.info().map(|info| info.duration_secs);
+        }
         snapshot
     }
 
@@ -896,12 +957,19 @@ impl App {
         operations: &mut Option<u64>,
         feedback: &mut Option<ScriptFeedback>,
     ) -> ScriptRunResult {
+        #[cfg(windows)]
+        let native_video =
+            surface == ScriptInputSurface::Viewer && self.is_native_video_script_surface();
+        #[cfg(not(windows))]
+        let native_video = false;
         let context = match self.operation_script_eligibility(ctx, surface) {
             ScriptEligibility::Available(context) => context,
-            ScriptEligibility::Silent => return ScriptRunResult::empty(surface, true),
+            ScriptEligibility::Silent => {
+                return ScriptRunResult::empty(surface, native_video, true);
+            }
             ScriptEligibility::Notify(reason) => {
                 self.script_failure(number, reason, feedback);
-                return ScriptRunResult::empty(surface, true);
+                return ScriptRunResult::empty(surface, native_video, true);
             }
         };
         let snapshot = self.collect_operation_script_snapshot(surface);
@@ -927,37 +995,62 @@ impl App {
             Ok(output) => output,
             Err(error) => {
                 self.script_failure(number, error, feedback);
-                return ScriptRunResult::empty(surface, true);
+                return ScriptRunResult::empty(surface, native_video, true);
             }
         };
-        // 動画/音声の実行関数の共有は段3。評価済みの並びを一つも適用しない。
-        if context == ScriptContext::FsVideo && !output.operations().is_empty() {
-            self.script_failure(number, "この画面ではまだ使用できません", feedback);
-            return ScriptRunResult::empty(surface, true);
-        }
-        let mut result = ScriptRunResult::empty(surface, false);
+        let mut result = ScriptRunResult::empty(surface, native_video, false);
         for (index, operation) in output.operations().iter().enumerate() {
-            if self.script_context(surface) != context
-                || self.operation_script_target(surface) != target
+            if !matches!(
+                self.operation_script_eligibility(ctx, surface),
+                ScriptEligibility::Available(current) if current == context
+            ) || self.operation_script_target(surface) != target
             {
                 self.script_failure(
                     number,
                     format!("『{}』を実行できませんでした", operation.action.ini_name()),
                     feedback,
                 );
-                return ScriptRunResult::empty(surface, true);
+                return ScriptRunResult::empty(surface, native_video, true);
             }
             result = match surface {
                 ScriptInputSurface::Grid => {
                     self.execute_grid_key_action(ctx, operation.action, "script_grid")
                 }
                 ScriptInputSurface::Viewer => {
-                    let (action, rejected, delegated) =
-                        self.execute_fullscreen_script_action(ctx, operation.action);
-                    ScriptRunResult::Fullscreen {
-                        action,
-                        rejected,
-                        delegated,
+                    #[cfg(windows)]
+                    if native_video {
+                        let rejected = self.fullscreen_idx.is_none_or(|idx| {
+                            !self.is_native_video_script_surface()
+                                || !self.native_video_script_action_admitted(idx, operation.action)
+                                || matches!(
+                                    self.execute_video_key_action(
+                                        ctx,
+                                        idx,
+                                        operation.action,
+                                        super::VideoKeyActionSurface::Native,
+                                    ),
+                                    super::VideoKeyActionResult::Rejected
+                                )
+                        });
+                        ScriptRunResult::NativeVideo { rejected }
+                    } else {
+                        let (action, rejected, delegated) =
+                            self.execute_fullscreen_script_action(ctx, operation.action);
+                        ScriptRunResult::Fullscreen {
+                            action,
+                            rejected,
+                            delegated,
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let (action, rejected, delegated) =
+                            self.execute_fullscreen_script_action(ctx, operation.action);
+                        ScriptRunResult::Fullscreen {
+                            action,
+                            rejected,
+                            delegated,
+                        }
                     }
                 }
             };

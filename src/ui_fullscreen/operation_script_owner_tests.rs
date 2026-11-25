@@ -903,21 +903,37 @@ fn operation_script_owner_child_text_gate_uses_child_pass_instead_of_root() {
     .drop_without_applying_deltas();
 }
 
+#[cfg(windows)]
 #[test]
-fn operation_script_owner_egui_media_buttons_return_slots_and_runtime_rejects_stage3_operations() {
+fn operation_script_owner_egui_media_buttons_return_slots_and_execute_at_tail() {
+    let _input = crate::key_input::lock_test_input();
     use crate::ring_shortcut::MouseButtonSlot;
     for audio in [false, true] {
         let ctx = egui::Context::default();
-        let mut app = ready(&ctx, r#"["VideoPlayPause"]"#);
+        let mut app = ready(&ctx, r#"["VideoMute"]"#);
         let path = app
             .tmp
             .path()
             .join(if audio { "audio.mp3" } else { "video.mp4" });
+        let player_path = path.clone();
         app.items[0] = if audio {
             GridItem::Audio(path)
         } else {
             GridItem::Video(path)
         };
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(
+                    player_path,
+                    0.0,
+                )),
+                load_seq: 0,
+            },
+        );
+        if !audio {
+            app.video_audio_mode = Some(0);
+        }
         app.settings.ring_shortcuts.mouse_buttons_video.back = RingActionId::ScriptSlot1;
         app.settings.ring_shortcuts.mouse_buttons_video.forward = RingActionId::ScriptSlot1;
         app.settings.ring_shortcuts.mouse_buttons_video.middle = RingActionId::ScriptSlot1;
@@ -935,11 +951,13 @@ fn operation_script_owner_egui_media_buttons_return_slots_and_runtime_rejects_st
                 );
                 assert_eq!(result.script_slot, Some(1));
                 assert!(result.navigation.is_none());
+                let before = app.settings.video_muted;
                 let mut frame = FsScriptFrame::default();
                 app.collect_fs_script_slot(&mut frame, result.script_slot, FsScriptEntry::Pointer);
+                assert_eq!(app.settings.video_muted, before);
                 finish(&mut app, ctx, &mut frame, &mut FsKeyAction::default());
+                assert_eq!(app.settings.video_muted, !before);
                 app.notify_fs_script_frame(&mut frame);
-                assert!(toast(&app).contains("まだ使用できません"));
             }
         })
         .drop_without_applying_deltas();

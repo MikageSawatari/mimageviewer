@@ -6,6 +6,19 @@ use crate::keymap::{
     VIDEO_SEEK_STRIP_ACTIONS,
 };
 
+/// Execution ownership is distinct from the HWND which happened to receive a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VideoKeyActionSurface {
+    Native,
+    EguiVideo,
+    EguiMusic,
+}
+
+pub(crate) enum VideoKeyActionResult {
+    Accepted(crate::ui_fullscreen::FsKeyAction),
+    Rejected,
+}
+
 #[cfg(test)]
 thread_local! {
     static NATIVE_METADATA_FOR_TEST: std::cell::RefCell<Option<crate::video::native_presenter::NativeOverlayMetadata>> = const { std::cell::RefCell::new(None) };
@@ -12636,6 +12649,355 @@ impl App {
         });
     }
 
+    /// Native output owns completion; egui-owned music and video return navigation requests.
+    pub(crate) fn is_native_video_script_surface(&self) -> bool {
+        self.fullscreen_idx.is_some_and(|idx| {
+            matches!(
+                self.items.get(idx),
+                Some(GridItem::Video(_) | GridItem::Audio(_))
+            ) && !self.fs_music_view_active(idx)
+                && matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Video { player, .. })
+                    if player.native_source_epoch().is_some() && !player.native_presenter_hidden())
+        })
+    }
+
+    /// The native overlay has its own egui context. ROOT focus is not its input ownership.
+    pub(crate) fn native_video_script_input_blocked(&self) -> bool {
+        self.fullscreen_idx.is_some_and(|idx| {
+            matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Video { player, .. })
+            if {
+                let routing = player.native_overlay_input_routing_snapshot();
+                routing.text_input_active || routing.modal_dialog_active
+            })
+        })
+    }
+
+    /// Script admission uses the same current owner facts as native key routing.
+    /// Legacy key matching keeps its existing branch order and modal exceptions.
+    pub(crate) fn native_video_script_action_admitted(
+        &self,
+        fs_idx: usize,
+        action: KeyAction,
+    ) -> bool {
+        self.fullscreen_idx == Some(fs_idx)
+            && self
+                .music_vst_shell
+                .as_ref()
+                .is_none_or(|shell| shell.fs_idx != fs_idx)
+            && !self.normalize_scan_is_modal_for_current_player(fs_idx)
+            && !self.native_video_script_input_blocked()
+            && self.fs_context_menu_idx.is_none()
+            && !(action == KeyAction::VideoLoop && self.video_continuous_mode.is_enabled())
+    }
+
+    pub(crate) fn execute_video_key_action(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        action: KeyAction,
+        surface: VideoKeyActionSurface,
+    ) -> VideoKeyActionResult {
+        let (result, seek_outcome) =
+            self.execute_video_key_action_with_seek_outcome(ctx, fs_idx, action, surface);
+        if let Some(outcome) = seek_outcome {
+            self.show_video_key_seek_outcome(outcome);
+        }
+        if surface == VideoKeyActionSurface::EguiVideo
+            && matches!(
+                action,
+                KeyAction::VideoVolumeUp | KeyAction::VideoVolumeDown
+            )
+            && matches!(&result, VideoKeyActionResult::Accepted(_))
+        {
+            self.persist_video_key_volume(fs_idx);
+        }
+        if surface == VideoKeyActionSurface::Native
+            && matches!(
+                action,
+                KeyAction::VideoPlayPause
+                    | KeyAction::VideoMute
+                    | KeyAction::VideoVolumeUp
+                    | KeyAction::VideoVolumeDown
+                    | KeyAction::VideoLoop
+                    | KeyAction::VideoSeekStart
+                    | KeyAction::VideoSeekBackSmall
+                    | KeyAction::VideoSeekForwardSmall
+                    | KeyAction::VideoSeekBackMedium
+                    | KeyAction::VideoSeekForwardMedium
+                    | KeyAction::VideoSeekBackLarge
+                    | KeyAction::VideoSeekForwardLarge
+                    | KeyAction::VideoSeekStripToggle
+                    | KeyAction::VideoPrevFile
+                    | KeyAction::VideoNextFile
+                    | KeyAction::VideoCapture
+            )
+        {
+            self.request_native_video_hud_repaint(ctx);
+        }
+        result
+    }
+
+    pub(crate) fn persist_video_key_volume(&mut self, fs_idx: usize) {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            self.settings.video_volume = player.volume();
+            self.settings.save();
+        }
+    }
+
+    pub(crate) fn show_video_key_seek_outcome(
+        &mut self,
+        outcome: crate::video::RelativeSeekOutcome,
+    ) {
+        match outcome {
+            crate::video::RelativeSeekOutcome::AtStart => {
+                self.show_feedback_toast("動画先頭です".to_string());
+            }
+            crate::video::RelativeSeekOutcome::AtEnd => {
+                self.show_feedback_toast("動画末尾です".to_string());
+            }
+            crate::video::RelativeSeekOutcome::Seeked => {}
+        }
+    }
+
+    /// The egui video key handler batches seeks and reports only its final boundary outcome.
+    /// All other callers use the wrapper above; native/music retain their own existing hints.
+    pub(crate) fn execute_video_key_action_with_seek_outcome(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        action: KeyAction,
+        surface: VideoKeyActionSurface,
+    ) -> (
+        VideoKeyActionResult,
+        Option<crate::video::RelativeSeekOutcome>,
+    ) {
+        use crate::settings::VideoSeekStep;
+        use crate::ui_fullscreen::FsKeyAction;
+        use VideoKeyActionSurface::{EguiMusic, EguiVideo, Native};
+
+        let accepted = |action| (VideoKeyActionResult::Accepted(action), None);
+        let rejected = || (VideoKeyActionResult::Rejected, None);
+        if self.fullscreen_idx != Some(fs_idx) {
+            return rejected();
+        }
+        // The music key path has neither frame capture nor the video seek strip.
+        if surface == EguiMusic
+            && matches!(
+                action,
+                KeyAction::VideoCapture | KeyAction::VideoSeekStripToggle
+            )
+        {
+            return rejected();
+        }
+        if let Some((family, edit)) = super::operation_script_grid::script_rating_key_edit(action) {
+            if surface == Native {
+                let noop = self.operation_script_rating_noop(family, Some(fs_idx), edit);
+                let outcome =
+                    self.apply_fullscreen_shared_rating_edit_outcome(Some(fs_idx), family, edit);
+                if outcome.changed
+                    || outcome.target == crate::ui_fullscreen::FullscreenRatingTarget::Unavailable
+                {
+                    self.request_native_video_hud_repaint(ctx);
+                }
+                return if outcome.changed || noop {
+                    accepted(FsKeyAction::default())
+                } else {
+                    rejected()
+                };
+            }
+            let before = self
+                .page_path_key(fs_idx)
+                .or_else(|| self.rating_path_key(fs_idx));
+            let changed = self.apply_fullscreen_shared_rating_edit(Some(fs_idx), family, edit);
+            let mut result = FsKeyAction::default();
+            match self.fullscreen_idx {
+                None => result.page_transition = crate::ui_fullscreen::FsKeyPageTransition::Closed,
+                Some(idx)
+                    if idx != fs_idx
+                        || self
+                            .page_path_key(idx)
+                            .or_else(|| self.rating_path_key(idx))
+                            != before =>
+                {
+                    result.page_transition =
+                        crate::ui_fullscreen::FsKeyPageTransition::Rebased { idx };
+                }
+                _ => {}
+            }
+            return if changed {
+                accepted(result)
+            } else {
+                rejected()
+            };
+        }
+        if matches!(
+            action,
+            KeyAction::FsCopyPath | KeyAction::FsCopyFileName | KeyAction::FsCopyImage
+        ) {
+            return if self.fs_context_menu_idx.is_none()
+                && self.grid_item_input_allowed()
+                && self.execute_copy_key_action(ctx, action)
+            {
+                accepted(FsKeyAction::default())
+            } else {
+                rejected()
+            };
+        }
+        // Navigation and close do not require an already-decoded player.
+        match action {
+            KeyAction::VideoCapture => {
+                let already_pending = self.capture_pending.is_some();
+                self.save_video_frame_to_file(ctx, fs_idx);
+                return if !already_pending && self.capture_pending.is_some() {
+                    accepted(FsKeyAction::default())
+                } else {
+                    rejected()
+                };
+            }
+            KeyAction::VideoCloseFullscreen => {
+                return match surface {
+                    Native => {
+                        self.handle_fullscreen_close_request_immediate();
+                        accepted(FsKeyAction::default())
+                    }
+                    EguiVideo => {
+                        self.close_fullscreen_to_page_list();
+                        accepted(FsKeyAction::default())
+                    }
+                    EguiMusic => accepted(FsKeyAction {
+                        close: true,
+                        ..Default::default()
+                    }),
+                };
+            }
+            KeyAction::VideoPrevFile | KeyAction::VideoNextFile => {
+                let forward = action == KeyAction::VideoNextFile;
+                return if surface == Native {
+                    if self.try_navigate_native_video_fullscreen(
+                        ctx,
+                        fs_idx,
+                        if forward { 1 } else { -1 },
+                    ) {
+                        accepted(FsKeyAction::default())
+                    } else {
+                        rejected()
+                    }
+                } else {
+                    accepted(self.execute_egui_video_file_navigation(ctx, fs_idx, forward))
+                };
+            }
+            _ => {}
+        }
+        if surface == EguiMusic && action == KeyAction::VideoLoop {
+            self.cycle_music_loop_mode(ctx, fs_idx);
+            return accepted(FsKeyAction::default());
+        }
+        if !matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. })) {
+            return rejected();
+        }
+        match action {
+            KeyAction::VideoPlayPause => {
+                if surface != EguiMusic && self.video_tile_mode_active {
+                    if !self.play_selected_video_tile(ctx, fs_idx) {
+                        return rejected();
+                    }
+                } else if surface == Native {
+                    self.handle_native_video_toggle_play_command(ctx, fs_idx);
+                } else if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
+                {
+                    player.toggle_play();
+                }
+            }
+            KeyAction::VideoSeekStart => {
+                if surface == EguiMusic {
+                    self.music_seek_start(fs_idx);
+                } else {
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                        player.seek(
+                            0.0,
+                            crate::video::SeekPlayback::StartPlayback,
+                            crate::video::SeekOrigin::User,
+                        );
+                    }
+                    if surface == Native {
+                        self.maybe_start_normalize_scan_for_play_intent(fs_idx);
+                    }
+                }
+            }
+            KeyAction::VideoSeekBackSmall
+            | KeyAction::VideoSeekForwardSmall
+            | KeyAction::VideoSeekBackMedium
+            | KeyAction::VideoSeekForwardMedium
+            | KeyAction::VideoSeekBackLarge
+            | KeyAction::VideoSeekForwardLarge => {
+                let (step, direction) = match action {
+                    KeyAction::VideoSeekBackSmall => (VideoSeekStep::Small, -1.0),
+                    KeyAction::VideoSeekForwardSmall => (VideoSeekStep::Small, 1.0),
+                    KeyAction::VideoSeekBackMedium => (VideoSeekStep::Medium, -1.0),
+                    KeyAction::VideoSeekForwardMedium => (VideoSeekStep::Medium, 1.0),
+                    KeyAction::VideoSeekBackLarge => (VideoSeekStep::Large, -1.0),
+                    _ => (VideoSeekStep::Large, 1.0),
+                };
+                let delta = direction * self.settings.video_seek_seconds(step);
+                match surface {
+                    Native => self.native_video_seek_relative_with_hint(fs_idx, delta),
+                    EguiMusic => self.music_seek_relative(fs_idx, delta),
+                    EguiVideo => {
+                        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
+                        else {
+                            unreachable!()
+                        };
+                        let outcome = player.seek_relative(
+                            delta,
+                            crate::video::SeekPlayback::PreserveIntent,
+                            crate::video::SeekOrigin::User,
+                        );
+                        return (
+                            VideoKeyActionResult::Accepted(FsKeyAction::default()),
+                            Some(outcome),
+                        );
+                    }
+                }
+            }
+            KeyAction::VideoVolumeUp | KeyAction::VideoVolumeDown => {
+                let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+                    unreachable!()
+                };
+                let direction = if action == KeyAction::VideoVolumeUp {
+                    1
+                } else {
+                    -1
+                };
+                let volume = crate::settings::step_video_volume_by_fader_key_step(
+                    player.volume(),
+                    direction,
+                );
+                player.set_volume(volume);
+                if surface != EguiVideo {
+                    self.settings.video_volume = volume;
+                    self.settings.save();
+                }
+            }
+            KeyAction::VideoMute => {
+                if self.toggle_video_session_mute_for_fs_idx(fs_idx) && surface == Native {
+                    self.request_native_video_hud_repaint(ctx);
+                }
+            }
+            KeyAction::VideoLoop => {
+                self.cycle_native_video_loop_common(ctx, fs_idx);
+            }
+            KeyAction::VideoSeekStripToggle => {
+                let applied = self.apply_video_seek_strip_action(fs_idx, action);
+                self.sync_native_video_seek_strip(ctx, fs_idx);
+                if !applied {
+                    return rejected();
+                }
+            }
+            _ => return rejected(),
+        }
+        accepted(FsKeyAction::default())
+    }
+
     /// Resolve the prefix of native dispatch through every file/folder navigation action.
     /// Later media commands cannot take precedence over those actions. Fixed-key branches in
     /// this prefix return None, so the modal scan never admits a conflicting non-navigation key.
@@ -12711,6 +13073,13 @@ impl App {
         ] {
             if !key.repeat && matches(action) {
                 return Some(action);
+            }
+            if action == KeyAction::ToggleAlwaysOnTop && !key.repeat {
+                for script in super::operation_script_runtime::SCRIPT_SLOT_ACTIONS {
+                    if matches(script) {
+                        return Some(script);
+                    }
+                }
             }
         }
         if self.video_tile_mode_active && !key.alt && matches!(key.virtual_key, 0x25 | 0x27) {
@@ -12856,55 +13225,42 @@ impl App {
         let mut hud_activity = true;
         if let Some(rating_key) = rating_key {
             use crate::keymap::{RatingEdit, RatingTargetFamily};
+            use crate::ui_fullscreen::FullscreenRatingTarget;
+            let rating = self.apply_fullscreen_shared_rating_edit_outcome(
+                Some(fs_idx),
+                rating_key.family,
+                rating_key.edit,
+            );
             let action = match rating_key.family {
-                RatingTargetFamily::Container => {
-                    hud_activity = self.apply_rating_edit_to_current_container(rating_key.edit);
-                    match rating_key.edit {
-                        RatingEdit::Assign(stars) => {
-                            NativeVideoFixedKeyAction::RatingContainer(stars)
-                        }
-                        RatingEdit::Step(direction) => {
-                            NativeVideoFixedKeyAction::RatingContainerStep(direction)
-                        }
+                RatingTargetFamily::Container => match rating_key.edit {
+                    RatingEdit::Assign(stars) => NativeVideoFixedKeyAction::RatingContainer(stars),
+                    RatingEdit::Step(direction) => {
+                        NativeVideoFixedKeyAction::RatingContainerStep(direction)
                     }
-                }
-                RatingTargetFamily::Item => {
-                    hud_activity =
-                        self.apply_rating_edit_to_fullscreen_item(fs_idx, rating_key.edit);
-                    match rating_key.edit {
-                        RatingEdit::Assign(stars) => NativeVideoFixedKeyAction::RatingItem(stars),
-                        RatingEdit::Step(direction) => {
-                            NativeVideoFixedKeyAction::RatingItemStep(direction)
-                        }
+                },
+                RatingTargetFamily::Item => match rating_key.edit {
+                    RatingEdit::Assign(stars) => NativeVideoFixedKeyAction::RatingItem(stars),
+                    RatingEdit::Step(direction) => {
+                        NativeVideoFixedKeyAction::RatingItemStep(direction)
                     }
-                }
+                },
                 RatingTargetFamily::BookPreferred => {
-                    let applied_to = match self.resolve_book_preferred_viewer_target() {
-                        BookPreferredRatingTarget::Book(target) => {
-                            hud_activity = self.apply_rating_edit_to_container_target(
-                                &target,
-                                rating_key.edit,
-                                ContainerRatingToast::Book,
-                            );
-                            NativeVideoBookPreferredAppliedTo::Book
-                        }
-                        BookPreferredRatingTarget::ViewerItem => {
-                            hud_activity =
-                                self.apply_rating_edit_to_fullscreen_item(fs_idx, rating_key.edit);
-                            NativeVideoBookPreferredAppliedTo::Item
-                        }
-                        BookPreferredRatingTarget::Unavailable(reason) => {
-                            self.report_book_preferred_unavailable(reason);
-                            NativeVideoBookPreferredAppliedTo::Unavailable
-                        }
-                    };
                     NativeVideoFixedKeyAction::RatingBookPreferred {
-                        applied_to,
+                        applied_to: match rating.target {
+                            FullscreenRatingTarget::Book => NativeVideoBookPreferredAppliedTo::Book,
+                            FullscreenRatingTarget::Item => NativeVideoBookPreferredAppliedTo::Item,
+                            FullscreenRatingTarget::Unavailable => {
+                                NativeVideoBookPreferredAppliedTo::Unavailable
+                            }
+                            FullscreenRatingTarget::Container => {
+                                unreachable!("book preferred rating target")
+                            }
+                        },
                         edit: rating_key.edit,
                     }
                 }
             };
-            if hud_activity {
+            if rating.changed || rating.target == FullscreenRatingTarget::Unavailable {
                 self.request_native_video_hud_repaint(ctx);
             }
             return NativeVideoKeyOutcome::FixedAction(action);
@@ -12941,7 +13297,12 @@ impl App {
         }
         let outcome = match key.virtual_key {
             _ if !key.repeat && resolved_action == Some(KeyAction::VideoCloseFullscreen) => {
-                self.handle_fullscreen_close_request_immediate();
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoCloseFullscreen,
+                    VideoKeyActionSurface::Native,
+                );
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoCloseFullscreen)
             }
@@ -12958,12 +13319,24 @@ impl App {
                 && self.video_tile_mode_active
                 && resolved_action == Some(KeyAction::VideoPlayPause) =>
             {
-                self.play_selected_video_tile(ctx, fs_idx);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoPlayPause,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
             }
             // Enter: play / pause.
             _ if !key.repeat && resolved_action == Some(KeyAction::VideoPlayPause) => {
-                self.handle_native_video_toggle_play_command(ctx, fs_idx);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoPlayPause,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
             }
             // Escape: close native fullscreen. If the native overlay has a text
@@ -13000,16 +13373,13 @@ impl App {
             }
             // W: seek to start and play.
             _ if !key.repeat && resolved_action == Some(KeyAction::VideoSeekStart) => {
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    // `seek(0.0)` 自体が `apply_command(Play)` 経由で autoplay intent
-                    // を立てるので、追加 `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
-                    player.seek(
-                        0.0,
-                        crate::video::SeekPlayback::StartPlayback,
-                        crate::video::SeekOrigin::User,
-                    );
-                }
-                self.maybe_start_normalize_scan_for_play_intent(fs_idx);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoSeekStart,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStart)
             }
             _ if !key.repeat
@@ -13027,6 +13397,22 @@ impl App {
                 self.toggle_always_on_top(ctx, crate::app::ActionSurface::Viewer);
                 hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::ToggleAlwaysOnTop)
+            }
+            _ if !key.repeat
+                && resolved_action
+                    .and_then(super::operation_script_runtime::script_slot_number)
+                    .is_some() =>
+            {
+                let action = resolved_action.expect("resolved script slot");
+                let slot = super::operation_script_runtime::script_slot_number(action).unwrap();
+                self.run_script_slot(
+                    ctx,
+                    slot,
+                    super::operation_script_runtime::ScriptInputSurface::Viewer,
+                    false,
+                );
+                hud_activity = false;
+                NativeVideoKeyOutcome::Action(action)
             }
             // F12: detached viewer mode toggle. Keep this as a keymap action
             // so a future remap works when the native video HWND has focus.
@@ -13091,45 +13477,63 @@ impl App {
                 NativeVideoKeyOutcome::Action(KeyAction::VideoFrameStepForward)
             }
             _ if resolved_action == Some(KeyAction::VideoSeekBackSmall) => {
-                let seconds = self
-                    .settings
-                    .video_seek_seconds(crate::settings::VideoSeekStep::Small);
-                self.native_video_seek_relative_with_hint(fs_idx, -seconds);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoSeekBackSmall,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackSmall)
             }
             _ if resolved_action == Some(KeyAction::VideoSeekForwardSmall) => {
-                let seconds = self
-                    .settings
-                    .video_seek_seconds(crate::settings::VideoSeekStep::Small);
-                self.native_video_seek_relative_with_hint(fs_idx, seconds);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoSeekForwardSmall,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardSmall)
             }
             _ if resolved_action == Some(KeyAction::VideoSeekBackMedium) => {
-                let seconds = self
-                    .settings
-                    .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
-                self.native_video_seek_relative_with_hint(fs_idx, -seconds);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoSeekBackMedium,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackMedium)
             }
             _ if resolved_action == Some(KeyAction::VideoSeekForwardMedium) => {
-                let seconds = self
-                    .settings
-                    .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
-                self.native_video_seek_relative_with_hint(fs_idx, seconds);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoSeekForwardMedium,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardMedium)
             }
             _ if resolved_action == Some(KeyAction::VideoSeekBackLarge) => {
-                let seconds = self
-                    .settings
-                    .video_seek_seconds(crate::settings::VideoSeekStep::Large);
-                self.native_video_seek_relative_with_hint(fs_idx, -seconds);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoSeekBackLarge,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekBackLarge)
             }
             _ if resolved_action == Some(KeyAction::VideoSeekForwardLarge) => {
-                let seconds = self
-                    .settings
-                    .video_seek_seconds(crate::settings::VideoSeekStep::Large);
-                self.native_video_seek_relative_with_hint(fs_idx, seconds);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoSeekForwardLarge,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekForwardLarge)
             }
             // Left / Right: same seek granularity as the egui fullscreen path.
@@ -13204,11 +13608,23 @@ impl App {
                 NativeVideoKeyOutcome::FixedAction(NativeVideoFixedKeyAction::MouseForward)
             }
             _ if resolved_action == Some(KeyAction::VideoPrevFile) => {
-                self.navigate_native_video_fullscreen(ctx, fs_idx, -1);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoPrevFile,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPrevFile)
             }
             _ if resolved_action == Some(KeyAction::VideoNextFile) => {
-                self.navigate_native_video_fullscreen(ctx, fs_idx, 1);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoNextFile,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoNextFile)
             }
             // Home / End (keymap: FsJumpFirst/FsJumpLast): jump to the first / last visible navigable item.
@@ -13258,38 +13674,48 @@ impl App {
                 .keymap
                 .matches_vk_action(KeyAction::VideoVolumeUp, &key) =>
             {
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    let v =
-                        crate::settings::step_video_volume_by_fader_key_step(player.volume(), 1);
-                    player.set_volume(v);
-                    self.settings.video_volume = v;
-                    self.settings.save();
-                }
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoVolumeUp,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoVolumeUp)
             }
             _ if self
                 .keymap
                 .matches_vk_action(KeyAction::VideoVolumeDown, &key) =>
             {
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    let v =
-                        crate::settings::step_video_volume_by_fader_key_step(player.volume(), -1);
-                    player.set_volume(v);
-                    self.settings.video_volume = v;
-                    self.settings.save();
-                }
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoVolumeDown,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoVolumeDown)
             }
             // M: mute
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::VideoMute, &key) => {
-                if self.toggle_video_session_mute_for_fs_idx(fs_idx) {
-                    self.request_native_video_hud_repaint(ctx);
-                }
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoMute,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoMute)
             }
             // L: loop (4 段階サイクル: Off → Full → Chapter → Bookmark)
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::VideoLoop, &key) => {
-                self.cycle_native_video_loop_common(ctx, fs_idx);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoLoop,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoLoop)
             }
             // J / K: previous / next chapter, bookmark, or pin marker.
@@ -13319,7 +13745,13 @@ impl App {
                     .keymap
                     .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
             {
-                self.play_selected_video_tile(ctx, fs_idx);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoPlayPause,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
             }
             // Space: play / pause (= Enter と等価)。
@@ -13328,7 +13760,13 @@ impl App {
                     .keymap
                     .matches_vk_action(KeyAction::VideoPlayPause, &key) =>
             {
-                self.handle_native_video_toggle_play_command(ctx, fs_idx);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoPlayPause,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
             }
             // P: pin the selected tile while tile mode is open; otherwise pin the current
@@ -13358,7 +13796,13 @@ impl App {
             }
             // Ctrl+S: save current video frame to the capture folder.
             _ if !key.repeat && self.keymap.matches_vk_action(KeyAction::VideoCapture, &key) => {
-                self.save_video_frame_to_file(ctx, fs_idx);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoCapture,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoCapture)
             }
             // Ctrl+B: add current video frame to the active compiled book.
@@ -13455,8 +13899,13 @@ impl App {
                     .keymap
                     .matches_vk_action(KeyAction::VideoSeekStripToggle, &key) =>
             {
-                self.apply_video_seek_strip_action(fs_idx, KeyAction::VideoSeekStripToggle);
-                self.sync_native_video_seek_strip(ctx, fs_idx);
+                self.execute_video_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoSeekStripToggle,
+                    VideoKeyActionSurface::Native,
+                );
+                hud_activity = false;
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStripToggle)
             }
             _ if !key.repeat
@@ -15254,6 +15703,15 @@ impl App {
         fs_idx: usize,
         base_delta: i32,
     ) {
+        self.try_navigate_native_video_fullscreen(ctx, fs_idx, base_delta);
+    }
+
+    fn try_navigate_native_video_fullscreen(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        base_delta: i32,
+    ) -> bool {
         // tile/fast swap pending 中はナビを即時実行できないが、silent drop すると
         // 「ホイール / 前-次項目ボタンが反応しない」体感バグになる (実機 fb 2026-05-26)。
         // 最新 delta を deferred フィールドに格納し、swap 完了後の polling で drain する
@@ -15269,10 +15727,10 @@ impl App {
                 crate::app::ManualMediaNavigationLanding::NativeVideo,
                 self.manual_nav_wrap_enabled(),
             ) {
-                return;
+                return true;
             }
             self.native_video_deferred_nav_delta = Some(base_delta);
-            return;
+            return true;
         }
         // `fs_nav_is_locked()` は video swap だけでなく Ctrl+↑↓ などのフルスクリーン
         // 横断ナビゲーション (= フォルダ移動) でも true になる。この場合 lock 解除後の
@@ -15280,7 +15738,7 @@ impl App {
         // deferred delta を後追い適用すると予期せぬ 1 アイテム移動が発火しうる
         // (Codex 第 8 P2 指摘)。defer せず silent return に留める。
         if self.fs_nav_is_locked() {
-            return;
+            return false;
         }
         if base_delta != 0 {
             self.cancel_rating_membership_restore();
@@ -15298,12 +15756,12 @@ impl App {
             crate::app::ManualMediaNavigationLanding::NativeVideo,
             self.manual_nav_wrap_enabled(),
         ) {
-            return;
+            return true;
         }
         let display_order = self.current_reader_order().to_vec();
         let page_nav = self.spread_page_nav(base_delta);
         let (nav_delta, wrap) = match page_nav {
-            crate::ui_fullscreen::FsPageNav::None => return,
+            crate::ui_fullscreen::FsPageNav::None => return false,
             crate::ui_fullscreen::FsPageNav::Delta(delta) => {
                 (delta, self.manual_nav_wrap_enabled())
             }
@@ -15322,11 +15780,13 @@ impl App {
             ),
             crate::ui_fullscreen::FsPageNav::Boundary { at_end } => {
                 self.show_native_video_boundary_toast(ctx, at_end);
-                return;
+                return false;
             }
             // 分割中の移動。ここに来るのは動画 / 音声を表示しているときで、動画は
             // 分割されないので同じページ内の左右移動にはならない。念のため塞ぐ。
-            crate::ui_fullscreen::FsPageNav::Split(step) if step.source_idx == fs_idx => return,
+            crate::ui_fullscreen::FsPageNav::Split(step) if step.source_idx == fs_idx => {
+                return false;
+            }
             crate::ui_fullscreen::FsPageNav::Split(step) => {
                 // 左右は着地側が決めるので、ここでは元ページまでの距離だけ見る。
                 (
@@ -15350,6 +15810,7 @@ impl App {
             "native_media_window_manual",
             crate::app::ManualMediaNavigationLanding::NativeVideo,
         );
+        true
     }
 
     /// `poll_native_video_fast_swap` / `poll_video_tile_swap_pending` が pending を
@@ -16848,6 +17309,574 @@ mod native_video_display_mode_toggle_tests {
 #[cfg(all(test, windows))]
 mod configurable_video_seek_dispatch_tests {
     use super::*;
+
+    fn enable_native_seek_script(app: &mut App, idx: usize) {
+        use crate::operation_script::{CompiledOperationScript, OperationScriptState};
+        app.settings.operation_script_enabled = true;
+        app.operation_script.state = OperationScriptState::Ready(Box::new(
+            CompiledOperationScript::compile(
+                "fn slots() { [#{slot:1,label:\"seek\",run:\"entry\"}] }\nfn entry(s) { [\"VideoSeekBackSmall\"] }",
+            ).unwrap(),
+        ));
+        if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get_mut(&idx) {
+            if player.native_source_epoch().is_none() {
+                player.configure_native_timing_for_test(100.0, 300.0, false, false);
+            }
+        }
+        assert!(app.is_native_video_script_surface());
+    }
+
+    fn set_native_script_action(app: &mut App, idx: usize, action: KeyAction) {
+        use crate::operation_script::{CompiledOperationScript, OperationScriptState};
+        enable_native_seek_script(app, idx);
+        let source = format!(
+            "fn slots() {{ [#{{slot:1,label:\"parity\",run:\"entry\"}}] }}\nfn entry(s) {{ [\"{}\"] }}",
+            action.ini_name(),
+        );
+        app.operation_script.state = OperationScriptState::Ready(Box::new(
+            CompiledOperationScript::compile(&source).unwrap(),
+        ));
+    }
+
+    fn run_native_action_script(app: &mut App, ctx: &egui::Context) -> bool {
+        match app.run_script_slot(
+            ctx,
+            1,
+            super::super::operation_script_runtime::ScriptInputSurface::Viewer,
+            false,
+        ) {
+            super::super::operation_script_runtime::ScriptRunResult::NativeVideo { rejected } => {
+                !rejected
+            }
+            _ => panic!("native script returned egui postprocessing"),
+        }
+    }
+
+    fn native_control_state(
+        app: &App,
+        idx: usize,
+    ) -> (bool, f64, bool, f64, bool, crate::settings::VideoLoopMode) {
+        let player = app.fs_video_player(idx).unwrap();
+        (
+            player.intent_playing(),
+            player.volume(),
+            player.is_muted(),
+            app.settings.video_volume,
+            app.settings.video_muted,
+            app.settings.video_loop_mode,
+        )
+    }
+
+    #[test]
+    fn operation_script_native_controls_match_vk_shared_and_script_execution() {
+        for action in [
+            KeyAction::VideoPlayPause,
+            KeyAction::VideoMute,
+            KeyAction::VideoVolumeUp,
+            KeyAction::VideoVolumeDown,
+            KeyAction::VideoLoop,
+            KeyAction::VideoSeekStart,
+        ] {
+            let (mut key_app, idx) = setup_seek_app();
+            let (mut shared_app, shared_idx) = setup_seek_app();
+            let (mut script_app, script_idx) = setup_seek_app();
+            for (app, index) in [
+                (&mut *key_app, idx),
+                (&mut *shared_app, shared_idx),
+                (&mut *script_app, script_idx),
+            ] {
+                set_native_script_action(app, index, action);
+                app.settings.audio_normalize_enabled = false;
+            }
+            key_app.keymap = crate::keymap::Keymap::from_ini_str(&format!(
+                "[FsVideo]\n{} = F16\n",
+                action.ini_name()
+            ));
+            let ctx = egui::Context::default();
+            assert_eq!(
+                key_app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7f, false, false)),
+                NativeVideoKeyOutcome::Action(action)
+            );
+            assert!(matches!(
+                shared_app.execute_video_key_action(
+                    &ctx,
+                    shared_idx,
+                    action,
+                    VideoKeyActionSurface::Native
+                ),
+                VideoKeyActionResult::Accepted(_)
+            ));
+            assert!(
+                run_native_action_script(&mut script_app, &ctx),
+                "{action:?}"
+            );
+            assert_eq!(
+                native_control_state(&key_app, idx),
+                native_control_state(&shared_app, shared_idx),
+                "{action:?}"
+            );
+            assert_eq!(
+                native_control_state(&key_app, idx),
+                native_control_state(&script_app, script_idx),
+                "{action:?}"
+            );
+            if action == KeyAction::VideoSeekStart {
+                assert_eq!(player_seek_base(&key_app, idx), 0.0);
+                assert_eq!(player_seek_base(&script_app, script_idx), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn operation_script_native_capture_strip_and_navigation_refusals_match_vk_shared_and_script() {
+        for action in [
+            KeyAction::VideoCapture,
+            KeyAction::VideoSeekStripToggle,
+            KeyAction::VideoPrevFile,
+            KeyAction::VideoNextFile,
+        ] {
+            let (mut key_app, idx) = setup_seek_app();
+            let (mut shared_app, shared_idx) = setup_seek_app();
+            let (mut script_app, script_idx) = setup_seek_app();
+            for (app, index) in [
+                (&mut *key_app, idx),
+                (&mut *shared_app, shared_idx),
+                (&mut *script_app, script_idx),
+            ] {
+                set_native_script_action(app, index, action);
+                if action == KeyAction::VideoCapture {
+                    app.capture_pending = Some(super::super::CapturePending {
+                        rx: std::sync::mpsc::channel().1,
+                    });
+                } else if action == KeyAction::VideoSeekStripToggle {
+                    app.fs_video_player(index).unwrap().set_seek_strip_material_availability(
+                        crate::video::seek_strip::SeekStripMaterialAvailability::Unavailable(
+                            crate::video::seek_strip::StripAxisUnavailableReason::KeyframesTooSparse));
+                } else {
+                    app.fs_nav_locked_gen = Some(app.items_generation);
+                }
+            }
+            key_app.keymap = crate::keymap::Keymap::from_ini_str(&format!(
+                "[FsVideo]\n{} = F16\n",
+                action.ini_name()
+            ));
+            let ctx = egui::Context::default();
+            assert_eq!(
+                key_app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7f, false, false)),
+                NativeVideoKeyOutcome::Action(action)
+            );
+            assert!(
+                matches!(
+                    shared_app.execute_video_key_action(
+                        &ctx,
+                        shared_idx,
+                        action,
+                        VideoKeyActionSurface::Native
+                    ),
+                    VideoKeyActionResult::Rejected
+                ),
+                "{action:?}"
+            );
+            assert!(
+                !run_native_action_script(&mut script_app, &ctx),
+                "{action:?}"
+            );
+            for (app, index) in [
+                (&*key_app, idx),
+                (&*shared_app, shared_idx),
+                (&*script_app, script_idx),
+            ] {
+                assert_eq!(app.fullscreen_idx, Some(index));
+                assert_eq!(player_seek_base(app, index), 100.0);
+                assert_eq!(
+                    app.capture_pending.is_some(),
+                    action == KeyAction::VideoCapture
+                );
+                assert!(app.media_navigation_pending.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn operation_script_native_close_is_completed_for_vk_shared_and_script() {
+        for route in ["key", "shared", "script"] {
+            let (mut app, idx) = setup_seek_app();
+            set_native_script_action(&mut app, idx, KeyAction::VideoCloseFullscreen);
+            app.keymap =
+                crate::keymap::Keymap::from_ini_str("[FsVideo]\nVideoCloseFullscreen = F16\n");
+            let ctx = egui::Context::default();
+            match route {
+                "key" => assert_eq!(
+                    app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7f, false, false)),
+                    NativeVideoKeyOutcome::Action(KeyAction::VideoCloseFullscreen)
+                ),
+                "shared" => assert!(
+                    matches!(app.execute_video_key_action(&ctx, idx, KeyAction::VideoCloseFullscreen, VideoKeyActionSurface::Native), VideoKeyActionResult::Accepted(action) if !action.navigation_already_accepted())
+                ),
+                _ => assert!(run_native_action_script(&mut app, &ctx)),
+            }
+            assert!(app.fullscreen_idx.is_none(), "{route}");
+        }
+    }
+
+    #[test]
+    fn operation_script_native_rating_families_match_vk_shared_and_script() {
+        use super::super::book_materialization::{BookScope, ProjectionRecipe};
+        for action in [
+            KeyAction::RatingItem4,
+            KeyAction::RatingItemClear,
+            KeyAction::RatingItemStepUp,
+            KeyAction::RatingItemStepDown,
+            KeyAction::RatingContainer4,
+            KeyAction::RatingContainerClear,
+            KeyAction::RatingContainerStepUp,
+            KeyAction::RatingContainerStepDown,
+            KeyAction::RatingBookPreferred4,
+            KeyAction::RatingBookPreferredClear,
+            KeyAction::RatingBookPreferredStepUp,
+            KeyAction::RatingBookPreferredStepDown,
+        ] {
+            let mut results = Vec::new();
+            for route in ["key", "shared", "script"] {
+                let (mut app, idx) = setup_seek_app();
+                set_native_script_action(&mut app, idx, action);
+                let folder = PathBuf::from(r"C:\clips");
+                app.current_folder = Some(folder.clone());
+                app.projection_recipe =
+                    ProjectionRecipe::Book(BookScope::ImageFolder(folder.clone()));
+                let item_key = app.rating_path_key(idx).unwrap();
+                let book_key = crate::adjustment_db::normalize_path(&folder);
+                app.rating_db.as_ref().unwrap().set(&item_key, 3).unwrap();
+                app.rating_db.as_ref().unwrap().set(&book_key, 3).unwrap();
+                app.rating_cache.clear();
+                app.current_folder_rating_cache = None;
+                app.keymap = crate::keymap::Keymap::from_ini_str(&format!(
+                    "[Rating]\n{} = F16\n",
+                    action.ini_name()
+                ));
+                let ctx = egui::Context::default();
+                match route {
+                    "key" => assert!(matches!(
+                        app.dispatch_native_video_key_event(
+                            &ctx,
+                            idx,
+                            native_key(0x7f, false, false)
+                        ),
+                        NativeVideoKeyOutcome::FixedAction(_)
+                    )),
+                    "shared" => assert!(
+                        matches!(
+                            app.execute_video_key_action(
+                                &ctx,
+                                idx,
+                                action,
+                                VideoKeyActionSurface::Native
+                            ),
+                            VideoKeyActionResult::Accepted(_)
+                        ),
+                        "{action:?}"
+                    ),
+                    _ => assert!(run_native_action_script(&mut app, &ctx), "{action:?}"),
+                }
+                results.push((
+                    app.rating_db.as_ref().unwrap().get(&item_key),
+                    app.rating_db.as_ref().unwrap().get(&book_key),
+                    app.meta_undo.undo_len(),
+                ));
+            }
+            assert_eq!(results[0], results[1], "{action:?}");
+            assert_eq!(results[0], results[2], "{action:?}");
+        }
+    }
+
+    #[test]
+    fn operation_script_native_path_copies_match_existing_key_executor_and_script() {
+        for action in [KeyAction::FsCopyPath, KeyAction::FsCopyFileName] {
+            let mut results = Vec::new();
+            for route in ["key-executor", "shared", "script"] {
+                let (mut app, idx) = setup_seek_app();
+                set_native_script_action(&mut app, idx, action);
+                let ctx = egui::Context::default();
+                match route {
+                    "key-executor" => assert!(app.execute_copy_key_action(&ctx, action)),
+                    "shared" => assert!(matches!(
+                        app.execute_video_key_action(
+                            &ctx,
+                            idx,
+                            action,
+                            VideoKeyActionSurface::Native
+                        ),
+                        VideoKeyActionResult::Accepted(_)
+                    )),
+                    _ => assert!(run_native_action_script(&mut app, &ctx)),
+                }
+                let text: Vec<_> = ctx
+                    .output_mut(|output| std::mem::take(&mut output.commands))
+                    .into_iter()
+                    .filter_map(|command| match command {
+                        egui::OutputCommand::CopyText(text) => Some(text),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(text.len(), 1);
+                results.push(text);
+            }
+            assert_eq!(results[0], results[1], "{action:?}");
+            assert_eq!(results[0], results[2], "{action:?}");
+        }
+    }
+
+    #[test]
+    fn operation_script_native_positioned_ring_and_gesture_recognize_then_execute_once() {
+        use crate::ring_shortcut::{
+            MouseGestureBinding, MouseGestureDirection, RightDragMode, RingActionId,
+        };
+        use crate::video::native_window::{
+            NativeVideoMouseButton, NativeVideoMouseEvent, NativeVideoWindowEvent,
+        };
+        for mode in [RightDragMode::RingShortcut, RightDragMode::MouseGesture] {
+            let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+            enable_native_seek_script(&mut app, idx);
+            app.settings.ring_shortcuts.right_drag_video = Some(mode.clone());
+            app.settings
+                .ring_shortcuts
+                .video
+                .slots
+                .fill(RingActionId::ScriptSlot1);
+            app.settings.ring_shortcuts.mouse_gestures_video.bindings =
+                vec![MouseGestureBinding::new(
+                    vec![MouseGestureDirection::Right],
+                    RingActionId::ScriptSlot1,
+                )];
+            let ctx = egui::Context::default();
+            route_native_mouse_button(
+                &mut app,
+                &ctx,
+                idx,
+                source_epoch,
+                native_extra_mouse_event(1, owner, NativeVideoMouseButton::Right, true, false),
+            );
+            assert!(
+                app.mouse_ring_flick.is_some() || app.mouse_gesture.is_some(),
+                "{mode:?}"
+            );
+            app.handle_native_video_window_event(
+                &ctx,
+                idx,
+                NativeVideoWindowEvent::MouseMove(NativeVideoMouseEvent {
+                    x: 240,
+                    y: 80,
+                    shift: false,
+                    ctrl: false,
+                }),
+            );
+            assert_eq!(
+                player_seek_base(&app, idx),
+                100.0,
+                "recognition must wait for release: {mode:?}"
+            );
+            let mut release =
+                native_extra_mouse_event(2, owner, NativeVideoMouseButton::Right, false, false);
+            release.x = 240;
+            route_native_mouse_button(&mut app, &ctx, idx, source_epoch, release);
+            assert_eq!(player_seek_base(&app, idx), 97.0, "{mode:?}");
+            assert!(app.mouse_ring_flick.is_none() && app.mouse_gesture.is_none());
+            assert!(app.fs_context_menu_idx.is_none());
+            assert!(app.mouse_ring_nav.is_none());
+        }
+    }
+
+    #[test]
+    fn operation_script_native_slot_key_runs_once_and_rejects_repeat() {
+        let (mut app, idx) = setup_seek_app();
+        enable_native_seek_script(&mut app, idx);
+        app.keymap = crate::keymap::Keymap::from_ini_str("[Global]\nScriptSlot1 = F16\n");
+        let ctx = egui::Context::default();
+        let first = native_key(0x7f, false, false);
+        assert_eq!(
+            app.dispatch_native_video_key_event(&ctx, idx, first),
+            NativeVideoKeyOutcome::Action(KeyAction::ScriptSlot1)
+        );
+        assert_eq!(player_seek_base(&app, idx), 97.0);
+        app.dispatch_native_video_key_event(
+            &ctx,
+            idx,
+            crate::video::native_window::NativeVideoKeyEvent {
+                repeat: true,
+                ..first
+            },
+        );
+        assert_eq!(player_seek_base(&app, idx), 97.0);
+        app.dispatch_native_video_key_event(&ctx, idx, first);
+        assert_eq!(player_seek_base(&app, idx), 94.0);
+    }
+
+    #[test]
+    fn operation_script_native_slot_does_not_preempt_the_existing_prefix() {
+        let (mut app, idx) = setup_seek_app();
+        enable_native_seek_script(&mut app, idx);
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[Global]\nScriptSlot1 = F16\n[FsVideo]\nVideoPlayPause = F16\n",
+        );
+        let ctx = egui::Context::default();
+        assert_eq!(
+            app.dispatch_native_video_key_event(&ctx, idx, native_key(0x7f, false, false)),
+            NativeVideoKeyOutcome::Action(KeyAction::VideoPlayPause)
+        );
+        assert_eq!(player_seek_base(&app, idx), 100.0);
+    }
+
+    #[test]
+    fn operation_script_native_browser_assignment_rejects_only_repeats() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        let (mut app, idx) = setup_seek_app();
+        enable_native_seek_script(&mut app, idx);
+        set_video_mouse_action(&mut app, MouseButtonSlot::Back, RingActionId::ScriptSlot1);
+        let ctx = egui::Context::default();
+        let first = native_key(0xa6, false, false);
+        app.dispatch_native_video_key_event(&ctx, idx, first);
+        assert_eq!(player_seek_base(&app, idx), 97.0);
+        app.dispatch_native_video_key_event(
+            &ctx,
+            idx,
+            crate::video::native_window::NativeVideoKeyEvent {
+                repeat: true,
+                ..first
+            },
+        );
+        assert_eq!(player_seek_base(&app, idx), 97.0);
+    }
+
+    #[test]
+    fn operation_script_native_xbutton_double_click_and_middle_use_one_press_owner() {
+        use crate::ring_shortcut::{MouseButtonSlot, RingActionId};
+        use crate::video::native_window::NativeVideoMouseButton;
+        let (mut app, idx, source_epoch, owner) = setup_mouse_hold_app();
+        enable_native_seek_script(&mut app, idx);
+        set_video_mouse_action(&mut app, MouseButtonSlot::Back, RingActionId::ScriptSlot1);
+        set_video_mouse_action(&mut app, MouseButtonSlot::Middle, RingActionId::ScriptSlot1);
+        let ctx = egui::Context::default();
+        for (receipt, down, double_click) in [
+            (1, true, false),
+            (2, false, false),
+            (3, true, true),
+            (4, false, false),
+        ] {
+            route_native_mouse_button(
+                &mut app,
+                &ctx,
+                idx,
+                source_epoch,
+                native_extra_mouse_event(
+                    receipt,
+                    owner,
+                    NativeVideoMouseButton::Extra1,
+                    down,
+                    double_click,
+                ),
+            );
+        }
+        assert_eq!(player_seek_base(&app, idx), 94.0);
+        assert!(
+            app.native_video_mouse_seek_holds.back.is_none(),
+            "script slots must never arm seek repetition"
+        );
+        for (receipt, down) in [(5, true), (6, false)] {
+            route_native_mouse_button(
+                &mut app,
+                &ctx,
+                idx,
+                source_epoch,
+                native_extra_mouse_event(
+                    receipt,
+                    owner,
+                    NativeVideoMouseButton::Middle,
+                    down,
+                    false,
+                ),
+            );
+        }
+        assert_eq!(player_seek_base(&app, idx), 91.0);
+    }
+
+    #[test]
+    fn operation_script_native_overlay_ownership_blocks_before_execution() {
+        let (mut app, idx) = setup_seek_app();
+        enable_native_seek_script(&mut app, idx);
+        let ctx = egui::Context::default();
+        for (text, modal) in [(true, false), (false, true)] {
+            if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get(&idx) {
+                player.set_native_overlay_input_routing_for_test(
+                    crate::video::native_presenter::NativeOverlayInputRouting {
+                        text_input_active: text,
+                        modal_dialog_active: modal,
+                        ..Default::default()
+                    },
+                );
+            }
+            assert!(app.native_video_script_input_blocked());
+            assert!(!app.native_video_script_action_admitted(idx, KeyAction::VideoSeekBackSmall));
+            app.run_script_slot(
+                &ctx,
+                1,
+                super::super::operation_script_runtime::ScriptInputSurface::Viewer,
+                false,
+            );
+            assert_eq!(player_seek_base(&app, idx), 100.0);
+        }
+    }
+
+    #[test]
+    fn operation_script_native_shared_seek_matches_vk_handler_and_refuses_unknown_action() {
+        for (action, vk, shift, ctrl) in [
+            (KeyAction::VideoSeekBackSmall, 0x25, true, false),
+            (KeyAction::VideoSeekForwardSmall, 0x27, true, false),
+            (KeyAction::VideoSeekBackMedium, 0x7c, false, false),
+            (KeyAction::VideoSeekForwardMedium, 0x7d, false, false),
+            (KeyAction::VideoSeekBackLarge, 0x25, false, true),
+            (KeyAction::VideoSeekForwardLarge, 0x27, false, true),
+            (KeyAction::VideoSeekStart, 0x57, false, false),
+        ] {
+            let (mut key_app, idx) = setup_seek_app();
+            let (mut shared_app, other_idx) = setup_seek_app();
+            let (mut script_app, script_idx) = setup_seek_app();
+            set_native_script_action(&mut script_app, script_idx, action);
+            let ctx = egui::Context::default();
+            assert_eq!(
+                key_app.dispatch_native_video_key_event(&ctx, idx, native_key(vk, shift, ctrl)),
+                NativeVideoKeyOutcome::Action(action)
+            );
+            assert!(matches!(
+                shared_app.execute_video_key_action(
+                    &ctx,
+                    other_idx,
+                    action,
+                    VideoKeyActionSurface::Native
+                ),
+                VideoKeyActionResult::Accepted(_)
+            ));
+            assert_eq!(
+                player_seek_base(&key_app, idx),
+                player_seek_base(&shared_app, other_idx)
+            );
+            assert!(run_native_action_script(&mut script_app, &ctx));
+            assert_eq!(
+                player_seek_base(&key_app, idx),
+                player_seek_base(&script_app, script_idx)
+            );
+        }
+        let (mut app, idx) = setup_seek_app();
+        assert!(matches!(
+            app.execute_video_key_action(
+                &egui::Context::default(),
+                idx,
+                KeyAction::VideoExternalPlayer,
+                VideoKeyActionSurface::Native
+            ),
+            VideoKeyActionResult::Rejected
+        ));
+        assert_eq!(player_seek_base(&app, idx), 100.0);
+    }
 
     #[test]
     fn list_order_native_dispatch_starts_the_captured_book_order_worker() {

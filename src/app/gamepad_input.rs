@@ -8221,10 +8221,11 @@ impl App {
             action.as_str()
         ));
         let dispatched_action = action.clone();
-        let script_slot = (context != RingShortcutContext::Grid)
-            .then(|| action.script_slot_key_action())
-            .flatten()
-            .and_then(super::operation_script_runtime::script_slot_number);
+        let script_slot = (context != RingShortcutContext::Grid
+            && !self.operation_script_uses_native_video())
+        .then(|| action.script_slot_key_action())
+        .flatten()
+        .and_then(super::operation_script_runtime::script_slot_number);
         MouseButtonDispatchResult {
             navigation: self.apply_ring_action(ctx, context, action, source),
             dispatched_action: Some(dispatched_action),
@@ -9260,20 +9261,19 @@ impl App {
                 None
             }
             RingShortcutContext::VideoFullscreen => {
+                if self.operation_script_uses_native_video() {
+                    // Native operations finish here, including their ordinary
+                    // navigation/close handling. Do not also return a draw request.
+                    self.run_script_slot(ctx, slot, ScriptInputSurface::Viewer, false);
+                    return None;
+                }
                 if matches!(phase, RingScriptPhase::DrawOwned) {
                     return None;
                 }
-                // Native/egui media execution belongs to stage 3.
-                use super::operation_script_runtime::ScriptEligibility;
-                let reason =
-                    match self.operation_script_eligibility(ctx, ScriptInputSurface::Viewer) {
-                        ScriptEligibility::Available(_) => {
-                            "動画・音声の操作はまだ使用できません".into()
-                        }
-                        ScriptEligibility::Notify(reason) => reason,
-                        ScriptEligibility::Silent => return None,
-                    };
-                self.show_feedback_warning(format!("スクリプト操作 {slot}: {reason}"));
+                let fs_idx = self.fullscreen_idx?;
+                let mut action = crate::ui_fullscreen::FsKeyAction::default();
+                self.run_fullscreen_script_slot_for_action(ctx, slot, &mut action, &mut None);
+                self.finish_fullscreen_key_action(ctx, fs_idx, action);
                 None
             }
         }
@@ -9290,6 +9290,7 @@ impl App {
     ) -> Option<AddressBarNav> {
         if matches!(phase, RingScriptPhase::DrawOwned)
             && context != RingShortcutContext::Grid
+            && !self.operation_script_uses_native_video()
             && let Some(slot) = action
                 .script_slot_key_action()
                 .and_then(super::operation_script_runtime::script_slot_number)
@@ -15413,6 +15414,115 @@ mod script_slot_assignment_stage_tests {
                 "fn slots() {{ [#{{slot:1,label:\"test\",run:\"run\"}}] }} fn run(s) {{ [\"{operation}\"] }}"
             )).unwrap(),
         ));
+    }
+
+    #[cfg(windows)]
+    fn media_script_app(music: bool) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        let path = std::path::PathBuf::from(if music {
+            r"C:\script-ring\audio.mp3"
+        } else {
+            r"C:\script-ring\video.mp4"
+        });
+        app.items = vec![if music {
+            crate::grid_item::GridItem::Audio(path.clone())
+        } else {
+            crate::grid_item::GridItem::Video(path.clone())
+        }];
+        app.visible_indices = vec![0];
+        app.current_folder = Some(r"C:\script-ring".into());
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        app.video_session_muted = false;
+        app.fs_cache.insert(
+            0,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path),
+                ),
+                load_seq: 0,
+            },
+        );
+        install_script(&mut app, "VideoMute");
+        app
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn script_native_media_mouse_runs_once_and_returns_no_draw_request() {
+        let ctx = egui::Context::default();
+        for slot in [
+            MouseButtonSlot::Back,
+            MouseButtonSlot::Forward,
+            MouseButtonSlot::Middle,
+        ] {
+            let mut app = media_script_app(false);
+            let profile = &mut app.settings.ring_shortcuts.mouse_buttons_video;
+            match slot {
+                MouseButtonSlot::Back => profile.back = RingActionId::ScriptSlot1,
+                MouseButtonSlot::Forward => profile.forward = RingActionId::ScriptSlot1,
+                MouseButtonSlot::Middle => profile.middle = RingActionId::ScriptSlot1,
+            }
+            for repeat in [false, true] {
+                let result = app.dispatch_mouse_button_with_repeat(
+                    &ctx,
+                    slot,
+                    crate::app::ActionSurface::Viewer,
+                    "script-native-mouse-test",
+                    repeat,
+                );
+                assert!(result.navigation.is_none());
+                assert!(result.script_slot.is_none());
+                assert_eq!(
+                    result.dispatched_action,
+                    (!repeat).then_some(RingActionId::ScriptSlot1)
+                );
+                assert!(
+                    app.video_session_muted,
+                    "initial runs once, repeat does not toggle again"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn script_media_ring_native_completes_and_music_keeps_draw_ownership() {
+        let ctx = egui::Context::default();
+        for music in [false, true] {
+            for gesture in [false, true] {
+                let mut app = media_script_app(music);
+                let command = if gesture {
+                    RightDragCommand::MouseGesture {
+                        context: RightDragContext::VideoFullscreen,
+                        action: RingActionId::ScriptSlot1,
+                        pattern_label: "→".into(),
+                        show_result_toast: false,
+                    }
+                } else {
+                    RightDragCommand::RingShortcut {
+                        context: RingShortcutContext::VideoFullscreen,
+                        action: RingActionId::ScriptSlot1,
+                        direction: RingDirection::Up,
+                        source: "script-media-ring-test",
+                    }
+                };
+                let (nav, slot) =
+                    app.execute_right_drag_command_for_fullscreen_render(&ctx, command);
+                assert!(nav.is_none());
+                assert_eq!(slot, music.then_some(1));
+                assert_eq!(app.video_session_muted, !music);
+                if music {
+                    app.apply_ring_action_before_fullscreen_render(
+                        &ctx,
+                        RingShortcutContext::VideoFullscreen,
+                        RingActionId::ScriptSlot1,
+                        "script-music-pre-render-test",
+                    );
+                    assert!(app.video_session_muted);
+                }
+            }
+        }
     }
 
     #[test]

@@ -19,6 +19,19 @@
 //! しまう」誤認を避けるため明示。
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FullscreenRatingTarget {
+    Container,
+    Item,
+    Book,
+    Unavailable,
+}
+
+pub(crate) struct FullscreenRatingEditOutcome {
+    pub(crate) changed: bool,
+    pub(crate) target: FullscreenRatingTarget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpreadPresentationPersistence {
     Saved,
     NotRemembered,
@@ -29,6 +42,8 @@ mod compare_original;
 mod spread_step;
 use crate::app::operation_script_runtime::ScriptFeedback;
 use crate::app::spread_shift_owner::retire_spread_step;
+#[cfg(windows)]
+use crate::app::{VideoKeyActionResult, VideoKeyActionSurface};
 pub(crate) mod in_page_scroll;
 mod initial_placement;
 mod pan_bounds;
@@ -36565,11 +36580,6 @@ impl App {
             return (action, true, false);
         };
         if self.items.get(fs_idx).is_none()
-            || matches!(
-                self.items.get(fs_idx),
-                Some(GridItem::Video(_) | GridItem::Audio(_))
-            )
-            || self.fs_music_view_active(fs_idx)
             || self.ime_input_active(ctx)
             || self.operation_script_keyboard_blocked(ctx)
             || self.any_modal_dialog_open_for_fullscreen_keys()
@@ -36595,6 +36605,53 @@ impl App {
                 | KeyAction::FsSiblingNext
         ) && self.fs_navigation_front_menu_presented(ctx)
         {
+            return (action, true, false);
+        }
+        let media = matches!(
+            self.items.get(fs_idx),
+            Some(GridItem::Video(_) | GridItem::Audio(_))
+        );
+        if media {
+            #[cfg(windows)]
+            {
+                if self.fs_context_menu_idx.is_some()
+                    || self.normalize_scan_is_modal_for_current_player(fs_idx)
+                    || (key_action == KeyAction::VideoLoop
+                        && self.video_continuous_mode.is_enabled())
+                    || (self.fs_music_view_active(fs_idx)
+                        && self.music_fullscreen_editor_or_modal_blocks_input(ctx, fs_idx))
+                {
+                    return (action, true, false);
+                }
+                let surface = if self.fs_music_view_active(fs_idx) {
+                    VideoKeyActionSurface::EguiMusic
+                } else {
+                    VideoKeyActionSurface::EguiVideo
+                };
+                let before_key = self
+                    .page_path_key(fs_idx)
+                    .or_else(|| self.rating_path_key(fs_idx));
+                return match self.execute_video_key_action(ctx, fs_idx, key_action, surface) {
+                    VideoKeyActionResult::Accepted(mut action) => {
+                        match self.fullscreen_idx {
+                            None => action.page_transition = FsKeyPageTransition::Closed,
+                            Some(idx)
+                                if idx != fs_idx
+                                    || self
+                                        .page_path_key(idx)
+                                        .or_else(|| self.rating_path_key(idx))
+                                        != before_key =>
+                            {
+                                action.page_transition = FsKeyPageTransition::Rebased { idx };
+                            }
+                            _ => {}
+                        }
+                        (action, false, false)
+                    }
+                    VideoKeyActionResult::Rejected => (action, true, false),
+                };
+            }
+            #[cfg(not(windows))]
             return (action, true, false);
         }
         let before_key = self
@@ -36632,38 +36689,59 @@ impl App {
         (action, !accepted && !delegated, delegated)
     }
 
-    fn apply_fullscreen_shared_rating_edit(
+    pub(crate) fn apply_fullscreen_shared_rating_edit(
         &mut self,
         fs_idx: Option<usize>,
         family: crate::keymap::RatingTargetFamily,
         edit: crate::keymap::RatingEdit,
     ) -> bool {
+        let noop = self.operation_script_rating_noop(family, fs_idx, edit);
+        self.apply_fullscreen_shared_rating_edit_outcome(fs_idx, family, edit)
+            .changed
+            || noop
+    }
+
+    pub(crate) fn apply_fullscreen_shared_rating_edit_outcome(
+        &mut self,
+        fs_idx: Option<usize>,
+        family: crate::keymap::RatingTargetFamily,
+        edit: crate::keymap::RatingEdit,
+    ) -> FullscreenRatingEditOutcome {
         use crate::app::book_preferred_rating::{BookPreferredRatingTarget, ContainerRatingToast};
         use crate::keymap::RatingTargetFamily;
-        let noop = self.operation_script_rating_noop(family, fs_idx, edit);
-        let changed = match family {
-            RatingTargetFamily::Container => self.apply_rating_edit_to_current_container(edit),
-            RatingTargetFamily::Item => {
-                fs_idx.is_some_and(|idx| self.apply_rating_edit_to_fullscreen_item(idx, edit))
-            }
+        let (changed, target) = match family {
+            RatingTargetFamily::Container => (
+                self.apply_rating_edit_to_current_container(edit),
+                FullscreenRatingTarget::Container,
+            ),
+            RatingTargetFamily::Item => (
+                fs_idx.is_some_and(|idx| self.apply_rating_edit_to_fullscreen_item(idx, edit)),
+                FullscreenRatingTarget::Item,
+            ),
             RatingTargetFamily::BookPreferred => {
                 match self.resolve_book_preferred_viewer_target() {
-                    BookPreferredRatingTarget::Book(target) => self
-                        .apply_rating_edit_to_container_target(
+                    BookPreferredRatingTarget::Book(target) => (
+                        self.apply_rating_edit_to_container_target(
                             &target,
                             edit,
                             ContainerRatingToast::Book,
                         ),
-                    BookPreferredRatingTarget::ViewerItem => fs_idx
-                        .is_some_and(|idx| self.apply_rating_edit_to_fullscreen_item(idx, edit)),
+                        FullscreenRatingTarget::Book,
+                    ),
+                    BookPreferredRatingTarget::ViewerItem => (
+                        fs_idx.is_some_and(|idx| {
+                            self.apply_rating_edit_to_fullscreen_item(idx, edit)
+                        }),
+                        FullscreenRatingTarget::Item,
+                    ),
                     BookPreferredRatingTarget::Unavailable(reason) => {
                         self.report_book_preferred_unavailable(reason);
-                        false
+                        (false, FullscreenRatingTarget::Unavailable)
                     }
                 }
             }
         };
-        changed || noop
+        FullscreenRatingEditOutcome { changed, target }
     }
 
     /// Snapshot reads never resolve shifts, hydrate rotations or rebuild viewer owners.
@@ -37249,14 +37327,11 @@ impl App {
                 &[KeyAction::VideoPrevFile, KeyAction::VideoNextFile],
             )
         {
-            self.music_navigate_file(
+            action = self.execute_egui_media_key_action(
                 ctx,
                 fs_idx,
-                if nav == KeyAction::VideoNextFile {
-                    1
-                } else {
-                    -1
-                },
+                nav,
+                VideoKeyActionSurface::EguiMusic,
             );
             return action;
         }
@@ -37345,7 +37420,19 @@ impl App {
             }
             // この egui 経路では close は `action.close` で呼び出し側に伝える (esc と同じ方式、
             // 8838 参照)。close_fullscreen を直接呼ばない。
-            action.close = true;
+            #[cfg(windows)]
+            {
+                action = self.execute_egui_media_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::VideoCloseFullscreen,
+                    VideoKeyActionSurface::EguiMusic,
+                );
+            }
+            #[cfg(not(windows))]
+            {
+                action.close = true;
+            }
             return action;
         }
 
@@ -37422,9 +37509,18 @@ impl App {
             && !ctx.egui_wants_keyboard_input()
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoPlayPause)
-            && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
         {
-            player.toggle_play();
+            #[cfg(windows)]
+            self.execute_egui_media_key_action(
+                ctx,
+                fs_idx,
+                KeyAction::VideoPlayPause,
+                VideoKeyActionSurface::EguiMusic,
+            );
+            #[cfg(not(windows))]
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.toggle_play();
+            }
         }
 
         // GIF / APNG / animated WebP は動画と同じ既存の再生トグル操作を使う。
@@ -37463,6 +37559,14 @@ impl App {
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoLoop)
         {
+            #[cfg(windows)]
+            self.execute_egui_media_key_action(
+                ctx,
+                fs_idx,
+                KeyAction::VideoLoop,
+                VideoKeyActionSurface::EguiMusic,
+            );
+            #[cfg(not(windows))]
             self.cycle_music_loop_mode(ctx, fs_idx);
         }
 
@@ -37476,6 +37580,14 @@ impl App {
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoSeekStart)
         {
+            #[cfg(windows)]
+            self.execute_egui_media_key_action(
+                ctx,
+                fs_idx,
+                KeyAction::VideoSeekStart,
+                VideoKeyActionSurface::EguiMusic,
+            );
+            #[cfg(not(windows))]
             self.music_seek_start(fs_idx);
         }
 
@@ -37509,21 +37621,39 @@ impl App {
         {
             let vol_up = self.keymap.consume_action(ctx, KeyAction::VideoVolumeUp);
             let vol_down = self.keymap.consume_action(ctx, KeyAction::VideoVolumeDown);
+            #[cfg(windows)]
             if vol_up || vol_down {
-                let new_v = if let Some(FsCacheEntry::Video { player, .. }) =
-                    self.fs_cache.get(&fs_idx)
-                {
-                    let dir = if vol_up { 1 } else { -1 };
-                    let v =
-                        crate::settings::step_video_volume_by_fader_key_step(player.volume(), dir);
-                    player.set_volume(v);
-                    Some(v)
-                } else {
-                    None
-                };
-                if let Some(v) = new_v {
-                    self.settings.video_volume = v;
-                    self.settings.save();
+                self.execute_egui_media_key_action(
+                    ctx,
+                    fs_idx,
+                    if vol_up {
+                        KeyAction::VideoVolumeUp
+                    } else {
+                        KeyAction::VideoVolumeDown
+                    },
+                    VideoKeyActionSurface::EguiMusic,
+                );
+            }
+            #[cfg(not(windows))]
+            {
+                if vol_up || vol_down {
+                    let new_v = if let Some(FsCacheEntry::Video { player, .. }) =
+                        self.fs_cache.get(&fs_idx)
+                    {
+                        let dir = if vol_up { 1 } else { -1 };
+                        let v = crate::settings::step_video_volume_by_fader_key_step(
+                            player.volume(),
+                            dir,
+                        );
+                        player.set_volume(v);
+                        Some(v)
+                    } else {
+                        None
+                    };
+                    if let Some(v) = new_v {
+                        self.settings.video_volume = v;
+                        self.settings.save();
+                    }
                 }
             }
         }
@@ -37538,6 +37668,14 @@ impl App {
             && !self.music_bookmark_modal_open()
             && self.keymap.consume_action(ctx, KeyAction::VideoMute)
         {
+            #[cfg(windows)]
+            self.execute_egui_media_key_action(
+                ctx,
+                fs_idx,
+                KeyAction::VideoMute,
+                VideoKeyActionSurface::EguiMusic,
+            );
+            #[cfg(not(windows))]
             self.toggle_video_session_mute_for_fs_idx(fs_idx);
         }
 
@@ -37594,32 +37732,58 @@ impl App {
                 && self
                     .keymap
                     .consume_fixed_chord(ctx, Chord::key(KeyName::Right));
-            let small_secs = self
-                .settings
-                .video_seek_seconds(crate::settings::VideoSeekStep::Small);
-            let medium_secs = self
-                .settings
-                .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
-            let large_secs = self
-                .settings
-                .video_seek_seconds(crate::settings::VideoSeekStep::Large);
-            let delta = if plain_left || medium_left {
-                -medium_secs
+            #[cfg(windows)]
+            if let Some(action) = if plain_left || medium_left {
+                Some(KeyAction::VideoSeekBackMedium)
             } else if plain_right || medium_right {
-                medium_secs
+                Some(KeyAction::VideoSeekForwardMedium)
             } else if shift_left {
-                -small_secs
+                Some(KeyAction::VideoSeekBackSmall)
             } else if shift_right {
-                small_secs
+                Some(KeyAction::VideoSeekForwardSmall)
             } else if ctrl_left {
-                -large_secs
+                Some(KeyAction::VideoSeekBackLarge)
             } else if ctrl_right {
-                large_secs
+                Some(KeyAction::VideoSeekForwardLarge)
             } else {
-                0.0
-            };
-            if delta != 0.0 {
-                self.music_seek_relative(fs_idx, delta);
+                None
+            } {
+                self.execute_egui_media_key_action(
+                    ctx,
+                    fs_idx,
+                    action,
+                    VideoKeyActionSurface::EguiMusic,
+                );
+            }
+            #[cfg(not(windows))]
+            {
+                let small_secs = self
+                    .settings
+                    .video_seek_seconds(crate::settings::VideoSeekStep::Small);
+                let medium_secs = self
+                    .settings
+                    .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
+                let large_secs = self
+                    .settings
+                    .video_seek_seconds(crate::settings::VideoSeekStep::Large);
+                let delta = if plain_left || medium_left {
+                    -medium_secs
+                } else if plain_right || medium_right {
+                    medium_secs
+                } else if shift_left {
+                    -small_secs
+                } else if shift_right {
+                    small_secs
+                } else if ctrl_left {
+                    -large_secs
+                } else if ctrl_right {
+                    large_secs
+                } else {
+                    0.0
+                };
+                if delta != 0.0 {
+                    self.music_seek_relative(fs_idx, delta);
+                }
             }
         }
 
@@ -39179,12 +39343,37 @@ impl App {
         // 一部スキップしつつスライドショーを継続できる。フォルダをまたぐ Ctrl+↑↓ や
         // S / Space / Esc は従来どおり停止する。
         if nav_next && !ctrl_d {
-            self.apply_fullscreen_shared_key_action(
-                ctx,
-                fs_idx,
-                KeyAction::FsPageNext,
-                &mut action,
-            );
+            #[cfg(windows)]
+            if video_file_nav == Some(KeyAction::VideoNextFile) {
+                action.page_nav = self
+                    .execute_egui_media_key_action(
+                        ctx,
+                        fs_idx,
+                        KeyAction::VideoNextFile,
+                        if fs_music_view_active {
+                            VideoKeyActionSurface::EguiMusic
+                        } else {
+                            VideoKeyActionSurface::EguiVideo
+                        },
+                    )
+                    .page_nav;
+            } else {
+                self.apply_fullscreen_shared_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::FsPageNext,
+                    &mut action,
+                );
+            }
+            #[cfg(not(windows))]
+            {
+                self.apply_fullscreen_shared_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::FsPageNext,
+                    &mut action,
+                );
+            }
             *navigation_operation = self.page_turn_consumed_key_operation(if arrow_down {
                 arrow_down_input
             } else if arrow_left {
@@ -39194,12 +39383,37 @@ impl App {
             });
         }
         if nav_prev && !ctrl_u {
-            self.apply_fullscreen_shared_key_action(
-                ctx,
-                fs_idx,
-                KeyAction::FsPagePrev,
-                &mut action,
-            );
+            #[cfg(windows)]
+            if video_file_nav == Some(KeyAction::VideoPrevFile) {
+                action.page_nav = self
+                    .execute_egui_media_key_action(
+                        ctx,
+                        fs_idx,
+                        KeyAction::VideoPrevFile,
+                        if fs_music_view_active {
+                            VideoKeyActionSurface::EguiMusic
+                        } else {
+                            VideoKeyActionSurface::EguiVideo
+                        },
+                    )
+                    .page_nav;
+            } else {
+                self.apply_fullscreen_shared_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::FsPagePrev,
+                    &mut action,
+                );
+            }
+            #[cfg(not(windows))]
+            {
+                self.apply_fullscreen_shared_key_action(
+                    ctx,
+                    fs_idx,
+                    KeyAction::FsPagePrev,
+                    &mut action,
+                );
+            }
             *navigation_operation = self.page_turn_consumed_key_operation(if arrow_up {
                 arrow_up_input
             } else if arrow_right {
@@ -61381,6 +61595,47 @@ impl App {
         markers
     }
 
+    /// Resolve media keys through the same executor used by scripts.
+    #[cfg(windows)]
+    fn execute_egui_media_key_action(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        action: KeyAction,
+        surface: VideoKeyActionSurface,
+    ) -> FsKeyAction {
+        match self.execute_video_key_action(ctx, fs_idx, action, surface) {
+            VideoKeyActionResult::Accepted(action) => action,
+            VideoKeyActionResult::Rejected => FsKeyAction::default(),
+        }
+    }
+
+    /// Egui keys and scripts return navigation to their existing drawing owner.
+    #[cfg(windows)]
+    pub(crate) fn execute_egui_video_file_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        forward: bool,
+    ) -> FsKeyAction {
+        if self.fs_music_view_active(fs_idx) && self.music_normalize_modal_active(fs_idx) {
+            self.music_navigate_file(ctx, fs_idx, if forward { 1 } else { -1 });
+            return FsKeyAction::default();
+        }
+        let mut action = FsKeyAction::default();
+        self.apply_fullscreen_shared_key_action(
+            ctx,
+            fs_idx,
+            if forward {
+                KeyAction::FsPageNext
+            } else {
+                KeyAction::FsPagePrev
+            },
+            &mut action,
+        );
+        action
+    }
+
     /// 動画再生時のキー入力を処理する。フルスクリーン中で `state.is_video` のときに
     /// 1 フレームに 1 回呼ぶ。
     pub(crate) fn handle_video_input(
@@ -61714,7 +61969,17 @@ impl App {
         let escape_for_tile = false;
 
         if close_video {
-            self.close_fullscreen_to_page_list();
+            #[cfg(windows)]
+            self.execute_egui_media_key_action(
+                ctx,
+                fs_idx,
+                KeyAction::VideoCloseFullscreen,
+                VideoKeyActionSurface::EguiVideo,
+            );
+            #[cfg(not(windows))]
+            {
+                self.close_fullscreen_to_page_list();
+            }
             return;
         }
         if shift_enter {
@@ -61725,7 +61990,12 @@ impl App {
         }
         #[cfg(windows)]
         if play_pause && self.video_tile_mode_active {
-            self.play_selected_video_tile(ctx, fs_idx);
+            self.execute_egui_media_key_action(
+                ctx,
+                fs_idx,
+                KeyAction::VideoPlayPause,
+                VideoKeyActionSurface::EguiVideo,
+            );
             return;
         }
         #[cfg(windows)]
@@ -61736,7 +62006,17 @@ impl App {
         #[cfg(not(windows))]
         let _ = (tile_left_ctrl, tile_right_ctrl, tile_left);
         if save_frame_key {
-            self.save_video_frame_to_file(ctx, fs_idx);
+            #[cfg(windows)]
+            self.execute_egui_media_key_action(
+                ctx,
+                fs_idx,
+                KeyAction::VideoCapture,
+                VideoKeyActionSurface::EguiVideo,
+            );
+            #[cfg(not(windows))]
+            {
+                self.save_video_frame_to_file(ctx, fs_idx);
+            }
             return;
         }
         if add_book_key {
@@ -61777,36 +62057,52 @@ impl App {
         }
 
         // 先に現在の音量だけ取り出す (player borrow を短く保つ)
-        let cur_volume = match self.fs_cache.get(&fs_idx) {
+        let _cur_volume = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => player.volume(),
             _ => return,
         };
         // Phase 7.H: 音量は Shift+↑↓ 限定 (= dB fader key step)。プレーン ↑↓ はファイル移動。
+        #[cfg(not(windows))]
         let new_vol = if shift_up {
             Some(crate::settings::step_video_volume_by_fader_key_step(
-                cur_volume, 1,
+                _cur_volume,
+                1,
             ))
         } else if shift_down {
             Some(crate::settings::step_video_volume_by_fader_key_step(
-                cur_volume, -1,
+                _cur_volume,
+                -1,
             ))
         } else {
             None
         };
 
+        #[cfg(not(windows))]
         let small_seek_secs = self
             .settings
             .video_seek_seconds(crate::settings::VideoSeekStep::Small);
+        #[cfg(not(windows))]
         let medium_seek_secs = self
             .settings
             .video_seek_seconds(crate::settings::VideoSeekStep::Medium);
+        #[cfg(not(windows))]
         let large_seek_secs = self
             .settings
             .video_seek_seconds(crate::settings::VideoSeekStep::Large);
 
         // player に作用させる (借用はこの if-let のスコープ内で完結)
         let mut seek_outcome: Option<crate::video::RelativeSeekOutcome> = None;
+        #[cfg(windows)]
+        if play_pause {
+            self.execute_egui_media_key_action(
+                ctx,
+                fs_idx,
+                KeyAction::VideoPlayPause,
+                VideoKeyActionSurface::EguiVideo,
+            );
+        }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            #[cfg(not(windows))]
             if play_pause {
                 player.toggle_play();
             }
@@ -61817,6 +62113,28 @@ impl App {
                 player.step_frame(1);
             }
             // Phase 7.H シーク粒度は Small / Medium / Large の共通設定を使う。
+        }
+        #[cfg(windows)]
+        for (pressed, action) in [
+            (left || medium_left, KeyAction::VideoSeekBackMedium),
+            (right || medium_right, KeyAction::VideoSeekForwardMedium),
+            (shift_left, KeyAction::VideoSeekBackSmall),
+            (shift_right, KeyAction::VideoSeekForwardSmall),
+            (ctrl_left, KeyAction::VideoSeekBackLarge),
+            (ctrl_right, KeyAction::VideoSeekForwardLarge),
+        ] {
+            if pressed {
+                let (_, outcome) = self.execute_video_key_action_with_seek_outcome(
+                    ctx,
+                    fs_idx,
+                    action,
+                    VideoKeyActionSurface::EguiVideo,
+                );
+                seek_outcome = outcome;
+            }
+        }
+        #[cfg(not(windows))]
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             if left || medium_left {
                 seek_outcome = Some(player.seek_relative(
                     -medium_seek_secs,
@@ -61863,6 +62181,19 @@ impl App {
                 player.set_volume(v);
             }
         }
+        #[cfg(windows)]
+        if shift_up || shift_down {
+            let _ = self.execute_video_key_action_with_seek_outcome(
+                ctx,
+                fs_idx,
+                if shift_up {
+                    KeyAction::VideoVolumeUp
+                } else {
+                    KeyAction::VideoVolumeDown
+                },
+                VideoKeyActionSurface::EguiVideo,
+            );
+        }
         // 先頭 / 末尾に達してシークが発行されなかった場合は境界トーストで通知する
         // (player 借用が終わってから self を触る)。
         match seek_outcome {
@@ -61878,12 +62209,27 @@ impl App {
         // 設定への反映 (player 借用は終わっているので self.settings を書き換え可能)。
         // Phase 8 (Codex P3-1): 即時 save 化。グリッド列数や動画タイル列数が
         // 即時保存されるのと挙動を揃え、強制終了時の loss を防ぐ。
+        #[cfg(windows)]
+        if shift_up || shift_down {
+            self.persist_video_key_volume(fs_idx);
+        }
+        #[cfg(not(windows))]
         if let Some(v) = new_vol {
             self.settings.video_volume = v;
             self.settings.save();
         }
         if mute_key {
-            self.toggle_video_session_mute_for_fs_idx(fs_idx);
+            #[cfg(windows)]
+            self.execute_egui_media_key_action(
+                ctx,
+                fs_idx,
+                KeyAction::VideoMute,
+                VideoKeyActionSurface::EguiVideo,
+            );
+            #[cfg(not(windows))]
+            {
+                self.toggle_video_session_mute_for_fs_idx(fs_idx);
+            }
         }
         if loop_key {
             // cycle_native_video_loop_common は app/native_video.rs (cfg(windows)) に
@@ -61891,7 +62237,12 @@ impl App {
             // mimageviewer の動画機能自体が Windows 限定 (`pub mod video;` が cfg(windows))
             // なので非 Windows では何もしない。
             #[cfg(windows)]
-            self.cycle_native_video_loop_common(ctx, fs_idx);
+            self.execute_egui_media_key_action(
+                ctx,
+                fs_idx,
+                KeyAction::VideoLoop,
+                VideoKeyActionSurface::EguiVideo,
+            );
             #[cfg(not(windows))]
             let _ = (ctx, fs_idx);
         }
@@ -61908,8 +62259,17 @@ impl App {
         let _ = tile_key;
         #[cfg(windows)]
         if let Some(action) = seek_strip_action {
-            self.apply_video_seek_strip_action(fs_idx, action);
-            self.sync_native_video_seek_strip(ctx, fs_idx);
+            if action == KeyAction::VideoSeekStripToggle {
+                self.execute_egui_media_key_action(
+                    ctx,
+                    fs_idx,
+                    action,
+                    VideoKeyActionSurface::EguiVideo,
+                );
+            } else {
+                self.apply_video_seek_strip_action(fs_idx, action);
+                self.sync_native_video_seek_strip(ctx, fs_idx);
+            }
         }
         if perf_key {
             self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
@@ -61933,6 +62293,16 @@ impl App {
             #[cfg(not(windows))]
             let _ = (ctx, fs_idx);
         }
+        #[cfg(windows)]
+        if rewind_key {
+            self.execute_egui_media_key_action(
+                ctx,
+                fs_idx,
+                KeyAction::VideoSeekStart,
+                VideoKeyActionSurface::EguiVideo,
+            );
+        }
+        #[cfg(not(windows))]
         if rewind_key && let Some(p) = self.fs_video_player(fs_idx) {
             // `StartPlayback` の seek は autoplay intent を
             // 立てるので、追加 `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
@@ -105454,3 +105824,6 @@ mod operation_script_merge_tests;
 
 #[cfg(test)]
 mod operation_script_owner_tests;
+
+#[cfg(all(test, windows))]
+mod operation_script_media_tests;

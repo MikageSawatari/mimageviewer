@@ -47,6 +47,370 @@ fn toast(app: &App) -> &str {
     &app.fs_feedback_toast.as_ref().expect("script feedback").0
 }
 
+#[cfg(windows)]
+fn video_app(body: &str, music: bool) -> AppTestEnv {
+    let mut app = grid_app(body);
+    let folder = app.current_folder.clone().unwrap();
+    app.items = (0..2)
+        .map(|i| {
+            let path = folder.join(format!("{i}.{}", if music { "mp3" } else { "mp4" }));
+            if music {
+                GridItem::Audio(path)
+            } else {
+                GridItem::Video(path)
+            }
+        })
+        .collect();
+    app.fullscreen_idx = Some(0);
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    app.settings.rating_filter = [true; 6];
+    for idx in 0..2 {
+        let path = app.items[idx].file_operation_path().unwrap().to_path_buf();
+        let mut player = crate::video::VideoPlayer::stream_ready_disconnected_for_test(path);
+        player.set_position_for_test(10.0);
+        player.set_duration_for_test(120.0);
+        player.set_muted(false);
+        app.fs_cache.insert(
+            idx,
+            super::super::FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+    }
+    app
+}
+
+#[cfg(windows)]
+fn video_player(app: &App, idx: usize) -> &crate::video::VideoPlayer {
+    match app.fs_cache.get(&idx).unwrap() {
+        super::super::FsCacheEntry::Video { player, .. } => player,
+        _ => panic!("video fixture"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn video_snapshot_reads_only_cached_player_values_and_keeps_unknown_duration_empty() {
+    for music in [false, true] {
+        let mut app = video_app("[]", music);
+        let snapshot = app.collect_operation_script_snapshot(ScriptInputSurface::Viewer);
+        assert_eq!(snapshot.context, ScriptContext::FsVideo);
+        assert_eq!(snapshot.video.playing, Some(false));
+        assert_eq!(snapshot.video.position_sec, Some(10.0));
+        assert_eq!(snapshot.video.duration_sec, Some(120.0));
+        assert!(snapshot.item.rating.is_none());
+        let path = app.items[0].file_operation_path().unwrap().to_path_buf();
+        app.fs_cache.insert(
+            0,
+            super::super::FsCacheEntry::Video {
+                player: Box::new(crate::video::VideoPlayer::disconnected_for_test(path, 4.0)),
+                load_seq: 0,
+            },
+        );
+        let snapshot = app.collect_operation_script_snapshot(ScriptInputSurface::Viewer);
+        assert_eq!(snapshot.video.position_sec, Some(4.0));
+        assert!(snapshot.video.duration_sec.is_none());
+        app.fs_cache.clear();
+        let snapshot = app.collect_operation_script_snapshot(ScriptInputSurface::Viewer);
+        assert!(snapshot.video.playing.is_none());
+        assert!(snapshot.video.position_sec.is_none());
+        assert!(snapshot.video.duration_sec.is_none());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn video_run_executes_in_order_in_native_and_music_contexts() {
+    for music in [false, true] {
+        let mut app = video_app(
+            r#"#{run:["VideoMute","VideoMute","VideoSeekForwardSmall","VideoSeekBackSmall","VideoMute"],notice:"video done"}"#,
+            music,
+        );
+        let result = app.run_script_slot(
+            &egui::Context::default(),
+            1,
+            ScriptInputSurface::Viewer,
+            false,
+        );
+        assert!(!result.rejected());
+        assert!(!result.needs_postprocessing());
+        assert!(matches!(result, ScriptRunResult::NativeVideo { .. }) != music);
+        assert!(video_player(&app, 0).is_muted());
+        assert_eq!(video_player(&app, 0).user_seek_base_secs_for_test(), 10.0);
+        assert_eq!(toast(&app), "video done");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn video_rejected_capture_discards_remainder_after_completed_operation() {
+    for music in [false, true] {
+        let mut app = video_app(
+            r#"#{run:["VideoMute","VideoCapture","VideoMute"],notice:"must not complete"}"#,
+            music,
+        );
+        // Retain the native owner, but no metadata for capture. Mute is available
+        // during loading and no decoding/file worker is started by this test.
+        let path = app.items[0].file_operation_path().unwrap().to_path_buf();
+        let (player, _metadata_tx, _) =
+            crate::video::VideoPlayer::loading_resume_disconnected_for_test(
+                path,
+                crate::settings::VideoResumePosition::Media(10.0),
+                false,
+            );
+        app.fs_cache.insert(
+            0,
+            super::super::FsCacheEntry::Video {
+                player: Box::new(player),
+                load_seq: 0,
+            },
+        );
+        let result = app.run_script_slot(
+            &egui::Context::default(),
+            1,
+            ScriptInputSurface::Viewer,
+            false,
+        );
+        assert!(result.rejected());
+        assert!(video_player(&app, 0).is_muted());
+        assert!(app.capture_pending.is_none());
+        assert!(toast(&app).contains("VideoCapture"));
+        assert!(!toast(&app).contains("must not complete"));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn video_navigation_must_be_final_and_cannot_displace_existing_navigation() {
+    for music in [false, true] {
+        for (body, navigation) in [
+            (r#"["VideoMute","VideoCloseFullscreen","VideoMute"]"#, false),
+            (r#"["VideoMute","VideoNextFile"]"#, true),
+        ] {
+            let mut app = video_app(body, music);
+            let result = app.run_script_slot(
+                &egui::Context::default(),
+                1,
+                ScriptInputSurface::Viewer,
+                navigation,
+            );
+            assert!(result.rejected());
+            assert!(!video_player(&app, 0).is_muted());
+            assert_eq!(app.fullscreen_idx, Some(0));
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn video_c_close_completes_native_and_returns_music_close_to_existing_finisher() {
+    for music in [false, true] {
+        let mut app = video_app(
+            r#"#{run:["VideoMute","VideoCloseFullscreen"],notice:"closed"}"#,
+            music,
+        );
+        let ctx = egui::Context::default();
+        let result = app.run_script_slot(&ctx, 1, ScriptInputSurface::Viewer, false);
+        if music {
+            let ScriptRunResult::Fullscreen {
+                action,
+                rejected: false,
+                delegated: false,
+            } = result
+            else {
+                panic!("music must return its ordinary close request");
+            };
+            assert!(action.close);
+            assert_eq!(app.fullscreen_idx, Some(0), "caller owns egui completion");
+            assert!(video_player(&app, 0).is_muted());
+            app.finish_fullscreen_key_action(&ctx, 0, action);
+        } else {
+            assert!(matches!(
+                result,
+                ScriptRunResult::NativeVideo { rejected: false }
+            ));
+        }
+        assert!(app.fullscreen_idx.is_none());
+        assert_eq!(toast(&app), "closed");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn video_refused_loop_during_continuous_playback_discards_remaining_operations() {
+    for music in [false, true] {
+        let mut app = video_app(r#"["VideoMute","VideoLoop","VideoMute"]"#, music);
+        app.video_continuous_mode = crate::video::VideoContinuousMode::Continuous;
+        let result = app.run_script_slot(
+            &egui::Context::default(),
+            1,
+            ScriptInputSurface::Viewer,
+            false,
+        );
+        assert!(result.rejected());
+        assert!(video_player(&app, 0).is_muted());
+        assert!(toast(&app).contains("VideoLoop"));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn video_native_target_change_after_rating_stops_remaining_operations() {
+    let mut app = video_app(
+        r#"#{run:["RatingItem4","VideoMute"],notice:"must not complete"}"#,
+        false,
+    );
+    app.settings.rating_filter = [false, false, false, true, false, false];
+    let key = app.rating_path_key(0).unwrap();
+    app.rating_db.as_ref().unwrap().set(&key, 3).unwrap();
+    app.rating_cache.insert(0, 3);
+    app.rating_cache.insert(1, 0);
+    app.visible_indices = vec![0];
+    let before = app.operation_script_target(ScriptInputSurface::Viewer);
+    let result = app.run_script_slot(
+        &egui::Context::default(),
+        1,
+        ScriptInputSurface::Viewer,
+        false,
+    );
+    assert!(matches!(
+        result,
+        ScriptRunResult::NativeVideo { rejected: false }
+    ));
+    assert_ne!(
+        app.operation_script_target(ScriptInputSurface::Viewer),
+        before
+    );
+    assert_eq!(app.rating_cache.get(&0), Some(&4));
+    assert!(toast(&app).contains("対象が変わった"));
+    assert!(!toast(&app).contains("must not complete"));
+}
+
+#[cfg(windows)]
+#[test]
+fn video_native_overlay_focus_blocks_evaluation_but_grid_uses_its_own_focus() {
+    for modal in [false, true] {
+        let mut app = video_app(r#"#{run:["VideoMute"],notice:"must not evaluate"}"#, false);
+        video_player(&app, 0).set_native_overlay_input_routing_for_test(
+            crate::video::native_presenter::NativeOverlayInputRouting {
+                text_input_active: !modal,
+                modal_dialog_active: modal,
+                ..Default::default()
+            },
+        );
+        let ctx = egui::Context::default();
+        assert_eq!(
+            app.operation_script_eligibility(&ctx, ScriptInputSurface::Viewer),
+            ScriptEligibility::Silent
+        );
+        assert!(
+            app.run_script_slot(&ctx, 1, ScriptInputSurface::Viewer, false)
+                .rejected()
+        );
+        assert!(!video_player(&app, 0).is_muted());
+        assert!(app.fs_feedback_toast.is_none());
+        assert_eq!(
+            app.operation_script_eligibility(&ctx, ScriptInputSurface::Grid),
+            ScriptEligibility::Available(ScriptContext::Grid)
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn video_native_eligibility_uses_overlay_focus_instead_of_root_text_focus() {
+    let mut app = video_app(r#"["VideoMute"]"#, false);
+    let ctx = egui::Context::default();
+    crate::ime_focus::install_ime_input_policy(&ctx);
+    ctx.run_ui(egui::RawInput::default(), |ui| {
+        let mut text = String::new();
+        let mut focus = true;
+        crate::ime_focus::show_singleline(ui, &mut text, Some(&mut focus), |edit| edit);
+        assert!(
+            app.keyboard_ownership_snapshot(ui.ctx())
+                .text_input
+                .is_some()
+        );
+        assert_eq!(
+            app.operation_script_eligibility(ui.ctx(), ScriptInputSurface::Viewer),
+            ScriptEligibility::Available(ScriptContext::FsVideo)
+        );
+        assert!(
+            !app.run_script_slot(ui.ctx(), 1, ScriptInputSurface::Viewer, false)
+                .rejected()
+        );
+        assert!(video_player(&app, 0).is_muted());
+    })
+    .drop_without_applying_deltas();
+}
+
+#[cfg(windows)]
+#[test]
+fn video_media_modals_reject_even_empty_and_throwing_scripts_before_evaluation() {
+    for music in [false, true] {
+        for body in [
+            r#"#{run:[],notice:"must not evaluate"}"#,
+            r#"throw "must not evaluate";"#,
+        ] {
+            let mut app = video_app(body, music);
+            app.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+                owner_context_id: app.projected_viewer_context_id(),
+                fs_idx: 0,
+                stream_index: 1,
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                progress: Arc::new(
+                    crate::video::normalize_scanner::NormalizeScanProgress::default(),
+                ),
+                rx: std::sync::mpsc::channel().1,
+                was_playing: false,
+                file_path: app.items[0].file_operation_path().unwrap().to_path_buf(),
+                target_lufs_milli: -14_000,
+                provisional_applied: false,
+                provisional_result: None,
+                _join: std::thread::spawn(|| {}),
+            });
+            let ctx = egui::Context::default();
+            assert!(app.normalize_scan_is_modal_for_current_player(0));
+            assert_eq!(
+                app.operation_script_eligibility(&ctx, ScriptInputSurface::Viewer),
+                ScriptEligibility::Silent
+            );
+            let (_, feedback) =
+                app.run_script_slot_with_feedback(&ctx, 1, ScriptInputSurface::Viewer, false);
+            assert!(feedback.is_none());
+            assert!(app.fs_feedback_toast.is_none());
+            assert_eq!(
+                app.operation_script_eligibility(&ctx, ScriptInputSurface::Grid),
+                ScriptEligibility::Available(ScriptContext::Grid)
+            );
+            app.normalize_state.as_mut().unwrap().provisional_applied = true;
+            assert_eq!(
+                app.operation_script_eligibility(&ctx, ScriptInputSurface::Viewer),
+                ScriptEligibility::Available(ScriptContext::FsVideo)
+            );
+        }
+    }
+    for title_editor in [false, true] {
+        let mut app = video_app(r#"throw "must not evaluate";"#, true);
+        if title_editor {
+            app.music_bookmark_title_edit =
+                Some(crate::video::native_presenter::NativeBookmarkTitleEdit {
+                    id: 1,
+                    title: String::new(),
+                    request_focus: false,
+                });
+        } else {
+            app.music_bulk_bookmark_dialog = Some(Default::default());
+        }
+        let ctx = egui::Context::default();
+        let (_, feedback) =
+            app.run_script_slot_with_feedback(&ctx, 1, ScriptInputSurface::Viewer, false);
+        assert!(feedback.is_none());
+        assert!(app.fs_feedback_toast.is_none());
+    }
+}
+
 #[test]
 fn script_slot_number_covers_the_twenty_global_actions_only() {
     for (index, action) in SCRIPT_SLOT_ACTIONS.iter().copied().enumerate() {

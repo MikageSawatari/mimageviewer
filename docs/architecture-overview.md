@@ -15,7 +15,12 @@ ROOTは非blockingで結果を受け取り、世代が古い結果を捨てる�
 結果は `FsKeyAction::merge_script_action` で既存の移動要求へ合流し、既存dispatcherで1回処理する。
 Closedは既に終了した結果としてdispatcherを通さず、Rebasedは番号だけ取り直す。
 保留wheelの適用順は維持し、保留と同じフレームのスクリプト要求・適用内のスクリプトは通知して拒否する。
-動画・音声の操作本体は段3、イベントは段4で接続する。
+段3では `execute_video_key_action` が解決済みKeyActionの動画・音声操作を共有する。
+nativeは実行完了の受付可否だけを返し、eguiの動画・音楽は既存の `FsKeyAction` を返す。
+nativeのキー・Browserキー・マウス・リングはその場で実行し、音楽表示は描画の所有passの経路を保つ。
+native overlayの文字入力は保持済みの入力snapshotで判断し、動画の状態欄はplayerの保持値だけを読む。
+通常native動画の右クリックメニューの表示・実行位置には現行描画経路との相違があり、設計担当の判断待ち。
+イベントは段4で接続する。
 詳細は [設計](operation-script-plan.md)。
 
 ## ブラウザ閲覧の保存先のページ構成（§1.870）
