@@ -230,7 +230,7 @@ keep_file_time: bool,  // 既定 false
   | 形式 | 残すもの |
   | --- | --- |
   | JPEG | APP1 (EXIF・XMP)、APP2 の ICC (`ICC_PROFILE`、複数セグメントを順に) |
-  | PNG | tEXt / iTXt / zTXt (AI プロンプト)、`eXIf`、`iCCP` |
+  | PNG | tEXt / iTXt / zTXt (AI プロンプト、Raw profile の EXIF・XMP を含む)、`eXIf`、`iCCP` |
   | WebP | `EXIF`、`XMP `、`ICCP` |
 
   - **EXIF の共通処理**: 3 形式とも、EXIF は TIFF 本体 (JPEG は APP1 の `Exif\0\0` の後、PNG の `eXIf` は
@@ -242,9 +242,12 @@ keep_file_time: bool,  // 既定 false
     (先頭から 16〜19 バイト) が `RGB ` のものだけ転記する。グレースケール (`GRAY`)・CMYK などの ICC は
     付けない (付けると出力に合わないプロファイルになる)。それらの元画像は ICC なしの出力になり、
     他のソフトでは sRGB として表示される。
-  - **単ページの出力は変えない**: `SaveOptions` に足す欄 (EXIF の共通処理、JPEG/PNG の ICC 転記、
-    PNG の `eXIf` 転記) は既定で OFF にし、一括の書き出しだけが ON にする。単ページの WebP は今と同じく
-    EXIF をそのまま転記する (単ページの IFD1 の扱いは §13 の補足、別件)。
+  - **単ページとの共通処理**: `SaveOptions::metadata_profile` は `Single` (既定) / `Batch`。
+    単ページも IFD1 を外し、縮小画像を検出するが、転記対象と Orientation の扱いは従来どおり。
+    読めない EXIF は単ページでは残して「EXIF (外せませんでした)」と警告し、一括では転記しない。
+    PNG のテキスト内の `Raw profile type exif` / `APP1` も両方で処理する。ImageMagick の長さと16進の桁数を
+    厳密に照合し、変わった数字だけ元の位置で書き換え、圧縮の有無・iTXt の言語と訳語を保つ。
+    詳細は [単ページの設計 §3.1〜3.3](single-export-thumbnail-plan.md)。
   - XMP は解釈せずそのまま残す。XMP の `xmp:Thumbnails`、EXIF の MakerNote (メーカー独自の領域) に
     含まれ得る縮小画像は消さない (利用者決定、§13 Q3)。代わりに §3.7 の警告を出す。
   - EXIF の画素数タグは書き換えない (単ページと同じ)。
@@ -265,6 +268,7 @@ keep_file_time: bool,  // 既定 false
 
 | 種類 | 条件 | 調べ方 |
 | --- | --- | --- |
+| EXIF (外せませんでした) | **単ページだけ** | 読めない EXIF を従来どおり残す場合。一括は読めない EXIF を転記せず、この種類は立てない ([単ページの設計 §3.2](single-export-thumbnail-plan.md)) |
 | XMP の縮小画像 | **常に** (項目の編集に関係なく) | 転記する XMP に、縮小画像の構造を書くための名前空間 `http://ns.adobe.com/xap/1.0/g/img/` (`xmpGImg`、`xmp:Thumbnails` の中身はこの名前空間で書かれる) のバイト列があるか。調べる範囲は下の「調べる XMP」 |
 | メーカー独自の領域 (MakerNote) | **限定した 5 種類の保存済み編集がある項目だけ** | EXIF の共通処理 (§3.6) で TIFF を読むときに、Exif IFD (タグ 0x8769 が指す IFD) に MakerNote (タグ 0x927C、長さ 1 以上) があるか |
 
@@ -282,7 +286,12 @@ keep_file_time: bool,  // 既定 false
   `png_metadata::read_png_text_chunks` の累積上限と同じ値) で打ち切る。チャンクの上限で打ち切った・
   展開できなかったチャンクは「調べられない」、合計の上限に達したらそれ以降の XMP チャンクは調べずに
   「調べられない」として、**警告側に倒す** (縮小画像ありと同じ扱い)。名前空間が見つかった時点でその項目の
-  XMP の検査は終える。
+  XMP の検査は終える。ただし Raw profile の EXIF の処理はこの省略と独立して続ける。
+  `Raw profile type exif` / `APP1` / `xmp` (キーワードは大文字小文字を問わない) も同じ展開・合計上限を共有する。
+  Raw profile の XMP と、XMP の見出しを持つ APP1 は16進を戻してから名前空間を調べる。
+  戻せない・宣言長と桁数が合わない・上限超過の Raw XMP は転記したまま「調べられない」と警告する。
+  Raw EXIF は読めなければ一括ではチャンクを転記しない (単ページは残して警告)。
+  詳細は [単ページの設計 §3.2・§3.4](single-export-thumbnail-plan.md)。
 - **WebP**: 転記する `XMP ` チャンク。
 
 - 「隠す編集」は、その項目の編集 snapshot に消しゴム・隠蔽・切り取り・注釈・補正レイヤーのどれかがあること
@@ -305,7 +314,8 @@ keep_file_time: bool,  // 既定 false
 
 **対象と見せ方**:
 - worker は該当する項目を書き終えた直後に `ExportEvent::ThumbnailNotice { label, path, kinds }` を送る
-  (`kinds` は XMP / メーカー独自の領域の組)。`ExportPending` に一覧として持つ。単ページの worker は送らない。
+  (`kinds` は XMP / メーカー独自の領域の組。単ページでは読めない EXIF の種類もある)。`ExportPending` に一覧として持つ。
+  単ページの worker も [単ページの設計 §3.4](single-export-thumbnail-plan.md) に従い、`Completed` の直後に同じイベントを送る。
   ログ (mimageviewer.log) にも出力のパスと種類を 1 行ずつ残す。
 - 完了 (`AllDone`) でも取消 (`Cancelled`) でも、警告が 1 件でもあれば**進捗ダイアログを自動で閉じず**
   (通知のトーストに置き換えない)、警告の枠を出す。利用者が「閉じる」か × で閉じるまで残る。
@@ -327,8 +337,8 @@ keep_file_time: bool,  // 既定 false
     幅は今の進捗ダイアログと同じ固定幅で、長いファイル名は折り返す (floating scrollbar の幅を確保する)。
   - 説明: 「元の情報を残して書き出した次のファイルに、元の絵の縮小画像が含まれている可能性があります。
     消しゴムや隠蔽で隠した部分が、縮小画像に残っていることがあります。公開する前に確認するか、
-    『元の情報を残す』をオフにして書き出し直してください。」
-  - 警告の一覧: 出力のファイル名と種類 (「XMP の縮小画像」「XMP (調べられませんでした)」「メーカー独自の情報」)。
+    元の情報を残さない設定 (一括では『元の情報を残す』、1 枚の書き出しでは『AI プロンプト / EXIF を保持』をオフ) で書き出し直してください。」
+  - 警告の一覧: 出力のファイル名と種類 (「EXIF (外せませんでした)」(単ページのみ)「XMP の縮小画像」「XMP (調べられませんでした)」「メーカー独自の情報」)。
     行を押すとそのファイルを Explorer で示す (`reveal_path_async`、既存)。
   - **表示の条件**: 警告の画面は `end.is_some()` かつ警告が 1 件以上のときだけ。書き出し中 (`end == None`) に
     `ThumbnailNotice` が届いても一覧に記録するだけで、画面は今の進捗ダイアログ (キャンセルの操作を含む) のまま。

@@ -2456,6 +2456,7 @@ fn write_composited_color_image(
     crate::save_with_metadata::save_image_with_metadata(
         image, None, None, dest, src_format, &options,
     )
+    .map(|_| ())
     .map_err(|e| format!("本ページを保存できません: {}: {e}", dest.display()))
 }
 

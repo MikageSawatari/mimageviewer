@@ -1,7 +1,7 @@
-//! 一括エクスポート専用の転記。元の情報は書き直さず、EXIF の向きと IFD1 だけ処理する。
+//! 単枚・一括の転記と縮小画像の検出。profile ごとの転記対象と向きの扱いを保つ。
 use super::*;
 use std::collections::{BTreeMap, HashSet};
-use std::io::Read;
+use std::io::{Read, Write};
 
 const XMP_IMAGE_NS: &[u8] = b"http://ns.adobe.com/xap/1.0/g/img/";
 const XMP_STANDARD: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
@@ -9,6 +9,7 @@ const XMP_EXTENDED: &[u8] = b"http://ns.adobe.com/xmp/extension/\0";
 const XMP_KEY: &[u8] = b"XML:com.adobe.xmp";
 const CHUNK_LIMIT: usize = 16 * 1024 * 1024;
 const FILE_LIMIT: usize = 32 * 1024 * 1024;
+const RAW_APP1_PREFIX_LIMIT: usize = 1024;
 
 fn has_thumbnail(bytes: &[u8]) -> bool {
     bytes.windows(XMP_IMAGE_NS.len()).any(|s| s == XMP_IMAGE_NS)
@@ -24,44 +25,56 @@ pub(super) fn transfer(
     format: &SrcFormat,
     options: &SaveOptions,
 ) -> Result<(Vec<u8>, ThumbnailNoticeKinds), SaveError> {
+    let batch = options.metadata_profile == MetadataProfile::Batch;
     let mut notice = ThumbnailNoticeKinds::default();
     let bytes = match format {
         SrcFormat::Jpeg => {
             let mut segments = extract_jpeg_app1_segments(src)?;
             segments.retain_mut(|seg| {
                 if seg[4..].starts_with(b"Exif\0\0") {
-                    let Some((tiff, maker)) = clean_exif(&seg[10..]) else {
+                    let Some(tiff) = transfer_exif(&seg[10..], options, &mut notice) else {
                         return false;
                     };
                     seg[10..].copy_from_slice(&tiff);
-                    notice.maker_note |= maker && options.thumbnail_notice_for_hidden_edits;
+                }
+                if !batch && options.caller_applied_orientation {
+                    reset_exif_orientation_in_app1(seg);
                 }
                 true
             });
             notice.xmp = jpeg_xmp_thumbnail(&segments);
-            segments.extend(jpeg_rgb_icc_segments(src)?);
+            if batch {
+                segments.extend(jpeg_rgb_icc_segments(src)?);
+            }
             splice_jpeg_app1_segments(encoded, &segments)?
         }
         SrcFormat::Png => {
-            let mut chunks = extract_png_metadata_chunks(src)?;
+            let chunks = if batch {
+                extract_png_metadata_chunks(src)?
+            } else {
+                extract_png_text_chunks_raw(src)?
+            };
             let mut total = 0;
-            chunks.retain_mut(|chunk| {
+            let mut retained = Vec::new();
+            let mut raw_app1_xmp = Vec::new();
+            for mut chunk in chunks {
                 let kind = chunk[4..8].to_vec();
                 match kind.as_slice() {
                     b"eXIf" => {
-                        let Some((tiff, maker)) = clean_exif(&chunk[8..chunk.len() - 4]) else {
-                            return false;
+                        let Some((tiff, maker)) = clean_exif(&chunk[8..chunk.len() - 4], true)
+                        else {
+                            continue;
                         };
-                        *chunk = png_chunk(b"eXIf", &tiff);
+                        chunk = png_chunk(b"eXIf", &tiff);
                         notice.maker_note |= maker && options.thumbnail_notice_for_hidden_edits;
                     }
                     b"iCCP" => {
                         let data = &chunk[8..chunk.len() - 4];
                         let Some(end) = data.iter().position(|&b| b == 0) else {
-                            return false;
+                            continue;
                         };
                         if data.get(end + 1) != Some(&0) {
-                            return false;
+                            continue;
                         }
                         let mut header = [0; 20];
                         if flate2::read::ZlibDecoder::new(&data[end + 2..])
@@ -69,15 +82,25 @@ pub(super) fn transfer(
                             .is_err()
                             || !rgb_icc(&header)
                         {
-                            return false;
+                            continue;
                         }
                     }
-                    _ if !notice.xmp => inspect_png_xmp(chunk, &mut total, &mut notice),
-                    _ => {}
+                    _ => {
+                        if !process_png_text::<CHUNK_LIMIT, FILE_LIMIT>(
+                            &mut chunk,
+                            &mut total,
+                            options,
+                            &mut notice,
+                            &mut raw_app1_xmp,
+                        )? {
+                            continue;
+                        }
+                    }
                 }
-                true
-            });
-            splice_png_text_chunks(encoded, &chunks)?
+                retained.push(chunk);
+            }
+            notice.xmp |= xmp_payloads_thumbnail(raw_app1_xmp.iter().map(Vec::as_slice));
+            splice_png_text_chunks(encoded, &retained)?
         }
         SrcFormat::Webp => {
             let (icc, exif, xmp) = extract_webp_metadata_chunks(src)?;
@@ -87,14 +110,13 @@ pub(super) fn transfer(
                 } else {
                     0
                 };
-                let (tiff, maker) = clean_exif(&payload[prefix..])?;
-                notice.maker_note |= maker && options.thumbnail_notice_for_hidden_edits;
+                let tiff = transfer_exif(&payload[prefix..], options, &mut notice)?;
                 let mut result = payload[..prefix].to_vec();
                 result.extend(tiff);
                 Some(result)
             });
             notice.xmp = xmp.as_deref().is_some_and(has_thumbnail);
-            let icc = icc.filter(|p| rgb_icc(p));
+            let icc = icc.filter(|p| !batch || rgb_icc(p));
             if icc.is_some() || exif.is_some() || xmp.is_some() {
                 inject_webp_metadata(encoded, icc, exif, xmp)?
             } else {
@@ -107,9 +129,13 @@ pub(super) fn transfer(
 }
 
 fn jpeg_xmp_thumbnail(segments: &[Vec<u8>]) -> bool {
+    xmp_payloads_thumbnail(segments.iter().map(|seg| &seg[4..]))
+}
+
+// JPEG APP1 と PNG Raw APP1 は同じ見出し・断片の結合規則を使う。
+fn xmp_payloads_thumbnail<'a>(payloads: impl IntoIterator<Item = &'a [u8]>) -> bool {
     let mut groups: BTreeMap<&[u8], Vec<(u32, &[u8])>> = BTreeMap::new();
-    for seg in segments {
-        let payload = &seg[4..];
+    for payload in payloads {
         if let Some(body) = payload.strip_prefix(XMP_STANDARD) {
             if has_thumbnail(body) {
                 return true;
@@ -178,68 +204,303 @@ fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
     chunk
 }
 
-fn inspect_png_xmp(chunk: &[u8], total: &mut usize, notice: &mut ThumbnailNoticeKinds) {
-    let data = &chunk[8..chunk.len() - 4];
-    let Some(key_end) = data.iter().position(|&b| b == 0) else {
-        return;
-    };
-    if &data[..key_end] != XMP_KEY {
-        return;
-    }
-    let remaining = FILE_LIMIT.saturating_sub(*total);
-    if remaining == 0 {
-        notice.xmp_uninspectable = true;
-        return;
-    }
-    let body = &data[key_end + 1..];
-    let decoded = (|| -> Option<Vec<u8>> {
-        let (compressed, content) = match &chunk[4..8] {
-            b"tEXt" => (false, body),
-            b"zTXt" => {
-                if body.first() != Some(&0) {
-                    return None;
-                }
-                (true, &body[1..])
-            }
-            b"iTXt" => {
-                if body.len() < 2 || body[0] > 1 || body[1] != 0 {
-                    return None;
-                }
-                let mut content = &body[2..];
-                for _ in 0..2 {
-                    let end = content.iter().position(|&b| b == 0)?;
-                    content = &content[end + 1..];
-                }
-                (body[0] == 1, content)
-            }
-            _ => return None,
-        };
-        let limit = CHUNK_LIMIT.min(remaining);
-        if compressed {
-            let mut decoded = Vec::new();
-            let result = flate2::read::ZlibDecoder::new(content)
-                .take((limit + 1) as u64)
-                .read_to_end(&mut decoded);
-            *total += decoded.len().min(limit);
-            if result.is_err() || decoded.len() > limit {
-                return None;
-            }
-            Some(decoded)
-        } else {
-            *total += content.len().min(limit);
-            if content.len() > limit {
-                return None;
-            }
-            Some(content.to_vec())
-        }
-    })();
-    match decoded {
-        Some(body) => notice.xmp |= has_thumbnail(&body),
-        None => notice.xmp_uninspectable = true,
+// 読めない Single の EXIF は従来どおり残す。Batch だけが落とす。
+fn transfer_exif(
+    data: &[u8],
+    options: &SaveOptions,
+    notice: &mut ThumbnailNoticeKinds,
+) -> Option<Vec<u8>> {
+    let batch = options.metadata_profile == MetadataProfile::Batch;
+    if let Some((tiff, maker)) = clean_exif(data, batch) {
+        notice.maker_note |= maker && options.thumbnail_notice_for_hidden_edits;
+        Some(tiff)
+    } else if batch {
+        None
+    } else {
+        notice.exif_uninspectable = true;
+        Some(data.to_vec())
     }
 }
 
-// TIFF の offset はすべて TIFF 本体から。無効な領域や循環を含む EXIF は丸ごと落とす。
+// 本文の開始位置を保持し、iTXt の言語・訳語と圧縮フラグを再利用する。
+fn png_text_layout(chunk: &[u8], key_end: usize) -> Option<(usize, bool)> {
+    let data = &chunk[8..chunk.len() - 4];
+    let start = key_end + 1;
+    match &chunk[4..8] {
+        b"tEXt" => Some((start, false)),
+        b"zTXt" if data.get(start) == Some(&0) => Some((start + 1, true)),
+        b"iTXt" => {
+            let flag = *data.get(start)?;
+            if flag > 1 || data.get(start + 1) != Some(&0) {
+                return None;
+            }
+            let mut pos = start + 2;
+            for _ in 0..2 {
+                pos += data.get(pos..)?.iter().position(|&b| b == 0)? + 1;
+            }
+            Some((pos, flag == 1))
+        }
+        _ => None,
+    }
+}
+
+fn decode_png_text<const CHUNK: usize, const FILE: usize>(
+    content: &[u8],
+    compressed: bool,
+    total: &mut usize,
+) -> Option<Vec<u8>> {
+    let limit = CHUNK.min(FILE.saturating_sub(*total));
+    if limit == 0 {
+        return None;
+    }
+    if compressed {
+        let mut decoded = Vec::new();
+        let result = flate2::read::ZlibDecoder::new(content)
+            .take((limit + 1) as u64)
+            .read_to_end(&mut decoded);
+        *total += decoded.len().min(limit);
+        if result.is_err() || decoded.len() > limit {
+            return None;
+        }
+        Some(decoded)
+    } else {
+        *total += content.len().min(limit);
+        (content.len() <= limit).then(|| content.to_vec())
+    }
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+// 長さの行と16進の開始位置。長さの妥当性は厳密な読み取り側で調べる。
+fn raw_profile_layout(body: &[u8]) -> Option<(&[u8], usize)> {
+    let body_start = if body.starts_with(b"\r\n") {
+        2
+    } else if body.starts_with(b"\n") {
+        1
+    } else {
+        return None;
+    };
+    let type_end = body[body_start..].iter().position(|&b| b == b'\n')? + body_start;
+    if body[body_start..type_end]
+        .iter()
+        .all(u8::is_ascii_whitespace)
+    {
+        return None;
+    }
+    let length_start = type_end + 1;
+    let length_end = body[length_start..].iter().position(|&b| b == b'\n')? + length_start;
+    Some((&body[length_start..length_end], length_end + 1))
+}
+
+// ImageMagick: 改行・種類名・改行・10進長・改行・空白区切りの16進。
+// 宣言より後ろのデータも含めて、桁数が厳密に一致することを確認する。
+fn raw_profile(body: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
+    let (length_line, hex_start) = raw_profile_layout(body)?;
+    let length_text = std::str::from_utf8(length_line).ok()?.trim();
+    if length_text.is_empty() || !length_text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let length: usize = length_text.parse().ok()?;
+    let digits = length.checked_mul(2)?;
+    let positions: Vec<usize> = (hex_start..body.len())
+        .filter(|&i| !body[i].is_ascii_whitespace())
+        .collect();
+    if positions.len() != digits {
+        return None;
+    }
+    let bytes = positions
+        .chunks_exact(2)
+        .map(|p| Some((hex_digit(body[p[0]])? << 4) | hex_digit(body[p[1]])?))
+        .collect::<Option<Vec<_>>>()?;
+    Some((bytes, positions))
+}
+
+// 厳密な解析に失敗した APP1 の分類専用。長さの宣言は信用せず、
+// XMP の見出しに必要な先頭の数字だけ戻す。本体の検査・転記には使わない。
+fn raw_profile_has_xmp_header(body: &[u8]) -> bool {
+    let Some((_, hex_start)) = raw_profile_layout(body) else {
+        return false;
+    };
+    let mut digits = body[hex_start..]
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace());
+    let header_len = XMP_STANDARD.len().max(XMP_EXTENDED.len());
+    let mut prefix = Vec::with_capacity(header_len);
+    for _ in 0..header_len {
+        let Some(high) = digits.next().and_then(hex_digit) else {
+            return false;
+        };
+        let Some(low) = digits.next().and_then(hex_digit) else {
+            return false;
+        };
+        prefix.push((high << 4) | low);
+        if prefix.as_slice() == XMP_STANDARD || prefix.as_slice() == XMP_EXTENDED {
+            return true;
+        }
+        if !XMP_STANDARD.starts_with(&prefix) && !XMP_EXTENDED.starts_with(&prefix) {
+            return false;
+        }
+    }
+    false
+}
+
+// 本文検査の 16/32 MiB の枠とは別に、分類だけに最大 1 KiB を使う。
+// 合計残量は増減させず、枠が尽きた後も XMP と分かるものは保持して警告する。
+// 分類時だけ zlib の 2 バイトのヘッダを飛ばし、raw deflate として読む。
+// Adler-32 の不一致で先頭まで失わないよう、末尾のチェックサムは検証しない。
+// 本文検査は従来どおり ZlibDecoder を使い、この先頭は本文の検査や書き換えには使わない。
+fn raw_app1_prefix_has_xmp_header(content: &[u8], compressed: bool) -> bool {
+    if !compressed {
+        return raw_profile_has_xmp_header(&content[..content.len().min(RAW_APP1_PREFIX_LIMIT)]);
+    }
+    let Some(deflate) = content.get(2..) else {
+        return false;
+    };
+    let mut prefix = Vec::new();
+    let _ = flate2::read::DeflateDecoder::new(deflate)
+        .take(RAW_APP1_PREFIX_LIMIT as u64)
+        .read_to_end(&mut prefix);
+    raw_profile_has_xmp_header(&prefix)
+}
+
+fn keep_uninspectable_png_text(
+    raw_exif: bool,
+    options: &SaveOptions,
+    notice: &mut ThumbnailNoticeKinds,
+) -> bool {
+    if raw_exif {
+        if options.metadata_profile == MetadataProfile::Batch {
+            return false;
+        }
+        notice.exif_uninspectable = true;
+    } else {
+        notice.xmp_uninspectable = true;
+    }
+    true
+}
+
+fn patch_raw_profile(body: &mut [u8], positions: &[usize], original: &[u8], cleaned: &[u8]) {
+    for (i, (&old, &new)) in original.iter().zip(cleaned).enumerate() {
+        if old == new {
+            continue;
+        }
+        for (pos, nibble) in [
+            (positions[i * 2], new >> 4),
+            (positions[i * 2 + 1], new & 15),
+        ] {
+            if hex_digit(body[pos]) != Some(nibble) {
+                body[pos] = if nibble < 10 {
+                    b'0' + nibble
+                } else if body[pos].is_ascii_uppercase() {
+                    b'A' + nibble - 10
+                } else {
+                    b'a' + nibble - 10
+                };
+            }
+        }
+    }
+}
+
+// Raw EXIF は XMP 検出後も必ず処理する。上限は XML XMP と Raw profile で共有する。
+// 製品の上限は呼び出し元で固定し、テストだけが小さい上限を指定する。
+fn process_png_text<const CHUNK: usize, const FILE: usize>(
+    chunk: &mut Vec<u8>,
+    total: &mut usize,
+    options: &SaveOptions,
+    notice: &mut ThumbnailNoticeKinds,
+    raw_app1_xmp: &mut Vec<Vec<u8>>,
+) -> Result<bool, SaveError> {
+    let data = &chunk[8..chunk.len() - 4];
+    let Some(key_end) = data.iter().position(|&b| b == 0) else {
+        return Ok(true);
+    };
+    let key = &data[..key_end];
+    let raw_app1 = key.eq_ignore_ascii_case(b"Raw profile type APP1");
+    let raw_exif = key.eq_ignore_ascii_case(b"Raw profile type exif") || raw_app1;
+    let raw_xmp = key.eq_ignore_ascii_case(b"Raw profile type xmp");
+    if !raw_exif && !raw_xmp && (key != XMP_KEY || notice.xmp) {
+        return Ok(true);
+    }
+    let layout = png_text_layout(chunk, key_end);
+    let decoded = layout.and_then(|(start, compressed)| {
+        decode_png_text::<CHUNK, FILE>(&data[start..], compressed, total)
+            .map(|body| (start, compressed, body))
+    });
+    let Some((start, compressed, mut body)) = decoded else {
+        if raw_app1
+            && layout.is_some_and(|(start, compressed)| {
+                raw_app1_prefix_has_xmp_header(&data[start..], compressed)
+            })
+        {
+            notice.xmp_uninspectable = true;
+            return Ok(true);
+        }
+        return Ok(keep_uninspectable_png_text(raw_exif, options, notice));
+    };
+    if !raw_exif && !raw_xmp {
+        notice.xmp |= has_thumbnail(&body);
+        return Ok(true);
+    }
+    let (bytes, positions) = match raw_profile(&body) {
+        Some(parsed) => parsed,
+        None => {
+            if raw_app1 && raw_profile_has_xmp_header(&body) {
+                notice.xmp_uninspectable = true;
+                return Ok(true);
+            }
+            return Ok(keep_uninspectable_png_text(raw_exif, options, notice));
+        }
+    };
+    if raw_app1 && (bytes.starts_with(XMP_STANDARD) || bytes.starts_with(XMP_EXTENDED)) {
+        notice.xmp |= xmp_payloads_thumbnail(std::iter::once(bytes.as_slice()));
+        if bytes.starts_with(XMP_EXTENDED) {
+            raw_app1_xmp.push(bytes);
+        }
+        return Ok(true);
+    }
+    if raw_xmp {
+        notice.xmp |= has_thumbnail(&bytes);
+        return Ok(true);
+    }
+    let prefix = usize::from(bytes.starts_with(b"Exif\0\0")) * 6;
+    let Some(cleaned) = transfer_exif(&bytes[prefix..], options, notice) else {
+        return Ok(false);
+    };
+    let mut payload = bytes[..prefix].to_vec();
+    payload.extend(cleaned);
+    if payload == bytes {
+        return Ok(true);
+    }
+    patch_raw_profile(&mut body, &positions, &bytes, &payload);
+    let mut replacement = data[..start].to_vec();
+    if compressed {
+        let encoded = (|| -> io::Result<Vec<u8>> {
+            let mut encoder =
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&body)?;
+            encoder.finish()
+        })();
+        replacement.extend(encoded.map_err(|err| {
+            crate::logger::log(&format!("export raw profile compression: {err}"));
+            SaveError::EncodingFailed(format!("PNG raw profile: {err}"))
+        })?);
+    } else {
+        replacement.extend(body);
+    }
+    let kind: [u8; 4] = chunk[4..8].try_into().unwrap();
+    *chunk = png_chunk(&kind, &replacement);
+    Ok(true)
+}
+
+// TIFF の offset はすべて TIFF 本体から。無効な領域や循環は読めないと返す。
 struct Tiff<'a> {
     data: &'a [u8],
     little: bool,
@@ -304,7 +565,7 @@ impl Tiff<'_> {
     }
 }
 
-fn clean_exif(data: &[u8]) -> Option<(Vec<u8>, bool)> {
+fn clean_exif(data: &[u8], reset_orientation: bool) -> Option<(Vec<u8>, bool)> {
     let little = match data.get(..2)? {
         b"II" => true,
         b"MM" => false,
@@ -338,6 +599,10 @@ fn clean_exif(data: &[u8]) -> Option<(Vec<u8>, bool)> {
         let mut tile_lengths = None;
         for entry in entries {
             let tag = t.u16(entry)?;
+            // Single は不正な Orientation もそのまま残し、読めない理由にしない。
+            if tag == 0x0112 && !reset_orientation {
+                continue;
+            }
             let (kind, count, range) = t.values(entry)?;
             if range.len() > 4 {
                 retained_values.push(range);
