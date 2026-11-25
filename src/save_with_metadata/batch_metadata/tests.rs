@@ -495,6 +495,173 @@ fn png_raw_app1_unreadable_xmp_keeps_chunks_and_warns_in_both_profiles() {
     }
 }
 
+const PNG_TEST_CHUNK_LIMIT: usize = 256;
+const PNG_TEST_FILE_LIMIT: usize = 512;
+
+fn assert_raw_app1_xmp_limit_notice(mut chunk: Vec<u8>, options: &SaveOptions, total: &mut usize) {
+    let original = chunk.clone();
+    let mut notice = ThumbnailNoticeKinds::default();
+    let mut fragments = Vec::new();
+    assert!(
+        process_png_text::<PNG_TEST_CHUNK_LIMIT, PNG_TEST_FILE_LIMIT>(
+            &mut chunk,
+            total,
+            options,
+            &mut notice,
+            &mut fragments,
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        notice,
+        ThumbnailNoticeKinds {
+            xmp_uninspectable: true,
+            ..Default::default()
+        }
+    );
+    assert_eq!(chunk, original);
+    assert!(fragments.is_empty());
+}
+
+#[test]
+fn png_raw_app1_xmp_over_chunk_limit_is_kept_with_xmp_notice() {
+    for opts in [single_options(false), options(false)] {
+        for header in [XMP_STANDARD, XMP_EXTENDED] {
+            let payload = [header, &[b'x'; 512]].concat();
+            let body = raw_body(&payload, payload.len());
+            assert!(body.len() > RAW_APP1_PREFIX_LIMIT);
+            for (kind, compression) in [
+                (b"tEXt", false),
+                (b"zTXt", true),
+                (b"iTXt", false),
+                (b"iTXt", true),
+            ] {
+                let chunk = raw_text(kind, b"Raw profile type APP1", &body, compression);
+                let mut total = 0;
+                assert_raw_app1_xmp_limit_notice(chunk, &opts, &mut total);
+                assert_eq!(total, PNG_TEST_CHUNK_LIMIT);
+            }
+        }
+    }
+}
+
+#[test]
+fn png_raw_app1_xmp_after_total_limit_is_kept_with_xmp_notice() {
+    let filler = text(b"zTXt", &[b'x'; PNG_TEST_CHUNK_LIMIT], false);
+    for opts in [single_options(false), options(false)] {
+        for header in [XMP_STANDARD, XMP_EXTENDED] {
+            let body = raw_body(header, header.len());
+            assert!(body.len() < PNG_TEST_CHUNK_LIMIT);
+            for (kind, compression) in [
+                (b"tEXt", false),
+                (b"zTXt", true),
+                (b"iTXt", false),
+                (b"iTXt", true),
+            ] {
+                let mut total = 0;
+                let mut notice = ThumbnailNoticeKinds::default();
+                let mut fragments = Vec::new();
+                for _ in 0..2 {
+                    let mut filler = filler.clone();
+                    assert!(
+                        process_png_text::<PNG_TEST_CHUNK_LIMIT, PNG_TEST_FILE_LIMIT>(
+                            &mut filler,
+                            &mut total,
+                            &opts,
+                            &mut notice,
+                            &mut fragments,
+                        )
+                        .unwrap()
+                    );
+                }
+                assert_eq!(total, PNG_TEST_FILE_LIMIT);
+                assert!(notice.is_empty());
+                let chunk = raw_text(kind, b"Raw profile type APP1", &body, compression);
+                assert_raw_app1_xmp_limit_notice(chunk, &opts, &mut total);
+                assert_eq!(total, PNG_TEST_FILE_LIMIT);
+            }
+        }
+    }
+}
+
+#[test]
+fn png_raw_app1_zlib_error_uses_bounded_xmp_prefix() {
+    for opts in [single_options(false), options(false)] {
+        for header in [XMP_STANDARD, XMP_EXTENDED] {
+            let payload = [header, &[b'x'; 512]].concat();
+            let body = raw_body(&payload, payload.len());
+            for kind in [b"zTXt", b"iTXt"] {
+                let chunk = raw_text(kind, b"Raw profile type APP1", &body, true);
+                let mut data = chunk[8..chunk.len() - 4].to_vec();
+                *data.last_mut().unwrap() ^= 1; // corrupt the zlib checksum, not the PNG CRC
+                let mut chunk = png_chunk(kind, &data);
+                let original = chunk.clone();
+                let mut total = 0;
+                let mut notice = ThumbnailNoticeKinds::default();
+                let mut fragments = Vec::new();
+                assert!(
+                    process_png_text::<4096, 8192>(
+                        &mut chunk,
+                        &mut total,
+                        &opts,
+                        &mut notice,
+                        &mut fragments,
+                    )
+                    .unwrap()
+                );
+                assert_eq!(chunk, original);
+                assert_eq!(
+                    notice,
+                    ThumbnailNoticeKinds {
+                        xmp_uninspectable: true,
+                        ..Default::default()
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn png_raw_app1_unknown_prefix_keeps_exif_rule_without_reading_past_prefix_limit() {
+    let payload = [XMP_STANDARD, XMP_IMAGE_NS].concat();
+    let mut beyond_prefix = vec![b'\n'];
+    beyond_prefix.extend(vec![b'a'; RAW_APP1_PREFIX_LIMIT]);
+    beyond_prefix.extend_from_slice(&raw_body(&payload, payload.len())[1..]);
+    assert!(raw_profile_has_xmp_header(&beyond_prefix));
+    let exif = tiff(true);
+    let exif_body = raw_body(&exif, exif.len());
+    for opts in [single_options(false), options(false)] {
+        for body in [&beyond_prefix, &exif_body] {
+            assert!(body.len() > PNG_TEST_CHUNK_LIMIT);
+            for (kind, compression) in [
+                (b"tEXt", false),
+                (b"zTXt", true),
+                (b"iTXt", false),
+                (b"iTXt", true),
+            ] {
+                let mut chunk = raw_text(kind, b"Raw profile type APP1", body, compression);
+                let original = chunk.clone();
+                let mut notice = ThumbnailNoticeKinds::default();
+                let mut total = 0;
+                let keep = process_png_text::<PNG_TEST_CHUNK_LIMIT, PNG_TEST_FILE_LIMIT>(
+                    &mut chunk,
+                    &mut total,
+                    &opts,
+                    &mut notice,
+                    &mut Vec::new(),
+                )
+                .unwrap();
+                let single = opts.metadata_profile == MetadataProfile::Single;
+                assert_eq!(keep, single);
+                assert_eq!(notice.exif_uninspectable, single);
+                assert!(!notice.xmp && !notice.xmp_uninspectable);
+                assert_eq!(chunk, original);
+            }
+        }
+    }
+}
+
 #[test]
 fn exif_stripped_thumbnail_ranges_are_erased_and_malformed_offsets_rejected() {
     let mut bytes = tiff(true);
@@ -892,7 +1059,7 @@ fn text_body(chunk: &[u8]) -> Vec<u8> {
     let data = &chunk[8..chunk.len() - 4];
     let key_end = data.iter().position(|&b| b == 0).unwrap();
     let (start, compressed) = png_text_layout(chunk, key_end).unwrap();
-    decode_png_text(&data[start..], compressed, &mut 0).unwrap()
+    decode_png_text::<CHUNK_LIMIT, FILE_LIMIT>(&data[start..], compressed, &mut 0).unwrap()
 }
 
 #[test]

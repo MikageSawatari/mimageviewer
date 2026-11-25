@@ -9,6 +9,7 @@ const XMP_EXTENDED: &[u8] = b"http://ns.adobe.com/xmp/extension/\0";
 const XMP_KEY: &[u8] = b"XML:com.adobe.xmp";
 const CHUNK_LIMIT: usize = 16 * 1024 * 1024;
 const FILE_LIMIT: usize = 32 * 1024 * 1024;
+const RAW_APP1_PREFIX_LIMIT: usize = 1024;
 
 fn has_thumbnail(bytes: &[u8]) -> bool {
     bytes.windows(XMP_IMAGE_NS.len()).any(|s| s == XMP_IMAGE_NS)
@@ -85,7 +86,7 @@ pub(super) fn transfer(
                         }
                     }
                     _ => {
-                        if !process_png_text(
+                        if !process_png_text::<CHUNK_LIMIT, FILE_LIMIT>(
                             &mut chunk,
                             &mut total,
                             options,
@@ -243,8 +244,12 @@ fn png_text_layout(chunk: &[u8], key_end: usize) -> Option<(usize, bool)> {
     }
 }
 
-fn decode_png_text(content: &[u8], compressed: bool, total: &mut usize) -> Option<Vec<u8>> {
-    let limit = CHUNK_LIMIT.min(FILE_LIMIT.saturating_sub(*total));
+fn decode_png_text<const CHUNK: usize, const FILE: usize>(
+    content: &[u8],
+    compressed: bool,
+    total: &mut usize,
+) -> Option<Vec<u8>> {
+    let limit = CHUNK.min(FILE.saturating_sub(*total));
     if limit == 0 {
         return None;
     }
@@ -347,6 +352,25 @@ fn raw_profile_has_xmp_header(body: &[u8]) -> bool {
     false
 }
 
+// 本文検査の 16/32 MiB の枠とは別に、分類だけに最大 1 KiB を使う。
+// 合計残量は増減させず、枠が尽きた後も XMP と分かるものは保持して警告する。
+// 分類時だけ zlib の 2 バイトのヘッダを飛ばし、raw deflate として読む。
+// Adler-32 の不一致で先頭まで失わないよう、末尾のチェックサムは検証しない。
+// 本文検査は従来どおり ZlibDecoder を使い、この先頭は本文の検査や書き換えには使わない。
+fn raw_app1_prefix_has_xmp_header(content: &[u8], compressed: bool) -> bool {
+    if !compressed {
+        return raw_profile_has_xmp_header(&content[..content.len().min(RAW_APP1_PREFIX_LIMIT)]);
+    }
+    let Some(deflate) = content.get(2..) else {
+        return false;
+    };
+    let mut prefix = Vec::new();
+    let _ = flate2::read::DeflateDecoder::new(deflate)
+        .take(RAW_APP1_PREFIX_LIMIT as u64)
+        .read_to_end(&mut prefix);
+    raw_profile_has_xmp_header(&prefix)
+}
+
 fn keep_uninspectable_png_text(
     raw_exif: bool,
     options: &SaveOptions,
@@ -386,7 +410,8 @@ fn patch_raw_profile(body: &mut [u8], positions: &[usize], original: &[u8], clea
 }
 
 // Raw EXIF は XMP 検出後も必ず処理する。上限は XML XMP と Raw profile で共有する。
-fn process_png_text(
+// 製品の上限は呼び出し元で固定し、テストだけが小さい上限を指定する。
+fn process_png_text<const CHUNK: usize, const FILE: usize>(
     chunk: &mut Vec<u8>,
     total: &mut usize,
     options: &SaveOptions,
@@ -404,10 +429,20 @@ fn process_png_text(
     if !raw_exif && !raw_xmp && (key != XMP_KEY || notice.xmp) {
         return Ok(true);
     }
-    let decoded = png_text_layout(chunk, key_end).and_then(|(start, compressed)| {
-        decode_png_text(&data[start..], compressed, total).map(|body| (start, compressed, body))
+    let layout = png_text_layout(chunk, key_end);
+    let decoded = layout.and_then(|(start, compressed)| {
+        decode_png_text::<CHUNK, FILE>(&data[start..], compressed, total)
+            .map(|body| (start, compressed, body))
     });
     let Some((start, compressed, mut body)) = decoded else {
+        if raw_app1
+            && layout.is_some_and(|(start, compressed)| {
+                raw_app1_prefix_has_xmp_header(&data[start..], compressed)
+            })
+        {
+            notice.xmp_uninspectable = true;
+            return Ok(true);
+        }
         return Ok(keep_uninspectable_png_text(raw_exif, options, notice));
     };
     if !raw_exif && !raw_xmp {
