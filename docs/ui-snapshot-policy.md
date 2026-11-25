@@ -1,6 +1,6 @@
 §1.843 第 2 段では、AI 連携の許可補足・見せる情報・許す操作にキー・リング・マウスボタン・ジェスチャーを加える。
 更新対象は既存の `agent_integration_window_{disabled,read,open,organize,records}_{light,dark}` の10枚。
-PNG の再生成・目視・通常比較、glyph lint は未実行で、設計担当が共有 runner で行う。
+2026-11-25 に設計担当が共有 runner で再生成し、目視と通常比較 (10 件成功)、glyph lint を行った。
 
 §1.362 段 A は lib の `ui_dialogs::export_batch::tests::gpu_tests` に
 `batch_export_snapshot_default` / `batch_export_snapshot_expanded` /

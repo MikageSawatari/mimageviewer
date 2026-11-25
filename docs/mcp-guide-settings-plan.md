@@ -1756,7 +1756,7 @@ P1 なし。指摘はすべて受け入れ、次の改訂 (§19.5) に入れた�
 
 ## 20. 第 2 段: 操作カスタマイズ (キー割り当て・リング・マウス・ジェスチャー) — v5.8.0
 
-状態: **F・G・H のコードとテストを追加 (2026-11-25)、未ビルド・未テスト・実装の独立レビュー未実施**。設計のレビュー履歴は §20.15。基点は master `e3c2010fc`、ブランチ `mcp-keys-843`
+状態: **F・G・H を実装 (2026-11-25)。関連テストは設計担当が共有 runner で実行し成功 (§20.12.2)。実装の独立レビューは r1 ACCEPT WITH CHANGES の修正を確認中 (§20.15)**。設計のレビュー履歴は §20.15。基点は master `e3c2010fc`、ブランチ `mcp-keys-843`
 (worktree `G:\home\mimageviewer-mcpkeys843`)。行番号はこの基点のもの。根拠はコードと文書の参照だけで、
 実行時の挙動は誰も観測していない。第 2 段は v5.8.0 で始める (利用者決定 2026-11-25、backlog §1.843)。
 
@@ -2093,7 +2093,19 @@ UI スレッドで次を順に行う。
 - **区切り H (画面・文書)**: §20.9。
 - 実装担当は cargo を流さない。ビルド・テストは設計担当が共有 runner で流す (第 1 段と同じ)。
 
-#### 20.12.1 実装の引き継ぎ (2026-11-25、検証未実施)
+#### 20.12.2 検証の記録 (2026-11-25、実行・観測は設計担当、共有 runner、対象 `5fef054b0` + snapshot)
+
+- `cargo nextest run -p mimageviewer-agent-ipc -p mimageviewer-mcp`: 176 件すべて成功。
+- `cargo nextest run -p mimageviewer --lib -E 'test(/operation_customize|agent_operations|agent_settings|agent_ipc::|keymap::|ring_shortcut::|ui_dialogs::preferences::|agent_integration::|stage1_|settings_restore|settings_transfer/)'`:
+  973 件中 972 件成功。失敗 1 件は `settings_transfer::tests::all_settings_fields_are_classified` (522 と 520) で、基点の master
+  `e3c2010fc` にある既存の失敗。master では `115b49891` で 522 に直っており、このブランチは設定の項目を変えていない。
+- tool 一覧の実測 (`stage2_complete_tool_discovery_fits_final_envelope_budget`): 最大 49,924 字、予約 512 字を足して 50,436 / 52,000。
+- `ui_snapshot` の `agent_integration_window_*` 10 枚: `UPDATE_SNAPSHOTS=1` で生成し、read_light・organize_dark を目視
+  (設定のチェック欄の説明・見せる / 見せない・許す操作の行が §20.9 の文言どおり、はみ出しなし)。通常の比較で 10 件成功。
+- `python scripts/check_ui_glyphs.py`・`python scripts/check_site_cards.py`: 問題なし。
+- 本体 lib の全件は未 (master への取り込みの後に統括)。製品は起動していない。
+
+#### 20.12.1 実装の引き継ぎ (2026-11-25、実装担当の記録。この時点では検証未実施、検証は §20.12.2)
 
 - F は `operation_customize_agent` に置いた。スロットを型で列挙し、行・候補・検査を同じ列挙から作る。
   override は現在の位置で置き換え、同値の項目は写しにも書かない。ジェスチャーの順序・重複とキー配列の重複を保つ。
@@ -2367,3 +2379,16 @@ r1 の対象外だった追記 (`823d33328` の §20.14a、`d6b7696f0` の §20.
 
 **r3 (2026-11-25、対象 `87a5fb788`、同じ thread) — ACCEPT**。r2 の 5 件の解消を確認、新しい指摘なし (レビュー担当の報告。
 実装・GUI・応答の実測は未検証)。
+
+**実装の独立レビュー r1** (GPT-6.1 Sol / xhigh、read-only、実装者とは別の thread `01a2115b-e936-7dd3-98f6-bda73dbd2c24`、
+対象 `a2d268b91..08209211b`) — **ACCEPT WITH CHANGES**、P1 なし。
+
+| 指摘 | 対応 |
+| --- | --- |
+| P2 画面を指定した予約の照会が、Global を経由して一覧専用の Shift+矢印を画像・動画・ページ一覧にも返す | 予約の文脈が Global か、その画面の文脈の組に直接含まれるかで判定。Shift+4 方向の回帰テスト (`5fef054b0`) |
+| P3 AI 連携の窓の snapshot 10 枚が未更新 | 設計担当が生成・目視・通常比較 (§20.12.2) |
+
+同じ区切りで設計担当の検収から直したもの: キーの文字列を `Chord::settings_name` に正規化して保存 (`08209211b`)、v3 の凍結テストの
+版の確認を literal に戻す (同)、画面の名前・表示名・文脈の組を 1 つの表に (`5fef054b0`)、`get_operations` の override の解釈を
+1 回の呼び出しで 1 回にする (同。行ごとに全 override と全操作を照合しており、override が多いと UI スレッドで重かった。全件 override の
+テストが debug で 196 秒 → 関連テスト全体で 53 秒)。
