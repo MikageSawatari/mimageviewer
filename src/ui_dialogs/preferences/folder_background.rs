@@ -39,11 +39,17 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, settings: &mut Settings) {
             };
         }
     });
-    if !settings.folder_cell_background.valid() {
-        ui.colored_label(
-            ui.visuals().error_fg_color,
-            "フォルダの背景は文字とのコントラスト比が4.5:1以上の色を指定してください",
-        );
+    for dark in [false, true] {
+        if !settings.folder_cell_background.readable(dark) {
+            let theme = if dark { "Dark" } else { "Light" };
+            let ratio = crate::folder_cell_background::display_text_contrast(
+                settings.folder_cell_background.min_text_contrast(dark),
+            );
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("{theme} の色は文字とのコントラスト比が {ratio} で、4.5:1 未満です。検索結果のフォルダの場所や件数が読みにくくなることがあります。"),
+            );
+        }
     }
     // Preview the retained colors even while OFF, without changing the draft.
     let preview = FolderCellBackground {
@@ -71,6 +77,41 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, settings: &mut Settings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_background_low_contrast_warning_while_off_uses_truncated_ratio() {
+        use egui_kittest::kittest::Queryable;
+        let mut settings = Settings::default();
+        settings.folder_cell_background.light = [255, 240, 179];
+        settings.folder_cell_background.dark = [220; 3];
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(720.0, 700.0))
+            .build_ui_state(
+                |root, settings| {
+                    egui::CentralPanel::default().show(root, |ui| draw_settings(ui, settings));
+                },
+                settings,
+            );
+        harness.run_steps(3);
+        assert!(!harness.state().folder_cell_background.enabled);
+        for dark in [false, true] {
+            let theme = if dark { "Dark" } else { "Light" };
+            let ratio = crate::folder_cell_background::display_text_contrast(
+                harness
+                    .state()
+                    .folder_cell_background
+                    .min_text_contrast(dark),
+            );
+            if !dark {
+                assert_eq!(ratio, "4.4:1");
+            }
+            let message = format!(
+                "{theme} の色は文字とのコントラスト比が {ratio} で、4.5:1 未満です。検索結果のフォルダの場所や件数が読みにくくなることがあります。"
+            );
+            assert!(harness.get_by_label(&message).rect().is_positive());
+        }
+    }
 
     #[test]
     fn folder_background_reset_preserves_enabled_and_only_edits_draft() {

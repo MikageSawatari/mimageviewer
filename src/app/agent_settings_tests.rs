@@ -121,6 +121,31 @@ fn assert_no_publication(app: &App) {
     ));
 }
 
+#[test]
+fn agent_settings_accepts_low_contrast_folder_background_without_confirmation() {
+    let ctx = egui::Context::default();
+    let mut app = fixture(&ctx);
+    let value = json!({"enabled": true, "light": [255,230,140], "dark": [220,220,220]});
+    let result = app
+        .agent_set_settings(
+            &changes(json!({"folder_cell_background": value.clone()})),
+            "folder-background-client",
+            &ctx,
+        )
+        .unwrap();
+    assert_eq!(result.changed.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&app.settings.folder_cell_background).unwrap(),
+        value
+    );
+    assert_eq!(
+        Settings::load().folder_cell_background,
+        app.settings.folder_cell_background
+    );
+    assert!(app.pref_state.is_none());
+    assert!(!app.show_preferences);
+}
+
 fn acquire_remote(session: &crate::remote_ipc::session::SessionHandle) {
     session.acquire(mimageviewer_ipc::SessionAcquireRequest {
         client_id: "settings-test".into(),

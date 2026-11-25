@@ -1,4 +1,4 @@
-//! Thumbnail folder backgrounds, shared by painting, previews and validation.
+//! Thumbnail folder backgrounds, shared by painting, previews and readability warnings.
 
 use crate::details_name_colors::{DetailsNameCategory, category, contrast_ratio};
 use crate::grid_item::GridItem;
@@ -41,16 +41,39 @@ impl FolderCellBackground {
         Color32::from_rgb(r, g, b)
     }
 
-    /// Validate stored colors even while disabled, as with details-name colors.
-    pub fn valid(&self) -> bool {
-        [false, true].into_iter().all(|dark| {
-            // Add every new text color painted directly on a folder background here.
-            // Icons and captions on their own plates are not direct text.
-            [search_folder_path_color(dark), search_count_color(dark)]
-                .into_iter()
-                .all(|text| contrast_ratio(text, self.color(dark)) >= 4.5)
-        })
+    pub fn readable(&self, dark: bool) -> bool {
+        self.min_text_contrast(dark) >= 4.5
     }
+
+    pub fn min_text_contrast(&self, dark: bool) -> f64 {
+        // Add every new text color painted directly on a folder background here.
+        // Icons and captions on their own plates are not direct text.
+        [search_folder_path_color(dark), search_count_color(dark)]
+            .into_iter()
+            .map(|text| contrast_ratio(text, self.color(dark)))
+            .fold(f64::INFINITY, f64::min)
+    }
+}
+
+/// Themes newly painted by this draft; false = Light, true = Dark.
+/// Live enabled colors already represent the user's choice, without a saved approval flag.
+pub fn newly_painted_low_contrast(
+    live: &FolderCellBackground,
+    draft: &FolderCellBackground,
+) -> Vec<bool> {
+    [false, true]
+        .into_iter()
+        .filter(|&dark| {
+            draft.enabled
+                && !draft.readable(dark)
+                && !(live.enabled && live.color(dark) == draft.color(dark))
+        })
+        .collect()
+}
+
+/// Truncate rather than round: a ratio below 4.5 must never be displayed as 4.5.
+pub fn display_text_contrast(ratio: f64) -> String {
+    format!("{:.1}:1", (ratio * 10.0).floor() / 10.0)
 }
 
 /// Keep the existing selection/check priority and normal colors in one owner.
@@ -86,7 +109,7 @@ mod tests {
     use crate::grid_item::SearchContainerKind;
 
     #[test]
-    fn folder_background_painter_and_validator_share_text_colors() {
+    fn folder_background_painter_and_readability_share_text_colors() {
         for dark in [false, true] {
             assert_eq!(
                 search_folder_path_color(dark),
@@ -178,7 +201,7 @@ mod tests {
                     }
                 }
                 assert!(background_seen && path_seen && count_seen);
-                assert!(colors.valid());
+                assert!(colors.readable(dark));
             }
         }
     }
@@ -189,7 +212,7 @@ mod tests {
         assert!(!defaults.enabled);
         assert_eq!(defaults.light, [255, 244, 204]);
         assert_eq!(defaults.dark, [58, 52, 32]);
-        assert!(defaults.valid());
+        assert!(defaults.readable(false) && defaults.readable(true));
         assert_eq!(
             serde_json::from_str::<FolderCellBackground>("{}").unwrap(),
             defaults
@@ -203,6 +226,110 @@ mod tests {
                 .unwrap(),
             colors
         );
+    }
+
+    #[test]
+    fn folder_background_newly_painted_low_contrast_transition_table() {
+        let readable = FolderCellBackground::default();
+        let low = FolderCellBackground {
+            enabled: true,
+            light: [255, 230, 140], // Report >>903.
+            dark: [220; 3],
+        };
+        assert!(!low.readable(false));
+        assert!(!low.readable(true));
+        let on = FolderCellBackground {
+            enabled: true,
+            ..readable.clone()
+        };
+        let cases = [
+            (
+                readable.clone(),
+                FolderCellBackground {
+                    enabled: false,
+                    ..low.clone()
+                },
+                vec![],
+            ),
+            (
+                FolderCellBackground {
+                    enabled: false,
+                    ..low.clone()
+                },
+                low.clone(),
+                vec![false, true],
+            ),
+            (on.clone(), on.clone(), vec![]),
+            (
+                on.clone(),
+                FolderCellBackground {
+                    light: low.light,
+                    ..on.clone()
+                },
+                vec![false],
+            ),
+            (
+                on.clone(),
+                FolderCellBackground {
+                    dark: low.dark,
+                    ..on.clone()
+                },
+                vec![true],
+            ),
+            (on, low.clone(), vec![false, true]),
+            (low.clone(), low.clone(), vec![]),
+            (
+                low.clone(),
+                FolderCellBackground {
+                    enabled: false,
+                    ..low.clone()
+                },
+                vec![],
+            ),
+            (
+                low.clone(),
+                FolderCellBackground {
+                    enabled: true,
+                    ..readable
+                },
+                vec![],
+            ),
+            (
+                low.clone(),
+                FolderCellBackground {
+                    light: [255, 240, 179],
+                    ..low.clone()
+                },
+                vec![false],
+            ),
+            (
+                low.clone(),
+                FolderCellBackground {
+                    dark: [200; 3],
+                    ..low
+                },
+                vec![true],
+            ),
+        ];
+        for (live, draft, expected) in cases {
+            assert_eq!(
+                newly_painted_low_contrast(&live, &draft),
+                expected,
+                "live={live:?}, draft={draft:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_background_contrast_display_truncates_below_boundary() {
+        for (ratio, text) in [
+            (4.49, "4.4:1"),
+            (4.499999, "4.4:1"),
+            (4.5, "4.5:1"),
+            (1.0, "1.0:1"),
+        ] {
+            assert_eq!(display_text_contrast(ratio), text);
+        }
     }
 
     #[test]
@@ -300,7 +427,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_background_validation_checks_each_text_and_theme_at_four_point_five() {
+    fn folder_background_readability_checks_each_text_and_theme_at_four_point_five() {
         // Adjacent 8-bit grays straddle each direct text color's 4.5:1 floor.
         // The count color is stricter in both themes; validate the entire pair too.
         for (dark, text, a, b) in [
@@ -321,14 +448,17 @@ mod tests {
                 let expected = [search_folder_path_color(dark), search_count_color(dark)]
                     .into_iter()
                     .all(|fg| contrast_ratio(fg, colors.color(dark)) >= 4.5);
-                assert_eq!(colors.valid(), expected);
+                assert_eq!(colors.readable(dark), expected);
+                let minimum = contrast_ratio(search_folder_path_color(dark), colors.color(dark))
+                    .min(contrast_ratio(search_count_color(dark), colors.color(dark)));
+                assert_eq!(colors.min_text_contrast(dark), minimum);
             }
         }
         let mut colors = FolderCellBackground::default();
         colors.light = [255, 240, 179];
-        assert!(!colors.valid());
+        assert!(!colors.readable(false));
         colors.light = [255, 244, 204];
         colors.dark = [220; 3];
-        assert!(!colors.valid());
+        assert!(!colors.readable(true));
     }
 }

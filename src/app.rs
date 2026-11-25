@@ -6722,6 +6722,8 @@ pub(crate) enum DirectoryScanRoute {
 
 pub(crate) enum FolderOpenScanPurpose {
     PaneNavigation,
+    /// The capture-location menu uses pane navigation, but distinguishes a missing destination.
+    CaptureDestinationNavigation,
     /// Main direct open. Admission is complete; completion reuses the pre-scanned install.
     DirectNavigation,
     /// A grid `Folder` requested while always-new mode is active. The main context
@@ -6760,9 +6762,19 @@ pub(crate) enum FolderOpenScanPurpose {
 }
 
 impl FolderOpenScanPurpose {
+    fn scan_error_message(&self, error: &std::io::Error) -> &'static str {
+        if matches!(self, Self::CaptureDestinationNavigation)
+            && error.kind() == std::io::ErrorKind::NotFound
+        {
+            crate::known_folders::CAPTURE_DESTINATION_NOT_FOUND
+        } else {
+            "フォルダを読み取れませんでした"
+        }
+    }
+
     fn perf_tag(&self) -> &'static str {
         match self {
-            Self::PaneNavigation => "pane-navigation",
+            Self::PaneNavigation | Self::CaptureDestinationNavigation => "pane-navigation",
             Self::DirectNavigation => "direct-navigation",
             Self::GridFolderCandidate { .. } => "grid-folder-candidate",
             Self::DetachedFolder => "detached-folder",
@@ -6787,6 +6799,7 @@ impl FolderOpenScanPurpose {
                 navigation_purpose, ..
             } => navigation_purpose.diagnostic_trace(),
             Self::PaneNavigation
+            | Self::CaptureDestinationNavigation
             | Self::DirectNavigation
             | Self::GridFolderCandidate { .. }
             | Self::DetachedFolder
@@ -6802,6 +6815,7 @@ impl FolderOpenScanPurpose {
                 navigation_purpose, ..
             } => navigation_purpose.take_diagnostic_trace(),
             Self::PaneNavigation
+            | Self::CaptureDestinationNavigation
             | Self::DirectNavigation
             | Self::GridFolderCandidate { .. }
             | Self::DetachedFolder
@@ -62065,6 +62079,10 @@ impl App {
         self.start_folder_open_scan(path, FolderOpenScanPurpose::PaneNavigation);
     }
 
+    pub(crate) fn start_capture_destination_open(&mut self, path: PathBuf) {
+        self.start_folder_open_scan(path, FolderOpenScanPurpose::CaptureDestinationNavigation);
+    }
+
     /// Only explicit user pane commands choose success-only search exit at admission.
     pub(crate) fn start_user_folder_pane_open(&mut self, path: PathBuf) {
         self.replace_ready_folder_pane_open(path, None);
@@ -62183,6 +62201,7 @@ impl App {
             && matches!(
                 purpose,
                 FolderOpenScanPurpose::PaneNavigation
+                    | FolderOpenScanPurpose::CaptureDestinationNavigation
                     | FolderOpenScanPurpose::JumpToPhysicalFolder { .. }
                     | FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
             )
@@ -62210,7 +62229,11 @@ impl App {
         }
         // 旧 pending を破棄 (連打で最後のクリックだけ生かす)。
         let previous = self.cancel_folder_pane_open(
-            if matches!(purpose, FolderOpenScanPurpose::PaneNavigation) {
+            if matches!(
+                purpose,
+                FolderOpenScanPurpose::PaneNavigation
+                    | FolderOpenScanPurpose::CaptureDestinationNavigation
+            ) {
                 PaneOpenRestoreExit::ReplacedByPaneScan
             } else {
                 PaneOpenRestoreExit::Abandoned
@@ -62569,7 +62592,7 @@ impl App {
                     ready.path.display(),
                     ready.purpose.perf_tag()
                 ));
-                self.show_feedback_warning("フォルダを読み取れませんでした".to_string());
+                self.show_feedback_warning(ready.purpose.scan_error_message(&error).to_string());
                 if matches!(
                     &ready.purpose,
                     FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
@@ -62598,7 +62621,8 @@ impl App {
                 epub_restore: None,
                 navigation: ready.navigation,
             }),
-            FolderOpenScanPurpose::PaneNavigation => Some(ResolvedMainFolderOpen {
+            FolderOpenScanPurpose::PaneNavigation
+            | FolderOpenScanPurpose::CaptureDestinationNavigation => Some(ResolvedMainFolderOpen {
                 restore_intent: StartupListIntent::ExplicitList,
                 path: ready.path,
                 scan,
@@ -62906,7 +62930,8 @@ impl App {
                 ));
                 DetachedPhysicalFolderOpenPoll::Failed
             }
-            FolderOpenScanPurpose::PaneNavigation => {
+            FolderOpenScanPurpose::PaneNavigation
+            | FolderOpenScanPurpose::CaptureDestinationNavigation => {
                 // active detached viewport はフォルダペインを持たないため通常は到達しない。
                 // 将来ペインを共有しても結果を捨てず、その bundle の物理ナビとして適用する。
                 self.load_folder_with_scan(ready.path, Some(scan));

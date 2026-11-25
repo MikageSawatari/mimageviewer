@@ -506,7 +506,7 @@ pub fn perform_with(
             let path = output.as_deref().unwrap_or(&prepared.env.default_output);
             validate_output(&prepared.env, path)?;
             if !path.is_dir() {
-                return Err("保存先はまだありません。最初の保存時に作成します。".into());
+                return Err(crate::known_folders::CAPTURE_DESTINATION_NOT_FOUND.into());
             }
             folders.open(path)?;
             None

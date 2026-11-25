@@ -16,6 +16,8 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{Parallelism, Settings};
 
+const PREFERENCES_MIN_WIDTH: f32 = 620.0;
+
 #[cfg(test)]
 thread_local! {
     static PREFERENCES_DISPLAY_ENRICHMENT_CALLS: std::cell::Cell<usize> = const {
@@ -404,6 +406,43 @@ fn draw_discard_changes_confirm(
     if discard {
         Some(true)
     } else if keep_editing || response.should_close() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn draw_folder_background_confirm(
+    ctx: &egui::Context,
+    colors: &crate::folder_cell_background::FolderCellBackground,
+    themes: &[bool],
+) -> Option<bool> {
+    let mut apply = false;
+    let mut reselect = false;
+    let response = egui::Modal::new(egui::Id::unique("folder_background_confirm")).show(ctx, |ui| {
+        ui.set_width(420.0_f32.min((ctx.content_rect().width() - 48.0).max(0.0)));
+        ui.heading("フォルダの背景色の確認");
+        ui.add_space(8.0);
+        for &dark in themes {
+            let theme = if dark { "Dark" } else { "Light" };
+            let ratio = crate::folder_cell_background::display_text_contrast(
+                colors.min_text_contrast(dark),
+            );
+            ui.colored_label(ui.visuals().warn_fg_color, format!(
+                "{theme} の色は文字とのコントラスト比が {ratio} (4.5:1 未満) です。検索結果のフォルダの場所や件数が読みにくくなることがあります。"
+            ));
+        }
+        ui.label("この色で設定しますか？");
+        ui.add_space(8.0);
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            reselect = ui.button("色を選び直す").clicked();
+            apply = ui.button("この色で設定").clicked();
+        });
+    });
+    if apply {
+        Some(true)
+    } else if reselect || response.should_close() {
         Some(false)
     } else {
         None
@@ -1211,6 +1250,8 @@ pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
     transfer_feedback: Option<PreferencesTransferFeedback>,
+    /// Only UI OK asks about themes newly painted by this immutable draft.
+    folder_background_confirmation: Option<Vec<bool>>,
     /// 保存済み位置と音声トラック選択を明示的にクリアした編集意図。
     video_media_memory_clear_requested: bool,
     /// この編集ダイアログを開いた時点の通常ホイール割り当て。
@@ -1811,6 +1852,7 @@ impl PreferencesState {
         Self {
             settings: s.preferences_snapshot(),
             transfer_feedback: None,
+            folder_background_confirmation: None,
             video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
             selected: PreferencesPage::General,
@@ -3561,19 +3603,31 @@ impl App {
         let mut settings_window = None;
 
         let transfer_dialog_open = self.preferences_transfer_dialog_open();
+        let folder_background_confirm_open = self
+            .pref_state
+            .as_ref()
+            .is_some_and(|state| state.folder_background_confirmation.is_some());
         let collection_reorder_open = self.collection_reorder_open();
-        if transfer_dialog_open || registration_dialog_open || vlm_dialog_open {
+        if transfer_dialog_open
+            || registration_dialog_open
+            || vlm_dialog_open
+            || folder_background_confirm_open
+        {
             // Popups use independent UI layers and do not inherit a disabled
             // parent. Remove that combination while the transfer modal is shown.
             egui::Popup::close_all(ctx);
         }
 
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
+        let safe_rect = ctx.content_rect().shrink2(egui::vec2(24.0, 32.0));
+        let safe_size = safe_rect.size().max(egui::Vec2::ZERO);
         let enter_pressed = !transfer_dialog_open
+            && !folder_background_confirm_open
             && !registration_dialog_open
             && !vlm_dialog_open
             && self.dialog_enter_pressed(ctx);
         let escape_pressed = !transfer_dialog_open
+            && !folder_background_confirm_open
             && !registration_dialog_open
             && !vlm_dialog_open
             && self.dialog_escape_pressed(ctx);
@@ -3582,12 +3636,20 @@ impl App {
         let mut dialog_page = None;
         egui::Window::new("環境設定")
             .drag_area(egui::WindowDrag::Anywhere)
-            .enabled(!transfer_dialog_open && !registration_dialog_open && !vlm_dialog_open)
+            .enabled(
+                !transfer_dialog_open
+                    && !registration_dialog_open
+                    && !vlm_dialog_open
+                    && !folder_background_confirm_open,
+            )
             .open(&mut open)
             .resizable(true)
             .collapsible(false)
             .default_pos(dialog_pos)
             .default_size([720.0, 520.0])
+            .min_size(egui::vec2(PREFERENCES_MIN_WIDTH, 0.0).min(safe_size))
+            .max_size(safe_size)
+            .constrain_to(safe_rect)
             .show(ctx, |ui| {
                 let state = self.pref_state.as_mut().unwrap();
                 #[cfg(windows)]
@@ -3715,6 +3777,16 @@ impl App {
                         draw_page(ui, state, enter_pressed);
                     }
                 });
+                #[cfg(test)]
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::unique("preferences_right_panel_layout"),
+                        (
+                            rendered_page,
+                            crate::test_ui::scroll_layout::ScrollLayout::from_output(&output),
+                        ),
+                    );
+                });
                 // ScrollArea clamps its output against the current content and viewport.
                 // Capture before any close path drops the draft; never associate a result
                 // list's offset with the page selected by a click inside that list.
@@ -3769,7 +3841,6 @@ impl App {
                             && organize_validation.is_ok()
                             && !collection_reorder_open
                             && state.settings.details_name_colors.valid_standard_custom()
-                            && state.settings.folder_cell_background.valid()
                             && name_colors::hex_input_ready(ctx),
                         egui::Button::new("  OK  "),
                     );
@@ -3800,8 +3871,6 @@ impl App {
                             ui.visuals().error_fg_color,
                             "色: HEX は6桁で指定してください",
                         );
-                    } else if !state.settings.folder_cell_background.valid() {
-                        ui.colored_label(ui.visuals().error_fg_color, "フォルダの背景は文字とのコントラスト比が4.5:1以上の色を指定してください");
                     } else if !state.settings.details_name_colors.valid_standard_custom() {
                         ui.colored_label(
                             ui.visuals().error_fg_color,
@@ -3869,6 +3938,38 @@ impl App {
             open = true;
         }
         self.submit_browser_integration_preferences(ctx);
+        if apply {
+            let state = self.pref_state.as_mut().unwrap();
+            let themes = crate::folder_cell_background::newly_painted_low_contrast(
+                &self.settings.folder_cell_background,
+                &state.settings.folder_cell_background,
+            );
+            if !themes.is_empty() {
+                state.folder_background_confirmation = Some(themes);
+                apply = false;
+            }
+        }
+        // The modal owns close/key decisions even in its opening and closing frame.
+        if let Some(state) = self.pref_state.as_mut()
+            && let Some(themes) = state.folder_background_confirmation.as_ref()
+        {
+            cancel = false;
+            open = true;
+            if let Some(confirmed) =
+                draw_folder_background_confirm(ctx, &state.settings.folder_cell_background, themes)
+            {
+                state.folder_background_confirmation = None;
+                if confirmed {
+                    apply = true;
+                } else {
+                    let entry = search_index::PREF_SEARCH_INDEX
+                        .iter()
+                        .find(|entry| entry.anchor == "thumbnail/folder-background")
+                        .expect("folder background search entry");
+                    select_preference_search_result(state, entry);
+                }
+            }
+        }
         if apply {
             self.apply_preferences_dialog(ctx);
         } else if cancel || !open {
@@ -6521,7 +6622,174 @@ mod tests {
     }
 
     #[test]
-    fn folder_cell_background_preferences_edit_ok_paints_and_invalid_blocks_ok() {
+    fn folder_cell_background_preferences_reselect_escape_and_backdrop_keep_draft() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        for dismiss in ["button", "escape", "backdrop"] {
+            let mut harness = preferences_view_harness(PreferencesPage::General);
+            let live = harness.state().settings.preferences_snapshot();
+            let draft = {
+                let state = harness.state_mut().pref_state.as_mut().unwrap();
+                state.settings.folder_cell_background.enabled = true;
+                state.settings.folder_cell_background.light = [255, 230, 140];
+                state.settings.thumb_show_type_icon = !live.thumb_show_type_icon;
+                state.settings.preferences_snapshot()
+            };
+            harness.run_steps(3);
+            harness.get_by_label("  OK  ").click();
+            harness.run_steps(3);
+            let ratio = crate::folder_cell_background::display_text_contrast(
+                draft.folder_cell_background.min_text_contrast(false),
+            );
+            let message = format!(
+                "Light の色は文字とのコントラスト比が {ratio} (4.5:1 未満) です。検索結果のフォルダの場所や件数が読みにくくなることがあります。"
+            );
+            assert!(harness.get_by_label(&message).rect().is_positive());
+            assert!(
+                harness
+                    .get_by_label("  OK  ")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            assert!(settings_equal_for_close_prompt(
+                &harness.state().settings,
+                &live
+            ));
+            // Enter belongs to the modal; it cannot commit the draft through Preferences.
+            harness.key_press(egui::Key::Enter);
+            harness.run_steps(3);
+            assert!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .folder_background_confirmation
+                    .is_some()
+            );
+            assert!(settings_equal_for_close_prompt(
+                &harness.state().settings,
+                &live
+            ));
+            match dismiss {
+                "button" => harness.get_by_label("色を選び直す").click(),
+                "escape" => harness.key_press(egui::Key::Escape),
+                "backdrop" => {
+                    let pos = egui::pos2(5.0, 5.0);
+                    harness.event(egui::Event::PointerMoved(pos));
+                    for pressed in [true, false] {
+                        harness.event(egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        });
+                        harness.run_steps(1);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            harness.run_steps(3);
+            assert!(harness.state().show_preferences, "{dismiss}");
+            assert!(
+                !harness.state().show_preferences_discard_confirm,
+                "{dismiss}"
+            );
+            let state = harness.state().pref_state.as_ref().unwrap();
+            assert!(state.folder_background_confirmation.is_none(), "{dismiss}");
+            assert_eq!(state.selected, PreferencesPage::Thumbnail, "{dismiss}");
+            assert_eq!(
+                state.highlight.map(|value| value.0),
+                Some("thumbnail/folder-background")
+            );
+            assert!(
+                settings_equal_for_close_prompt(&state.settings, &draft),
+                "{dismiss}"
+            );
+            assert!(settings_equal_for_close_prompt(
+                &harness.state().settings,
+                &live
+            ));
+        }
+    }
+
+    #[test]
+    fn folder_cell_background_preferences_unchanged_and_disabled_skip_confirmation() {
+        use egui_kittest::kittest::Queryable;
+        let mut harness = preferences_view_harness(PreferencesPage::General);
+        // OFF retains low-contrast colors without asking.
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .folder_cell_background
+            .light = [255, 230, 140];
+        harness.run_steps(3);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert_eq!(
+            harness.state().settings.folder_cell_background.light,
+            [255, 230, 140]
+        );
+        assert!(!harness.state().settings.folder_cell_background.enabled);
+        // Enabling that retained color starts painting it, so OK must ask.
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::General);
+        harness.run_steps(3);
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .folder_cell_background
+            .enabled = true;
+        harness.run_steps(3);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().settings.folder_cell_background.enabled);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .folder_background_confirmation,
+            Some(vec![false])
+        );
+        harness.get_by_label("この色で設定").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        // Another preference changes without asking about the same live color again.
+        let before = harness.state().settings.thumb_show_type_icon;
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::General);
+        harness.run_steps(3);
+        harness
+            .state_mut()
+            .pref_state
+            .as_mut()
+            .unwrap()
+            .settings
+            .thumb_show_type_icon = !before;
+        harness.run_steps(3);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert!(harness.state().settings.folder_cell_background.enabled);
+        assert_eq!(
+            harness.state().settings.folder_cell_background.light,
+            [255, 230, 140]
+        );
+        assert_eq!(harness.state().settings.thumb_show_type_icon, !before);
+    }
+
+    #[test]
+    fn folder_cell_background_preferences_confirm_applies_saves_and_paints() {
         use egui_kittest::kittest::{NodeT, Queryable};
         fn collect_rects(
             shape: &egui::Shape,
@@ -6678,7 +6946,7 @@ mod tests {
         harness.run_steps(3);
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
         harness.run_steps(3);
-        harness.get_by_label(hex).type_text("FFF0B3");
+        harness.get_by_label(hex).type_text("FFF");
         harness.run_steps(3);
         assert!(
             harness
@@ -6689,7 +6957,7 @@ mod tests {
         assert!(!harness.state().settings.folder_cell_background.enabled);
         harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
         harness.run_steps(3);
-        harness.get_by_label(hex).type_text("FFFFE6");
+        harness.get_by_label(hex).type_text("FFE68C");
         harness.run_steps(3);
         assert!(
             !harness
@@ -6712,9 +6980,27 @@ mod tests {
         );
         harness.get_by_label("  OK  ").click();
         harness.run_steps(3);
+        assert!(harness.state().show_preferences);
+        assert!(!harness.state().settings.folder_cell_background.enabled);
+        assert!(
+            harness
+                .get_by_label("フォルダの背景色の確認")
+                .rect()
+                .is_positive()
+        );
+        let before = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        assert!(
+            !before
+                .load_into_settings()
+                .unwrap()
+                .folder_cell_background
+                .enabled
+        );
+        harness.get_by_label("この色で設定").click();
+        harness.run_steps(3);
         let expected = crate::folder_cell_background::FolderCellBackground {
             enabled: true,
-            light: [255, 255, 230],
+            light: [255, 230, 140],
             dark: [30, 35, 20],
         };
         assert!(!harness.state().show_preferences);
@@ -7039,6 +7325,137 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn preferences_narrow_layout_all_pages_fit_and_actions_visible() {
+        use crate::test_ui::scroll_layout::ScrollLayout;
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut harness = preferences_view_harness(PreferencesPage::General);
+        let window_id = egui::Id::unique("環境設定");
+        let before = harness
+            .ctx
+            .memory(|memory| memory.area_rect(window_id))
+            .unwrap();
+        let start = before.right_center();
+        let end = start - egui::vec2(before.width(), 0.0);
+        harness.hover_at(start);
+        harness.run_steps(2);
+        harness.drag_at(start);
+        harness.run_steps(2);
+        harness.hover_at(end);
+        harness.run_steps(3);
+        harness.drop_at(end);
+        harness.run_steps(4);
+        let narrow = harness
+            .ctx
+            .memory(|memory| memory.area_rect(window_id))
+            .unwrap();
+        assert!(
+            (narrow.width() - PREFERENCES_MIN_WIDTH).abs() <= 1.0,
+            "minimum width not reached: before={before:?}, after={narrow:?}, configured={PREFERENCES_MIN_WIDTH}"
+        );
+        assert!(PREFERENCES_MIN_WIDTH <= 640.0);
+        let mut failures = Vec::new();
+        for &page in PreferencesPage::ALL {
+            {
+                let state = harness.state_mut().pref_state.as_mut().unwrap();
+                state.selected = page;
+                state.showing_results = false;
+                state.pending_anchor = None;
+                state.highlight = None;
+                state.right_panel_scroll_generation =
+                    state.right_panel_scroll_generation.wrapping_add(1);
+            }
+            harness.run_steps(4);
+            let mut width_reported = false;
+            // Visit the entire page so ComboBoxes below the first viewport are checked too.
+            for step in 0..128 {
+                let (rendered, layout) = harness
+                    .ctx
+                    .data(|data| {
+                        data.get_temp::<(PreferencesPage, ScrollLayout)>(egui::Id::unique(
+                            "preferences_right_panel_layout",
+                        ))
+                    })
+                    .expect("production preferences ScrollArea");
+                assert_eq!(rendered, page);
+                let tolerance = 1.0 / harness.ctx.pixels_per_point();
+                if layout.content.x > layout.inner.width() + tolerance && !width_reported {
+                    width_reported = true;
+                    failures.push(format!("page={page:?} ({}) step={step}: content width {} > viewport {}; layout={layout:?}",
+                        page.label(), layout.content.x, layout.inner.width()));
+                    for role in [
+                        egui::accesskit::Role::Label,
+                        egui::accesskit::Role::ComboBox,
+                        egui::accesskit::Role::Button,
+                        egui::accesskit::Role::TextInput,
+                    ] {
+                        for node in harness.get_all_by_role(role) {
+                            let rect = node.rect();
+                            if rect.left() >= layout.inner.left()
+                                && rect.right() > layout.inner.right() + tolerance
+                            {
+                                failures.push(format!(
+                                    "page={page:?}: overflowing {role:?}, rect={rect:?}, node={:?}",
+                                    node.accesskit_node()
+                                ));
+                            }
+                        }
+                    }
+                }
+                let row_height = harness.ctx.global_style().spacing.interact_size.y;
+                for combo in harness.get_all_by_role(egui::accesskit::Role::ComboBox) {
+                    let rect = combo.rect();
+                    if rect.height() > row_height + tolerance {
+                        failures.push(format!("page={page:?} ({}) step={step}: ComboBox value={:?}, rect={rect:?}, one-row height={row_height}, node={:?}",
+                            page.label(), combo.value(), combo.accesskit_node()));
+                    }
+                }
+                for label in ["  OK  ", "キャンセル"] {
+                    let rect = harness.get_by_label(label).rect();
+                    if !harness.ctx.content_rect().contains_rect(rect) || !rect.is_positive() {
+                        failures.push(format!(
+                            "page={page:?}: action {label:?} outside 1093x614 screen: {rect:?}"
+                        ));
+                    }
+                }
+                let max_offset = (layout.content.y - layout.inner.height()).max(0.0);
+                if layout.offset.y + tolerance >= max_offset {
+                    break;
+                }
+                assert!(step < 127, "page={page:?}: failed to reach end: {layout:?}");
+                harness.hover_at(layout.inner.center());
+                harness.event(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -layout.inner.height() * 0.8),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                });
+                harness.run_steps(6);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "narrow preferences at {PREFERENCES_MIN_WIDTH}px:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn preferences_minimum_width_is_clamped_to_small_screen() {
+        let mut harness = preferences_view_harness(PreferencesPage::General);
+        harness.set_size(egui::vec2(500.0, 614.0));
+        harness.run_steps(5);
+        let window = harness
+            .ctx
+            .memory(|memory| memory.area_rect(egui::Id::unique("環境設定")))
+            .unwrap();
+        assert!(
+            window.width() <= 500.0 - 48.0 + 1.0,
+            "clamped window={window:?}"
+        );
     }
 
     #[test]

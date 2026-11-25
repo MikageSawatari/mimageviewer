@@ -58,6 +58,103 @@ fn make_scan_ready(app: &mut App) -> Arc<AtomicBool> {
 }
 
 #[test]
+fn capture_destination_missing_warns_without_replacing_current_listing() {
+    let mut app = setup_app();
+    let origin = folder(&app, "capture-origin");
+    std::fs::create_dir(origin.join("child")).unwrap();
+    app.load_folder(origin.clone());
+    app.finish_page_identity_preparation_for_test();
+    let generation = app.items_generation;
+    let items = app.items.clone();
+    let address = app.address.clone();
+    let selected = app.selected;
+    let destination = app.tmp.path().join("capture-not-created");
+    app.start_capture_destination_open(destination.clone());
+    assert!(matches!(
+        app.folder_pane_open_pending.as_ref().unwrap().purpose,
+        FolderOpenScanPurpose::CaptureDestinationNavigation
+    ));
+    make_scan_ready(&mut app);
+    let ctx = egui::Context::default();
+    app.post_render_main_navigation(&ctx, update_phases::MainFrameNavigation::default());
+    assert_eq!(
+        app.fs_feedback_toast.as_ref().unwrap().0,
+        crate::known_folders::CAPTURE_DESTINATION_NOT_FOUND
+    );
+    assert_eq!(app.current_folder.as_ref(), Some(&origin));
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.items, items);
+    assert_eq!(app.selected, selected);
+    assert_eq!(app.address, address);
+    // The intent must not leak into a subsequent ordinary pane open of the same path.
+    app.start_folder_pane_open(destination);
+    make_scan_ready(&mut app);
+    app.post_render_main_navigation(&ctx, update_phases::MainFrameNavigation::default());
+    assert_eq!(
+        app.fs_feedback_toast.as_ref().unwrap().0,
+        "フォルダを読み取れませんでした"
+    );
+    assert_eq!(app.current_folder.as_ref(), Some(&origin));
+    assert_eq!(app.items_generation, generation);
+}
+
+#[test]
+fn capture_destination_existing_opens_like_pane_navigation() {
+    let mut app = setup_app();
+    app.settings.auto_fullscreen_image_folders = false;
+    let origin = folder(&app, "capture-existing-origin");
+    let destination = folder(&app, "capture-existing-destination");
+    std::fs::create_dir(destination.join("child")).unwrap();
+    app.load_folder(origin.clone());
+    app.finish_page_identity_preparation_for_test();
+    app.start_capture_destination_open(destination.clone());
+    make_scan_ready(&mut app);
+    app.post_render_main_navigation(
+        &egui::Context::default(),
+        update_phases::MainFrameNavigation::default(),
+    );
+    app.finish_page_identity_preparation_for_test();
+    assert_eq!(app.current_folder.as_ref(), Some(&destination));
+    assert!(
+        app.items
+            .contains(&GridItem::Folder(destination.join("child")))
+    );
+    assert_eq!(
+        app.folder_nav_back_stack.last().unwrap().location,
+        FolderNavHistoryTarget::Path(origin)
+    );
+}
+
+#[test]
+fn capture_destination_other_scan_errors_keep_generic_warning() {
+    let mut app = setup_app();
+    let origin = folder(&app, "capture-error-origin");
+    app.load_folder(origin.clone());
+    app.finish_page_identity_preparation_for_test();
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::Other,
+    ] {
+        let destination = app.tmp.path().join("capture-error");
+        app.start_capture_destination_open(destination);
+        let pending = app.folder_pane_open_pending.as_mut().unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(Err(std::io::Error::from(kind))).unwrap();
+        pending.rx = rx;
+        app.post_render_main_navigation(
+            &egui::Context::default(),
+            update_phases::MainFrameNavigation::default(),
+        );
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "フォルダを読み取れませんでした",
+            "{kind:?}"
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
+    }
+}
+
+#[test]
 fn direct_navigation_worker_ready_scan_yields_to_same_frame_navigation_inputs() {
     for input in ["favorite", "address", "tree"] {
         let mut app = setup_app();

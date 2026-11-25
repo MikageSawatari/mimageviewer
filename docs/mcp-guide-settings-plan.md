@@ -1304,7 +1304,7 @@ instructions のガイド追加は 257 字、全体は 1,109 UTF-16 単位。
 
 | 鍵 | anchor | 値・検査 |
 | --- | --- | --- |
-| `folder_cell_background` | `thumbnail/folder-background` | `{ enabled, light: [u8; 3], dark: [u8; 3] }`。`FolderCellBackground::valid` が、実描画と共有する階層パス・件数の文字色に対して両テーマとも 4.5:1 以上を要求する。OFF でも保存した色を検査する |
+| `folder_cell_background` | `thumbnail/folder-background` | `{ enabled, light: [u8; 3], dark: [u8; 3] }`。4.5:1 未満の色も受け付ける。読みやすさによる確認は環境設定の OK だけで行い、AI からの変更では確認しない。型・RGB の範囲の検査は維持する (§1.890) |
 
 除外側で第 1 段に加えた鍵と画面の anchor (57 鍵):
 

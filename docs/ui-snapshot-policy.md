@@ -16,6 +16,8 @@ PNG の生成・目視・通常比較は未実施で、ClaudeCode が行う。in
 
 # UI スナップショットテスト運用方針
 
+§1.890 / §1.857 の変更は `prefs-890-857-862-plan.md` を参照。低コントラスト確認の PNG は追加せず、文言と遷移を headless テストで検査する。既定色の4枚は変更なしの見込み。狭幅の折り返しとラベル付きコンボの分離は既存 fixture の比較が必要で、PNG の生成・比較・目視は未実施 (コンパイル禁止の委任条件)。変更が出たものだけ設計担当が生成して目視する。
+
 §1.843 の AI 連携は、既存の `agent_integration_window_{disabled,read,open,organize,records}_{light,dark}`
 の10枚を更新対象にする。新しい許可2つと補足、3区画の表示、確認なしで実行する範囲の説明を追加した。
 disabled / read は新しいチェックをOFF、open / organize / records はONにして描く。

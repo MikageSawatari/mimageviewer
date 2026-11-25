@@ -296,7 +296,7 @@ pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
         let mut selected = state.settings.ui_font.selection.clone();
         let selected_label = selected.display_name().to_string();
         let filter = state.ui_font_filter.trim().to_lowercase();
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let label = ui.label("フォント:");
             egui::ComboBox::from_id_salt("ui_font_face")
                 .selected_text(selected_label)
@@ -335,7 +335,7 @@ pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .response
                 .labelled_by(label.id);
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("絞り込み:");
             crate::ime_focus::add_singleline(ui, &mut state.ui_font_filter, None, |edit| {
                 edit.desired_width(210.0).hint_text("フォント名")
@@ -361,7 +361,7 @@ pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     ui.add_space(4.0);
     anchored(ui, state, "font/vertical-adjust", |ui, state| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let label = ui.label("縦位置の微調整:");
             let response = ui
                 .add(
@@ -1570,7 +1570,7 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     ui.end_row();
                 }
             });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("既定に戻す").clicked() {
                 s.grid_display_order = settings::GridDisplayOrder::default();
             }
@@ -7975,7 +7975,7 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "ai-backend/backend", |ui, state| {
         ui.label("バックエンド:");
         anchored(ui, state, "ai-backend/tensorrt-pack", |ui, _state| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.radio_value(
                     &mut new_choice,
                     AiBackend::DirectMl,
@@ -8017,7 +8017,7 @@ pub(super) fn page_ai_backend(ui: &mut egui::Ui, state: &mut PreferencesState) {
             AiBackend::DirectMl | AiBackend::Cpu => state.trt_worker_active,
         }
     };
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         if trt_unavailable {
             ui.label("現在動作中: DirectML");
             ui.colored_label(
@@ -8868,24 +8868,38 @@ pub(super) fn draw_video_bar_visibility_settings(
     ui.small("ON にするとストリップを開いたままにし、下部シークバーも固定して、ストリップの領域を映像から除外します。ストリップ右上の鍵アイコンからも切り替えできます。");
     ui.small("固定バーと映像の間隔は、静止画フルスクリーンと共通の余白設定を使います。");
     ui.add_space(6.0);
-    egui::ComboBox::from_label("マウスオーバーのサムネイル")
-        .selected_text(settings.video_seek_hover_preview_mode.label())
-        .show_ui(ui, |ui| {
-            for mode in crate::settings::VideoSeekHoverPreviewMode::ALL {
-                ui.selectable_value(
-                    &mut settings.video_seek_hover_preview_mode,
-                    mode,
-                    mode.label(),
-                );
-            }
-        });
-    egui::ComboBox::from_label("サムネイルストリップ表示中の通常シークバー")
-        .selected_text(settings.video_seek_bar_with_strip.label())
-        .show_ui(ui, |ui| {
-            for mode in crate::settings::VideoSeekBarWithStrip::ALL {
-                ui.selectable_value(&mut settings.video_seek_bar_with_strip, mode, mode.label());
-            }
-        });
+    ui.horizontal_wrapped(|ui| {
+        let combo = egui::ComboBox::from_id_salt("マウスオーバーのサムネイル")
+            .selected_text(settings.video_seek_hover_preview_mode.label())
+            .show_ui(ui, |ui| {
+                for mode in crate::settings::VideoSeekHoverPreviewMode::ALL {
+                    ui.selectable_value(
+                        &mut settings.video_seek_hover_preview_mode,
+                        mode,
+                        mode.label(),
+                    );
+                }
+            });
+        combo
+            .response
+            .labelled_by(ui.label("マウスオーバーのサムネイル").id);
+    });
+    ui.horizontal_wrapped(|ui| {
+        let combo = egui::ComboBox::from_id_salt("サムネイルストリップ表示中の通常シークバー")
+            .selected_text(settings.video_seek_bar_with_strip.label())
+            .show_ui(ui, |ui| {
+                for mode in crate::settings::VideoSeekBarWithStrip::ALL {
+                    ui.selectable_value(
+                        &mut settings.video_seek_bar_with_strip,
+                        mode,
+                        mode.label(),
+                    );
+                }
+            });
+        combo
+            .response
+            .labelled_by(ui.label("サムネイルストリップ表示中の通常シークバー").id);
+    });
 }
 
 pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -9016,7 +9030,7 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(8.0);
         anchored(ui, state, "video/seek-thumbnail-tolerance", |ui, state| {
             let s = &mut state.settings;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let label = ui.label("シーク時のズレ許容 (秒)");
                 ui.add(
                     egui::DragValue::new(&mut s.video_seek_thumbnail_tolerance_secs)
@@ -9072,7 +9086,7 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(8.0);
         anchored(ui, state, "video/seek-strip-interval", |ui, state| {
             let s = &mut state.settings;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let label = ui.label("シークストリップの画像間隔");
                 egui::ComboBox::from_id_salt("video_seek_strip_min_interval")
                     .selected_text(crate::video::seek_strip::format_seek_strip_range_value(
@@ -9105,7 +9119,7 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.add_space(8.0);
         anchored(ui, state, "video/seek-strip-waveform-span", |ui, state| {
             let s = &mut state.settings;
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let label = ui.label("音声波形で見渡す範囲");
                 egui::ComboBox::from_id_salt("video_seek_strip_waveform_span")
                     .selected_text(crate::video::seek_strip::format_seek_strip_range_value(
@@ -9224,7 +9238,7 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
         for (index, entry) in state.settings.creative_luts.iter_mut().enumerate() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 if let Some(builtin) = entry.builtin {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(egui::RichText::new(&entry.name).strong());
                         ui.label(
                             egui::RichText::new("組み込みプリセット")
@@ -9234,7 +9248,7 @@ pub(super) fn page_creative_lut(ui: &mut egui::Ui, state: &mut PreferencesState)
                     });
                     ui.label(egui::RichText::new(builtin.description()).small().weak());
                 } else {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label("表示名:");
                         crate::ime_focus::add_singleline(ui, &mut entry.name, None, |edit| {
                             edit.desired_width(220.0).hint_text("LUT名")
@@ -10389,7 +10403,7 @@ pub(super) fn page_exif_display(
     ui.add_space(4.0);
 
     anchored(ui, state, "exif/custom-tag", |ui, state| {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let field_label = ui.label("カスタム追加:");
             let response = ui
                 .text_edit_singleline(&mut state.exif_add_tag_input)
@@ -11119,7 +11133,8 @@ pub(super) fn draw_fullscreen_page_start_position_setting(
     ui: &mut egui::Ui,
     settings: &mut Settings,
 ) {
-    egui::ComboBox::from_label("ページ切替後の表示位置")
+    ui.horizontal_wrapped(|ui| {
+            let combo = egui::ComboBox::from_id_salt("ページ切替後の表示位置")
         .selected_text(settings.fullscreen_page_start_position.label())
         .show_ui(ui, |ui| {
             for &position in FullscreenPageStartPosition::all() {
@@ -11128,6 +11143,8 @@ pub(super) fn draw_fullscreen_page_start_position_setting(
         })
         .response
         .on_hover_text("読み始めは、縦にはみ出すときは上端、横にはみ出すときは読み方向の始まり（右→左なら右端、左→右なら左端）に合わせます。");
+            combo.labelled_by(ui.label("ページ切替後の表示位置").id);
+        });
     ui.small("画面からはみ出すとき、ページを切り替えた直後にどこから表示するか。");
 }
 
@@ -11162,13 +11179,18 @@ fn draw_fullscreen_wheel_action_setting(ui: &mut egui::Ui, value: &mut Fullscree
 }
 
 fn draw_fullscreen_wheel_zoom_step_setting(ui: &mut egui::Ui, value: &mut FullscreenWheelZoomStep) {
-    egui::ComboBox::from_label("ホイールでの拡大・縮小の刻み")
-        .selected_text(value.label())
-        .show_ui(ui, |ui| {
-            for &step in FullscreenWheelZoomStep::all() {
-                ui.selectable_value(value, step, step.label());
-            }
-        });
+    ui.horizontal_wrapped(|ui| {
+        let combo = egui::ComboBox::from_id_salt("ホイールでの拡大・縮小の刻み")
+            .selected_text(value.label())
+            .show_ui(ui, |ui| {
+                for &step in FullscreenWheelZoomStep::all() {
+                    ui.selectable_value(value, step, step.label());
+                }
+            });
+        combo
+            .response
+            .labelled_by(ui.label("ホイールでの拡大・縮小の刻み").id);
+    });
     ui.small("静止画のホイールズーム（通常のホイールがズーム・Ctrl+ホイール・編集中）で、1 段ごとに拡大する倍率です。縮小はその逆の倍率です。Z ズーム・動画・キー・中ボタンドラッグ・タッチ・ゲームパッド・360 度には適用しません。");
 }
 
@@ -11310,13 +11332,18 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     ui.add_space(4.0);
     anchored(ui, state, "spread/page-layout", |ui, state| {
         let s = &mut state.settings;
-        egui::ComboBox::from_label("デフォルトのページ構成")
-            .selected_text(s.default_spread_mode.label())
-            .show_ui(ui, |ui| {
-                for &mode in SpreadMode::all() {
-                    ui.selectable_value(&mut s.default_spread_mode, mode, mode.label());
-                }
-            });
+        ui.horizontal_wrapped(|ui| {
+            let combo = egui::ComboBox::from_id_salt("デフォルトのページ構成")
+                .selected_text(s.default_spread_mode.label())
+                .show_ui(ui, |ui| {
+                    for &mode in SpreadMode::all() {
+                        ui.selectable_value(&mut s.default_spread_mode, mode, mode.label());
+                    }
+                });
+            combo
+                .response
+                .labelled_by(ui.label("デフォルトのページ構成").id);
+        });
     });
     anchored(
         ui,
@@ -11379,13 +11406,18 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     ui.add_space(8.0);
     anchored(ui, state, "spread/reading-flow", |ui, state| {
         let s = &mut state.settings;
-        egui::ComboBox::from_label("デフォルトの連結方式")
-            .selected_text(s.default_reading_flow.label())
-            .show_ui(ui, |ui| {
-                for &flow in ReadingFlow::all() {
-                    ui.selectable_value(&mut s.default_reading_flow, flow, flow.label());
-                }
-            });
+        ui.horizontal_wrapped(|ui| {
+            let combo = egui::ComboBox::from_id_salt("デフォルトの連結方式")
+                .selected_text(s.default_reading_flow.label())
+                .show_ui(ui, |ui| {
+                    for &flow in ReadingFlow::all() {
+                        ui.selectable_value(&mut s.default_reading_flow, flow, flow.label());
+                    }
+                });
+            combo
+                .response
+                .labelled_by(ui.label("デフォルトの連結方式").id);
+        });
     });
     anchored(ui, state, "spread/direction", |ui, state| {
         let s = &mut state.settings;
@@ -11472,52 +11504,76 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     });
     anchored(ui, state, "spread/seek-preview", |ui, state| {
         let s = &mut state.settings;
-        egui::ComboBox::from_label("マウスオーバーのサムネイル")
-            .selected_text(s.still_seek_hover_preview_mode.label())
-            .show_ui(ui, |ui| {
-                for mode in crate::settings::StillSeekHoverPreviewMode::ALL {
-                    ui.selectable_value(&mut s.still_seek_hover_preview_mode, mode, mode.label());
-                }
-            });
+        ui.horizontal_wrapped(|ui| {
+            let combo = egui::ComboBox::from_id_salt("マウスオーバーのサムネイル")
+                .selected_text(s.still_seek_hover_preview_mode.label())
+                .show_ui(ui, |ui| {
+                    for mode in crate::settings::StillSeekHoverPreviewMode::ALL {
+                        ui.selectable_value(
+                            &mut s.still_seek_hover_preview_mode,
+                            mode,
+                            mode.label(),
+                        );
+                    }
+                });
+            combo
+                .response
+                .labelled_by(ui.label("マウスオーバーのサムネイル").id);
+        });
     });
     anchored(ui, state, "spread/seek-bar-with-strip", |ui, state| {
         let s = &mut state.settings;
-        egui::ComboBox::from_label("サムネイル列表示中の通常シークバー")
-            .selected_text(s.still_seek_bar_with_strip.label())
-            .show_ui(ui, |ui| {
-                for mode in crate::settings::StillSeekBarWithStrip::ALL {
-                    ui.selectable_value(&mut s.still_seek_bar_with_strip, mode, mode.label());
-                }
-            });
+        ui.horizontal_wrapped(|ui| {
+            let combo = egui::ComboBox::from_id_salt("サムネイル列表示中の通常シークバー")
+                .selected_text(s.still_seek_bar_with_strip.label())
+                .show_ui(ui, |ui| {
+                    for mode in crate::settings::StillSeekBarWithStrip::ALL {
+                        ui.selectable_value(&mut s.still_seek_bar_with_strip, mode, mode.label());
+                    }
+                });
+            combo
+                .response
+                .labelled_by(ui.label("サムネイル列表示中の通常シークバー").id);
+        });
     });
     anchored(ui, state, "spread/seek-direction", |ui, state| {
         let s = &mut state.settings;
-        egui::ComboBox::from_label("ページシークバーの方向")
-            .selected_text(s.fullscreen_seek_direction.label())
-            .show_ui(ui, |ui| {
-                for &direction in FullscreenSeekDirection::all() {
-                    ui.selectable_value(
-                        &mut s.fullscreen_seek_direction,
-                        direction,
-                        direction.label(),
-                    );
-                }
-            });
+        ui.horizontal_wrapped(|ui| {
+            let combo = egui::ComboBox::from_id_salt("ページシークバーの方向")
+                .selected_text(s.fullscreen_seek_direction.label())
+                .show_ui(ui, |ui| {
+                    for &direction in FullscreenSeekDirection::all() {
+                        ui.selectable_value(
+                            &mut s.fullscreen_seek_direction,
+                            direction,
+                            direction.label(),
+                        );
+                    }
+                });
+            combo
+                .response
+                .labelled_by(ui.label("ページシークバーの方向").id);
+        });
         ui.small("「読み方向に合わせる」では、右→左の本はシークバー右端が先頭です。この設定はシークバーのつまみ・塗り・バー上のクリック／ドラッグに適用されます。");
     });
     anchored(ui, state, "spread/cursor-direction", |ui, state| {
         let s = &mut state.settings;
-        egui::ComboBox::from_label("カーソルキー左右の方向")
-            .selected_text(s.fullscreen_horizontal_cursor_direction.label())
-            .show_ui(ui, |ui| {
-                for &direction in FullscreenHorizontalCursorDirection::all() {
-                    ui.selectable_value(
-                        &mut s.fullscreen_horizontal_cursor_direction,
-                        direction,
-                        direction.label(),
-                    );
-                }
-            });
+        ui.horizontal_wrapped(|ui| {
+            let combo = egui::ComboBox::from_id_salt("カーソルキー左右の方向")
+                .selected_text(s.fullscreen_horizontal_cursor_direction.label())
+                .show_ui(ui, |ui| {
+                    for &direction in FullscreenHorizontalCursorDirection::all() {
+                        ui.selectable_value(
+                            &mut s.fullscreen_horizontal_cursor_direction,
+                            direction,
+                            direction.label(),
+                        );
+                    }
+                });
+            combo
+                .response
+                .labelled_by(ui.label("カーソルキー左右の方向").id);
+        });
         ui.small("通常の左右キーによるページ移動だけに適用します。前／次コマンド、Shift+左右、Ctrl+左右、PageUp／PageDown、画面端クリック、ホイールの方向は変わりません。");
     });
     anchored(ui, state, "spread/up-down-key-action", |ui, state| {
@@ -11553,7 +11609,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     // 共通値 1 つにする。個別値が必要になる具体例が出るまでは対称な設定を正本とする。
     anchored(ui, state, "spread/bar-gap", |ui, state| {
         let s = &mut state.settings;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let label = ui.label("固定バーと表示内容の間隔");
             ui.add(
                 egui::DragValue::new(&mut s.fullscreen_fixed_bar_gap_px)
@@ -11604,7 +11660,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     });
     anchored(ui, state, "spread/page-jump", |ui, state| {
         let s = &mut state.settings;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             let label = ui.label("ページジャンプ量");
             egui::ComboBox::from_id_salt("fullscreen_jump_mode")
                 .selected_text(s.fullscreen_jump_mode.label())
