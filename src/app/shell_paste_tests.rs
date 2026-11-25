@@ -77,10 +77,20 @@ type FocusTrace =
 
 struct HandlerFocus {
     foreign_process: bool,
+    started_from_main: bool,
+    owned_by_main: bool,
     trace: FocusTrace,
 }
 
 impl FocusApi for HandlerFocus {
+    fn started_from_main(&mut self, main_hwnd: isize) -> bool {
+        self.trace
+            .lock()
+            .unwrap()
+            .push(("start", main_hwnd, std::thread::current().id()));
+        self.started_from_main
+    }
+
     fn snapshot(&mut self, main_hwnd: isize) -> FocusSnapshot {
         self.trace
             .lock()
@@ -93,6 +103,9 @@ impl FocusApi for HandlerFocus {
             foreground_hwnd: 2,
             foreground_thread: 11,
             foreground_process: if self.foreign_process { 101 } else { 100 },
+            root_owner_hwnd: if self.owned_by_main { main_hwnd } else { 3 },
+            foreground_visible: true,
+            main_enabled: true,
         }
     }
 
@@ -110,6 +123,15 @@ impl FocusApi for HandlerFocus {
 }
 
 fn assert_handler_focus_completion(foreign_process: bool, invocation: ShellPasteResult) {
+    assert_handler_focus_completion_with(foreign_process, true, true, invocation);
+}
+
+fn assert_handler_focus_completion_with(
+    foreign_process: bool,
+    started_from_main: bool,
+    owned_by_main: bool,
+    invocation: ShellPasteResult,
+) {
     for origin in [
         ShellPasteOrigin::Tree,
         ShellPasteOrigin::CtrlV,
@@ -130,6 +152,8 @@ fn assert_handler_focus_completion(foreign_process: bool, invocation: ShellPaste
             },
             HandlerFocus {
                 foreign_process,
+                started_from_main,
+                owned_by_main,
                 trace: trace.clone(),
             },
         );
@@ -146,11 +170,11 @@ fn assert_handler_focus_completion(foreign_process: bool, invocation: ShellPaste
         }
         let start_failed = matches!(invocation, Err(ShellPasteError::Start(_)));
         let expected_calls: &[&str] = if start_failed {
-            &["invoke"] // fake invoker simulates failing before Shell was called
-        } else if foreign_process {
-            &["invoke", "snapshot"]
+            &["start", "invoke"] // fake invoker simulates failing before Shell was called
+        } else if foreign_process || !started_from_main || !owned_by_main {
+            &["start", "invoke", "snapshot"]
         } else {
-            &["invoke", "snapshot", "restore"]
+            &["start", "invoke", "snapshot", "restore"]
         };
         let calls = trace.lock().unwrap().clone();
         assert_eq!(
@@ -180,8 +204,12 @@ fn assert_handler_focus_completion(foreign_process: bool, invocation: ShellPaste
                 events[0]["focus_return"],
                 if start_failed {
                     "not_invoked"
+                } else if !started_from_main {
+                    "not_started_from_main"
                 } else if foreign_process {
                     "other_process"
+                } else if !owned_by_main {
+                    "unowned_window"
                 } else {
                     "restored"
                 }
@@ -213,11 +241,21 @@ fn shell_paste_handler_failed_invocation_still_returns_focus_and_records_end() {
 }
 
 #[test]
-fn shell_paste_handler_start_failure_records_not_invoked_without_focus_query() {
+fn shell_paste_handler_start_failure_records_not_invoked_without_focus_return_query() {
     assert_handler_focus_completion(
         false,
         Err(ShellPasteError::Start("fake OLE failure".into())),
     );
+}
+
+#[test]
+fn shell_paste_handler_does_not_restore_if_not_started_from_main() {
+    assert_handler_focus_completion_with(false, false, true, Ok(()));
+}
+
+#[test]
+fn shell_paste_handler_does_not_restore_unowned_worker_window() {
+    assert_handler_focus_completion_with(false, true, false, Ok(()));
 }
 
 #[test]

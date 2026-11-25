@@ -169,8 +169,9 @@ pub fn invoke_shell_folder_background_verb(
     hwnd: isize,
     folder: &std::path::Path,
     verb: ShellClipboardVerb,
+    before_invoke: impl FnOnce(),
 ) -> Result<(), String> {
-    windows_impl::invoke_shell_folder_background_verb(hwnd, folder, verb)
+    windows_impl::invoke_shell_folder_background_verb(hwnd, folder, verb, before_invoke)
 }
 
 #[cfg(not(windows))]
@@ -200,6 +201,7 @@ pub fn invoke_shell_folder_background_verb(
     hwnd: isize,
     folder: &std::path::Path,
     verb: ShellClipboardVerb,
+    _before_invoke: impl FnOnce(),
 ) -> Result<(), String> {
     let _ = (hwnd, folder, verb);
     Err("Shell clipboard verbs are available only on Windows".to_string())
@@ -1035,6 +1037,7 @@ mod windows_impl {
         hwnd: isize,
         folder: &std::path::Path,
         verb: ShellClipboardVerb,
+        before_invoke: impl FnOnce(),
     ) -> Result<(), String> {
         if hwnd == 0 {
             return Err("main HWND is not available".to_string());
@@ -1069,7 +1072,7 @@ mod windows_impl {
         );
         query_result?;
         let stage_t0 = Instant::now();
-        let result = invoke_canonical_verb(&menu, hwnd, verb);
+        let result = invoke_canonical_verb(&menu, hwnd, verb, before_invoke);
         let ms = elapsed_ms(stage_t0);
         emit_shell_verb_timing("verb_invoke", "background", verb, ms, 1, result.is_ok());
         result
@@ -1197,6 +1200,7 @@ mod windows_impl {
         shell_menu: &IContextMenu,
         hwnd: HWND,
         verb: ShellClipboardVerb,
+        before_invoke: impl FnOnce(),
     ) -> Result<(), String> {
         let verb_name = verb.canonical_name();
         let verb_cstr = CString::new(verb_name).expect("static Shell verb has no NUL");
@@ -1208,6 +1212,8 @@ mod windows_impl {
             hIcon: HANDLE::default(),
             ..Default::default()
         };
+        // Sample activation after bind/query, at the actual invocation boundary.
+        before_invoke();
         unsafe { shell_menu.InvokeCommand(&invoke) }
             .map_err(|e| format!("IContextMenu::InvokeCommand({verb_name}) failed: {e}"))
     }

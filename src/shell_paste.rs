@@ -24,6 +24,9 @@ pub(crate) enum FocusReturn {
     MainGone,
     RestoreFailed,
     NotInvoked,
+    NotStartedFromMain,
+    NoForeground,
+    UnownedWindow,
 }
 
 impl FocusReturn {
@@ -36,6 +39,9 @@ impl FocusReturn {
             Self::MainGone => "main_gone",
             Self::RestoreFailed => "restore_failed",
             Self::NotInvoked => "not_invoked",
+            Self::NotStartedFromMain => "not_started_from_main",
+            Self::NoForeground => "no_foreground",
+            Self::UnownedWindow => "unowned_window",
         }
     }
 }
@@ -54,9 +60,13 @@ pub(crate) struct FocusSnapshot {
     pub(crate) foreground_hwnd: isize,
     pub(crate) foreground_thread: u32,
     pub(crate) foreground_process: u32,
+    pub(crate) root_owner_hwnd: isize,
+    pub(crate) foreground_visible: bool,
+    pub(crate) main_enabled: bool,
 }
 
 pub(crate) trait FocusApi {
+    fn started_from_main(&mut self, main_hwnd: isize) -> bool;
     fn snapshot(&mut self, main_hwnd: isize) -> FocusSnapshot;
     fn set_foreground(&mut self, main_hwnd: isize) -> bool;
     fn class_name(&self, foreground_hwnd: isize) -> String;
@@ -68,26 +78,39 @@ enum FocusDecision {
     Restore,
 }
 
-fn decide_focus_return(main_hwnd: isize, snapshot: &FocusSnapshot) -> FocusDecision {
+fn decide_focus_return(
+    main_hwnd: isize,
+    started_from_main: bool,
+    snapshot: &FocusSnapshot,
+) -> FocusDecision {
     if !snapshot.main_valid {
         FocusDecision::Keep(FocusReturn::MainGone)
     } else if snapshot.foreground_hwnd == main_hwnd {
         FocusDecision::Keep(FocusReturn::AlreadyMain)
+    } else if !started_from_main {
+        FocusDecision::Keep(FocusReturn::NotStartedFromMain)
     } else if snapshot.foreground_hwnd == 0 {
-        FocusDecision::Restore
+        FocusDecision::Keep(FocusReturn::NoForeground)
     } else if snapshot.foreground_process != snapshot.current_process {
         FocusDecision::Keep(FocusReturn::OtherProcess)
     } else if snapshot.foreground_thread == snapshot.main_thread {
         FocusDecision::Keep(FocusReturn::OtherMivWindow)
+    } else if snapshot.root_owner_hwnd != main_hwnd {
+        FocusDecision::Keep(FocusReturn::UnownedWindow)
     } else {
         FocusDecision::Restore
     }
 }
 
-fn return_focus(main_hwnd: isize, api: &mut dyn FocusApi) -> FocusReturn {
+fn return_focus(main_hwnd: isize, started_from_main: bool, api: &mut dyn FocusApi) -> FocusReturn {
     let snapshot = api.snapshot(main_hwnd);
-    let class_name = crate::perf::is_enabled().then(|| api.class_name(snapshot.foreground_hwnd));
-    let result = match decide_focus_return(main_hwnd, &snapshot) {
+    let classes = crate::perf::is_enabled().then(|| {
+        (
+            api.class_name(snapshot.foreground_hwnd),
+            api.class_name(snapshot.root_owner_hwnd),
+        )
+    });
+    let result = match decide_focus_return(main_hwnd, started_from_main, &snapshot) {
         FocusDecision::Keep(result) => result,
         FocusDecision::Restore => {
             if api.set_foreground(main_hwnd) {
@@ -98,7 +121,7 @@ fn return_focus(main_hwnd: isize, api: &mut dyn FocusApi) -> FocusReturn {
             }
         }
     };
-    if let Some(class_name) = class_name {
+    if let Some((class_name, root_owner_class)) = classes {
         let has_foreground = snapshot.foreground_hwnd != 0;
         crate::perf::event(
             "shell_paste",
@@ -108,6 +131,14 @@ fn return_focus(main_hwnd: isize, api: &mut dyn FocusApi) -> FocusReturn {
             &[
                 ("focus_return", result.perf_tag().into()),
                 ("foreground_class", class_name.into()),
+                ("started_from_main", started_from_main.into()),
+                ("root_owner_class", root_owner_class.into()),
+                (
+                    "root_owner_is_main",
+                    (snapshot.root_owner_hwnd == main_hwnd).into(),
+                ),
+                ("foreground_visible", snapshot.foreground_visible.into()),
+                ("main_enabled", snapshot.main_enabled.into()),
                 (
                     "same_thread",
                     has_foreground
@@ -129,12 +160,15 @@ fn return_focus(main_hwnd: isize, api: &mut dyn FocusApi) -> FocusReturn {
 fn complete_invocation(
     main_hwnd: isize,
     invocation: ShellPasteResult,
+    started_from_main: Option<bool>,
     focus: &mut dyn FocusApi,
 ) -> ShellPasteCompletion {
     let focus_return = if matches!(invocation, Err(ShellPasteError::Start(_))) {
         FocusReturn::NotInvoked
+    } else if let Some(started_from_main) = started_from_main {
+        return_focus(main_hwnd, started_from_main, focus)
     } else {
-        return_focus(main_hwnd, focus)
+        FocusReturn::NotInvoked
     };
     ShellPasteCompletion {
         invocation,
@@ -238,8 +272,14 @@ impl ShellPasteService {
                 .name("shell-paste-test".into())
                 .spawn(move || {
                     while let Ok(request) = receiver.recv() {
+                        let started_from_main = focus.started_from_main(request.hwnd);
                         let result = invoke(request.hwnd, &request.folder);
-                        let completion = complete_invocation(request.hwnd, result, focus.as_mut());
+                        let completion = complete_invocation(
+                            request.hwnd,
+                            result,
+                            Some(started_from_main),
+                            focus.as_mut(),
+                        );
                         request.completion.finish(completion);
                     }
                 })
@@ -294,6 +334,10 @@ struct NoMainForTest;
 
 #[cfg(test)]
 impl FocusApi for NoMainForTest {
+    fn started_from_main(&mut self, _: isize) -> bool {
+        false
+    }
+
     fn snapshot(&mut self, _: isize) -> FocusSnapshot {
         FocusSnapshot {
             main_valid: false,
@@ -302,6 +346,9 @@ impl FocusApi for NoMainForTest {
             foreground_hwnd: 0,
             foreground_thread: 0,
             foreground_process: 0,
+            root_owner_hwnd: 0,
+            foreground_visible: false,
+            main_enabled: false,
         }
     }
 
@@ -361,16 +408,24 @@ mod native {
             Ole::{OleInitialize, OleUninitialize},
             Threading::{CreateEventW, GetCurrentProcessId, INFINITE},
         },
-        UI::WindowsAndMessaging::{
-            DispatchMessageW, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId,
-            IsWindow, MSG, MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
-            SetForegroundWindow, TranslateMessage, WM_QUIT,
+        UI::{
+            Input::KeyboardAndMouse::IsWindowEnabled,
+            WindowsAndMessaging::{
+                DispatchMessageW, GA_ROOTOWNER, GetAncestor, GetClassNameW, GetForegroundWindow,
+                GetWindowThreadProcessId, IsWindow, IsWindowVisible, MSG,
+                MsgWaitForMultipleObjects, PM_REMOVE, PeekMessageW, QS_ALLINPUT,
+                SetForegroundWindow, TranslateMessage, WM_QUIT,
+            },
         },
     };
 
     struct NativeFocus;
 
     impl FocusApi for NativeFocus {
+        fn started_from_main(&mut self, main_hwnd: isize) -> bool {
+            unsafe { GetForegroundWindow() }.0 as isize == main_hwnd
+        }
+
         fn snapshot(&mut self, main_hwnd: isize) -> FocusSnapshot {
             let main = HWND(main_hwnd as *mut _);
             let main_valid = unsafe { IsWindow(Some(main)) }.as_bool();
@@ -393,6 +448,13 @@ mod native {
                 foreground_hwnd: foreground.0 as isize,
                 foreground_thread,
                 foreground_process,
+                root_owner_hwnd: if foreground.0.is_null() {
+                    0
+                } else {
+                    unsafe { GetAncestor(foreground, GA_ROOTOWNER) }.0 as isize
+                },
+                foreground_visible: unsafe { IsWindowVisible(foreground) }.as_bool(),
+                main_enabled: unsafe { IsWindowEnabled(main) }.as_bool(),
             }
         }
 
@@ -466,13 +528,23 @@ mod native {
             // Drain queued requests too, without waiting for another event edge.
             match receiver.try_recv() {
                 Ok(request) => {
+                    // None also covers bind/query failures before InvokeCommand.
+                    let mut started_from_main = None;
                     let result = crate::native_context_menu::invoke_shell_folder_background_verb(
                         request.hwnd,
                         &request.folder,
                         crate::native_context_menu::ShellClipboardVerb::Paste,
+                        || {
+                            started_from_main = Some(NativeFocus.started_from_main(request.hwnd));
+                        },
                     )
                     .map_err(ShellPasteError::Invocation);
-                    let completion = complete_invocation(request.hwnd, result, &mut NativeFocus);
+                    let completion = complete_invocation(
+                        request.hwnd,
+                        result,
+                        started_from_main,
+                        &mut NativeFocus,
+                    );
                     request.completion.finish(completion);
                     continue;
                 }
@@ -562,12 +634,17 @@ mod tests {
     struct FakeFocus {
         main_valid: bool,
         foreground: (isize, u32, u32),
+        root_owner_hwnd: isize,
         restore_succeeds: bool,
         snapshots: usize,
         restored: Vec<isize>,
     }
 
     impl FocusApi for FakeFocus {
+        fn started_from_main(&mut self, _: isize) -> bool {
+            true
+        }
+
         fn snapshot(&mut self, main_hwnd: isize) -> FocusSnapshot {
             assert_eq!(main_hwnd, 42);
             self.snapshots += 1;
@@ -578,6 +655,9 @@ mod tests {
                 foreground_hwnd: self.foreground.0,
                 foreground_thread: self.foreground.1,
                 foreground_process: self.foreground.2,
+                root_owner_hwnd: self.root_owner_hwnd,
+                foreground_visible: true,
+                main_enabled: true,
             }
         }
 
@@ -593,45 +673,40 @@ mod tests {
 
     #[test]
     fn shell_paste_focus_return_decision_table() {
-        use FocusDecision::{Keep, Restore};
         use FocusReturn::*;
         // HWND, thread, process. Main is HWND 42, thread 10, process 100.
         let cases = [
-            (true, (42, 10, 100), true, Keep(AlreadyMain), AlreadyMain, 0),
-            (true, (0, 0, 0), true, Restore, Restored, 1),
-            (true, (43, 11, 100), true, Restore, Restored, 1),
-            (
-                true,
-                (43, 10, 100),
-                true,
-                Keep(OtherMivWindow),
-                OtherMivWindow,
-                0,
-            ),
-            (
-                true,
-                (43, 11, 101),
-                true,
-                Keep(OtherProcess),
-                OtherProcess,
-                0,
-            ),
+            (true, true, (42, 10, 100), 42, true, AlreadyMain),
+            (true, true, (0, 0, 0), 0, true, NoForeground),
+            (true, true, (43, 11, 100), 42, true, Restored),
+            (true, true, (43, 10, 100), 42, true, OtherMivWindow),
+            (true, true, (43, 11, 101), 42, true, OtherProcess),
             // Main validity takes precedence even when it is the foreground HWND.
-            (false, (42, 10, 100), true, Keep(MainGone), MainGone, 0),
-            (true, (43, 11, 100), false, Restore, RestoreFailed, 1),
+            (true, false, (42, 10, 100), 42, true, MainGone),
+            (true, true, (43, 11, 100), 42, false, RestoreFailed),
+            (false, true, (43, 11, 100), 42, true, NotStartedFromMain),
+            (true, true, (43, 11, 100), 44, true, UnownedWindow),
+            (true, true, (43, 11, 100), 0, true, UnownedWindow),
+            (false, true, (42, 10, 100), 42, true, AlreadyMain),
         ];
-        for (main_valid, foreground, restore_succeeds, decision, expected, attempts) in cases {
+        for (started, main_valid, foreground, root_owner_hwnd, restore_succeeds, expected) in cases
+        {
             let mut api = FakeFocus {
                 main_valid,
                 foreground,
+                root_owner_hwnd,
                 restore_succeeds,
                 snapshots: 0,
                 restored: Vec::new(),
             };
             let snapshot = api.snapshot(42);
-            assert_eq!(decide_focus_return(42, &snapshot), decision);
+            let (decision, attempts) = match expected {
+                Restored | RestoreFailed => (FocusDecision::Restore, 1),
+                kept => (FocusDecision::Keep(kept), 0),
+            };
+            assert_eq!(decide_focus_return(42, started, &snapshot), decision);
             api.snapshots = 0;
-            assert_eq!(return_focus(42, &mut api), expected);
+            assert_eq!(return_focus(42, started, &mut api), expected);
             assert_eq!(api.snapshots, 1);
             assert_eq!(api.restored, vec![42; attempts]);
         }
@@ -642,17 +717,19 @@ mod tests {
         let mut api = FakeFocus {
             main_valid: true,
             foreground: (43, 11, 100),
+            root_owner_hwnd: 42,
             restore_succeeds: true,
             snapshots: 0,
             restored: Vec::new(),
         };
-        let completion = complete_invocation(
-            42,
-            Err(ShellPasteError::Start("OLE failed".into())),
-            &mut api,
-        );
-        assert_eq!(completion.focus_return, FocusReturn::NotInvoked);
-        assert_eq!(completion.focus_return.perf_tag(), "not_invoked");
+        for error in [
+            ShellPasteError::Start("OLE failed".into()),
+            ShellPasteError::Invocation("bind failed".into()),
+        ] {
+            let completion = complete_invocation(42, Err(error), None, &mut api);
+            assert_eq!(completion.focus_return, FocusReturn::NotInvoked);
+            assert_eq!(completion.focus_return.perf_tag(), "not_invoked");
+        }
         assert_eq!(api.snapshots, 0);
         assert!(api.restored.is_empty());
     }
@@ -667,6 +744,9 @@ mod tests {
             (FocusReturn::MainGone, "main_gone"),
             (FocusReturn::RestoreFailed, "restore_failed"),
             (FocusReturn::NotInvoked, "not_invoked"),
+            (FocusReturn::NotStartedFromMain, "not_started_from_main"),
+            (FocusReturn::NoForeground, "no_foreground"),
+            (FocusReturn::UnownedWindow, "unowned_window"),
         ] {
             assert_eq!(result.perf_tag(), tag);
         }

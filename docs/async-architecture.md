@@ -37,19 +37,33 @@ App は `ShellPasteService` 一つと実行中要求一つを持つ。3 入口�
 完了受信は root の `poll_file_organize` の隣、early return 前で行い、修飾キーを OS に合わせる。
 完了は動詞の呼び出しの完了であり、転送の完了は Shell が管理する。
 呼び出しが成功・失敗で戻った直後、完了を送る前に、同じ worker が main への前面の返却を一度だけ判定する。
-main が無効なら操作せず、前面が NULL または同じ process の main と別 thread の窓なら
-`SetForegroundWindow(main)` を一度呼ぶ。既に main、同じ UI thread の別窓、別 process の前面は保つ。
+bind の `CreateViewObject(hwnd)` と `CMINVOKECOMMANDINFO.hwnd` には main HWND を渡している。
+通常は Shell の画面を閉じると Windows が owner の main へ activation を返すはずだが、
+サブ PC 担当の Claude の perf ログ (master 38e8e43c5 の build-dev) では呼び出しの戻り時も
+`focused:false` で、約 0.9 秒 (2 回とも 890〜897 ms) 戻らなかった。理由は未特定。
+候補は (a) Shell の進捗窓 (置換の画面の owner) が残って前面を持つ、(b) main がまだ disabled で返せない、の二つ。
+開始時の前面は bind/query 後の `InvokeCommand` 直前のコールバックで worker が採取する。
+**main が前面の状態で開始し、終了時の前面が同じ process・main と別 thread、かつ
+`GetAncestor(fg, GA_ROOTOWNER) == main` のときだけ** `SetForegroundWindow(main)` を一度呼ぶ。
+開始時に main が前面でなければ `not_started_from_main`、前面 NULL は `no_foreground`、
+同じ process・別 thread でも root owner が main でなければ `unowned_window` として操作しない。
+main 無効、既に main、同じ UI thread の別窓、別 process の前面も従来どおり操作しない。
+別アプリへ移った利用者、mIV の他の窓、前面の無い状態を奪わないため、この貼り付けの Shell の画面の系列に限定する。
+サブ PC の再確認で診断から理由を確かめ、Windows が自然に戻す形にできると分かれば、この処理を外す。
 thread の比較元は main HWND の `GetWindowThreadProcessId`、process は `GetCurrentProcessId`。
 復帰失敗はログで終え、待ち・再試行・入力の偽装はしない。`ShellPasteCompletion` は呼び出しの `Result` と
-typed `FocusReturn` を併せて返す。開始・OLE 初期化の失敗など呼び出していない経路は `not_invoked`。
+typed `FocusReturn` を併せて返す。開始・OLE 初期化・bind/query の失敗など `InvokeCommand` を呼んでいない経路は `not_invoked`。
 `PostOperationSelection` の番号は `request_post_operation_selection` 一か所で発行し、失敗時は一致する要求だけを取り下げる。
 take / 戻しでは番号を保ち、後から作られた新規フォルダ・別の操作の選択要求を取り下げない。
 `shell_paste/submit` の `origin`、`shell_paste/end` の `origin`・`ms`・`outcome`・`focus_return` は perf 有効時だけ記録する。
 `outcome` は typed enum の `invoked|failed|start_failed|disconnected`。
 `invoked` は `InvokeCommand` が成功で戻った意味だけで、転送の成否・利用者の中止を含まない。
 Shell の paste 動詞からは中止を取得できず、`IFileOperation` への置換は行わない。
-worker の `shell_paste/focus_return` は、判定時の前面のクラス名 (`foreground_class`) と
+worker の `shell_paste/focus_return` は、開始時の前面が main か (`started_from_main`)、
+終了時の前面と root owner のクラス名 (`foreground_class`・`root_owner_class`)、根が main か (`root_owner_is_main`)、
+`IsWindowVisible(fg)` (`foreground_visible`)・`IsWindowEnabled(main)` (`main_enabled`)、
 main と同じ thread か (`same_thread`)・同じ process か (`same_process`)、`focus_return` を一行に記録する。
+すべて復帰操作前の値で、候補 (a)(b) の判別に使う。
 前面 NULL の比較値は null。前面の返却の追加分はコンパイル・テスト・レビュー・実機確認とも未実施。
 通常の呼び出し失敗はログ、開始失敗と受信口切断はログと通知で終端し、再試行しない。
 詳細は [設計書 §2・実装の記録](ui-sync-853-plan.md)。コンパイル・Rust テスト・実 Shell 検証は未実施。

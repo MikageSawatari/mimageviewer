@@ -708,11 +708,15 @@ Ctrl+S空クエリの空列だけは定数サイズの準備を同期実行す�
 ツリーの右クリック「貼り付け」・一覧の Ctrl+V・一覧メニューの「貼り付け」は `start_shell_paste` に集約し、Shell の bind・query・`InvokeCommand` を常駐 `shell-paste` STA thread へ投入する。`OleInitialize` とメッセージポンプを保ち、呼び出しが戻った後も Shell の転送 proxy が使う apartment を生かす。UI は初期化・呼び出し・終了を待たない。worker が Shell に渡す時点のクリップボードを使い、読み取り・照合はしない。貼り付け中の追加要求と整理・D&D 転送の受付、mIV 自身のファイルの切り取り・コピーは通知して断る。画像・テキストのコピー、外部アプリのクリップボード変更は止めない。完了は転送完了ではなく動詞の呼び出しの完了で、root poll で修飾キーを同期し、失敗時は自分の番号の選択要求だけを取り下げる。ツリーの形式照会は従来どおりメニューを開いた時だけ行う。[設計 §2・§5.13](ui-sync-853-plan.md) と [ツリー設計 §7](folder-tree-dnd-plan.md) を参照。コンパイル・Rust テスト・実 Shell 検証は未実施。
 
 呼び出しの成功・失敗どちらでも、worker は完了送信前に main へ前面を返す判定を一度行う。
-前面 NULL または同じ process の別 thread の窓だけが復帰対象で、main と同じ UI thread の別窓や
-別アプリの前面は保つ。復帰に待ち・再試行・追加 repaint は使わない。
+`InvokeCommand` 直前に main が前面で、終了時の前面が同じ process・main と別 thread、かつ
+root owner が main (`GetAncestor(fg, GA_ROOTOWNER) == main`) の場合だけが復帰対象。
+前面 NULL、owner の異なる窓、main と同じ UI thread の別窓や別アプリの前面は保つ。
+Windows が自然に activation を返さなかった理由は未特定であり、[設計 §5.13](ui-sync-853-plan.md) の
+診断をサブ PC で採取し、自然に戻す形にできると分かればこの処理を外す。復帰に待ち・再試行・追加 repaint は使わない。
 `shell_paste/end` の `outcome=invoked` は呼び出し成功のみを表し、転送成功・完了・中止を判定しない。
 ほかは `failed|start_failed|disconnected`。同じ end に `focus_return`、worker の
-`shell_paste/focus_return` に前面のクラス名と thread/process の比較を記録する。追加分の検証は未実施。
+`shell_paste/focus_return` に開始時の前面、終了時の前面と root owner のクラス名・根が main か、
+前面の visible・main の enabled、thread/process の比較を記録する。追加分の検証は未実施。
 
 文字起こし表示（T1区切り3）のDB SELECTと署名取得は単一readerで行い、UI/presenterは不変のsnapshotとArc本文だけを使う。
 再生原点は既存decoderから取得し、描画で再probeしない。nativeとmusicは可変高一覧rendererを共有する。

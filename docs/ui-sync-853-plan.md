@@ -924,9 +924,22 @@ target 指定 Down を通す形へ更新した。設計担当が追加した `ui
 次の → (173.7) は `focused:true` で届いて選択が動いた。
 同じ担当から、60 GB の貼り付けを進捗画面の × で中止しても `shell_paste/end` が `outcome:"ok"` だったと報告された。
 
-原因と境界: source inspection では Shell UI は main HWND を持ち主にするが、呼び出しは別の常駐 STA 上で行い、
-戻り時に main へ activation を返す処理が無かった。モーダル UI が閉じると持ち主へ前面を返す契約を、
-thread が分かれた呼び出しの終了 edge で明示する (R3-3)。この変更による実機での改善は未確認。
+事実と未特定の理由: source inspection では `src/app/main_drop.rs` が main HWND を service へ渡し、
+`src/native_context_menu.rs` の bind の `CreateViewObject(hwnd)` と `CMINVOKECOMMANDINFO.hwnd` の
+両方にその HWND を使っている。Shell の画面の owner は main となるはずで、通常は画面を閉じると
+Windows が owner へ activation を返す。それでも上記のサブ PC 担当の Claude の perf ログでは、
+呼び出しが戻った時点で `focused:false` のまま、約 0.9 秒 (2 回とも 890〜897 ms) 戻らなかった。
+**理由は未特定**。候補は (a) 置換の画面の owner である Shell の進捗窓が完了後もしばらく残って前面を持つ、
+(b) 閉じる時点で main がまだ disabled で Windows が activation を返せない、の二つ。
+メイン PC でエージェントが画面を出して確認はしていない。この変更による実機での改善も未確認。
+
+当初の「同じ process の別 thread または前面 NULL なら戻す」判定 (0a065beed) は広すぎるため、
+**main が前面の状態で開始し、終了時の前面がこの貼り付けの Shell の画面の系列のときだけ**に限定する。
+系列の判定は同じ process・main と別 thread、かつ `GetAncestor(fg, GA_ROOTOWNER) == main`。
+別アプリへ移った利用者、mIV の他の窓、前面の無い状態を奪わないための限定であり、
+Windows が自然に owner へ activation を返さなかった根本理由を特定したという意味ではない。
+サブ PC の再確認で下記の診断から (a)(b) を切り分け、Windows が自然に戻す形にできると分かれば、
+この後から前面を戻す処理を外す (R3-3)。
 `"ok"` は `InvokeCommand` の成功を転送成功と読み違えられる名前だった (R3-2)。Shell は利用者の中止でも
 成功を返し、paste 動詞から mIV が転送の成否・中止を取得する手段は無い。§2.2 の invocation 完了の契約を維持する。
 `IFileOperation` への置換は、Shell の対応形式や切り取りの完了通知の退行を避けるため行わない。
@@ -935,29 +948,35 @@ thread が分かれた呼び出しの終了 edge で明示する (R3-3)。この
 
 - `src/shell_paste.rs`: native 呼び出しが成功・失敗で戻った直後、同じ worker で前面を一度判定し、
   `ShellPasteCompletion { invocation, focus_return }` を送る。純粋な判定関数と `FocusApi` の問い合わせ・設定を分離し、
-  test invoker の worker も偽物で同じ判定を通す。開始・OLE 初期化の失敗は `not_invoked`。
+  test invoker の worker も偽物で同じ判定を通す。`src/native_context_menu.rs` の `InvokeCommand` 直前の
+  コールバックで `GetForegroundWindow() == main` を記録する (bind/query 前の採取ではない)。
+  開始・OLE 初期化・bind/query の失敗で `InvokeCommand` に達していなければ `not_invoked`。
 - 判定は下表。thread は main HWND の thread と比較し、process は現在 process と比較する。
   `SetForegroundWindow(main)` 以外の回避策、待ち、再試行、追加 repaint は使わない。
-- perf 有効時の worker の `shell_paste/focus_return` は `focus_return`・`foreground_class`・
-  `same_thread`・`same_process` を一行に出す (前面 NULL の比較は null)。クラス名は前面を戻す前に取得する。
+- perf 有効時の worker の `shell_paste/focus_return` は `focus_return`・`started_from_main`・
+  `foreground_class`・`root_owner_class`・`root_owner_is_main`・`foreground_visible`・`main_enabled`・
+  `same_thread`・`same_process` を一行に出す (前面 NULL の thread/process 比較は null)。
+  クラス名・visible・enabled は前面を戻す前に取得し、候補 (a)(b) の判別に使う。
 - `src/app/main_drop.rs`: `ShellPasteOutcome` の match で選択要求の取り下げを決め、通知は従来どおり。
   end の値は `invoked|failed|start_failed|disconnected` とし、`focus_return` を併記する。
   `invoked` は呼び出し成功であって転送の成否・中止を含まない。受信口切断の前面結果は取得不能のため `not_invoked`。
 - `src/shell_paste_native_tests.rs`: ignored 2 件は完了型の `.invocation` を参照する変更だけで、
   前面操作や実機シナリオを追加しない。
 
-| 条件 (main の無効を最優先) | 操作 | `focus_return` |
+| 条件 (上から優先。未呼び出しは判定前に終端) | 操作 | `focus_return` |
 | --- | --- | --- |
 | main HWND が無効 | 無し | `main_gone` |
 | 前面が main | 無し | `already_main` |
-| 前面 NULL | main へ一度復帰 | `restored` (失敗は下段) |
-| 同じ process、main と別 thread | main へ一度復帰 | `restored` (失敗は下段) |
-| 同じ process、main と同じ thread の別窓 | 無し | `other_miv_window` |
+| 開始時の前面が main ではない | 無し | `not_started_from_main` |
+| 前面 NULL | 無し | `no_foreground` |
 | 別 process | 無し | `other_process` |
+| 同じ process、main と同じ thread の別窓 | 無し | `other_miv_window` |
+| 同じ process・別 thread、root owner が main ではない | 無し | `unowned_window` |
+| 同じ process・別 thread、root owner が main | main へ一度復帰 | `restored` (失敗は下段) |
 | 復帰の `SetForegroundWindow` が失敗 | ログのみ | `restore_failed` |
 | Shell を呼んでいない | 無し | `not_invoked` |
 
-簡素化: 前面を返す責務を呼び出し終了の一か所に置くため、タイマー・入力の保留・再試行・新しいモーダル状態は不要。
+簡素化: 開始時の証拠と終了時の系列を一つの呼び出し内で照合し、タイマー・入力の保留・再試行・新しいモーダル状態は作らない。
 3 入口の受付・選択・通知と、detached の述語や viewport 経路は変えない。
 
 追加テスト (コードを追加した記録であり、結果ではない):
@@ -969,14 +988,17 @@ shell_paste_focus_return_perf_tags
 shell_paste_handler_restores_main_once_after_invocation_and_records_end
 shell_paste_handler_preserves_foreign_foreground_and_records_end
 shell_paste_handler_failed_invocation_still_returns_focus_and_records_end
-shell_paste_handler_start_failure_records_not_invoked_without_focus_query
+shell_paste_handler_start_failure_records_not_invoked_without_focus_return_query
+shell_paste_handler_does_not_restore_if_not_started_from_main
+shell_paste_handler_does_not_restore_unowned_worker_window
 shell_paste_outcome_perf_tags_describe_invocation
 ```
 
-表のテストは復帰成功・失敗を偽 API で通し、試行回数も検査する。handler-level は 3 入口それぞれで
-invoke → snapshot → restore の順序・同じ worker thread・main HWND への一度だけの復帰を検査し、
+表のテストは新しい判定結果を含む全種と復帰成功・失敗を偽 API で通し、試行回数も検査する。
+handler-level は 3 入口それぞれで start → invoke → snapshot → restore の順序・同じ worker thread・main HWND への一度だけの復帰を検査し、
 同じ end の実データに `focus_return=restored`・`outcome=invoked` が載ることを検査する。
-別 process、呼び出し失敗、開始失敗も分けて検査する。既存の受信口切断テストは
+別 process、開始時の前面が main でない場合、root owner が main でない別 thread の窓、
+呼び出し失敗、開始失敗も分けて検査する。既存の受信口切断テストは
 `outcome=disconnected`・`focus_return=not_invoked` の期待を追加した。
 
 未実施: コンパイル・Rust テスト・旧コードへ戻して落ちる破壊検証・独立レビュー・実 Shell / 製品での実機確認。
