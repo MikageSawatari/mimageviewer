@@ -7,9 +7,10 @@ use crate::ui_dialogs::agent_integration::{
 use std::time::{Duration, Instant};
 
 const REGISTRATION_INTERVAL: Duration = Duration::from_secs(5);
-// U1: keep the Web and getting-started sections even with registered apps.
-fn show_web_and_guide(_has_registered_app: bool) -> bool {
-    true
+// U1 (user decision 2026-11-25): registered apps replace the Web and
+// getting-started sections; they are shown only while no app is registered.
+fn show_web_and_guide(has_registered_app: bool) -> bool {
+    !has_registered_app
 }
 
 pub(crate) const APP_PROMPT: &str = "mImageViewer の MCP ツール (search_help・get_help) で、この版のマニュアルを調べてから答えてください。質問: ";
@@ -163,7 +164,7 @@ fn draw_contents(
     }
     let has_registered = registered.into_iter().any(|value| value);
     if show_web_and_guide(has_registered) {
-        if has_registered || checking {
+        if checking {
             fixed_scope(ui, "apps_separator", |ui| {
                 ui.separator();
             });
@@ -180,11 +181,7 @@ fn draw_contents(
         });
         button(ui, Destination::Guide);
         fixed_scope(ui, "description", |ui| {
-            ui.weak(if has_registered {
-                "Web の AI へは案内の文をコピーして開きます"
-            } else {
-                "AI アプリに mIV を登録すると、この版のマニュアルを引いて答えます"
-            });
+            ui.weak("AI アプリに mIV を登録すると、この版のマニュアルを引いて答えます");
         });
     }
     selected

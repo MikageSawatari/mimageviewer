@@ -148,15 +148,18 @@ fn ask_ai_submenu_order_for_unregistered_claude_both_and_checking() {
             ..Default::default()
         });
         harness.run();
-        let expected: Vec<_> = apps
-            .into_iter()
-            .chain([
+        // U1: registered apps replace the Web and getting-started sections.
+        let web_and_guide = if apps.is_empty() {
+            vec![
                 Destination::Google,
                 Destination::ChatGptWeb,
                 Destination::ClaudeWeb,
                 Destination::Guide,
-            ])
-            .collect();
+            ]
+        } else {
+            Vec::new()
+        };
+        let expected: Vec<_> = apps.into_iter().chain(web_and_guide).collect();
         let actual: Vec<_> = harness
             .state()
             .responses
@@ -184,14 +187,37 @@ fn ask_ai_destination_ids_survive_section_insertion_and_removal() {
         ..Default::default()
     });
     harness.run();
-    let baseline: Vec<_> = harness
+    let mut baseline: Vec<_> = harness
         .state()
         .responses
         .iter()
         .map(|(dest, response)| (*dest, response.id))
         .collect();
-    for registered in [[false, true], [true, false], [false; 2], [true; 2]] {
+    // Web and guide items appear only while nothing is registered (U1); take
+    // their ids from the unregistered and checking layouts, which differ by
+    // the "checking" row above them.
+    for checking in [false, true] {
+        harness.state_mut().registered = [false; 2];
+        harness.state_mut().checking = checking;
+        harness.run();
+        for (destination, response) in &harness.state().responses {
+            if let Some((_, id)) = baseline.iter().find(|(dest, _)| dest == destination) {
+                assert_eq!(response.id, *id);
+            } else {
+                baseline.push((*destination, response.id));
+            }
+        }
+    }
+    assert_eq!(baseline.len(), 6);
+    for (registered, checking) in [
+        ([false, true], false),
+        ([true, false], false),
+        ([false; 2], false),
+        ([false; 2], true),
+        ([true; 2], false),
+    ] {
         harness.state_mut().registered = registered;
+        harness.state_mut().checking = checking;
         harness.run();
         for (destination, id) in &baseline {
             if let Some((_, response)) = harness
