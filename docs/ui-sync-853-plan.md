@@ -987,5 +987,12 @@ after が計測出力・menu 破棄より先であることを検査する。han
 値 (前面 NULL・main disabled・main 以外で開始も含む)、別 event と end の分離、outcome を検査する。
 読み取り専用 adapter に設定 API はなく、worker・完了 handler に前面変更 API が無いこともソースで検査する。
 
-今回の変更のコンパイル・Rust テスト・独立レビュー・サブ PC / 実 Shell / 製品での確認は未実施。
-cargo・製品起動・コミットは依頼に従って実行していない。今回の検証結果は設計担当が追記する。
+検証 (設計担当が run-heavy で実行、544cb085e): 関連 lib (`shell_paste|main_drop|file_operation_selection_tests|native_context_menu|post_operation_selection`) 123 passed、
+`--features test-script` の `shell_paste|clipboard_capture` 175 passed、実 Shell の ignored 2 件はそれぞれ単独で passed。
+旧コードへ戻して落ちる破壊検証、lib 全件、ui-smoke、サブ PC・製品での確認は未実施。
+
+独立レビュー (GPT-6.1 Sol / xhigh、read-only、実装とは別の担当、2026-11-25):
+r1 (e0036a17a) REJECT。P2-1 `GA_ROOTOWNER == main` は操作の由来を識別しない (native 動画の全画面窓など main を owner に持つ別 thread の窓から奪い得る)、
+P2-2 `InvokeCommand` の戻りは Shell の画面の役目が終わった証拠ではない、P3 採取境界のテストが本物の経路を通らない。
+設計担当は前面の返却を外し、診断だけを残した (544cb085e)。r2 (544cb085e) ACCEPT、P1〜P3 なし。
+承認の対象は診断と outcome の変更で、**R3-3 は未修正**。サブ PC の再確認で `shell_paste/foreground_after_invoke` を見て理由を判別してから直し方を決める。
