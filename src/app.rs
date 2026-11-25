@@ -23945,6 +23945,7 @@ impl App {
         ctx: &egui::Context,
     ) -> crate::keyboard_input::KeyboardOwner {
         if let Some(owner) = crate::keyboard_input::cached_keyboard_owner(ctx) {
+            crate::focus_debug::record_keyboard_owner(ctx, owner);
             crate::ime_focus::record_keyboard_owner(ctx, owner);
             #[cfg(all(windows, feature = "test-script"))]
             crate::test_script::publish_action_pass_owner(
@@ -23956,6 +23957,7 @@ impl App {
         let owner =
             crate::keyboard_input::decide_keyboard_owner(self.keyboard_ownership_snapshot(ctx));
         crate::keyboard_input::cache_keyboard_owner(ctx, owner);
+        crate::focus_debug::record_keyboard_owner(ctx, owner);
         crate::ime_focus::record_keyboard_owner(ctx, owner);
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::publish_action_pass_owner(
@@ -104345,7 +104347,8 @@ impl eframe::App for App {
         self.accept_viewport_close_request(ctx, viewport_id)
     }
 
-    fn raw_input_hook(&mut self, _ctx: &egui::Context, _input: &mut egui::RawInput) {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, _input: &mut egui::RawInput) {
+        crate::focus_debug::install(ctx);
         #[cfg(windows)]
         if _input.viewport_id == egui::ViewportId::ROOT {
             // Eframe has delivered the previous output before preparing this

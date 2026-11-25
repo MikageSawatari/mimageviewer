@@ -27,20 +27,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GWL_STYLE, GWLP_USERDATA, GetClientRect,
     GetForegroundWindow, GetParent, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    HTCLIENT, HWND_TOP, IDC_ARROW, IsWindow, IsWindowVisible, IsZoomed, LoadCursorW, MA_ACTIVATE,
-    MA_ACTIVATEANDEAT, MSG, PM_REMOVE, POINTER_INPUT_TYPE, PT_TOUCH, PeekMessageW, PostMessageW,
-    PostQuitMessage, RegisterClassW, SC_MINIMIZE, SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE,
-    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SetWindowLongPtrW, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS, WM_APPCOMMAND,
-    WM_CANCELMODE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION,
-    WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
-    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
-    WM_NULL, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERENTER, WM_POINTERLEAVE,
-    WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    HTCLIENT, HWND_TOP, IDC_ARROW, InSendMessageEx, IsWindow, IsWindowVisible, IsZoomed,
+    LoadCursorW, MA_ACTIVATE, MA_ACTIVATEANDEAT, MSG, PM_REMOVE, POINTER_INPUT_TYPE, PT_TOUCH,
+    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SC_MINIMIZE, SW_HIDE, SW_SHOW,
+    SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOWPOS, WM_APPCOMMAND, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERENTER,
+    WM_POINTERLEAVE, WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CHILD,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -1975,7 +1976,13 @@ fn pump_thread_messages_inner(
                 break;
             }
             let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            {
+                let _dispatch = crate::mouse_seek_debug::begin_native_message_dispatch(
+                    msg.hwnd.0 as usize as u64,
+                    msg.message,
+                );
+                DispatchMessageW(&msg);
+            }
             if let Some(health) = health {
                 health.record_message_dispatched();
             }
@@ -2409,6 +2416,7 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let message_scope = crate::mouse_seek_debug::enter_native_wnd_proc(hwnd.0 as usize as u64, msg);
     #[cfg(feature = "test-script")]
     // Capture before touch-source/debug helpers, then compare with the value read at the
     // established metadata match point. This trace is observational and covers only the
@@ -2550,6 +2558,7 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_APPCOMMAND => {
+            let in_send_flags = unsafe { InSendMessageEx(None) };
             // Mouse driver が進む/戻るボタンを APPCOMMAND_BROWSER_BACKWARD/FORWARD で
             // 送ってくる経路 (Chrome / Explorer 等の標準ナビ経路) を受ける。
             // HIWORD(lparam) の下 12 bit が AppCommand コード。
@@ -2571,6 +2580,7 @@ unsafe extern "system" fn wnd_proc(
                         hwnd.0 as usize as u64,
                         wparam.0 as u64,
                         lparam.0,
+                        message_scope.app_command_delivery(in_send_flags),
                     ),
                     virtual_key: vk,
                     scan_code: 0,
