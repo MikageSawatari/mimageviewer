@@ -232,6 +232,9 @@ pub(super) fn edit(
             match action {
                 Action::Remove => {
                     servers.retain(|(k, _)| k != "mimageviewer");
+                    if servers.is_empty() {
+                        top.remove(pos);
+                    }
                 }
                 Action::Register => {
                     let value = Json::Object(vec![
@@ -280,12 +283,16 @@ pub(super) fn edit(
                         .get_mut("mcp_servers")
                         .and_then(toml_edit::Item::as_table_like_mut)
                     {
-                        servers.remove("mimageviewer");
+                        if servers.remove("mimageviewer").is_some() && servers.is_empty() {
+                            doc.remove("mcp_servers");
+                        }
                     }
                 }
                 Action::Register => {
                     if !doc.contains_key("mcp_servers") {
-                        doc["mcp_servers"] = toml_edit::Item::Table(toml_edit::Table::new());
+                        let mut servers = toml_edit::Table::new();
+                        servers.set_implicit(true);
+                        doc["mcp_servers"] = toml_edit::Item::Table(servers);
                     }
                     let mut server = toml_edit::Table::new();
                     server["command"] = toml_edit::value(&command.command);

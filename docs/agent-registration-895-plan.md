@@ -223,3 +223,20 @@ ChatGPT (Codex) の登録先 (`CODEX_HOME` / `.codex`) も同じ関数の形で�
   - ui_snapshot の filter `agent_integration|agent_registration`: 300d98c9d で 11/11 成功。画像の更新はない (フィクスチャは「手順を見る」も成功の文も表示しない)。
   - `check_ui_glyphs` は成功。本体 lib の全件は未実行 (取り込みの後に統括)。
   - 修正後の mIV で Claude Desktop・ChatGPT へ登録する実機確認は、まだ誰も行っていない。
+
+## 9. 追加修正: 解除で空になった親を残さない (2026-11-26)
+
+サブ PC 担当の実機確認 (修正後の master、Claude Desktop 6.28899.6) では、登録前に `mcpServers` が無い設定へ
+登録してから解除すると、`"mcpServers": {}` が残り、4149 バイトから 4169 バイトになった。
+コードでも、Claude・ChatGPT とも登録時に作った親を解除時に残す経路になっていた。
+
+解除で `mimageviewer` を実際に消し、その結果 Claude の `mcpServers` / ChatGPT の `mcp_servers` が空になった場合だけ、
+親ごと消す。対象項目が無い解除では空の親もそのまま残し、`Unchanged` の判定を変えない。他のサーバーが在れば親を残す。
+ChatGPT の inline・dotted key の親にも同じ規則を使う。
+
+登録前の状態や `.orig.bak` は参照せず、新しい状態を持たない。登録前から空の親が在った場合も、登録してから解除すれば
+親ごと消える。空の親と親が無い状態は AI アプリにとって同じ意味なので、この違いは割り切る。
+ChatGPT は登録時に親を新設する場合だけ `set_implicit(true)` とし、`[mcp_servers]` の見出しを出さず
+`[mcp_servers.mimageviewer]` を足す。既存の親の書き方は変えない。
+
+追加修正のビルド・テストは設計担当の共有 runner へ引き継ぐ。実装担当は cargo・製品起動・実設定ファイルへのアクセスを行わない。
