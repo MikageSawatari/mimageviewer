@@ -829,3 +829,9 @@ sidecar は起動前から有効に戻し、設定順で待ちを迂回しない
 製品コード・detached 述語・viewport 経路は変更していない。今回の追補差分のコンパイル・テスト・独立レビューは未実施。
 製品側の停止を確認した結果ではなく、修正後の通常フレーム進行での結果は設計担当の検証待ち。
 今回も cargo・rustfmt・製品起動・git index 操作・コミットは行っていない。
+
+d0bb9fa16 の検証: 設計担当がメイン PC で run-heavy 経由で流し、関連 156 件 (remote_return / multiwindow_ /
+startup_default_ / startup_scan / section1285_ / section1473_history_menu_ / section1853) がすべて成功した。
+独立レビュー (GPT-6.1 Sol / xhigh、実装とは別の会話) は ACCEPT、指摘なし。検索を開くと起動の解決待ちが退役する経路は
+`take_origin_for_search_entry` (app.rs) → `retire_main_list_requests_for_surface_switch` → `retire_replaced_main_list_requests`
+→ `cancel_unresolved_open_for_navigation` (startup_ops.rs) で、追加テストが既定の起動先と明示パスの両方で確かめている。
