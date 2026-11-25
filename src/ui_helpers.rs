@@ -3272,7 +3272,7 @@ pub fn boundary_page_navigation_idx(
 /// パスに関連付けられたデフォルトアプリケーションで開く (動画は外部プレイヤー、
 /// ディレクトリは Explorer)。
 ///
-/// 内部は `opener::open` 経由で Windows の `ShellExecuteW` を直接呼ぶ。パスは
+/// worker 内で `opener::open` 経由で Windows の `ShellExecuteW` を呼ぶ。パスは
 /// `lpFile` に wide-string データとして渡るので、`cmd /c start ...` のように
 /// シェルメタ文字 (`&` `^` `|` `"` 等) を含むファイル名がコマンドとして解釈される
 /// ことはない。`cmd.exe` のコンソールウィンドウも出ない。
@@ -3280,9 +3280,10 @@ pub fn boundary_page_navigation_idx(
 /// セキュリティ: ファイル名は信頼境界の外なので、シェル経由で起動してはならない。
 pub fn open_external_player(path: &Path) {
     crate::logger::log(format!("open_external_player: {}", path.display()));
-    if let Err(e) = opener::open(path) {
-        crate::logger::log(format!("open_external_player failed: {e}"));
-    }
+    let _ = crate::external_links::spawn_open(
+        crate::external_links::OpenTarget::Player(path.to_path_buf()),
+        None,
+    );
 }
 
 /// Windows のゴミ箱を Explorer で開く。
@@ -3316,9 +3317,7 @@ pub fn open_recycle_bin_async() {
 /// URL をデフォルトブラウザで開く。
 pub fn open_url(url: &str) {
     crate::logger::log(format!("open_url: {url}"));
-    if let Err(err) = crate::external_links::open_url(url) {
-        crate::logger::log(format!("open_url failed: {err}"));
-    }
+    let _ = crate::external_links::open_url(url);
 }
 
 /// オンラインマニュアルの URL を作る。

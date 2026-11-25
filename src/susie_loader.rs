@@ -666,6 +666,8 @@ impl Drop for SusieWorkerPool {
 // グローバルシングルトン (設定から起動時に初期化)
 // ─────────────────────────────────────────────────────────────────
 
+/// Pool and recognition revision are published under the same lock.
+/// INIT_GENERATION tracks operations, including builds that never publish.
 struct PoolState {
     pool: Arc<SusieWorkerPool>,
     revision: u64,
@@ -754,7 +756,7 @@ static INIT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// `init_pool(enabled, parallel)` に分離した。複数回呼ぶと最初の値が採用される。
 ///
 /// **2 段階初期化** (Codex P2 v14b 2026-05-14):
-/// 1. **Cheap install**: `POOL.get_or_init` で `RwLock<Arc<empty_pool>>` を **即座に**
+/// 1. **Cheap install**: `POOL.get_or_init` で empty `PoolState` を **即座に**
 ///    入れる。OnceLock の init closure は数 µs で完了するので、他スレッドの
 ///    `OnceLock::get_or_init` が待たされない。
 /// 2. **Heavy build**: `SusieWorkerPool::start` を OnceLock の **外側で** 実行する。
@@ -782,10 +784,11 @@ pub fn init_pool(enabled: bool, parallel: bool) {
     // Step 3: 世代再確認 + swap。reload や別の init_pool が走っていれば
     // 自分の build 物は捨てる (= ユーザー choice / 最新値を尊重)。
     if INIT_GENERATION.load(Ordering::SeqCst) == my_gen {
-        let previous = rwlock
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace(pool);
+        let previous = {
+            let mut writer = rwlock.write().unwrap_or_else(|e| e.into_inner());
+            writer.replace(pool)
+        };
+        // Worker shutdown can block; it must not hold the publication lock.
         drop(previous);
     } else {
         crate::logger::log(
@@ -916,11 +919,11 @@ pub fn reload(enabled: bool, parallel: bool) {
         empty_pool()
     };
     if INIT_GENERATION.load(Ordering::SeqCst) == my_gen {
-        // 旧プールの Drop がここで走る
-        let previous = lock
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .replace(new_pool);
+        let previous = {
+            let mut writer = lock.write().unwrap_or_else(|e| e.into_inner());
+            writer.replace(new_pool)
+        };
+        // Worker shutdown can block; it must not hold the publication lock.
         drop(previous);
     } else {
         crate::logger::log(
@@ -1621,13 +1624,39 @@ mod tests {
     fn pool_replacement_publishes_revision_with_the_pool() {
         let lock = RwLock::new(PoolState::empty());
         let initial = Arc::clone(&lock.read().unwrap().pool);
-        for revision in 1..=2 {
-            let previous = lock.write().unwrap().replace(empty_pool());
+        let mut first = empty_pool();
+        first.extensions.insert("mag".into());
+        // Building a replacement leaves both visible recognition and revision.
+        assert_eq!(lock.read().unwrap().revision, 0);
+        assert!(!lock.read().unwrap().pool.supports_extension("mag"));
+        let previous = {
+            let mut writer = lock.write().unwrap();
+            writer.replace(first)
+        };
+        let retained = {
             let state = lock.read().unwrap();
-            assert_eq!(state.revision, revision);
+            assert_eq!(state.revision, 1);
+            assert!(state.pool.supports_extension("mag"));
+            assert!(!Arc::ptr_eq(&previous, &state.pool));
+            assert!(Arc::ptr_eq(&initial, &previous));
+            Arc::clone(&state.pool)
+        };
+        assert!(!previous.supports_extension("mag"));
+        drop(previous);
+        let previous = {
+            let mut writer = lock.write().unwrap();
+            writer.replace(empty_pool())
+        };
+        {
+            let state = lock.read().unwrap();
+            assert_eq!(state.revision, 2);
+            assert!(!state.pool.supports_extension("mag"));
             assert!(!Arc::ptr_eq(&previous, &state.pool));
             assert!(!Arc::ptr_eq(&initial, &state.pool));
         }
+        assert!(retained.supports_extension("mag"));
+        assert!(Arc::ptr_eq(&retained, &previous));
+        drop(previous);
     }
 
     #[test]

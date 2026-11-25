@@ -2,6 +2,225 @@ use std::path::PathBuf;
 
 use crate::grid_item::GridItem;
 
+/// Memory-only snapshot shared by pane scans and startup resolution workers.
+/// Susie recognition remains live while scanning, so startup adoption must also
+/// compare its revision before/after scanning and against this snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FolderScanPolicy {
+    include_convertible_archives: bool,
+    include_epub: bool,
+    show_hidden_files: bool,
+    file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
+    duration_wanted: bool,
+    page_count_fingerprint: Option<i64>,
+    duration_cache_dir: PathBuf,
+    pub(crate) susie_pool_revision: u64,
+}
+
+impl FolderScanPolicy {
+    pub(crate) fn capture(
+        settings: &crate::settings::Settings,
+        duration_wanted: bool,
+        page_count_fingerprint: Option<i64>,
+        duration_cache_dir: PathBuf,
+    ) -> Self {
+        Self {
+            include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
+            include_epub: !settings.epub_file_handling_ignores_epub(),
+            show_hidden_files: settings.show_hidden_files,
+            file_type_visibility: settings.file_type_visibility.clone(),
+            duration_wanted,
+            page_count_fingerprint,
+            duration_cache_dir,
+            susie_pool_revision: crate::susie_loader::pool_revision(),
+        }
+    }
+
+    /// Worker-only: directory metadata and optional read-only listing metadata catalog.
+    pub(crate) fn scan(
+        &self,
+        path: &std::path::Path,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<ScannedDir> {
+        if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "folder scan cancelled",
+            ));
+        }
+        let mut scan = scan_directory_with_visibility_cancel(
+            path,
+            self.include_convertible_archives,
+            self.include_epub,
+            self.show_hidden_files,
+            &self.file_type_visibility,
+            cancel,
+        )?;
+        collect_folder_listing_metadata_facts(
+            path,
+            &mut scan,
+            &self.duration_cache_dir,
+            self.duration_wanted,
+            self.page_count_fingerprint,
+        );
+        Ok(scan)
+    }
+}
+
+#[cfg(test)]
+mod folder_scan_policy_tests {
+    use super::*;
+
+    #[test]
+    fn section1853_policy_snapshot_tracks_all_scan_inputs() {
+        let mut settings = crate::settings::Settings::default();
+        let policy = FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-a"));
+        assert_eq!(
+            policy,
+            FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-a"))
+        );
+        let with_pages =
+            FolderScanPolicy::capture(&settings, false, Some(883), PathBuf::from("cache-a"));
+        assert_ne!(policy, with_pages);
+        assert_ne!(
+            with_pages,
+            FolderScanPolicy::capture(&settings, false, Some(884), PathBuf::from("cache-a"))
+        );
+        settings.show_hidden_files = !settings.show_hidden_files;
+        assert_ne!(
+            policy,
+            FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-a"))
+        );
+        // The snapshot owns its visibility set rather than sharing later edits.
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("jpg".into());
+        assert!(
+            !policy
+                .file_type_visibility
+                .excluded_extensions
+                .contains("jpg")
+        );
+        let captured = FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-a"));
+        settings.show_hidden_files = !settings.show_hidden_files;
+        settings.file_type_visibility.excluded_extensions.clear();
+        assert_ne!(captured, policy);
+        assert_ne!(
+            policy,
+            FolderScanPolicy::capture(&settings, true, None, PathBuf::from("cache-a"))
+        );
+        assert_ne!(
+            policy,
+            FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-b"))
+        );
+        settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ignore;
+        assert_ne!(
+            policy,
+            FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-a"))
+        );
+        settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ask;
+        settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+        assert_ne!(
+            policy,
+            FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-a"))
+        );
+        let mut changed = policy.clone();
+        changed.susie_pool_revision = changed.susie_pool_revision.wrapping_add(1);
+        assert_ne!(changed, policy);
+    }
+
+    #[test]
+    fn section1853_policy_scan_collects_page_count_facts_with_captured_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("books");
+        let images = root.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::write(images.join("one.jpg"), b"fixture").unwrap();
+        let settings = crate::settings::Settings::default();
+        let cache = temp.path().join("cache");
+        let policy = FolderScanPolicy::capture(&settings, false, None, cache.clone());
+        let scan = policy.scan(&root, None).unwrap();
+        let item = GridItem::Folder(images);
+        let stamp = scan
+            .folders
+            .iter()
+            .find(|entry| entry.item == item)
+            .unwrap()
+            .display_meta
+            .unwrap();
+        assert!(scan.page_count_facts.is_none());
+        let writer = crate::catalog::CatalogDb::open(&cache, &root).unwrap();
+        writer
+            .set_container_page_meta(
+                "images",
+                crate::catalog::ContainerPageKind::Folder,
+                stamp.0,
+                stamp.1,
+                883,
+                Some(1),
+            )
+            .unwrap();
+        drop(writer);
+        // The worker uses the captured request identity, including stale values.
+        // Materialization rejects a row whose fingerprint does not match it.
+        for fingerprint in [883, 884] {
+            let policy =
+                FolderScanPolicy::capture(&settings, false, Some(fingerprint), cache.clone());
+            let scan = policy.scan(&root, None).unwrap();
+            assert!(scan.duration_facts.is_none());
+            let facts = scan.page_count_facts.unwrap();
+            assert_eq!(facts.fingerprint(), fingerprint);
+            assert_eq!(
+                facts.page_count_for(&item, stamp),
+                (fingerprint == 883).then_some(crate::settings::ListingPageCount::Known(1))
+            );
+        }
+        assert!(policy.scan(&root, None).unwrap().page_count_facts.is_none());
+    }
+
+    #[test]
+    fn section1853_policy_scan_preserves_visibility_and_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("keep.jpg"), b"fixture").unwrap();
+        std::fs::write(temp.path().join("omit.png"), b"fixture").unwrap();
+        std::fs::write(temp.path().join("omit.7z"), b"fixture").unwrap();
+        std::fs::write(temp.path().join("omit.epub"), b"fixture").unwrap();
+        std::fs::create_dir(temp.path().join("directory.zip")).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ignore;
+        settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        let cache = temp.path().join("no-catalog-created");
+        let policy = FolderScanPolicy::capture(&settings, false, None, cache.clone());
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let scan = policy.scan(temp.path(), Some(&cancel)).unwrap();
+        assert_eq!(scan.all_media.len(), 1);
+        assert_eq!(scan.all_media[0].path, temp.path().join("keep.jpg"));
+        assert_eq!(scan.omitted.counts.file_type, 1);
+        assert_eq!(scan.omitted.counts.ignored_archive, 1);
+        assert_eq!(scan.omitted.counts.ignored_epub, 1);
+        assert!(scan.folders.iter().any(|entry| {
+            matches!(&entry.item, GridItem::Folder(path) if path == &temp.path().join("directory.zip"))
+        }));
+        assert!(!cache.exists());
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        // A pre-cancelled request must return Interrupted before touching even
+        // a missing path, which would otherwise produce NotFound.
+        assert_eq!(
+            policy
+                .scan(&temp.path().join("missing"), Some(&cancel))
+                .err()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::Interrupted
+        );
+    }
+}
+
 /// `all_media` の各要素がどの `GridItem` になるかのスキャン時分類。
 /// Image → `GridItem::Image`、Video → `GridItem::Video`、Audio → `GridItem::Audio`。
 /// 動画のアップスケール派生ペア除去 (`filter_upscaled_video_pairs_fast`) は Video のみ対象。

@@ -10,9 +10,49 @@ use crate::main_drop_target::{DropGeometry, DropPlace, DropRequest, DropRow};
 use crate::shell_file_ops::{ShellTransferRequest, ShellTransferResult};
 use crate::ui_dialogs::file_organize::{FileOrganizeRequest, FileOrganizeRunning};
 
+pub(crate) const SHELL_PASTE_BUSY_MESSAGE: &str = "貼り付けが完了するまでお待ちください";
+const SHELL_PASTE_START_FAILURE: &str = "貼り付けを開始できませんでした";
+const SHELL_PASTE_COMPLETION_FAILURE: &str = "貼り付けを完了できませんでした";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShellPasteOrigin {
+    Tree,
+    CtrlV,
+    GridMenu,
+}
+
+impl ShellPasteOrigin {
+    fn perf_tag(self) -> &'static str {
+        match self {
+            Self::Tree => "tree",
+            Self::CtrlV => "ctrl_v",
+            Self::GridMenu => "grid_menu",
+        }
+    }
+}
+
+pub(crate) struct ShellPasteRunning {
+    pub(crate) rx: mpsc::Receiver<Result<(), crate::shell_paste::ShellPasteError>>,
+    pub(crate) selection_id: Option<crate::post_operation_selection::PostOperationSelectionId>,
+    pub(crate) origin: ShellPasteOrigin,
+    pub(crate) started_at: std::time::Instant,
+    pub(crate) perf_seq: u64,
+}
+
 #[cfg(test)]
 thread_local! {
     static BOOKS_ROOT_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MODIFIER_RESYNC_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn record_modifier_resync_for_test() {
+    MODIFIER_RESYNC_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn take_modifier_resync_calls_for_test() -> usize {
+    MODIFIER_RESYNC_CALLS.with(|calls| calls.replace(0))
 }
 
 #[cfg(test)]
@@ -85,7 +125,9 @@ impl App {
 
     /// Read-only: publishing cursor eligibility must never invalidate an undo receipt.
     pub(crate) fn shell_transfer_admission(&self, ctx: &egui::Context) -> Result<(), String> {
-        let reason = if !matches!(self.file_organize_request, FileOrganizeRequest::Hidden) {
+        let reason = if self.shell_paste_request.is_some() {
+            Some(SHELL_PASTE_BUSY_MESSAGE)
+        } else if !matches!(self.file_organize_request, FileOrganizeRequest::Hidden) {
             Some("整理操作が完了するまでお待ちください")
         } else if self.remote_session_blocks_local_control() {
             Some("リモート接続中は整理操作を開始できません")
@@ -305,70 +347,172 @@ impl App {
     }
 
     pub(crate) fn paste_files_to_folder(&mut self, ctx: &egui::Context, folder: PathBuf) {
-        self.paste_files_to_folder_with(ctx, folder, |hwnd, folder| {
-            crate::native_context_menu::invoke_shell_folder_background_verb(
-                hwnd,
-                folder,
-                crate::native_context_menu::ShellClipboardVerb::Paste,
-            )
-        });
+        self.start_shell_paste(ctx, folder, ShellPasteOrigin::CtrlV);
     }
 
     pub(crate) fn paste_tree_files_to_folder(&mut self, ctx: &egui::Context, folder: PathBuf) {
-        self.paste_tree_files_to_folder_with(ctx, folder, Self::book_root_path, |hwnd, folder| {
-            crate::native_context_menu::invoke_shell_folder_background_verb(
-                hwnd,
-                folder,
-                crate::native_context_menu::ShellClipboardVerb::Paste,
-            )
-        });
+        self.start_shell_paste(ctx, folder, ShellPasteOrigin::Tree);
     }
 
-    pub(crate) fn paste_tree_files_to_folder_with(
+    pub(crate) fn paste_grid_files_to_folder(&mut self, ctx: &egui::Context, folder: PathBuf) {
+        self.start_shell_paste(ctx, folder, ShellPasteOrigin::GridMenu);
+    }
+
+    pub(crate) fn start_shell_paste(
         &mut self,
         ctx: &egui::Context,
         folder: PathBuf,
-        resolve_books_root: impl FnOnce(&Self) -> PathBuf,
-        invoke: impl FnOnce(isize, &Path) -> Result<(), String>,
+        origin: ShellPasteOrigin,
     ) {
-        if let Err(reason) =
-            self.shell_transfer_submission_admission_with(ctx, &folder, resolve_books_root)
+        self.start_shell_paste_with(ctx, folder, origin, Self::book_root_path);
+    }
+
+    pub(crate) fn start_shell_paste_with(
+        &mut self,
+        ctx: &egui::Context,
+        folder: PathBuf,
+        origin: ShellPasteOrigin,
+        resolve_books_root: impl FnOnce(&Self) -> PathBuf,
+    ) {
+        // Reject read-only before mutation admission retires the book-append receipt.
+        if self.shell_paste_request.is_some() {
+            self.show_feedback_warning(SHELL_PASTE_BUSY_MESSAGE.to_owned());
+            return;
+        }
+        if origin == ShellPasteOrigin::Tree
+            && let Err(reason) =
+                self.shell_transfer_submission_admission_with(ctx, &folder, resolve_books_root)
         {
             crate::logger::log(format!("shell_transfer: rejected: {reason}"));
             self.show_feedback_warning(reason);
             return;
         }
-        self.paste_files_to_folder_with(ctx, folder, invoke);
-    }
-
-    pub(crate) fn paste_files_to_folder_with(
-        &mut self,
-        ctx: &egui::Context,
-        folder: PathBuf,
-        invoke: impl FnOnce(isize, &Path) -> Result<(), String>,
-    ) {
         let Some(hwnd) = self.main_hwnd else { return };
         if !self.admit_book_append_followup_mutation() {
             return;
         }
-        let created_selection = self.is_physical_folder_listing()
+        let selection_id = (self.is_physical_folder_listing()
             && self
                 .current_folder
                 .as_deref()
-                .is_some_and(|current| crate::folder_tree::path_eq(current, &folder));
-        if created_selection {
-            self.request_post_operation_selection_for_added_items(folder.clone());
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &folder)))
+        .then(|| self.request_post_operation_selection_for_added_items(folder.clone()));
+        let started_at = std::time::Instant::now();
+        let perf_seq = self.input_seq;
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "shell_paste",
+                "submit",
+                None,
+                perf_seq,
+                &[("origin", serde_json::Value::from(origin.perf_tag()))],
+            );
         }
-        let result = invoke(hwnd, &folder);
-        Self::resync_egui_modifiers_from_os(ctx);
-        match result {
-            Ok(()) => ctx.request_repaint(),
-            Err(error) => {
-                crate::logger::log(format!("shell_clipboard: Paste failed: {error}"));
-                if created_selection {
-                    self.cancel_post_operation_selection("shell_paste_failed");
-                }
+        match self.shell_paste_service.submit(hwnd, folder, ctx.clone()) {
+            Ok(rx) => {
+                self.shell_paste_request = Some(ShellPasteRunning {
+                    rx,
+                    selection_id,
+                    origin,
+                    started_at,
+                    perf_seq,
+                });
+                self.refresh_main_drop_admission(ctx);
             }
+            Err(error) => {
+                crate::logger::log(format!(
+                    "shell_paste: invocation submission failed: {error}"
+                ));
+                self.finish_shell_paste_invocation(
+                    ctx,
+                    selection_id,
+                    origin,
+                    started_at,
+                    perf_seq,
+                    "start_failed",
+                    Some(SHELL_PASTE_START_FAILURE),
+                );
+            }
+        }
+    }
+
+    pub(crate) fn poll_shell_paste(&mut self, ctx: &egui::Context) {
+        let Some(running) = self.shell_paste_request.take() else {
+            return;
+        };
+        let (outcome, warning) = match running.rx.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {
+                self.shell_paste_request = Some(running);
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                crate::logger::log("shell_paste: invocation worker disconnected");
+                ("disconnected", Some(SHELL_PASTE_COMPLETION_FAILURE))
+            }
+            Ok(Ok(())) => ("ok", None),
+            Ok(Err(crate::shell_paste::ShellPasteError::Start(error))) => {
+                crate::logger::log(format!(
+                    "shell_paste: invocation worker unavailable: {error}"
+                ));
+                ("start_failed", Some(SHELL_PASTE_START_FAILURE))
+            }
+            Ok(Err(crate::shell_paste::ShellPasteError::Invocation(error))) => {
+                crate::logger::log(format!("shell_paste: invocation failed: {error}"));
+                ("failed", None)
+            }
+        };
+        self.finish_shell_paste_invocation(
+            ctx,
+            running.selection_id,
+            running.origin,
+            running.started_at,
+            running.perf_seq,
+            outcome,
+            warning,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_shell_paste_invocation(
+        &mut self,
+        ctx: &egui::Context,
+        selection_id: Option<crate::post_operation_selection::PostOperationSelectionId>,
+        origin: ShellPasteOrigin,
+        started_at: std::time::Instant,
+        perf_seq: u64,
+        outcome: &'static str,
+        warning: Option<&str>,
+    ) {
+        if outcome != "ok"
+            && let Some(id) = selection_id
+            && self
+                .post_operation_selection
+                .as_ref()
+                .is_some_and(|request| request.id() == id)
+        {
+            self.cancel_post_operation_selection("shell_paste_invocation_failed");
+        }
+        if let Some(warning) = warning {
+            self.show_feedback_warning(warning.to_owned());
+        }
+        Self::resync_egui_modifiers_from_os(ctx);
+        self.refresh_main_drop_admission(ctx);
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "shell_paste",
+                "end",
+                None,
+                perf_seq,
+                &[
+                    ("origin", serde_json::Value::from(origin.perf_tag())),
+                    (
+                        "ms",
+                        serde_json::Value::from(started_at.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("outcome", serde_json::Value::from(outcome)),
+                ],
+            );
         }
     }
 }
@@ -449,3 +593,7 @@ pub(crate) fn clipboard_has_drop_files() -> bool {
 #[cfg(test)]
 #[path = "main_drop_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "shell_paste_tests.rs"]
+mod shell_paste_tests;

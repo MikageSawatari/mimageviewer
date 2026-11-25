@@ -2941,13 +2941,8 @@ impl App {
                         ui.separator();
                         ui.add_space(8.0);
                     }
-                    if let Some(warning) = draw_exif_panel(
-                        ui,
-                        exif,
-                        &mut self.exif_sections_open,
-                        crate::external_links::open_url,
-                    ) {
-                        self.show_feedback_warning(warning.to_string());
+                    if let Some(url) = draw_exif_panel(ui, exif, &mut self.exif_sections_open) {
+                        self.open_google_maps(ctx, url);
                     }
                 }
 
@@ -6339,14 +6334,14 @@ mod metadata_info_target_tests {
             let mut harness = crate::test_ui::builder()
                 .with_size(egui::vec2(360.0, 300.0))
                 .build_ui_state(
-                    move |ui, state: &mut (AppTestEnv, Vec<String>, Vec<&'static str>)| {
+                    move |ui, state: &mut (AppTestEnv, Vec<String>)| {
                         if !fonts_ready {
                             crate::ui_fonts::configure_fonts(ui.ctx());
                             fonts_ready = true;
                             ui.ctx().request_repaint();
                             return;
                         }
-                        let (app, opened, warnings) = state;
+                        let (app, opened) = state;
                         let (anchor, pages, _) = app.resolve_metadata_info_target();
                         if let Some(spread) = app
                             .similar_panel
@@ -6364,17 +6359,13 @@ mod metadata_info_target_tests {
                                 .idx(anchor, pages)
                         });
                         if let Some(exif) = app.get_exif_for_idx(idx)
-                            && let Some(warning) =
-                                draw_exif_panel(ui, &exif, &mut app.exif_sections_open, |url| {
-                                    opened.push(url.to_string());
-                                    // Simulate an opener error which leaks its URL if forwarded.
-                                    Err(format!("failed: {url}"))
-                                })
+                            && let Some(url) =
+                                draw_exif_panel(ui, &exif, &mut app.exif_sections_open)
                         {
-                            warnings.push(warning);
+                            opened.push(url);
                         }
                     },
-                    (app, Vec::new(), Vec::new()),
+                    (app, Vec::new()),
                 );
             harness.run();
             assert!(
@@ -6413,10 +6404,6 @@ mod metadata_info_target_tests {
             harness.run();
             assert_eq!(harness.state().1.len(), 3);
             assert!(harness.state().1[2].ends_with("-32.5000000%2C-132.7500000"));
-            assert_eq!(
-                harness.state().2,
-                vec!["Google マップを開けませんでした"; 3]
-            );
             harness.state_mut().0.fullscreen_idx = Some(3);
             harness.state_mut().0.spread_mode = SpreadMode::Single;
             harness.run();
@@ -6443,12 +6430,7 @@ mod metadata_info_target_tests {
                     ui.ctx().request_repaint();
                     return;
                 }
-                assert!(
-                    draw_exif_panel(ui, &exif, &mut Default::default(), |_| panic!(
-                        "no browser action expected"
-                    ))
-                    .is_none()
-                );
+                assert!(draw_exif_panel(ui, &exif, &mut Default::default()).is_none());
             });
             harness.run();
             assert!(harness.query_by_label("Google マップで開く").is_none());
@@ -7339,9 +7321,8 @@ fn draw_exif_panel(
     ui: &mut egui::Ui,
     exif: &ExifInfo,
     sections_open: &mut std::collections::HashMap<String, bool>,
-    mut open_url: impl FnMut(&str) -> Result<(), String>,
-) -> Option<&'static str> {
-    let mut warning = None;
+) -> Option<String> {
+    let mut map_request = None;
     ui.label(
         egui::RichText::new("EXIF")
             .color(egui::Color32::WHITE)
@@ -7387,15 +7368,12 @@ fn draw_exif_panel(
                     .clicked()
             {
                 // This pass's info_idx EXIF owns the action; never retain a pending location.
-                // The opener's error may contain the URL, so discard it without logging.
-                if open_url(&crate::external_links::google_maps_url(gps)).is_err() {
-                    warning = Some("Google マップを開けませんでした");
-                }
+                map_request = Some(crate::external_links::google_maps_url(gps));
             }
             ui.add_space(4.0);
         }
     }
-    warning
+    map_request
 }
 
 #[doc(hidden)]
@@ -7414,9 +7392,7 @@ pub fn draw_exif_gps_snapshot_fixture(ui: &mut egui::Ui) {
             longitude: 139.75,
         }),
     };
-    let _ = draw_exif_panel(ui, &exif, &mut Default::default(), |_| {
-        panic!("snapshot must not open a browser")
-    });
+    let _ = draw_exif_panel(ui, &exif, &mut Default::default());
 }
 
 /// キー: 値 を1つの LayoutJob で描画し、長い値も確実に折り返す。
@@ -7730,7 +7706,10 @@ fn draw_tweet_panel(ui: &mut egui::Ui, ctx: &egui::Context, t: &XmpTweetInfo) {
             if xmp_reader::is_safe_tweet_url(url)
                 && ui.button("元ツイートを開く").on_hover_text(url).clicked()
             {
-                let _ = opener::open(url);
+                let _ = crate::external_links::spawn_open(
+                    crate::external_links::OpenTarget::Tweet(url.to_owned()),
+                    None,
+                );
             }
         }
         if let Some(url) = t.author_url.as_deref() {
@@ -7740,7 +7719,10 @@ fn draw_tweet_panel(ui: &mut egui::Ui, ctx: &egui::Context, t: &XmpTweetInfo) {
                     .on_hover_text(url)
                     .clicked()
             {
-                let _ = opener::open(url);
+                let _ = crate::external_links::spawn_open(
+                    crate::external_links::OpenTarget::Tweet(url.to_owned()),
+                    None,
+                );
             }
         }
         if let Some(url) = t.tweet_url.as_deref() {
@@ -7776,7 +7758,10 @@ fn draw_tweet_panel(ui: &mut egui::Ui, ctx: &egui::Context, t: &XmpTweetInfo) {
                 .on_hover_text(qurl)
                 .clicked()
         {
-            let _ = opener::open(qurl);
+            let _ = crate::external_links::spawn_open(
+                crate::external_links::OpenTarget::Tweet(qurl.to_owned()),
+                None,
+            );
         }
     }
 }

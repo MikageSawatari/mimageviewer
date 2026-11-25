@@ -4,6 +4,19 @@ use super::*;
 use crate::ui_dialogs::context_menu::DeleteTarget;
 
 impl App {
+    pub(crate) fn finish_startup_open_path_resolve_for_test(&mut self) {
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.startup_open_path_resolve_pending.is_some() {
+            self.poll_startup_open_path_resolve(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "startup target resolution and scan did not settle"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     /// Exercise the ROOT input phases around an injected tree renderer, in update order.
     pub(crate) fn folder_tree_keyboard_frame_for_test(
         &mut self,
@@ -17713,6 +17726,10 @@ mod startup_open_path_resolve_tests {
             rx,
             started_at: std::time::Instant::now(),
             toast_shown: false,
+            scan_phase: std::sync::Arc::new(crate::app::startup_ops::StartupScanPhase::new()),
+            input_kind: crate::app::startup_ops::StartupResolveInputKind::Explicit(
+                StartupOpenPathSource::InitialStartup,
+            ),
             held_resolve_for_activation_admission: None,
         });
         (tx, cancel)
@@ -18168,6 +18185,10 @@ mod startup_open_path_resolve_tests {
             rx: resolve_rx,
             started_at: std::time::Instant::now(),
             toast_shown: false,
+            scan_phase: std::sync::Arc::new(crate::app::startup_ops::StartupScanPhase::new()),
+            input_kind: crate::app::startup_ops::StartupResolveInputKind::Explicit(
+                StartupOpenPathSource::InitialStartup,
+            ),
             held_resolve_for_activation_admission: None,
         });
         let outside = app.tmp.path().join("outside-startup-snapshot");
@@ -18571,6 +18592,10 @@ mod startup_open_path_resolve_tests {
             bookmark_relative_page_openable: None,
             elapsed_ms: 1.0,
             direct_media: None,
+            folder_scan: None,
+            scan_policy: None,
+            scan_policy_mixed: false,
+            default_target: None,
         })
         .expect("held resolver receiver must remain owned");
 
@@ -18825,6 +18850,10 @@ mod startup_open_path_resolve_tests {
                 bookmark_relative_page_openable: None,
                 elapsed_ms: 1.0,
                 direct_media: None,
+                folder_scan: None,
+                scan_policy: None,
+                scan_policy_mixed: false,
+                default_target: None,
             },
             &egui::Context::default(),
         );
@@ -19110,6 +19139,10 @@ mod startup_open_path_resolve_tests {
             rx,
             started_at: std::time::Instant::now() - std::time::Duration::from_millis(500),
             toast_shown: false,
+            scan_phase: std::sync::Arc::new(crate::app::startup_ops::StartupScanPhase::new()),
+            input_kind: crate::app::startup_ops::StartupResolveInputKind::Explicit(
+                StartupOpenPathSource::InitialStartup,
+            ),
             held_resolve_for_activation_admission: None,
         });
 
@@ -19145,6 +19178,10 @@ mod startup_open_path_resolve_tests {
             rx,
             started_at: std::time::Instant::now(),
             toast_shown: false,
+            scan_phase: std::sync::Arc::new(crate::app::startup_ops::StartupScanPhase::new()),
+            input_kind: crate::app::startup_ops::StartupResolveInputKind::Explicit(
+                StartupOpenPathSource::InitialStartup,
+            ),
             held_resolve_for_activation_admission: None,
         });
 
@@ -19194,6 +19231,10 @@ mod startup_open_path_resolve_tests {
                 bookmark_relative_page_openable: None,
                 elapsed_ms: 1.0,
                 direct_media: None,
+                folder_scan: None,
+                scan_policy: None,
+                scan_policy_mixed: false,
+                default_target: None,
             })
             .is_err(),
             "late result receiver must be gone"
@@ -19245,6 +19286,10 @@ mod startup_open_path_resolve_tests {
                 bookmark_relative_page_openable: None,
                 elapsed_ms: 1.0,
                 direct_media: None,
+                folder_scan: None,
+                scan_policy: None,
+                scan_policy_mixed: false,
+                default_target: None,
             })
             .is_err(),
             "late bookmark completion receiver must be gone"
@@ -19366,6 +19411,10 @@ mod startup_open_path_resolve_tests {
                 bookmark_relative_page_openable: None,
                 elapsed_ms: 1.0,
                 direct_media: None,
+                folder_scan: None,
+                scan_policy: None,
+                scan_policy_mixed: false,
+                default_target: None,
             },
             &ctx,
         );
@@ -22168,6 +22217,7 @@ mod quick_folder_restart_tests {
         let before = env.quick_folder_workspaces.clone();
 
         env.open_default_startup_target();
+        env.finish_startup_open_path_resolve_for_test();
         assert!(matches!(
             env.pdf_enumerate_pending.as_ref().map(|pending| &pending.5),
             Some(PdfOpenPhase::ColdCandidate { .. })
@@ -22251,6 +22301,7 @@ mod quick_folder_restart_tests {
         // Constructor must restore ownership before the first startup open.
         assert_eq!(env.active_quick_folder_slot, active);
         env.open_default_startup_target();
+        env.finish_startup_open_path_resolve_for_test();
         assert_eq!(env.current_folder.as_ref(), Some(previous));
         assert_eq!(env.active_quick_folder_slot, active);
         for (idx, workspace) in before.iter().enumerate() {
@@ -36125,6 +36176,10 @@ fn ignored_epub_bookmark_resolver_keeps_refusal_feedback() {
             bookmark_relative_page_openable: None,
             elapsed_ms: 1.0,
             direct_media: None,
+            folder_scan: None,
+            scan_policy: None,
+            scan_policy_mixed: false,
+            default_target: None,
         },
         &egui::Context::default(),
     );
@@ -75198,6 +75253,10 @@ mod still_window_mode_key_tests {
             rx,
             started_at: std::time::Instant::now(),
             toast_shown: false,
+            scan_phase: std::sync::Arc::new(crate::app::startup_ops::StartupScanPhase::new()),
+            input_kind: crate::app::startup_ops::StartupResolveInputKind::Explicit(
+                StartupOpenPathSource::InitialStartup,
+            ),
             held_resolve_for_activation_admission: None,
         });
 
@@ -75237,6 +75296,10 @@ mod still_window_mode_key_tests {
                 bookmark_relative_page_openable: None,
                 elapsed_ms: 1.0,
                 direct_media: None,
+                folder_scan: None,
+                scan_policy: None,
+                scan_policy_mixed: false,
+                default_target: None,
             })
             .is_err(),
             "late resolver completion must not resurrect the retired shell"
@@ -79927,6 +79990,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 rx,
                 started_at: std::time::Instant::now(),
                 toast_shown: false,
+                scan_phase: std::sync::Arc::new(crate::app::startup_ops::StartupScanPhase::new()),
+                input_kind: crate::app::startup_ops::StartupResolveInputKind::Explicit(
+                    StartupOpenPathSource::InitialStartup,
+                ),
                 held_resolve_for_activation_admission: None,
             });
             let result = || StartupOpenPathResolveResult {
@@ -79940,6 +80007,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 bookmark_relative_page_openable: None,
                 elapsed_ms: 1.0,
                 direct_media: None,
+                folder_scan: None,
+                scan_policy: None,
+                scan_policy_mixed: false,
+                default_target: None,
             };
             if completion_time == "published" {
                 tx.send(result()).unwrap();
@@ -113383,6 +113454,7 @@ fn section1335_direct_zip_exit_restart_keeps_explicit_parent_list() {
         .ai_runtime_cleanup
         .app_from_settings_after_drop(saved, AiRuntimeFixture::NotStarted);
     env.open_default_startup_target();
+    env.finish_startup_open_path_resolve_for_test();
     phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut env);
     assert!(
         env.fullscreen_idx.is_none(),

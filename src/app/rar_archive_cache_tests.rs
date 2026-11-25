@@ -232,6 +232,7 @@ fn open_entry(app: &mut App, source: &Path, entry: Entry) {
                 cursor: None,
             });
             app.open_previous_startup_list();
+            app.finish_startup_open_path_resolve_for_test();
         }
         Entry::Bookmark => {
             let row = crate::bookmark_browser::BookmarkBrowserRow {

@@ -78,6 +78,11 @@ fn settle_book(app: &mut App) {
     app.finish_page_identity_preparation_for_test();
 }
 
+fn settle_startup_target(app: &mut App) {
+    app.finish_startup_open_path_resolve_for_test();
+    settle_book(app);
+}
+
 fn open_zip(app: &mut App, path: &Path, direct: bool) {
     assert!(matches!(
         app.load_folder_or_convert_archive_with_auto_fullscreen(path.to_path_buf(), direct),
@@ -98,7 +103,7 @@ fn restart_previous_from_saved_settings(env: &mut phase_c_support::AppTestEnv) {
     let saved = crate::settings::Settings::load();
     env.replace_app_from_settings(saved, AiRuntimeFixture::NotStarted);
     env.open_default_startup_target();
-    settle_book(env);
+    settle_startup_target(env);
     let ctx = egui::Context::default();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while env.sidecar_restore_active() {
@@ -636,7 +641,7 @@ fn section1335_drive_and_other_startup_modes_retain_their_explicit_dispatch() {
         env.settings.startup_folder_mode = mode;
         env.settings.startup_folder_path = Some(specific.clone());
         env.open_default_startup_target();
-        settle_book(&mut env);
+        settle_startup_target(&mut env);
         assert!(env.fullscreen_idx.is_none());
         match mode {
             crate::settings::StartupFolderMode::Drives => {
@@ -1778,7 +1783,7 @@ fn section1335_first_app_startup_migrates_missing_record_and_second_startup_keep
             .app_from_settings_after_drop(first_load, AiRuntimeFixture::NotStarted);
         // There was no preceding explicit load in this App lifetime.
         env.open_default_startup_target();
-        settle_book(&mut env);
+        settle_startup_target(&mut env);
         assert_eq!(env.current_folder.as_ref(), Some(&legacy_path));
         assert!(env.fullscreen_idx.is_none());
         assert_eq!(env.items[env.selected.unwrap()].name(), "b.png");
@@ -1799,7 +1804,7 @@ fn section1335_first_app_startup_migrates_missing_record_and_second_startup_keep
             .ai_runtime_cleanup
             .app_from_settings_after_drop(second_load, AiRuntimeFixture::NotStarted);
         env.open_default_startup_target();
-        settle_book(&mut env);
+        settle_startup_target(&mut env);
         assert_eq!(env.current_folder.as_ref(), Some(&legacy_path));
         assert!(env.fullscreen_idx.is_none());
         assert_eq!(env.items[env.selected.unwrap()].name(), "b.png");
@@ -1885,7 +1890,7 @@ fn section1335_previous_zip_missing_or_recapsed_prefix_rejects_old_same_name_cur
             AiRuntimeFixture::NotStarted,
         );
         env.open_default_startup_target();
-        settle_book(&mut env);
+        settle_startup_target(&mut env);
         let prefix = if collapse_changed {
             "chapter/only/"
         } else {
@@ -2205,7 +2210,7 @@ fn section1335_departing_same_items_page_open_captures_list_cursor_before_page_n
         assert_eq!(saved.startup_list_restore, departure);
         env.replace_app_from_settings(saved, AiRuntimeFixture::NotStarted);
         env.open_default_startup_target();
-        settle_book(&mut env);
+        settle_startup_target(&mut env);
         assert_eq!(env.current_folder.as_ref(), Some(&target));
         assert!(env.fullscreen_idx.is_none());
         assert_eq!(env.items[env.selected.unwrap()].name(), names[12]);
@@ -2336,7 +2341,7 @@ fn section1335_synthetic_install_captures_changed_physical_departure_without_man
             .ai_runtime_cleanup
             .app_from_settings_after_drop(saved, AiRuntimeFixture::NotStarted);
         env.open_default_startup_target();
-        settle_book(&mut env);
+        settle_startup_target(&mut env);
         assert_eq!(env.current_folder.as_ref(), Some(&folder));
         assert!(env.fullscreen_idx.is_none());
         assert_eq!(env.items[env.selected.unwrap()].name(), "page-12.png");
@@ -2370,7 +2375,7 @@ fn section1335_startup_cursor_rows_survive_grid_page_acceptance_before_first_scr
         AiRuntimeFixture::NotStarted,
     );
     env.open_default_startup_target();
-    settle_book(&mut env);
+    settle_startup_target(&mut env);
     assert_eq!(env.items[env.selected.unwrap()].name(), names[12]);
     assert_eq!(env.grid_scroll.row_anchor(), Some(2));
     // No UI frame has measured this restored list's final scroll geometry.
@@ -2391,7 +2396,7 @@ fn section1335_startup_cursor_rows_survive_grid_page_acceptance_before_first_scr
         .ai_runtime_cleanup
         .app_from_settings_after_drop(saved, AiRuntimeFixture::NotStarted);
     env.open_default_startup_target();
-    settle_book(&mut env);
+    settle_startup_target(&mut env);
     assert!(env.fullscreen_idx.is_none());
     assert_eq!(env.items[env.selected.unwrap()].name(), names[12]);
     assert_eq!(env.grid_scroll.row_anchor(), Some(2));
@@ -2812,7 +2817,7 @@ fn section1335_bookshelf_compiled_folder_direct_read_and_explicit_list_restart_d
             .ai_runtime_cleanup
             .app_from_settings_after_drop(saved, AiRuntimeFixture::NotStarted);
         env.open_default_startup_target();
-        settle_book(&mut env);
+        settle_startup_target(&mut env);
         let expected = if direct { &root } else { &child };
         assert_eq!(env.current_folder.as_ref(), Some(expected));
         assert!(env.fullscreen_idx.is_none());

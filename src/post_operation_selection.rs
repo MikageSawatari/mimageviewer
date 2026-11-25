@@ -57,9 +57,14 @@ impl ExpectedOutputs {
     }
 }
 
+/// App の共通受付で発行する、遅延完了との照合用の番号。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PostOperationSelectionId(pub(crate) u64);
+
 /// 操作の結果へ選択を移す要求。**適用先のフォルダを持つので、別の一覧は汚さない。**
 #[derive(Debug, Clone)]
 pub(crate) struct PostOperationSelection {
+    id: PostOperationSelectionId,
     folder: PathBuf,
     expected: ExpectedOutputs,
     /// 前回選択を適用した出力。ここから増えなければ操作は落ち着いたとみなす。
@@ -68,13 +73,23 @@ pub(crate) struct PostOperationSelection {
 }
 
 impl PostOperationSelection {
-    pub(crate) fn new(folder: PathBuf, expected: ExpectedOutputs, now: Instant) -> Self {
+    pub(crate) fn new(
+        id: PostOperationSelectionId,
+        folder: PathBuf,
+        expected: ExpectedOutputs,
+        now: Instant,
+    ) -> Self {
         Self {
+            id,
             folder,
             expected,
             applied: Vec::new(),
             expires_at: now + OUTPUT_WAIT_TIMEOUT,
         }
+    }
+
+    pub(crate) fn id(&self) -> PostOperationSelectionId {
+        self.id
     }
 
     /// 適用したことを記録し、次の再読込を待つ期限を延ばす。
@@ -275,7 +290,12 @@ mod tests {
     #[test]
     fn a_created_folder_is_found_wherever_the_sort_put_it() {
         let now = Instant::now();
-        let request = PostOperationSelection::new(folder(), known(&["new"]), now);
+        let request = PostOperationSelection::new(
+            PostOperationSelectionId(1),
+            folder(),
+            known(&["new"]),
+            now,
+        );
         // 名前順で末尾に入った場合。
         let step = decide(&request, Some(&folder()), &visible(&["a", "b", "new"]), now);
         assert_eq!(step, Step::Apply(vec![2]));
@@ -284,7 +304,12 @@ mod tests {
     #[test]
     fn a_paste_is_recognised_by_what_was_not_there_before() {
         let now = Instant::now();
-        let request = PostOperationSelection::new(folder(), added_since(&["a", "b"]), now);
+        let request = PostOperationSelection::new(
+            PostOperationSelectionId(1),
+            folder(),
+            added_since(&["a", "b"]),
+            now,
+        );
         let step = decide(
             &request,
             Some(&folder()),
@@ -299,7 +324,12 @@ mod tests {
         // 貼り付けた元の名前は `a.jpg` だが、衝突して `a (2).jpg` になった。
         // 元の名前で探していたら取り逃がす。
         let now = Instant::now();
-        let request = PostOperationSelection::new(folder(), added_since(&["a.jpg"]), now);
+        let request = PostOperationSelection::new(
+            PostOperationSelectionId(1),
+            folder(),
+            added_since(&["a.jpg"]),
+            now,
+        );
         let step = decide(
             &request,
             Some(&folder()),
@@ -312,7 +342,12 @@ mod tests {
     #[test]
     fn moving_to_another_folder_before_it_finishes_leaves_that_list_alone() {
         let now = Instant::now();
-        let request = PostOperationSelection::new(folder(), known(&["new"]), now);
+        let request = PostOperationSelection::new(
+            PostOperationSelectionId(1),
+            folder(),
+            known(&["new"]),
+            now,
+        );
         let elsewhere = PathBuf::from(r"C:\other");
         // 移動先にも同じ名前の項目があっても、選択を奪ってはいけない。
         let step = decide(
@@ -329,7 +364,12 @@ mod tests {
     fn an_output_hidden_by_the_filter_is_waited_for_rather_than_forced_into_view() {
         // 絞り込みで隠れている項目は `visible` に入らない。フィルタは変えない。
         let now = Instant::now();
-        let request = PostOperationSelection::new(folder(), known(&["new"]), now);
+        let request = PostOperationSelection::new(
+            PostOperationSelectionId(1),
+            folder(),
+            known(&["new"]),
+            now,
+        );
         assert_eq!(
             decide(&request, Some(&folder()), &visible(&["a", "b"]), now),
             Step::Wait
@@ -339,7 +379,12 @@ mod tests {
     #[test]
     fn a_paste_that_produced_nothing_is_dropped_instead_of_waiting_forever() {
         let now = Instant::now();
-        let request = PostOperationSelection::new(folder(), added_since(&["a"]), now);
+        let request = PostOperationSelection::new(
+            PostOperationSelectionId(1),
+            folder(),
+            added_since(&["a"]),
+            now,
+        );
         assert_eq!(
             decide(&request, Some(&folder()), &visible(&["a"]), now),
             Step::Wait
@@ -358,7 +403,12 @@ mod tests {
     #[test]
     fn a_long_paste_keeps_selecting_the_files_as_they_arrive() {
         let now = Instant::now();
-        let mut request = PostOperationSelection::new(folder(), added_since(&["a"]), now);
+        let mut request = PostOperationSelection::new(
+            PostOperationSelectionId(1),
+            folder(),
+            added_since(&["a"]),
+            now,
+        );
 
         // 1 回目の再読込では 2 件だけ届いている。
         let first = visible(&["a", "b", "c"]);
@@ -417,7 +467,12 @@ mod tests {
     #[test]
     fn the_request_lets_go_once_the_user_moves_the_selection() {
         let now = Instant::now();
-        let mut request = PostOperationSelection::new(folder(), added_since(&["a"]), now);
+        let mut request = PostOperationSelection::new(
+            PostOperationSelectionId(1),
+            folder(),
+            added_since(&["a"]),
+            now,
+        );
         let listing = visible(&["a", "b", "c"]);
         let Step::Apply(indices) = decide(&request, Some(&folder()), &listing, now) else {
             panic!("should apply");
@@ -454,7 +509,12 @@ mod tests {
     /// 貼り付け結果を 1 度も選べない。
     #[test]
     fn a_request_that_has_not_applied_yet_owns_nothing_and_keeps_waiting() {
-        let request = PostOperationSelection::new(folder(), added_since(&["a"]), Instant::now());
+        let request = PostOperationSelection::new(
+            PostOperationSelectionId(1),
+            folder(),
+            added_since(&["a"]),
+            Instant::now(),
+        );
         assert!(!request.has_applied());
         assert!(request.still_owns_selection(Some(&folder().join("a")), &[]));
         assert!(request.still_owns_selection(None, &[]));
@@ -464,7 +524,12 @@ mod tests {
     #[test]
     fn a_single_output_is_still_ours_with_nothing_checked() {
         let now = Instant::now();
-        let mut request = PostOperationSelection::new(folder(), added_since(&["a"]), now);
+        let mut request = PostOperationSelection::new(
+            PostOperationSelectionId(1),
+            folder(),
+            added_since(&["a"]),
+            now,
+        );
         let listing = visible(&["a", "b"]);
         let Step::Apply(indices) = decide(&request, Some(&folder()), &listing, now) else {
             panic!("should apply");
@@ -480,7 +545,12 @@ mod tests {
     #[test]
     fn waiting_does_not_expire_while_files_keep_arriving() {
         let now = Instant::now();
-        let mut request = PostOperationSelection::new(folder(), added_since(&["a"]), now);
+        let mut request = PostOperationSelection::new(
+            PostOperationSelectionId(1),
+            folder(),
+            added_since(&["a"]),
+            now,
+        );
         let first = visible(&["a", "b"]);
         let Step::Apply(indices) = decide(&request, Some(&folder()), &first, now) else {
             panic!("should apply");
