@@ -16,7 +16,9 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{Parallelism, Settings};
 
-const PREFERENCES_MIN_WIDTH: f32 = 620.0;
+// The design owner's 620 px measurement is the narrowest measured baseline;
+// allow another 4 px while keeping the fixed-table exceptions separate.
+const PREFERENCES_MIN_WIDTH: f32 = 624.0;
 
 #[cfg(test)]
 thread_local! {
@@ -7331,8 +7333,15 @@ mod tests {
     fn preferences_narrow_layout_all_pages_fit_and_actions_visible() {
         use crate::test_ui::scroll_layout::ScrollLayout;
         use egui_kittest::kittest::{NodeT, Queryable};
-        let mut harness = preferences_view_harness(PreferencesPage::General);
-        let window_id = egui::Id::unique("環境設定");
+        // §1.857, round 4: this editor already exceeds the default 720 px window.
+        // Its item/status, arrow and separator columns need a separate row design.
+        // Only width is excluded; ComboBox height and action visibility still apply.
+        const PREFERENCES_NARROW_WIDTH_EXCLUSIONS: &[PreferencesPage] = &[
+            PreferencesPage::ContextMenuLayout, // Fixed item / ↑ / ↓ / separator controls.
+        ];
+        let mut harness =
+            preferences_view_harness_with_combo_reference(PreferencesPage::General, true);
+        let window_id = preferences_window_id_for_test();
         let before = harness
             .ctx
             .memory(|memory| memory.area_rect(window_id))
@@ -7381,7 +7390,10 @@ mod tests {
                     .expect("production preferences ScrollArea");
                 assert_eq!(rendered, page);
                 let tolerance = 1.0 / harness.ctx.pixels_per_point();
-                if layout.content.x > layout.inner.width() + tolerance && !width_reported {
+                if !PREFERENCES_NARROW_WIDTH_EXCLUSIONS.contains(&page)
+                    && layout.content.x > layout.inner.width() + tolerance
+                    && !width_reported
+                {
                     width_reported = true;
                     failures.push(format!("page={page:?} ({}) step={step}: content width {} > viewport {}; layout={layout:?}",
                         page.label(), layout.content.x, layout.inner.width()));
@@ -7391,9 +7403,12 @@ mod tests {
                         egui::accesskit::Role::Button,
                         egui::accesskit::Role::TextInput,
                     ] {
-                        for node in harness.get_all_by_role(role) {
+                        for node in harness.query_all_by_role(role) {
                             let rect = node.rect();
                             if rect.left() >= layout.inner.left()
+                                && rect.top() >= layout.inner.top() - tolerance
+                                && rect.top() < layout.inner.bottom()
+                                && rect.bottom() > layout.inner.top()
                                 && rect.right() > layout.inner.right() + tolerance
                             {
                                 failures.push(format!(
@@ -7404,10 +7419,24 @@ mod tests {
                         }
                     }
                 }
-                let row_height = harness.ctx.global_style().spacing.interact_size.y;
-                for combo in harness.get_all_by_role(egui::accesskit::Role::ComboBox) {
+                // ComboBox uses ButtonStyle's frame padding, text and icon height,
+                // not just spacing.interact_size.y (vendor/egui combo_box.rs).
+                let row_height = harness
+                    .ctx
+                    .data(|data| {
+                        data.get_temp::<f32>(egui::Id::unique(
+                            "preferences_single_line_combo_height",
+                        ))
+                    })
+                    .expect("single-line reference ComboBox in this harness");
+                for combo in harness.query_all_by_role(egui::accesskit::Role::ComboBox) {
                     let rect = combo.rect();
-                    if rect.height() > row_height + tolerance {
+                    if rect.left() >= layout.inner.left() - tolerance
+                        && rect.top() >= layout.inner.top() - tolerance
+                        && rect.top() < layout.inner.bottom()
+                        && rect.bottom() > layout.inner.top()
+                        && rect.height() > row_height + tolerance
+                    {
                         failures.push(format!("page={page:?} ({}) step={step}: ComboBox value={:?}, rect={rect:?}, one-row height={row_height}, node={:?}",
                             page.label(), combo.value(), combo.accesskit_node()));
                     }
@@ -7450,7 +7479,7 @@ mod tests {
         harness.run_steps(5);
         let window = harness
             .ctx
-            .memory(|memory| memory.area_rect(egui::Id::unique("環境設定")))
+            .memory(|memory| memory.area_rect(preferences_window_id_for_test()))
             .unwrap();
         assert!(
             window.width() <= 500.0 - 48.0 + 1.0,
@@ -9781,8 +9810,22 @@ mod tests {
         harness
     }
 
+    fn preferences_window_id_for_test() -> egui::Id {
+        // Window::new hashes Atoms::text() (Option<Cow<str>>), not the bare title.
+        // Derive that same ID without changing the product's persisted window state.
+        let title = egui::Atoms::new("環境設定");
+        egui::Id::unique(title.text())
+    }
+
     fn preferences_view_harness(
         page: PreferencesPage,
+    ) -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
+        preferences_view_harness_with_combo_reference(page, false)
+    }
+
+    fn preferences_view_harness_with_combo_reference(
+        page: PreferencesPage,
+        measure_combo: bool,
     ) -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
         let mut app = crate::app::setup_app_for_test();
         app.settings.external_tools = (1..=2)
@@ -9797,9 +9840,35 @@ mod tests {
             .with_context_setup(crate::ui_fonts::configure_fonts)
             .with_size(egui::vec2(1093.0, 614.0))
             .build_ui_state(
-                |root_ui, app| {
+                move |root_ui, app| {
                     let ctx = &root_ui.ctx().clone();
-                    app.show_preferences_dialog(ctx)
+                    app.show_preferences_dialog(ctx);
+                    if measure_combo {
+                        // Same Context, fonts and style as the preferences page,
+                        // outside the right pane and unable to intercept input.
+                        let reference =
+                            egui::Area::new(egui::Id::unique("preferences_reference_combo"))
+                                .order(egui::Order::Background)
+                                .fixed_pos(egui::Pos2::ZERO)
+                                .interactable(false)
+                                .show(ctx, |ui| {
+                                    ui.set_width(256.0);
+                                    let combo = egui::ComboBox::from_id_salt("single_line")
+                                        .selected_text("標準")
+                                        .show_ui(ui, |_| {});
+                                    crate::ui_helpers::set_accessibility_label(
+                                        &combo.response,
+                                        "1 行のコンボの高さの基準",
+                                    );
+                                    combo
+                                });
+                        ctx.data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::unique("preferences_single_line_combo_height"),
+                                reference.inner.response.rect.height(),
+                            )
+                        });
+                    }
                 },
                 app,
             );

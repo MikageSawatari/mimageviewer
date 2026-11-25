@@ -402,7 +402,9 @@ pub(super) fn page_font(ui: &mut egui::Ui, state: &mut PreferencesState) {
         .inner_margin(egui::Margin::same(6))
         .corner_radius(4.0)
         .show(ui, |ui| {
-            ui.set_min_width(420.0);
+            // The preview frame adds 6 px on each side. Its preferred inner
+            // width must still fit the page when the preferences window is narrow.
+            ui.set_min_width(420.0_f32.min(ui.available_width()));
             if let Some(texture) = &state.ui_font_preview_texture {
                 let available = ui.available_width().min(texture.size_vec2().x);
                 let size = egui::vec2(
@@ -5756,9 +5758,18 @@ pub(super) fn page_menu_layout(ui: &mut egui::Ui, state: &mut PreferencesState) 
                 .default_open(open)
                 .open(Some(open))
                 .show(ui, |ui| {
+                    // The other three columns are the visibility checkbox and
+                    // the two small arrows. Wrap item names in the remaining
+                    // width instead of letting the longest name widen the table.
+                    let column_spacing = 8.0;
+                    let control_column_width = ui.spacing().interact_size.x;
+                    let item_wrap_width =
+                        (ui.available_width() - 3.0 * control_column_width - 3.0 * column_spacing)
+                            .max(control_column_width);
                     egui::Grid::new(("menu_layout_commands", top))
                         .num_columns(4)
-                        .spacing([8.0, 4.0])
+                        .spacing([column_spacing, 4.0])
+                        .max_col_width(item_wrap_width)
                         .striped(true)
                         .show(ui, |ui| {
                             for (command_index, &command) in command_order.iter().enumerate() {
@@ -12777,10 +12788,11 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
         let mut music_open = s.music_open_resume;
         let mut music_nav = s.music_nav_resume;
 
+        let combo_width = 96.0;
         let combo = |ui: &mut egui::Ui, id: &str, val: &mut ResumeMode| {
             egui::ComboBox::from_id_salt(id)
                 .selected_text(val.label())
-                .width(96.0)
+                .width(combo_width)
                 .show_ui(ui, |ui| {
                     for &m in ResumeMode::all() {
                         ui.selectable_value(val, m, m.label());
@@ -12789,9 +12801,26 @@ pub(super) fn page_playback_resume(ui: &mut egui::Ui, state: &mut PreferencesSta
                 .response
         };
 
+        let column_spacing = 24.0;
+        let row_label_width = ui
+            .painter()
+            .layout_no_wrap(
+                "ZIP / PDF (本)".to_owned(),
+                egui::TextStyle::Body.resolve(ui.style()),
+                ui.visuals().text_color(),
+            )
+            .size()
+            .x
+            .max(ui.spacing().interact_size.x);
+        // Keep all three columns and their labels. Only the long navigation
+        // heading needs to wrap when the page cannot fit its unbroken text.
+        let column_wrap_width =
+            (ui.available_width() - row_label_width - combo_width - 2.0 * column_spacing)
+                .max(combo_width);
         egui::Grid::new("playback_resume_grid")
             .num_columns(3)
-            .spacing([24.0, 10.0])
+            .spacing([column_spacing, 10.0])
+            .max_col_width(column_wrap_width)
             .show(ui, |ui| {
                 ui.label("");
                 let open_label = ui.strong("一覧から開く");

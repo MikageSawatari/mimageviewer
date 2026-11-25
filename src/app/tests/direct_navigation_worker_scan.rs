@@ -100,29 +100,56 @@ fn capture_destination_missing_warns_without_replacing_current_listing() {
 
 #[test]
 fn capture_destination_existing_opens_like_pane_navigation() {
-    let mut app = setup_app();
-    app.settings.auto_fullscreen_image_folders = false;
-    let origin = folder(&app, "capture-existing-origin");
-    let destination = folder(&app, "capture-existing-destination");
-    std::fs::create_dir(destination.join("child")).unwrap();
-    app.load_folder(origin.clone());
-    app.finish_page_identity_preparation_for_test();
-    app.start_capture_destination_open(destination.clone());
-    make_scan_ready(&mut app);
-    app.post_render_main_navigation(
-        &egui::Context::default(),
-        update_phases::MainFrameNavigation::default(),
-    );
-    app.finish_page_identity_preparation_for_test();
-    assert_eq!(app.current_folder.as_ref(), Some(&destination));
-    assert!(
-        app.items
-            .contains(&GridItem::Folder(destination.join("child")))
-    );
-    assert_eq!(
-        app.folder_nav_back_stack.last().unwrap().location,
-        FolderNavHistoryTarget::Path(origin)
-    );
+    let dirs = tempfile::tempdir().unwrap();
+    let origin = dirs.path().join("origin");
+    let destination = dirs.path().join("destination");
+    std::fs::create_dir(&origin).unwrap();
+    std::fs::create_dir_all(destination.join("child")).unwrap();
+    for quick_slot in [true, false] {
+        let mut pane_history = None;
+        for capture in [false, true] {
+            let mut app = setup_app();
+            app.settings.auto_fullscreen_image_folders = false;
+            // Existing main-history tests explicitly disable the quick-folder slot.
+            // Compare both purposes with the default slot as well as without it.
+            if !quick_slot {
+                app.active_quick_folder_slot = None;
+            }
+            app.load_folder(origin.clone());
+            app.finish_page_identity_preparation_for_test();
+            if capture {
+                app.start_capture_destination_open(destination.clone());
+            } else {
+                app.start_folder_pane_open(destination.clone());
+            }
+            make_scan_ready(&mut app);
+            app.post_render_main_navigation(
+                &egui::Context::default(),
+                update_phases::MainFrameNavigation::default(),
+            );
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.current_folder.as_ref(), Some(&destination));
+            assert!(
+                app.items
+                    .contains(&GridItem::Folder(destination.join("child")))
+            );
+            let (active_back, active_forward) = app.active_folder_history_vectors();
+            let history = (
+                active_back.to_vec(),
+                active_forward.to_vec(),
+                app.folder_nav_back_stack.clone(),
+                app.folder_nav_forward_stack.clone(),
+            );
+            if let Some(expected) = &pane_history {
+                assert_eq!(
+                    &history, expected,
+                    "capture history differs from PaneNavigation: quick_slot={quick_slot}"
+                );
+            } else {
+                pane_history = Some(history);
+            }
+        }
+    }
 }
 
 #[test]
