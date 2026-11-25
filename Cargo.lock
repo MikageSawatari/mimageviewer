@@ -4133,6 +4133,7 @@ dependencies = [
  "opener",
  "ort",
  "pdfium-render",
+ "percent-encoding",
  "png 0.18.1",
  "pollster 0.4.0",
  "qrcode",

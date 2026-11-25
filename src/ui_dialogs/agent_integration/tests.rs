@@ -1,6 +1,58 @@
 use super::*;
 use egui_kittest::kittest::{NodeT, Queryable};
 
+#[test]
+fn ask_ai_codex_settings_button_opens_once_on_worker_without_waiting() {
+    use crate::external_links::{
+        AiAppLink, ExternalOpenFailure, FailureSink, OpenTarget, TestOpenerGuard,
+    };
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+    let settings = Settings::default();
+    let selection = PermissionSelection::from(&settings);
+    let state = injected(&settings);
+    let (tx, rx) = mpsc::channel();
+    let sink = FailureSink {
+        tx,
+        ctx: egui::Context::default(),
+    };
+    let (called_tx, called_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let caller = std::thread::current().id();
+    let _opener = TestOpenerGuard::install(move |target| {
+        assert_ne!(caller, std::thread::current().id());
+        assert!(matches!(
+            target,
+            OpenTarget::AiApp(AiAppLink::CodexSettings)
+        ));
+        called_tx.send(()).unwrap();
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        Err("codex://settings rejected".into())
+    });
+    let mut harness = crate::test_ui::builder()
+        .with_size(egui::vec2(1000.0, 600.0))
+        .with_context_setup(crate::ui_fonts::configure_fonts)
+        .build_ui_state(
+            move |ui, state| draw_app(ui, &selection, state, AppTarget::ChatGpt, Some(&sink)),
+            state,
+        );
+    harness.run();
+    harness.get_by_label("設定を開く").click();
+    harness.run();
+    called_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(called_rx.try_recv().is_err());
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ExternalOpenFailure::ChatGptApp
+    );
+}
+
 fn painted_text(output: &egui::FullOutput) -> Vec<&egui::epaint::TextShape> {
     fn collect<'a>(shape: &'a egui::Shape, texts: &mut Vec<&'a egui::epaint::TextShape>) {
         match shape {
@@ -543,7 +595,7 @@ fn agent_registration_instructions_show_confirmed_app_menu_paths() {
             .with_size(egui::vec2(900.0, 1200.0))
             .with_context_setup(crate::ui_fonts::configure_fonts)
             .build_ui_state(
-                move |ui, state| draw_app(ui, &selection, state, target),
+                move |ui, state| draw_app(ui, &selection, state, target, None),
                 state,
             );
         harness.run_steps(5);
@@ -574,9 +626,14 @@ fn agent_registration_open_settings_feedback_uses_injected_opener() {
         let mut state = injected(&settings);
         state.feedback = Some((AppTarget::ClaudeDesktop, Ok("previous feedback".into())));
         let mut calls = 0;
-        open_codex_settings(&mut state, |url| {
+        open_codex_settings(&mut state, |target| {
             calls += 1;
-            assert_eq!(url, "codex://settings");
+            assert!(matches!(
+                target,
+                crate::external_links::OpenTarget::AiApp(
+                    crate::external_links::AiAppLink::CodexSettings
+                )
+            ));
             if succeeds {
                 Ok(())
             } else {
@@ -594,7 +651,7 @@ fn agent_registration_open_settings_feedback_uses_injected_opener() {
             .with_size(egui::vec2(900.0, 600.0))
             .with_context_setup(crate::ui_fonts::configure_fonts)
             .build_ui_state(
-                move |ui, state| draw_app(ui, &selection, state, AppTarget::ChatGpt),
+                move |ui, state| draw_app(ui, &selection, state, AppTarget::ChatGpt, None),
                 state,
             );
         harness.run_steps(5);
@@ -625,7 +682,7 @@ fn agent_registration_local_cache_guidance_is_visible_in_the_registered_row_with
         .with_size(egui::vec2(900.0, 600.0))
         .with_context_setup(crate::ui_fonts::configure_fonts)
         .build_ui_state(
-            move |ui, state| draw_app(ui, &selection, state, AppTarget::ClaudeDesktop),
+            move |ui, state| draw_app(ui, &selection, state, AppTarget::ClaudeDesktop, None),
             state,
         );
     harness.run_steps(5);

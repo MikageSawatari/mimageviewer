@@ -2835,6 +2835,7 @@ pub enum MenuCommandId {
     SettingsRemoteConnection,
     SettingsAgentIntegration,
     HelpOpenManual,
+    HelpAskAi,
     HelpOpenLogs,
     HelpShowWhatsNew,
     HelpAbout,
@@ -2898,6 +2899,7 @@ impl MenuCommandId {
         Self::SettingsRemoteConnection,
         Self::SettingsAgentIntegration,
         Self::HelpOpenManual,
+        Self::HelpAskAi,
         Self::HelpOpenLogs,
         Self::HelpShowWhatsNew,
         Self::HelpAbout,
@@ -2959,6 +2961,7 @@ impl MenuCommandId {
             MenuCommandId::SettingsOperationCustomize => "SettingsOperationCustomize",
             MenuCommandId::SettingsPreferences => "SettingsPreferences",
             MenuCommandId::HelpOpenManual => "HelpOpenManual",
+            MenuCommandId::HelpAskAi => "HelpAskAi",
             MenuCommandId::SettingsRemoteConnection => "SettingsRemoteConnection",
             MenuCommandId::SettingsAgentIntegration => "SettingsAgentIntegration",
             MenuCommandId::HelpOpenLogs => "HelpOpenLogs",
@@ -3326,6 +3329,12 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::HelpOpenManual,
         parent: TopMenuId::Help,
         label: "ヘルプサイトを開く",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::HelpAskAi,
+        parent: TopMenuId::Help,
+        label: "AI で調べる",
         action: None,
     },
     MenuCommandSpec {
@@ -13357,6 +13366,7 @@ mod tests {
             vec![
                 MenuCommandId::HelpAbout,
                 MenuCommandId::HelpOpenManual,
+                MenuCommandId::HelpAskAi,
                 MenuCommandId::HelpShowWhatsNew,
             ]
         );
@@ -13544,6 +13554,53 @@ mod tests {
     }
 
     #[test]
+    fn ask_ai_menu_layout_stable_name_saved_order_hiding_and_label() {
+        let command = MenuCommandId::HelpAskAi;
+        assert_eq!(command.stable_name(), "HelpAskAi");
+        assert_eq!(MenuCommandId::parse_stable_name("HelpAskAi"), Some(command));
+        let spec = menu_command_spec(command).unwrap();
+        assert_eq!(spec.parent, TopMenuId::Help);
+        assert_eq!(spec.action, None);
+        assert_eq!(Keymap::empty().menu_command_label(command), "AI で調べる");
+        let commands = |settings: &MenuLayoutSettings| {
+            resolve_menu_layout(settings)
+                .menus
+                .into_iter()
+                .find(|menu| menu.id == TopMenuId::Help)
+                .unwrap()
+                .commands
+        };
+        let default = commands(&Default::default());
+        let manual = default
+            .iter()
+            .position(|id| *id == MenuCommandId::HelpOpenManual)
+            .unwrap();
+        assert_eq!(default[manual + 1], command);
+        let mut saved = MenuLayoutSettings {
+            command_order: vec![MenuCommandOrderSettings {
+                parent: "Help".into(),
+                commands: vec!["HelpAbout".into(), "HelpOpenManual".into()],
+            }],
+            ..Default::default()
+        };
+        assert!(
+            commands(&saved).contains(&command),
+            "old saved layouts append the new command"
+        );
+        saved.command_order[0]
+            .commands
+            .insert(0, "HelpAskAi".into());
+        assert_eq!(commands(&saved)[0], command);
+        saved.hidden_commands.push("HelpAskAi".into());
+        assert!(!commands(&saved).contains(&command));
+        let json = serde_json::to_string(&saved).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MenuLayoutSettings>(&json).unwrap(),
+            saved
+        );
+    }
+
+    #[test]
     fn metadata_transfer_commands_are_available_in_v2_8_development_menus() {
         assert!(crate::metadata_transfer::UI_ENABLED);
         let file_commands = menu_commands_for_parent(TopMenuId::File)
@@ -13703,6 +13760,7 @@ mod tests {
             ),
             (MenuCommandId::SettingsPreferences, "環境設定…"),
             (MenuCommandId::HelpOpenManual, "ヘルプサイトを開く"),
+            (MenuCommandId::HelpAskAi, "AI で調べる"),
             (MenuCommandId::SettingsRemoteConnection, "リモート接続…"),
             (MenuCommandId::SettingsAgentIntegration, "AI 連携…"),
             (MenuCommandId::HelpOpenLogs, "ログフォルダを開く"),

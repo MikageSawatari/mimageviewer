@@ -17,8 +17,11 @@ Default の Remote 取消では空の requested path を明示入力として延
 既存の取消・main 要求の後勝ちと、detached ブックマークの引き渡し経路を維持する。
 
 外部 URL・player・tweet・map は `external_links::spawn_open` に集約する。短命の名前付き worker が COM STA を初期化して
-Shell を呼び、UI は待たず、取消・世代・join は持たない。一般の失敗はログのみ、マップだけ App 共通の一つの受信口へ
-通知し ROOT を起床する。root は `poll_file_organize` の隣で早期 return 前に警告を採用する。
+Shell を呼び、UI は待たず、取消・join は持たない。一般の失敗はログのみ、マップと AI アプリの失敗、
+Web の AI のコピー結果は App 共通の一つの受信口へ通知し ROOT を起床する。root は `poll_file_organize` の隣で早期 return 前に通知を採用する。
+§1.894 の AI アプリ URL は型付きの固定先だけを許し、Web の AI は同じ worker 内でテキストを書いてから開く。
+書き込みは画像コピーと mIV / OS の世代照合を共有し、通知は結果に応じた文言を使う。登録検出は窓とメニューで
+spawn / 受信処理を共有するが、それぞれの受信口を所有する。追加部分の自動検証・実行時の挙動は未確認。サブ PC で確認予定。
 `ext/open_end` (`target_kind`, `ms`, `ok`) と `nav/startup_resolve_scan` (`resolve_ms`, `scan_ms`, `folders`, `media`,
 `outcome`, `source`) は perf 有効時だけ記録する。Rust 検証・実機計測は未実施。
 [設計書 §1・§3](ui-sync-853-plan.md) を参照。

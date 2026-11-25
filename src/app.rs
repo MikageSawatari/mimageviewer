@@ -754,6 +754,7 @@ pub(crate) use archive_inner_book::{
     ArchiveBookEntry, ArchiveBookOpenOutcome, ArchiveBookTarget, DetachedZipTarget,
     ZipListReturnRequest,
 };
+pub(crate) mod ask_ai;
 #[cfg(all(test, windows))]
 mod context_state_tests;
 pub(crate) mod external_open;
@@ -18356,6 +18357,7 @@ pub struct App {
     pub(crate) startup_open_path: Option<ExplicitOpenPath>,
     /// 起動引数 / 2 重起動 activation で渡されたパスを UI スレッド外で解決中。
     pub(crate) startup_open_path_resolve_pending: Option<StartupOpenPathResolvePending>,
+    ask_ai_registration: ask_ai::AskAiRegistration,
     external_open_failure_tx: mpsc::Sender<crate::external_links::ExternalOpenFailure>,
     external_open_failures: mpsc::Receiver<crate::external_links::ExternalOpenFailure>,
 
@@ -21741,6 +21743,7 @@ impl App {
             initialized: false,
             startup_open_path: None,
             startup_open_path_resolve_pending: None,
+            ask_ai_registration: Default::default(),
             external_open_failure_tx,
             external_open_failures,
             applied_ui_theme: None,

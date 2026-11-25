@@ -1,12 +1,22 @@
-//! Request-scoped viewer opening policy, plus process-wide external Shell failures.
+//! Request-scoped viewer opening policy, plus process-wide external-open notifications.
 //! No App-global next-open flags.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 impl super::App {
+    pub(crate) fn external_open_sink(
+        &self,
+        ctx: &egui::Context,
+    ) -> crate::external_links::FailureSink {
+        crate::external_links::FailureSink {
+            tx: self.external_open_failure_tx.clone(),
+            ctx: ctx.clone(),
+        }
+    }
+
     /// The photo/spread side is resolved by the drawing pass; no pending GPS
-    /// state survives navigation. Only failures travel back to the root poll.
+    /// state survives navigation. External-open notifications use the root poll.
     pub(crate) fn open_google_maps(&self, ctx: &egui::Context, url: String) {
         let _ = crate::external_links::spawn_open(
             crate::external_links::OpenTarget::Map(url),
@@ -19,7 +29,11 @@ impl super::App {
 
     pub(crate) fn poll_external_open_failures(&mut self) {
         while let Ok(failure) = self.external_open_failures.try_recv() {
-            self.show_feedback_warning(failure.message().to_owned());
+            if failure.is_warning() {
+                self.show_feedback_warning(failure.message().to_owned());
+            } else {
+                self.show_feedback_toast(failure.message().to_owned());
+            }
         }
     }
 }
@@ -213,6 +227,25 @@ impl ViewerOpenAdoption {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_ai_root_poll_delivers_app_warnings_and_clipboard_result_toasts() {
+        use crate::external_links::ExternalOpenFailure as Event;
+        use crate::feedback::FeedbackKind;
+        let mut app = crate::app::setup_app_for_test();
+        for (event, kind) in [
+            (Event::ClaudeApp, FeedbackKind::Warning),
+            (Event::ChatGptApp, FeedbackKind::Warning),
+            (Event::AiWebClipboardWritten, FeedbackKind::Info),
+            (Event::AiWebClipboardSkipped, FeedbackKind::Info),
+            (Event::AiWebClipboardFailed, FeedbackKind::Warning),
+        ] {
+            app.external_open_failure_tx.send(event).unwrap();
+            app.poll_external_open_failures();
+            assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, event.message());
+            assert_eq!(app.feedback_toasts_for_test.last().unwrap().1, kind);
+        }
+    }
 
     #[test]
     fn external_open_map_failure_repaints_root_and_root_poll_warns() {
