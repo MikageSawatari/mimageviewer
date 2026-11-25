@@ -47,7 +47,7 @@
 
 ### 1.903 v5.8.0 の依存物の更新 (PDFium 8179・mIV Sound の元 (EffeTune Mixwright) 0.19.0・crate 22 件) — v5.7.0 のリリース時の確認から (2026-11-26)
 
-- 状態: **v5.8.0 で行う (利用者決定 2026-11-25「依存物の更新は、v5.8.0にしたいと思います」)、2026-11-26 に着手 (利用者「並行して着手可能でしょうか」)、担当 deps-903**。
+- 状態: **v5.8.0 で行う (利用者決定 2026-11-25「依存物の更新は、v5.8.0にしたいと思います」)、2026-11-26 に着手 (利用者「並行して着手可能でしょうか」)、担当 deps-903**。 crate 23 件 (472f507bf) と PDFium 8179 (8d5780125、メイン checkout の vendor/pdfium も 8179 に差し替え) は独立レビュー ACCEPT で master 入り (11-26)。mIV Sound 0.19.0 は担当でレビュー指摘の修正中。CHANGELOG の文案「PDF の表示に使う PDFium を更新しました。」(crate は利用者向けの記載なし)。サブ PC の確認点: PDF のサムネイル・ページ送り・見開き・拡大、文字の多い PDF (縦書き・横書き)、図形・半透明の多い PDF、スキャン PDF、パスワード付き PDF、About の PDFium の版 160.0.8179.0。
 - 中身: v5.7.0 のリリースの Phase 2 (依存物の確認) で見つかった更新。PDFium 8179 (今の版から)、mIV Sound の元 (EffeTune Mixwright) の上流 0.19.0 (派生版の取り込み)、cargo の crate 22 件。手順は docs/native-dependencies.md と docs/release-checklist.md の Phase 2。
 - 注意: mIV Sound の DLL や VST3 host の中身が変わると、公開前のポータブル版の VirusTotal 検査が要る (release-checklist 12.6)。FFmpeg は LGPL の DLL のまま。
 
