@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent_registration as backend;
 use crate::ui_dialogs::agent_integration::MockBackend;
-use egui_kittest::kittest::{NodeT, Queryable};
+use egui_kittest::kittest::Queryable;
 use std::{cell::RefCell, rc::Rc, sync::mpsc};
 
 fn mock(states: [RegistrationState; 2]) -> MockBackend {

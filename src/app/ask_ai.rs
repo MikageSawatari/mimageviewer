@@ -124,7 +124,7 @@ impl Destination {
 
 fn fixed_scope<R>(
     ui: &mut egui::Ui,
-    key: impl std::hash::Hash,
+    key: impl std::hash::Hash + std::fmt::Debug,
     draw: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     ui.scope_builder(
