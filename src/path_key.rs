@@ -69,6 +69,14 @@ pub fn eq_keep_drive(a: &Path, b: &Path) -> bool {
     normalize_keep_drive(a) == normalize_keep_drive(b)
 }
 
+/// Compare synthetic-location bases without interpreting verbatim dot components.
+/// Keep drive-relative `C:` distinct from rooted `C:\` while ignoring trailing separators.
+pub(crate) fn eq_synthetic_path_base(a: &Path, b: &Path) -> bool {
+    a.has_root() == b.has_root()
+        && normalize_keep_drive(a).trim_end_matches('/')
+            == normalize_keep_drive(b).trim_end_matches('/')
+}
+
 /// Standardize an accepted physical path without I/O or changing its identity.
 /// This is an input/display spelling, not a persistent key. Keep component casing,
 /// relative/dot components and namespace paths intact; do not resolve symlinks.
@@ -299,6 +307,27 @@ mod tests {
     // §1.898: 実ドライブのルートは判定だけに渡す。本物の Shell を実パスに呼ばせない。
     // 実行経路のテストは一時フォルダ内の偽パスと差し替えを使う。
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_synthetic_base_comparison_preserves_verbatim_dots() {
+        for (left, right) in [
+            (r"\\?\C:\data\", r"\\?\C:\data"),
+            (r"C:\data\", r"C:\data"),
+            (r"\\?\C:\data\.\", r"\\?\C:\data\."),
+            (r"\\?\C:\data\..\", r"\\?\C:\data\.."),
+            (r"\\?\UNC\server\share\", r"\\?\UNC\server\share"),
+        ] {
+            assert!(eq_synthetic_path_base(Path::new(left), Path::new(right)));
+        }
+        for (left, right) in [
+            (r"\\?\C:\data\.", r"\\?\C:\data"),
+            (r"\\?\C:\data\..", r"\\?\C:\"),
+            (r"C:", r"C:\"),
+        ] {
+            assert!(!eq_synthetic_path_base(Path::new(left), Path::new(right)));
+        }
+    }
 
     #[cfg(windows)]
     #[test]

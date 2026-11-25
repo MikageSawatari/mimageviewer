@@ -64,6 +64,8 @@ pub(crate) fn structural_file_operation_path_refusal(path: &Path) -> Option<File
 親と既知の合成名を比べる。合成パス 6 個を先に作らない。スマートフォルダーは ID 解析を
 唯一の解析関数とし、真偽判定もその結果から導く。正規化済み入力と `data_dir` を受け取る内部解析を
 汎用の合成パス判定とも共有する (2026-11-25 利用者の修正依頼による追補)。
+基点の比較は `path_key::eq_synthetic_path_base` を両方の判定で共有し、末尾区切りの有無を同一視する。
+verbatim の `.`・`..` は解釈せず、ドライブ相対の `C:` とルートの `C:\` は区別する。
 
 `FileOperationRefusal` に `VolumeRoot` と `VirtualLocation` を足し、文言もここで持つ
 (「ドライブや共有のルートは{action}できません」「仮想の場所は{action}できません」)。
@@ -143,6 +145,8 @@ handler-level (App のテスト環境):
 unit: `structural_file_operation_path_refusal` に `C:\`、`C:`、`\\?\C:\`、`\\server\share`、`\\server\share\`、
 `\\?\UNC\server\share\`、`\\?\Volume{GUID}\`、`X:\`、`C:\photos\..`、`\\server\share\dir\..` → `VolumeRoot`、
 `C:\foo`、`C:\foo\..\bar`、`\\server\share\dir` → `None`、合成パス (末尾区切りあり・大文字小文字違い) → `VirtualLocation`。`data_dir` 自体が `.`・`..` を含むとき (例 `.\data`、`C:\x\..\data`) の合成パスも、入力の表記によらず `VirtualLocation`。スマートフォルダーの合成パスも同じ。
+通常／verbatim の `data_dir` の末尾区切りあり・なしの 4 通りで、mIV の生成関数が返した合成パスが
+判定され、スマートフォルダーの ID も取り出せることを純粋なテストで検査する。
 
 worker 側: ルートの拒否理由は上の純粋なパス判定で検査する。実行の最後の防ぎは一時フォルダ内の
 合成パスで検査し、`start_delete_files_with` / `rename_item_async_with` の偽 worker が呼ばれず、

@@ -5076,7 +5076,7 @@ pub(super) fn smart_folder_id_from_normalized_synthetic_path(
 ) -> Option<uuid::Uuid> {
     let parent = path.parent()?;
     if !super::synthetic_view_name_eq(parent.file_name()?.to_str()?, "__smart_folder__")
-        || !crate::folder_tree::path_eq(parent.parent()?, data_dir)
+        || !crate::path_key::eq_synthetic_path_base(parent.parent()?, data_dir)
     {
         return None;
     }
@@ -14944,6 +14944,42 @@ mod tests {
         let path = smart_folder_synthetic_path(id);
         assert_eq!(smart_folder_id_from_synthetic_path(&path), Some(id));
         assert!(is_smart_folder_synthetic_path(&path));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_generated_synthetic_paths_accept_trailing_data_dir_separator() {
+        // b5c324434 は verbatim data_dir の末尾区切りが残り、生成した合成パスを認識しない。
+        // Pure generation/parsing only: no App, worker or Shell is created for these paths.
+        let _guard = crate::data_dir::TestDataDirGuard::new();
+        let id = uuid::Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        for data_dir in [r"\\?\C:\data\", r"\\?\C:\data", r"C:\data\", r"C:\data"] {
+            crate::data_dir::set_test_override(Some(data_dir.into()));
+            for path in [
+                crate::app::drive_list_synthetic_path(),
+                crate::app::search_results_synthetic_path(),
+                crate::app::reading_history_synthetic_path(),
+                crate::app::bookmark_view_synthetic_path(),
+                crate::app::rating_view_synthetic_path(),
+                crate::app::subfolder_expansion_synthetic_path(),
+            ] {
+                assert!(
+                    crate::app::is_synthetic_view_path(&path),
+                    "data_dir={data_dir}, path={path:?}"
+                );
+                assert_eq!(
+                    crate::grid_item::structural_file_operation_path_refusal(&path),
+                    Some(crate::grid_item::FileOperationRefusal::VirtualLocation)
+                );
+            }
+            let path = smart_folder_synthetic_path(id);
+            assert!(
+                crate::app::is_synthetic_view_path(&path),
+                "data_dir={data_dir}, path={path:?}"
+            );
+            assert!(is_smart_folder_synthetic_path(&path));
+            assert_eq!(smart_folder_id_from_synthetic_path(&path), Some(id));
+        }
     }
 
     #[cfg(windows)]

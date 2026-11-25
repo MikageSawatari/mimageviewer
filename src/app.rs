@@ -13747,7 +13747,7 @@ pub(crate) fn is_synthetic_view_path_normalized(path: &Path) -> bool {
     (known_name
         && path
             .parent()
-            .is_some_and(|parent| crate::folder_tree::path_eq(parent, &data_dir)))
+            .is_some_and(|parent| crate::path_key::eq_synthetic_path_base(parent, &data_dir)))
         || smart_folder::smart_folder_id_from_normalized_synthetic_path(path, &data_dir).is_some()
 }
 
