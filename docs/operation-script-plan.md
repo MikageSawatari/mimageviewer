@@ -648,11 +648,11 @@ fn rate3_next(s) {
     ["RatingItem3", "FsPageNext"]
 }
 
-// 本を開いたとき、PNG の透過部分の背景が黒なら白にします。
+// 本を開いたとき、パスに \manga\ を含むなら読む向きを右→左にします。
 fn on_event(s) {
     if s.context != "fs_image" { return []; }
-    if "open" in s.events && s.item.ext == "png" {
-        if s.view.background == "black" { return ["FsBgCycle"]; }
+    if "open" in s.events && s.book.path.contains("\\manga\\") {
+        if s.view.direction != "rtl" { return ["FsReadingDirectionToggle"]; }
     }
     []
 }
@@ -662,9 +662,9 @@ fn on_event(s) {
   `()` と空配列は「何もしない」。
 - 操作名は `KeyAction::ini_name()` の文字列 (設定にも保存している安定した名前) をそのまま使う
   (例の綴りは仮。実際の綴りは `ini_name()` を正とする)。
-- r11 の再監査で `FsReadingDirectionToggle` は自由回転解除後の分割sliceの再調整を残すためイベント可にしない。
-  雛形は、印を付けた背景操作へ差し替えた。黒→白はAI高画質化中の2色巡回でも通常の3色巡回でも1回で成立する。
-  不透明画像など、既存の背景操作を受け付けない表示では既存の拒否と通知を保つ。
+- r12 (利用者の決定「A (open の回だけ)」) で、`FsReadingDirectionToggle` は「`"open"` の回だけイベントから実行できる」
+  印になったので、例を「本を開いたら読む向きを合わせる」に戻した (§3.3 の r12)。r11 の再監査の間は、背景の操作の例
+  (PNG の背景が黒なら白へ 1 回巡回) にしていた。
 
 ### 4.3 公開する状態
 
