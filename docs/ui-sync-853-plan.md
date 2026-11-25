@@ -767,3 +767,12 @@ master の同期 loader は catalog を読まないまま維持した。policy �
 
 `async-architecture.md` は本ブランチの二節と master の一括エクスポートの透かしの節を残し、
 Susie の記述を統合後の名前へ揃えた。本作業では cargo・rustfmt・製品起動・コミット操作は行っていない。
+
+merge 後 (3d85f11fa) の検証は設計担当がメイン PC で run-heavy 経由で行った。関連の filter
+(§1.853/§1.859/§1.861、起動・場所移動・アドレス入力・物理履歴、§1.883 の `page_badge_883` / `page_sort_883` /
+ページ数・一覧ソート・`folder_scan`・`duration_762` 等) は 406 件すべて成功した。解消の差分の独立レビュー
+(GPT-6.1 Sol / xhigh、実装とは別の会話) は ACCEPT、指摘なし。
+実 Shell テスト 2 件は、merge 後・merge 前 (e62b93173、10:37 には成功) のどちらでも 13:30 以降は
+`InvokeCommand` が 30 秒で返らず失敗した。merge は shell_paste 系のファイルに触れておらず、merge 前のコミットでも
+同じ失敗になるので、merge による退行ではなく開発機側の状態の変化と見ている。クリップボードを開いている窓・所有者は無く、
+explorer は応答し、画面のロックも無かった。原因は未特定。
