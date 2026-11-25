@@ -7367,15 +7367,9 @@ mod tests {
         assert!(PREFERENCES_MIN_WIDTH <= 640.0);
         let mut failures = Vec::new();
         for &page in PreferencesPage::ALL {
-            {
-                let state = harness.state_mut().pref_state.as_mut().unwrap();
-                state.selected = page;
-                state.showing_results = false;
-                state.pending_anchor = None;
-                state.highlight = None;
-                state.right_panel_scroll_generation =
-                    state.right_panel_scroll_generation.wrapping_add(1);
-            }
+            // Use the explicit page-open path, which restores the top instead
+            // of carrying the previous page's saved scroll offset into this one.
+            harness.state_mut().open_preferences_page(page);
             harness.run_steps(4);
             let mut width_reported = false;
             // Visit the entire page so ComboBoxes below the first viewport are checked too.
@@ -7389,6 +7383,12 @@ mod tests {
                     })
                     .expect("production preferences ScrollArea");
                 assert_eq!(rendered, page);
+                if step == 0 {
+                    assert_eq!(
+                        layout.offset.y, 0.0,
+                        "page={page:?}: scan must start at the top: {layout:?}"
+                    );
+                }
                 let tolerance = 1.0 / harness.ctx.pixels_per_point();
                 if !PREFERENCES_NARROW_WIDTH_EXCLUSIONS.contains(&page)
                     && layout.content.x > layout.inner.width() + tolerance
