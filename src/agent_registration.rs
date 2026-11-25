@@ -289,6 +289,54 @@ enum RegistrationDestination {
     NotFound,
 }
 
+fn resolve_claude_package(local: &Path, package: &Path) -> Result<RegistrationDestination, String> {
+    let package_name = package
+        .file_name()
+        .ok_or("インストール先を確認できません")?;
+    let data_root = local.join("Claude-Data");
+    // Use the directory entry's spelling for display, including case.
+    let entries = match fs::read_dir(&data_root) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(_) => return Err("設定フォルダを確認できません".into()),
+    };
+    if let Some(entries) = entries {
+        for entry in entries {
+            let entry = entry.map_err(|_| "設定フォルダを確認できません")?;
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&package_name.to_string_lossy())
+                && entry
+                    .file_type()
+                    .map_err(|_| "設定フォルダを確認できません")?
+                    .is_dir()
+            {
+                return Ok(RegistrationDestination::Resolved {
+                    path: entry.path().join("claude_desktop_config.json"),
+                    message: None,
+                });
+            }
+        }
+    }
+    let cache_path = package.join("LocalCache/Roaming/Claude/claude_desktop_config.json");
+    if cache_path.parent().is_some_and(Path::is_dir) {
+        return Ok(RegistrationDestination::Resolved {
+            path: cache_path,
+            message: Some(CLAUDE_LOCAL_CACHE_GUIDANCE),
+        });
+    }
+    Ok(RegistrationDestination::Ambiguous {
+        paths: vec![
+            data_root
+                .join(package_name)
+                .join("claude_desktop_config.json"),
+            cache_path,
+        ],
+        message: "Claude Desktop を一度起動して終了してから「再確認」を押してください",
+    })
+}
+
 /// Worker-only source of truth for detection and revalidation before writing.
 fn resolve_destination(
     env: &RegistrationEnvironment,
@@ -304,86 +352,49 @@ fn resolve_destination(
             let squirrel = local
                 .as_deref()
                 .is_some_and(|p| p.join("AnthropicClaude").is_dir());
-            let mut paths = Vec::new();
+            let mut destinations = Vec::new();
             if squirrel {
-                paths.push(
-                    env.absolute(
-                        env.app_data
-                            .as_deref()
-                            .ok_or("設定フォルダを確認できません")?,
-                    )?
-                    .join("Claude/claude_desktop_config.json"),
-                );
+                destinations.push(RegistrationDestination::Resolved {
+                    path: env
+                        .absolute(
+                            env.app_data
+                                .as_deref()
+                                .ok_or("設定フォルダを確認できません")?,
+                        )?
+                        .join("Claude/claude_desktop_config.json"),
+                    message: None,
+                });
             }
             let packages =
                 packages(env, "Claude_").map_err(|_| "インストール先を確認できません")?;
-            paths.extend(
-                packages
-                    .iter()
-                    .map(|p| p.join("LocalCache/Roaming/Claude/claude_desktop_config.json")),
-            );
-            if paths.len() > 1 {
+            for package in packages {
+                destinations.push(resolve_claude_package(
+                    local.as_deref().ok_or("設定フォルダを確認できません")?,
+                    &package,
+                )?);
+            }
+            // Count installations, not paths: an uninitialized package has two candidates.
+            if destinations.len() > 1 {
+                let mut paths = Vec::new();
+                for destination in destinations {
+                    match destination {
+                        RegistrationDestination::Resolved { path, .. } => paths.push(path),
+                        RegistrationDestination::Ambiguous {
+                            paths: candidates, ..
+                        } => {
+                            paths.extend(candidates);
+                        }
+                        RegistrationDestination::NotFound => {}
+                    }
+                }
                 return Ok(RegistrationDestination::Ambiguous {
                     paths,
                     message: "Claude が複数の形で入っています。手順を見て、お使いの Claude の設定ファイルに書いてください",
                 });
             }
-            if squirrel {
-                return Ok(RegistrationDestination::Resolved {
-                    path: paths.remove(0),
-                    message: None,
-                });
-            }
-            let Some(package) = packages.first() else {
-                return Ok(RegistrationDestination::NotFound);
-            };
-            let package_name = package
-                .file_name()
-                .ok_or("インストール先を確認できません")?;
-            let data_root = local
-                .ok_or("設定フォルダを確認できません")?
-                .join("Claude-Data");
-            // Use the directory entry's spelling for display, including case.
-            let entries = match fs::read_dir(&data_root) {
-                Ok(entries) => Some(entries),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                Err(_) => return Err("設定フォルダを確認できません".into()),
-            };
-            if let Some(entries) = entries {
-                for entry in entries {
-                    let entry = entry.map_err(|_| "設定フォルダを確認できません")?;
-                    if entry
-                        .file_name()
-                        .to_string_lossy()
-                        .eq_ignore_ascii_case(&package_name.to_string_lossy())
-                        && entry
-                            .file_type()
-                            .map_err(|_| "設定フォルダを確認できません")?
-                            .is_dir()
-                    {
-                        return Ok(RegistrationDestination::Resolved {
-                            path: entry.path().join("claude_desktop_config.json"),
-                            message: None,
-                        });
-                    }
-                }
-            }
-            let cache_path = paths.remove(0);
-            if cache_path.parent().is_some_and(Path::is_dir) {
-                return Ok(RegistrationDestination::Resolved {
-                    path: cache_path,
-                    message: Some(CLAUDE_LOCAL_CACHE_GUIDANCE),
-                });
-            }
-            Ok(RegistrationDestination::Ambiguous {
-                paths: vec![
-                    data_root
-                        .join(package_name)
-                        .join("claude_desktop_config.json"),
-                    cache_path,
-                ],
-                message: "Claude Desktop を一度起動して終了してから「再確認」を押してください",
-            })
+            Ok(destinations
+                .pop()
+                .unwrap_or(RegistrationDestination::NotFound))
         }
         AppTarget::ChatGpt => {
             let profile_codex = env

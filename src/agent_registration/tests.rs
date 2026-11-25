@@ -736,7 +736,20 @@ fn claude_installs_map_to_own_configs_and_ambiguity_is_not_writable() {
     let d = detect(&env);
     let row = app(&d, AppTarget::ClaudeDesktop);
     assert_eq!(row.state, RegistrationState::Ambiguous);
-    assert_eq!(row.config_paths.len(), 2);
+    assert_eq!(
+        row.config_paths,
+        vec![
+            env.app_data
+                .as_ref()
+                .unwrap()
+                .join("Claude/claude_desktop_config.json"),
+            env.local_app_data
+                .as_ref()
+                .unwrap()
+                .join("Claude-Data/Claude_one/claude_desktop_config.json"),
+            package.join("LocalCache/Roaming/Claude/claude_desktop_config.json"),
+        ]
+    );
     assert!(
         row.write_request(Action::Register, d.command.as_ref().unwrap())
             .is_none()
@@ -877,38 +890,88 @@ fn claude_package_destination_prefers_data_and_keeps_actual_directory_case() {
 }
 
 #[test]
-fn claude_package_data_does_not_override_multiple_install_ambiguity() {
+fn claude_multiple_installs_keep_ambiguity_and_resolve_each_package_candidate() {
     for squirrel in [false, true] {
         let (_temp, env) = fixture();
-        let (_, data, cache) = claude_package_paths(&env);
+        let (_, _, cache) = claude_package_paths(&env);
+        let data = env
+            .local_app_data
+            .as_ref()
+            .unwrap()
+            .join("Claude-Data/cLaUdE_oNe/claude_desktop_config.json");
         fs::create_dir_all(data.parent().unwrap()).unwrap();
-        let other = if squirrel {
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        let expected = if squirrel {
             install_squirrel(&env);
-            env.app_data
-                .as_ref()
-                .unwrap()
-                .join("Claude/claude_desktop_config.json")
+            vec![
+                env.app_data
+                    .as_ref()
+                    .unwrap()
+                    .join("Claude/claude_desktop_config.json"),
+                data.clone(),
+            ]
         } else {
             let package = env
                 .local_app_data
                 .as_ref()
                 .unwrap()
                 .join("Packages/Claude_Two");
-            fs::create_dir_all(&package).unwrap();
-            package.join("LocalCache/Roaming/Claude/claude_desktop_config.json")
+            let other_cache = package.join("LocalCache/Roaming/Claude/claude_desktop_config.json");
+            fs::create_dir_all(other_cache.parent().unwrap()).unwrap();
+            vec![data.clone(), other_cache]
         };
         let detection = detect(&env);
         let row = app(&detection, AppTarget::ClaudeDesktop);
         assert_eq!(row.state, RegistrationState::Ambiguous);
-        assert_eq!(row.config_paths.len(), 2);
-        assert!(row.config_paths.contains(&cache));
-        assert!(row.config_paths.contains(&other));
+        assert_eq!(row.config_paths, expected);
+        assert!(!row.config_paths.contains(&cache));
+        let data_index = if squirrel { 1 } else { 0 };
+        assert_eq!(
+            row.config_paths[data_index]
+                .parent()
+                .and_then(Path::file_name),
+            data.parent().and_then(Path::file_name),
+            "ambiguous candidates must retain the actual directory entry's spelling"
+        );
         assert_eq!(
             row.message.as_deref(),
             Some(
                 "Claude が複数の形で入っています。手順を見て、お使いの Claude の設定ファイルに書いてください"
             )
         );
+        assert!(!row.can_write(Action::Register));
+        assert!(!row.can_write(Action::Remove));
+        assert!(
+            row.write_request(Action::Register, detection.command.as_ref().unwrap())
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn claude_multiple_packages_without_data_keep_cache_and_uninitialized_candidates() {
+    for first_cache_exists in [false, true] {
+        let (_temp, env) = fixture();
+        let (_, data, cache) = claude_package_paths(&env);
+        if first_cache_exists {
+            fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        }
+        let local = env.local_app_data.as_ref().unwrap();
+        let other_package = local.join("Packages/Claude_Two");
+        fs::create_dir_all(&other_package).unwrap();
+        let mut expected = if first_cache_exists {
+            vec![cache]
+        } else {
+            vec![data, cache]
+        };
+        expected.extend([
+            local.join("Claude-Data/Claude_Two/claude_desktop_config.json"),
+            other_package.join("LocalCache/Roaming/Claude/claude_desktop_config.json"),
+        ]);
+        let detection = detect(&env);
+        let row = app(&detection, AppTarget::ClaudeDesktop);
+        assert_eq!(row.state, RegistrationState::Ambiguous);
+        assert_eq!(row.config_paths, expected);
         assert!(!row.can_write(Action::Register));
         assert!(!row.can_write(Action::Remove));
     }
