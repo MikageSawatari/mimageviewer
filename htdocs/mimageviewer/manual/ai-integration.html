@@ -85,6 +85,8 @@
     <h1 class="page-title">AI アプリとの連携</h1>
     <p class="page-desc">同じ PC の Claude Desktop や ChatGPT (Codex) から、mImageViewer のライブラリを検索・整理できます。
       AI アプリとほかのアプリをつなぐ共通規格「MCP」を使います。</p>
+    <p>ChatGPT では、デスクトップアプリの <strong>Codex の画面</strong>（または Codex CLI・IDE の拡張）から使います。
+      ChatGPT の通常のチャットからは使えません。</p>
 
     <div class="box warn">
       <span class="box-icon">⚠️</span>
@@ -176,7 +178,8 @@
     <p>AI アプリが、個々の操作（ツール）を使うたびに許可を求める場合があります。これは AI アプリの確認で、mIV から止めることはできません。</p>
     <ul>
       <li><strong>Claude Desktop</strong>: アプリ自身の設定で、個々の操作を常に許可できる場合があります。お使いのアプリの設定を確認してください。</li>
-      <li><strong>ChatGPT (Codex)</strong>: mIV から登録すると、mIV との連携の操作は確認なしで実行する設定になります。mIV の「許可の範囲」と各チェックが操作の上限になります。</li>
+      <li><strong>ChatGPT (Codex)</strong>: mIV から登録すると、mIV との連携の操作は確認なしで実行する設定になります。mIV の「許可の範囲」と各チェックが操作の上限になります。
+        登録先は Codex の設定なので、ChatGPT のデスクトップアプリでは Codex の画面で使ってください。</li>
     </ul>
 
     <h2 id="examples">頼めることの例</h2>
@@ -286,6 +289,7 @@
     <h2 id="troubleshooting">使えないときは</h2>
     <ul>
       <li>ファイルや設定を扱う場合は mIV を起動し、「AI 連携」の許可の範囲・各チェックと対象アプリの登録状態を確認してください。使い方の説明だけなら起動は不要です。</li>
+      <li>ChatGPT で mIV の連携が見つからない場合は、通常のチャットではなく、デスクトップアプリの Codex の画面（または Codex CLI・IDE の拡張）で新しいセッションを始めているか確認してください。</li>
       <li>登録・解除が動作中のため断られた場合は、対象アプリを終了して「再確認」を押してください。</li>
       <li>設定ファイルを読めない、登録先を決められないなどと表示された場合は、表示された理由を確認し、「手順を見る」から手動設定の案内を開いてください。</li>
       <li>AI アプリが mIV の連携を使わずに、自分の画面操作などを試して止まることがあります。
