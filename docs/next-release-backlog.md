@@ -291,6 +291,7 @@ esults-871)**。既存の通知の仕組みで、§1.843 の変更が原因で�
 ### 1.847 リモートの取得のテスト 2 件が、混んでいると 1 回の処理で完了せず落ちる — v5.5.1 の配布ビルドから (2026-11-22)
 
 - 状態: **未着手、収録版未定 (テストの組み方、製品の挙動は変わらない見込み)**。観測 (統括、v5.5.1 の build-dist の test-full、aa6f06685): `app::tests::still_window_mode_key_tests::remote_acquire_cancels_archive_open_before_direct_or_converted_completion` と `remote_acquire_cancels_main_epub_modal_before_published_completion` が、取得を始めた直後の 1 回の poll の後で `AcquiringRemote` (期待は `RemoteActive`) になり落ちた。同じソースの lib 全件 2 本 (既定・test-script) では通っている。
+- 追加の観測 (2026-11-26、deps-903 の担当、ブランチ deps-903 の lib 全件): 同じ群の `remote_acquire_retires_startup_resolves_and_rejects_new_activations` と `remote_session_acquire_closes_mounted_active_and_parked_live_media_at_position` が `AcquiringRemote` のまま落ちた (20,784 件中 2 件)。同じ群 14 件の単独実行は 3 回とも成功、直前の master の全件も成功。
 - 推論 (コードから、未確認): 取得の完了 (`src/remote_ipc/ui.rs` の acquire barrier) は、本の位置の書き込み担当 (`spread_shift_service` の `is_ready()`・`book_resume_writer` の watermark) などの準備を待つ。テストはそれが 1 回目の poll までに終わる前提。製品は次のフレームで完了する。`docs/egui-0.37-stage1a-verification.md` に同型の `remote_acquire_retires_startup_resolves_and_rejects_new_activations` の記録がある。直し方は、テストが barrier の待ち対象の準備完了を観測してから取得する形 (回数や時間の待ちにしない)。
 
 ### 1.848 タグ・レーティングの一覧の並べ替えでも、待ちの間のキーが前の順で効く — §1.838 の設計レビューから (2026-11-22)
