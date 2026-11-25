@@ -183,6 +183,7 @@ enum Description {
 #[derive(Clone, Debug)]
 enum Decision {
     None(Description),
+    Refused(crate::grid_item::FileOperationRefusal),
     Grid,
     Folder {
         destination: PathBuf,
@@ -193,12 +194,13 @@ enum Decision {
 
 impl Decision {
     fn accepted(&self) -> bool {
-        !matches!(self, Self::None(_))
+        !matches!(self, Self::None(_) | Self::Refused(_))
     }
 
     fn description(&self) -> Description {
         match self {
             Self::None(description) => description.clone(),
+            Self::Refused(_) => Description::None,
             Self::Grid => Description::Invalid,
             Self::Folder {
                 destination,
@@ -296,6 +298,15 @@ fn decide(
             ShellTransferOperation::Copy
         }
     };
+    if operation == ShellTransferOperation::Move {
+        if let Some(reason) = internal
+            .paths
+            .iter()
+            .find_map(|path| crate::grid_item::structural_file_operation_path_refusal(path))
+        {
+            return Decision::Refused(reason);
+        }
+    }
     let Some(destination_parts) = lexical_components(&destination) else {
         return Decision::None(Description::None);
     };
@@ -367,6 +378,7 @@ impl DragSession {
     ) -> Result<Option<DropRequest>, String> {
         match decision {
             Decision::None(_) => Ok(None),
+            Decision::Refused(reason) => Ok(Some(DropRequest::Failed(reason.message("移動")))),
             Decision::Grid => {
                 let paths = self.data.paths()?;
                 if paths.is_empty() {

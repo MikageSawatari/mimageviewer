@@ -5064,11 +5064,23 @@ pub(crate) fn smart_folder_synthetic_path(id: uuid::Uuid) -> PathBuf {
 }
 
 pub(crate) fn smart_folder_id_from_synthetic_path(path: &Path) -> Option<uuid::Uuid> {
-    let relative = path.strip_prefix(smart_folder_root()).ok()?;
-    if relative.components().count() != 1 {
+    let path = crate::path_key::lexical_normalize(path);
+    let data_dir = crate::path_key::lexical_normalize(&crate::data_dir::get());
+    smart_folder_id_from_normalized_synthetic_path(&path, &data_dir)
+}
+
+/// Both arguments are already lexically normalized; shared by ID parsing and generic guards.
+pub(super) fn smart_folder_id_from_normalized_synthetic_path(
+    path: &Path,
+    data_dir: &Path,
+) -> Option<uuid::Uuid> {
+    let parent = path.parent()?;
+    if !super::synthetic_view_name_eq(parent.file_name()?.to_str()?, "__smart_folder__")
+        || !crate::path_key::eq_synthetic_path_base(parent.parent()?, data_dir)
+    {
         return None;
     }
-    uuid::Uuid::parse_str(relative.file_name()?.to_str()?).ok()
+    uuid::Uuid::parse_str(path.file_name()?.to_str()?).ok()
 }
 
 pub(crate) fn is_smart_folder_synthetic_path(path: &Path) -> bool {
@@ -10128,6 +10140,8 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    // §1.898: 実ドライブのルートは判定だけに渡す。本物の Shell を実パスに呼ばせない。
+    // 実行経路のテストは一時フォルダ内の偽パスと差し替えを使う。
     use super::*;
 
     #[test]
@@ -12004,6 +12018,20 @@ mod tests {
         app: &mut crate::app::App,
         policy: crate::file_type_visibility::FileTypeVisibility,
     ) -> uuid::Uuid {
+        install_smart_identity_test_root_with_items(
+            app,
+            policy,
+            [r"C:\Smart\a.jpg", r"C:\Smart\b.jpg"]
+                .map(|path| GridItem::Image(path.into()))
+                .to_vec(),
+        )
+    }
+
+    fn install_smart_identity_test_root_with_items(
+        app: &mut crate::app::App,
+        policy: crate::file_type_visibility::FileTypeVisibility,
+        items: Vec<GridItem>,
+    ) -> uuid::Uuid {
         let definition = crate::settings::SmartFolderDefinition::new("reading identities");
         let definition_id = definition.id;
         app.settings.file_type_visibility = policy.clone();
@@ -12032,9 +12060,7 @@ mod tests {
                 presentation,
                 app.smart_folder_metadata_revision,
             ));
-        app.items = [r"C:\Smart\a.jpg", r"C:\Smart\b.jpg"]
-            .map(|path| GridItem::Image(path.into()))
-            .to_vec();
+        app.items = items;
         app.thumbnails = vec![ThumbnailState::Failed, ThumbnailState::Failed];
         app.image_metas = vec![None, None];
         app.visible_indices = vec![0, 1];
@@ -12047,6 +12073,86 @@ mod tests {
             ),
         );
         definition_id
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_normalized_smart_path_restores_and_opens_resident_root() {
+        // 911284580 は判定 true のパスから ID を取れず、復元 false／open Ignored になる。
+        for through_open in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.indexer_init.mark_unavailable_if_not_ready();
+            app.active_quick_folder_slot = None;
+            let items = ["a.jpg", "b.jpg"]
+                .map(|name| GridItem::Image(app.tmp.path().join(name)))
+                .to_vec();
+            let id =
+                install_smart_identity_test_root_with_items(&mut app, Default::default(), items);
+            let definition = app
+                .top_level_grid_view
+                .smart_folder_session()
+                .unwrap()
+                .root_snapshot()
+                .unwrap()
+                .definition
+                .clone();
+            app.settings.smart_folders = vec![definition.clone()];
+            let grid = app.take_visible_smart_folder_grid();
+            let mut session = app.top_level_grid_view.take_smart_folder_session().unwrap();
+            let child = app.tmp.path().join("child");
+            session.phase = SmartFolderOpenPhase::Child {
+                logical_path: child.clone(),
+                parked_root: SmartFolderRootPayload::Visible(grid),
+            };
+            app.top_level_grid_view
+                .install_smart_folder_session(session);
+            let mut state = super::super::top_level_grid_view::SmartFolderViewState::root(
+                id,
+                vec![child.clone()],
+            );
+            assert!(state.enter_containing_path(&child));
+            app.top_level_grid_view.replace_surface(
+                super::super::top_level_grid_view::TopLevelGridSurface::SmartFolder(state),
+            );
+            app.current_folder = Some(child);
+            app.items_are_smart_folder_view = false;
+            assert!(app.resident_smart_root_restore_is_exact(&definition));
+            let path = crate::data_dir::get()
+                .join("unused")
+                .join("..")
+                .join("__smart_folder__")
+                .join(id.to_string());
+            assert!(is_smart_folder_synthetic_path(&path));
+            assert_eq!(smart_folder_id_from_synthetic_path(&path), Some(id));
+            if through_open {
+                let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen_classified(
+                    path,
+                    false,
+                    crate::app::OpenRequestOwner::Navigation,
+                    Some(crate::app::OpenPathKind::Directory),
+                    None,
+                    crate::app::StartupListIntent::ExplicitList,
+                );
+                assert_eq!(outcome, crate::app::FolderOpenOutcome::Loaded);
+            } else {
+                assert!(app.restore_smart_folder_for_synthetic_path(&path));
+            }
+            assert_eq!(app.current_smart_folder_id, Some(id));
+            assert!(app.items_are_smart_folder_view);
+            assert_eq!(
+                app.effective_folder(),
+                Some(smart_folder_synthetic_path(id))
+            );
+            assert!(matches!(
+                app.top_level_grid_view
+                    .smart_folder_session()
+                    .unwrap()
+                    .phase,
+                SmartFolderOpenPhase::Root
+            ));
+            assert!(app.smart_folder_pending.is_none());
+            assert!(app.smart_folder_transition.is_none());
+        }
     }
 
     fn park_smart_identity_test_root(app: &mut crate::app::App, grid: SmartFolderPreparedGrid) {
@@ -14838,5 +14944,81 @@ mod tests {
         let path = smart_folder_synthetic_path(id);
         assert_eq!(smart_folder_id_from_synthetic_path(&path), Some(id));
         assert!(is_smart_folder_synthetic_path(&path));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_generated_synthetic_paths_accept_trailing_data_dir_separator() {
+        // b5c324434 は verbatim data_dir の末尾区切りが残り、生成した合成パスを認識しない。
+        // Pure generation/parsing only: no App, worker or Shell is created for these paths.
+        let _guard = crate::data_dir::TestDataDirGuard::new();
+        let id = uuid::Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        for data_dir in [r"\\?\C:\data\", r"\\?\C:\data", r"C:\data\", r"C:\data"] {
+            crate::data_dir::set_test_override(Some(data_dir.into()));
+            for path in [
+                crate::app::drive_list_synthetic_path(),
+                crate::app::search_results_synthetic_path(),
+                crate::app::reading_history_synthetic_path(),
+                crate::app::bookmark_view_synthetic_path(),
+                crate::app::rating_view_synthetic_path(),
+                crate::app::subfolder_expansion_synthetic_path(),
+            ] {
+                assert!(
+                    crate::app::is_synthetic_view_path(&path),
+                    "data_dir={data_dir}, path={path:?}"
+                );
+                assert_eq!(
+                    crate::grid_item::structural_file_operation_path_refusal(&path),
+                    Some(crate::grid_item::FileOperationRefusal::VirtualLocation)
+                );
+            }
+            let path = smart_folder_synthetic_path(id);
+            assert!(
+                crate::app::is_synthetic_view_path(&path),
+                "data_dir={data_dir}, path={path:?}"
+            );
+            assert!(is_smart_folder_synthetic_path(&path));
+            assert_eq!(smart_folder_id_from_synthetic_path(&path), Some(id));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_smart_folder_parser_and_predicate_normalize_both_sides() {
+        // 911284580 は判定 true の別表記で ID を None にし、整合の検査が落ちる。
+        let _guard = crate::data_dir::TestDataDirGuard::new();
+        let id = uuid::Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
+        for (data, clean) in [(r"C:\x\..\data", r"C:\data"), (r".\data", "data")] {
+            crate::data_dir::set_test_override(Some(data.into()));
+            for base in [data, clean] {
+                let path = Path::new(base)
+                    .join("__smart_folder__")
+                    .join(id.to_string());
+                for path in [
+                    path.clone(),
+                    PathBuf::from(format!("{}\\", path.display())),
+                    PathBuf::from(path.to_string_lossy().to_uppercase().replace('\\', "/")),
+                ] {
+                    assert_eq!(
+                        smart_folder_id_from_synthetic_path(&path),
+                        Some(id),
+                        "{path:?}"
+                    );
+                    assert!(is_smart_folder_synthetic_path(&path));
+                    assert!(super::super::is_synthetic_view_path(&path));
+                }
+            }
+            for path in [
+                Path::new(clean).join("__smart_folder__").join("invalid"),
+                Path::new(clean).join("other").join(id.to_string()),
+                Path::new(clean)
+                    .join("__smart_folder__")
+                    .join("child")
+                    .join(id.to_string()),
+            ] {
+                assert_eq!(smart_folder_id_from_synthetic_path(&path), None);
+                assert!(!is_smart_folder_synthetic_path(&path));
+            }
+        }
     }
 }
