@@ -346,3 +346,9 @@ P1・P2 なし。UI スレッドの境界・URL とログ・画像コピーの�
 実装の検証 (設計担当、共有の runner): `cargo nextest` の関連 filter (ask_ai・メニューの並び・search_nav_inventory・
 agent_integration・external_links / external_open・クリップボードの書き込み・native_clipboard) 187 件通過 (うち新規 ask_ai 18 件)、
 `mimageviewer-mcp` 122 件通過。本体 lib 全件は master への取り込み後に統括が流す。実機 (各アプリ・サービスの URL、実際のクリップボード) は未確認。
+
+### 13.5 利用者の決定 U1 の反映の実装レビュー (2026-11-25、対象 `93c7abf47..f30847c0c`、同じ実装レビュー担当) — ACCEPT
+
+r4 ACCEPT WITH CHANGES: P2 押した項目のテストが、切り替え前に表示されない項目を押そうとしていた (実際に失敗していた) → 表示中の項目だけを押す。
+P3 設計書 §4 の図と「常に出す」の記述が古い → 登録の有無で図を分けた。r5 **ACCEPT** (指摘なし)。
+検証 (設計担当): `test(/ask_ai/) | agent_integration` 56 件通過。`build-dev.ps1` 成功 (U1 を含む)。
