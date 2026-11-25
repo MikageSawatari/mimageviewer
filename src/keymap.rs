@@ -7814,24 +7814,11 @@ pub fn page_overview_action_allowed(action: KeyAction) -> bool {
     FS_PAGE_OVERVIEW_ACTION_PRIORITY.contains(&action)
 }
 
-const ACTIVE_SCOPE_SETS: &[&[CommandScope]] = &[
-    GRID_ACTIVE_SCOPES,
-    FS_IMAGE_ACTIVE_SCOPES,
-    FS_VIDEO_ACTIVE_SCOPES,
-    FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
-    &[KeyContext::Erase],
-    &[KeyContext::Conceal],
-    &[KeyContext::Crop],
-    &[KeyContext::SnsSplit],
-    &[KeyContext::Text],
-    &[KeyContext::LocalAdjust],
-];
-
 pub fn command_scopes_overlap(a: CommandScope, b: CommandScope) -> bool {
     a == b
-        || ACTIVE_SCOPE_SETS
+        || OPERATION_SCREENS
             .iter()
-            .any(|set| set.contains(&a) && set.contains(&b))
+            .any(|screen| screen.scopes.contains(&a) && screen.scopes.contains(&b))
 }
 
 fn native_video_shortcut_action(action: KeyAction) -> bool {
@@ -7882,34 +7869,77 @@ pub(crate) fn actions_can_overlap(first: KeyAction, second: KeyAction) -> bool {
         || help_context_shortcuts_overlaps_scope(second, first.context())
 }
 
-/// Public screen names follow ACTIVE_SCOPE_SETS in the same order. This is a
-/// description of potential shortcuts, not a runtime viewport admission path.
-pub(crate) const OPERATION_SCREENS: &[(&str, &str)] = &[
-    ("grid", "サムネイル一覧"),
-    ("image_fullscreen", "画像フルスクリーン"),
-    ("video_fullscreen", "動画フルスクリーン"),
-    ("page_overview", "ページ一覧"),
-    ("erase", "消しゴム"),
-    ("conceal", "隠蔽加工"),
-    ("crop", "切り抜き"),
-    ("sns_split", "SNS 分割"),
-    ("text", "テキスト"),
-    ("local_adjust", "補正レイヤー"),
+/// One owner for screen identity, labels and simultaneously active scopes.
+/// This describes potential shortcuts, not runtime viewport admission.
+pub(crate) struct OperationScreen {
+    pub(crate) name: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) scopes: &'static [CommandScope],
+}
+
+pub(crate) const OPERATION_SCREENS: &[OperationScreen] = &[
+    OperationScreen {
+        name: "grid",
+        label: "サムネイル一覧",
+        scopes: GRID_ACTIVE_SCOPES,
+    },
+    OperationScreen {
+        name: "image_fullscreen",
+        label: "画像フルスクリーン",
+        scopes: FS_IMAGE_ACTIVE_SCOPES,
+    },
+    OperationScreen {
+        name: "video_fullscreen",
+        label: "動画フルスクリーン",
+        scopes: FS_VIDEO_ACTIVE_SCOPES,
+    },
+    OperationScreen {
+        name: "page_overview",
+        label: "ページ一覧",
+        scopes: FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+    },
+    OperationScreen {
+        name: "erase",
+        label: "消しゴム",
+        scopes: &[KeyContext::Erase],
+    },
+    OperationScreen {
+        name: "conceal",
+        label: "隠蔽加工",
+        scopes: &[KeyContext::Conceal],
+    },
+    OperationScreen {
+        name: "crop",
+        label: "切り抜き",
+        scopes: &[KeyContext::Crop],
+    },
+    OperationScreen {
+        name: "sns_split",
+        label: "SNS 分割",
+        scopes: &[KeyContext::SnsSplit],
+    },
+    OperationScreen {
+        name: "text",
+        label: "テキスト",
+        scopes: &[KeyContext::Text],
+    },
+    OperationScreen {
+        name: "local_adjust",
+        label: "補正レイヤー",
+        scopes: &[KeyContext::LocalAdjust],
+    },
 ];
 
 pub(crate) fn action_active_on_screen(action: KeyAction, screen: &str) -> bool {
-    let Some(index) = OPERATION_SCREENS
-        .iter()
-        .position(|(name, _)| *name == screen)
-    else {
+    let Some(screen) = OPERATION_SCREENS.iter().find(|entry| entry.name == screen) else {
         return false;
     };
-    let scopes = ACTIVE_SCOPE_SETS[index];
+    let scopes = screen.scopes;
     if scopes.contains(&KeyContext::FsPageOverview) {
         return page_overview_action_allowed(action);
     }
     if action == KeyAction::FsPageOverviewToggle {
-        return screen == "image_fullscreen";
+        return screen.name == "image_fullscreen";
     }
     scopes.contains(&action.context())
         || scopes
@@ -7925,11 +7955,10 @@ pub(crate) fn reserved_labels_for_screen(chord: Chord, screen: Option<&str>) -> 
                 && screen.is_none_or(|screen| {
                     OPERATION_SCREENS
                         .iter()
-                        .position(|(name, _)| *name == screen)
-                        .is_some_and(|index| {
-                            ACTIVE_SCOPE_SETS[index]
-                                .iter()
-                                .any(|scope| reserved_binding_overlaps_scope(*scope, binding.scope))
+                        .find(|entry| entry.name == screen)
+                        .is_some_and(|entry| {
+                            binding.scope == KeyContext::Global
+                                || entry.scopes.contains(&binding.scope)
                         })
                 })
         })
@@ -8110,6 +8139,25 @@ fn reserved_binding_overlaps_scope(
 impl Keymap {
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// Agent views resolve action names once for raw-value lookup and reuse
+    /// those identities here. Keep the normal chord parser and last-valid-row
+    /// semantics, without formatting discarded conflict warning strings.
+    pub(crate) fn from_resolved_overrides<'a>(
+        bindings: impl IntoIterator<Item = (KeyAction, &'a [String])>,
+    ) -> Self {
+        let mut warnings = Vec::new();
+        let mut overrides = HashMap::new();
+        for (action, names) in bindings {
+            if let Some(chords) = parse_setting_chords(action, names, &mut warnings) {
+                overrides.insert(action, chords);
+            }
+        }
+        Self {
+            overrides,
+            warnings,
+        }
     }
 
     pub fn from_settings(settings: &KeymapSettings) -> Self {

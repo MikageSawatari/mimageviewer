@@ -1978,10 +1978,10 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::NONE,
         });
-        let _ = ctx.run_pass(raw, |ctx| {
+        let _ = crate::test_ui::headless_paint_output(ctx.run_pass(raw, |ctx| {
             app.update_ime_state(ctx);
             app.show_settings_restore_dialog(ctx);
-        });
+        }));
         assert!(!app.show_settings_restore);
         assert!(app.settings_restore_state.operation_task_rx.is_none());
         let edits: OperationEdits =
@@ -1999,9 +1999,10 @@ mod tests {
             .is_err()
         );
         app.show_settings_restore = true;
-        let _ = ctx.run_pass(egui::RawInput::default(), |ctx| {
-            app.show_settings_restore_dialog(ctx)
-        });
+        let _ =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.show_settings_restore_dialog(ctx)
+            }));
         assert_eq!(app.settings.keymap, expected);
         assert_eq!(crate::settings::Settings::load().keymap, expected);
     }

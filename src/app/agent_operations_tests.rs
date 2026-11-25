@@ -265,9 +265,9 @@ fn agent_operations_reads_live_assignments_during_drafts_and_dialog_reopens_with
     )
     .unwrap();
     app.show_operation_customize = true;
-    let _ = ctx.run_pass(egui::RawInput::default(), |ctx| {
+    let _ = crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
         app.show_operation_customize_dialog(ctx)
-    });
+    }));
     let state = app.operation_customize_state.as_ref().unwrap();
     assert_eq!(state.settings.keymap, app.settings.keymap);
     assert!(!state.settings.gamepad_enabled);

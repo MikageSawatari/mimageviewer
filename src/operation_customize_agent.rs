@@ -1,13 +1,13 @@
 //! In-memory operation views and atomic edit preparation, independent of App.
 use crate::keymap::{
     self, BindingConflict, BindingConflictKind, Chord, KeyAction, KeyBindingOverride, KeyTrigger,
-    Keymap,
+    Keymap, KeymapSettings,
 };
 use crate::operation_customize_share::OperationCustomizeBundle;
 use crate::ring_shortcut::*;
 use mimageviewer_agent_ipc::*;
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 fn bad(message: impl Into<String>) -> AgentError {
     AgentError::new(ErrorCode::BadRequest, message)
@@ -433,40 +433,91 @@ fn parse_pattern(text: &str) -> Option<Vec<MouseGestureDirection>> {
     }
 }
 
-fn key_value(bundle: &OperationCustomizeBundle, action: KeyAction) -> Value {
-    bundle
-        .keymap
-        .overrides
-        .iter()
-        .rev()
-        .find(|binding| KeyAction::parse_ini_name(&binding.action) == Some(action))
-        .map(|binding| json!(binding.chords))
-        .unwrap_or(Value::Null)
+/// Request-local interpretation of the persisted override rows. Keep every row
+/// identity for effective-key parsing and mutation, and the last position for
+/// constant-time public-value lookup. Unknown rows retain their original place.
+#[derive(Default)]
+struct KeyOverrides {
+    rows: Vec<Option<KeyAction>>,
+    last: HashMap<KeyAction, usize>,
 }
 
-fn assign_key(bundle: &mut OperationCustomizeBundle, action: KeyAction, value: &Value) {
-    if value.is_null() {
-        bundle.keymap.remove_override(action);
-    } else {
-        let binding = KeyBindingOverride {
+impl KeyOverrides {
+    fn new(settings: &KeymapSettings) -> Self {
+        let mut index = Self::default();
+        for binding in &settings.overrides {
+            index.push(KeyAction::parse_ini_name(&binding.action));
+        }
+        index
+    }
+
+    fn push(&mut self, action: Option<KeyAction>) {
+        if let Some(action) = action {
+            self.last.insert(action, self.rows.len());
+        }
+        self.rows.push(action);
+    }
+
+    fn value(&self, settings: &KeymapSettings, action: KeyAction) -> Value {
+        self.last
+            .get(&action)
+            .map(|index| json!(settings.overrides[*index].chords))
+            .unwrap_or(Value::Null)
+    }
+
+    fn keymap(&self, settings: &KeymapSettings) -> Keymap {
+        Keymap::from_resolved_overrides(self.rows.iter().zip(&settings.overrides).filter_map(
+            |(action, binding)| action.map(|action| (action, binding.chords.as_slice())),
+        ))
+    }
+
+    /// Apply the whole validated key edit set in one pass, so removals cannot
+    /// stale stored positions. Replace the last row in place; null removes all
+    /// aliases for that action. Newly customized actions append in request order.
+    fn apply(
+        &self,
+        settings: &mut KeymapSettings,
+        changes: &HashMap<KeyAction, Value>,
+        order: &[KeyAction],
+    ) -> Self {
+        let binding = |action: KeyAction, value: &Value| KeyBindingOverride {
             action: action.ini_name().into(),
             chords: value
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|v| v.as_str().unwrap().to_owned())
+                .map(|value| value.as_str().unwrap().to_owned())
                 .collect(),
         };
-        if let Some(index) = bundle
-            .keymap
-            .overrides
-            .iter()
-            .rposition(|binding| KeyAction::parse_ini_name(&binding.action) == Some(action))
+        let mut next = Self::default();
+        let mut updated = Vec::with_capacity(settings.overrides.len() + order.len());
+        for (position, mut row) in std::mem::take(&mut settings.overrides)
+            .into_iter()
+            .enumerate()
         {
-            bundle.keymap.overrides[index] = binding;
-        } else {
-            bundle.keymap.overrides.push(binding);
+            let action = self.rows[position];
+            if let Some(action) = action
+                && let Some(value) = changes.get(&action)
+            {
+                if value.is_null() {
+                    continue;
+                }
+                if self.last.get(&action) == Some(&position) {
+                    row = binding(action, value);
+                }
+            }
+            next.push(action);
+            updated.push(row);
         }
+        for &action in order {
+            let value = &changes[&action];
+            if !self.last.contains_key(&action) && !value.is_null() {
+                next.push(Some(action));
+                updated.push(binding(action, value));
+            }
+        }
+        settings.overrides = updated;
+        next
     }
 }
 
@@ -510,6 +561,8 @@ pub(crate) fn prepare_edits(
     let defaults = OperationCustomizeBundle::defaults();
     let mut result = OperationsWriteResult::default();
     let mut changed_actions = Vec::new();
+    let before_keys = KeyOverrides::new(&before.keymap);
+    let mut key_changes = HashMap::new();
     for (name, value) in edits.keys.iter().flatten() {
         let action = action(name)?;
         let target = if value.is_null() {
@@ -538,7 +591,7 @@ pub(crate) fn prepare_edits(
             }
             Value::Array(chords)
         };
-        let old = key_value(before, action);
+        let old = before_keys.value(&before.keymap, action);
         let change = OperationChange {
             name: name.clone(),
             label: format!(
@@ -552,7 +605,7 @@ pub(crate) fn prepare_edits(
         if change.before == change.after {
             result.unchanged.push(change);
         } else {
-            assign_key(&mut candidate, action, &change.after);
+            key_changes.insert(action, change.after.clone());
             changed_actions.push(action);
             result.changed.push(change);
         }
@@ -588,7 +641,10 @@ pub(crate) fn prepare_edits(
         }
     }
     if !changed_actions.is_empty() {
-        result.conflicts = Keymap::from_settings(&candidate.keymap)
+        let candidate_keys =
+            before_keys.apply(&mut candidate.keymap, &key_changes, &changed_actions);
+        result.conflicts = candidate_keys
+            .keymap(&candidate.keymap)
             .binding_conflicts()
             .into_iter()
             .filter(|conflict| related(conflict, &changed_actions))
@@ -605,14 +661,17 @@ pub(crate) fn readback(
     prepared: &OperationsWriteResult,
 ) -> OperationsWriteResult {
     let mut result = prepared.clone();
+    let before_keys = KeyOverrides::new(&before.keymap);
+    let after_keys = KeyOverrides::new(&after.keymap);
     for row in result.changed.iter_mut().chain(&mut result.unchanged) {
-        row.before = if let Ok(action) = action(&row.name) {
-            key_value(before, action)
+        let key_action = action(&row.name).ok();
+        row.before = if let Some(action) = key_action {
+            before_keys.value(&before.keymap, action)
         } else {
             Slot::parse(&row.name).unwrap().value(before)
         };
-        row.after = if let Ok(action) = action(&row.name) {
-            key_value(after, action)
+        row.after = if let Some(action) = key_action {
+            after_keys.value(&after.keymap, action)
         } else {
             Slot::parse(&row.name).unwrap().value(after)
         };
@@ -683,7 +742,8 @@ pub(crate) fn get_operations(
     let mut note = None;
     let mut rows: Vec<OperationRow> = match view {
         "keys" => {
-            let keymap = Keymap::from_settings(&bundle.keymap);
+            let overrides = KeyOverrides::new(&bundle.keymap);
+            let keymap = overrides.keymap(&bundle.keymap);
             if let Some(context) = &request.context
                 && !KeyAction::all()
                     .iter()
@@ -694,7 +754,7 @@ pub(crate) fn get_operations(
             if let Some(screen) = &request.screen
                 && !keymap::OPERATION_SCREENS
                     .iter()
-                    .any(|(name, _)| *name == screen)
+                    .any(|entry| entry.name == screen)
             {
                 return Err(bad(format!("{screen}: 不明な screen です")));
             }
@@ -788,7 +848,7 @@ pub(crate) fn get_operations(
                         .collect();
                     let screens: Vec<_> = keymap::OPERATION_SCREENS
                         .iter()
-                        .filter(|(screen, _)| keymap::action_active_on_screen(action, screen))
+                        .filter(|screen| keymap::action_active_on_screen(action, screen.name))
                         .collect();
                     OperationRow::Key(OperationKeyRow {
                         action: action.ini_name().into(),
@@ -811,12 +871,15 @@ pub(crate) fn get_operations(
                             .iter()
                             .map(Chord::settings_name)
                             .collect(),
-                        customized: !key_value(bundle, action).is_null(),
+                        customized: overrides.last.contains_key(&action),
                         inputs,
-                        screens: screens.iter().map(|(name, _)| (*name).to_owned()).collect(),
+                        screens: screens
+                            .iter()
+                            .map(|screen| screen.name.to_owned())
+                            .collect(),
                         screen_labels: screens
                             .iter()
-                            .map(|(_, label)| (*label).to_owned())
+                            .map(|screen| screen.label.to_owned())
                             .collect(),
                     })
                 })
@@ -856,14 +919,17 @@ pub(crate) fn get_operations(
         .collect(),
         "conflicts" => {
             let mut candidate = bundle.clone();
+            let mut overrides = KeyOverrides::new(&candidate.keymap);
             if let (Some(actions), Some(key)) = (&actions, &request.key) {
                 let action = actions[0];
                 let chord = keymap::parse_chord_for_action(action, key)
                     .map_err(|error| bad(format!("{}: {error}", action.ini_name())))?
                     .ok_or_else(|| bad("key に空と none は使えません"))?;
-                assign_key(&mut candidate, action, &json!([chord.settings_name()]));
+                let changes = HashMap::from([(action, json!([chord.settings_name()]))]);
+                overrides = overrides.apply(&mut candidate.keymap, &changes, &[action]);
             }
-            Keymap::from_settings(&candidate.keymap)
+            overrides
+                .keymap(&candidate.keymap)
                 .binding_conflicts()
                 .into_iter()
                 .filter(|conflict| {

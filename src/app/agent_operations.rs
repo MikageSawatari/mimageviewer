@@ -35,14 +35,48 @@ impl App {
         &self,
         args: &OperationsQuery,
     ) -> Result<OperationsPage, AgentError> {
-        self.agent_settings_read_permission()?;
-        operations::get_operations(
-            &OperationCustomizeBundle::from_settings(&self.settings),
-            args,
-        )
+        let started = std::time::Instant::now();
+        let result = (|| {
+            self.agent_settings_read_permission()?;
+            operations::get_operations(
+                &OperationCustomizeBundle::from_settings(&self.settings),
+                args,
+            )
+        })();
+        crate::perf::event(
+            "agent",
+            "get_operations",
+            None,
+            0,
+            &[(
+                "duration_ms",
+                serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
+            )],
+        );
+        result
     }
 
     pub(crate) fn agent_set_operations(
+        &mut self,
+        args: &OperationEdits,
+        client_name: &str,
+    ) -> Result<OperationsWriteResult, AgentError> {
+        let started = std::time::Instant::now();
+        let result = self.agent_set_operations_inner(args, client_name);
+        crate::perf::event(
+            "agent",
+            "set_operations",
+            None,
+            0,
+            &[(
+                "duration_ms",
+                serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
+            )],
+        );
+        result
+    }
+
+    fn agent_set_operations_inner(
         &mut self,
         args: &OperationEdits,
         client_name: &str,

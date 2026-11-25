@@ -20,11 +20,16 @@ fn key_rows(page: OperationsPage) -> Vec<OperationKeyRow> {
 }
 
 fn public_values(bundle: &OperationCustomizeBundle) -> Value {
+    let overrides = KeyOverrides::new(&bundle.keymap);
     json!({
         "keys": KeyAction::all().iter().copied().filter(|action| action.is_user_facing())
-            .map(|action| (action.ini_name().to_owned(), key_value(bundle, action))).collect::<serde_json::Map<_, _>>(),
+            .map(|action| (action.ini_name().to_owned(), overrides.value(&bundle.keymap, action))).collect::<serde_json::Map<_, _>>(),
         "inputs": Slot::all().into_iter().map(|slot| (slot.name(), slot.value(bundle))).collect::<serde_json::Map<_, _>>()
     })
+}
+
+fn key_value(bundle: &OperationCustomizeBundle, action: KeyAction) -> Value {
+    KeyOverrides::new(&bundle.keymap).value(&bundle.keymap, action)
 }
 
 fn undo(result: &OperationsWriteResult) -> OperationEdits {
@@ -381,12 +386,201 @@ fn operations_right_drag_null_uses_explicit_default_without_legacy_inheritance()
 }
 
 #[test]
+fn operations_override_index_preserves_raw_last_rows_and_matches_effective_loader() {
+    let mut bundle = OperationCustomizeBundle::defaults();
+    for &action in KeyAction::all() {
+        bundle.keymap.overrides.push(KeyBindingOverride {
+            action: action.ini_name().into(),
+            chords: action
+                .default_chords()
+                .iter()
+                .map(Chord::settings_name)
+                .collect(),
+        });
+    }
+    bundle.keymap.overrides.extend([
+        KeyBindingOverride {
+            action: " fscopyimage ".into(),
+            chords: vec!["F14".into()],
+        },
+        KeyBindingOverride {
+            action: "FsCopyImage".into(),
+            chords: vec!["F15".into(), "F15".into()],
+        },
+        KeyBindingOverride {
+            action: "GridCopyImage".into(),
+            chords: vec!["F17".into()],
+        },
+        KeyBindingOverride {
+            action: "gridcopyimage".into(),
+            chords: vec!["not-a-key".into()],
+        },
+        KeyBindingOverride {
+            action: "UnknownFutureOperation".into(),
+            chords: vec!["F16".into()],
+        },
+    ]);
+    let index = KeyOverrides::new(&bundle.keymap);
+    assert_eq!(index.rows.len(), bundle.keymap.overrides.len());
+    assert_eq!(
+        index.value(&bundle.keymap, KeyAction::FsCopyImage),
+        json!(["F15", "F15"])
+    );
+    assert_eq!(
+        index.value(&bundle.keymap, KeyAction::GridCopyImage),
+        json!(["not-a-key"])
+    );
+    let effective = index.keymap(&bundle.keymap);
+    let reference = Keymap::from_settings(&bundle.keymap);
+    for &action in KeyAction::all() {
+        assert_eq!(
+            effective.effective_chords(action),
+            reference.effective_chords(action),
+            "{action:?}"
+        );
+    }
+    assert_eq!(
+        effective
+            .effective_chords(KeyAction::GridCopyImage)
+            .into_iter()
+            .map(Chord::settings_name)
+            .collect::<Vec<_>>(),
+        vec!["F17"]
+    );
+    let first = get_operations(&bundle, &OperationsQuery::default()).unwrap();
+    let mut visible = Vec::new();
+    for page in 1..=first.pages {
+        let response = get_operations(&bundle, &query(json!({"page":page}))).unwrap();
+        for item in response.items {
+            visible.push(match item {
+                PageRow::Value(OperationRow::Key(row)) => {
+                    assert!(row.customized);
+                    wire_digest(&row.action).unwrap()
+                }
+                PageRow::TooLong(marker) => marker.id,
+                _ => panic!("wrong key row"),
+            });
+        }
+    }
+    let expected: Vec<_> = KeyAction::all()
+        .iter()
+        .filter(|action| action.is_user_facing())
+        .map(|action| wire_digest(action.ini_name()).unwrap())
+        .collect();
+    assert_eq!(visible, expected);
+    let (after, result) =
+        prepare_edits(&bundle, &edits(json!({"keys":{"FsCopyImage":["F18"]}}))).unwrap();
+    assert_eq!(readback(&bundle, &after, &result), result);
+}
+
+#[test]
+fn operations_override_index_batch_edits_keep_positions_unknown_rows_and_readback() {
+    let mut before = OperationCustomizeBundle::defaults();
+    before.keymap.overrides = vec![
+        KeyBindingOverride {
+            action: "GridCopyImage".into(),
+            chords: vec!["F13".into()],
+        },
+        KeyBindingOverride {
+            action: "UnknownFutureOperation".into(),
+            chords: vec!["F16".into()],
+        },
+        KeyBindingOverride {
+            action: " fscopyimage ".into(),
+            chords: vec!["F14".into()],
+        },
+        KeyBindingOverride {
+            action: "FsToggleMetadata".into(),
+            chords: vec!["F19".into()],
+        },
+        KeyBindingOverride {
+            action: " gridcopyimage ".into(),
+            chords: vec!["F15".into()],
+        },
+    ];
+    let (after, result) = prepare_edits(
+        &before,
+        &edits(json!({"keys":{
+            "GridCopyImage":null, "FsCopyImage":["f13"], "FsCopyPath":["F18"]
+        }})),
+    )
+    .unwrap();
+    assert_eq!(
+        after
+            .keymap
+            .overrides
+            .iter()
+            .map(|binding| binding.action.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "UnknownFutureOperation",
+            "FsCopyImage",
+            "FsToggleMetadata",
+            "FsCopyPath"
+        ]
+    );
+    assert_eq!(after.keymap.overrides[0], before.keymap.overrides[1]);
+    assert_eq!(after.keymap.overrides[2], before.keymap.overrides[3]);
+    assert_eq!(readback(&before, &after, &result), result);
+    let (restored, _) = prepare_edits(&after, &undo(&result)).unwrap();
+    assert_eq!(public_values(&restored), public_values(&before));
+}
+
+#[test]
+fn operations_screen_catalog_keeps_names_labels_and_scope_contracts_together() {
+    use crate::keymap::KeyContext;
+    let names: HashSet<_> = keymap::OPERATION_SCREENS
+        .iter()
+        .map(|screen| screen.name)
+        .collect();
+    assert_eq!(names.len(), keymap::OPERATION_SCREENS.len());
+    for (name, scopes) in [
+        ("grid", keymap::GRID_ACTIVE_SCOPES),
+        ("image_fullscreen", keymap::FS_IMAGE_ACTIVE_SCOPES),
+        ("video_fullscreen", keymap::FS_VIDEO_ACTIVE_SCOPES),
+        ("page_overview", keymap::FS_PAGE_OVERVIEW_ACTIVE_SCOPES),
+        ("erase", &[KeyContext::Erase][..]),
+        ("conceal", &[KeyContext::Conceal][..]),
+        ("crop", &[KeyContext::Crop][..]),
+        ("sns_split", &[KeyContext::SnsSplit][..]),
+        ("text", &[KeyContext::Text][..]),
+        ("local_adjust", &[KeyContext::LocalAdjust][..]),
+    ] {
+        let screen = keymap::OPERATION_SCREENS
+            .iter()
+            .find(|screen| screen.name == name)
+            .unwrap();
+        assert!(!screen.label.is_empty());
+        assert_eq!(screen.scopes, scopes, "{name}");
+    }
+}
+
+#[test]
+fn operations_grid_shift_arrow_reservations_do_not_leak_to_fullscreen_screens() {
+    let bundle = OperationCustomizeBundle::defaults();
+    for key in ["Shift+Left", "Shift+Right", "Shift+Up", "Shift+Down"] {
+        let grid = get_operations(&bundle, &query(json!({"key":key,"screen":"grid"}))).unwrap();
+        assert!(
+            grid.reserved
+                .iter()
+                .any(|label| label.contains("Shift+矢印")),
+            "{key}"
+        );
+        for screen in ["image_fullscreen", "video_fullscreen", "page_overview"] {
+            let result =
+                get_operations(&bundle, &query(json!({"key":key,"screen":screen}))).unwrap();
+            assert!(result.reserved.is_empty(), "{key}/{screen}");
+        }
+    }
+}
+
+#[test]
 fn operations_screens_match_overlap_for_every_action_pair_and_exceptions() {
     for &first in KeyAction::all() {
         for &second in KeyAction::all() {
-            let overlap = keymap::OPERATION_SCREENS.iter().any(|(screen, _)| {
-                keymap::action_active_on_screen(first, screen)
-                    && keymap::action_active_on_screen(second, screen)
+            let overlap = keymap::OPERATION_SCREENS.iter().any(|screen| {
+                keymap::action_active_on_screen(first, screen.name)
+                    && keymap::action_active_on_screen(second, screen.name)
             });
             assert_eq!(
                 overlap,

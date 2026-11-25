@@ -1887,7 +1887,7 @@ tool を 2 本足す。どちらも本体と通信し、UI スレッドで実行
 - **`keys`**: キーの操作の一覧。1 行 =
   `{ "action": "GridCopyImage", "label": "画像をコピー", "context": "Grid", "context_label": "サムネイル一覧",
   "trigger": "press", "keys": [], "default": [], "customized": false, "inputs": ["ring.grid.up_right"],
-  "screens": ["grid"] }`。`screens` はその操作が効く画面 (§20.14b、`ACTIVE_SCOPE_SETS` から作る)。
+  "screens": ["grid"] }`。`screens` はその操作が効く画面 (§20.14b、`OPERATION_SCREENS` から作る)。
   - `keys` は今効いているキー、`default` は既定のキー (`KeyAction::default_chords`)、`customized` は override の有無。
     キーの綴りは保存の形 (`Chord::settings_name`、例 `Ctrl+Shift+C`)。
   - `inputs` は、同じ操作が今割り当てられているキー以外のスロットの名前。キーの操作に対応する `RingActionId` を
@@ -1904,9 +1904,9 @@ tool を 2 本足す。どちらも本体と通信し、UI スレッドで実行
       ことがある)。
     - `screen`: **その画面で効く**操作だけ (`grid`・`image_fullscreen`・`video_fullscreen`・`page_overview`・`erase`・`conceal`・
       `crop`・`sns_split`・`text`・`local_adjust`)。`key` と併せると「その画面でそのキーは空いているか」になる。効くかの判定は
-      1 つの helper (`action_active_on_screen`) にし、`ACTIVE_SCOPE_SETS`・ページ一覧の操作の例外 (`page_overview_action_allowed`)・
+      1 つの helper (`action_active_on_screen`) にし、`OPERATION_SCREENS` (画面の名前・表示名・同時に効く文脈の一表)・ページ一覧の操作の例外 (`page_overview_action_allowed`)・
       ヘルプの例外 (`help_context_shortcuts_overlaps_scope`) を `actions_can_overlap` と同じ部品で組む。予約の割り当ても画面で絞る
-      (`reserved_binding_overlaps_scope`)。行の `screens` も同じ helper で作り、「2 つの操作の `screens` が重なる ⇔
+      (予約が Global、または指定画面の文脈の組に直接含まれる場合)。行の `screens` も同じ helper で作り、「2 つの操作の `screens` が重なる ⇔
       `actions_can_overlap`」をテストで全組について確かめる。例外の検査例: `FsPageOverviewToggle` (フルスクリーン共通に属すが
       動画では効かない)、ページ一覧で効く操作の有限集合、編集モードのヘルプの例外 (`src/keymap.rs:7790-7806`)。
     - どの形も 60 件ずつのページ (`page`、応答に `page`・`pages`)。`key` の結果も同じ (同じキーを多数の操作に付けることは
@@ -2099,6 +2099,9 @@ UI スレッドで次を順に行う。
   override は現在の位置で置き換え、同値の項目は写しにも書かない。ジェスチャーの順序・重複とキー配列の重複を保つ。
   `ring_bindings_for_key_action` とその内部 helper は `ring_shortcut` へ移し、窓も同じ関数を読む。
   キー操作の表示名の短縮処理は `keymap::compact_key_action_label` に移し、窓と取得・検索・変更行で共用する。
+  override の解釈は要求内の `KeyOverrides` にまとめ、後の行の値・各行の解釈済み操作・変更位置を索引に保持する。
+  行ごとの `parse_ini_name` を廃し、実効キーは通常の chord parser を共用する `Keymap::from_resolved_overrides` から作る。
+  変更は一括で置換・削除し、別名の重複行と未知の行も既存の規則どおり扱う。全件 override の取得・変更・readback のテストを置いた。
   画面の投影は keymap の既存 scope・有限集合・ヘルプ例外を使い、全組一致のテストを置いた。detached の述語・viewport は変更していない。
 - G は `app/agent_operations` と既存の UI dispatch を使う。許可・Remote の読み取り拒否・書き込み受付を第 1 段と共有し、
   変更なしは保存・通知しない。項目と応答全体の予算を確定前に検査し、既存の `apply_operation_customize_bundle` で保存する。
@@ -2111,6 +2114,9 @@ UI スレッドで次を順に行う。
 - 重複起動された別の実装セッションは設計担当が停止したとの連絡を受け、この実装を正本に整理した。
   別形式の Command・module 宣言・画面 helper は削除し、App handler・受付配線・共通予算・JSON 解析・MCP 草案は API を揃えて取り込んだ。
   この整理自体もコンパイル・テスト未実施。
+- `OPERATION_SCREENS` に画面名・表示名・同時に効く文脈をまとめ、重なりと画面の照会で添字の対応を持たない。
+  画面を指定した予約の照会は Global またはその画面に直接属する文脈だけを返す。一覧の Shift+矢印はほかの画面へ出さない。
+  `agent/get_operations`・`agent/set_operations` に全処理の `duration_ms` を追加した (測定未実施)。
 - cargo (fmt を含む)、glyph lint、site cards、snapshot PNG 生成・目視・比較、製品起動、独立レビューは未実施。コミットしていない。
   まれな保存失敗は既存と同じログと警告で扱い、回復処理は追加していない。
 
@@ -2143,6 +2149,10 @@ operations_labels_and_queries_use_the_customization_command_names
 operations_duplicate_key_arrays_restore_and_noop_preserves_override_order
 operations_right_drag_null_uses_explicit_default_without_legacy_inheritance
 operations_screens_match_overlap_for_every_action_pair_and_exceptions
+operations_override_index_preserves_raw_last_rows_and_matches_effective_loader
+operations_override_index_batch_edits_keep_positions_unknown_rows_and_readback
+operations_screen_catalog_keeps_names_labels_and_scope_contracts_together
+operations_grid_shift_arrow_reservations_do_not_leak_to_fullscreen_screens
 operations_screen_key_lookup_includes_global_and_fullscreen_common
 operations_conflict_preview_replaces_three_keys_and_filters_action_and_candidate
 operations_conflict_kinds_match_editor_and_default_pairs_do_not_warn
@@ -2278,7 +2288,7 @@ MCP経由のヘルプでは、そのあたりをユーザにうまく説明し�
 
 - 操作は文脈 (`KeyContext`、13 個) に属し、同じ意味の操作でも文脈ごとに別の操作 (例 `GridCopyImage` と `FsCopyImage`)。
   キーも操作ごとに別に持つ。
-- 画面ごとに同時に効く文脈の組がある (`src/keymap.rs:7690-7751` の `ACTIVE_SCOPE_SETS`): 一覧 = 全体共通・一覧・レーティング、
+- 画面ごとに同時に効く文脈の組がある (`src/keymap.rs` の `OPERATION_SCREENS`。設計時の `ACTIVE_SCOPE_SETS` を画面名・表示名と一表に統合): 一覧 = 全体共通・一覧・レーティング、
   画像フルスクリーン = 全体共通・フルスクリーン共通・レーティング・画像フルスクリーン、動画フルスクリーン = 全体共通・
   フルスクリーン共通・レーティング・動画フルスクリーン、ページ一覧 = 全体共通・フルスクリーン共通・ページ一覧 (一部の操作だけ)、
   編集モード 6 種はそれぞれ単独。

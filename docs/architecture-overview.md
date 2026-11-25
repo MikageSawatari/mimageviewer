@@ -21,7 +21,10 @@ wire と永続形式、detached の述語・viewport・窓の寿命は変更し�
 変更の応答は確定前に予算を検査し、通知と「AI による変更」に記録する。AI が外部ツールを起動する経路は持たない。
 `operation_customize_agent` は App に依存しない割り当ての投影・検査・bundle 更新を持ち、
 `app/agent_operations` は設定と共有する許可・受付を検査して `apply_operation_customize_bundle` へ渡す。
-キーとリングの対応表は `ring_shortcut::ring_bindings_for_key_action` を窓と共有し、画面の投影は keymap の scope・例外と共有する。
+キーとリングの対応表は `ring_shortcut::ring_bindings_for_key_action` を窓と共有する。
+画面名・表示名・同時に効く scope は keymap の `OPERATION_SCREENS` 一表で所有し、重なり判定と画面の投影が同じ表を読む。
+操作の要求内では override 名を一度ずつ解釈する索引を作り、実効キー・変更前後の値・置換位置に共有する。
+`agent/get_operations`・`agent/set_operations` は許可検査から応答までの `duration_ms`、`agent/set_operations_commit` は既存確定経路の時間を記録する。
 `agent-ipc::bound_page_rows` は設定と操作の単行・ページ合計予算を共通化し、所属を保ったまま大きい行を省く。
 IPC 版は 7。スタック用スクリプトの本文は、同じ設定許可の `stack_script` で読み書きする。
 本文の取得・検査は agent worker、AI の照合付き書き込みと環境設定の「既定に戻す」「スクリプトを開く」は
