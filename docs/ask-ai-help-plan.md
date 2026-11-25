@@ -73,7 +73,9 @@ B の状態は「検出の結果の cache」になるので、古さの扱いを
                               └────────────────────────────────────────┘
 ```
 
-- **各項目は送り先ごとの固定の ID で描く** (`ui.push_id` に送り先の種類の固定の鍵を渡し、その中に項目のボタンを 1 つだけ置く)。
+- **各項目は送り先ごとの固定の ID で描く**。送り先とこのメニューの名前空間から作った `egui::Id` を `UiBuilder::scope_id`
+  (`vendor/egui/src/ui_builder.rs:63`) に渡した子 UI の中に、項目のボタンを 1 つだけ置く。`ui.push_id` は子の `unique_id` に
+  親の自動の順番が混ざるので (`vendor/egui/src/ui.rs:254`・`:2299`) 使わない (独立レビュー r2 P3)。
   egui のボタンの自動の ID は前にある widget の数で決まり (`vendor/egui/src/ui.rs:929`)、離したときのクリックは押したときの ID に
   届く (`vendor/egui/src/interaction.rs:180`)。押している間に検出の結果が届いて上の区画が増減すると、自動の ID のままでは
   別の送り先が同じ ID を受け継ぎ得る (独立レビュー r1 P2)。区切り線・説明の行・「確認中…」の行も同じく固定の鍵の中に置く。
@@ -136,7 +138,7 @@ B の状態は「検出の結果の cache」になるので、古さの扱いを
 すべて `external_links::spawn_open` の短命 `external-open-*` worker に乗せる (§1.861、`docs/ui-responsiveness.md` 冒頭)。
 
 - 始め方のマニュアル: 既存の `OpenTarget::Url` (HTTP(S) の検査あり)。`ui_helpers::open_url` と同じ。
-- Web の AI: `OpenTarget` に `AiWeb { site, text, clipboard_seq }` を足し、**同じ worker の中でクリップボードへ書いてから開く** (§7.4)。
+- Web の AI: `OpenTarget` に `AiWeb { site, text, clipboard_request }` を足し、**同じ worker の中でクリップボードへ書いてから開く** (§7.4)。
   URL は `site` (Google の AI モード・ChatGPT・Claude の 3 つの型) から固定で作り、HTTP(S) の検査も通す。
 - AI アプリ: `OpenTarget` に**型付きの** `AiApp(AiAppLink)` を足す。`AiAppLink` は
   `ClaudeNew { prompt }`・`CodexNew { prompt }`・`CodexSettings` の 3 つで、URL は `external_links` の中で
@@ -151,7 +153,7 @@ B の状態は「検出の結果の cache」になるので、古さの扱いを
 `ExternalOpenFailure` (今は `GoogleMaps` だけ) に `ClaudeApp`・`ChatGptApp` を足し、既存の App 共通の受信口
 (`external_open_failure_tx` / `external_open_failures`、`src/app/external_open.rs`) で警告を出す。
 文: 「Claude Desktop を開けませんでした」「ChatGPT のアプリを開けませんでした」。
-Web の AI のクリップボードの失敗は `AiWebClipboard` (§7.4)。ページを開くこと自体の失敗は、マニュアルとともに
+Web の AI のクリップボードの結果の通知は §7.4。ページを開くこと自体の失敗は、マニュアルとともに
 今の「ヘルプサイトを開く」と同じく通知しない。
 
 ログ: `external_open ai_app failed` の種類だけを残す。**案内の文は固定なので個人の情報は入らないが、URL を含むエラー文は
@@ -171,21 +173,28 @@ perf の `ext/open_end` は `target_kind` = `ai_app`。
 UI スレッドで同期に行う (`vendor/egui-winit/src/lib.rs:1280` → `vendor/egui-winit/src/clipboard.rs:134`)。一方 `spawn_open` は
 すぐ worker を始めるので、「書いてから開く」の順が保証されない (独立レビュー r1 P2)。
 
-- 押したとき、UI スレッドでは既存の `reserve_clipboard_write_sequence()` (`src/ui_dialogs/context_menu.rs:2954`) で
-  クリップボードの書き込みの世代を予約し、`OpenTarget::AiWeb` を投入するだけ。
-- worker は、(1) 既存の `CLIPBOARD_WRITE_MUTEX` の中で世代がまだ最新なら文を `CF_UNICODETEXT` で書き、(2) その後で URL を開く。
-  世代が古い (押した後に mIV で別のコピーをした) ときは書かずに開く (後のコピーを上書きしない、既存の画像コピーと同じ規則)。
-- テキストの書き込み本体は、今 `src/video/native_presenter/render_core.rs:4503` にある `write_clipboard_text_windows` を
-  共有の場所 (例: `context_menu.rs` の画像の書き込みの隣、または小さな `clipboard_text` モジュール) へ移して、
-  native presenter とこの worker の両方から呼ぶ (同じ Win32 の手順を 2 か所に書かない)。native presenter 側の呼び方・挙動は変えない。
-  移した関数は成否を返す (今は黙って return している)。
-- 書けなかった (OpenClipboard の失敗など) ときは、`ExternalOpenFailure::AiWebClipboard` で警告
-  「案内の文をクリップボードに入れられませんでした」を出し、ページは開く。まれな失敗なので再試行はしない。
-- トースト「案内の文をコピーしました。開いたページの入力欄に貼り付けて (Ctrl+V)、続けて質問を書いてください」は押したときに
-  UI で出す (書き込みの完了を待たない)。
-- テスト: worker の opener の差し込み (`TestOpenerGuard`) と同じ形で、クリップボードの書き込みにも差し込みを用意し、
-  実際の OS のクリップボードに触れない。書き込みが終わるまで opener が呼ばれないこと、世代が古いと書かずに開くこと、
-  書けないと警告が届き開くことを検査する。
+- 押したとき、UI スレッドでは既存の `request_edited_clipboard_write()` (`src/ui_dialogs/context_menu.rs:2804`) で、
+  mIV のクリップボードの書き込みの世代と、OS のクリップボードの世代 (baseline) を取り、`OpenTarget::AiWeb` を投入するだけ。
+  UI ではクリップボードの mutex を取らない (既存の注記のとおり)。
+- worker は、(1) 文を `CF_UNICODETEXT` で書き、(2) その結果を App へ知らせ、(3) URL を開く。書き込みの判定は
+  編集反映の画像コピーと同じ `write_image_clipboard_if_latest` (`context_menu.rs:3172`) の手順を**テキスト用に共有**する:
+  `OpenClipboard` の成功後・`EmptyClipboard` の前に、mIV の世代がまだ最新か、OS の世代が baseline のままかを照合し、
+  どちらかが変わっていれば書かない。これで、押した後に mIV の別のコピー (世代を進める画像コピー) をした場合も、
+  `copy_text` 経由の通常のテキストコピー (パス・名前のコピー `context_menu.rs:2064`、native presenter の Ctrl+C
+  `render_core.rs:14478`。どちらも mIV の世代を進めない) や他のアプリのコピーをした場合も、後のコピーを上書きしない
+  (独立レビュー r2 P2)。要求の型・結果の型 (`ClipboardImageWriteResult` の Written / Superseded / ClipboardChanged / Failed)・
+  Win32 の API の抽象 (`ClipboardImageApi`) は画像と共有し、テキスト用に名前を一般化してよい。native presenter 側には
+  mutex の待ちを足さず、今の `write_clipboard_text_windows` は変えない。
+- 通知は worker の結果で決める (独立レビュー r2 P2)。既存の App 共通の受信口 (`external_open_failure_tx` / `external_open_failures`)
+  を、失敗だけでなくこの結果も運べるように広げる (型名を変えてよい)。UI の完了待ち・新しい pending の状態は作らない。
+  - Written: トースト「案内の文をコピーしました。開いたページの入力欄に貼り付けて (Ctrl+V)、続けて質問を書いてください」
+  - Superseded / ClipboardChanged: トースト「ほかのコピーがあったため、案内の文はクリップボードに入れていません」(貼り付けを促さない)
+  - Failed: 警告「案内の文をクリップボードに入れられませんでした」。まれな失敗なので再試行はしない。
+  - どの場合もページは開く。
+- テスト: worker の opener の差し込み (`TestOpenerGuard`) と同じ形で、クリップボードの API にも差し込みを用意し (既存の
+  `ClipboardImageApi` の試験用の実装を使ってよい)、実際の OS のクリップボードに触れない。書き込みが終わるまで opener が
+  呼ばれないこと、mIV の世代が進むと書かずに開くこと、OS の世代が変わる (通常のテキストコピーの代わり) と書かずに開き
+  後のコピーが残ること、各結果で上の通知が届くことを検査する。
 
 今のクリップボードの中身は上書きされる (項目を押した利用者の操作の結果としてトーストで知らせる)。
 
@@ -258,12 +267,11 @@ mIV 自身は通信しないが、利用者が開いた AI の提供元へ文が
   `Unregistered`・失敗は出ない)。5 秒の間隔の内は再検出しない、過ぎたら始める、実行中は重ねない。
 - メニュー: `HelpAskAi` の追加 (保存済みの並びへの追加・非表示・`stable_name`・分類)。サブメニューの描画を egui_kittest で、
   未登録・Claude だけ・両方・検出中の 4 つの状態の項目の並びを検査する (スナップショットは足さない。並びの検査で足りる)。
-- 固定の ID: 項目を押している間に検出の結果を採って上の区画が増えても減っても、離したときに別の送り先を開かない
-  (押した送り先を開くか、何も開かない)。
+- 固定の ID: 上の区画が増えても減っても、同じ送り先の項目の `Response.id` が変わらない。項目を押している間に検出の結果を
+  採って上の区画が増減しても、離したときに別の送り先を開かない (押した送り先を開くか、何も開かない)。
 - 開く: `TestOpenerGuard` で、押したときに worker で 1 回だけ開き、UI の呼び出しは待たない。Web の AI ではクリップボードの
-  書き込みの差し込み (§7.4) が終わってから opener が呼ばれる。世代が古いと書かずに開く。書けないと `AiWebClipboard` の警告。
+  書き込みの差し込み (§7.4) が終わってから opener が呼ばれる。§7.4 のテストのとおり、後のコピーを上書きせず、結果ごとの通知が届く。
   AI アプリの失敗で `ExternalOpenFailure::ClaudeApp` 等が届き、警告が出る。ログに URL も案内の文も出ない。
-- native presenter の Ctrl+C / Ctrl+X のコピーが、移した書き込み関数で今までどおり動く (既存のテストがあれば流す)。
 - AI 連携の窓の「設定を開く」が worker 経由になった (UI スレッドで opener を呼ばない)。
 
 ### 12.2 サブ PC (v5.8.0 の候補のインストーラ版、利用者の Claude Desktop / ChatGPT のアプリがある環境)
@@ -297,3 +305,12 @@ B 案・App の検出の cache・検出と MockBackend の共通化・型付き 
 - P2 項目の ID: 開いているメニューの項目の増減で、押した ID が別の送り先へ移り得る → 固定の ID と回帰テスト (§4・§12.1)。
 - P3 `Registered` の意味: 設定ファイルの一致の代理の判定で、アプリの実在・接続・版を保証しない → 説明を改め、確認手順に足した (§6・§12.2)。
 - P3 公開文書の文: アプリ用と Web 用の文の違い、「受け渡しをしない」の矛盾 → privacy の要旨を直した (§10)。
+
+### 13.2 2 巡目 (2026-11-25、対象 `a92ab8b4a`) — ACCEPT WITH CHANGES
+
+登録の判定・privacy の修正は解消とされた。指摘 3 件はコードで確かめて受け入れた。
+
+- P2 世代だけでは通常のテキストコピー (`copy_text`、mIV の世代を進めない) を上書きし得る → 編集反映の画像コピーと同じく、
+  OS の世代の baseline も照合する。手順・型を画像と共有し、render_core の関数は移さない (§7.4)。
+- P2 書かなかったのに「コピーしました」と出る → worker の結果で通知を分ける (§7.4)。
+- P3 `push_id` では子の ID が親の順番に依存する → `UiBuilder::scope_id` (§4)。
