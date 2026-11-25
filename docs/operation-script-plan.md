@@ -1157,5 +1157,6 @@ r8 の 2 件は解消、追加の P1 / P2 なし。保留の有無は所有 pass
 | --- | --- | --- | --- | --- |
 | 1 | cd48a44fc | REVISE | P2 一覧の Browser 戻る/進むの自動繰り返しでスクリプトが起動する / P2 ROOT 側の予備経路でスクリプトの結果が同じフレームのキーの結果を置き換える / P3 `GridOpenSelected` が開けなかった場合も成功を返す。委ねた経路のテストの不足 | f106e2e3f: 件数と非 repeat の事実を 1 つの atomic で運ぶ (§3.1)、`merge_script_action` で 1 か所で合流 (§5.2)、受付の結果を開く処理から返す |
 | 2 | f106e2e3f (同じ会話の続き) | ACCEPT WITH CHANGES | P3 detached-rework-plan.md §11 に、受付の結果を返すために別ウィンドウへ開く経路の関数に触れた範囲を追記する | §11 に追記 |
+| 3 | f35aaa598 (master 0381f253e の取り込み、同じ会話の続き) | ACCEPT | なし。衝突の解消 (ScriptSlot のキーとリングの対応を master で移った `ring_shortcut.rs` の共有関数へ、設定の分類の件数) と、master が元の場所だけ変えて切り出した実行関数へ届いていない変更が無いかを確認。コンパイルで見つかった 1 件 (§1.746 の `input_advances_right_to_left`) はマージで直した | — |
 
-detached の合意は 2 回とも得た (記録と引用は detached-rework-plan.md §11)。
+detached の合意は 3 回とも得た (1・2 回目の記録と引用は detached-rework-plan.md §11)。3 回目の言葉:「既存の所有境界・受付結果を使う構造的な変更であり、症状パッチではない」。マージで detached への触れ方は変わっていない。
