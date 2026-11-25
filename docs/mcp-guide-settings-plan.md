@@ -1863,8 +1863,8 @@ tool を 2 本足す。どちらも本体と通信し、UI スレッドで実行
 | --- | --- | --- |
 | `ring.{grid,image,video}.{up,up_right,right,down_right,down,down_left,left,up_left}` | `RingActionId` の保存名、または `"none"` | その方向の既定 |
 | `mouse.{grid,image,video}.{back,forward,middle}` | 同上 | そのボタンの既定 |
-| `gesture.{grid,image,video,edit}.<並び>` (並びは `U` `R` `D` `L` の 1〜4 文字、同じ文字を隣に並べない。例 `DR`) | 同上。`"none"` はその並びの割り当てを消す | 既定の割り当てにある並びなら既定の操作、無ければ消す |
-| `right_drag.{grid,image,video,edit}` | `disabled` / `ring_shortcut` / `mouse_gesture` (`edit` は `ring_shortcut` を除く) | 既定 |
+| `gesture.{grid,image,video,edit}` (**文脈ごとの登録の列全体**) | 順序つきの配列 `[{ "pattern": "DR", "action": "<RingActionId>" }, …]`。並びは `U` `R` `D` `L` の 1〜4 文字、同じ文字を隣に並べない。`[]` は登録なし | その文脈の既定の登録の列 |
+| `right_drag.{grid,image,video,edit}` | `disabled` / `ring_shortcut` / `mouse_gesture` (`edit` は `ring_shortcut` を除く)。読む値は今効いている値 (`right_drag_mode`) | 既定の値を**明示して**入れる (保存上の「未指定」に戻して旧設定 `mouse_flick_enabled` の継承に頼ることはしない) |
 | `short_right_click.{image,video}` | `close_fullscreen` / `none` / `context_menu` | 既定 |
 | `option.select_grid_item_on_right_drag_start`・`option.mouse_ring_help_visible`・`option.mouse_gesture_help_visible`・`option.mouse_gesture_result_toast_visible`・`option.gamepad_enabled` | 真偽 | 既定 |
 | `option.video_normal_wheel_action` | `navigate_items` / `adjust_volume` | 既定 |
@@ -1872,6 +1872,12 @@ tool を 2 本足す。どちらも本体と通信し、UI スレッドで実行
 - 値の綴りは `settings.db` に保存している serde の形と同じ (`RingActionId::as_str`、`RightDragMode::as_str` ほか)。新しい綴りを決めない。
 - ジェスチャーの並びの文字は、保存の形 (`MouseGestureDirection` の serde) とは別の短い表記。読み書きの境界で変換する
   (変換は 1 か所、往復のテストを置く)。入力の正規化 (隣の同じ向きをまとめる) で値が変わる並びは拒む。
+- **ジェスチャーを並び単位でなく文脈単位の列で扱う理由** (独立レビュー r1 P1): 窓は同じ並びの重複登録を警告つきで許し
+  (`pages.rs:3621`)、sanitize も残し、実行時は先のものだけが効く (`ring_shortcut.rs:445-460`)。並び単位の住所では、重複のある
+  並びを書き換えたときに後ろの登録を変更前の値から戻せない (通常の操作で作れる利用者のデータ)。列全体を読み書きすれば、
+  順序・重複を含めて `before` で正確に戻せ、窓の編集 (列の追加・置き換え・削除) と同じ単位になる。重複は窓と同じく拒まない。
+- 1 つの文脈の列が 1 行の予算 (§20.4.2) に収まらないほど多い場合は、共通の決まりどおり `too_long` を返し、その文脈は AI からは
+  読み書きできない (数百件の登録が要り、通常の使い方では起きない)。
 - リングの説明に「右ドラッグのリングとゲームパッドの X リングで共用」と書く (窓と同じ)。
 
 #### 20.4.2 `get_operations { view?, query?, key?, actions?, context?, slots?, slot?, page? }`
@@ -1887,29 +1893,41 @@ tool を 2 本足す。どちらも本体と通信し、UI スレッドで実行
   - `inputs` は、同じ操作が今割り当てられているキー以外のスロットの名前。キーの操作に対応する `RingActionId` を
     `ring_bindings_for_key_action` (共有の場所へ移す。窓の割り当て編集の表示と同じ対応) で求め、今のリング・マウスボタン・
     ジェスチャーのスロットのうち、その値が入っているものを返す。
-  - 絞り込み (どれか 1 つ。併用は `context` だけ):
-    - `query`: 表示名・操作名・文脈の表示名への部分一致 (空白区切りの AND)。先頭 32 件と `more`。
-    - `key`: キー 1 つ (例 `Ctrl+C`、修飾だけ `Shift` も可)。そのキーが今付いている操作を全部の文脈から返し、加えて
-      予約の割り当て (`RESERVED_BINDINGS`) に当たれば `reserved` に表示名を返す。結果が空なら、そのキーはどの操作にも
-      付いていない。**固定の入力 (IME・クリップボードの貼り付けなど、keymap の外) は返らない**ので、説明に
-      「固定の入力は get_help (ショートカット一覧)」と書く。
+  - 絞り込み (`query`・`key`・`actions` はどれか 1 つ。`context` と `screen` はほかと併用できるが、互いには併用しない):
+    - `query`: 表示名・操作名・文脈の表示名への部分一致 (空白区切りの AND)。
+    - `key`: キー 1 つ (例 `Ctrl+C`、修飾だけ `Shift` も可)。そのキーが今付いている操作を返し、加えて予約の割り当て
+      (`RESERVED_BINDINGS`) に当たれば `reserved` に表示名を返す。**固定の入力 (IME・クリップボードの貼り付けなど、
+      keymap の外) は返らない**ので、説明に「固定の入力は get_help (ショートカット一覧)」と書く。
     - `actions`: 操作名 32 個まで。
-    - どれも無い: 全件を 60 件ずつのページ (`page`、応答に `page`・`pages`)。
-    - `context`: 文脈の名前 (`KeyContext::ini_name`) で絞る。
+    - `context`: **その文脈に属する**操作だけ (`KeyContext::ini_name`)。所属で絞るだけで、空き判定には使えない
+      (独立レビュー r1 P2: 一覧では Global・Grid・Rating が同時に効くので、`context: "Grid"` で空でも Global の操作が付いている
+      ことがある)。
+    - `screen`: **その画面で効く**操作だけ (`grid`・`image_fullscreen`・`video_fullscreen`・`page_overview`・`erase`・`conceal`・
+      `crop`・`sns_split`・`text`・`local_adjust`)。`key` と併せると「その画面でそのキーは空いているか」になる。効くかの判定は
+      1 つの helper (`action_active_on_screen`) にし、`ACTIVE_SCOPE_SETS`・ページ一覧の操作の例外 (`page_overview_action_allowed`)・
+      ヘルプの例外 (`help_context_shortcuts_overlaps_scope`) を `actions_can_overlap` と同じ部品で組む。予約の割り当ても画面で絞る
+      (`reserved_binding_overlaps_scope`)。行の `screens` も同じ helper で作り、「2 つの操作の `screens` が重なる ⇔
+      `actions_can_overlap`」をテストで全組について確かめる。
+    - どの形も 60 件ずつのページ (`page`、応答に `page`・`pages`)。`key` の結果も同じ (同じキーを多数の操作に付けることは
+      禁止されていない、独立レビュー r1 P2)。
+  - 操作名は `ini_name` と**大文字小文字まで一致**するものだけを受け付ける (独立レビュー r1 P2。`parse_ini_name` は大小と前後の
+    空白を無視するので、そのまま使うと同じ操作を 2 つの名前で指せる)。大小だけ違う名前には、正しい名前をエラー文で示す。
+  - `inputs` の名前は最大 37 個 (リング 24・マウスボタン 9・ジェスチャー 4 文脈) で、1 行の予算に収まる。
   - 利用者に見せない 4 操作 (`is_user_facing` が false) は返さない・書かせない。
 - **`inputs`**: キー以外のスロットの今の値。1 行 = `{ "slot", "label", "value", "value_label", "default" }`。
-  `slots` (名前の前方一致、例 `gesture.image`) で絞る。ジェスチャーは今の割り当てと既定の割り当ての並びを合わせて返す
-  (既定にあって今無い並びは `value: "none"`)。60 件ずつのページ。
+  `slots` (名前の前方一致、例 `mouse.image`) で絞る。ジェスチャーは文脈ごとに 1 行で、`value`・`default` は登録の列
+  (`value_label` は各登録の表示名の列)。60 件ずつのページ。
 - **`conflicts`**: 今の競合の一覧 (`binding_conflicts`)。1 行 = `{ "key", "kind", "action", "other" }` (`other` は相手の操作名か
   予約の表示名)。`kind` は `same_context` (Hard) / `overlap` (ActiveOverlap) / `trigger_mismatch` / `reserved`。60 件ずつ。
   - **試算**: `actions` (1 個) と `key` を併せて渡すと、「その操作にそのキーを足したら起きる競合」を、実行中の値の写しで
     同じ `binding_conflicts` に計算して返す (何も変えない)。AI は割り当てる前に、相手の操作と文脈の重なりを利用者に説明できる。
     文脈が重なるか (`actions_can_overlap`) は AI が操作の一覧から推測できないので、この試算を用意する。
-- **`choices`**: `slot` 1 つ (例 `mouse.image.back`) に入れられる値と表示名。`RingActionId` のスロットは、その文脈・入力の
-  検査を通る候補 (`available_for_context` ほか、窓の候補と同じ関数)。
+- **`choices`**: `slot` 1 つ (例 `mouse.image.back`、ジェスチャーは `gesture.image`) に入れられる値と表示名。`RingActionId` の
+  スロットは、その文脈・入力の検査を通る候補 (`available_for_context` ほか、窓の候補と同じ関数)。60 件ずつのページ。
 
-どの形も、最終の応答の形でデータ応答の予算に収まることをテストで検査する (§4.3・§6.2 と同じ測り方)。実行は UI スレッドで
-メモリの中の値を読むだけ。
+どの形も、最終の応答の形でデータ応答の予算に収まることをテストで検査する (§4.3・§6.2 と同じ測り方。1 行 12,000 字・
+1 ページ 38,000 字、`crates/agent-ipc/src/lib.rs:115`)。受け入れのテストに、同じキーを多数の操作へ付けた状態、候補の最大の
+スロット、行の長い操作の 60 件を入れる。実行は UI スレッドでメモリの中の値を読むだけ。
 
 #### 20.4.3 `set_operations { keys?, inputs? }`
 
@@ -1924,16 +1942,16 @@ tool を 2 本足す。どちらも本体と通信し、UI スレッドで実行
 
 1 つでも通らなければ全体を拒み、何も変えない。エラー文に操作名・スロット名を入れる (AI が直せるように)。
 
-- 操作名: `KeyAction::parse_ini_name` で引けて、利用者に見せる操作であること。
+- 操作名: `ini_name` と大文字小文字まで一致し (§20.4.2)、利用者に見せる操作であること。スロットの名前も小文字の綴りと
+  完全一致。これで同じ操作・同じスロットを 2 つの名前で指すことは起きない (JSON の同じ鍵の重複は受け口の解析で拒む)。
 - キー: 各要素が `parse_chord_for_action(action, s)` で `Ok(Some(_))` (空・`none` は配列に入れさせない。割り当てなしは `[]`)。
   同じ配列の中の重複は拒む (窓は黙って除くが、AI には「言ったとおりに入った」か「何も変わらない」かにする)。4 個以上は拒む。
 - スロット: 名前の形・文脈・ボタン・方向・並びが §20.4.1 のとおりであること。`RingActionId` は `Unknown` にならず、その
   スロットの検査 (`is_valid_for_context` / `is_available_for_mouse_button_assignment` / `is_valid_for_right_drag_context`) を通ること。
 - 変えた後の bundle に `ring_shortcuts.sanitize()` をかけ、**渡した値が正規化で変わるなら拒む** (第 1 段 §6.4.3 の
   「正規化で値が変わる入力は拒む」と同じ)。
-- 同じ並びのジェスチャーが今のデータに 2 つ以上ある場合 (窓は重複の登録を止めず、先のものだけが効く、`ring_shortcut.rs:460`):
-  そのスロットへ書くと、その並びの割り当てを 1 つにまとめる。応答の行に「重複していた n 件をまとめた」と書く
-  (効いていない重複だけが消え、効き方は頼んだとおりになる)。
+- ジェスチャーの列: 各登録の並びと操作を上と同じに検査する。同じ並びの重複は拒まない (窓と同じ。先のものが効くことを
+  tool の説明に書く)。列の長さは窓に上限が無いので設けず、応答の予算 (§20.6 の 5) で抑える。
 - 第 1 段と同じく、`keymap`・`ring_shortcuts`・`gamepad_enabled` を `set_settings` に渡されたときのエラー文を
   「`set_operations` で変えます」に変える (`src/settings_transfer/stage1.rs:260` の理由の文)。
 
@@ -1943,8 +1961,16 @@ UI スレッドで次を順に行う。
 
 1. 許可を見る (§20.7)、受付 (第 1 段 §6.5 と同じ `admit_agent_settings_write`)。
 2. `OperationCustomizeBundle::from_settings(&self.settings)` を作り、`before` として控える。
-3. 検査しながら bundle の写しへ値を入れる (§20.5)。
-4. **`settings_eq` で前と同じなら終わる** (確定・保存・通知をしない。全項目を `unchanged`)。
+3. 全項目を検査する (§20.5)。
+4. **項目ごとに「公開の値」を今の値と比べ、同じ項目は書かない** (`unchanged`)。全部同じなら終わる (確定・保存・通知をしない)。
+   独立レビュー r1 P2 により `settings_eq` (bundle 全体の比較) は使わない。override の並び順まで比べるので、同じ値を書くだけで
+   違う bundle になる (`set_override_chords` は消してから末尾へ足す、`src/keymap.rs:10439`)。
+   - 公開の値: キーは override が無ければ `null`、あれば保存の配列 (順序を含む)。スロットは読みと同じ値 (右ドラッグは今効いている
+     値、ジェスチャーは列)。
+   - 違う項目だけを bundle の写しへ入れる。キーの override は**今の位置で置き換え** (無ければ末尾へ足す)、ほかの override の
+     並びを動かさない。
+   - 往復の不変条件: `before` を書き戻すと、すべての項目の公開の値が変更前と同じになる (右ドラッグは保存上「未指定」だったものが
+     明示の値になり得るが、効き方は同じ。それ以外は保存の形まで同じ)。
 5. 応答の全体を組み立てて予算を検査する (収まらなければ何も変えずに拒む、第 1 段 §6.4.3 と同じ)。
 6. `apply_operation_customize_bundle(bundle)`。
 7. 実行中の値から変更後を読み直して応答を作り、通知・記録・ログを出す。
@@ -2004,7 +2030,8 @@ UI スレッドで次を順に行う。
   キー割り当てを外す。
 - `privacy.html:174,331`: 渡す情報に「操作カスタマイズの割り当て」を足す。ほかの通信・保存は増えない。
 - 製品ページ `index.html`: 「安心して使えます」と AI 連携の記述を確かめ、「〜だけ」が偽にならないかを見る (実装担当が確認して報告)。
-- 設計文書: この節、`docs/mcp-integration-plan.md` §15.4 (上限)、`docs/keymap-spec.md` (AI から変えられることを 1 行)。
+- 設計文書: この節、`docs/mcp-integration-plan.md` §15.4 (上限)、`docs/keymap-spec.md` (AI から変えられることを 1 行)、
+  `docs/architecture-overview.md` (新しい module・確定の経路・IPC 7。今は環境設定の経路と IPC 6 の説明、`:13`)。
 - 新しい `KeyAction` は足さない (keymap の規則の対象外)。
 
 ### 20.10 §1.363 (ブランチ `script-363-impl`) との重なり
@@ -2031,15 +2058,23 @@ UI スレッドで次を順に行う。
 
 - **区切り F (中身)**: 新しい module (例 `src/operation_customize_agent.rs`) に、スロットの名前の解釈、行の組み立て、検査と
   bundle への適用を、App に依存しない純関数で置く。`ring_bindings_for_key_action` を共有の場所へ移す (窓の表示も同じ関数を使う)。
-  テスト: スロットの種類ごとの正常・異常、キーの型の形・4 個・重複・空、未知の操作・見せない操作、正規化で変わる値の拒否、
-  ジェスチャーの並びの往復と重複のまとめ、`before` を渡すと `settings_eq` で元の bundle に戻る往復、競合の抽出。
+  テスト: スロットの種類ごとの正常・異常、キーの型の形・4 個・重複・空、未知の操作・大小だけ違う操作名・見せない操作、
+  正規化で変わる値の拒否、ジェスチャーの並びの表記の往復、異なる操作を持つ同じ並びの重複を含む列の書き換えと `before` での復元、
+  `before` を書き戻すと全項目の公開の値が戻る往復 (§20.6 の不変条件)、同じ値の書き込みで override の並びが動かないこと、
+  右ドラッグの `null` が旧設定 `mouse_flick_enabled` に関わらず既定の値になること、`action_active_on_screen` と
+  `actions_can_overlap` の一致 (全組)、`screen` + `key` の空き判定で Global・FsCommon の操作を見落とさないこと、競合の抽出と試算。
 - **区切り G (受け口)**: App の handler (許可・受付・変更なし・予算・確定・通知・記録・ログ)、IPC 7 (版 6 の凍結 fixture)、
   MCP の 2 本、`set_settings` のエラー文、INSTRUCTIONS、予算の上限。テスト:
   - 状態遷移: 書いた後に `self.keymap` の実効のキーが変わる / 変更なしで保存しない (`save_generation`) / 窓を開くと新しい値が
     下書きに出る。
   - 受付: 操作カスタマイズの窓・破棄の確認・環境設定・設定の復元・リモート操作中に拒み、何も変わらない。許可なしで拒む。
-  - 兄弟の不変: AI の変更の後、環境設定を開いて何も変えずに OK しても、キー・リング・`gamepad_enabled`・
-    `video_normal_wheel_action` が戻らない (`overwrite_non_preferences_from` の引き継ぎと 3 者比較を通る)。
+    設定の復元の窓で取り込みの worker を動かしたまま窓を閉じ、その後に AI が変更しても、閉じた窓の完了が AI の変更を上書きしない
+    (閉じると状態と受け口を捨てる、`src/ui_dialogs/settings_restore.rs:466`)。マウスの旧設定の移行の案内 (`src/app.rs:24485-24500`)
+    は下書きを持たず実行中の値へ直接書くので、AI の変更と食い違う写しが無いことをテストで確かめる。
+  - 兄弟の不変: AI の変更の後、環境設定を開いて何も変えずに OK しても戻らない。根拠は項目で異なる: キー・リングは確定の
+    `overwrite_non_preferences_from` が実行中の値を引き継ぐ (`src/settings.rs:11583-11587`)。`gamepad_enabled` は引き継がれないが、
+    環境設定を開いている間は AI の変更を受け付けず (§20.7)、開いたときの写しは AI の変更の後の値なので戻らない。
+    `video_normal_wheel_action` は 3 者比較で、環境設定で触れていなければ実行中の値が残る。
   - IPC の互換、応答の予算、tool 一覧の予算、説明 1 本の字数。
 - **区切り H (画面・文書)**: §20.9。
 - 実装担当は cargo を流さない。ビルド・テストは設計担当が共有 runner で流す (第 1 段と同じ)。
@@ -2133,4 +2168,21 @@ MCP経由のヘルプでは、そのあたりをユーザにうまく説明し�
   (操作カスタマイズだけで v5.8.0 に出し、残りは第 2 段の後半として別に設計)」。確定の入口が画面ごとに別で、操作カスタマイズと
   共有する部分が無く、同じ枝に入れると規模と検査の組み合わせが大きくなる。
 - 通常の使い方が不便になる変更・利用者の作ったデータが失われる点: 無い見込み (割り当ての値は応答と記録の変更前の値で戻せる。
-  ジェスチャーの重複のまとめで消えるのは効いていない重複だけ、§20.5)。
+  ジェスチャーは列全体で戻せる、§20.4.1)。
+
+### 20.15 独立レビューの記録
+
+GPT-6.1 Sol / xhigh、read-only、thread `01a21106-d9d1-7af1-adfa-fbced64f502a`。
+
+**r1 (2026-11-25、対象 `6c504cee3`) — REVISE**。指摘は全部コードで確かめて受け入れた。
+
+| 指摘 | 対応 |
+| --- | --- |
+| P1 同じ並びの重複ジェスチャーを 1 つにまとめると、`before` (操作 1 つ) から後ろの登録を戻せない。重複は通常の操作で作れる | 並び単位の住所をやめ、文脈ごとの登録の列全体を読み書きする。重複は拒まない (§20.4.1・§20.5) |
+| P2 `settings_eq` は override の並び順まで比べ、同じ値の書き込みでも変わる (`set_override_chords` は末尾へ移す)。右ドラッグは保存上 `Option` で、未指定は旧設定を継承する | 項目ごとの公開の値で比べ、違う項目だけ書く。override は今の位置で置き換え。右ドラッグの `null` は既定を明示して入れる。往復の不変条件を公開の値で定義 (§20.4.1・§20.6) |
+| P2 `key` の結果にページが無い。ジェスチャーの参照が大きくなり得る | 全部の形を 60 件ずつのページに。ジェスチャーは文脈単位の列になり、`inputs` の名前は最大 37 個 (§20.4.2) |
+| P2 `context` で絞った空の結果を空きと読めない (一覧では Global も効く) | 所属の絞り込み `context` と、画面で効く操作の絞り込み `screen` を分け、空き判定は `screen` + `key`。判定の helper を `actions_can_overlap` と同じ部品で組み、一致をテスト (§20.4.2) |
+| P2 `parse_ini_name` が大小を無視するので、同じ操作を 2 つの名前で指せる | 操作名・スロット名は完全一致だけ受け付ける (§20.4.2・§20.5) |
+| P3 `architecture-overview.md` の更新、受付テスト (移行の案内・復元の worker の完了)、`gamepad_enabled` が戻らない根拠の書き分け | §20.9・§20.12 に反映 |
+
+r1 の対象外だった追記 (`823d33328` の §20.14a、`d6b7696f0` の §20.14b) は r2 で確かめてもらう。
