@@ -324,3 +324,8 @@ B 案・App の検出の cache・検出と MockBackend の共通化・型付き 
 
 P1・P2 なし。UI スレッドの境界・URL とログ・画像コピーの既存の動作・検出の周期・固定の ID・通知の対応・テストの差し込みに
 欠陥は見つからなかったとされた。P3 1 件 (`docs/spec.md` のヘルプメニューの一覧に「AI で調べる」が無い) を受け入れて直した。
+- 2 巡目: 表の「ヘルプ」行そのものに項目が無い (P3) → `db3025cdc` で直した。3 巡目: **ACCEPT** (指摘なし)。
+
+実装の検証 (設計担当、共有の runner): `cargo nextest` の関連 filter (ask_ai・メニューの並び・search_nav_inventory・
+agent_integration・external_links / external_open・クリップボードの書き込み・native_clipboard) 187 件通過 (うち新規 ask_ai 18 件)、
+`mimageviewer-mcp` 122 件通過。本体 lib 全件は master への取り込み後に統括が流す。実機 (各アプリ・サービスの URL、実際のクリップボード) は未確認。
