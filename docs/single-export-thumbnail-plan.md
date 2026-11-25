@@ -1,6 +1,6 @@
 # 1 枚の書き出し (Ctrl+E) の元の縮小画像の扱い 設計 (§1.888)
 
-状態: 設計中 (2026-11-25)。独立設計レビュー前。実装なし。
+状態: 設計中 (2026-11-25)。独立設計レビュー 1 回目 REVISE を受けて改訂 (§7)。実装なし。
 関連: [一括エクスポートの設計](batch-export-plan.md) §3.6 (EXIF の共通処理)・§3.7 (縮小画像の警告)・§13 Q3、
 [バックログ §1.888](next-release-backlog.md)。
 
@@ -17,7 +17,8 @@
   「メタデータを保持」の**他の中身 (EXIF・ICC・プロンプト等) は変えない**、**既定値は変えない**。
 
 範囲外 (今と同じ): 見開き合成・PDF・形式が変わる書き出し (どれも元の情報を転記しない)、
-`books.rs` の保存 (転記しない)、一括の書き出し (§1.362 のまま。下の §3.4 の文言だけ共通)。
+`books.rs` の保存 (転記しない)。一括の書き出しは §1.362 のままで、PNG の Raw profile の扱い (§3.2・§3.4) と
+警告の説明文 (§3.4) だけが共通に変わる (一括は未リリース)。
 
 ## 2. 今のコード (master `206768a81`、コード読み)
 
@@ -27,8 +28,14 @@
 | 形式 | 転記するもの (今) | EXIF の処理 (今) |
 | --- | --- | --- |
 | JPEG | すべての APP1 (EXIF・XMP・拡張 XMP)。ICC (APP2) は転記しない | `reset_exif_orientation_in_app1` で Orientation を 1。IFD1 はそのまま |
-| PNG | tEXt / iTXt / zTXt だけ (`eXIf`・`iCCP` は転記しない) | EXIF を転記しないので無し |
+| PNG | tEXt / iTXt / zTXt だけ (`eXIf`・`iCCP` は転記しない) | `eXIf` は無し。ただしテキストチャンクの「Raw profile」形式 (下) の EXIF はそのまま転記される |
 | WebP | `ICCP` (色空間を問わず)・`EXIF`・`XMP ` | 何もしない (Orientation も IFD1 もそのまま) |
+
+PNG のテキストチャンクには、キーワード `Raw profile type exif` / `Raw profile type APP1` / `Raw profile type xmp`
+(大文字小文字を問わない) で EXIF・XMP を 16 進の文字列にして入れる形式がある (ImageMagick などが書く。
+本文は「改行・種類名・改行・10 進の長さ・改行・16 進の数字 (途中に改行)」)。今の転記はこれらもそのまま残し、
+§1.362 の検出 (`inspect_png_xmp`) は `XML:com.adobe.xmp` しか見ないので、一括でも 1 枚でも見落としている
+(独立設計レビュー 1 回目の P1)。
 
 ダイアログの既定は `settings.export_embed_metadata` (既定 ON)。進捗と結果は一括と同じ `ExportPending` と
 `ui_dialogs::export_batch::draw_progress_window`・`App::poll_export_pending` で扱い、警告の画面
@@ -53,20 +60,36 @@ pub enum MetadataProfile {
 
 - 転記しないとき (`include_metadata == false`) は今と同じで、どちらの値でも何も転記・検出しない。
 - 今 `batch_metadata: false` の呼び出し元は `export_dialog::run_export` と、転記しない `books.rs`、テストだけ。
-  したがって「縮小画像を処理しない転記」は製品の経路から無くなる。古い転記の関数は Single の中で、
-  EXIF を読めないときの扱い (§3.2) にだけ残る。
+  したがって「縮小画像を処理しない転記」は製品の経路から無くなる。Single は今の形式ごとの転記
+  (`encode_jpeg_rgba` などの APP1 / テキスト / WebP チャンクの選び方と JPEG の Orientation の書き換え) をそのまま使い、
+  そこに §3.2 の IFD1 の処理と §3.4 の検出を足す。
 
 ### 3.2 EXIF (Single)
 
 - **JPEG の EXIF APP1・WebP の `EXIF`**: §1.362 の `clean_exif` (TIFF を読み、IFD1 を外して縮小画像の範囲を 0 で埋め、
   MakerNote の有無を返す) を同じく通す。PNG は EXIF を転記しないので対象外。
-- **Orientation は今の扱いのまま**: `clean_exif` に `reset_orientation: bool` を足す。
-  - JPEG: `caller_applied_orientation` の値 (1 枚の書き出しは `true`、今と同じく 1 にする)。
-  - WebP: `false` (今は WebP の Orientation を書き換えていない。変えると統括の指示に反するので変えない。
-    書き換えないときは、Orientation の形が不正なことを読めない理由にしない)。
+- **Orientation は今の扱いのまま**: `clean_exif` に `reset_orientation: bool` を足す。`clean_exif` は IFD0 だけでなく
+  Exif IFD などの下位の IFD の Orientation もすべて書き換えるので、今の 1 枚の出力 (IFD0 の最初の Orientation だけ)
+  と範囲が違う (独立設計レビュー 1 回目の P2)。
+  - Single は常に `false` (Orientation に触れない。形が不正な Orientation を読めない理由にしない)。そのうえで JPEG だけ、
+    今と同じく `caller_applied_orientation` なら `reset_exif_orientation_in_app1` を当てる (処理の順番は
+    `clean_exif` の後。IFD1 を外しても IFD0 の位置は変わらない)。WebP は今と同じく Orientation を書き換えない。
   - Batch は今と同じく常に `true`。
+  - したがって Single の EXIF の変化は「IFD0 の次の IFD を 0 にする・IFD1 が指す縮小画像の範囲を 0 で埋める」だけで、
+    それ以外のバイトは今の出力と同じになる (テストで比べる)。
+- **PNG の「Raw profile」の EXIF** (`Raw profile type exif` / `APP1`、§2): Single と Batch の両方で扱う
+  (一括は未リリースなので、ここで合わせて直す)。
+  - 本文を読む: tEXt はそのまま、zTXt と圧縮の iTXt は展開してから (展開の上限と合計の上限は XMP と共通の
+    16 MiB / 32 MiB)。種類名の行・長さの行の後の 16 進の数字を、空白と改行を飛ばして長さの分だけバイトにする。
+    先頭が `Exif\0\0` ならその後を TIFF とする。`APP1` で先頭が XMP の見出しなら下の XMP として調べる。
+  - `clean_exif` (Single は `false`、Batch は `true`) を通し、**変わったバイトに当たる 16 進の数字だけを元の位置で
+    書き換える** (大文字小文字は元に合わせる)。長さは変わらないので、改行の位置・種類名・長さの行は元のまま。
+    圧縮されていたチャンクは同じ圧縮の有無で作り直す (iTXt の言語・訳語のキーワードは元のまま)。CRC は計算し直す。
+  - 読めないとき (形式が違う・16 進でない・長さが足りない・上限を超えた・`clean_exif` が `None`) は、下の
+    「TIFF として読めない EXIF」と同じ (Single は残して警告、Batch はそのチャンクを転記しない)。
+  - `eXIf` チャンクの扱い (Single は転記しない、Batch は §1.362 のまま) は変えない。
 - **TIFF として読めない EXIF (`clean_exif` が `None`)**: Single では**今と同じ処理で転記し** (JPEG は
-  `reset_exif_orientation_in_app1`、WebP はそのまま)、警告の種類「EXIF (調べられませんでした)」
+  `reset_exif_orientation_in_app1`、WebP と PNG の Raw profile はそのまま)、警告の種類「EXIF (外せませんでした)」
   (`ThumbnailNoticeKinds::exif_uninspectable`) を立てる。一括は今どおり転記しない (この種類を立てない)。
   - 理由: 一括と同じく外すと、リリース済みの出力から EXIF が丸ごと消える (統括の指示に反する)。黙って残すと
     縮小画像が漏れ得る。XMP の「調べられない → 警告」と同じ考え方で警告側に倒す。
@@ -86,25 +109,31 @@ pub enum MetadataProfile {
 
 - **検出** (worker、エンコードの中、追加の読み込みなし): §1.362 §3.7 の表と同じ。
   - XMP の縮小画像: 常に。JPEG の標準・拡張 XMP、PNG の `XML:com.adobe.xmp` テキストチャンク (展開の上限と
-    「調べられない → 警告」も同じ)、WebP の `XMP `。
+    「調べられない → 警告」も同じ)、PNG の `Raw profile type xmp` (と XMP の入った `APP1`。16 進を戻してから
+    名前空間を探す。戻せない・上限を超えたら「調べられない」)、WebP の `XMP `。Raw profile の XMP は書き換えない。
+    PNG の Raw profile の検出は Batch にも同じく効く。
   - MakerNote: 「隠す編集」がある出力だけ。1 枚の書き出しでは、合成するページの編集 snapshot の
     `erase` / `conceal` / `export_crop` / `comic` / `local_adjust` のどれかが `Some`、**または**その出力の
-    `ExportEntry::conceal_preset` が `Some` (隠蔽プリセットの出力 `_1`〜`_4`)、**または** `crop_override` が `Some`
-    (SNS 分割の枠)。出力ごとに決める (同じ書き出しの `_0` と `_1` で違い得る)。
+    `crop_override` が `Some` (SNS 分割の枠。snapshot に切り取りが無くても枠の外を落とす)。
+    - 隠蔽プリセットの出力 (`_1`〜`_4`) は、選べる条件が snapshot に隠蔽マスクがあること
+      (`has_conceal_mask`) なので、`_0` も含めて snapshot の `conceal` で対象になる。`conceal_preset` は条件に足さない
+      (今の製品の経路では重複になる。独立設計レビュー 1 回目の P3)。
+    - 見開き合成は元の情報を転記しないので対象外 (MakerNote も検出しない)。
   - 元の情報を転記しない出力 (見開き・PDF・形式変更・OFF) は検出しない。
 - **送り方**: `run_export` は、その出力の `Completed` を送った直後に、警告があれば
   `ExportEvent::ThumbnailNotice { label, path, kinds }` を送り、ログに
   `export thumbnail metadata: <出力パス>: <kinds>` を 1 行残す (一括の行は今どおり `batch export ...`)。
   `save_image_with_metadata` は保存結果の警告を返す形にする (`encode_image_with_metadata_report` と同じ値)。
-- **画面**: 共通の進捗ダイアログ (§1.362 §3.7) がそのまま出す。完了で警告があれば、今の「成功 1 件なら Explorer で
-  示して閉じる」ではなく、警告の画面を残す (共通の `poll_export_pending` の今の規則どおり、新しい分岐は足さない)。
-  - 種類の表示に「EXIF (調べられませんでした)」を足す。
+- **画面**: 共通の進捗ダイアログ (§1.362 §3.7) がそのまま出す。完了で警告があれば、今の「成功 1 件なら
+  保存の通知 (『保存しました: <名前>』、押すと Explorer で示す) を出してダイアログを閉じる」ではなく、警告の画面を残す
+  (共通の `poll_export_pending` の今の規則どおり、新しい分岐は足さない)。
+  - 種類の表示に「EXIF (外せませんでした)」を足す (`exif_uninspectable`、Single だけが立てる)。
   - 説明文の最後の文を、1 枚と一括の両方に合う言い方にする:
     「公開する前に確認するか、元の情報を残さない設定 (一括では『元の情報を残す』、1 枚の書き出しでは
     『AI プロンプト / EXIF を保持』をオフ) で書き出し直してください。」
 - **書き出しの前の案内**: 1 枚のダイアログのチェックボックスに説明 (hover) を付ける。
-  「EXIF の縮小画像は外します。XMP などに縮小画像が残っていそうなときは、書き出しの後で知らせます
-  (隠した部分が縮小画像に残ることがあります)。」 行を足さないので、ダイアログの高さは変わらない。
+  「EXIF の縮小画像は外します。外せなかったときや、XMP などに縮小画像が残っていそうなときは、書き出しの後で
+  知らせます (隠した部分が縮小画像に残ることがあります)。」 行を足さないので、ダイアログの高さは変わらない。
 
 ## 4. 簡素化と、まれな失敗の割り切り
 
@@ -119,14 +148,22 @@ pub enum MetadataProfile {
   - JPEG: IFD1 付きの EXIF → 出力の IFD0 の次の IFD が 0、縮小画像の範囲が 0、Orientation が 1。ICC (APP2) は
     出力に無い (元に RGB の ICC があっても)。XMP の APP1 はバイト列が同じ。
   - WebP: IFD1 付き・Orientation 6 の EXIF → IFD1 が外れ、Orientation は 6 のまま。GRAY の `ICCP` も残る。
+  - JPEG: IFD0 と Exif IFD の両方に Orientation がある EXIF → IFD0 だけが 1 になり、Exif IFD の値は元のまま。
+    IFD1 の範囲と次の IFD の 4 バイト以外は、今の処理 (`reset_exif_orientation_in_app1` だけ) の出力と同じバイト列。
   - PNG: テキストチャンクが今と同じ。`eXIf`・`iCCP` が出力に無い。
+  - PNG の Raw profile (tEXt と zTXt の両方): IFD1 付きの EXIF → 16 進の該当の数字だけが `0` になり、改行・種類名・
+    長さの行は同じ。展開すると縮小画像の範囲が 0。Raw profile の XMP に xmpGImg → `xmp`。16 進でない本文 →
+    Single は元のまま + `exif_uninspectable`、Batch はそのチャンクが無い。
   - 3 形式とも xmpGImg の XMP で `xmp` が立つ。名前空間の無い XMP では立たない。
   - MakerNote: `thumbnail_notice_for_hidden_edits` の有無で `maker_note` が変わる。
   - 読めない EXIF (例: IFD の循環): 出力が今の処理のバイト列と同じで、`exif_uninspectable` が立つ。
   - Batch は今のテストのまま通り、`exif_uninspectable` を立てない。
 - `tests/export_integration.rs` (1 枚の worker):
   - IFD1 と xmpGImg を持つ JPEG を書き出す → `Completed` の後に `ThumbnailNotice` (xmp)、出力に IFD1 が無い。
-  - 隠蔽プリセットの出力 (`conceal_preset: Some`) と MakerNote → その出力だけ `maker_note`。
+  - 隠蔽マスクのある snapshot と MakerNote で `_0` と隠蔽プリセットの出力を書く → 両方に `maker_note`。
+    snapshot に隠す編集が無い SNS 分割 (`crop_override: Some`) → `maker_note`。隠す編集が無い通常の出力 → 立たない。
+  - ZIP 内の JPEG (IFD1 付き) → 出力に IFD1 が無く、xmpGImg なら `ThumbnailNotice`。
+  - 成功 1 件 + 警告 → 保存の通知に移らず、警告の画面が残る (`App` のテスト)。
   - 「保持」OFF・形式変更では `ThumbnailNotice` を送らない。
 - UI: 警告の一覧に新しい種類の文言が出る (既存の一括の警告テストに足す)。`python scripts/check_ui_glyphs.py`。
   スナップショットに説明文が写っていれば更新する。
@@ -136,10 +173,19 @@ pub enum MetadataProfile {
 - マニュアル `htdocs/mimageviewer/manual/export.html`: 1 枚の書き出しの「メタデータ保持」の行と説明に、
   EXIF の縮小画像を外すこと、XMP などに残りそうなときは書き出しの後に知らせることを書く。一括の段落の
   「『元の情報を残す』をオフ」は §3.4 の説明文に合わせる。
-- [batch-export-plan.md](batch-export-plan.md) §3.6 の「単ページの出力は変えない」の項を本書への参照に直す。
+- [batch-export-plan.md](batch-export-plan.md): §3.6 の「単ページの出力は変えない」の項を本書への参照に直す。
+  §3.6 の PNG の行と §3.7 の「調べる XMP」に Raw profile を足す。§3.7 の「単ページの worker は送らない」を直し、
+  種類の一覧と説明文を §3.4 に合わせる。
+- [spec.md](spec.md) の「Ctrl+E エクスポート」のメタデータ転記の項に、EXIF の縮小画像を外すことと書き出し後の警告を書く。
 - [docs/README.md](README.md) の索引に本書を足す。バックログ §1.888 の状態。
 - 永続データ: 変えない (設定・DB のスキーマ変更なし)。
 
 ## 7. 独立設計レビューの記録
 
-(まだ受けていない)
+### 1 回目 (2026-11-25、対象 752919710、gpt-6.1-sol / xhigh): REVISE
+
+- P1 PNG のテキストの Raw profile の EXIF・XMP が対象から漏れる (一括も同じ) → §2・§3.2・§3.4 で扱う。
+- P2 `clean_exif` の Orientation の書き換えが下位の IFD まで及び、今の JPEG の出力より範囲が広い → Single は
+  `clean_exif` で Orientation に触れず、JPEG だけ今の関数を当てる (§3.2)。比べるテストを足した (§5)。
+- P3 隠蔽プリセットの条件が重複し、テストの期待が実際と合わない → `conceal_preset` を条件から外し、テストを直した。
+- P3 読めない EXIF のときの案内・文書の更新先 (spec.md・一括の設計書)・今の成功 1 件の通知の説明 → 直した。
