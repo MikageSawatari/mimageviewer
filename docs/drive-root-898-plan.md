@@ -19,9 +19,12 @@
 | 切り取り | Ctrl+X (`GridCutFiles`)、右クリックの切り取り | `invoke_shell_clipboard_verb_for_paths_with` (キーとメニューで共通) |
 | 名前の変更 | `GridRename` (既定キーなし)、右クリック | `request_rename_dialog` → `start_rename_item_after_confirmation` → `shell_file_ops::rename_item_async` |
 | 移動 | ファイル整理先 (キー・リング・右クリック)、グリッドからフォルダ／ツリーへのドラッグ (Shift か同じドライブで移動) | 整理先: `request_file_organize_dialog`。ドラッグ: `main_drop_target` の判定 → `submit_shell_transfer_with`。両方とも worker の `validate_transfer_request` を通る |
-| 貼り付け (切り取りの続き) | Ctrl+V・メニュー | 元は OS のクリップボード。mIV が切り取りでルートを入れなければ、mIV 発のルートの移動は起きない |
+| 貼り付け (切り取りの続き) | Ctrl+V・メニュー (`main_drop.rs` → `shell_paste.rs` → Shell の `Paste`) | 元は OS のクリップボード。`validate_transfer_request` を通らない。§3.4 で範囲外とする |
 
-- Shift+Delete (完全削除) の操作は無い。削除は常に FOF_ALLOWUNDO。
+- Shift+Delete (完全削除) の操作は無い。グリッドの削除は常に FOF_ALLOWUNDO。
+- 本棚の本の削除・名前の変更 (`books.rs`) は別経路だが、本棚の直下の本だけに限られ、ルートには届かない。
+- ブックマーク一覧の Delete はブックマークの登録の削除で、ファイル操作ではない。
+- 外部へのドラッグは `DROPEFFECT_COPY` だけで、移動にならない。
 - MCP と mIV Remote には、ファイルを削除・名前変更・移動する操作が無い (タグ・評価・コレクションなどだけ)。対象外。
 - Windows の Shell の右クリックメニュー (Explorer の削除など) は、mIV の確認を通らない。ドライブ一覧では右クリック自体を
   開かない既存の分岐があり、他の場所にはルートの項目が出ない。下の §3.3 で渡すパスからも外す。
@@ -37,12 +40,19 @@
 pub(crate) fn structural_file_operation_path_refusal(path: &Path) -> Option<FileOperationRefusal>
 ```
 
-- `VolumeRoot`: `path_key::is_drive_or_share_root(path)` (= `parent().is_none()`)。`C:\`、`C:`、`\\?\C:\`、
-  `\\server\share`、`\\?\UNC\server\share\`、`\\?\Volume{...}\`、subst のドライブ (`X:\`) はすべてこれに当たる。
+- 判定の前に、パスを**ファイルシステムに問い合わせずに**整える (`lexical_normalize`)。`\\?\` で始まらないパスは
+  `.` を除き、`..` で直前の通常成分を取り除く (ルートより上へは上がらない)。`\\?\` 形式は Windows が `.`・`..` を
+  解釈しない約束なので、そのまま使う。リンク先・ジャンクションの実体は調べない (普通のジャンクションを断らない)。
+- `VolumeRoot`: 整えたパスで `path_key::is_drive_or_share_root` (= `parent().is_none()`)。`C:\`、`\\?\C:\`、
+  `\\server\share`、`\\?\UNC\server\share\`、`\\?\Volume{...}\`、subst のドライブ (`X:\`)、`C:\photos\..`、
+  `\\server\share\dir\..` が当たる。`C:` (ドライブ相対の指定) も当たるが、実ルートと断定するのではなく
+  「どこを指すか決まらない指定」として断る。`C:\foo\..\bar` は通常のフォルダなので通す。
   ファイルシステムへ問い合わせないので、UI スレッドで呼んでよい。
-- `VirtualLocation`: `App::is_synthetic_view_path(path)` (`%APPDATA%\mimageviewer\__drive_list__` などの合成パス)。
+- `VirtualLocation`: 整えたパスで `App::is_synthetic_view_path(path)` (`%APPDATA%\mimageviewer\__drive_list__` などの合成パス)。
   閲覧履歴などから合成パスが `Folder` 項目として出た場合も、実ファイルとして扱わない。
-  (`is_synthetic_view_path` は今 `app.rs` の自由関数。判定の持ち主を変えずに呼べるよう `pub(crate)` のまま使う。)
+  (`is_synthetic_view_path` は今 `app.rs` の自由関数。判定の持ち主を変えずに呼べるよう `pub(crate)` のまま使う。
+  比較は既存の `folder_tree::path_eq` (大文字小文字・区切りの表記を同一視) に任せる。合成パスは mIV 自身が
+  `data_dir` から作る表記だけを対象とし、`\\?\` の別名まではテストで保証しない。)
 
 `FileOperationRefusal` に `VolumeRoot` と `VirtualLocation` を足し、文言もここで持つ
 (「ドライブや共有のルートは{action}できません」「仮想の場所は{action}できません」)。
@@ -50,7 +60,8 @@ pub(crate) fn structural_file_operation_path_refusal(path: &Path) -> Option<File
 項目からは `GridItem::structural_file_operation_refusal(&self)` を使う。中身は
 `file_operation_refusal()` の結果、無ければ `drag_source_path()` に上の判定をかけた結果。
 
-**コピー (Ctrl+C・ドラッグのコピー・パスのコピー) は対象外**。今の挙動を変えない。
+**コピー (Ctrl+C・ドラッグのコピー・パスのコピー・整理先のコピー) は対象外**。今の挙動を変えない
+(ドライブ一覧の Ctrl+C を保つ既存テスト、`context_menu.rs` の 4189 行付近もそのまま通す)。
 
 ### 3.2 断る場所 (確認の画面を出す前)
 
@@ -59,7 +70,7 @@ pub(crate) fn structural_file_operation_path_refusal(path: &Path) -> Option<File
 | 削除 | `request_delete_confirm` の先頭で全対象を判定。1 件でも当たれば確認を開かず、通知を出して戻る (一部だけ消す動きにはしない) | `show_feedback_warning(reason.message("削除"))` |
 | 切り取り | `invoke_shell_clipboard_verb_for_paths_with` で verb が `Cut` のとき、全パスを判定 | 同上、「切り取り」 |
 | 名前の変更 | `request_rename_dialog` の先頭 (今の `file_name()` が無いときの分岐より前) | 同上、「名前の変更」 |
-| 移動 (整理先) | `request_file_organize_dialog` で集めた対象を判定 (整理先は移動とコピーを窓の中で選ぶので、窓を開く前に両方とも断る) | 同上、「整理」 |
+| 移動 (整理先) | 窓の中で「移動」を選んで実行したとき (`submit_file_organize_with` の受付)。「コピー」は通す。整理先の窓は削除の確認ではないので、窓は開いてよい | 同上、「移動」。窓は閉じずに残す |
 | 移動 (ドラッグ) | ドロップ時の判定 (`main_drop_target`) で効果が移動になるとき。コピーになるときは通す | 同上、「移動」 |
 
 ドライブはチェックできないので (ドライブ一覧ではフォルダのチェックを禁止済み)、ドライブとファイルが混ざった選択は
@@ -72,10 +83,18 @@ UI の入口を後から足しても漏れないよう、Shell を呼ぶ直前�
 
 - `start_delete_files` (確認の後、worker を起こす前)
 - `shell_file_ops::validate_transfer_request` で移動のとき
-- `shell_file_ops::rename_item_async` / `run_rename_item`
-- 右クリックの Shell メニューへ渡す `shell_paths` (`context_menu_target`) から、当たるパスを含む選択では `None` にする
+- `shell_file_ops::rename_item_async` (実行経路が必ず通る 1 か所。`run_rename_item` には重ねない)
+- Windows の右クリックメニューを開く要求 (`NativeContextMenuRequest.paths` の組立) で、当たるパスを含む選択なら
+  Windows のメニューを使わず mIV のメニューにする。`context_menu_target` の `shell_paths` 自体は変えない
+  (Ctrl+C がこの値を使うため。コピーを止めない)
 
-### 3.4 採らなかった案
+### 3.4 採らなかった案・範囲外
+
+- **貼り付け (Ctrl+V・背景メニュー) の元の検査**: 元は OS のクリップボードで、mIV は行き先のフォルダだけを渡し、
+  移動は Shell の `Paste` が行う (Explorer の貼り付けと同じ部品)。mIV 自身の切り取りでルートを入れないので、
+  mIV 発のルートの移動は起きない。Explorer はドライブの切り取りを出さないので、ルートを移動用に載せるのは
+  別のアプリだけで、その扱いは Explorer で貼り付けたときと同じになる (OS に合わせる)。クリップボードの中身を
+  読んで検査する仕組みは足さない。
 
 - **ドライブ一覧のときだけ Delete 等を止める (`items_are_drive_list` を見る)**: 一覧の種類で止めると、同じルートが別の場所
   (閲覧履歴・検索・将来のビュー) に出たときに漏れる。パスで決めれば一覧の種類を問わない。ドライブ一覧の既存の UI 分岐
@@ -91,17 +110,23 @@ UI の入口を後から足しても漏れないよう、Shell を呼ぶ直前�
 handler-level (App のテスト環境):
 
 1. ドライブ一覧 (`install_drive_list` 相当で `Folder("C:\\")` を並べ、カーソルを置く) で Delete キー →
-   `show_delete_confirm == false`、警告の通知が 1 件 (旧: 確認が開く)。
-2. 同じ状態で Ctrl+X → クリップボードを書く関数が呼ばれない (`_with` の差し替えで数える)、通知 1 件 (旧: 呼ばれる)。
-3. `request_rename_dialog(C:\)` → 窓が開かず、`VolumeRoot` の文言の通知 (旧: 窓は開かないが理由が違う/無い — 実装時に旧挙動を確認して書く)。
-4. ファイル整理先をドライブで要求 → 窓が開かない、通知 1 件 (旧: 開く)。
-5. ドラッグのドロップで、移動になる組み合わせのルートは断り、コピーは通る。
-6. 合成パス (`__drive_list__`) の `Folder` 項目で Delete → 確認が開かない。
-7. 普通のフォルダ (`C:\foo`) と普通のファイルでは、上のどれも今までどおり確認・窓が開く (退行が無いこと)。
+   `show_delete_confirm == false`、`VolumeRoot` の文言の通知 (旧: 確認が開く)。
+2. 同じ状態で Ctrl+X → テスト用の有効な HWND と差し替え関数を用意し、呼出回数ゼロと `VolumeRoot` の文言の通知
+   (旧: 呼ばれる。HWND が無いと旧コードでも呼ばれないので、HWND を必ず用意する)。同じ状態の Ctrl+C は今までどおり 1 回呼ばれる。
+3. `request_rename_dialog(C:\)` → 窓が開かず、`VolumeRoot` の文言の通知 (旧: 「この項目は名前を変更できません」)。
+4. ファイル整理先でドライブを「移動」で実行 → Shell の転送を起こさず `VolumeRoot` の通知。「コピー」は今までどおり受け付ける。
+5. ドラッグのドロップ: 既存の祖先関係の検査では通る**別ドライブへの Shift 移動**で、ルートを断り通知が出る。同じ組み合わせのコピーは通る。
+6. 合成パス (`__drive_list__`) の `Folder` 項目で Delete → 確認が開かず `VirtualLocation` の通知。
+7. ルートと通常のフォルダの混在を `request_delete_confirm` へ渡す → 全体を断る。
+8. 普通のフォルダ (`C:\foo`)・`C:\foo\..\bar`・普通のファイルでは、上のどれも今までどおり確認・窓が開く (退行が無いこと)。
 
 unit: `structural_file_operation_path_refusal` に `C:\`、`C:`、`\\?\C:\`、`\\server\share`、`\\server\share\`、
-`\\?\UNC\server\share\`、`\\?\Volume{GUID}\`、`X:\` → `VolumeRoot`、`C:\foo`、`\\server\share\dir` → `None`。
-worker 側: `start_delete_files` にルートを直接渡すと worker を起こさない、`validate_transfer_request` が移動のルートを `Err`。
+`\\?\UNC\server\share\`、`\\?\Volume{GUID}\`、`X:\`、`C:\photos\..`、`\\server\share\dir\..` → `VolumeRoot`、
+`C:\foo`、`C:\foo\..\bar`、`\\server\share\dir` → `None`、合成パス (末尾区切りあり・大文字小文字違い) → `VirtualLocation`。
+
+worker 側 (単なる `Err` ではなく、ルートを理由に断ったことを確かめる): `start_delete_files` にルートを直接渡すと
+worker を起こさない、`validate_transfer_request` が移動のルートをルートの理由で `Err` (コピーは通る)、
+`rename_item_async` がルートを理由に断る。
 
 ## 5. 文書
 
