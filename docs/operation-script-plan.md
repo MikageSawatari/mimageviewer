@@ -1446,7 +1446,7 @@ detached の合意を得た (記録と引用は detached-rework-plan.md §11)。
 
 11月25日の実装にr12を反映した。既存r11のClaudeCode実行結果・nested表記修正と今回r12差分の引継ぎは末尾の11月26日追記を参照。
 
-**r11識別＋r12のイベント権限を実装済み。最新の回帰修正後のRust検証・release計測・実機・独立実装レビューは未実施。修正前の利用者提供heavy結果は末尾追記を参照。**
+**r11識別＋r12のイベント権限を実装済み。関連テストと release 計測は設計担当 (ClaudeCode) が run-heavy で実行済み (末尾の「設計担当の検証」)。実機・独立実装レビューは未実施。**
 利用者の指示によりcargo build/test/check、アプリ起動、コミットを行っていない。確認はbare cargo fmt、
 UI glyph checker、差分の空白確認だけ。新しい受入・review結果やdetachedの実装合意は記録していない。
 
@@ -1708,3 +1708,13 @@ UI文字列の変更は無いためglyph checkerは再実行しない。Rust bui
 変更file:lineは`src/app/operation_script_runtime/tests/events.rs:24`（禁止syntax拒否）/ `:49`（変数再代入で偽装し判断）、
 `src/ui_fullscreen/operation_script_event_tests.rs:316` / `:430`（Pageだけの比較）、`:522`（初回描画前の準備）/ `:531`（Open+Pageだけの比較）/ `:540`（実移動）、本追記。
 bare `cargo fmt`と`git diff --check`はexit 0。Rustでの修正確認はClaudeCodeの再実行待ち。
+
+### 2026-11-26 設計担当 (ClaudeCode) の検証
+
+- 関連テスト: 791529cf1 で `operation_script|open_only|page_turn::slide_tests|poll_video` を run-heavy で実行し、243 件すべて成功
+  (9e8180f0f での段 3 の filter 全体を含む 5,122 件の実行では、上の 4 件だけが失敗していた)。
+- release 計測 (`perf_operation_script_page_identity`、791529cf1): 変化の無いフレームのイベントの識別の作成と比較
+  (`event_identity_unchanged`、N=50,000、読み手の順を含めず本の構成は強い `Arc`) の中央値は 0.8〜0.9 µs、p95 は最大 2.1 µs
+  (ZIP・画像、単ページ・見開き、自動・構成済み)。段 2b の識別 (N=50,000 で 1.1〜2.2 ms) と違い N に比例しない。
+  毎フレームの検出の費用は O(1) に収まる (§5.2 の段 4 の前の計測と比べた結果)。
+- 製品バイナリの実機確認はしていない。
