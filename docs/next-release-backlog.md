@@ -42,7 +42,7 @@
 
 ### 1.898 ドライブ一覧で Delete キーを押すと、ドライブそのもの (C:\ など) が削除の対象になり、確認の後に Shell の削除が実行される — v5.8.0 のサブ PC 確認から (2026-11-25)
 
-- 状態: **未着手、収録版未定 (リリース済みの動きの見込み、優先度高)**。観測: サブ PC 担当 (2026-11-25、master 38e8e43c5 の build-dev、--data-dir の試験用の場所、ログは C:\home\mimageviewer-subpc\v580b\results-890-incident-mimageviewer.log)。試験の操作の誤り (アドレス欄にフォーカスが無いまま Backspace 60 回・Delete 10 回・Enter を送った) で、一覧が親へ上がり続けてドライブ一覧 (C: を選択) に着き、Delete で削除の確認が開き、Enter で確定された。ログ: `[delete] failed: C:\: Shell 操作が中断されました` / `done: canceled=false succeeded=0 failed=1`。C:\ 直下に変化なし、ごみ箱に今日の項目なし (読み取りで確認)。
+- 状態: **v5.8.0 で直す (利用者決定 2026-11-25「v5.8.0 で直す」)、担当 small-bugs-746**。以前の状態: 未着手、収録版未定 (リリース済みの動きの見込み、優先度高)。観測: サブ PC 担当 (2026-11-25、master 38e8e43c5 の build-dev、--data-dir の試験用の場所、ログは C:\home\mimageviewer-subpc\v580b\results-890-incident-mimageviewer.log)。試験の操作の誤り (アドレス欄にフォーカスが無いまま Backspace 60 回・Delete 10 回・Enter を送った) で、一覧が親へ上がり続けてドライブ一覧 (C: を選択) に着き、Delete で削除の確認が開き、Enter で確定された。ログ: `[delete] failed: C:\: Shell 操作が中断されました` / `done: canceled=false succeeded=0 failed=1`。C:\ 直下に変化なし、ごみ箱に今日の項目なし (読み取りで確認)。
 - 問題: ドライブ一覧のドライブ (ルート) を削除・移動・名前の変更の対象にできること自体。今回は Shell が断ったが、ドライブの種類 (USB・ネットワーク・subst など) によって Shell がどう扱うかは未確認。
 - 次: ドライブ一覧の項目 (ドライブのルート) と、仮想の場所の項目を、削除・切り取り・名前の変更・移動の対象から外す (確認の画面を出す前に断り、理由を通知)。同じ形の入口 (Delete キー・右クリックの削除・ドラッグで移動・MCP からの操作など) を列挙して同じ判定に通す。旧コードで落ちる handler-level のテスト付き。
 
