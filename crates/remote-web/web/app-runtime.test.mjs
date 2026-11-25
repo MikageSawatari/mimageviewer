@@ -6109,7 +6109,7 @@ test("G1 Remote return adoption restores the book response after temporary A2 sp
   assert.deepEqual(after.pageGroups,before.pageGroups);
 });
 
-test("horizontal button labels follow configured mode across container and collection updates", () => {
+test("horizontal button labels follow configured mode and reading direction across container and collection updates", () => {
   const originalHistory = globalThis.history;
   globalThis.history = { state: {}, replaceState() {} };
   const address = { path: testPath("horizontal-input"), subresource: { kind: "file" } };
@@ -6124,10 +6124,13 @@ test("horizontal button labels follow configured mode across container and colle
   };
   try {
     for (const kind of ["container", "collection"]) {
-      for (const [configuredMode, expectedRtl] of [["rtl", true], ["single", false], ["rtl_cover", true]]) {
+      for (const [configuredMode, direction, expectedRtl] of [
+        ["rtl", "rtl", true], ["single", "rtl", true], ["single", "ltr", false],
+        ["rtl_cover", "rtl", true], ["ltr", "rtl", false],
+      ]) {
         const data = {
           entries, image_count: entries.length,
-          configured_spread_mode: configuredMode, effective_spread_mode: "single", reading_direction: "rtl",
+          configured_spread_mode: configuredMode, effective_spread_mode: "single", reading_direction: direction,
           page_groups: entries.map((entry) => ({ anchor: entry.address, pages: [entry.address], slice: "full" })),
         };
         if (kind === "container") applyContainerData(address, data, true);
@@ -6136,7 +6139,7 @@ test("horizontal button labels follow configured mode across container and colle
         viewer.syncPagePositionFeedback();
         assert.deepEqual(labels.left, ["aria-label", expectedRtl ? "次の画像" : "前の画像"], kind);
         assert.deepEqual(labels.right, ["aria-label", expectedRtl ? "前の画像" : "次の画像"], kind);
-        assert.equal(viewerPagePresentationForTest().seekState.direction, "rtl", kind);
+        assert.equal(viewerPagePresentationForTest().seekState.direction, direction, kind);
       }
     }
   } finally {
@@ -6175,7 +6178,7 @@ for (const [selectedMode, expectedMode] of [["ltr", "rtl"], ["split_ltr", "split
       assert.equal(requestSpreadMode(selectedMode, true), true);
       // No response can have arrived: the write is still behind responseGate.
       const snapshot = containerRuntimeStateForTest();
-      const rtl = inputAdvancesRightToLeft(snapshot.spreadMode);
+      const rtl = inputAdvancesRightToLeft(snapshot.spreadMode, snapshot.readingDirection);
       assert.equal(commandFromKey({ key: "ArrowRight", rtl }, "viewer").name, CommandName.PREV_PAGE);
       assert.equal(viewerTapCommand(290, 300, rtl).name, CommandName.PREV_PAGE);
       assert.equal(viewerPageButtonState("right", rtl).commandName, CommandName.PREV_PAGE);

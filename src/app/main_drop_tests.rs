@@ -208,6 +208,18 @@ fn ready() -> AppTestEnvForTest {
     app
 }
 
+fn poll_paste_until_finished(app: &mut App, ctx: &egui::Context) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.shell_paste_request.is_some() {
+        app.poll_shell_paste(ctx);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fake paste did not finish"
+        );
+        std::thread::yield_now();
+    }
+}
+
 fn grid_drop_app(view: crate::settings::GridViewMode) -> AppTestEnvForTest {
     let mut app = ready();
     let current = app.tmp.path().to_owned();
@@ -1019,18 +1031,27 @@ fn main_drop_paste_selection_belongs_only_to_the_current_real_folder() {
             });
             app.request_post_operation_selection_for_added_items(current.clone());
             let revision = app.book_append_undo_revision;
-            let mut calls = 0;
-            app.paste_files_to_folder_with(&ctx, target.clone(), |hwnd, actual| {
-                assert_eq!(hwnd, 1);
-                assert_eq!(actual, target);
-                calls += 1;
-                if succeeds {
-                    Ok(())
-                } else {
-                    Err("fake paste failure".into())
-                }
-            });
-            assert_eq!(calls, 1);
+            let (called_tx, called_rx) = mpsc::channel();
+            let expected = target.clone();
+            app.shell_paste_service =
+                crate::shell_paste::ShellPasteService::with_test_invoker(move |hwnd, actual| {
+                    assert_eq!(hwnd, 1);
+                    assert_eq!(actual, expected);
+                    called_tx.send(()).unwrap();
+                    if succeeds {
+                        Ok(())
+                    } else {
+                        Err(crate::shell_paste::ShellPasteError::Invocation(
+                            "fake paste failure".into(),
+                        ))
+                    }
+                });
+            app.paste_files_to_folder(&ctx, target.clone());
+            called_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            poll_paste_until_finished(&mut app, &ctx);
+            assert!(called_rx.try_recv().is_err());
             assert_eq!(app.book_append_undo_revision, revision.wrapping_add(1));
             assert_eq!(
                 app.post_operation_selection.is_some(),
@@ -1067,26 +1088,41 @@ fn main_drop_paste_to_other_folder_creates_no_selection_and_ctrl_v_uses_the_same
     });
     let other = app.tmp.path().join("other");
     take_books_root_resolutions_for_test();
-    app.paste_files_to_folder_with(&ctx, other, |_, _| Ok(()));
+    let (called_tx, called_rx) = mpsc::channel();
+    app.shell_paste_service =
+        crate::shell_paste::ShellPasteService::with_test_invoker(move |_, actual| {
+            called_tx.send(actual.to_owned()).unwrap();
+            Ok(())
+        });
+    app.paste_files_to_folder(&ctx, other.clone());
+    assert_eq!(
+        called_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap(),
+        other
+    );
+    poll_paste_until_finished(&mut app, &ctx);
     assert!(app.post_operation_selection.is_none());
     assert_eq!(
         take_books_root_resolutions_for_test(),
         0,
         "the shared paste helper adds no root lookup"
     );
-    let mut invocations = 0;
     app.handle_clipboard_paste_with(
         &ctx,
         || Ok(crate::clipboard_capture::data::ClipboardKind::Files),
         |app, ctx, _, _, folder| {
-            app.paste_files_to_folder_with(ctx, folder, |_, actual| {
-                assert_eq!(actual, current);
-                invocations += 1;
-                Ok(())
-            });
+            app.paste_files_to_folder(ctx, folder);
         },
     );
-    assert_eq!(invocations, 1);
+    assert_eq!(
+        called_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap(),
+        current
+    );
+    poll_paste_until_finished(&mut app, &ctx);
+    assert!(called_rx.try_recv().is_err());
     assert!(app.post_operation_selection.is_some());
     assert_eq!(
         take_books_root_resolutions_for_test(),
@@ -1374,17 +1410,25 @@ fn main_drop_books_rejection_and_default_resolution_are_shared_by_all_operation_
             };
             take_books_root_resolutions_for_test();
             if route == "paste" {
-                app.paste_tree_files_to_folder_with(
-                    &ctx,
-                    target.clone(),
-                    resolver,
-                    |hwnd, actual| {
+                let (called_tx, called_rx) = mpsc::channel();
+                let expected = target.clone();
+                app.shell_paste_service = crate::shell_paste::ShellPasteService::with_test_invoker(
+                    move |hwnd, actual| {
                         assert_eq!(hwnd, 1);
-                        assert_eq!(actual, target);
-                        executions += 1;
+                        assert_eq!(actual, expected);
+                        called_tx.send(()).unwrap();
                         Ok(())
                     },
                 );
+                app.start_shell_paste_with(&ctx, target.clone(), ShellPasteOrigin::Tree, resolver);
+                if location == "outside" {
+                    called_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    poll_paste_until_finished(&mut app, &ctx);
+                    executions = 1;
+                }
+                assert!(called_rx.try_recv().is_err());
             } else {
                 let request = transfer(target.clone());
                 let (_held, rx) = mpsc::channel();

@@ -347,6 +347,7 @@ fn caption_rename_completion_clears_shared_display() {
         rx,
     });
     tx.send(crate::rename_key_migration::RenameMigrationReport {
+        converted_cache_pairs: Vec::new(),
         rows: 1,
         errors: Vec::new(),
         store_mutations: caption_mutation(),

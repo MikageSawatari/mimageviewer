@@ -159,6 +159,7 @@ pub(crate) fn draw_samples(
                         *checked,
                         None,
                         None,
+                        None,
                         false,
                         Default::default(),
                         true,

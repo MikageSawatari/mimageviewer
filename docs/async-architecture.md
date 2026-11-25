@@ -1,5 +1,57 @@
 # 非同期・並列アーキテクチャ
 
+## 起動 resolver の走査と外部 Shell 起動（§1.853・§1.861、実装・検証待ち）
+
+`startup-open-resolve` は既存 pending 一つで、明示の起動入力と既定の場所の typed input を扱う。
+worker が known-folder 解決・祖先探索・分類・要求ファイルの準備を済ませ、main の Directory なら同じ cancel token で
+走査と長さ・ページ数順の材料収集まで行う。ツリーと共有する `FolderScanPolicy` は在メモリ設定・ページ数の事実の fingerprint と Susie の pool revision を控える。
+Susie は `PoolState` の pool と revision を同じ短い publication lock 内で公開し、旧 pool の終了は lock 外で行う。
+worker は revision を走査の前後で照合する。root poll は設定不一致・混在結果を採らず、pending を take する前に
+走査だけの worker を出して受信口を交換する。元の resolved payload、requested lease、owner/navigation、held activation、
+cancel token、診断 span、走査の段階の開始時刻をすべて保持し、受付や解決を繰り返さない。
+atomic 一つの走査開始時刻を `main_startup_scan_elapsed()` が main 投影・detached lease 不在とともに読む。
+入力停止・500 ms の表示猶予・同じ bookmark request ID の期限免除はこの述語に揃える。
+spawn 失敗と切断は共通のログ・通知による終端で、同期 fallback や既定先への再試行をしない。
+解決不能な明示の InitialStartup から Default への既存の一度だけの fallback は維持する。
+Default の Remote 取消では空の requested path を明示入力として延期せず、既存の返却時の分岐に任せる。
+既存の取消・main 要求の後勝ちと、detached ブックマークの引き渡し経路を維持する。
+
+外部 URL・player・tweet・map は `external_links::spawn_open` に集約する。短命の名前付き worker が COM STA を初期化して
+Shell を呼び、UI は待たず、取消・世代・join は持たない。一般の失敗はログのみ、マップだけ App 共通の一つの受信口へ
+通知し ROOT を起床する。root は `poll_file_organize` の隣で早期 return 前に警告を採用する。
+`ext/open_end` (`target_kind`, `ms`, `ok`) と `nav/startup_resolve_scan` (`resolve_ms`, `scan_ms`, `folders`, `media`,
+`outcome`, `source`) は perf 有効時だけ記録する。Rust 検証・実機計測は未実施。
+[設計書 §1・§3](ui-sync-853-plan.md) を参照。
+
+## Shell 貼り付けの常駐 STA（§1.859、実装・検証待ち）
+
+App は `ShellPasteService` 一つと実行中要求一つを持つ。3 入口は `start_shell_paste` に揃え、
+読み取りだけの拒否判定を済ませてから本への追加の追従変更を受付し、現在の実フォルダの選択要求だけを作る。
+初回投入で起こす `shell-paste` thread は `OleInitialize` を一度行い、channel と event、
+`MsgWaitForMultipleObjects` / メッセージポンプで要求と COM を扱う。bind → query → `InvokeCommand` をここで行い、
+呼び出し後も thread を生かして OLE proxy を保つ。UI は初期化を待たず、終了時も join しない。
+クリップボードの読み取り・照合はせず、Shell が実行する時点の内容を使う。
+
+貼り付け中の二重投入、整理・D&D 転送の投入を断る。Ctrl+V と一覧メニューは整理の実行中も従来どおり受け付ける。
+ファイルの切り取り・コピーは共通入口の先頭で、書き込みの予約と `begin_local_write` より前に断る。
+完了受信は root の `poll_file_organize` の隣、early return 前で行い、修飾キーを OS に合わせる。
+完了は動詞の呼び出しの完了であり、転送の完了は Shell が管理する。
+`PostOperationSelection` の番号は `request_post_operation_selection` 一か所で発行し、失敗時は一致する要求だけを取り下げる。
+take / 戻しでは番号を保ち、後から作られた新規フォルダ・別の操作の選択要求を取り下げない。
+`shell_paste/submit` の `origin`、`shell_paste/end` の `origin`・`ms`・`outcome` は perf 有効時だけ記録する。
+通常の呼び出し失敗はログ、開始失敗と受信口切断はログと通知で終端し、再試行しない。
+詳細は [設計書 §2・実装の記録](ui-sync-853-plan.md)。コンパイル・Rust テスト・実 Shell 検証は未実施。
+
+## 一括エクスポートの透かし（§1.362 段 B、検証待ち）
+
+`ctrl-e-batch-export` worker は開始時に透かしのフォントまたはロゴを 1 回読む。
+素材の読み込みに失敗した場合は全項目を同じ理由で失敗にし、出力を作らない。
+画像の縮小結果は直前の寸法について 1 件だけ保持し、リサイズ後に straight RGBA へ合成して保存する。
+ダイアログの `logo_check` はパスと `Pending(Receiver)` / Found / Missing / Unsupported の組を 1 つ持つ。
+存在確認だけを短命 `export-logo-check` スレッドの metadata 1 回で行い、専用 channel で結果を返す。
+確認の開始ごとに receiver を置き換え、閉じると破棄する。スレッドの join や UI の待機はしない。
+worker は最後に実際の画像を読み、事前確認後の削除も全件失敗として扱う。
+
 ## フォルダ変更中の囲い（§1.858 B、段1・検証待ち）
 
 `mutation_fence` はプロセス共通の登録簿を持つ。移動・名前の変更・削除の worker が、
@@ -1078,7 +1130,7 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | VST3 host bridge | **別プロセス** (`mimageviewer-vst3-host.exe`、C++) | ユーザー VST と音響調整で最大 2 本。配信開始で増えない | 1 process が 1 chain 全体を host する。App の `DspProcessingCoordinator` がローカル pump とリモート世代の process/reset/flush をブロック単位で排他する。bridge 内部は audio loop + GUI message pump + stdin pump。詳細は [docs/vst3-integration.md](vst3-integration.md) |
 | VST3 plugin GUI worker | bridge 内 per-slot STA thread (lazy) | editor を生成した slot ごと。表示した plugin 数まで増え得る | C++ bridge の plugin loader が slot ごとに STA message thread を lazy 生成し、bridge-owned editor surface と `IPlugView::attached()` を管理する。Rust 側に単一 `vst3-plugin-gui` thread はない |
 | 動画音声 RT 出力 | `cpal::Stream` 内部スレッド | 動画 1 つにつき 1 本 | WASAPI Shared モード。コールバックで ring buffer から f32 stereo を pop し、**実消費サンプル数 (= `real_consumed`) 分のみ** `next_pts_secs` を進めて `AvClock::set_audio_pts` でマスタークロックを更新。silence 出力中 (= `real_consumed=0`) は pts 進行 skip。`!clock.is_playing()` (= 一時停止 / EOF) と `pump_seek_serial < clock_serial` (= pre-seek サンプル全消去) は早期 return。`AvClock::set_audio_pts` 側に defensive wall-rate cap (= `wall_dt + 5ms` で pts 進行を頭打ち) を保持し、buffer 非空 pre-fill burst の異常前進への保険にしている (Phase 9 後の cleanup refactor、詳細は [docs/video-engine-redesign.md](video-engine-redesign.md) の「Phase 9 後の Post-cleanup refactor」節) |
-| 起動 / activation パス解決 | `std::thread` (`startup-open-resolve`) | 起動引数 / 2 重起動 activation ごとに最大 1 本 | `resolve_openable_path_detailed` (`Path::is_dir` / `is_file` + 親探索) を UI スレッド外で実行する。400ms 以上未完了ならメインウィンドウに「パスを確認しています…」toast を出し、完了後だけ UI スレッドで既存の `load_folder_or_convert_archive...` に戻す。明示 activation としおり行は共通の main 受付で先行の未採用要求を退役し、分類・走査・resolver の完了は継続として扱う（§1.419）。snapshot 中の activation は範囲判定まで先行要求を保留し、その間に開始した BookmarkRow 継続の resolver も同じ held 側へ置く。範囲内なら受付して load、拒否なら同じ receiver を再開し、しおりの各時計へ min(保留時間, その時計の経過時間) を補償する。独立 detached context のページ・動画待ちは取消しない。Remote 取得時は既存の旧 pending 終了を保ち、操作権を持つ間の二重起動パスはログ・toast とともに拒否して返却後へ持ち越さない |
+| 起動 / activation / 既定先の解決と走査 | `std::thread` (`startup-open-resolve`) | 既存 resolver pending ごとに最大 1 本 | 解決と main の実フォルダ走査を同じ worker で済ませ、UI は `pre_scan` を採用する (§1.853、上記)。400ms のパス確認通知は解決中だけ。設定不一致では同じ pending の受信口だけ交換して走査を続ける。明示 activation としおり行は共通の main 受付で先行の未採用要求を退役し、分類・走査・resolver の完了は継続として扱う（§1.419）。snapshot 中の activation は範囲判定まで先行要求を保留し、その間に開始した BookmarkRow 継続の resolver も同じ held 側へ置く。範囲内なら受付して load、拒否なら同じ receiver を再開し、しおりの各時計へ min(保留時間, その時計の経過時間) を補償する。独立 detached context のページ・動画待ちは取消しない。Remote 取得時は既存の旧 pending 終了を保ち、操作権を持つ間の二重起動パスはログ・toast とともに拒否して返却後へ持ち越さない |
 | RAR / 7z / LZH / ZIP スキャン・変換 | `std::thread` (scan / convert ごとの使い捨て) + mpsc | `ArchiveConvertState` 1 件 | 直接 RAR 判定、画像 inventory、パスワード再試行、キャッシュ ZIP 変換を行う。閲覧RARのscanはsecretなしのheaderが後続巻と示したら`Rejected`で先頭ファイルを案内する。許可された先頭巻／単巻は`ArchiveScanOutcome::Direct` / `CachedZip` / `NeedsConversion`のどれか一つを返し、password後の0画像・入れ子なしも案内付き`Rejected`とする。UI側のclicked-volume cache lookup／`fallback_cached_zip`は持たず、Directに確定したRAR backingを履歴のZip-kind prepareでcacheへ再振替しない。`ArchiveConvertState.cancel` は事前 scan から変換完了までの単一 owner で、RAR / 7z / LZH / ZIP の各 entry 境界が同じ token を確認する。`OpenRequestOwner::Navigation` はarchive種別判定より前にvisible-open lifecycleを取得し、archive Aのscan中にarchive Bを開く場合もAのtokenとreceiverを終了してからBのstateを作る。state drop、Esc / cancel、activation、競合する通常 navigation、後続 bookmark、Remote 取得も同じ規約で古いworkerとlate resultを無効化する。Remote 取得では閲覧を開く completion だけを終了し、閲覧を開かない sibling ZIP の出力は続ける。ブックマーク起点では`completion`がrequest IDとtarget identityも保持し、直接RARまたは元アーカイブ→キャッシュZIPのmount後に同じownerでページ待機へ進める。確認・パスワード・変換中は通常の45秒resolve timeoutを適用せず、完了はownerが現在値と一致する場合だけ表示へ適用する |
 | EPUB → PDF 変換 (S2a、呼出元は S2b) | 背景 worker + 子プロセス + Job Object + mpsc | 変換 1 冊につき子プロセス 1 本 | `epub_convert` が書き込み排除した元ファイルから一時コピーを作る。子を suspended で生成し `KILL_ON_JOB_CLOSE` の Job に割り当ててから再開する。stdout の JSON 進捗は channel へ、stderr は別スレッドでログへ流す。cancel event または timeout で Job を停止し、一時フォルダと `.part` を回収する。公開前の PDF 検証器は必須注入で、S2b 接続時に PDFium を使う。成功時の世代ファイルは不変で、廃止分と未完了予約だけを `epub_cache` の次回起動ゲートで掃除し、完了予約行を削除する。ファイル削除は root と各親ディレクトリを再解析ポイントを辿らずに開いて確認した後、対象ハンドルから行う |
 | フォルダ一覧の変換アーカイブ読み取り元判定 | `std::thread` (`archive-cache-peek`) + mpsc | viewer context / items generation ごとに最大 1 | 全候補を UI 側で `Pending` 登録するが、worker へは visible + keep + その item の pin 依存先だけを渡す。RAR は volume header 解決 → cache DB peek → miss 時だけ full inspection の順。候補ごとに `Direct` / `CachedZip` / `Unavailable` を逐次送信し、UI は通知ごとに `items_generation` を照合する。range 移動時は共有 scope を差し替え、既に開始済みの 1 冊だけを完了可として旧 range の queued 候補を skip する。現 batch 終了後に新 range の未解決候補を追加する。folder 切替・再読込・drop は cancel token を立てる。rollup edit filter 時だけ folder 全体 scope。batch 完了時は `nav/archive_cache_peek`、各候補は `nav/archive_cache_candidate` を記録する |

@@ -258,6 +258,9 @@ pub(super) fn stage1_set_video_lock(s: &mut Settings, v: &StillLock) {
 }
 
 pub(super) fn stage1_key_error(key: &str, reason: &str) -> String {
+    if matches!(key, "keymap" | "ring_shortcuts" | "gamepad_enabled") {
+        return format!("{key}: set_operations で変えます");
+    }
     if key.starts_with("agent_")
         || matches!(
             key,
@@ -524,6 +527,8 @@ impl Stage1Value for SortOrder {
             (Self::SizeDesc, Self::SizeDesc.label().into()),
             (Self::DurationAsc, Self::DurationAsc.label().into()),
             (Self::DurationDesc, Self::DurationDesc.label().into()),
+            (Self::PageCountAsc, Self::PageCountAsc.label().into()),
+            (Self::PageCountDesc, Self::PageCountDesc.label().into()),
             (Self::RatingAsc, Self::RatingAsc.label().into()),
             (Self::RatingDesc, Self::RatingDesc.label().into()),
         ])
@@ -1029,9 +1034,9 @@ mod tests {
         assert_eq!(rows.len(), keys.len());
         let (export, issues) = project(capture_export(&settings));
         assert!(issues.is_empty(), "{issues:?}");
-        assert_eq!(export.len(), 171);
+        assert_eq!(export.len(), 172);
         assert_eq!(STAGE1_MARKED_ANCHORS.len(), 57);
-        assert_eq!(rows.len(), 228);
+        assert_eq!(rows.len(), 229);
         for key in export.keys() {
             assert!(keys.contains(key.as_str()), "{key}");
         }
@@ -1349,11 +1354,16 @@ mod tests {
             "show_grid_edge_buttons",
         ] {
             assert!(!rows.iter().any(|row| row.key == key), "{key}");
+            let expected = if matches!(key, "keymap" | "ring_shortcuts" | "gamepad_enabled") {
+                "set_operations で変えます"
+            } else {
+                "まだ AI からは変えられません"
+            };
             assert!(
                 stage1_validate(&settings, &change(key, Value::Null))
                     .err()
                     .expect("stage-2 keys must be refused")
-                    .contains("まだ AI からは変えられません"),
+                    .contains(expected),
                 "{key}"
             );
         }

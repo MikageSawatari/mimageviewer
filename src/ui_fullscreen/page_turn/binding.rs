@@ -162,7 +162,7 @@ impl PageTurnUnitBinding {
             && self.items == app.items_generation
             && self.mode == app.spread_mode
             && self.reading_flow == app.reading_flow
-            && self.reading_rtl == app.page_turn_reading_rtl()
+            && self.reading_rtl == app.input_advances_right_to_left()
             && self.slice == app.fullscreen_page_slice
             && app
                 .page_turn_resolved_layout(self.layout.anchor)
@@ -363,13 +363,6 @@ pub(super) fn same_page_turn_view(
 }
 
 impl App {
-    pub(super) fn page_turn_reading_rtl(&self) -> bool {
-        self.spread_mode
-            .canonical_reading_direction()
-            .unwrap_or(self.reading_direction)
-            == ReadingDirection::Rtl
-    }
-
     /// Resolve once at the existing adoption/lookup prefix, never from a read-only matcher.
     pub(in crate::ui_fullscreen) fn resolve_page_turn_layout_before_lookup(&mut self) {
         if let Some(anchor) = self.fullscreen_idx
@@ -469,7 +462,7 @@ impl App {
             items: self.items_generation,
             mode: self.spread_mode,
             reading_flow: self.reading_flow,
-            reading_rtl: self.page_turn_reading_rtl(),
+            reading_rtl: self.input_advances_right_to_left(),
             slice: self.fullscreen_page_slice,
             layout,
             content,

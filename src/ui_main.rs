@@ -243,7 +243,7 @@ fn sort_control_decision(
         SortControlDecision::None
     } else if !selected_before_click {
         SortControlDecision::Change
-    } else if order.is_rating() || order.is_duration() {
+    } else if order.is_rating() || order.lazy_metric().is_some() {
         SortControlDecision::Reload
     } else {
         SortControlDecision::None
@@ -2869,12 +2869,42 @@ fn grid_sort_combo<R>(
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<Option<R>> {
     toolbar_combo_slot(ui, enabled, 100.0, text, |ui, text| {
+        // Popup::show creates its Area before applying popup_style. Area::begin reads
+        // Context's default_area_size, so a Ui/popup-local style cannot lift that cap.
+        // Restore before user contents run: nested menus/tooltips and later windows
+        // must retain their own defaults, including when the combo stays closed.
+        struct AreaStyleGuard {
+            ctx: egui::Context,
+            theme: egui::Theme,
+            previous: std::sync::Arc<egui::Style>,
+        }
+        impl Drop for AreaStyleGuard {
+            fn drop(&mut self) {
+                self.ctx.set_style_of(self.theme, self.previous.clone());
+            }
+        }
+        let ctx = ui.ctx().clone();
+        let theme = ctx.theme();
+        let previous = ctx.style_of(theme);
+        let margin = egui::Frame::popup(&previous).total_margin();
+        let mut area_style = Some(AreaStyleGuard {
+            ctx: ctx.clone(),
+            theme,
+            previous,
+        });
+        ctx.style_mut_of(theme, |style| {
+            style.spacing.default_area_size.y = height + margin.top + margin.bottom;
+        });
         let combo = egui::ComboBox::from_id_salt(id_salt)
             .width(100.0)
             .height(height)
             .popup_style(sort_combo_popup_style())
             .selected_text(text)
-            .show_ui(ui, add);
+            .show_ui(ui, |ui| {
+                drop(area_style.take());
+                add(ui)
+            });
+        drop(area_style);
         crate::ui_helpers::set_accessibility_label(&combo.response, "ソート:");
         combo
     })
@@ -6565,6 +6595,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 true,
                 None,
                 None,
+                None,
                 false,
                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                 false,
@@ -8563,7 +8594,12 @@ mod fixed_sort_control_tests {
             sort_control_decision(true, true, SortOrder::RatingDesc),
             SortControlDecision::Reload
         );
-        for order in [SortOrder::DurationAsc, SortOrder::DurationDesc] {
+        for order in [
+            SortOrder::DurationAsc,
+            SortOrder::DurationDesc,
+            SortOrder::PageCountAsc,
+            SortOrder::PageCountDesc,
+        ] {
             assert_eq!(
                 sort_control_decision(true, true, order),
                 SortControlDecision::Reload
@@ -8588,7 +8624,7 @@ mod fixed_sort_control_tests {
         assert!(
             SortOrder::collection_options()
                 .iter()
-                .all(|order| !order.is_rating() && !order.is_duration())
+                .all(|order| !order.is_rating() && order.lazy_metric().is_none())
         );
         assert!(
             crate::app::setup_app_for_test()
@@ -8627,7 +8663,11 @@ mod fixed_sort_control_tests {
     fn rating_and_duration_sort_controls_dispatch_one_reload_for_selected_order() {
         use crate::settings::{SortOrder, ToolbarSectionDisplay};
 
-        for order in [SortOrder::RatingDesc, SortOrder::DurationDesc] {
+        for order in [
+            SortOrder::RatingDesc,
+            SortOrder::DurationDesc,
+            SortOrder::PageCountDesc,
+        ] {
             for control in ["button", "dropdown", "facet", "menu", "icon"] {
                 let mut app = crate::app::setup_app_for_test();
                 let folder = app.tmp.path().join(format!("sort-click-{control}"));
@@ -8745,6 +8785,392 @@ mod fixed_sort_control_tests {
     }
 
     #[test]
+    fn page_count_sort_controls_show_progress_only_for_selected_page_count() {
+        use crate::settings::{LazyMetric, SortOrder};
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sort_order = SortOrder::PageCountAsc;
+        let order = app.settings.sort_order;
+        let progress = app
+            .lazy_metric_loading_text(LazyMetric::PageCount)
+            .expect("requested page count scan");
+        assert!(progress.contains("ページ数"));
+        assert!(
+            app.sort_order_control_label(order, true)
+                .ends_with(&progress)
+        );
+        assert!(app.sort_order_tooltip(order, true).ends_with(&progress));
+        assert_eq!(
+            app.sort_order_control_label(order, false),
+            order.short_label()
+        );
+        assert_eq!(
+            app.sort_order_control_label(SortOrder::DurationAsc, true),
+            SortOrder::DurationAsc.short_label()
+        );
+        app.top_level_grid_view.replace_surface(
+            crate::app::top_level_grid_view::TopLevelGridSurface::SubfolderExpansion,
+        );
+        assert_eq!(
+            app.grid_sort_dropdown_text(),
+            SortOrder::FileName.short_label()
+        );
+    }
+
+    #[test]
+    fn sort_popup_actual_listing_routes_fit_all_rows_at_minimum_size_and_150_percent() {
+        use crate::app::top_level_grid_view::TopLevelGridSurface;
+        use crate::settings::{SortOrder, SubfolderExpansionOrder};
+
+        for surface in [
+            TopLevelGridSurface::Folder,
+            TopLevelGridSurface::SubfolderExpansion,
+            TopLevelGridSurface::Rating { stars: 3 },
+            TopLevelGridSurface::Bookmarks,
+        ] {
+            for placement in ["toolbar_sort_combo", "facet_sort_combo"] {
+                let mut app = crate::app::setup_app_for_test();
+                app.settings.toolbar_sort_items = SortOrder::all().to_vec();
+                app.items_are_rating_view = matches!(surface, TopLevelGridSurface::Rating { .. });
+                app.items_are_bookmark_view = matches!(surface, TopLevelGridSurface::Bookmarks);
+                app.items_are_subfolder_expansion_view =
+                    matches!(surface, TopLevelGridSurface::SubfolderExpansion);
+                app.top_level_grid_view.replace_surface(surface.clone());
+                let mut labels = SortOrder::all()
+                    .iter()
+                    .map(|order| order.short_label())
+                    .collect::<Vec<_>>();
+                if app.items_are_rating_view {
+                    labels.extend([
+                        crate::rating_view::RatingViewSort::RatedAtDesc.short_label(),
+                        crate::rating_view::RatingViewSort::RatedAtAsc.short_label(),
+                    ]);
+                }
+                if app.items_are_bookmark_view {
+                    labels.extend([
+                        crate::bookmark_browser::BookmarkViewSort::CreatedAtDesc.short_label(),
+                        crate::bookmark_browser::BookmarkViewSort::CreatedAtAsc.short_label(),
+                    ]);
+                }
+                if placement == "facet_sort_combo" {
+                    if app.items_are_subfolder_expansion_view {
+                        labels.extend(
+                            SubfolderExpansionOrder::all()
+                                .iter()
+                                .map(|mode| mode.label()),
+                        );
+                    }
+                    labels.push("最新の情報に更新");
+                }
+                let mut harness = crate::test_ui::builder()
+                    .with_size(egui::vec2(1093.0, 614.0))
+                    .with_context_setup(|ctx| {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        crate::settings::apply_ui_scale_factor(ctx, 1.5);
+                    })
+                    .build_ui(move |root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            super::apply_toolbar_style(ui);
+                            app.draw_grid_sort_dropdown(ui, placement);
+                        });
+                    });
+                harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+                harness.run();
+                assert_eq!(harness.ctx.content_rect().size(), egui::vec2(1093.0, 614.0));
+                assert!((harness.ctx.zoom_factor() - 1.5).abs() < 0.01);
+                // ComboBox gives popup_id an accessibility role but Area's geometry
+                // belongs to a separate widget (popup_id.with("move")), not that node.
+                let popup_id =
+                    egui::Popup::current_open_id_for(&harness.ctx, egui::ViewportId::ROOT)
+                        .expect("listing sort popup must be open");
+                let popup = harness
+                    .ctx
+                    .memory(|memory| memory.area_rect(popup_id))
+                    .expect("listing sort popup must have Area geometry");
+                let margin = egui::Frame::popup(&harness.ctx.global_style()).total_margin();
+                let viewport = egui::Rect::from_min_max(
+                    popup.min + egui::vec2(margin.left, margin.top),
+                    popup.max - egui::vec2(margin.right, margin.bottom),
+                );
+                assert!(harness.ctx.content_rect().expand(1.0).contains_rect(popup));
+                for label in labels {
+                    let row = harness.get_by_label(label).rect();
+                    assert!(
+                        viewport
+                            .expand(1.0 / harness.ctx.pixels_per_point())
+                            .contains_rect(row),
+                        "{surface:?} / {placement} / {label}: row={row:?}, viewport={viewport:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_sort_popup_stops_resumes_and_hides_completed_loading_with_columns_off() {
+        use crate::settings::{SelectionInfoDisplayMode, SortOrder};
+
+        for view in [GridViewMode::Thumbnail, GridViewMode::Details] {
+            for placement in ["toolbar_sort_combo", "facet_sort_combo"] {
+                for (order, duration_facet, stop, resume) in [
+                    (
+                        SortOrder::DurationAsc,
+                        false,
+                        "長さの読み込みを停止",
+                        "長さの読み込みを再開",
+                    ),
+                    (
+                        SortOrder::PageCountAsc,
+                        false,
+                        "ページ数の読み込みを停止",
+                        "ページ数の読み込みを再開",
+                    ),
+                    (
+                        SortOrder::PageCountAsc,
+                        true,
+                        "読み込みを停止",
+                        "読み込みを再開",
+                    ),
+                ] {
+                    let mut app = crate::app::setup_app_for_test();
+                    app.settings.grid_view_mode = view;
+                    app.settings.sort_order = order;
+                    app.settings.details_sort_key = crate::settings::DetailsSortKey::Toolbar;
+                    app.settings.toolbar_sort_items = SortOrder::all().to_vec();
+                    app.settings.details_show_page_count = false;
+                    app.settings.details_show_created = false;
+                    app.settings.details_show_image_dimensions = false;
+                    app.settings.details_show_video_duration = false;
+                    app.settings.details_show_video_dimensions = false;
+                    app.settings.details_show_video_codec = false;
+                    app.settings.thumb_show_page_count = false;
+                    app.settings.thumb_show_media_duration = false;
+                    app.settings.thumb_show_resume_meter = false;
+                    app.settings.selection_info_display_mode = SelectionInfoDisplayMode::Hidden;
+                    app.settings.facet_filter = Default::default();
+                    app.ai_model_facet_requested = false;
+                    app.duration_facet_requested = duration_facet;
+                    app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 0 };
+                    // No sources are opened: the ordinary zero-target completion path
+                    // will publish proof after the popup resumes the metadata owner.
+                    assert!(app.items.is_empty());
+                    assert!(
+                        app.unproven_listing_meta_requirements()
+                            .contains(app.listing_meta_requirements())
+                    );
+                    let mut labels = SortOrder::all()
+                        .iter()
+                        .map(|&candidate| {
+                            app.sort_order_control_label(candidate, candidate == order)
+                        })
+                        .collect::<Vec<_>>();
+                    if placement == "facet_sort_combo" {
+                        labels.push("最新の情報に更新".to_owned());
+                    }
+                    labels.push(stop.to_owned());
+                    let app = Rc::new(RefCell::new(app));
+                    let render_app = Rc::clone(&app);
+                    let mut harness = crate::test_ui::builder()
+                        .with_size(egui::vec2(1093.0, 614.0))
+                        .with_context_setup(|ctx| {
+                            crate::ui_fonts::configure_fonts(ctx);
+                            crate::settings::apply_ui_scale_factor(ctx, 1.5);
+                        })
+                        .build_ui(move |root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                super::apply_toolbar_style(ui);
+                                render_app
+                                    .borrow_mut()
+                                    .draw_grid_sort_dropdown(ui, placement);
+                            });
+                        });
+                    harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+                    harness.run();
+                    assert_eq!(harness.ctx.content_rect().size(), egui::vec2(1093.0, 614.0));
+                    assert!((harness.ctx.zoom_factor() - 1.5).abs() < 0.01);
+                    let popup_id =
+                        egui::Popup::current_open_id_for(&harness.ctx, egui::ViewportId::ROOT)
+                            .unwrap();
+                    let popup = harness
+                        .ctx
+                        .memory(|memory| memory.area_rect(popup_id))
+                        .unwrap();
+                    let margin = egui::Frame::popup(&harness.ctx.global_style()).total_margin();
+                    let viewport = egui::Rect::from_min_max(
+                        popup.min + egui::vec2(margin.left, margin.top),
+                        popup.max - egui::vec2(margin.right, margin.bottom),
+                    );
+                    assert!(harness.ctx.content_rect().expand(1.0).contains_rect(popup));
+                    for label in labels {
+                        let row = harness.get_by_label(&label).rect();
+                        assert!(
+                            viewport
+                                .expand(1.0 / harness.ctx.pixels_per_point())
+                                .contains_rect(row),
+                            "{view:?} / {placement} / {label}: row={row:?}, viewport={viewport:?}"
+                        );
+                    }
+                    harness.get_by_label(stop).click();
+                    harness.run();
+                    assert_eq!(
+                        app.borrow().details_image_dims_state,
+                        LazyColumnState::Cancelled
+                    );
+                    harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+                    harness.run();
+                    harness.get_by_label(resume).click();
+                    harness.run();
+                    assert_eq!(
+                        app.borrow().details_image_dims_state,
+                        LazyColumnState::NotRequested
+                    );
+                    for _ in 0..3 {
+                        app.borrow_mut().poll_details_meta_load(&harness.ctx);
+                    }
+                    assert!(app.borrow().unproven_listing_meta_requirements().is_empty());
+                    assert!(app.borrow().sort_loading_control_label().is_none());
+                    harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+                    harness.run();
+                    assert!(harness.query_by_label(stop).is_none());
+                    assert!(harness.query_by_label(resume).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_sort_menu_and_buttons_stop_resume_with_sort_dropdowns_hidden() {
+        use crate::settings::{SelectionInfoDisplayMode, SortOrder, ToolbarSectionDisplay};
+
+        for control in ["menu", "menu_locked", "buttons", "collapsible", "unknown"] {
+            let menu = control.starts_with("menu");
+            for (order, duration_facet, stop, resume) in [
+                (
+                    SortOrder::DurationAsc,
+                    false,
+                    "長さの読み込みを停止",
+                    "長さの読み込みを再開",
+                ),
+                (
+                    SortOrder::PageCountAsc,
+                    false,
+                    "ページ数の読み込みを停止",
+                    "ページ数の読み込みを再開",
+                ),
+                (
+                    SortOrder::PageCountAsc,
+                    true,
+                    "読み込みを停止",
+                    "読み込みを再開",
+                ),
+            ] {
+                let mut app = crate::app::setup_app_for_test();
+                app.settings.grid_view_mode = GridViewMode::Thumbnail;
+                app.settings.sort_order = SortOrder::FileName;
+                app.settings.show_toolbar_sort = !menu;
+                app.settings.show_facet_sort = false;
+                app.settings.details_show_page_count = false;
+                app.settings.details_show_created = false;
+                app.settings.details_show_image_dimensions = false;
+                app.settings.details_show_video_duration = false;
+                app.settings.details_show_video_dimensions = false;
+                app.settings.details_show_video_codec = false;
+                app.settings.toolbar_sort_display = match control {
+                    "collapsible" => ToolbarSectionDisplay::Collapsible,
+                    "unknown" => ToolbarSectionDisplay::Unknown,
+                    _ => ToolbarSectionDisplay::Buttons,
+                };
+                app.settings.toolbar_sort_items = SortOrder::all().to_vec();
+                app.settings.thumb_show_page_count = false;
+                app.settings.thumb_show_media_duration = false;
+                app.settings.thumb_show_resume_meter = false;
+                app.settings.selection_info_display_mode = SelectionInfoDisplayMode::Hidden;
+                app.settings.facet_filter = Default::default();
+                app.ai_model_facet_requested = false;
+                app.duration_facet_requested = duration_facet;
+                // Hold the metadata session until the UI resumes it. There is no
+                // physical listing to reload or probe in this routing fixture.
+                assert!(app.current_folder.is_none() && app.items.is_empty());
+                app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 0 };
+                let app = Rc::new(RefCell::new(app));
+                let render_app = Rc::clone(&app);
+                let mut harness = crate::test_ui::builder()
+                    .with_size(egui::vec2(1700.0, 650.0))
+                    .with_context_setup(crate::ui_fonts::configure_fonts)
+                    .build_ui(move |root_ui| {
+                        let mut app = render_app.borrow_mut();
+                        app.render_menubar(root_ui);
+                        app.render_toolbar(root_ui);
+                        app.render_facet_filter_bar(root_ui);
+                    });
+                harness.run();
+                assert!(harness.query_by_label(stop).is_none());
+                if menu {
+                    assert!(!app.borrow().settings.show_toolbar_sort);
+                    assert!(!app.borrow().settings.show_facet_sort);
+                    harness.get_all_by_label("設定").next().unwrap().click();
+                    harness.run();
+                    harness.get_by_label("ソート順").click();
+                    harness.run();
+                    harness
+                        .get_by_label(&format!("  {}", order.label()))
+                        .click();
+                } else {
+                    harness.get_by_label(order.short_label()).click();
+                }
+                harness.run();
+                assert_eq!(app.borrow().settings.sort_order, order);
+                assert!(!app.borrow().listing_meta_requirements().is_empty());
+                if control == "menu_locked" {
+                    let mut app = app.borrow_mut();
+                    app.settings.grid_view_mode = GridViewMode::Details;
+                    app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+                    assert!(app.grid_sort_lock_reason().is_some());
+                }
+                for (label, expected) in [
+                    (stop, LazyColumnState::Cancelled),
+                    (resume, LazyColumnState::NotRequested),
+                ] {
+                    if menu {
+                        harness.get_all_by_label("設定").next().unwrap().click();
+                        harness.run();
+                        harness.get_by_label("ソート順").click();
+                        harness.run();
+                        if control == "menu_locked" {
+                            assert!(
+                                harness
+                                    .get_by_label(&format!("✓ {}", order.label()))
+                                    .accesskit_node()
+                                    .is_disabled()
+                            );
+                        }
+                    }
+                    harness.get_by_label(label).click();
+                    harness.run();
+                    assert_eq!(
+                        app.borrow().details_image_dims_state,
+                        expected,
+                        "{control} / {order:?}"
+                    );
+                }
+                // The existing zero-target completion publishes the proof. All
+                // surfaces then remove the shared stop/resume control.
+                app.borrow_mut().poll_details_meta_load(&harness.ctx);
+                assert!(app.borrow().unproven_listing_meta_requirements().is_empty());
+                if menu {
+                    harness.get_all_by_label("設定").next().unwrap().click();
+                    harness.run();
+                    if control != "menu_locked" {
+                        harness.get_by_label("ソート順").click();
+                    }
+                }
+                harness.run();
+                assert!(harness.query_by_label(stop).is_none());
+                assert!(harness.query_by_label(resume).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn duration_facet_menu_stops_and_resumes_the_metadata_owner() {
         let mut app = crate::app::setup_app_for_test();
         app.duration_facet_requested = true;
@@ -8836,7 +9262,10 @@ mod fixed_sort_control_tests {
         let render_app = Rc::clone(&app);
         let fonts_set = Cell::new(false);
         let mut harness = crate::test_ui::builder()
-            .with_size(egui::vec2(1280.0, 800.0))
+            .with_size(egui::vec2(1093.0, 614.0))
+            .with_context_setup(|ctx| {
+                crate::settings::apply_ui_scale_factor(ctx, 1.5);
+            })
             .build_ui(move |root_ui| {
                 let ctx = &root_ui.ctx().clone();
                 if !fonts_set.replace(true) {
@@ -8849,7 +9278,19 @@ mod fixed_sort_control_tests {
             });
         harness.run();
         harness.run();
-        for label in ["評価↑", "評価↓"] {
+        assert_eq!(harness.ctx.content_rect().size(), egui::vec2(1093.0, 614.0));
+        assert!((harness.ctx.zoom_factor() - 1.5).abs() < 0.01);
+        for order in SortOrder::all()
+            .iter()
+            .copied()
+            .filter(|order| order.is_rating() || order.lazy_metric().is_some())
+        {
+            let label = order.short_label();
+            let reason = app
+                .borrow()
+                .collection_sort_capabilities()
+                .disabled_reason(order)
+                .expect("unsupported collection sort reason");
             harness
                 .get_all_by_role(egui::accesskit::Role::ComboBox)
                 .into_iter()
@@ -8869,12 +9310,22 @@ mod fixed_sort_control_tests {
                 assert_eq!(popup.rows[1].label, "シャッフル（再選択で並べ直す）");
                 assert_eq!(popup.rows[10].label, "長さ↑");
                 assert_eq!(popup.rows[11].label, "長さ↓");
-                assert_eq!(popup.rows[12].label, "評価↑");
-                assert_eq!(popup.rows[13].label, "評価↓");
+                assert_eq!(popup.rows[12].label, "ページ↑");
+                assert_eq!(popup.rows[13].label, "ページ↓");
+                assert_eq!(popup.rows[14].label, "評価↑");
+                assert_eq!(popup.rows[15].label, "評価↓");
                 assert!(!popup.sort_control_locked);
                 assert!(popup.popup_ui_enabled);
                 assert!(popup.rows[..10].iter().all(|row| !row.disabled));
                 assert!(popup.rows[10..].iter().all(|row| row.disabled));
+            }
+            for &candidate in SortOrder::all() {
+                let row = harness.get_by_label(candidate.short_label());
+                assert!(harness.ctx.content_rect().contains_rect(row.rect()));
+                assert_eq!(
+                    row.accesskit_node().is_disabled(),
+                    candidate.is_rating() || candidate.lazy_metric().is_some(),
+                );
             }
             let row = harness.get_by_label(label);
             assert!(
@@ -8886,19 +9337,11 @@ mod fixed_sort_control_tests {
             #[cfg(all(windows, feature = "test-script"))]
             {
                 let popup = crate::test_script::collection_sort_popup_snapshot(&harness.ctx);
-                assert_eq!(
-                    popup.rendered_tooltip.as_deref(),
-                    Some("コレクションでは評価順を使えません。手動の並べ替えで順番を変えられます")
-                );
+                assert_eq!(popup.rendered_tooltip.as_deref(), Some(reason));
             }
-            assert!(
-                harness
-                    .get_by_label(
-                        "コレクションでは評価順を使えません。手動の並べ替えで順番を変えられます"
-                    )
-                    .rect()
-                    .is_positive()
-            );
+            let tooltip = harness.get_by_label(reason).rect();
+            assert!(tooltip.is_positive());
+            assert!(harness.ctx.content_rect().contains_rect(tooltip));
             harness.get_by_label(label).click();
             harness.run();
         }
@@ -9102,8 +9545,8 @@ impl App {
         selected: bool,
     ) -> String {
         let label = order.short_label();
-        if selected && order.is_duration() {
-            if let Some(progress) = self.duration_loading_text() {
+        if let Some(metric) = order.lazy_metric().filter(|_| selected) {
+            if let Some(progress) = self.lazy_metric_loading_text(metric) {
                 return format!("{label} {progress}");
             }
         }
@@ -9112,12 +9555,52 @@ impl App {
 
     fn sort_order_tooltip(&self, order: crate::settings::SortOrder, selected: bool) -> String {
         let description = order.description();
-        if selected && order.is_duration() {
-            if let Some(progress) = self.duration_loading_text() {
+        if let Some(metric) = order.lazy_metric().filter(|_| selected) {
+            if let Some(progress) = self.lazy_metric_loading_text(metric) {
                 return format!("{description}\n{progress}");
             }
         }
         description.to_string()
+    }
+
+    /// Use the same unfinished-metric predicate as the sort progress text.
+    fn sort_loading_control_label(&self) -> Option<&'static str> {
+        let selected = self
+            .effective_listing_sort_order(self.settings.sort_order)
+            .lazy_metric()?;
+        self.lazy_metric_loading_text(selected)?;
+        let requirements = self.listing_meta_requirements();
+        let resume = matches!(self.details_image_dims_state, LazyColumnState::Cancelled);
+        Some(
+            match (requirements.duration, requirements.page_count, resume) {
+                (true, true, false) => "読み込みを停止",
+                (true, true, true) => "読み込みを再開",
+                (true, false, false) => "長さの読み込みを停止",
+                (true, false, true) => "長さの読み込みを再開",
+                (false, true, false) => "ページ数の読み込みを停止",
+                (false, true, true) => "ページ数の読み込みを再開",
+                (false, false, _) => unreachable!("selected metric has unfinished progress"),
+            },
+        )
+    }
+
+    /// Shared by popup rows and toolbar buttons. The container closes its own
+    /// popup on a click; a toolbar has no closable parent.
+    fn draw_sort_loading_control(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(label) = self.sort_loading_control_label() else {
+            return false;
+        };
+        ui.separator();
+        if !ui.button(label).clicked() {
+            return false;
+        }
+        if matches!(self.details_image_dims_state, LazyColumnState::Cancelled) {
+            self.resume_details_meta_loading();
+        } else {
+            self.cancel_details_meta_loading();
+        }
+        ui.ctx().request_repaint();
+        true
     }
 
     fn apply_sort_control_change(&mut self) {
@@ -9127,8 +9610,8 @@ impl App {
     fn reload_from_sort_control(&mut self, ctx: &egui::Context) {
         #[cfg(test)]
         SORT_CONTROL_TEST_RELOADS.with(|count| count.set(count.get() + 1));
-        if self.settings.sort_order.is_duration()
-            && self.listing_sort_capabilities().duration_allowed
+        if self.settings.sort_order.lazy_metric().is_some()
+            && self.listing_sort_capabilities().lazy_metric_allowed
         {
             self.apply_sort_change_reload();
         } else {
@@ -10163,7 +10646,7 @@ impl App {
                                         }
                                     }
                                 });
-                                if let Some(reason) = sort_lock {
+                                if let Some(reason) = sort_lock.filter(|_| self.sort_loading_control_label().is_none()) {
                                     // 無効ウィジェットは通常の hover を sense しないため、
                                     // disabled 専用ツールチップで理由を出す。
                                     let _response = ui.add_enabled(
@@ -10178,6 +10661,9 @@ impl App {
                                     SORT_CONTROL_TEST_RESPONSES.with(|responses| responses.borrow_mut().push(("menu", _response.enabled())));
                                 } else {
                                     ui.menu_button("ソート順", |ui| {
+                                        // Keep scan controls reachable while a details header
+                                        // owns sorting, just as in the toolbar/facet popup.
+                                        ui.add_enabled_ui(sort_lock.is_none(), |ui| {
                                         if let Some(root) = root_order {
                                             if let Some(mode) =
                                                 draw_collection_order_mode_menu_entries(ui, root)
@@ -10279,6 +10765,10 @@ impl App {
                                                     ui.close();
                                                 }
                                             }
+                                        }
+                                        });
+                                        if self.draw_sort_loading_control(ui) {
+                                            ui.close();
                                         }
                                     });
                                 }
@@ -12617,6 +13107,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                     }
                                 }
                             }
+                            self.draw_sort_loading_control(ui);
                         }
                         crate::settings::ToolbarSectionDisplay::Dropdown => {
                             let (changed, reload, open) = self.draw_grid_sort_dropdown(ui, "toolbar_sort_combo");
@@ -14191,7 +14682,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let grouping_available =
             id_salt == "facet_sort_combo" && self.items_are_subfolder_expansion_view;
         let refresh_available = id_salt == "facet_sort_combo" && self.grid_sort_refresh_available();
-        let combo_enabled = !sort_disabled || grouping_available || refresh_available;
+        let loading_control = self.sort_loading_control_label();
+        let combo_enabled =
+            !sort_disabled || grouping_available || refresh_available || loading_control.is_some();
         let root_order = self.collection_grid_root_order().and_then(Result::ok);
         let tb_sorts = self.settings.toolbar_sort_items.clone();
         let mut sort_changed = false;
@@ -14206,8 +14699,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             root_order.is_some(),
             self.items_are_rating_view,
             self.items_are_bookmark_view,
-            2 * usize::from(grouping_available) + usize::from(refresh_available),
-            usize::from(grouping_available) + usize::from(refresh_available),
+            2 * usize::from(grouping_available)
+                + usize::from(refresh_available)
+                + usize::from(loading_control.is_some()),
+            usize::from(grouping_available)
+                + usize::from(refresh_available)
+                + usize::from(loading_control.is_some()),
         );
         let current_text = self.grid_sort_dropdown_text();
         // 場所を先に取ってから無効化する。逆順だと折り返しが子 UI の
@@ -14393,6 +14890,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             reload_requested = true;
                         }
                     }
+                }
+                if self.draw_sort_loading_control(ui) {
+                    ui.close();
                 }
             },
         );
@@ -18627,6 +19127,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     .and_then(|row| row.title())
                     .map(str::to_owned);
                 let media_duration = self.thumbnail_media_duration_text(idx);
+                let page_count = self.thumbnail_page_count_text(idx);
                 let filter_match_count = if self.items_are_drive_list {
                     None
                 } else {
@@ -18663,6 +19164,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.checked.contains(&idx),
                     filter_match_count,
                     media_duration.as_deref(),
+                    page_count.as_deref(),
                     self.settings.thumb_show_resume_meter,
                     crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
                     self.settings.thumb_show_type_icon,
@@ -22388,6 +22890,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     .and_then(|row| row.title())
                                     .map(str::to_owned);
                                 let media_duration = self.thumbnail_media_duration_text(idx);
+                                let page_count = self.thumbnail_page_count_text(idx);
                                 let is_checked = self.checked.contains(&idx);
                                 let filter_match = if self.items_are_drive_list {
                                     None
@@ -22427,6 +22930,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     is_checked,
                                     filter_match_count,
                                     media_duration.as_deref(),
+                                    page_count.as_deref(),
                                     self.settings.thumb_show_resume_meter,
                                     crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
                                     self.settings.thumb_show_type_icon,
@@ -22557,6 +23061,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         self.checked.contains(&idx),
                                         filter_match_count,
                                         media_duration.as_deref(),
+                                        page_count.as_deref(),
                                         self.settings.thumb_show_resume_meter,
                                         crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
                                         self.settings.thumb_show_type_icon,
@@ -35298,7 +35803,7 @@ mod toolbar_bg_menu_1876_tests;
 #[cfg(test)]
 mod toolbar_wrap_tests {
     use super::{
-        sort_combo_popup_height, sort_combo_popup_style, toolbar_combo_slot, toolbar_combo_width,
+        grid_sort_combo, sort_combo_popup_height, toolbar_combo_slot, toolbar_combo_width,
         toolbar_text_width,
     };
     use eframe::egui;
@@ -35330,12 +35835,13 @@ mod toolbar_wrap_tests {
                         let orders = crate::settings::SortOrder::all();
                         let height =
                             sort_combo_popup_height(ui, orders.len(), false, false, false, 0, 0);
-                        let combo = egui::ComboBox::from_id_salt("ten-sort-rows")
-                            .width(100.0)
-                            .height(height)
-                            .popup_style(sort_combo_popup_style())
-                            .selected_text("ソート")
-                            .show_ui(ui, |ui| {
+                        let combo = grid_sort_combo(
+                            ui,
+                            true,
+                            "ソート".to_owned(),
+                            "ten-sort-rows",
+                            height,
+                            |ui| {
                                 ui.spacing_mut().interact_size.y = 22.0;
                                 ui.style_mut().text_styles.insert(
                                     egui::TextStyle::Button,
@@ -35349,7 +35855,8 @@ mod toolbar_wrap_tests {
                                         .unwrap()
                                         .push((row.rect, ui.clip_rect()));
                                 }
-                            });
+                            },
+                        );
                         crate::ui_helpers::set_accessibility_label(&combo.response, "ソート");
                         *observed_id.lock().unwrap() = Some(combo.response.id);
                     });
@@ -35407,17 +35914,25 @@ mod toolbar_wrap_tests {
     fn collection_sort_popup_shows_manual_shuffle_and_all_standard_rows_or_fits_screen() {
         use egui_kittest::kittest::{NodeT, Queryable};
 
-        for (screen_size, font_size, all_rows_expected) in [
-            (egui::vec2(600.0, 480.0), 14.0, true),
-            (egui::vec2(600.0, 480.0), 22.0, true),
-            (egui::vec2(360.0, 150.0), 14.0, false),
+        // Keep all 16 rows at the minimum supported logical size, including 150% UI scale.
+        // Smaller viewports still exercise clipping and the scroll fallback.
+        for (screen_size, font_size, ui_scale, all_rows_expected) in [
+            (egui::vec2(1093.0, 614.0), 14.0, 1.0, true),
+            (egui::vec2(1093.0, 614.0), 14.0, 1.5, true),
+            (egui::vec2(1093.0, 614.0), 22.0, 1.5, true),
+            // With the unrelated 400pt cap removed these rows fit; scrolling is unnecessary.
+            (egui::vec2(600.0, 480.0), 22.0, 1.0, true),
+            (egui::vec2(360.0, 150.0), 14.0, 1.0, false),
         ] {
             let combo_id = std::sync::Arc::new(std::sync::Mutex::new(None));
             let observed_id = combo_id.clone();
             let row_geometry = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed_rows = row_geometry.clone();
             let mut harness = crate::test_ui::builder()
-                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_context_setup(move |ctx| {
+                    crate::ui_fonts::configure_fonts(ctx);
+                    crate::settings::apply_ui_scale_factor(ctx, ui_scale);
+                })
                 .with_size(screen_size)
                 .build_ui(move |root_ui| {
                     egui::CentralPanel::default().show(root_ui, |ui| {
@@ -35430,12 +35945,13 @@ mod toolbar_wrap_tests {
                         let orders = crate::settings::SortOrder::all();
                         let height =
                             sort_combo_popup_height(ui, orders.len(), true, false, false, 0, 0);
-                        let combo = egui::ComboBox::from_id_salt("collection-sort-rows")
-                            .width(100.0)
-                            .height(height)
-                            .popup_style(sort_combo_popup_style())
-                            .selected_text("手動")
-                            .show_ui(ui, |ui| {
+                        let combo = grid_sort_combo(
+                            ui,
+                            true,
+                            "手動".to_owned(),
+                            "collection-sort-rows",
+                            height,
+                            |ui| {
                                 ui.spacing_mut().interact_size.y = 22.0;
                                 ui.style_mut().text_styles.insert(
                                     egui::TextStyle::Button,
@@ -35453,7 +35969,7 @@ mod toolbar_wrap_tests {
                                 ui.separator();
                                 for &order in orders {
                                     let row = ui.add_enabled(
-                                        !order.is_rating() && !order.is_duration(),
+                                        !order.is_rating() && order.lazy_metric().is_none(),
                                         egui::Button::selectable(false, order.short_label()),
                                     );
                                     observed_rows
@@ -35461,7 +35977,8 @@ mod toolbar_wrap_tests {
                                         .unwrap()
                                         .push((row.rect, ui.clip_rect()));
                                 }
-                            });
+                            },
+                        );
                         crate::ui_helpers::set_accessibility_label(&combo.response, "ソート");
                         *observed_id.lock().unwrap() = Some(combo.response.id);
                     });
@@ -35471,6 +35988,8 @@ mod toolbar_wrap_tests {
             egui::Popup::open_id(&harness.ctx, popup_id);
             harness.run();
             harness.run();
+            assert_eq!(harness.ctx.content_rect().size(), screen_size);
+            assert!((harness.ctx.zoom_factor() - ui_scale).abs() < 0.01);
             let popup_rect = harness
                 .ctx
                 .memory(|memory| memory.area_rect(popup_id))
@@ -35483,14 +36002,14 @@ mod toolbar_wrap_tests {
                 popup_rect.bottom() <= screen_size.y + 1.0,
                 "popup below screen: {popup_rect:?} / {screen_size:?}"
             );
-            let geometry = row_geometry.lock().unwrap();
+            let geometry = row_geometry.lock().unwrap().clone();
             assert_eq!(geometry.len(), crate::settings::SortOrder::all().len() + 2);
             if all_rows_expected {
                 assert!(
                     geometry
                         .iter()
-                        .all(|(row, clip)| row.bottom() <= clip.bottom() + 1.0),
-                    "a collection sort row is outside the scroll viewport: {geometry:?}"
+                        .all(|(row, clip)| clip.expand(1.0).contains_rect(*row)),
+                    "a collection sort row is outside the scroll viewport: screen={screen_size:?}, font={font_size}, scale={ui_scale}, rows={geometry:?}"
                 );
                 assert!(
                     geometry.last().unwrap().0.bottom() <= popup_rect.bottom(),
@@ -35500,7 +36019,7 @@ mod toolbar_wrap_tests {
                     let node = harness.get_by_label(order.short_label());
                     assert_eq!(
                         node.accesskit_node().is_disabled(),
-                        order.is_rating() || order.is_duration()
+                        order.is_rating() || order.lazy_metric().is_some()
                     );
                 }
             } else {
@@ -35508,7 +36027,40 @@ mod toolbar_wrap_tests {
                     geometry
                         .last()
                         .is_some_and(|(row, clip)| row.bottom() > clip.bottom()),
-                    "short screen should use the popup's scroll viewport"
+                    "short screen should use the popup's scroll viewport: screen={screen_size:?}, font={font_size}, scale={ui_scale}, rows={geometry:?}"
+                );
+                let before_last_bottom = geometry.last().unwrap().0.bottom();
+                harness.hover_at(popup_rect.center());
+                harness.event(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, -10000.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                });
+                harness.step();
+                harness.run();
+                let scrolled = row_geometry.lock().unwrap();
+                let (last, clip) = scrolled.last().unwrap();
+                assert!(
+                    last.bottom() < before_last_bottom - 1.0,
+                    "wheel did not scroll the popup: before={before_last_bottom}, last={last:?}"
+                );
+                assert!(
+                    last.top() >= clip.top() - 1.0 && last.bottom() <= clip.bottom() + 1.0,
+                    "last row is unreachable on the short screen: last={last:?}, clip={clip:?}"
+                );
+                let scrolled_popup = harness
+                    .ctx
+                    .memory(|memory| memory.area_rect(popup_id))
+                    .unwrap();
+                assert!(
+                    harness
+                        .ctx
+                        .content_rect()
+                        .expand(1.0)
+                        .contains_rect(scrolled_popup),
+                    "scrolling moved the popup outside the screen: {scrolled_popup:?}"
                 );
             }
         }
@@ -35516,14 +36068,17 @@ mod toolbar_wrap_tests {
 
     #[test]
     fn collection_popup_first_frame_fits_right_edge_at_150_percent_dpi() {
+        let screen_size = egui::vec2(1093.0, 614.0);
         let rows = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = rows.clone();
         let id = std::sync::Arc::new(std::sync::Mutex::new(None));
         let observed_id = id.clone();
         let fonts_set = std::cell::Cell::new(false);
         let mut harness = crate::test_ui::builder()
-            .with_size(egui::vec2(853.0, 533.0))
-            .with_pixels_per_point(1.5)
+            .with_size(screen_size)
+            .with_context_setup(|ctx| {
+                crate::settings::apply_ui_scale_factor(ctx, 1.5);
+            })
             .build_ui(move |root_ui| {
                 let ctx = &root_ui.ctx().clone();
                 if !fonts_set.replace(true) {
@@ -35533,7 +36088,7 @@ mod toolbar_wrap_tests {
                 }
                 egui::Panel::top("probe").show(root_ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.add_space(700.0);
+                        ui.add_space(screen_size.x - 153.0);
                         let h = sort_combo_popup_height(
                             ui,
                             crate::settings::SortOrder::all().len(),
@@ -35543,12 +36098,8 @@ mod toolbar_wrap_tests {
                             0,
                             0,
                         );
-                        let combo = egui::ComboBox::from_id_salt("probe_combo")
-                            .width(100.0)
-                            .height(h)
-                            .popup_style(sort_combo_popup_style())
-                            .selected_text("手動")
-                            .show_ui(ui, |ui| {
+                        let combo =
+                            grid_sort_combo(ui, true, "手動".to_owned(), "probe_combo", h, |ui| {
                                 let family = egui::FontFamily::Name(std::sync::Arc::<str>::from(
                                     crate::ui_fonts::TOOLBAR_TEXT_FAMILY_NAME,
                                 ));
@@ -35574,7 +36125,7 @@ mod toolbar_wrap_tests {
                                 ui.separator();
                                 for &order in crate::settings::SortOrder::all() {
                                     let r = ui.add_enabled(
-                                        !order.is_rating() && !order.is_duration(),
+                                        !order.is_rating() && order.lazy_metric().is_none(),
                                         egui::Button::selectable(false, order.short_label()),
                                     );
                                     observed.lock().unwrap().push((
@@ -35592,6 +36143,9 @@ mod toolbar_wrap_tests {
             });
         harness.run();
         harness.run();
+        assert_eq!(harness.ctx.content_rect().size(), screen_size);
+        assert!((harness.ctx.zoom_factor() - 1.5).abs() < 0.01);
+        assert!((harness.ctx.pixels_per_point() - 1.5).abs() < 0.01);
         let combo_id = id.lock().unwrap().unwrap();
         let popup_id = combo_id.with("popup");
         let point = harness.ctx.read_response(combo_id).unwrap().rect.center();
@@ -35619,7 +36173,10 @@ mod toolbar_wrap_tests {
         for _ in 0..2 {
             harness.run();
             let rect = harness.ctx.memory(|m| m.area_rect(popup_id)).unwrap();
-            assert!(rect.left() >= -1.0 && rect.right() <= 854.0, "{rect:?}");
+            assert!(
+                harness.ctx.content_rect().expand(1.0).contains_rect(rect),
+                "popup outside minimum logical screen: {rect:?} / {screen_size:?}"
+            );
             let rows = rows.lock().unwrap();
             assert_eq!(rows.len(), crate::settings::SortOrder::all().len() + 2);
             for (index, (label, row, clip, enabled)) in rows.iter().enumerate() {
@@ -35645,6 +36202,89 @@ mod toolbar_wrap_tests {
     ];
 
     #[test]
+    fn sort_popup_area_height_restores_both_themes_before_contents_and_other_areas() {
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let ctx = egui::Context::default();
+            ctx.set_theme(theme);
+            let light = ctx.style_of(egui::Theme::Light);
+            let dark = ctx.style_of(egui::Theme::Dark);
+            let original = ctx.global_style();
+            let mut combo_id = None;
+            let mut contents_seen = false;
+            for frame in 0..4 {
+                ctx.run_pass(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1093.0, 614.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        ctx.root_ui(|root| {
+                            egui::CentralPanel::default().show(root, |ui| {
+                                let combo = grid_sort_combo(
+                                    ui,
+                                    true,
+                                    "Sort".to_owned(),
+                                    "area-scope",
+                                    430.0,
+                                    |ui| {
+                                        assert!(std::sync::Arc::ptr_eq(
+                                            &ctx.style_of(egui::Theme::Light),
+                                            &light
+                                        ));
+                                        assert!(std::sync::Arc::ptr_eq(
+                                            &ctx.style_of(egui::Theme::Dark),
+                                            &dark
+                                        ));
+                                        if !contents_seen {
+                                            assert!(
+                                                ui.max_rect().height() >= 429.0,
+                                                "initial computed viewport cap was lost: {:?}",
+                                                ui.max_rect()
+                                            );
+                                        }
+                                        contents_seen = true;
+                                        for row in 0..17 {
+                                            let _ =
+                                                ui.selectable_label(false, format!("Row {row}"));
+                                        }
+                                        // A different Area opened from the contents reads the original default.
+                                        egui::Area::new(egui::Id::new("unrelated-area"))
+                                            .order(egui::Order::Tooltip)
+                                            .sizing_pass(true)
+                                            .show(ctx, |other| {
+                                                assert_eq!(
+                                                    other.max_rect().height(),
+                                                    original.spacing.default_area_size.y
+                                                )
+                                            });
+                                    },
+                                );
+                                combo_id = Some(combo.response.id);
+                            });
+                        })
+                    },
+                )
+                .drop_without_applying_deltas();
+                assert!(std::sync::Arc::ptr_eq(
+                    &ctx.style_of(egui::Theme::Light),
+                    &light
+                ));
+                assert!(std::sync::Arc::ptr_eq(
+                    &ctx.style_of(egui::Theme::Dark),
+                    &dark
+                ));
+                if frame == 0 {
+                    egui::Popup::open_id(&ctx, combo_id.unwrap().with("popup"));
+                }
+            }
+            assert!(contents_seen);
+        }
+    }
+
+    #[test]
     fn sort_popup_reserves_floating_scrollbar_width_before_its_contents() {
         let ctx = egui::Context::default();
         ctx.global_style_mut(|style| {
@@ -35663,12 +36303,13 @@ mod toolbar_wrap_tests {
                 .run_pass(input.clone(), |ctx| {
                     ctx.root_ui(|root_ui| {
                         egui::CentralPanel::default().show(root_ui, |ui| {
-                            let combo = egui::ComboBox::from_id_salt("sort-popup-test")
-                                .width(100.0)
-                                .height(80.0)
-                                .popup_style(sort_combo_popup_style())
-                                .selected_text("シャッフル")
-                                .show_ui(ui, |ui| {
+                            let combo = grid_sort_combo(
+                                ui,
+                                true,
+                                "シャッフル".to_owned(),
+                                "sort-popup-test",
+                                80.0,
+                                |ui| {
                                     observed_popup_style = Some((
                                         ui.spacing().scroll.allocated_width(),
                                         ui.spacing().button_padding.x,
@@ -35679,7 +36320,8 @@ mod toolbar_wrap_tests {
                                             "シャッフル（再選択で並べ直す）",
                                         );
                                     }
-                                });
+                                },
+                            );
                             combo_id = Some(combo.response.id);
                         })
                     });

@@ -220,45 +220,11 @@ impl App {
             .map(|_| cursor)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_previous_startup_list(&mut self) {
-        let StartupListRestore::V1 { target, cursor } = self
-            .settings
-            .startup_list_restore
-            .clone()
-            .unwrap_or_default();
-        if target == StartupListTarget::DriveList {
-            self.enter_drive_list(None);
-            return;
-        }
-        let path = match &target {
-            StartupListTarget::PhysicalList { logical_path, .. } => Some(logical_path.as_path()),
-            _ => None,
-        };
-        let Some(folder) = crate::known_folders::startup_folder(
-            crate::settings::StartupFolderMode::Previous,
-            path,
-            None,
-        ) else {
-            return;
-        };
-        let (target, cursor) =
-            if path.is_some_and(|path| crate::folder_tree::path_eq(path, &folder)) {
-                (target, cursor)
-            } else {
-                (
-                    StartupListTarget::PhysicalList {
-                        logical_path: folder.clone(),
-                        zip_prefix: None,
-                    },
-                    None,
-                )
-            };
-        let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
-            folder,
-            false,
-            OpenRequestOwner::Navigation,
-            StartupListIntent::RestoreList { target, cursor },
-        );
+        let mut settings = self.settings.clone();
+        settings.startup_folder_mode = crate::settings::StartupFolderMode::Previous;
+        self.start_default_startup_input(settings);
     }
 
     fn restorable_current_main_list(&self) -> Option<StartupListTarget> {

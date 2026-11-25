@@ -1062,6 +1062,14 @@ Indexer spawn/errorも一度通知・次回起動に留める。rare failure内�
 
 ## 10. 実装分割（2026-10-06利用者指示）
 
+2026-11-25、§1.853 ([ui-sync-853-plan.md](ui-sync-853-plan.md) §3) で Phase B の off-UI 部分を実装した。
+既存 resolver の同じ worker に既定の場所の解決と実フォルダ走査を載せ、UI の同期 fallback を全 source で撤去する。
+走査設定・Susie 公開拡張子世代が変われば同じ pending の受信口だけを交換して走査を続け、payload・lease・取消・
+診断・走査開始時刻を保持する。解決・走査・採用の小区間はそれぞれ worker・worker・UI を囲む。
+first-dispatch watch の終端は明示/既定とも resolver 結果の UI 採用で、後続の列挙・変換の完了は含まない。
+**Deferred normal-present wake は未実装の残件**。dispatch のフレームは変更しない。コンパイル・Rust テスト・実機計測は未実施。
+以下の Phase A の説明・検証はその時点の記録として保持する。
+
 f2fcef6b2は独立設計レビューready、指摘なし。detached到達部も構造変更として設計owner
 ClaudeCodeと独立Codexが合意済み。Phase Aの正確な到達scopeはdetached-rework-plan §11へ記録した。
 

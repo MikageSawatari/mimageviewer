@@ -9,6 +9,7 @@ struct TreeDropTest {
     queries: usize,
     files_available: bool,
     invoked: Vec<PathBuf>,
+    invocation_rx: std::sync::mpsc::Receiver<PathBuf>,
     navigation: Option<FolderPaneActivation>,
 }
 
@@ -22,6 +23,12 @@ impl TreeDropTest {
         let target = root.join("target");
         std::fs::create_dir_all(&target).unwrap();
         app.settings.book_root = Some(app.tmp.path().join("books"));
+        let (invocation_tx, invocation_rx) = std::sync::mpsc::channel();
+        app.shell_paste_service =
+            crate::shell_paste::ShellPasteService::with_test_invoker(move |_, folder| {
+                invocation_tx.send(folder.to_owned()).unwrap();
+                Ok(())
+            });
         app.current_folder = Some(root.clone());
         app.folder_pane = folder_pane::FolderPaneState::test_tree(&root, vec![target.clone()]);
         app.folder_pane
@@ -38,6 +45,7 @@ impl TreeDropTest {
             queries: 0,
             files_available: true,
             invoked: Vec::new(),
+            invocation_rx,
             navigation: None,
         };
         test.frame(vec![]);
@@ -69,7 +77,6 @@ impl TreeDropTest {
                     app,
                     queries,
                     files_available,
-                    invoked,
                     navigation,
                     ..
                 } = self;
@@ -81,15 +88,7 @@ impl TreeDropTest {
                             *files_available
                         },
                         |app, ctx, path| {
-                            app.paste_tree_files_to_folder_with(
-                                ctx,
-                                path,
-                                App::book_root_path,
-                                |_, actual| {
-                                    invoked.push(actual.to_owned());
-                                    Ok(())
-                                },
-                            );
+                            app.paste_tree_files_to_folder(ctx, path);
                         },
                     );
                 };
@@ -105,6 +104,16 @@ impl TreeDropTest {
             },
         )
         .drop_without_applying_deltas();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while self.app.shell_paste_request.is_some() {
+            self.app.poll_shell_paste(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fake tree paste did not finish"
+            );
+            std::thread::yield_now();
+        }
+        self.invoked.extend(self.invocation_rx.try_iter());
     }
 
     fn row(&self) -> egui::Rect {

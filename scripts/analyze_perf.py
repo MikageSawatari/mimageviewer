@@ -2296,6 +2296,15 @@ def cmd_nav(events: list[dict]) -> None:
             continue
         kind = e.get("kind", "")
         ms = e.get("ms")
+        if kind == "startup_resolve_scan":
+            for field, label in (("resolve_ms", "startup_resolve"), ("scan_ms", "startup_scan")):
+                value = e.get(field)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    buckets[label].append(float(value))
+            if ms is None:
+                phases = [e.get(field) for field in ("resolve_ms", "scan_ms")]
+                if all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in phases):
+                    ms = sum(phases)
         if ms is None:
             continue
         # "dfs_end" -> "dfs" のように集約
@@ -2322,6 +2331,7 @@ def cmd_nav(events: list[dict]) -> None:
     groups: list[tuple[str, list[str]]] = [
         ("DFS (別スレッド)", ["dfs"]),
         ("Folder open scan (worker)", ["folder_open_scan"]),
+        ("Startup resolve / scan (worker)", ["startup_resolve_scan", "startup_resolve", "startup_scan"]),
         ("apply_folder_nav_result (UI)", ["apply"]),
         ("load_folder 全体 (UI)", ["load_folder"]),
         ("  load_folder 内訳", ["lf_scan", "lf_sort", "lf_dup_filter", "lf_auto_index"]),
@@ -2347,6 +2357,8 @@ def cmd_nav(events: list[dict]) -> None:
                 found = True
         if not found:
             print("  (イベントなし)")
+
+    print_startup_resolve_scans(events)
 
     print("\n[catalog seed の DB 読み]")
     for kind in ("sli_virtual_seed", "sli_video_pin_seed"):
@@ -2435,6 +2447,27 @@ def cmd_memory(events: list[dict]) -> None:
         print(f"{utc_prefix}{event.get('t', 0.0):8.3f} {str(event.get('pid', '-')):>7} {' '.join(values)}  {detail}")
 
 
+def print_startup_resolve_scans(events: list[dict]) -> None:
+    """Startup resolver attempts; scan continuations keep their own rows."""
+    rows = sorted(
+        (e for e in events if e.get("cat") == "nav" and e.get("kind") == "startup_resolve_scan"),
+        key=lambda e: e.get("t", 0.0),
+    )
+    if not rows:
+        return
+    print("\n[startup_resolve_scan (worker)]")
+    print(f"{'source':<12} {'outcome':<14} {'resolve ms':>10} {'scan ms':>10} {'folders':>8} {'media':>8}")
+    for event in rows:
+        times = [
+            f"{float(event[field]):10.1f}" if isinstance(event.get(field), (int, float)) else f"{'-':>10}"
+            for field in ("resolve_ms", "scan_ms")
+        ]
+        print(
+            f"{event.get('source', '?'):<12} {event.get('outcome', '?'):<14} {' '.join(times)} "
+            f"{str(event.get('folders', '-')):>8} {str(event.get('media', '-')):>8}"
+        )
+
+
 def cmd_startup(events: list[dict]) -> None:
     """main() 入口から first_frame までの各フェーズ経過時間を表示する。
 
@@ -2448,6 +2481,7 @@ def cmd_startup(events: list[dict]) -> None:
     startup_events = [e for e in events if e.get("cat") == "startup"]
     if not startup_events:
         print("(startup イベントなし — --perf-log 有効で再測定してください)")
+        print_startup_resolve_scans(events)
         return
 
     # 出力順は emit 順を尊重する (t 昇順 = main() の実行順)
@@ -2481,6 +2515,8 @@ def cmd_startup(events: list[dict]) -> None:
     if final and final.get("total_ms") is not None:
         print()
         print(f"=> 起動から初回フレームまで: {float(final['total_ms']):.0f} ms")
+
+    print_startup_resolve_scans(events)
 
 
 # -----------------------------------------------------------------------

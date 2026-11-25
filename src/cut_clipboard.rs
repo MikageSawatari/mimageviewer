@@ -11,6 +11,16 @@ use std::sync::mpsc;
 
 pub(crate) const CUT_CONTENT_OPACITY: f32 = 0.5;
 
+#[cfg(test)]
+thread_local! {
+    static LOCAL_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn local_write_calls_for_test() -> usize {
+    LOCAL_WRITE_CALLS.with(std::cell::Cell::get)
+}
+
 const CUT_OWNER_MAGIC: [u8; 8] = *b"mIVcut01";
 const CUT_OWNER_PAYLOAD_LEN: usize = 32;
 const CLIPBOARD_RETRY_DELAYS_MS: [u64; 4] = [25, 50, 100, 250];
@@ -205,6 +215,9 @@ pub(crate) struct LocalCutDataObject {
     sink: CutClipboardEventSink,
     #[cfg(test)]
     completion_observations: Option<Arc<std::sync::Mutex<Vec<ClipboardTransferSignal>>>>,
+    #[cfg(test)]
+    completion_thread_observations:
+        Option<Arc<std::sync::Mutex<Vec<(ClipboardTransferSignal, std::thread::ThreadId)>>>>,
 }
 
 impl LocalCutDataObject {
@@ -219,6 +232,13 @@ impl LocalCutDataObject {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(signal);
+        }
+        #[cfg(test)]
+        if let Some(observations) = self.completion_thread_observations.as_ref() {
+            observations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((signal, std::thread::current().id()));
         }
         self.sink.publish_local_completion(self.identity, signal);
     }
@@ -236,6 +256,7 @@ impl LocalCutDataObject {
                 repaint: Arc::new(|| {}),
             },
             completion_observations: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
+            completion_thread_observations: Some(Arc::new(std::sync::Mutex::new(Vec::new()))),
         }
     }
 
@@ -246,6 +267,16 @@ impl LocalCutDataObject {
         self.completion_observations
             .as_ref()
             .expect("test data object has an observation sink")
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completion_thread_observations_for_test(
+        &self,
+    ) -> Arc<std::sync::Mutex<Vec<(ClipboardTransferSignal, std::thread::ThreadId)>>> {
+        self.completion_thread_observations
+            .as_ref()
+            .expect("test data object has a thread observation sink")
             .clone()
     }
 }
@@ -407,6 +438,8 @@ impl CutClipboardReducer {
                     sink,
                     #[cfg(test)]
                     completion_observations: None,
+                    #[cfg(test)]
+                    completion_thread_observations: None,
                 })
             })
             .flatten();
@@ -768,6 +801,8 @@ impl CutClipboardObserver {
         intent: LocalClipboardWriteIntent,
         paths: &[PathBuf],
     ) -> LocalClipboardWrite {
+        #[cfg(test)]
+        LOCAL_WRITE_CALLS.with(|calls| calls.set(calls.get() + 1));
         let floor = self
             .request_counter
             .load(std::sync::atomic::Ordering::Acquire);

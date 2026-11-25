@@ -446,7 +446,10 @@ fn cover_auto_binding_is_shared_by_list_and_dialog_independent_of_reading_direct
             app.settings.default_reading_direction = reading;
             assert_eq!(app.thumbnail_auto_crop_identity(), expected);
             let dialog = app.book_cover_env();
-            assert_eq!(dialog.auto_cover_crop, expected);
+            assert_eq!(
+                dialog.cover_auto_crop_scope.identity_for(Path::new("")),
+                expected
+            );
             let req = request(&item, &HashMap::new(), app.thumbnail_auto_crop_identity());
             let key = crate::thumb_loader::cache_key_for_request(&req)
                 .unwrap()
@@ -464,7 +467,12 @@ fn cover_auto_binding_is_shared_by_list_and_dialog_independent_of_reading_direct
     }
     app.settings.thumb_cover_auto_crop = false;
     assert!(app.thumbnail_auto_crop_identity().is_none());
-    assert!(app.book_cover_env().auto_cover_crop.is_none());
+    assert!(
+        app.book_cover_env()
+            .cover_auto_crop_scope
+            .identity_for(Path::new(""))
+            .is_none()
+    );
 }
 
 #[test]
@@ -779,7 +787,9 @@ fn cover_auto_collection_source_digest_and_reuse_follow_enabled_binding() {
     for direction in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
         let delivery = super::collection_grid::prepare_collection_grid_thumbnail_sources(
             CollectionGridThumbnailSources {
-                auto_cover_crop: Some(AutoCropIdentity::new(direction)),
+                cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope::for_identity(
+                    Some(AutoCropIdentity::new(direction)),
+                ),
                 ..Default::default()
             },
             &AtomicBool::new(false),
@@ -791,10 +801,12 @@ fn cover_auto_collection_source_digest_and_reuse_follow_enabled_binding() {
         let folders = identity(
             super::collection_grid::prepare_collection_grid_thumbnail_sources(
                 CollectionGridThumbnailSources {
-                    auto_cover_crop: Some(AutoCropIdentity {
-                        binding: direction,
-                        folders: true,
-                    }),
+                    cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope::for_identity(
+                        Some(AutoCropIdentity {
+                            binding: direction,
+                            folders: true,
+                        }),
+                    ),
                     ..Default::default()
                 },
                 &AtomicBool::new(false),
@@ -838,7 +850,12 @@ fn cover_auto_folder_switch_keeps_list_survival_rating_and_dialog_identity_consi
         for folders in [false, true] {
             app.settings.thumb_cover_auto_crop_folders = folders;
             let auto = app.thumbnail_auto_crop_identity();
-            assert_eq!(app.book_cover_env().auto_cover_crop, auto);
+            assert_eq!(
+                app.book_cover_env()
+                    .cover_auto_crop_scope
+                    .identity_for(Path::new("")),
+                auto
+            );
             for item in [
                 GridItem::Folder(app.tmp.path().join("book")),
                 GridItem::ZipFile(app.tmp.path().join("book.zip")),

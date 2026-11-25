@@ -56,6 +56,8 @@ pub struct ZipTreeNode {
     /// この階層直下の画像。`entry_name` はフルパスを保持する (DB キー・
     /// `read_entry_bytes` 互換)。並びは列挙順 (= ZIP 内出現順)。
     pub images: Vec<ZipImageEntry>,
+    /// Number of retained image leaves, finalized before publication.
+    subtree_image_count: usize,
     pub(crate) directory_ancestry: Option<Vec<crate::archive_origin::ArchiveContainerOrigin>>,
 }
 
@@ -80,11 +82,13 @@ impl ZipTree {
             }
             let dir = entry_dir(&entry.entry_name);
             let mut node = &mut root;
+            node.subtree_image_count += 1;
             let mut prefix = String::new();
             for seg in dir.split('/').filter(|s| !s.is_empty()) {
                 prefix.push_str(seg);
                 prefix.push('/');
                 node = node.dirs.entry(seg.to_string()).or_default();
+                node.subtree_image_count += 1;
                 // Physical directories are structural rows; only actual archive boundaries are filtered.
                 let within_archive = entry
                     .container_ancestry
@@ -121,7 +125,7 @@ impl ZipTree {
                 .as_ref()
                 .filter(|ancestors| ancestors.iter().all(|origin| origin.allows(policy)))
                 .cloned();
-            let images = node
+            let images: Vec<_> = node
                 .images
                 .iter()
                 .filter(|entry| {
@@ -133,7 +137,7 @@ impl ZipTree {
                 })
                 .cloned()
                 .collect();
-            let dirs = node
+            let dirs: BTreeMap<_, _> = node
                 .dirs
                 .iter()
                 .filter_map(|(name, child)| {
@@ -144,7 +148,13 @@ impl ZipTree {
                     .then_some((name.clone(), projected))
                 })
                 .collect();
+            let subtree_image_count = images.len()
+                + dirs
+                    .values()
+                    .map(|child| child.subtree_image_count)
+                    .sum::<usize>();
             ZipTreeNode {
+                subtree_image_count,
                 images,
                 dirs,
                 directory_ancestry,
@@ -194,16 +204,14 @@ impl ZipTree {
 
     /// Return the number of image pages below a child container prefix.
     ///
-    /// This only walks the already-enumerated outer ZIP tree. Showing counts for
-    /// child ZIP/RAR cells therefore never reopens an archive on the UI thread.
+    /// Walk only the prefix depth and read the count precomputed at construction.
+    /// Child ZIP/RAR cells never reopen an archive or traverse a subtree on the UI thread.
     pub fn page_count_for_prefix_str(&self, dir_prefix: &str) -> Option<u32> {
-        let segs: Vec<String> = dir_prefix
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect();
-        let count = self.node_at(&segs)?.total_image_count();
-        u32::try_from(count).ok()
+        let mut node = &self.root;
+        for segment in dir_prefix.split('/').filter(|segment| !segment.is_empty()) {
+            node = node.dirs.get(segment)?;
+        }
+        u32::try_from(node.subtree_image_count).ok()
     }
 
     /// 冗長ラッパー階層の自動降下 (D1)。
@@ -767,14 +775,9 @@ impl ZipTreeNode {
         !self.images.is_empty() || self.dirs.values().any(|d| d.has_any_image())
     }
 
-    /// この部分木に含まれる画像の総数 (再帰)。
+    /// Total image count finalized during build or projection; constant-time lookup.
     pub fn total_image_count(&self) -> usize {
-        self.images.len()
-            + self
-                .dirs
-                .values()
-                .map(|d| d.total_image_count())
-                .sum::<usize>()
+        self.subtree_image_count
     }
 
     /// この部分木の代表画像 (= ZipDir セルのサムネ候補) を返す。
@@ -1221,6 +1224,42 @@ mod tests {
         assert!(segment_is_archive("ch01.rar"));
         assert!(segment_is_archive("ch02.7z"));
         assert!(segment_is_archive("old.LZH"));
+    }
+
+    #[test]
+    fn subtree_page_counts_follow_build_and_each_policy_projection() {
+        fn assert_subtrees(node: &ZipTreeNode) -> usize {
+            let actual = node.images.len() + node.dirs.values().map(assert_subtrees).sum::<usize>();
+            assert_eq!(node.total_image_count(), actual);
+            actual
+        }
+        let raw = tree(&[
+            "root.png",
+            "book.zip/001.jpg",
+            "book.zip/deep/002.png",
+            "book.zip/deep/003.jpg",
+            "empty-after-filter/004.png",
+            "invalid/",
+        ]);
+        assert_eq!(assert_subtrees(&raw.root), 5);
+        assert_eq!(raw.page_count_for_prefix_str("book.zip/"), Some(3));
+        let mut policy = crate::file_type_visibility::FileTypeVisibility::default();
+        policy.excluded_extensions.insert("png".into());
+        let projected = raw.project(&policy);
+        assert_eq!(assert_subtrees(&projected.root), 2);
+        assert_eq!(projected.page_count_for_prefix_str("book.zip/"), Some(2));
+        assert_eq!(
+            projected.page_count_for_prefix_str("book.zip/deep/"),
+            Some(1)
+        );
+        assert_eq!(
+            projected.page_count_for_prefix_str("empty-after-filter/"),
+            Some(0)
+        );
+        assert_eq!(assert_subtrees(&raw.root), 5);
+        let restored = projected.project(&Default::default());
+        assert_eq!(assert_subtrees(&restored.root), 5);
+        assert_eq!(restored.page_count_for_prefix_str("book.zip/"), Some(3));
     }
 
     #[test]

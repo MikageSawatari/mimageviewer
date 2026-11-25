@@ -27,6 +27,12 @@ mod read_types;
 pub use read_types::*;
 mod folder_types;
 pub use folder_types::*;
+mod unique_json;
+pub use unique_json::parse_unique_json;
+mod operations_types;
+pub use operations_types::*;
+mod page_budget;
+pub use page_budget::bound_page_rows;
 mod settings_types;
 pub use settings_types::*;
 mod favorite_types;
@@ -34,7 +40,7 @@ pub use favorite_types::*;
 mod stack_script_types;
 pub use stack_script_types::*;
 
-pub const AGENT_PROTOCOL_VERSION: u32 = 6;
+pub const AGENT_PROTOCOL_VERSION: u32 = 7;
 pub const MIN_ADAPTER_PROTOCOL_VERSION: u32 = 3;
 /// Fixed pipe namespace identifier, unrelated to business IPC versions. Never change it.
 pub const AGENT_PIPE_NAMESPACE: &str = "mimageviewer-agent-v3";
@@ -147,6 +153,8 @@ pub enum Command {
     },
     Status,
     GetViewState,
+    GetOperations(OperationsQuery),
+    SetOperations(OperationEdits),
     GetSettings {
         query: Option<String>,
         keys: Option<Vec<String>>,
@@ -303,6 +311,8 @@ pub enum Payload {
     Hello { version: u32 },
     Status(StatusPayload),
     ViewState(ViewState),
+    Operations(OperationsPage),
+    OperationsWrite(OperationsWriteResult),
     Settings(SettingsPage),
     SettingsWrite(SettingsWriteResult),
     FavoriteWrite(FavoriteWriteResult),
@@ -624,7 +634,8 @@ pub fn read_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Result<Op
     }
     let mut bytes = vec![0; len];
     reader.read_exact(&mut bytes)?;
-    serde_json::from_slice(&bytes)
+    parse_unique_json(&bytes)
+        .and_then(serde_json::from_value)
         .map(Some)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
@@ -859,7 +870,7 @@ mod tests {
             incomplete["command"].as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<Request>(incomplete).is_err());
         }
-        assert_eq!(AGENT_PROTOCOL_VERSION, 6);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 7);
     }
 
     #[test]
@@ -985,7 +996,7 @@ mod tests {
 
     #[test]
     fn collection_write_wire_roundtrips_grouped_input_positions() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 6);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 7);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -1057,7 +1068,7 @@ mod tests {
             .unwrap(),
             permission
         );
-        assert_eq!(AGENT_PROTOCOL_VERSION, 6);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 7);
     }
 
     #[test]
@@ -1136,7 +1147,7 @@ mod tests {
 
     #[test]
     fn metadata_write_wire_roundtrips_and_full_batch_outcomes_fit_budget() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 6);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 7);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -1213,7 +1224,7 @@ mod tests {
 
     #[test]
     fn open_wire_uses_typed_accepted_result_without_changing_protocol_version() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 6);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 7);
         assert_eq!(
             serde_json::to_value(Command::OpenInViewer {
                 path: "C:/猫.png".into(),

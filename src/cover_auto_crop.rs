@@ -8,6 +8,8 @@ use image::{DynamicImage, RgbImage};
 use std::borrow::Cow;
 
 mod layout;
+mod scope;
+pub(crate) use scope::CoverAutoCropScope;
 pub(crate) mod photo;
 
 const CONTENT_MARGIN_CAP: f64 = 0.05;

@@ -1458,6 +1458,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-25: 起動 resolver の main 走査の段階（§1.853、実装・検証待ち）
+
+- 正本: [ui-sync-853-plan.md](ui-sync-853-plan.md) §3.2・§5.3。main の resolver と detached lease 付き
+  ブックマークを既存の所有境界で区別し、さらに `main_folder_history_available()` で今の投影 context を確かめる。
+  走査を同じ worker に移すことに伴う入力/待機表示/同じ request ID の期限の契約で、症状を隠す guard・delay ではない。
+- detached の分類・記述子・viewport・placement は変えない。実装前に §2 を読み、設計 r3 の main 投影と lease 除外を
+  実装の根拠とした。受けていない独立実装レビューの合意・検証結果は記載しない。コンパイル・Rust テストは未実施。
+
 ### 2026-11-24: 操作のスクリプトはメインウィンドウの context だけで実行・イベント検出する (§1.363、設計の段階。実装はこれから)
 
 - 正本は [operation-script-plan.md](operation-script-plan.md) §3.2「凍結の決まり (detached リワーク) との照合」。キー・リング・右クリック等からスクリプトの操作の並びを実行し、本を開いた・ページが変わった等のイベントでも動く機能。
@@ -8230,3 +8238,9 @@ fork 先は空、元 context は cache と proof を保持する。detached の�
 - detached の述語・viewport の選択と配送・窓の寿命・HWND の処理は変更していない。guard・delay・retry・一括 reset・silent fallback は追加していない。
 - 設計担当 ClaudeCode と独立実装レビュー (実装者とは別の GPT-6.1 Sol / xhigh) は、これが症状パッチではなく構造的修正であることに合意。
   レビュー担当の言葉:「描画対象の面と入力所有を共有境界で一致させる構造的修正であり、症状パッチではない」。
+
+### 2026-11-25: 1 ページ表示の左右の入力を読み方向に従わせる (§1.746)
+
+- 変更の内容: 左右のキー・画面の左右半分のクリック・タップ・パッド・割り当てた見開きずらし・ヘルプの行が、左右の前後をページ構成 (`SpreadMode`) だけで決めていたため、1 ページ表示では <kbd>7</kbd> で右→左にしても右が次だった (左右キーは既定のカーソル設定のとき。「シークバー方向に合わせる」では左右キーだけ従来から読み方向に従っていた)。判定を `App::input_advances_right_to_left` の 1 つにまとめた (ページ構成が向きを持てばその向き、持たなければ viewer の読み方向)。紙めくりの束の判定 (`page_turn_reading_rtl`) と `SpreadMode::advances_right_to_left` はこれに統合した。Remote の Web 画面の同じ判定も揃えた。
+- detached に触れる範囲: 別ウィンドウの述語・viewport の選択と配送・窓の寿命・placement・HWND の処理は変えない。判定が読むのは、そのとき載っている viewer context の `spread_mode` と `reading_direction` だけで、どちらも context ごとの束に入っている (別ウィンドウは自分の値を読む。`input_reading_direction_uses_only_the_mounted_viewer_context` で確認)。guard・delay・retry・一括 reset・silent fallback は足していない。
+- 合意: 設計担当 ClaudeCode と独立実装レビュー (実装者とは別の GPT-6.1 Sol / xhigh、1 回目) は、これが症状パッチではなく構造的修正であることに合意。レビュー担当の言葉:「Both direction fields belong to the mounted viewer bundle, so detached/F12 contexts read their own values. I agree this is a structural fix, not a symptom patch.」 2 回目 (Remote の Web 画面を含めた全体、`b65066753`) で ACCEPT、合意は変わらない。レビュー担当の言葉:「I agree that the whole desktop + Remote change is a structural fix, not a symptom patch, under the detached freeze rules.」

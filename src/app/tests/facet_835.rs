@@ -54,6 +54,7 @@ fn configure(app: &mut App) {
     app.settings.sort_order = crate::settings::SortOrder::FileName;
     app.settings.selection_info_display_mode = SelectionInfoDisplayMode::Hidden;
     app.settings.thumb_show_media_duration = false;
+    app.settings.thumb_show_page_count = false;
     app.settings.thumb_show_resume_meter = false;
     app.settings.details_show_page_count = false;
     app.settings.details_show_created = false;

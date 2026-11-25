@@ -32,7 +32,14 @@ wire と永続形式、detached の述語・viewport・窓の寿命は変更し�
 表示専用の初期化を省いた下書きを既存の `apply_preferences_dialog` へ渡す。
 `app/agent_favorite` はフォルダの検査を worker に任せ、ダイアログと共有の `fav_add` の確定処理を通す。
 変更の応答は確定前に予算を検査し、通知と「AI による変更」に記録する。AI が外部ツールを起動する経路は持たない。
-IPC 版は 6。スタック用スクリプトの本文は、同じ設定許可の `stack_script` で読み書きする。
+`operation_customize_agent` は App に依存しない割り当ての投影・検査・bundle 更新を持ち、
+`app/agent_operations` は設定と共有する許可・受付を検査して `apply_operation_customize_bundle` へ渡す。
+キーとリングの対応表は `ring_shortcut::ring_bindings_for_key_action` を窓と共有する。
+画面名・表示名・同時に効く scope は keymap の `OPERATION_SCREENS` 一表で所有し、重なり判定と画面の投影が同じ表を読む。
+操作の要求内では override 名を一度ずつ解釈する索引を作り、実効キー・変更前後の値・置換位置に共有する。
+`agent/get_operations`・`agent/set_operations` は許可検査から応答までの `duration_ms`、`agent/set_operations_commit` は既存確定経路の時間を記録する。
+`agent-ipc::bound_page_rows` は設定と操作の単行・ページ合計予算を共通化し、所属を保ったまま大きい行を省く。
+IPC 版は 7。スタック用スクリプトの本文は、同じ設定許可の `stack_script` で読み書きする。
 本文の取得・検査は agent worker、AI の照合付き書き込みと環境設定の「既定に戻す」「スクリプトを開く」は
 `filename_stack_script` の単一 FIFO worker に集約する。ボタンは enqueue だけで、UI は I/O・完了待ち・監視を行わない。
 書き込みは本文全体の SHA-256 を照合し、変更行とログには本文を出さず行数だけを残す。
@@ -996,7 +1003,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `<本棚ルート>/mimageviewer.book-order.json` | 本棚ごとのName/Manualと直下フォルダ名順。UTF-8 JSON version1、16MiB上限。欠落は名前順として読み替え、読むだけでは書かない。不正/未知版は名前順＋順序書込停止で原本を維持。設定DB・既存本の形式は変更しない | `book_order.rs`（製本workerと即時順保存worker） |
 | `Settings.keymap` / `keymap.ini.default` | キーボード割り当て設定。GUI 編集の正本は `settings.db` 内の `Settings.keymap`。旧 `keymap.ini` が残っている環境では初回起動時に読み込み、同じ内容を `Settings.keymap` へ移してから `keymap.ini.imported*.bak` へリネームする。以後 `keymap.ini` は通常読み込み対象外。`keymap.ini.default` は現在バージョンの Action 名と既定キーを確認する参照ファイルとして更新される。競合は拒否せず warning として扱う | `keymap.rs` + `settings.rs` |
 | 利用者指定の `preferences.mivprefs.json` (推奨名) | 現在の確定済み環境設定の移行可能な項目だけを持つ UTF-8 JSON、format_version=1。data-dir 外にも保存可。正本 DB・全設定バックアップではなく、利用データ・パス・接続・操作カスタマイズは含めない。設定の復元画面から取り込み、検証成功後に draft へ反映し既存 OK で保存 | `settings_transfer.rs` + `ui_dialogs/settings_restore.rs` + `ui_dialogs/preferences.rs` |
-| `catalog.db` | フォルダ単位のサムネイル WebP キャッシュ (BLOB) + PDF メタデータ + ZIP / 画像のみフォルダのページ数 cache + 動画・音声の `video_meta`。ページ数・メディア情報の取得は既存詳細遅延 worker が `GlobalIoSemaphore` 配下で行い、cache 障害時は表示自体を失敗させず元ファイルから再取得する | `catalog.rs` + `app/metadata_ops.rs` |
+| `catalog.db` | フォルダ単位のサムネイル WebP キャッシュ (BLOB) + PDF メタデータ + ZIP / 画像のみフォルダのページ数 cache + 動画・音声の `video_meta`。ページ数・メディア情報の取得は既存詳細遅延 worker が `GlobalIoSemaphore` 配下で行い、cache 障害時は表示自体を失敗させず元ファイルから再取得する。§1.883 のページ数バッジも同経路・同じメモリ値を共有し、ZipDir だけは ZipTree が所有する事前集計値を直接読む | `catalog.rs` + `app/metadata_ops.rs` |
 | `video_tile_thumbs.db` | 動画タイル / resume サムネイルの WebP と、粗い全尺波形の量子化 chunk。新しい波形 chunk は stream index を含む追加テーブルへ保存し、既定トラックだけ旧テーブルを互換読みする。path、stream index、動画 mtime / size、bin 幅・総 bin 数、format version の完全一致時だけ再利用し、窓解析と raster は保存しない。サムネイルキャッシュ管理のファイル単位・フォルダ単位・全件削除を共有する | `video/tile_thumb_cache.rs` + `video/seek_strip_wave.rs` |
 | `content_identity.db` | 物理ファイルの size / 先頭 64 KiB hash / 全体 hash と、復元元か検出 cache だけかを表す `has_restorable_content`、復元辞退組を保持する。schema は `PRAGMA user_version` の単一入口で作成 / upgrade し、unversioned A1 行へ列を足す migration の default は復元元を表す `1`。期待 schema を用意できない session は typed `Unusable` とし、空台帳として処理を続けない | `content_identity.rs` + `app/content_identity_detection.rs` |
 | `auto_aspect_cache.db` | Auto サムネイル比率のフォルダ別前回確定値と、UUID table に置く Collection root 別前回確定値。後続の実統計は既存ゲート (streak/cooldown 等) に従って補正する。Collection の DB I/O は単一 actor に限定し、prepare worker が最大 100 ms 待つ optional Get、UI はメモリ値だけを扱う。サムネイルキャッシュ管理の全件・期限整理は両 table を対象にする | `auto_aspect_cache.rs` + `app.rs` |

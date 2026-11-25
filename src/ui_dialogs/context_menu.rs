@@ -955,6 +955,48 @@ impl crate::app::App {
         true
     }
 
+    #[cfg(test)]
+    pub(crate) fn dispatch_grid_paste_command_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        folder: PathBuf,
+    ) {
+        let target = self.context_menu_target(
+            0,
+            GridItem::Folder(folder.clone()),
+            true,
+            false,
+            Some(folder),
+            ContextMenuSurface::Grid,
+            None,
+        );
+        let _ = self.dispatch_native_grid_context_command(ctx, MenuCommand::Paste, &target);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispatch_grid_item_command_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        item: GridItem,
+        command: MenuCommand,
+    ) {
+        let target =
+            self.context_menu_target(0, item, false, false, None, ContextMenuSurface::Grid, None);
+        let _ = self.dispatch_native_grid_context_command(ctx, command, &target);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispatch_copy_key_action_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        action: crate::keymap::KeyAction,
+        dispatch: impl FnOnce(&mut Self, &egui::Context, MenuCommand),
+    ) {
+        self.dispatch_copy_key_action_with(ctx, action, |app, ctx, command, _| {
+            dispatch(app, ctx, command)
+        });
+    }
+
     pub(crate) fn handle_copy_action_keys(&mut self, ctx: &egui::Context, fullscreen: bool) {
         use crate::keymap::KeyAction::*;
         let actions = if fullscreen {
@@ -1986,26 +2028,9 @@ impl crate::app::App {
             }
             MenuCommand::Paste => {
                 if target.is_folder_context
-                    && let (Some(hwnd), Some(folder)) =
-                        (self.main_hwnd, target.folder_command_target.clone())
+                    && let Some(folder) = target.folder_command_target.clone()
                 {
-                    if !self.admit_book_append_followup_mutation() {
-                        return None;
-                    }
-                    // Ctrl+V と同じ約束。Shell が何を作るかは分からないので、呼ぶ前の
-                    // 一覧を控えて差分で拾う ([`crate::post_operation_selection`])。
-                    self.request_post_operation_selection_for_added_items(folder.clone());
-                    let result = crate::native_context_menu::invoke_shell_folder_background_verb(
-                        hwnd,
-                        &folder,
-                        crate::native_context_menu::ShellClipboardVerb::Paste,
-                    );
-                    Self::resync_egui_modifiers_from_os(ctx);
-                    if let Err(err) = result {
-                        crate::logger::log(format!("native_context_menu: mIV Paste failed: {err}"));
-                        // Ctrl+V と同じ約束。起きなかった貼り付けの要求は残さない (R-08)。
-                        self.cancel_post_operation_selection("shell_paste_failed");
-                    }
+                    self.paste_grid_files_to_folder(ctx, folder);
                 }
                 None
             }
@@ -2966,7 +2991,19 @@ fn copy_zip_image_to_clipboard(
 /// 遅い decode が後続の clipboard 操作を上書きしないよう、呼び出し開始時点で
 /// clipboard 書き込み世代を予約する。
 pub fn reserve_clipboard_write_sequence() -> u64 {
+    #[cfg(test)]
+    FILE_CLIPBOARD_WRITE_RESERVATIONS.with(|count| count.set(count.get() + 1));
     bump_clipboard_seq()
+}
+
+#[cfg(test)]
+thread_local! {
+    static FILE_CLIPBOARD_WRITE_RESERVATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn clipboard_file_write_reservations_for_test() -> u64 {
+    FILE_CLIPBOARD_WRITE_RESERVATIONS.with(std::cell::Cell::get)
 }
 
 /// 予約済み clipboard 世代で RGBA8 画像をコピーする。

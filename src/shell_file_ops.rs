@@ -896,6 +896,8 @@ pub struct ShellRenameOutcome {
     pub target: PathBuf,
     pub new_path: PathBuf,
     pub operation: ShellTransferOutcome,
+    pub converted_archive_rels: Vec<PathBuf>,
+    pub converted_archive_enumeration_incomplete: bool,
 }
 
 pub type ShellRenameResult = Result<ShellRenameOutcome, String>;
@@ -996,10 +998,12 @@ fn run_rename_item(hwnd: isize, target: PathBuf, new_name: String) -> ShellRenam
         1,
         target.parent().unwrap_or(&target),
     );
+    let mut classification_failed = false;
     let folders = match std::fs::metadata(&target) {
         Ok(metadata) if metadata.is_dir() => vec![target.clone()],
         Ok(_) => Vec::new(),
         Err(error) => {
+            classification_failed = true;
             crate::logger::log(format!(
                 "mutation_fence: cannot classify {target:?}: {error}"
             ));
@@ -1041,10 +1045,22 @@ fn run_rename_item(hwnd: isize, target: PathBuf, new_name: String) -> ShellRenam
             ));
         }
     }
+    // Freeze the filesystem inventory before publishing completion. App still owns
+    // rename_pending, so another rename/delete cannot overtake this enumeration.
+    let mut enumeration = if operation.classification() == ShellOperationClassification::Completed
+        && !folders.is_empty()
+    {
+        crate::rename_key_migration::collect_converted_archive_rels(&new_path)
+    } else {
+        Default::default()
+    };
+    enumeration.incomplete |= classification_failed;
     Ok(ShellRenameOutcome {
         target,
         new_path,
         operation,
+        converted_archive_rels: enumeration.converted_archive_rels,
+        converted_archive_enumeration_incomplete: enumeration.incomplete,
     })
 }
 

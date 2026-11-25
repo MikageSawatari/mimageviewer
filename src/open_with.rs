@@ -400,7 +400,7 @@ fn association_launch_error_message(error: &AssociationLaunchError) -> String {
 }
 
 #[cfg(windows)]
-struct ComApartmentGuard {
+pub(crate) struct ComApartmentGuard {
     uninitialize: bool,
 }
 
@@ -414,7 +414,7 @@ impl Drop for ComApartmentGuard {
 }
 
 #[cfg(windows)]
-fn initialize_com_sta() -> Result<ComApartmentGuard, windows::core::Error> {
+pub(crate) fn initialize_com_sta() -> Result<ComApartmentGuard, windows::core::Error> {
     use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 
     let result = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };

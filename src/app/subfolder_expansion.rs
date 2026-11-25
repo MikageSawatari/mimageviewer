@@ -5,7 +5,7 @@
 //! 集約する。ZIP/PDF/変換アーカイブの内部展開や watcher 追従は扱わない。
 
 use super::*;
-use crate::app::listing_sort::without_duration_request;
+use crate::app::listing_sort::without_lazy_metric_request;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1101,7 +1101,7 @@ fn sorted_entry_indices_for_request(
     mut progress: Option<&mut dyn FnMut(usize)>,
     chunk_size: usize,
 ) -> Option<Vec<usize>> {
-    let request = without_duration_request(request);
+    let request = without_lazy_metric_request(request);
     let total = entries.len();
     if total == 0 {
         report_subfolder_sort_progress(&mut progress, 0);
@@ -1311,7 +1311,7 @@ fn prepare_subfolder_expansion(
     cancel: &AtomicBool,
     tx: &mpsc::Sender<SubfolderExpansionPrepareEvent>,
 ) -> Result<Option<PreparedSubfolderExpansion>, String> {
-    options.request = without_duration_request(options.request);
+    options.request = without_lazy_metric_request(options.request);
     let reused_metadata = options.reused_metadata.as_ref();
     let total = snapshot.entries.len();
     let rating_order = matches!(
@@ -2274,7 +2274,7 @@ impl App {
         {
             crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::Numeric)
         } else {
-            without_duration_request(crate::rating_sort::ListingOrderRequest::from_settings(
+            without_lazy_metric_request(crate::rating_sort::ListingOrderRequest::from_settings(
                 &listing_settings,
             ))
         };
@@ -3180,6 +3180,10 @@ mod tests {
             rx,
             started_at: Instant::now(),
             toast_shown: false,
+            scan_phase: std::sync::Arc::new(crate::app::startup_ops::StartupScanPhase::new()),
+            input_kind: crate::app::startup_ops::StartupResolveInputKind::Explicit(
+                StartupOpenPathSource::InitialStartup,
+            ),
             held_resolve_for_activation_admission: None,
             diagnostic: None,
         });
@@ -3194,6 +3198,10 @@ mod tests {
             bookmark_relative_page_openable: None,
             elapsed_ms: 1.0,
             direct_media: None,
+            folder_scan: None,
+            scan_policy: None,
+            scan_policy_mixed: false,
+            default_target: None,
         }
     }
 

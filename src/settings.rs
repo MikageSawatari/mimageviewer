@@ -304,6 +304,29 @@ impl DetachedViewerWindowPlacement {
 // FavoriteEntry
 // -----------------------------------------------------------------------
 
+/// お気に入りの配下で表紙の自動切り出しを使うか。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FavoriteCoverAutoCropPreference {
+    #[default]
+    FollowGlobal,
+    On,
+    Off,
+}
+
+impl FavoriteCoverAutoCropPreference {
+    pub(crate) const fn all() -> &'static [Self] {
+        &[Self::FollowGlobal, Self::On, Self::Off]
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::FollowGlobal => "全体設定に従う",
+            Self::On => "切り出す",
+            Self::Off => "切り出さない",
+        }
+    }
+}
+
 /// お気に入りフォルダの 1 エントリ。
 ///
 /// `name` はユーザが任意に付けられる表示名 (ツールバーのボタンラベル等で使用)。
@@ -334,6 +357,8 @@ pub struct FavoriteEntry {
     pub auto_index_thumbs: bool,
     /// 現在の画像の別バージョンを探す索引の対象にするか。
     pub auto_index_similar: bool,
+    /// 表紙の自動切り出し。全体設定に従う場合は親のお気に入りの指定も引き継ぐ。
+    pub cover_auto_crop: FavoriteCoverAutoCropPreference,
 }
 
 // -----------------------------------------------------------------------
@@ -511,6 +536,8 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                 auto_index_thumbs: bool,
                 #[serde(default)]
                 auto_index_similar: bool,
+                #[serde(default)]
+                cover_auto_crop: FavoriteCoverAutoCropPreference,
             },
         }
 
@@ -529,6 +556,7 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                     auto_index_metadata: false,
                     auto_index_thumbs: false,
                     auto_index_similar: false,
+                    cover_auto_crop: FavoriteCoverAutoCropPreference::default(),
                 })
             }
             Raw::Full {
@@ -539,6 +567,7 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                 auto_index_metadata,
                 auto_index_thumbs,
                 auto_index_similar,
+                cover_auto_crop,
             } => Ok(FavoriteEntry {
                 id: id.unwrap_or_else(Uuid::nil),
                 name,
@@ -547,6 +576,7 @@ impl<'de> serde::Deserialize<'de> for FavoriteEntry {
                 auto_index_metadata,
                 auto_index_thumbs,
                 auto_index_similar,
+                cover_auto_crop,
             }),
         }
     }
@@ -558,7 +588,7 @@ impl serde::Serialize for FavoriteEntry {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("FavoriteEntry", 7)?;
+        let mut s = serializer.serialize_struct("FavoriteEntry", 8)?;
         s.serialize_field("id", &self.id)?;
         s.serialize_field("name", &self.name)?;
         s.serialize_field("path", &self.path)?;
@@ -566,6 +596,7 @@ impl serde::Serialize for FavoriteEntry {
         s.serialize_field("auto_index_metadata", &self.auto_index_metadata)?;
         s.serialize_field("auto_index_thumbs", &self.auto_index_thumbs)?;
         s.serialize_field("auto_index_similar", &self.auto_index_similar)?;
+        s.serialize_field("cover_auto_crop", &self.cover_auto_crop)?;
         s.end()
     }
 }
@@ -581,6 +612,7 @@ impl FavoriteEntry {
             auto_index_metadata: false,
             auto_index_thumbs: false,
             auto_index_similar: false,
+            cover_auto_crop: FavoriteCoverAutoCropPreference::default(),
         }
     }
 }
@@ -2309,17 +2341,35 @@ impl FacetNameFilterWidth {
 pub enum SortOrder {
     #[default]
     FileName, // ファイル名順（辞書順）
-    FileNameDesc, // ファイル名順（降順）
-    Numeric,      // 番号順（自然順: 1, 2, 9, 10, 11）
-    NumericDesc,  // 番号順（自然順、降順）
-    DateAsc,      // 日付順（昇順）
-    DateDesc,     // 日付順（降順）
-    SizeAsc,      // サイズ順（昇順、不明は末尾）
-    SizeDesc,     // サイズ順（降順、不明は末尾）
-    DurationAsc,  // 動画・音声の長さ順（昇順、不明は末尾）
-    DurationDesc, // 動画・音声の長さ順（降順、不明は末尾）
-    RatingAsc,    // 評価順（低い順）
-    RatingDesc,   // 評価順（高い順）
+    FileNameDesc,  // ファイル名順（降順）
+    Numeric,       // 番号順（自然順: 1, 2, 9, 10, 11）
+    NumericDesc,   // 番号順（自然順、降順）
+    DateAsc,       // 日付順（昇順）
+    DateDesc,      // 日付順（降順）
+    SizeAsc,       // サイズ順（昇順、不明は末尾）
+    SizeDesc,      // サイズ順（降順、不明は末尾）
+    DurationAsc,   // 動画・音声の長さ順（昇順、不明は末尾）
+    DurationDesc,  // 動画・音声の長さ順（降順、不明は末尾）
+    PageCountAsc,  // 本のページ数順（昇順、不明は末尾）
+    PageCountDesc, // 本のページ数順（降順、不明は末尾）
+    RatingAsc,     // 評価順（低い順）
+    RatingDesc,    // 評価順（高い順）
+}
+
+/// worker で後から取得する一覧の並べ替えキー。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LazyMetric {
+    Duration,
+    PageCount,
+}
+
+/// 一覧の snapshot に採用した本のページ数。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum ListingPageCount {
+    Known(u32),
+    Unavailable,
+    #[default]
+    Missing,
 }
 
 /// 一覧の snapshot に採用した動画・音声の長さ。表示値自体は丸めない。
@@ -2351,6 +2401,7 @@ pub(crate) struct ListingSortMetadata {
     pub(crate) mtime: i64,
     pub(crate) file_size: Option<i64>,
     pub(crate) duration: ListingDuration,
+    pub(crate) page_count: ListingPageCount,
 }
 
 impl ListingSortMetadata {
@@ -2359,6 +2410,7 @@ impl ListingSortMetadata {
             mtime,
             file_size,
             duration: ListingDuration::Missing,
+            page_count: ListingPageCount::Missing,
         }
     }
 }
@@ -2376,6 +2428,8 @@ impl SortOrder {
             Self::SizeDesc => "サイズ順（大きい順）",
             Self::DurationAsc => "長さ（短い順）",
             Self::DurationDesc => "長さ（長い順）",
+            Self::PageCountAsc => "ページ数（少ない順）",
+            Self::PageCountDesc => "ページ数（多い順）",
             Self::RatingAsc => "評価（低い順）",
             Self::RatingDesc => "評価（高い順）",
         }
@@ -2393,6 +2447,8 @@ impl SortOrder {
             Self::SizeDesc => "サイズ↓",
             Self::DurationAsc => "長さ↑",
             Self::DurationDesc => "長さ↓",
+            Self::PageCountAsc => "ページ↑",
+            Self::PageCountDesc => "ページ↓",
             Self::RatingAsc => "評価↑",
             Self::RatingDesc => "評価↓",
         }
@@ -2413,6 +2469,12 @@ impl SortOrder {
             }
             Self::DurationDesc => {
                 "動画・音声の長さが長い順。長さが分からないものは末尾。読み込み後に更新すると並べ直します"
+            }
+            Self::PageCountAsc => {
+                "本のページ数が少ない順。ページ数が分からないものは末尾。読み込み後に更新すると並べ直します"
+            }
+            Self::PageCountDesc => {
+                "本のページ数が多い順。ページ数が分からないものは末尾。読み込み後に更新すると並べ直します"
             }
             Self::RatingAsc => {
                 "評価の低い順。未評価は既定で★2と★3の間、設定で★1より下にもできます。評価を変えても、更新するまで並びは変わりません"
@@ -2435,6 +2497,8 @@ impl SortOrder {
             Self::SizeDesc,
             Self::DurationAsc,
             Self::DurationDesc,
+            Self::PageCountAsc,
+            Self::PageCountDesc,
             Self::RatingAsc,
             Self::RatingDesc,
         ]
@@ -2459,6 +2523,14 @@ impl SortOrder {
 
     pub const fn is_duration(self) -> bool {
         matches!(self, Self::DurationAsc | Self::DurationDesc)
+    }
+
+    pub(crate) const fn lazy_metric(self) -> Option<LazyMetric> {
+        match self {
+            Self::DurationAsc | Self::DurationDesc => Some(LazyMetric::Duration),
+            Self::PageCountAsc | Self::PageCountDesc => Some(LazyMetric::PageCount),
+            _ => None,
+        }
     }
 
     /// フォルダ代表サムネイルの探索に使える既存4候補。
@@ -2550,8 +2622,8 @@ impl SortOrder {
                 debug_assert!(false, "rating list sort requires complete rating facts");
                 name_a.compare_file_name(name_b)
             }
-            Self::DurationAsc | Self::DurationDesc => {
-                debug_assert!(false, "duration list sort requires compare_listing_keys");
+            Self::DurationAsc | Self::DurationDesc | Self::PageCountAsc | Self::PageCountDesc => {
+                debug_assert!(false, "lazy metric list sort requires compare_listing_keys");
                 name_a.compare_file_name(name_b)
             }
         }
@@ -2598,6 +2670,20 @@ impl SortOrder {
                     _ => Ordering::Equal,
                 };
                 duration_order.then_with(name_tie)
+            }
+            Self::PageCountAsc | Self::PageCountDesc => {
+                let page_count_order = match (meta_a.page_count, meta_b.page_count) {
+                    (ListingPageCount::Known(a), ListingPageCount::Known(b))
+                        if self == Self::PageCountAsc =>
+                    {
+                        a.cmp(&b)
+                    }
+                    (ListingPageCount::Known(a), ListingPageCount::Known(b)) => b.cmp(&a),
+                    (ListingPageCount::Known(_), _) => Ordering::Less,
+                    (_, ListingPageCount::Known(_)) => Ordering::Greater,
+                    _ => Ordering::Equal,
+                };
+                page_count_order.then_with(name_tie)
             }
             Self::RatingAsc | Self::RatingDesc => {
                 debug_assert!(false, "rating list sort requires complete rating facts");
@@ -3649,16 +3735,6 @@ impl SpreadMode {
         }
     }
 
-    /// **入力の左右を反転するか。**「右」が次ページ側になるモード。
-    ///
-    /// [`Self::is_rtl`] は**見開きのペア並び順**を表す別の問いで、横長分割を含まない。
-    /// 入力の左右まで `is_rtl` で決めていたため、横長分割 右→左 を選んでも矢印キーと
-    /// タップの左右が反転しなかった (2026-08-26 の実機報告。シークバーの向きは合っていた)。
-    /// 読み順は [`Self::reading_direction`] が正本なので、そこから導く。
-    pub fn advances_right_to_left(self) -> bool {
-        matches!(self.reading_direction(), Some(ReadingDirection::Rtl))
-    }
-
     /// 見開きの表紙有無を保ったまま横方向だけを差し替える。
     ///
     /// Single / 旧 Vertical は見開き構成ではないため、そのまま返す。
@@ -3697,7 +3773,7 @@ impl FinalCoverSpreadPreference {
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
-            Self::FollowGlobal => "全体に従う",
+            Self::FollowGlobal => "全体設定に従う",
             Self::On => "オン",
             Self::Off => "オフ",
         }
@@ -5425,6 +5501,9 @@ pub struct Settings {
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
+    /// サムネイル右下に本のページ数を表示する。
+    #[serde(default = "default_true")]
+    pub thumb_show_page_count: bool,
     /// 本・動画・音声のサムネイル下端に、記録済みの読書・再生位置を表示する。
     #[serde(default = "default_true")]
     pub thumb_show_resume_meter: bool,
@@ -5814,6 +5893,12 @@ pub struct Settings {
     /// 一括エクスポートの出力サイズ。
     #[serde(default)]
     pub export_batch_scale: crate::export_dialog::ExportScale,
+    /// 一括出力の前回値。旧4欄はこの値が無い設定の移行元だけに使う。
+    #[serde(default)]
+    pub export_batch_options: Option<crate::export_batch::BatchExportOptions>,
+    /// 一括書き出しの保存形式プリセット (保存順、PC 固有パスを含む)。
+    #[serde(default)]
+    pub export_batch_presets: Vec<crate::export_batch::BatchExportPreset>,
 
     // ── SNS 分割 ──────────────────────────────────────────────
     /// 直前に選んだ投稿先 (`"x"` / `"instagram"`)。ページ固有の配置は保存しない。
@@ -6231,6 +6316,9 @@ pub struct Settings {
     /// 旧既定10候補だけに長さ順を一度追加する。変更済み候補は保持する。
     #[serde(default)]
     pub(crate) toolbar_sort_duration_options_migrated: bool,
+    /// 旧既定12候補だけにページ数順を一度追加する。変更済み候補は保持する。
+    #[serde(default)]
+    pub(crate) toolbar_sort_page_count_options_migrated: bool,
     /// スマートフィルタバーに表示するボタン。
     /// 空 Vec は「ボタンを全部隠す」。アクティブ条件のチップと全解除は引き続き表示する。
     #[serde(default = "default_toolbar_facet_filter_items")]
@@ -8231,6 +8319,22 @@ pub(crate) fn default_toolbar_aspect_auto_visible() -> bool {
 fn default_toolbar_collections_display() -> ToolbarSectionDisplay {
     ToolbarSectionDisplay::Buttons
 }
+// Historical default is fixed: only this exact 12-item list is eligible for migration.
+const TOOLBAR_SORT_ITEMS_BEFORE_PAGE_COUNT: [SortOrder; 12] = [
+    SortOrder::FileName,
+    SortOrder::FileNameDesc,
+    SortOrder::Numeric,
+    SortOrder::NumericDesc,
+    SortOrder::DateAsc,
+    SortOrder::DateDesc,
+    SortOrder::SizeAsc,
+    SortOrder::SizeDesc,
+    SortOrder::DurationAsc,
+    SortOrder::DurationDesc,
+    SortOrder::RatingAsc,
+    SortOrder::RatingDesc,
+];
+
 pub(crate) fn default_toolbar_sort_items() -> Vec<SortOrder> {
     SortOrder::all().to_vec()
 }
@@ -8473,6 +8577,7 @@ impl Default for Settings {
             thumb_cover_auto_crop_folders: false,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
+            thumb_show_page_count: true,
             thumb_show_resume_meter: true,
             thumb_tooltip_show_filename: true,
             thumb_tooltip_show_image_dimensions: true,
@@ -8690,6 +8795,7 @@ impl Default for Settings {
             toolbar_sort_name_numeric_desc_options_migrated: true,
             toolbar_sort_rating_options_migrated: true,
             toolbar_sort_duration_options_migrated: true,
+            toolbar_sort_page_count_options_migrated: true,
             toolbar_facet_filter_items: default_toolbar_facet_filter_items(),
             toolbar_facet_duration_options_migrated: true,
             toolbar_facet_name_filter_index_stash: None,
@@ -8850,6 +8956,8 @@ impl Default for Settings {
             export_batch_template: default_export_batch_template(),
             export_batch_format: crate::capture::CaptureFormat::default(),
             export_batch_scale: crate::export_dialog::ExportScale::default(),
+            export_batch_options: None,
+            export_batch_presets: Vec::new(),
             sns_split_target: default_sns_split_target(),
             sns_split_count: default_sns_split_count(),
             sns_split_seam_permille: default_sns_split_seam_permille(),
@@ -9389,6 +9497,7 @@ pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
     settings.migrate_toolbar_sort_name_numeric_desc_options();
     settings.migrate_toolbar_sort_rating_options();
     settings.migrate_toolbar_sort_duration_options();
+    settings.migrate_toolbar_sort_page_count_options();
     settings.migrate_toolbar_facet_duration_options();
     settings.migrate_toolbar_folder_section();
     settings.sanitize();
@@ -9696,6 +9805,22 @@ impl Settings {
             || favorite_states
                 .into_iter()
                 .any(|state| state.sort_order.is_duration())
+    }
+
+    /// 共通・live・保存済みのお気に入りのいずれかがページ数順なら facts を要求する。
+    pub(crate) fn listing_may_sort_by_page_count<'a>(
+        &self,
+        favorite_states: impl IntoIterator<Item = &'a FavoriteViewState>,
+    ) -> bool {
+        let is_page_count = |order: SortOrder| order.lazy_metric() == Some(LazyMetric::PageCount);
+        is_page_count(self.sort_order)
+            || self
+                .favorite_view_overlay
+                .as_ref()
+                .is_some_and(|overlay| is_page_count(overlay.common.sort_order))
+            || favorite_states
+                .into_iter()
+                .any(|state| is_page_count(state.sort_order))
     }
 
     /// Resolve a configurable relative-seek step without rewriting a stored
@@ -10133,9 +10258,20 @@ impl Settings {
             SortOrder::RatingDesc,
         ];
         if self.toolbar_sort_items == LEGACY_DEFAULT {
-            self.toolbar_sort_items = default_toolbar_sort_items();
+            self.toolbar_sort_items = TOOLBAR_SORT_ITEMS_BEFORE_PAGE_COUNT.to_vec();
         }
         self.toolbar_sort_duration_options_migrated = true;
+        true
+    }
+
+    fn migrate_toolbar_sort_page_count_options(&mut self) -> bool {
+        if self.toolbar_sort_page_count_options_migrated {
+            return false;
+        }
+        if self.toolbar_sort_items == TOOLBAR_SORT_ITEMS_BEFORE_PAGE_COUNT {
+            self.toolbar_sort_items = default_toolbar_sort_items();
+        }
+        self.toolbar_sort_page_count_options_migrated = true;
         true
     }
 
@@ -10250,6 +10386,8 @@ impl Settings {
         let toolbar_sort_rating_options_migrated = settings.migrate_toolbar_sort_rating_options();
         let toolbar_sort_duration_options_migrated =
             settings.migrate_toolbar_sort_duration_options();
+        let toolbar_sort_page_count_options_migrated =
+            settings.migrate_toolbar_sort_page_count_options();
         let toolbar_facet_duration_options_migrated =
             settings.migrate_toolbar_facet_duration_options();
         let toolbar_folder_section_migrated = settings.migrate_toolbar_folder_section();
@@ -10424,6 +10562,7 @@ impl Settings {
             || toolbar_sort_name_numeric_desc_options_migrated
             || toolbar_sort_rating_options_migrated
             || toolbar_sort_duration_options_migrated
+            || toolbar_sort_page_count_options_migrated
             || toolbar_facet_duration_options_migrated
             || toolbar_folder_section_migrated
             || legacy_keymap_import.changed
@@ -11314,6 +11453,7 @@ impl Settings {
     /// `src` 側は Vec / String など大きいフィールドは `std::mem::take` で奪うので、
     /// 呼出後は空の既定値になる (呼出元はすぐ `*self = state.settings` で捨てる想定)。
     pub fn overwrite_non_preferences_from(&mut self, src: &mut Settings) {
+        self.export_batch_presets = std::mem::take(&mut src.export_batch_presets);
         // 通知を閉じる前の環境設定 draft で既読を巻き戻さない。
         self.whats_new_acknowledged_version
             .clone_from(&src.whats_new_acknowledged_version);
@@ -11437,6 +11577,8 @@ impl Settings {
             src.toolbar_sort_name_numeric_desc_options_migrated;
         self.toolbar_sort_rating_options_migrated = src.toolbar_sort_rating_options_migrated;
         self.toolbar_sort_duration_options_migrated = src.toolbar_sort_duration_options_migrated;
+        self.toolbar_sort_page_count_options_migrated =
+            src.toolbar_sort_page_count_options_migrated;
         self.toolbar_facet_duration_options_migrated = src.toolbar_facet_duration_options_migrated;
         self.toolbar_facet_filter_items = std::mem::take(&mut src.toolbar_facet_filter_items);
         self.toolbar_facet_name_filter_index_stash =
@@ -12399,6 +12541,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn thumb_show_page_count_defaults_on_and_preserves_disabled_setting() {
+        assert!(Settings::default().thumb_show_page_count);
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.thumb_show_page_count);
+        let disabled: Settings =
+            serde_json::from_str(r#"{"thumb_show_page_count":false}"#).unwrap();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.thumb_show_page_count);
+    }
+
+    #[test]
+    fn thumb_show_page_count_missing_db_key_defaults_on_and_false_roundtrips() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_page_count'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        let mut loaded = db.load_into_settings().unwrap();
+        assert!(loaded.thumb_show_page_count);
+        loaded.thumb_show_page_count = false;
+        db.save_full(&loaded).unwrap();
+        drop(db);
+        let reopened = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        assert!(!reopened.load_into_settings().unwrap().thumb_show_page_count);
+    }
+
     use super::*;
 
     fn released_image_ext_priority() -> Vec<String> {
@@ -12877,22 +13054,8 @@ mod tests {
             );
             // 元へ戻る。
             assert_eq!(flipped.with_reading_direction(direction), mode, "{mode:?}");
-            // **入力の左右も同じ読み順から導く。**ペア並び順 (`is_rtl`) で決めていたため、
-            // 横長分割 右→左 で矢印キーが反転しなかった (2026-08-26 の実機報告)。
-            assert_eq!(
-                mode.advances_right_to_left(),
-                direction == ReadingDirection::Rtl,
-                "{mode:?}"
-            );
         }
 
-        // 読み順を持たないモードは反転しない (1ページ表示の従来動作を変えない)。
-        assert!(!SpreadMode::Single.advances_right_to_left());
-        // 見開き 右→左 は従来どおり反転し、横長分割 右→左 も同じになる。
-        assert!(SpreadMode::Rtl.advances_right_to_left());
-        assert!(SpreadMode::RtlCover.advances_right_to_left());
-        assert!(SpreadMode::SplitRtl.advances_right_to_left());
-        assert!(!SpreadMode::SplitLtr.advances_right_to_left());
         // ペア並び順は分割を含まない。2 つの問いを取り違えない。
         assert!(!SpreadMode::SplitRtl.is_rtl());
     }
@@ -18947,6 +19110,61 @@ mod tests {
     // -- FavoriteEntry serde --
 
     #[test]
+    fn favorite_cover_auto_crop_preferences_match_labels_and_default() {
+        use FavoriteCoverAutoCropPreference::{FollowGlobal, Off, On};
+
+        assert_eq!(
+            FavoriteCoverAutoCropPreference::all(),
+            &[FollowGlobal, On, Off]
+        );
+        assert_eq!(FavoriteCoverAutoCropPreference::default(), FollowGlobal);
+        assert_eq!(FollowGlobal.label(), "全体設定に従う");
+        assert_eq!(On.label(), "切り出す");
+        assert_eq!(Off.label(), "切り出さない");
+        assert_eq!(
+            FavoriteEntry::new("new".into(), PathBuf::from(r"C:\new")).cover_auto_crop,
+            FollowGlobal
+        );
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_json_missing_defaults_to_follow_global() {
+        for json in [
+            r#""C:\\legacy""#,
+            r#"{"name":"old","path":"C:\\old"}"#,
+            r#"{"name":"old","path":"C:\\old","auto_index_similar":true,"future_field":1}"#,
+        ] {
+            let entry: FavoriteEntry = serde_json::from_str(json).unwrap();
+            assert_eq!(
+                entry.cover_auto_crop,
+                FavoriteCoverAutoCropPreference::FollowGlobal
+            );
+        }
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_json_roundtrip_all_preferences() {
+        for preference in FavoriteCoverAutoCropPreference::all() {
+            let mut entry = FavoriteEntry::new("book".into(), PathBuf::from(r"C:\book"));
+            entry.auto_index_similar = true;
+            entry.cover_auto_crop = *preference;
+            let json = serde_json::to_value(&entry).unwrap();
+            assert_eq!(json.as_object().unwrap().len(), 8);
+            assert_eq!(
+                json["cover_auto_crop"],
+                serde_json::to_value(preference).unwrap()
+            );
+
+            let restored: FavoriteEntry = serde_json::from_value(json).unwrap();
+            assert_eq!(restored.id, entry.id);
+            assert_eq!(restored.name, entry.name);
+            assert_eq!(restored.path, entry.path);
+            assert!(restored.auto_index_similar);
+            assert_eq!(restored.cover_auto_crop, *preference);
+        }
+    }
+
+    #[test]
     fn favorite_deserialize_legacy_string() {
         let json = r#""C:\\foo\\bar""#;
         let entry: FavoriteEntry = serde_json::from_str(json).unwrap();
@@ -19562,6 +19780,116 @@ mod tests {
     }
 
     #[test]
+    fn page_count_sort_unknowns_last_both_directions_and_name_ties() {
+        assert_eq!(
+            ListingSortMetadata::new(0, None).page_count,
+            ListingPageCount::Missing
+        );
+        let rows = [
+            ("unknown-b", ListingPageCount::Missing),
+            ("ten", ListingPageCount::Known(10)),
+            ("zero-b", ListingPageCount::Known(0)),
+            ("zero-a", ListingPageCount::Known(0)),
+            ("unknown-a", ListingPageCount::Unavailable),
+        ];
+        let sorted = |order: SortOrder| {
+            let mut rows = rows;
+            rows.sort_by(|(a_name, a), (b_name, b)| {
+                order.compare_listing_keys(
+                    &order.name_key(a_name),
+                    ListingSortMetadata {
+                        page_count: *a,
+                        ..ListingSortMetadata::new(0, None)
+                    },
+                    &order.name_key(b_name),
+                    ListingSortMetadata {
+                        page_count: *b,
+                        ..ListingSortMetadata::new(0, None)
+                    },
+                )
+            });
+            rows.map(|(name, _)| name)
+        };
+        assert_eq!(
+            sorted(SortOrder::PageCountAsc),
+            ["zero-a", "zero-b", "ten", "unknown-a", "unknown-b"]
+        );
+        assert_eq!(
+            sorted(SortOrder::PageCountDesc),
+            ["ten", "zero-a", "zero-b", "unknown-a", "unknown-b"]
+        );
+    }
+
+    #[test]
+    fn page_count_wire_and_scan_common_live_or_saved_favorite_sort() {
+        for (order, wire) in [
+            (SortOrder::PageCountAsc, "PageCountAsc"),
+            (SortOrder::PageCountDesc, "PageCountDesc"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(order).unwrap(),
+                serde_json::json!(wire)
+            );
+            assert_eq!(
+                serde_json::from_value::<SortOrder>(serde_json::json!(wire)).unwrap(),
+                order
+            );
+            assert_eq!(order.lazy_metric(), Some(LazyMetric::PageCount));
+        }
+        let mut settings = Settings::default();
+        let mut saved = FavoriteViewState::from_settings(&settings);
+        assert!(!settings.listing_may_sort_by_page_count([&saved]));
+        saved.sort_order = SortOrder::PageCountDesc;
+        assert!(settings.listing_may_sort_by_page_count([&saved]));
+        saved.sort_order = SortOrder::FileName;
+        settings.sort_order = SortOrder::PageCountAsc;
+        assert!(settings.listing_may_sort_by_page_count([&saved]));
+        settings.favorite_view_overlay = Some(FavoriteViewOverlay {
+            favorite_id: Uuid::new_v4(),
+            common: FavoriteViewState::from_settings(&settings),
+        });
+        settings.sort_order = SortOrder::FileName;
+        assert!(settings.listing_may_sort_by_page_count([&saved]));
+        settings.favorite_view_overlay = None;
+        assert!(!settings.listing_may_sort_by_page_count([&saved]));
+        settings.sort_order = SortOrder::DurationAsc;
+        assert!(!settings.listing_may_sort_by_page_count([&saved]));
+    }
+
+    #[test]
+    fn page_count_toolbar_migration_only_extends_untouched_defaults_once() {
+        let legacy: Vec<_> = SortOrder::all()
+            .iter()
+            .copied()
+            .filter(|sort| sort.lazy_metric() != Some(LazyMetric::PageCount))
+            .collect();
+        assert_eq!(legacy.len(), 12);
+        let mut old: Settings =
+            serde_json::from_value(serde_json::json!({ "toolbar_sort_items": legacy })).unwrap();
+        assert!(old.migrate_toolbar_sort_page_count_options());
+        assert_eq!(old.toolbar_sort_items, SortOrder::all());
+        old.toolbar_sort_items = legacy.clone();
+        let mut loaded: Settings =
+            serde_json::from_value(serde_json::to_value(old).unwrap()).unwrap();
+        assert!(!loaded.migrate_toolbar_sort_page_count_options());
+        assert_eq!(loaded.toolbar_sort_items, legacy);
+        let mut partial = legacy.clone();
+        partial.pop();
+        for items in [
+            vec![],
+            vec![SortOrder::FileName],
+            partial,
+            legacy.into_iter().rev().collect(),
+        ] {
+            let mut custom: Settings =
+                serde_json::from_value(serde_json::json!({ "toolbar_sort_items": items })).unwrap();
+            let before = custom.toolbar_sort_items.clone();
+            assert!(custom.migrate_toolbar_sort_page_count_options());
+            assert_eq!(custom.toolbar_sort_items, before);
+        }
+    }
+
+    #[test]
     fn duration_presets_boundaries_ranges_and_legacy_json() {
         for (preset, min, max) in [
             (FacetDurationPreset::Under1Minute, 0, Some(60)),
@@ -19646,7 +19974,7 @@ mod tests {
 
     #[test]
     fn duration_sort_wire_and_candidate_allowlists() {
-        assert_eq!(SortOrder::all().len(), 12);
+        assert_eq!(SortOrder::all().len(), 14);
         for &order in SortOrder::all() {
             let wire = serde_json::to_string(&order).unwrap();
             assert_eq!(serde_json::from_str::<SortOrder>(&wire).unwrap(), order);
@@ -19660,7 +19988,7 @@ mod tests {
                 serde_json::from_str::<FavoriteViewState>(&favorite_wire).unwrap(),
                 favorite
             );
-            if order.is_duration() {
+            if order.lazy_metric().is_some() {
                 assert!(!SortOrder::collection_options().contains(&order));
                 assert!(!SortOrder::folder_thumb_options().contains(&order));
             }
@@ -19701,13 +20029,19 @@ mod tests {
         let legacy = SortOrder::all()
             .iter()
             .copied()
-            .filter(|sort| !sort.is_duration())
+            .filter(|sort| sort.lazy_metric().is_none())
             .collect::<Vec<_>>();
         let mut old: Settings =
             serde_json::from_value(serde_json::json!({ "toolbar_sort_items": legacy })).unwrap();
         assert!(old.migrate_toolbar_sort_duration_options());
-        assert_eq!(old.toolbar_sort_items, SortOrder::all());
-        old.toolbar_sort_items.retain(|sort| !sort.is_duration());
+        let duration_defaults: Vec<_> = SortOrder::all()
+            .iter()
+            .copied()
+            .filter(|sort| sort.lazy_metric() != Some(LazyMetric::PageCount))
+            .collect();
+        assert_eq!(old.toolbar_sort_items, duration_defaults);
+        old.toolbar_sort_items
+            .retain(|sort| sort.lazy_metric().is_none());
         let mut loaded: Settings =
             serde_json::from_value(serde_json::to_value(old).unwrap()).unwrap();
         assert!(!loaded.migrate_toolbar_sort_duration_options());
@@ -19851,7 +20185,7 @@ mod tests {
 
         let current = Settings::default();
         assert!(current.toolbar_sort_name_numeric_desc_options_migrated);
-        assert_eq!(current.toolbar_sort_items.len(), 12);
+        assert_eq!(current.toolbar_sort_items.len(), 14);
     }
 
     #[test]
@@ -20376,6 +20710,7 @@ mod tests {
         previous_release.toolbar_sort_name_numeric_desc_options_migrated = false;
         previous_release.toolbar_sort_rating_options_migrated = false;
         previous_release.toolbar_sort_duration_options_migrated = false;
+        previous_release.toolbar_sort_page_count_options_migrated = false;
         previous_release.save();
 
         reset_backup_state_for_test();
@@ -20398,6 +20733,7 @@ mod tests {
         old.toolbar_sort_items = SortOrder::collection_options().to_vec();
         old.toolbar_sort_rating_options_migrated = false;
         old.toolbar_sort_duration_options_migrated = false;
+        old.toolbar_sort_page_count_options_migrated = false;
         old.save();
 
         reset_backup_state_for_test();
@@ -20417,10 +20753,12 @@ mod tests {
     fn toolbar_duration_markers_survive_settings_db_reload_without_restoring_hidden_options() {
         let _env = setup_backup_env();
         let mut old = Settings::default();
-        old.toolbar_sort_items.retain(|sort| !sort.is_duration());
+        old.toolbar_sort_items
+            .retain(|sort| sort.lazy_metric().is_none());
         old.toolbar_facet_filter_items
             .retain(|item| *item != ToolbarFacetFilterItem::Duration);
         old.toolbar_sort_duration_options_migrated = false;
+        old.toolbar_sort_page_count_options_migrated = false;
         old.toolbar_facet_duration_options_migrated = false;
         old.save();
 
@@ -20448,6 +20786,28 @@ mod tests {
         );
         assert!(hidden.toolbar_sort_duration_options_migrated);
         assert!(hidden.toolbar_facet_duration_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_page_count_marker_survives_db_reload_without_restoring_hidden_options() {
+        let _env = setup_backup_env();
+        let mut old = Settings::default();
+        old.toolbar_sort_items
+            .retain(|sort| sort.lazy_metric() != Some(LazyMetric::PageCount));
+        old.toolbar_sort_page_count_options_migrated = false;
+        old.save();
+        reset_backup_state_for_test();
+        let mut loaded = Settings::load();
+        assert_eq!(loaded.toolbar_sort_items, SortOrder::all());
+        assert!(loaded.toolbar_sort_page_count_options_migrated);
+        loaded
+            .toolbar_sort_items
+            .retain(|sort| sort.lazy_metric() != Some(LazyMetric::PageCount));
+        loaded.save();
+        reset_backup_state_for_test();
+        let hidden = Settings::load();
+        assert_eq!(hidden.toolbar_sort_items, loaded.toolbar_sort_items);
+        assert!(hidden.toolbar_sort_page_count_options_migrated);
     }
 
     #[test]

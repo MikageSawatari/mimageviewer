@@ -1955,6 +1955,59 @@ mod tests {
     use crate::keymap::KeyBindingOverride;
 
     #[test]
+    fn agent_operations_closed_restore_drops_import_worker_receiver_before_ai_commit() {
+        use mimageviewer_agent_ipc::{AgentLevel, OperationEdits};
+        let mut app = crate::app::setup_app_for_test();
+        app.initialized = true;
+        app.indexer_init = crate::app::IndexerInit::Unavailable;
+        app.settings.agent_level = AgentLevel::ReadOnly;
+        app.settings.agent_allow_settings = true;
+        let ctx = egui::Context::default();
+        app.install_agent_changes(crate::agent_ipc::changes::ChangeController::new(), &ctx);
+        let old_bundle = crate::operation_customize_share::OperationCustomizeBundle::from_settings(
+            &app.settings,
+        );
+        let (send, receive) = std::sync::mpsc::channel();
+        app.settings_restore_state.operation_task_rx = Some(receive);
+        app.show_settings_restore = true;
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = crate::test_ui::headless_paint_output(ctx.run_pass(raw, |ctx| {
+            app.update_ime_state(ctx);
+            app.show_settings_restore_dialog(ctx);
+        }));
+        assert!(!app.show_settings_restore);
+        assert!(app.settings_restore_state.operation_task_rx.is_none());
+        let edits: OperationEdits =
+            serde_json::from_value(serde_json::json!({"keys":{"FsCopyImage":["F13"]}})).unwrap();
+        app.agent_set_operations(&edits, "after-close").unwrap();
+        let expected = app.settings.keymap.clone();
+        assert!(
+            send.send(OperationTaskResult::PreparedApply {
+                kind: OperationApplyKind::Import {
+                    source_label: "closed".into()
+                },
+                bundle: old_bundle,
+                result: Ok("unused-backup.db".into()),
+            })
+            .is_err()
+        );
+        app.show_settings_restore = true;
+        let _ =
+            crate::test_ui::headless_paint_output(ctx.run_pass(egui::RawInput::default(), |ctx| {
+                app.show_settings_restore_dialog(ctx)
+            }));
+        assert_eq!(app.settings.keymap, expected);
+        assert_eq!(crate::settings::Settings::load().keymap, expected);
+    }
+
+    #[test]
     fn settings_family_close_policy_preserves_tray_hide_and_latches_process_exit() {
         assert_eq!(
             settings_family_deferred_root_close(false, true),

@@ -1247,10 +1247,9 @@ fn realmachine50_parked_click_case_with_touch_policy(
                 assert_eq!(viewer.fullscreen_idx, Some(0));
                 assert_eq!(viewer.items.len(), 2, "the restored viewer has a next page");
                 assert!(viewer.reading_flow.is_paged());
-                viewer.spread_mode.advances_right_to_left()
+                viewer.input_advances_right_to_left()
             }).unwrap();
-            // Single-page mode uses LTR input: its left half requests the
-            // previous page and correctly stays at page zero without wrapping.
+            // Use the restored viewer's effective reading direction for its next-page side.
             let next = egui::pos2(CHILD_SIZE.x * if rtl { 0.25 } else { 0.75 }, CHILD_SIZE.y * 0.5);
             assert_eq!(crate::touch_input::classify_tap(&crate::touch_input::TapZoneGeometry {
                 surface: egui::Rect::from_min_size(egui::Pos2::ZERO, CHILD_SIZE),
@@ -2507,6 +2506,64 @@ fn wait_for_list_hydration(app: &mut App, ctx: &egui::Context) {
     });
 }
 
+fn wait_for_scenario_frames(
+    app: &mut App,
+    driver: &mut ScenarioDriver,
+    label: &str,
+    timeout: std::time::Duration,
+    ready: impl Fn(&App) -> bool,
+) {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        driver.root(app);
+        if ready(app) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label}: sidecar={:?} target={:?} main={:?} local_writes={} bookmarks={} xmp={} spread={} writers={}",
+            app.sidecar_restore
+                .as_ref()
+                .map(|restore| restore.presentation()),
+            app.sidecar_restore
+                .as_ref()
+                .map(|restore| restore.target_context()),
+            app.viewer_context_main(),
+            app.local_adjust_write_pending.len(),
+            app.book_bookmark_pending_requests.len(),
+            app.rating_xmp_hydration.is_busy(),
+            app.spread_shift_service
+                .as_ref()
+                .is_some_and(|service| service.is_busy()),
+            app.rename_migration_writers_busy(),
+        );
+        std::thread::yield_now();
+    }
+}
+
+fn initialize_main_startup(app: &mut AppTestEnvForTest, driver: &mut ScenarioDriver) {
+    // Exercise the real first frame, but never enumerate the user's Desktop.
+    // Keep the frame's global completion drains running while sidecar quiescence
+    // waits for them; polling the restore alone is not a complete app update.
+    let folder = app.tmp.path().join("scenario-main-startup");
+    std::fs::create_dir(&folder).unwrap();
+    app.settings.startup_folder_mode = crate::settings::StartupFolderMode::Specific;
+    app.settings.startup_folder_path = Some(folder.clone());
+    wait_for_scenario_frames(
+        app,
+        driver,
+        "main startup",
+        std::time::Duration::from_secs(30),
+        |app| {
+            app.initialized
+                && app.startup_open_path_resolve_pending.is_none()
+                && app.sidecar_restore.is_none()
+        },
+    );
+    assert!(app.initialized);
+    assert_eq!(app.current_folder.as_ref(), Some(&folder));
+}
+
 fn run_scenario_a(book: ScenarioABook) {
     let label = match book {
         ScenarioABook::Folder => "S-A folder",
@@ -2663,6 +2720,9 @@ fn multiwindow_scenario_search_result_image_sidecar_reaches_paint() {
         app.settings.sidecar_backup_enabled = true;
         app.settings.tag_sidecar_backup_enabled = false;
         app.settings.detached_viewer_open_images_in_window = true;
+        // Include startup hydration with sidecars enabled, as in ordinary use.
+        initialize_main_startup(&mut app, &mut driver);
+        let startup_folder = app.current_folder.clone();
 
         let folder = app.tmp.path().join("search-hit-parent");
         std::fs::create_dir(&folder).unwrap();
@@ -2679,12 +2739,23 @@ fn multiwindow_scenario_search_result_image_sidecar_reaches_paint() {
         ));
 
         // Double-click dispatch uses this router before the generic image/fullscreen branch.
-        app.current_folder = Some(app.tmp.path().to_path_buf());
         app.open_global_search();
+        assert_eq!(app.global_search.saved_folder, startup_folder);
         app.global_search.focus_request = false;
         app.global_search.done = true;
         app.replace_search_view_items(vec![GridItem::Image(search_page.clone())], vec![None]);
-        wait_for_list_hydration(&mut app, &driver.ctx);
+        wait_for_scenario_frames(
+            &mut app,
+            &mut driver,
+            "search list hydration",
+            std::time::Duration::from_secs(10),
+            |app| app.sidecar_restore.is_none(),
+        );
+        let main_before = (
+            app.current_folder.clone(),
+            app.items.clone(),
+            app.items_generation,
+        );
         assert!(app.open_grid_container_in_detached_book_context(&driver.ctx, 0));
         let window_id = app.active_detached_window_id().expect("search hit opened a window");
         let viewport = App::detached_image_window_viewport_id(window_id);
@@ -2712,13 +2783,37 @@ fn multiwindow_scenario_search_result_image_sidecar_reaches_paint() {
             .expect("detached owner remains mountable");
         }
         assert!(app.sidecar_restore.is_some(), "valid parent sidecar starts a restore");
+        let (owner, generation) = app
+            .with_active_viewer_context(|active| {
+                assert!(active.current_folder.as_deref().is_some_and(|current| {
+                    crate::folder_tree::path_eq(current, &folder)
+                }));
+                (active.projected_viewer_context_id(), active.items_generation)
+            })
+            .expect("parent restore owner remains mountable");
+        assert_ne!(owner, app.viewer_context_main());
+        assert!(
+            app.sidecar_restore
+                .as_ref()
+                .unwrap()
+                .target_matches(owner, generation)
+        );
         let relay = sidecar_restore::SidecarCheckingRelay::new();
         app.attach_sidecar_checking_relay_for_test(Rc::clone(&relay));
-        wait_until(
+        // Hold only this request's Checking delivery; independent completions
+        // must continue through the same ROOT phases as ordinary application use.
+        wait_for_scenario_frames(
+            &mut app,
+            &mut driver,
             "search hit sidecar checking completion",
             std::time::Duration::from_secs(10),
-            || {
-                app.poll_sidecar_restore(&driver.ctx);
+            |app| {
+                assert!(
+                    app.sidecar_restore
+                        .as_ref()
+                        .is_some_and(|restore| restore.target_matches(owner, generation)),
+                    "parent restore must remain owned while Checking is held"
+                );
                 relay.captured()
             },
         );
@@ -2772,6 +2867,16 @@ fn multiwindow_scenario_search_result_image_sidecar_reaches_paint() {
             std::thread::yield_now();
         }
         assert!(app.items_are_global_search_view, "main search view is unchanged");
+        assert_eq!(app.global_search.saved_folder, startup_folder);
+        assert_eq!(
+            (
+                app.current_folder.clone(),
+                app.items.clone(),
+                app.items_generation
+            ),
+            main_before,
+            "detached parent hydration preserves the main search origin and list"
+        );
         assert!(app.items.iter().any(|item| matches!(item, GridItem::Image(path) if path == &search_page)));
         assert!(app.with_active_viewer_context(|active| {
             active.fullscreen_idx.and_then(|idx| active.items.get(idx)).is_some_and(
@@ -2814,6 +2919,7 @@ fn run_multiwindow_rar_tree_nav(
     app.settings.archive_file_handling = crate::settings::ArchiveFileHandling::Convert;
     app.settings.sidecar_backup_enabled = false;
     app.settings.tag_sidecar_backup_enabled = false;
+    initialize_main_startup(&mut app, &mut driver);
 
     let root = app.tmp.path().join("rar-tree-nav");
     std::fs::create_dir(&root).unwrap();

@@ -640,6 +640,8 @@ impl App {
         self.poll_new_folder_pending(ctx);
         self.poll_rename_pending(ctx);
         self.poll_file_organize(ctx);
+        self.poll_shell_paste(ctx);
+        self.poll_external_open_failures();
         self.poll_rename_migration_pending(ctx);
         self.poll_delete_purge_retry(ctx);
         self.poll_capture_pending(ctx);

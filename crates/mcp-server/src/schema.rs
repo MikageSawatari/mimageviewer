@@ -37,7 +37,10 @@ fn metadata_write(name: &str) -> bool {
 fn write(name: &str) -> bool {
     collection_write(name)
         || metadata_write(name)
-        || matches!(name, "set_settings" | "set_favorite" | "stack_script")
+        || matches!(
+            name,
+            "set_operations" | "set_settings" | "set_favorite" | "stack_script"
+        )
 }
 fn collection_write(name: &str) -> bool {
     matches!(
@@ -321,6 +324,8 @@ fn replace_schema(value: &mut Value, repeated: &Value, reference: &Value) {
 fn output(name: &str) -> Value {
     match name {
         "get_view_state" => json!({"required":["view","folder","fullscreen","item","search"]}),
+        "get_operations" => json!({"required":["items","page","pages"]}),
+        "set_operations" => json!({"required":["changed","unchanged","conflicts"]}),
         "get_settings" => json!({"required":["items","page","pages","more"]}),
         "set_settings" => json!({"required":["changed","unchanged"]}),
         "set_favorite" => json!({"required":["added","before","after"]}),
@@ -580,6 +585,9 @@ pub fn tools() -> Vec<Value> {
     let settings: Vec<Value> = serde_json::from_str(include_str!("settings_tools.json"))
         .expect("embedded settings tool definitions");
     tools.extend(settings);
+    let operations: Vec<Value> = serde_json::from_str(include_str!("operations_tools.json"))
+        .expect("embedded operations tool definitions");
+    tools.extend(operations);
     tools.push(
         serde_json::from_str(include_str!("favorite_tool.json"))
             .expect("embedded favorite tool definition"),
@@ -741,7 +749,7 @@ mod tests {
     #[test]
     fn tools_have_precise_annotation_contracts() {
         let tools = tools();
-        assert_eq!(tools.len(), 27);
+        assert_eq!(tools.len(), 29);
         for tool in &tools {
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
             assert_eq!(tool["outputSchema"]["type"], "object");

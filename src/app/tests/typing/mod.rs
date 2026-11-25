@@ -6,6 +6,7 @@ use super::*;
 use crate::ime_focus::typing_probe::{self as probe, Outcome};
 use std::time::{Duration, Instant};
 
+mod addr_click_after_fs_close;
 mod dialogs;
 mod facets;
 mod inventory;

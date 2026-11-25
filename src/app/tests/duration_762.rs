@@ -7,6 +7,7 @@ mod visible_stages;
 fn fixture() -> phase_c_support::AppTestEnv {
     let mut app = setup_media_duration_thumbnail_app();
     app.settings.thumb_show_media_duration = false;
+    app.settings.thumb_show_page_count = false;
     app.settings.thumb_show_resume_meter = false;
     app.settings.details_show_page_count = false;
     app.settings.details_show_created = false;
@@ -59,6 +60,7 @@ fn pending(
     let (priority_tx, _priority_rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     app.details_meta_pending = Some(DetailsMetaPending {
+        pool_revision: crate::susie_loader::pool_revision(),
         scan_scope: scope,
         listing_meta_scan: (scope == DetailsMetaScanScope::AllRequirements
             && app.whole_listing_meta_scan_wanted())

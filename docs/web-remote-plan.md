@@ -1233,7 +1233,7 @@ change は 180 ms debounce 後にこの判定を再実行する。
 
 `spread.db::get_direction` も本体側で同じ key / fallback から読み、`reading_direction` として応答する。
 LTR / RTL の見開き・横長分割モードは本体と同じく方向をそのモードへ揃え、Single の応答も
-保存済み方向を維持する。シークバーはこの `readingDirection` から向きを決め、入力の左右とは独立する。
+保存済み方向を維持する。シークバーはこの `readingDirection` から向きを決める。
 変換済み EPUB は PDF の本と同じ Remote 経路で開き、本とページの address は元 `.epub` とその
 `PdfPage` subresource を使う。Remote は変換を始めず、未変換時は PC の mImageViewer で一度開くよう
 案内する。一覧は本体の同名 PDF 優先設定を適用し、Web は EPUB バッジと表紙未取得時のプレースホルダーを表示する。
@@ -1242,14 +1242,14 @@ LTR / RTL の見開き・横長分割モードは本体と同じく方向をそ�
 Remote では従来どおり既定方向への反映対象外である。
 Web で RTL から Single へ切り替えた場合も、そのセッションの RTL を request に引き継ぐ。
 横方向入力の反転は `command-core.mjs::inputAdvancesRightToLeft` だけで判定する。本体の
-`SpreadMode::advances_right_to_left` と同じく、Rtl / RtlCover / SplitRtl では反転し、
-Single / Ltr / LtrCover / SplitLtr では反転しない。入力は保存由来の `configured_spread_mode`
-（Web 共通 state の `spreadMode`）を見るため、Single は保存済み方向が RTL でも右 tap zone /
-`ArrowRight` / `›` が次グループになる。縦持ちの表示限定 Single は構成モードを変えないため、
-構成が RTL なら綴じ方向に従って反転を続ける。コンテナ・各コレクションも同じ state 値を使う。
+`App::input_advances_right_to_left` と同じく、保存由来の `configured_spread_mode`
+（Web 共通 state の `spreadMode`）自身に読み方向があればそれを優先し、Single では
+viewer の `readingDirection` を使う。Single + RTL も反転し、Single + LTR は反転しない。
+縦持ちの表示限定 Single は構成モードを変えないため、構成が RTL なら反転を続ける。
+コンテナ・各コレクションのボタン・タップ・スワイプ・キー・ラベル・境界案内は同じ判定を使う。
 表示種別だけを変える要求も、受付時に `spreadModeWithReadingDirection` で要求と同じ読み方向へ正規化してから共通 state と再取得要求へ渡し、応答待ちの間も左右入力とラベルの反転を維持する。
 反転時は左 tap zone / `ArrowLeft` / `‹` が次、右 tap zone / `ArrowRight` / `›` が前になる。
-swipe は指でページを送る向きを維持し、反転時は右 swipe が次・左 swipe が前、Single と LTR は
+swipe は指でページを送る向きを維持し、反転時は右 swipe が次・左 swipe が前、左→右読みでは
 左 swipe が次・右 swipe が前になる。ボタンの aria-label と端ページのタップ案内も同じ判定から
 動作に合わせ、ラベルはモード変更時に更新する。
 上下矢印と PageUp / PageDown は前後という意味を維持する。本体の
@@ -2840,6 +2840,10 @@ serve が無い間の `public_url` は bind fallback (`http://127.0.0.1:<port>/`
 読まずに scan されるため、端末から届かない宛先を描いてはならない。案内側の probe が設定済みを示していても
 snapshot がまだ古い場合は QR を出さない。これは service を再起動するまで公開 URL が更新されないためで、
 その場合に古い URL を配るより出さない方が正しい。
+
+同じ PC のブラウザ用の `http://127.0.0.1:<port>/` は公開 URL と別の行で、受付中なら
+serve の有無にかかわらず表示し、コピーできるようにする。QR は付けない。ポートは
+`tailscale serve --bg <port>` の案内と同じ service control の `port()` 由来の値を使う。
 
 期限が得られた場合は日付と残り日数を表示し、30 日以内と期限切れを警告色にする。期限切れでは
 PC が tailnet から外れて外出先から接続できないことを明示し、デバイス一覧へ案内する。情報なしでは

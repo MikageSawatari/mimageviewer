@@ -12,6 +12,7 @@ mod duration_762_context_tests {
             generation: app.items_generation,
             items_len: app.items.len(),
             requirements: ListingMetaRequirements {
+                page_count: false,
                 duration: true,
                 ai: true,
             },
@@ -25,6 +26,7 @@ mod duration_762_context_tests {
             generation: sibling.items_generation,
             items_len: sibling.items.len(),
             requirements: ListingMetaRequirements {
+                page_count: false,
                 duration: true,
                 ai: true,
             },
@@ -53,6 +55,7 @@ mod duration_762_context_tests {
             generation: app.items_generation,
             items_len: app.items.len(),
             requirements: ListingMetaRequirements {
+                page_count: false,
                 duration: true,
                 ai: true,
             },

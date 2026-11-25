@@ -153,7 +153,7 @@
       インストーラ版のアンインストールでも、実行した Windows アカウントの登録と <code>browser-host</code> を削除します。
       別の管理者アカウントで実行すると、使っていたアカウントの登録は残るため、<strong>アンインストールの前に mIV の環境設定で連携を解除してください</strong>。
       保存先を <code>%APPDATA%\mimageviewer</code> の中に変更し、アンインストール時に設定とキャッシュの削除を選んだ場合は、その中の画像も削除対象になります。
-      <a href="manual/browser-integration.html">登録・解除と拡張の入手状況</a>もご覧ください。</p>
+      <a href="manual/browser-integration.html">登録・解除と拡張機能の入れ方</a>もご覧ください。</p>
     <p>音楽ビデオエディタは、利用者が選んだ保存先にプロジェクト（<code>.mivmv.json</code>）、MP4、LRC、連番 PNG を保存します。
       プロジェクトには編集内容と音声・画像の保存場所を記録し、素材そのものは埋め込みません。
       ネットワーク共有や同期フォルダを保存先に選ぶ場合は、その保存先や同期ソフトの動作に従います。</p>
@@ -169,8 +169,10 @@
     <p>本アプリは、動作に必要な次のデータを利用者の PC に保存します。リモート閲覧を有効にした場合、再生位置などは利用者の端末から PC へ送られます。開発者のサーバーへ送信されることはありません。外出先との暗号化された通信は Tailscale の中継サーバーを経由することがあります。</p>
     <ul class="pink-list">
       <li>アプリの設定・表示状態、動画・音声の再生位置とファイルごとに選んだ音声トラック</li>
+      <li>一括エクスポートの前回の設定と名前付きプリセット（保存先とロゴ画像の場所、透かしの文字を含みます）。環境設定の書き出し・読み込みには含まれません</li>
       <li>検索欄の入力履歴（既定で保存がオン）。コンテナ検索・現在地の絞り込み・アイテム検索・Everything 検索の種類ごとに、最近の検索語を 20 件まで設定と同じ <code>settings.db</code> に保存します。検索を確定したときと、実行済みの語のまま入力欄から通常に離れたときに記録します。環境設定の「ライブラリ → 履歴と復元 → 検索欄の入力履歴」でオフ・全件消去ができます。オフで「OK」を押すと現在の入力履歴も消去しますが、どちらの消去でも設定の自動バックアップにはしばらく残ります。履歴の内容を診断ログ・リモート閲覧・AI 連携には渡しません。リモート閲覧や AI 連携からの検索は、この入力履歴に記録しません</li>
       <li>AI 連携の許可の範囲、縮小画像・撮影位置・AI 説明文・文字起こし・今開いている場所を AI に見せるか、設定の確認と変更を AI に任せるかの設定</li>
+      <li>キー・リング・マウスボタン・ジェスチャーなどの操作カスタマイズの割り当て。AI に変更を許可した場合も、既存の設定と同じ場所に保存します</li>
       <li>スタック表示の分け方を変更するカスタムスクリプト（データフォルダ内の <code>stack_rules.rhai</code>）。AI に変更を許可した場合も、このファイルに保存します</li>
       <li>本ごとの見開き1ページずらしの調整（記憶をOFFにしても保存済み調整は保持し、明示的に解除できます。メタ情報の移行で持ち運べます）</li>
       <li>音響調整 (mIV Sound) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像</li>
@@ -327,8 +329,8 @@
         文字起こしを許可すると、動画・音声の文字起こしの本文を時刻つきで、ファイルの情報としてその作成日などの状態も AI アプリへ渡します。話された氏名や私的な会話もそのまま含むことがあります。許可しない場合は渡しません。
         GPS 欄を無効にしても、ファイル名やプロンプトなどの文章に書かれた場所の情報を取り除くものではありません。
         「今開いている場所を AI に見せる」を有効にすると、開いている場所と表示中の項目の場所を渡します。
-        「設定の確認と変更を AI に任せる」（既定ではオフ）を有効にすると、環境設定の項目と値（起動時のフォルダや保存先などの場所、外部ツールの実行ファイルと引数を含む）と、スタック用スクリプトの本文を渡します。本文も AI アプリの提供元へ送られます。
-        AI アプリからの指示で環境設定の変更、外部ツールの登録・変更・削除、スタック用スクリプトの書き換え、お気に入りへの登録と索引の切り替えを確認なしで行います。
+        「設定の確認と変更を AI に任せる」（既定ではオフ）を有効にすると、環境設定の項目と値（起動時のフォルダや保存先などの場所、外部ツールの実行ファイルと引数を含む）に加え、操作カスタマイズの割り当てとスタック用スクリプトの本文を渡します。本文も AI アプリの提供元へ送られます。
+        AI アプリからの指示で環境設定やキー・リング・マウスボタン・ジェスチャーの割り当ての変更、外部ツールの登録・変更・削除、スタック用スクリプトの書き換え、お気に入りへの登録と索引の切り替えを確認なしで行います。
         スタック用スクリプトのオン・オフも変えられます。外部ツールの起動はこの連携では行いません。
         AI 連携の許可の状態は渡しますが、AI からは変えられません。保存した PDF のパスワードとリモート接続の暗証番号は渡しません。
         AI が更新の確認をオンにすると、起動時とその後 24 時間ごとに GitHub へ新しい版を問い合わせます。
@@ -474,7 +476,7 @@
       The installer uninstaller also removes registration and <code>browser-host</code> for the Windows account running it.
       If you uninstall using a different administrator account, the original account's registration remains. <strong>Unregister browser integration in mIV Preferences before uninstalling.</strong>
       If you changed the image destination to a folder inside <code>%APPDATA%\mimageviewer</code> and choose to delete settings and cache during uninstall, those images are also included in that deletion.
-      See the <a href="manual/browser-integration.html">manual for registration, removal, and extension availability</a>.</p>
+      See the <a href="manual/browser-integration.html">manual for registration, removal, and installing the extension</a>.</p>
     <p>Everything filename search sends your query to Everything running on the same PC and receives file locations locally.
       mImageViewer does not save the result list. If search input history is enabled, queries are saved in that history on your PC, but not in diagnostic logs.
       The App does not change Everything's own search history settings. Viewing history, tags, ratings and thumbnail caches for files you open are saved as usual.

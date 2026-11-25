@@ -2989,3 +2989,9 @@ cargo nextest run -p mimageviewer --lib -E 'test(/converted_source_factory_/) | 
 - 本体 lib 全件 (`test-lib-full.ps1`): `e80f78a65` で 18,849 件成功・0 失敗、`a3a797ca9` で **18,859 件成功・0 失敗** (86 skipped、receipt `target/test-lib-full/b5473e10f7d96264297c339b35f64838284ae3fb3e1511d63fbc4fe318a0c896.json`)。
 - 実機の挙動は未確認 (エージェントは製品を起動しない)。
 - 別件として記録: `Pending` の間に `CacheOnly` で出た素材に付く idle upgrade の対象外の印は、確定後も一致していれば残る (§31.7、既存)。番号は未取得。
+
+## 32. お気に入りごとの自動切り出し (§1.787)
+
+設計の正本は [cover-crop-per-favorite-plan.md](cover-crop-per-favorite-plan.md) 第3版。
+「お気に入り > 編集」で全体に従う/切り出す/切り出さないを選び、アイテムの論理パスで解決する。
+入れ子の優先規則、K2 の子のキーと親の反映の遅れ、既存の一覧読み直し、保持中の別 context の範囲外は同書を参照する。

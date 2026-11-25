@@ -1,50 +1,69 @@
-//! グリッド選択の一括エクスポート (Ctrl+E)。
-//!
-//! 合成は製本と同じ [`crate::books::write_composited_page`] を使う。この module が
-//! 持つのは「出力先 / ファイル名 / 縮小 / 進捗とキャンセル」だけで、デコード → 合成 →
-//! エンコードのパイプラインを二重に持たない。
-//!
-//! 進捗は Ctrl+E 単ページと同じ [`crate::export_dialog::ExportEvent`] /
-//! [`crate::export_dialog::ExportPending`] で報告するので、進捗ダイアログと
-//! `poll_export_pending` はそのまま動く。
+//! Grid batch export owns its frozen options, output reservations and cancel token.
+//! Decoding and saved-edit composition remain shared with books/materialization.
 
-use std::collections::HashSet;
+mod options;
+mod paths;
+mod watermark;
+pub use options::*;
+
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
+use std::time::{Instant, SystemTime};
 
-use crate::export_dialog::{ExportEvent, ExportFailure, ExportPending, ExportScale, ExportSuccess};
+use crate::export_dialog::{ExportEvent, ExportFailure, ExportPending, ExportSuccess};
+use crate::save_with_metadata::{SaveOptions, SrcFormat, ThumbnailNoticeKinds};
+use paths::{OutputReservation, Target};
 
-/// テンプレートに使える置換子。ダイアログのヒントと [`expand_filename_template`] の
-/// 唯一の定義元。
-pub const TEMPLATE_PLACEHOLDER_HINT: &str = "<filename> / <dirname> / <num> が使えます";
+pub const TEMPLATE_PLACEHOLDER_HINT: &str =
+    "<filename> / <dirname> / <num> / <num:N> / <ext> / <date> / <time> が使えます";
 
-/// 書き出し 1 件ぶん。
 pub struct BatchExportItem {
-    /// `<filename>` に入る名前 (拡張子なし)。
     pub filename: String,
-    /// `<dirname>` に入る名前 (実フォルダ名 / ZIP・PDF のファイル名)。
     pub dirname: String,
+    pub source_dir: PathBuf,
+    pub source_ext: String,
     pub source: crate::books::CompositeSource,
     pub edits: crate::books::BakedEditSnapshot,
     pub(crate) composition_check: Option<crate::book_composition::CompositionOutputCheck>,
 }
 
+pub(super) fn source_path(source: &crate::books::CompositeSource) -> &Path {
+    match source {
+        crate::books::CompositeSource::File { path } => path,
+        crate::books::CompositeSource::ZipEntry { zip_path, .. } => zip_path,
+        crate::books::CompositeSource::PdfPage { pdf_path, .. } => pdf_path,
+    }
+}
+
 impl BatchExportItem {
-    /// Creates an item for callers without an App composition context.
-    /// App selection factories must attach their captured visibility check.
+    /// Pure path/string work only: safe while preparing on the UI thread.
     pub fn new(
         filename: String,
         dirname: String,
         source: crate::books::CompositeSource,
         edits: crate::books::BakedEditSnapshot,
     ) -> Self {
+        let source_dir = source_path(&source)
+            .parent()
+            .unwrap_or(Path::new(""))
+            .to_owned();
+        let source_ext = match &source {
+            crate::books::CompositeSource::File { path } => extension(path),
+            crate::books::CompositeSource::ZipEntry { entry_name, .. } => {
+                extension(Path::new(entry_name))
+            }
+            crate::books::CompositeSource::PdfPage { .. } => "pdf".into(),
+        };
         Self {
             filename,
             dirname,
+            source_dir,
+            source_ext,
             source,
             edits,
             composition_check: None,
@@ -52,91 +71,124 @@ impl BatchExportItem {
     }
 }
 
+fn extension(path: &Path) -> String {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
 pub struct BatchExportRequest {
-    pub output_dir: PathBuf,
-    pub template: String,
-    pub scale: ExportScale,
+    pub options: BatchExportOptions,
     pub items: Vec<BatchExportItem>,
     pub raw: Option<crate::raw::RawDecodeContext>,
-    /// worker が終わるまで「ローカル AI を使い得る作業が走っている」ことを示す借用。
-    ///
-    /// 合成は消しゴム (MI-GAN) や AI 拡大を回し得るので、リモートへ操作権を渡す前の
-    /// 静止確認 (`local_ai_remote_barrier_snapshot`) はこの worker を数えなければならない。
-    /// 数えていなかったので、消しゴム付きの一括書き出し中に接続するとローカル AI が
-    /// 走ったまま操作権が移り、リモート側の AI と GPU / モデルを取り合っていた
-    /// (v3.5.0 レビュー F09)。
-    ///
-    /// **どの項目が AI を回すかを起動前に決めない。** 実際に何を回すかは worker が
-    /// 合成しながら決めるので、ここで先読みすると「AI を使うか」の綴りが 2 つになる。
-    /// 借用は worker の寿命そのもので、cancel でも panic でも drop で返る。
-    ///
-    /// **`Option` にしない。** 一括書き出しは必ず合成を通るので、渡し忘れを型で防ぐ
-    /// (単枚の `ExportRequest` 側が `Option` なのは、AI を通らない経路が実在するため)。
+    /// Held for the entire worker lifetime, including cancellation and panic.
     pub local_ai_activity: crate::app::LocalAiActivityLease,
 }
 
-/// `<filename>` / `<dirname>` / `<num>` を展開する。未知の `<...>` は展開せずそのまま
-/// 残す (テンプレートの打ち間違いを黙って消さない)。`index` は 1 origin。
+/// Expand only known tokens once; a source filename containing token text is literal.
 pub fn expand_filename_template(
     template: &str,
     filename: &str,
     dirname: &str,
     index: usize,
 ) -> String {
-    template
-        .replace("<filename>", filename)
-        .replace("<dirname>", dirname)
-        .replace("<num>", &format!("{index:04}"))
+    expand_template(template, filename, dirname, "", index, None)
 }
 
-/// テンプレート展開 → ファイル名として使える文字へ正規化。
-///
-/// `basename_from_text` は禁止文字を `_` へ置き換え、空にはならない (空入力は
-/// `capture` になる) ので、ここに追加の空文字フォールバックは置かない。
-pub fn resolve_item_stem(template: &str, item: &BatchExportItem, index: usize) -> String {
-    let expanded = expand_filename_template(template, &item.filename, &item.dirname, index);
-    crate::capture::basename_from_text(&expanded)
-}
-
-/// まだ使われていない出力パスを決める。既存ファイルも、この実行で既に書いた名前も
-/// 避ける (テンプレート次第で複数の元画像が同じ名前へ落ちる)。上書きはしない。
-fn unique_target_path(
-    output_dir: &Path,
-    stem: &str,
-    extension: &str,
-    claimed: &mut HashSet<PathBuf>,
-) -> Result<PathBuf, String> {
-    for seq in 0..=9999u32 {
-        let candidate = if seq == 0 {
-            output_dir.join(format!("{stem}.{extension}"))
-        } else {
-            output_dir.join(format!("{stem}_{seq}.{extension}"))
+fn expand_template(
+    template: &str,
+    filename: &str,
+    dirname: &str,
+    ext: &str,
+    index: usize,
+    datetime: Option<&(String, String)>,
+) -> String {
+    let mut rest = template;
+    let mut output = String::with_capacity(template.len());
+    while let Some(start) = rest.find('<') {
+        output.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let Some(end) = rest.find('>') else { break };
+        let token = &rest[..=end];
+        let replacement = match token {
+            "<filename>" => Some(filename.to_owned()),
+            "<dirname>" => Some(dirname.to_owned()),
+            "<ext>" => Some(ext.to_owned()),
+            "<num>" => Some(format!("{index:04}")),
+            "<date>" => datetime.map(|v| v.0.clone()),
+            "<time>" => datetime.map(|v| v.1.clone()),
+            _ => token
+                .strip_prefix("<num:")
+                .and_then(|s| s.strip_suffix('>'))
+                .filter(|s| s.len() == 1)
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|n| (1..=9).contains(n))
+                .map(|width| format!("{index:0width$}")),
         };
-        if !claimed.contains(&candidate) && !candidate.exists() {
-            claimed.insert(candidate.clone());
-            return Ok(candidate);
-        }
+        output.push_str(replacement.as_deref().unwrap_or(token));
+        rest = &rest[end + 1..];
     }
-    Err(format!("同名ファイルが多すぎます: {stem}.{extension}"))
+    output.push_str(rest);
+    output
+}
+
+pub fn resolve_item_stem(template: &str, item: &BatchExportItem, index: usize) -> String {
+    item_stem(template, item, index, None)
+}
+
+/// The UI never stats sources. Keep deferred date/time tokens visible in its example,
+/// while applying the same filename sanitation to everything else.
+pub(crate) fn preview_item_stem(template: &str, item: &BatchExportItem, index: usize) -> String {
+    let expanded = expand_template(
+        template,
+        &item.filename,
+        &item.dirname,
+        &item.source_ext,
+        index,
+        None,
+    );
+    let mut marker = "__miv_export_deferred__".to_owned();
+    while expanded.contains(&marker) {
+        marker.push('_');
+    }
+    let date = format!("{marker}date");
+    let time = format!("{marker}time");
+    let text = expanded.replace("<date>", &date).replace("<time>", &time);
+    crate::capture::basename_from_text(&text)
+        .replace(&date, "<date>")
+        .replace(&time, "<time>")
+}
+
+fn item_stem(
+    template: &str,
+    item: &BatchExportItem,
+    index: usize,
+    datetime: Option<&(String, String)>,
+) -> String {
+    crate::capture::basename_from_text(&expand_template(
+        template,
+        &item.filename,
+        &item.dirname,
+        &item.source_ext,
+        index,
+        datetime,
+    ))
 }
 
 pub fn spawn_batch_export_worker(request: BatchExportRequest) -> Result<ExportPending, String> {
     let total = request.items.len();
     if total == 0 {
-        return Err("エクスポートする画像がありません".to_string());
+        return Err("エクスポートする画像がありません".into());
     }
     let BatchExportRequest {
-        output_dir,
-        template,
-        scale,
+        options,
         items,
         raw,
         local_ai_activity,
     } = request;
-    let request = BatchExportPlan {
-        output_dir,
-        template,
-        scale,
+    let plan = BatchExportPlan {
+        options,
         items,
         raw,
     };
@@ -146,9 +198,8 @@ pub fn spawn_batch_export_worker(request: BatchExportRequest) -> Result<ExportPe
     std::thread::Builder::new()
         .name("ctrl-e-batch-export".into())
         .spawn(move || {
-            // 借用は worker が終わるまで生かす (cancel / panic でも drop で返る)。
             let _local_ai_activity = local_ai_activity;
-            run_batch_export(request, worker_cancel, tx)
+            run_batch_export(plan, worker_cancel, tx)
         })
         .map_err(|e| format!("一括エクスポート worker を開始できません: {e}"))?;
     Ok(ExportPending {
@@ -156,21 +207,40 @@ pub fn spawn_batch_export_worker(request: BatchExportRequest) -> Result<ExportPe
         rx,
         total,
         done: 0,
-        last_message: "準備中".to_string(),
+        last_message: "準備中".into(),
         successes: Vec::new(),
         errors: Vec::new(),
-        finished: false,
+        skipped: Vec::new(),
+        thumbnail_notices: Vec::new(),
+        end: None,
         cancel_requested: false,
     })
 }
 
-/// 借用を外した、worker が実際に読む部分。
 struct BatchExportPlan {
-    output_dir: PathBuf,
-    template: String,
-    scale: ExportScale,
+    options: BatchExportOptions,
     items: Vec<BatchExportItem>,
     raw: Option<crate::raw::RawDecodeContext>,
+}
+
+#[derive(Default)]
+struct ItemTimings {
+    decode: f64,
+    compose: f64,
+    resize: f64,
+    watermark: f64,
+    encode: f64,
+    write: f64,
+    dimensions: [usize; 2],
+}
+
+enum ItemResult {
+    Skipped(PathBuf),
+    Written {
+        path: PathBuf,
+        kinds: ThumbnailNoticeKinds,
+        replaced: bool,
+    },
 }
 
 fn run_batch_export(
@@ -178,22 +248,73 @@ fn run_batch_export(
     cancel: Arc<AtomicBool>,
     tx: mpsc::Sender<ExportEvent>,
 ) {
-    if let Err(error) = std::fs::create_dir_all(&request.output_dir) {
-        let message = format!(
-            "保存先フォルダを作成できません: {}: {error}",
-            request.output_dir.display()
-        );
-        for item in &request.items {
-            let _ = tx.send(ExportEvent::Failed(ExportFailure {
-                label: item.filename.clone(),
-                message: message.clone(),
-            }));
+    run_batch_export_with_decoder(request, cancel, tx, &mut |item, cancel, raw, keep_bytes| {
+        if keep_bytes {
+            crate::books::decode_composite_source_for_materialization_with_bytes(
+                &item.source,
+                4096,
+                cancel,
+                raw,
+            )
+        } else {
+            crate::books::decode_composite_source_for_materialization(
+                &item.source,
+                4096,
+                cancel,
+                raw,
+            )
+            .map(|image| (image, None))
         }
-        let _ = tx.send(ExportEvent::AllDone);
-        return;
-    }
+    });
+}
 
-    let mut claimed: HashSet<PathBuf> = HashSet::new();
+fn run_batch_export_with_decoder(
+    request: BatchExportPlan,
+    cancel: Arc<AtomicBool>,
+    tx: mpsc::Sender<ExportEvent>,
+    decode: &mut impl FnMut(
+        &BatchExportItem,
+        Arc<AtomicBool>,
+        Option<&crate::raw::RawDecodeContext>,
+        bool,
+    ) -> Result<(eframe::egui::ColorImage, Option<Vec<u8>>), String>,
+) {
+    let prepared = Instant::now();
+    let base = paths::common_ancestor(&request.items);
+    let mut outputs = OutputReservation::default();
+    let mut watermark = match (|| {
+        if request.options.overwrite == OverwritePolicy::Replace {
+            outputs.protect_sources(&request.items)?;
+            let logo = &request.options.watermark;
+            if logo.enabled && logo.kind == WatermarkKind::Image {
+                outputs.protect_logo(logo.image_path.as_deref().unwrap_or(Path::new("")))?;
+            }
+        }
+        watermark::WatermarkAssets::load(&request.options.watermark)
+    })() {
+        Ok(assets) => assets,
+        Err(message) => {
+            for item in &request.items {
+                log::error!("batch export {}: {message}", item.filename);
+                let _ = tx.send(ExportEvent::Failed(ExportFailure {
+                    label: item.filename.clone(),
+                    message: message.clone(),
+                }));
+            }
+            let _ = tx.send(ExportEvent::AllDone);
+            return;
+        }
+    };
+    crate::perf::event(
+        "export_batch/prepare",
+        "complete",
+        None,
+        0,
+        &[(
+            "ms",
+            serde_json::json!(prepared.elapsed().as_secs_f64() * 1000.0),
+        )],
+    );
     let mut resolver = crate::book_composition::CompositionOutputResolver::default();
     for (index, item) in request.items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
@@ -204,276 +325,322 @@ fn run_batch_export(
         let _ = tx.send(ExportEvent::Started {
             label: label.clone(),
         });
-        if let Some(check) = &item.composition_check {
-            let refusal = match check.permits_with(&mut resolver) {
-                Ok(true) => None,
-                Ok(false) => {
-                    Some(crate::book_composition::COMPOSITION_OUTPUT_HIDDEN_NOTICE.to_owned())
+        let mut timings = ItemTimings::default();
+        let result = (|| {
+            if let Some(check) = &item.composition_check {
+                if !check.permits_with(&mut resolver)? {
+                    return Err(crate::book_composition::COMPOSITION_OUTPUT_HIDDEN_NOTICE.into());
                 }
-                Err(reason) => Some(reason),
-            };
-            if let Some(message) = refusal {
-                let _ = tx.send(ExportEvent::Failed(ExportFailure { label, message }));
-                continue;
             }
-        }
-        let stem = resolve_item_stem(&request.template, item, index + 1);
-        let path = match unique_target_path(
-            &request.output_dir,
-            &stem,
-            item.edits.format.extension(),
-            &mut claimed,
-        ) {
-            Ok(path) => path,
+            let options = &request.options;
+            let keep_file_time = options.can_keep_file_time() && options.keep_file_time;
+            let needs_datetime =
+                options.template.contains("<date>") || options.template.contains("<time>");
+            let modified = if needs_datetime || keep_file_time {
+                Some(
+                    std::fs::metadata(source_path(&item.source))
+                        .and_then(|m| m.modified())
+                        .map_err(|e| format!("元の更新日時を取得できません: {e}"))?,
+                )
+            } else {
+                None
+            };
+            let datetime = if needs_datetime {
+                Some(local_datetime(modified.unwrap())?)
+            } else {
+                None
+            };
+            let stem = item_stem(&options.template, item, index + 1, datetime.as_ref());
+            let directory = paths::output_directory(&options.destination, item, base.as_deref());
+            let format = options.format.resolve(&item.source_ext);
+            let target =
+                outputs.reserve(&directory, &stem, format.extension(), options.overwrite)?;
+            let (path, replace) = match target {
+                Target::Write { path, replace } => (path, replace),
+                Target::Skip(path) => return Ok(ItemResult::Skipped(path)),
+            };
+            let keep_metadata = options.keep_metadata
+                && source_metadata_format(&item.source_ext) == Some(format.clone())
+                && !matches!(item.source, crate::books::CompositeSource::PdfPage { .. });
+            let start = Instant::now();
+            let (pixels, bytes) = decode(
+                item,
+                Arc::clone(&cancel),
+                request.raw.as_ref(),
+                keep_metadata,
+            )?;
+            timings.decode = start.elapsed().as_secs_f64() * 1000.0;
+            let start = Instant::now();
+            let pixels = crate::books::compose_book_page_for_materialization(
+                pixels,
+                &item.edits,
+                Arc::clone(&cancel),
+            )?;
+            timings.compose = start.elapsed().as_secs_f64() * 1000.0;
+            let target_size = options.resize.scaled_size(pixels.size);
+            timings.dimensions = target_size;
+            validate_dimensions(&format, target_size)?;
+            let start = Instant::now();
+            let pixels = crate::export_dialog::resize_export_pixels(
+                Cow::Owned(pixels),
+                target_size,
+                options.resize.filter.into(),
+            )?;
+            timings.resize = start.elapsed().as_secs_f64() * 1000.0;
+            ensure_not_cancelled(&cancel)?;
+            let start = Instant::now();
+            let watermarked = watermark.apply(pixels.as_ref(), &options.watermark)?;
+            timings.watermark = start.elapsed().as_secs_f64() * 1000.0;
+            ensure_not_cancelled(&cancel)?;
+            let save_options = SaveOptions {
+                jpeg_quality: options.format.jpeg_quality.clamp(1, 100),
+                webp_quality: options.format.webp_quality.clamp(1, 100) as f32,
+                webp_lossless: options.format.webp_lossless,
+                jpeg_matte: item.edits.jpeg_matte,
+                include_metadata: keep_metadata,
+                batch_metadata: true,
+                thumbnail_notice_for_hidden_edits: item.edits.erase.is_some()
+                    || item.edits.conceal.is_some()
+                    || item.edits.export_crop.is_some()
+                    || item.edits.comic.is_some()
+                    || item.edits.local_adjust.is_some(),
+                ..Default::default()
+            };
+            let src_path = if keep_metadata && bytes.is_none() {
+                Some(source_path(&item.source))
+            } else {
+                None
+            };
+            let start = Instant::now();
+            let encoded = if let Some(rgba) = watermarked {
+                crate::save_with_metadata::encode_rgba_with_metadata(
+                    &rgba,
+                    target_size[0] as u32,
+                    target_size[1] as u32,
+                    src_path,
+                    bytes.as_deref(),
+                    format,
+                    &save_options,
+                )
+            } else {
+                crate::save_with_metadata::encode_image_with_metadata_report(
+                    pixels.as_ref(),
+                    src_path,
+                    bytes.as_deref(),
+                    format,
+                    &save_options,
+                )
+            }
+            .map_err(|e| e.to_string())?;
+            timings.encode = start.elapsed().as_secs_f64() * 1000.0;
+            ensure_not_cancelled(&cancel)?;
+            let start = Instant::now();
+            let previous_modified = if replace {
+                Some(
+                    std::fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .map_err(|e| format!("上書き前の更新日時を取得できません: {e}"))?,
+                )
+            } else {
+                None
+            };
+            write_output(
+                &path,
+                &encoded.bytes,
+                options.overwrite == OverwritePolicy::Replace,
+            )?;
+            outputs.record_written(&path)?;
+            set_replacement_file_time(&path, previous_modified, SystemTime::now())?;
+            if keep_file_time {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .and_then(|f| f.set_modified(modified.unwrap()))
+                    .map_err(|e| format!("出力の更新日時を設定できません: {e}"))?;
+            }
+            timings.write = start.elapsed().as_secs_f64() * 1000.0;
+            Ok(ItemResult::Written {
+                path,
+                kinds: encoded.thumbnail_notice,
+                replaced: replace,
+            })
+        })();
+        let outcome = match result {
+            Ok(ItemResult::Skipped(path)) => {
+                let _ = tx.send(ExportEvent::Skipped { label, path });
+                "skipped"
+            }
+            Ok(ItemResult::Written {
+                path,
+                kinds,
+                replaced,
+            }) => {
+                let _ = tx.send(ExportEvent::Completed(ExportSuccess {
+                    label: label.clone(),
+                    path: path.clone(),
+                }));
+                if !kinds.is_empty() {
+                    log::warn!(
+                        "batch export thumbnail metadata: {}: {:?}",
+                        path.display(),
+                        kinds
+                    );
+                    let _ = tx.send(ExportEvent::ThumbnailNotice { label, path, kinds });
+                }
+                if replaced { "replaced" } else { "written" }
+            }
             Err(message) => {
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = tx.send(ExportEvent::Cancelled);
+                    return;
+                }
+                log::error!("batch export {label}: {message}");
                 let _ = tx.send(ExportEvent::Failed(ExportFailure { label, message }));
-                continue;
+                "failed"
             }
         };
-        match crate::books::write_composited_page(
-            &item.source,
-            &item.edits,
-            &path,
-            request.scale,
-            request.raw.as_ref(),
-        ) {
-            Ok(_) => {
-                let _ = tx.send(ExportEvent::Completed(ExportSuccess { label, path }));
-            }
-            Err(message) => {
-                let _ = tx.send(ExportEvent::Failed(ExportFailure { label, message }));
-            }
-        }
+        crate::perf::event(
+            "export_batch/item",
+            "complete",
+            None,
+            index as u64,
+            &[
+                ("decode_ms", serde_json::json!(timings.decode)),
+                ("compose_ms", serde_json::json!(timings.compose)),
+                ("resize_ms", serde_json::json!(timings.resize)),
+                ("watermark_ms", serde_json::json!(timings.watermark)),
+                ("encode_ms", serde_json::json!(timings.encode)),
+                ("write_ms", serde_json::json!(timings.write)),
+                ("size", serde_json::json!(timings.dimensions)),
+                (
+                    "format",
+                    serde_json::json!(request.options.format.resolve(&item.source_ext).extension()),
+                ),
+                ("outcome", serde_json::json!(outcome)),
+            ],
+        );
     }
     let _ = tx.send(ExportEvent::AllDone);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn item(filename: &str, dirname: &str) -> BatchExportItem {
-        BatchExportItem {
-            composition_check: None,
-            filename: filename.to_string(),
-            dirname: dirname.to_string(),
-            source: crate::books::CompositeSource::File {
-                path: PathBuf::from("unused"),
-            },
-            edits: crate::books::BakedEditSnapshot {
-                params: crate::adjustment::AdjustParams::default(),
-                rotation: crate::rotation_db::Rotation::None,
-                conceal: None,
-                erase: None,
-                local_adjust: None,
-                comic: None,
-                comic_source_dims: None,
-                export_crop: None,
-                crop_legacy_writeback: None,
-                format: crate::capture::CaptureFormat::Png,
-                jpeg_matte: crate::capture::JpegMatte::Black,
-                stage: crate::bake_stage::BakeStage::default(),
-                creative_lut: None,
-                ai: None,
-            },
-        }
-    }
-
-    #[test]
-    fn template_expands_every_placeholder() {
-        let got = expand_filename_template("<dirname>/<filename>_<num>", "shot", "trip", 7);
-
-        assert_eq!(got, "trip/shot_0007");
-    }
-
-    #[test]
-    fn template_keeps_unknown_placeholders_instead_of_dropping_them() {
-        let got = expand_filename_template("<filename>_<unknown>", "shot", "trip", 1);
-
-        assert_eq!(got, "shot_<unknown>");
-    }
-
-    #[test]
-    fn stem_replaces_path_separators_so_the_output_stays_in_the_chosen_folder() {
-        let got = resolve_item_stem("<dirname>/<filename>", &item("shot", "trip"), 1);
-
-        assert_eq!(got, "trip_shot");
-    }
-
-    #[test]
-    fn unique_target_path_avoids_existing_files_and_names_claimed_in_this_run() {
-        let temp = tempfile::tempdir().unwrap();
-        std::fs::write(temp.path().join("out.png"), b"x").unwrap();
-        let mut claimed = HashSet::new();
-
-        let first = unique_target_path(temp.path(), "out", "png", &mut claimed).unwrap();
-        let second = unique_target_path(temp.path(), "out", "png", &mut claimed).unwrap();
-
-        assert_eq!(first, temp.path().join("out_1.png"));
-        assert_eq!(second, temp.path().join("out_2.png"));
-    }
-
-    #[test]
-    fn two_items_that_expand_to_the_same_name_both_get_written() {
-        let temp = tempfile::tempdir().unwrap();
-        let mut claimed = HashSet::new();
-
-        let a = resolve_item_stem("<dirname>", &item("one", "same"), 1);
-        let b = resolve_item_stem("<dirname>", &item("two", "same"), 2);
-        let a = unique_target_path(temp.path(), &a, "png", &mut claimed).unwrap();
-        let b = unique_target_path(temp.path(), &b, "png", &mut claimed).unwrap();
-
-        assert_ne!(a, b);
-    }
-    #[test]
-    fn worker_qualifies_captured_selection_against_latest_hidden_and_preserves_visible_order() {
-        use crate::book_composition::{
-            BookComposition, BookCompositionService, CandidatePage, CompositionOutputCheck,
-            CompositionPageRef, PageDomain, ReadingDirection,
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let input = temp.path().join("real.png");
-        image::RgbaImage::from_pixel(2, 2, image::Rgba([50, 60, 70, 255]))
-            .save(&input)
-            .unwrap();
-        let (service, owner) =
-            BookCompositionService::spawn_at(temp.path().join("data"), None).unwrap();
-        let scope = crate::book_scope::BookScopeKey::document("C:/selected.pdf").unwrap();
-        service
-            .prepare(scope.clone(), PageDomain::Document)
-            .recv()
-            .unwrap()
-            .status
-            .unwrap();
-        let mut items: Vec<_> = [2, 0, 1]
-            .into_iter()
-            .map(|page| {
-                let mut item = item(&format!("page-{page}"), "book");
-                item.source = crate::books::CompositeSource::File {
-                    path: input.clone(),
-                };
-                item.composition_check = Some(CompositionOutputCheck::new(
-                    service.clone(),
-                    CandidatePage {
-                        identity: crate::book_resume_db::PageIdentity::Document {
-                            container: "C:/selected.pdf".into(),
-                            page_num: page,
-                        },
-                        physical_archive: None,
-                        raw_tree: None,
-                    },
-                ));
-                item
-            })
-            .collect();
-        // A hidden selection may be nonexistent; admission must precede decode.
-        items[2].source = crate::books::CompositeSource::File {
-            path: temp.path().join("hidden-must-not-decode.png"),
-        };
-        let mut record = BookComposition::new(
-            ReadingDirection::Ltr,
-            (0..3)
-                .map(|page_num| CompositionPageRef::PdfPage { page_num })
-                .collect(),
-        );
-        record
-            .hidden_pages
-            .push(CompositionPageRef::PdfPage { page_num: 1 });
-        service
-            .save(scope, PageDomain::Document, record)
-            .recv()
-            .unwrap()
-            .status
-            .unwrap();
-        let output = temp.path().join("out");
-        let (tx, rx) = mpsc::channel();
-        run_batch_export(
-            BatchExportPlan {
-                output_dir: output.clone(),
-                template: "<num>_<filename>".into(),
-                scale: ExportScale::Full,
-                items,
-                raw: None,
-            },
-            Arc::new(AtomicBool::new(false)),
-            tx,
-        );
-        let events: Vec<_> = rx.into_iter().collect();
-        let completed: Vec<_> = events
-            .iter()
-            .filter_map(|event| match event {
-                ExportEvent::Completed(result) => Some(result.label.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(completed, vec!["page-2", "page-0"]);
-        assert!(events.iter().any(|event| matches!(event, ExportEvent::Failed(failure) if failure.label == "page-1" && failure.message == crate::book_composition::COMPOSITION_OUTPUT_HIDDEN_NOTICE)));
-        assert!(output.join("0001_page-2.png").exists());
-        assert!(output.join("0002_page-0.png").exists());
-        assert_eq!(std::fs::read_dir(output).unwrap().count(), 2);
-        owner.shutdown_and_join();
-    }
-
-    #[test]
-    fn worker_reports_unreadable_composition_without_reading_source_or_writing_page() {
-        use crate::book_composition::{
-            BookCompositionService, CandidatePage, CompositionOutputCheck, PageDomain,
-        };
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(
-            data.join("book_composition.db"),
-            b"preserve unreadable composition",
-        )
-        .unwrap();
-        let (service, owner) = BookCompositionService::spawn_at(data.clone(), None).unwrap();
-        service
-            .prepare(
-                crate::book_scope::BookScopeKey::document("C:/selected.pdf").unwrap(),
-                PageDomain::Document,
-            )
-            .recv()
-            .unwrap();
-        let mut source = item("unreadable", "book");
-        source.composition_check = Some(CompositionOutputCheck::new(
-            service,
-            CandidatePage {
-                identity: crate::book_resume_db::PageIdentity::Document {
-                    container: "C:/selected.pdf".into(),
-                    page_num: 0,
-                },
-                physical_archive: None,
-                raw_tree: None,
-            },
-        ));
-        let output = temp.path().join("out");
-        let (tx, rx) = mpsc::channel();
-        run_batch_export(
-            BatchExportPlan {
-                output_dir: output.clone(),
-                template: "<filename>".into(),
-                scale: ExportScale::Full,
-                items: vec![source],
-                raw: None,
-            },
-            Arc::new(AtomicBool::new(false)),
-            tx,
-        );
-        let events: Vec<_> = rx.into_iter().collect();
-        assert!(events.iter().any(
-            |event| matches!(event, ExportEvent::Failed(failure) if failure.label == "unreadable")
-        ));
-        assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, ExportEvent::Completed(_)))
-        );
-        assert_eq!(std::fs::read_dir(output).unwrap().count(), 0);
-        owner.shutdown_and_join();
-        assert_eq!(
-            std::fs::read(data.join("book_composition.db")).unwrap(),
-            b"preserve unreadable composition"
-        );
+fn source_metadata_format(ext: &str) -> Option<SrcFormat> {
+    match ext.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" | "jfif" => Some(SrcFormat::Jpeg),
+        "png" => Some(SrcFormat::Png),
+        "webp" => Some(SrcFormat::Webp),
+        _ => None,
     }
 }
+
+fn ensure_not_cancelled(cancel: &AtomicBool) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        Err("エクスポートをキャンセルしました".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_dimensions(format: &SrcFormat, size: [usize; 2]) -> Result<(), String> {
+    let max = match format {
+        SrcFormat::Webp => 16383,
+        SrcFormat::Jpeg => 65500,
+        _ => usize::MAX,
+    };
+    if size.iter().any(|n| *n > max) {
+        Err(format!(
+            "この形式で書ける大きさを超えています ({}×{})",
+            size[0], size[1]
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn local_datetime(time: SystemTime) -> Result<(String, String), String> {
+    use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTimeEx};
+    let ticks = match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => 116_444_736_000_000_000i128 + d.as_nanos() as i128 / 100,
+        Err(e) => 116_444_736_000_000_000i128 - e.duration().as_nanos() as i128 / 100,
+    };
+    let ticks = u64::try_from(ticks).map_err(|_| "元の更新日時を変換できません".to_string())?;
+    let ft = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+    unsafe {
+        FileTimeToSystemTime(&ft, &mut utc).map_err(|e| e.to_string())?;
+        SystemTimeToTzSpecificLocalTimeEx(None, &utc, &mut local).map_err(|e| e.to_string())?;
+    }
+    Ok((
+        format!("{:04}{:02}{:02}", local.wYear, local.wMonth, local.wDay),
+        format!("{:02}{:02}{:02}", local.wHour, local.wMinute, local.wSecond),
+    ))
+}
+
+fn set_replacement_file_time(
+    path: &Path,
+    previous: Option<SystemTime>,
+    written: SystemTime,
+) -> Result<(), String> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    // Cache stamps use whole seconds. Advance to the next boundary, rather
+    // than adding a second to the old fractional timestamp. Handle pre-epoch
+    // timestamps with the same floor operation.
+    let fractional_nanos = match previous.duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.subsec_nanos(),
+        Err(error) => (1_000_000_000 - error.duration().subsec_nanos()) % 1_000_000_000,
+    };
+    let next_second = previous
+        .checked_add(std::time::Duration::from_nanos(u64::from(
+            1_000_000_000 - fractional_nanos,
+        )))
+        .ok_or("出力の更新日時を計算できません")?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(written.max(next_second)))
+        .map_err(|e| format!("出力の更新日時を設定できません: {e}"))
+}
+
+fn write_output(path: &Path, bytes: &[u8], replace: bool) -> Result<(), String> {
+    use std::io::Write;
+    if replace {
+        let parent = path.parent().ok_or("保存先フォルダがありません")?;
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        // tempfile's Windows persist calls SetFileAttributesW / MoveFileExW
+        // directly. Canonicalize the parent so both native paths retain the
+        // verbatim prefix, including when the destination does not exist yet.
+        let parent = parent.canonicalize().map_err(|e| e.to_string())?;
+        let destination = parent.join(path.file_name().ok_or("保存先のファイル名がありません")?);
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".miv-tmp-")
+            .tempfile_in(&parent)
+            .map_err(|e| e.to_string())?;
+        tmp.write_all(bytes)
+            .and_then(|_| tmp.flush())
+            .map_err(|e| e.to_string())?;
+        tmp.persist(&destination).map_err(|e| e.to_string())?;
+    } else {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| e.to_string())?;
+        file.write_all(bytes)
+            .and_then(|_| file.flush())
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

@@ -395,6 +395,7 @@ preferences_policy! {
         video_thumbnail_indicator: VideoThumbnailIndicator => ("動画サムネイルの表示", |v, _raw| !matches!(v, VideoThumbnailIndicator::Unknown), plain, plain);
         audio_thumbnail_indicator: AudioThumbnailIndicator => ("音声サムネイルの表示", |v, _raw| !matches!(v, AudioThumbnailIndicator::Unknown), plain, plain);
         thumb_show_media_duration: bool => ("サムネイルの再生時間表示", |_, _| true, plain, plain);
+        thumb_show_page_count: bool => ("サムネイルのページ数表示", |_, _| true, plain, plain);
         thumb_show_resume_meter: bool => ("サムネイルの読書・再生位置表示", |_, _| true, plain, plain);
         thumb_name_font_scale_percent: u32 => ("サムネイル一覧の名前の文字サイズ", |v, _raw| (THUMB_NAME_FONT_SCALE_PERCENT_MIN..=THUMB_NAME_FONT_SCALE_PERCENT_MAX).contains(v), plain, plain);
         thumb_name_max_lines: u32 => ("サムネイル一覧の名前の最大行数", |v, _raw| (THUMB_NAME_MAX_LINES_MIN..=THUMB_NAME_MAX_LINES_MAX).contains(v), plain, plain);
@@ -747,6 +748,8 @@ preferences_policy! {
         export_batch_directory => "起動・保存・整理先の PC 固有パス";
         export_batch_template => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         export_batch_format => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        export_batch_options => "環境設定外で管理する一括書き出しの前回値 (PC 固有パスを含む)";
+        export_batch_presets => "環境設定外で管理する一括書き出しのプリセット (保存先・ロゴの PC 固有パスを含む)";
         export_batch_scale => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         sns_split_target => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         sns_split_count => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -794,6 +797,7 @@ preferences_policy! {
         toolbar_sort_name_numeric_desc_options_migrated => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         toolbar_sort_rating_options_migrated => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         toolbar_sort_duration_options_migrated => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        toolbar_sort_page_count_options_migrated => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         toolbar_facet_duration_options_migrated => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         toolbar_facet_filter_items => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         toolbar_facet_name_filter_index_stash => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -1259,6 +1263,7 @@ mod tests {
             ],
         );
         settings.thumb_show_media_duration = !settings.thumb_show_media_duration;
+        settings.thumb_show_page_count = !settings.thumb_show_page_count;
         settings.thumb_show_resume_meter = !settings.thumb_show_resume_meter;
         settings.thumb_name_prioritize_width = !settings.thumb_name_prioritize_width;
         settings.thumb_name_font_scale_percent = if settings.thumb_name_font_scale_percent == 200 {
@@ -2396,6 +2401,36 @@ mod tests {
     }
 
     #[test]
+    fn thumb_show_page_count_transfer_roundtrip_missing_invalid() {
+        for enabled in [false, true] {
+            let source = Settings {
+                thumb_show_page_count: enabled,
+                ..Settings::default()
+            };
+            let mut destination = Settings {
+                thumb_show_page_count: !enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.thumb_show_page_count, enabled);
+            parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.thumb_show_page_count, enabled);
+            for invalid in [json!("true"), json!(1), Value::Null] {
+                let report = parse_preferences(&document(json!({"thumb_show_page_count":invalid})))
+                    .unwrap()
+                    .apply_to(&mut destination);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.thumb_show_page_count, enabled);
+            }
+        }
+    }
+
+    #[test]
     fn page_start_position_transfer_roundtrip_missing_and_invalid_preserve_value() {
         for &position in FullscreenPageStartPosition::all() {
             let source = Settings {
@@ -2644,20 +2679,20 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 520);
+        assert_eq!(entries.len(), 524);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            173
+            174
         );
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            347
+            350
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2673,6 +2708,7 @@ mod tests {
             "show_toolbar_search_everything",
             "show_toolbar_physical_parent_button",
             "show_grid_edge_buttons",
+            "toolbar_sort_page_count_options_migrated",
         ] {
             assert!(
                 entries
@@ -2687,6 +2723,18 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
+        assert!(
+            entries
+                .iter()
+                .any(|(field, reason)| *field == "export_batch_options" && reason.is_some())
+        );
+        assert!(!wire.contains(&"export_batch_options"));
+        assert!(
+            entries
+                .iter()
+                .any(|(field, reason)| *field == "export_batch_presets" && reason.is_some())
+        );
+        assert!(!wire.contains(&"export_batch_presets"));
         for key in [
             "agent_show_current_view",
             "agent_allow_settings",
@@ -2704,7 +2752,7 @@ mod tests {
                 "AI permissions must not become writable: {key}"
             );
         }
-        assert_eq!(wire.len(), 171);
+        assert_eq!(wire.len(), 172);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -3359,6 +3407,7 @@ mod tests {
             path: sentinel.into(),
         }];
         settings.favorites = vec![FavoriteEntry {
+            cover_auto_crop: Default::default(),
             id: uuid::Uuid::new_v4(),
             name: "private-favorite".into(),
             path: sentinel.into(),

@@ -745,6 +745,7 @@ mod tests {
     use std::sync::mpsc;
     fn favorite(id: u128, path: PathBuf, on: bool) -> FavoriteEntry {
         FavoriteEntry {
+            cover_auto_crop: Default::default(),
             id: Uuid::from_u128(id),
             name: id.to_string(),
             path,

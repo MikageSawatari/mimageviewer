@@ -33,6 +33,7 @@ fn cover_auto_worker_zip_and_folder_sample_saved_body_rotations_without_cache_in
         req.set_auto_cover_crop(Some(crate::cover_auto_crop::AutoCropIdentity {
             binding: crate::settings::ReadingDirection::Rtl, folders: is_folder,
         }));
+        req.cover_auto_crop_scope = crate::cover_auto_crop::CoverAutoCropScope::for_identity(req.auto_cover_crop);
         let key = cache_key_for_request(&req).unwrap().into_owned();
         for angle in [Rotation::None, Rotation::Cw180, Rotation::Cw90, Rotation::Cw270] {
             for page in 1..=8 {

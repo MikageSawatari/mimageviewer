@@ -28,7 +28,7 @@ impl RatingViewSort {
                 Self::Normal(crate::settings::SortOrder::FileName)
             }
             Self::Normal(order) => {
-                Self::Normal(crate::app::listing_sort::without_duration_order(order))
+                Self::Normal(crate::app::listing_sort::without_lazy_metric_order(order))
             }
             _ => self,
         }
@@ -104,6 +104,7 @@ pub(crate) struct RatingViewPrepareOptions {
     pub(crate) edits: crate::app::page_edit_snapshot::PageEditAvailability,
     pub(crate) tags_db_path: Option<PathBuf>,
     pub(crate) sidecar_settings: crate::settings::Settings,
+    pub(crate) cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope,
 }
 
 /// A rating write changes membership without replacing the installed order.
@@ -366,7 +367,12 @@ fn prepare_rating_view(
                 options.folder_thumb_depth,
                 true,
                 &options.visibility,
-                crate::app::configured_thumbnail_auto_crop(&options.sidecar_settings),
+                crate::app::cover_auto_crop_for_item(
+                    &options.cover_auto_crop_scope,
+                    item,
+                    None,
+                    None,
+                ),
             )
         })
         .collect();
@@ -461,7 +467,7 @@ pub fn sort_rows(rows: &mut [RatingViewRow], sort: RatingViewSort) {
                 .then_with(|| compare_row_names(a, b, crate::settings::SortOrder::FileName))
         }),
         RatingViewSort::Normal(order) => {
-            let order = crate::app::listing_sort::without_duration_order(order);
+            let order = crate::app::listing_sort::without_lazy_metric_order(order);
             rows.sort_by(|a, b| compare_row_names(a, b, order));
         }
     }
@@ -852,6 +858,77 @@ mod tests {
             edits: Default::default(),
             tags_db_path: None,
             sidecar_settings: Default::default(),
+            cover_auto_crop_scope: Default::default(),
+        }
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_rating_prepare_uses_item_location() {
+        use crate::cover_auto_crop::{AutoCropIdentity, CoverAutoCropScope};
+        use crate::settings::{FavoriteCoverAutoCropPreference, FavoriteEntry, ReadingDirection};
+
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let favorite_root = temp.path().join("photos");
+        std::fs::create_dir(&favorite_root).unwrap();
+        let inside = favorite_root.join("inside.zip");
+        let outside = temp.path().join("outside.zip");
+        let db_path = temp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        for path in [&inside, &outside] {
+            write_zip_entries(path, &["cover.jpg"]);
+            db.set_user_rating(
+                &crate::path_key::normalize_keep_drive(path),
+                3,
+                Some(
+                    &crate::rating_db::RatingMeta::new(RatingItemKind::ZipFile)
+                        .with_source_path(path),
+                ),
+            )
+            .unwrap();
+        }
+        drop(db);
+        let mut favorite = FavoriteEntry::new("photos".into(), favorite_root);
+        favorite.cover_auto_crop = FavoriteCoverAutoCropPreference::Off;
+        let settings = crate::settings::Settings {
+            thumb_cover_auto_crop: true,
+            thumb_cover_auto_crop_binding: ReadingDirection::Ltr,
+            favorites: vec![favorite],
+            ..Default::default()
+        };
+        let mut options = membership_options(Default::default());
+        options.cover_auto_crop_scope = CoverAutoCropScope::from_settings(&settings);
+        options.sidecar_settings = settings.thumbnail_source_discovery_snapshot();
+        assert!(options.sidecar_settings.favorites.is_empty());
+        let prepared = prepare_rating_view(db_path, 3, options, &AtomicBool::new(false))
+            .unwrap()
+            .prepared
+            .unwrap();
+        assert_eq!(prepared.items.len(), 2);
+        let identity = AutoCropIdentity::new(ReadingDirection::Ltr);
+        for (path, automatic) in [(&inside, None), (&outside, Some(identity))] {
+            assert!(prepared.items.contains(&GridItem::ZipFile(path.clone())));
+            let base = format!("zipthumb:{}", path.display());
+            let mut request = crate::thumb_loader::LoadRequest {
+                path: path.clone(),
+                cache_key_override: Some(base.clone()),
+                ..Default::default()
+            };
+            request.set_auto_cover_crop(automatic);
+            let expected = crate::thumb_loader::cache_key_for_request(&request).unwrap();
+            assert!(
+                prepared.existing_keys.contains(expected.as_ref()),
+                "{expected}"
+            );
+            let automatic_key = crate::thumb_loader::representative_cache_key_for_policy_with_auto(
+                &base,
+                &settings.file_type_visibility,
+                Some(identity),
+            );
+            assert_eq!(
+                prepared.existing_keys.contains(&automatic_key),
+                automatic.is_some()
+            );
         }
     }
 
@@ -874,12 +951,14 @@ mod tests {
             crate::settings::ReadingDirection::Ltr,
         ] {
             let mut options = membership_options(Default::default());
-            options.sidecar_settings = crate::settings::Settings {
+            let settings = crate::settings::Settings {
                 thumb_cover_auto_crop: true,
                 thumb_cover_auto_crop_binding: binding,
                 ..Default::default()
-            }
-            .thumbnail_source_discovery_snapshot();
+            };
+            options.cover_auto_crop_scope =
+                crate::cover_auto_crop::CoverAutoCropScope::from_settings(&settings);
+            options.sidecar_settings = settings.thumbnail_source_discovery_snapshot();
             let prepared =
                 prepare_rating_view(db_path.clone(), 3, options, &AtomicBool::new(false))
                     .unwrap()
@@ -938,6 +1017,8 @@ mod tests {
                 let mut options = membership_options(Default::default());
                 // Match App's capture at the rating worker boundary, rather
                 // than passing the live Settings directly.
+                options.cover_auto_crop_scope =
+                    crate::cover_auto_crop::CoverAutoCropScope::from_settings(&settings);
                 options.sidecar_settings = settings.thumbnail_source_discovery_snapshot();
                 let prepared =
                     prepare_rating_view(db_path.clone(), 3, options, &AtomicBool::new(false))
@@ -999,6 +1080,8 @@ mod tests {
                     ..Default::default()
                 };
                 let mut options = membership_options(Default::default());
+                options.cover_auto_crop_scope =
+                    crate::cover_auto_crop::CoverAutoCropScope::from_settings(&settings);
                 options.sidecar_settings = settings.thumbnail_source_discovery_snapshot();
                 let prepared =
                     prepare_rating_view(db_path.clone(), 3, options, &AtomicBool::new(false))
@@ -1194,6 +1277,7 @@ mod tests {
                 edits: Default::default(),
                 tags_db_path: None,
                 sidecar_settings: crate::settings::Settings::default(),
+                cover_auto_crop_scope: Default::default(),
             };
             invalidate_source();
             let legacy =
@@ -1265,6 +1349,8 @@ mod tests {
         for order in [
             crate::settings::SortOrder::DurationAsc,
             crate::settings::SortOrder::DurationDesc,
+            crate::settings::SortOrder::PageCountAsc,
+            crate::settings::SortOrder::PageCountDesc,
         ] {
             assert_eq!(
                 RatingViewSort::Normal(order).normalized_for_rating_view(),
@@ -1739,6 +1825,8 @@ mod tests {
                     edits: Default::default(),
                     tags_db_path: None,
                     sidecar_settings: settings.thumbnail_source_discovery_snapshot(),
+                    cover_auto_crop_scope:
+                        crate::cover_auto_crop::CoverAutoCropScope::from_settings(&settings),
                 },
                 &AtomicBool::new(false),
             )
@@ -1800,6 +1888,8 @@ mod tests {
                     edits: Default::default(),
                     tags_db_path: None,
                     sidecar_settings: settings.thumbnail_source_discovery_snapshot(),
+                    cover_auto_crop_scope:
+                        crate::cover_auto_crop::CoverAutoCropScope::from_settings(&settings),
                 },
                 &AtomicBool::new(false),
             )

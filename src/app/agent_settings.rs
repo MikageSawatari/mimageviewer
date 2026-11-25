@@ -5,10 +5,12 @@ use crate::agent_ipc::changes::{
 };
 use crate::settings::Settings;
 use mimageviewer_agent_ipc::{
-    AgentError, AgentLevel, ErrorCode, MAX_ITEM_CHARS, MAX_PAGE_CHARS, MAX_SETTINGS_KEYS, PageRow,
-    SETTINGS_PAGE_SIZE, SettingChange, SettingChangeRow, SettingChoice, SettingRow, SettingsPage,
-    SettingsWriteResult, mcp_content_chars,
+    AgentError, AgentLevel, ErrorCode, MAX_PAGE_CHARS, MAX_SETTINGS_KEYS, SETTINGS_PAGE_SIZE,
+    SettingChange, SettingChangeRow, SettingChoice, SettingRow, SettingsPage, SettingsWriteResult,
+    mcp_content_chars,
 };
+#[cfg(test)]
+use mimageviewer_agent_ipc::{MAX_ITEM_CHARS, PageRow};
 use serde_json::{Map, Value};
 
 const DIALOG_BUSY: &str =
@@ -20,7 +22,7 @@ fn bad(message: impl Into<String>) -> AgentError {
 }
 
 impl App {
-    fn agent_settings_permission(&self) -> Result<(), AgentError> {
+    pub(super) fn agent_settings_permission(&self) -> Result<(), AgentError> {
         if self.settings.agent_level < AgentLevel::ReadOnly || !self.settings.agent_allow_settings {
             return Err(AgentError::new(
                 ErrorCode::Disabled,
@@ -29,6 +31,20 @@ impl App {
         }
         if !self.initialized || self.indexer_init.overlay_active() {
             return Err(AgentError::new(ErrorCode::NotReady, "mIV の起動処理中です"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn agent_settings_read_permission(&self) -> Result<(), AgentError> {
+        self.agent_settings_permission()?;
+        if self
+            .remote_session_handle()
+            .is_some_and(|session| session.with_local_composition_admission(|| ()).is_err())
+        {
+            return Err(AgentError::new(
+                ErrorCode::Busy,
+                "リモート操作中は設定を返しません",
+            ));
         }
         Ok(())
     }
@@ -49,16 +65,7 @@ impl App {
         keys: Option<&[String]>,
         page: Option<u32>,
     ) -> Result<SettingsPage, AgentError> {
-        self.agent_settings_permission()?;
-        if self
-            .remote_session_handle()
-            .is_some_and(|session| session.with_local_composition_admission(|| ()).is_err())
-        {
-            return Err(AgentError::new(
-                ErrorCode::Busy,
-                "リモート操作中は設定を返しません",
-            ));
-        }
+        self.agent_settings_read_permission()?;
         if query.is_some_and(|query| query.chars().take(201).count() > 200) {
             return Err(bad("query は 200 文字以内で指定してください"));
         }
@@ -127,6 +134,7 @@ impl App {
             pages,
             more,
         };
+        let mut rows = Vec::new();
         for row in selected {
             let row = SettingRow {
                 key: row.key,
@@ -146,40 +154,17 @@ impl App {
                 }),
                 template: if details { row.template } else { None },
             };
-            let omitted =
-                || PageRow::too_long(&row.key).map_err(|_| bad("応答を作成できませんでした"));
-            let item = if mcp_content_chars(&row).map_err(|_| bad("応答を作成できませんでした"))?
-                > MAX_ITEM_CHARS
-            {
-                omitted()?
-            } else {
-                PageRow::Value(row.clone())
-            };
-            response.items.push(item);
+            rows.push(row);
         }
-        // Keep page membership stable, including late rows. Replace the largest
-        // remaining value until the final structured JSON and text copy fit.
-        while mcp_content_chars(&response).map_err(|_| bad("応答を作成できませんでした"))?
-            > MAX_PAGE_CHARS
-        {
-            let index = response
-                .items
-                .iter()
-                .enumerate()
-                .filter_map(|(index, row)| match row {
-                    PageRow::Value(row) => {
-                        Some((index, mcp_content_chars(row).unwrap_or(usize::MAX)))
-                    }
-                    PageRow::TooLong(_) => None,
-                })
-                .max_by_key(|(_, size)| *size)
-                .map(|(index, _)| index)
-                .ok_or_else(|| bad(RESPONSE_TOO_LARGE))?;
-            if let PageRow::Value(row) = &response.items[index] {
-                response.items[index] =
-                    PageRow::too_long(&row.key).map_err(|_| bad("応答を作成できませんでした"))?;
-            }
-        }
+        response.items = mimageviewer_agent_ipc::bound_page_rows(
+            rows,
+            |row| row.key.clone(),
+            |items| SettingsPage {
+                items: items.to_vec(),
+                ..response.clone()
+            },
+        )
+        .map_err(bad)?;
         Ok(response)
     }
 

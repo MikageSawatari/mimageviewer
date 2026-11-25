@@ -20,14 +20,14 @@ fn shipped_hello_fixture_has_exact_adapter_bytes() {
     v3_wire::write_frame(&mut bytes, &hello()).unwrap();
     assert_eq!(bytes, include_bytes!("v3_wire/hello.frame"));
     assert_eq!(v3_wire::AGENT_PROTOCOL_VERSION, 3);
-    assert_eq!(current::AGENT_PROTOCOL_VERSION, 6);
+    assert_eq!(current::AGENT_PROTOCOL_VERSION, 7);
     assert_eq!(current::MIN_ADAPTER_PROTOCOL_VERSION, 3);
-    for version in [0, 2, 3, 4, 5, 6, 7, u32::MAX] {
+    for version in [0, 2, 3, 4, 5, 6, 7, 8, u32::MAX] {
         assert_eq!(
             current::supports_adapter_version(version),
-            matches!(version, 3 | 4 | 5 | 6)
+            matches!(version, 3 | 4 | 5 | 6 | 7)
         );
-        assert_eq!(current::check_version(version).is_ok(), version == 6);
+        assert_eq!(current::check_version(version).is_ok(), version == 7);
     }
 }
 

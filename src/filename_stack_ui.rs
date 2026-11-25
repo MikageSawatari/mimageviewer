@@ -2356,23 +2356,35 @@ impl crate::app::App {
         self.other_location_navigation_pending()
             || self.direct_navigation_scan_pending()
             || self.drive_jump_pending()
+            || self.main_startup_scan_elapsed().is_some()
     }
 
     /// Grace is visual only: item input is blocked immediately. Existing history/rating
     /// waits keep their immediate indicator, even if a physical scan is also pending.
     pub(crate) fn direct_navigation_wait_overlay_delay(&self) -> Option<std::time::Duration> {
+        self.direct_navigation_wait_overlay_delay_at(std::time::Instant::now())
+    }
+
+    pub(crate) fn direct_navigation_wait_overlay_delay_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
         if self.other_location_navigation_pending() {
             return None;
         }
         let elapsed = self
             .direct_navigation_scan_elapsed()
             .or_else(|| self.drive_jump_elapsed())
+            .or_else(|| self.main_startup_scan_elapsed_at(now))
             .or_else(|| self.view_order_refresh_scan_elapsed())?;
         (elapsed < DIRECT_NAVIGATION_WAIT_GRACE).then(|| DIRECT_NAVIGATION_WAIT_GRACE - elapsed)
     }
 
     pub(crate) fn grid_item_input_block(&self) -> Option<GridItemInputBlock> {
-        if self.direct_navigation_scan_pending() || self.drive_jump_pending() {
+        if self.direct_navigation_scan_pending()
+            || self.drive_jump_pending()
+            || self.main_startup_scan_elapsed().is_some()
+        {
             Some(GridItemInputBlock::DirectNavigationScan)
         } else if self.view_order_refresh_scan_pending() {
             Some(GridItemInputBlock::ViewOrderRefreshScan)
@@ -4337,6 +4349,31 @@ mod tests {
         assert!(media[0].is_video);
         assert!(matches!(passthrough[0], GridItem::Audio(_)));
         assert_eq!(passthrough_metas, [audio_meta]);
+    }
+
+    #[test]
+    fn page_sort_883_extract_stack_parts_preserves_book_page_counts_and_folder_size() {
+        use crate::settings::ListingPageCount;
+        let items = vec![
+            GridItem::Folder(PathBuf::from(r"C:\root\photos")),
+            GridItem::ZipFile(PathBuf::from(r"C:\root\book.zip")),
+            GridItem::Image(PathBuf::from(r"C:\root\post_1.jpg")),
+        ];
+        let mut folder = ListingSortMetadata::new(7, None);
+        folder.page_count = ListingPageCount::Known(12);
+        let mut book = ListingSortMetadata::new(8, Some(30));
+        book.page_count = ListingPageCount::Known(24);
+        let image = ListingSortMetadata::new(9, Some(40));
+        let (passthrough, metas, sort_metas, media) = extract_stack_parts(
+            &items,
+            &[Some((7, 0)), Some((8, 30)), Some((9, 40))],
+            &[folder, book, image],
+        );
+        assert_eq!(passthrough.len(), 2);
+        assert_eq!(metas, [Some((7, 0)), Some((8, 30))]);
+        assert_eq!(sort_metas, [folder, book]);
+        assert_eq!(media[0].sort_meta, image);
+        assert_eq!(media[0].sort_meta.page_count, ListingPageCount::Missing);
     }
 
     #[test]
