@@ -83,6 +83,346 @@ fn enter(app: &mut App, ctx: &egui::Context, origin: ShellPasteOrigin) {
     }
 }
 
+#[cfg(windows)]
+mod fixed_ctrl_v_tests {
+    use super::*;
+    use crate::key_input::{KeyEdge, KeyOperationId};
+
+    fn edge(vk: u32, pressed: bool, ctrl: bool) -> KeyEdge {
+        KeyEdge {
+            operation_id: KeyOperationId::unassigned(),
+            source_hwnd: 1,
+            source_viewport: egui::ViewportId::ROOT,
+            virtual_key: vk,
+            scan_code: if vk == 0x56 { 0x2F } else { 0x1D },
+            extended: false,
+            pressed,
+            repeat: false,
+            ctrl,
+            shift: false,
+            alt: false,
+        }
+    }
+
+    fn tap(ctrl: bool) -> Vec<KeyEdge> {
+        let mut edges = Vec::new();
+        if ctrl {
+            edges.push(edge(0x11, true, true));
+        }
+        edges.push(edge(0x56, true, ctrl));
+        edges.push(edge(0x56, false, ctrl));
+        if ctrl {
+            edges.push(edge(0x11, false, false));
+        }
+        edges
+    }
+
+    fn begin(ctx: &egui::Context, edges: Vec<KeyEdge>, focused: bool) {
+        // Native ingress stamps pending edges before the next App frame drains them.
+        for edge in edges {
+            crate::key_input::enqueue_test_pending_edge(edge);
+        }
+        crate::key_input::begin_frame();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .focused = Some(focused);
+        ctx.begin_pass(input);
+    }
+
+    fn dispatch_files(app: &mut App, ctx: &egui::Context) {
+        // Run the complete clipboard shortcut handler; replace only OS clipboard I/O.
+        app.handle_clipboard_shortcuts_with(ctx, || {
+            Ok(crate::clipboard_capture::data::ClipboardKind::Files)
+        });
+    }
+
+    fn assert_not_dispatched(app: &mut App, ctx: &egui::Context) {
+        app.handle_clipboard_shortcuts_with(ctx, || {
+            panic!("blocked Ctrl+V must not query the clipboard")
+        });
+        assert!(app.shell_paste_request.is_none());
+        assert!(app.fs_feedback_toast.is_none());
+    }
+
+    #[test]
+    fn shell_paste_ctrl_v_released_before_frame_submits_once_and_preserves_edge() {
+        let mut app = ready(); // AppTestEnv owns lock_test_input until App is dropped.
+        let ctx = egui::Context::default();
+        let worker = install_worker(&mut app);
+        begin(&ctx, tap(true), true);
+        assert!(!ctx.input(|input| input.key_down(egui::Key::V)));
+        assert!(!crate::key_input::physical_key_down(
+            crate::key_input::PhysicalKeySlot::new(0x56, false)
+        ));
+        dispatch_files(&mut app, &ctx);
+        worker.entered.recv_timeout(WAIT).unwrap();
+        assert_eq!(
+            app.shell_paste_request.as_ref().unwrap().origin,
+            ShellPasteOrigin::CtrlV
+        );
+        assert!(crate::key_input::pressed_key_down(
+            egui::ViewportId::ROOT,
+            |edge| { edge.virtual_key == 0x56 && edge.ctrl && !edge.repeat }
+        ));
+        finish_paste(&mut app, &ctx, &worker, true);
+        ctx.end_pass().drop_without_applying_deltas();
+
+        // Unconsumed edges expire at the normal next-frame boundary.
+        begin(&ctx, Vec::new(), true);
+        assert_not_dispatched(&mut app, &ctx);
+        assert!(worker.entered.try_recv().is_err());
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn shell_paste_ctrl_v_layout_replay_after_completion_dispatches_once() {
+        let mut app = ready();
+        let ctx = egui::Context::default();
+        let worker = install_worker(&mut app);
+        for edge in tap(true) {
+            crate::key_input::enqueue_test_pending_edge(edge);
+        }
+        let mut passes = 0;
+        let mut queries = 0;
+        ctx.run_ui(Default::default(), |ui| {
+            let ctx = ui.ctx();
+            crate::key_input::begin_frame_for_context_with_tracking(ctx, false);
+            assert!(!app.shortcuts_blocked_by_text_input(ctx));
+            assert!(app.grid_item_input_allowed());
+            assert!(app.shell_paste_request.is_none());
+            app.handle_clipboard_shortcuts_with(ctx, || {
+                queries += 1;
+                Ok(crate::clipboard_capture::data::ClipboardKind::Files)
+            });
+            if ctx.current_pass_index() == 0 {
+                worker.entered.recv_timeout(WAIT).unwrap();
+                assert_eq!(
+                    app.shell_paste_request.as_ref().unwrap().origin,
+                    ShellPasteOrigin::CtrlV
+                );
+                // Finish and poll the initial request before the actual egui
+                // replay. Busy admission must not be what prevents re-dispatch.
+                finish_paste(&mut app, ctx, &worker, true);
+                assert!(app.shell_paste_request.is_none());
+                ctx.request_discard("clipboard paste replay after completion");
+            } else {
+                assert!(app.shell_paste_request.is_none());
+                assert!(worker.entered.try_recv().is_err());
+                assert!(app.fs_feedback_toast.is_none());
+            }
+            assert!(crate::key_input::pressed_key_down(
+                egui::ViewportId::ROOT,
+                |edge| { edge.virtual_key == 0x56 && edge.ctrl && !edge.repeat }
+            ));
+            passes += 1;
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+        assert_eq!(queries, 1);
+
+        // A different press in a later backend frame is still eligible.
+        for edge in tap(true) {
+            crate::key_input::enqueue_test_pending_edge(edge);
+        }
+        ctx.run_ui(Default::default(), |ui| {
+            crate::key_input::begin_frame_for_context_with_tracking(ui.ctx(), false);
+            dispatch_files(&mut app, ui.ctx());
+            worker.entered.recv_timeout(WAIT).unwrap();
+            finish_paste(&mut app, ui.ctx(), &worker, true);
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn shell_paste_ctrl_v_keeps_shift_alt_and_routed_ownership_after_focus_loss() {
+        for (shift, alt) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut app = ready();
+            let ctx = egui::Context::default();
+            let worker = install_worker(&mut app);
+            let mut edges = tap(true);
+            for edge in &mut edges {
+                edge.shift = shift;
+                edge.alt = alt;
+            }
+            begin(&ctx, edges, false);
+            dispatch_files(&mut app, &ctx);
+            worker.entered.recv_timeout(WAIT).unwrap();
+            assert_eq!(
+                app.shell_paste_request.as_ref().unwrap().origin,
+                ShellPasteOrigin::CtrlV
+            );
+            finish_paste(&mut app, &ctx, &worker, true);
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn shell_paste_ctrl_v_rejects_plain_v_repeat_and_key_up() {
+        for edges in [
+            tap(false),
+            vec![KeyEdge {
+                repeat: true,
+                ..edge(0x56, true, true)
+            }],
+            vec![edge(0x56, false, true)],
+        ] {
+            let mut app = ready();
+            let ctx = egui::Context::default();
+            begin(&ctx, edges, true);
+            assert_not_dispatched(&mut app, &ctx);
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn shell_paste_ctrl_v_text_modal_ime_and_focused_ui_block_routed_edges() {
+        use crate::keyboard_input::{
+            KeyboardOwner, ShortcutScope, ShortcutSurface, TextInputPhase,
+        };
+        let viewport = egui::ViewportId::ROOT;
+        let widget_id = egui::Id::unique("ctrl_v_blocking_owner");
+        for focused in [true, false] {
+            for owner in [
+                KeyboardOwner::Modal,
+                KeyboardOwner::TextInput {
+                    viewport,
+                    widget_id,
+                    phase: TextInputPhase::Focused,
+                },
+                KeyboardOwner::TextInput {
+                    viewport,
+                    widget_id,
+                    phase: TextInputPhase::FocusRecovery,
+                },
+                KeyboardOwner::TextInput {
+                    viewport,
+                    widget_id,
+                    phase: TextInputPhase::ImeComposing,
+                },
+                KeyboardOwner::FocusedUi {
+                    viewport,
+                    widget_id,
+                },
+                KeyboardOwner::ApplicationShortcut {
+                    scope: ShortcutScope::new(viewport, ShortcutSurface::Fullscreen),
+                },
+            ] {
+                let mut app = ready();
+                let ctx = egui::Context::default();
+                begin(&ctx, tap(true), focused);
+                crate::keyboard_input::cache_keyboard_owner(&ctx, owner);
+                assert_not_dispatched(&mut app, &ctx);
+                assert!(
+                    crate::key_input::pressed_key_down(viewport, |edge| {
+                        edge.virtual_key == 0x56 && edge.ctrl
+                    }),
+                    "blocking must not consume the edge"
+                );
+                ctx.end_pass().drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
+    fn shell_paste_ctrl_v_ignores_foreign_edges_and_unfocused_egui_only_input() {
+        let mut app = ready();
+        let ctx = egui::Context::default();
+        let mut edges = tap(true);
+        for edge in &mut edges {
+            edge.source_viewport = egui::ViewportId::from_hash_of("foreign_clipboard_source");
+        }
+        begin(&ctx, edges, true);
+        assert_not_dispatched(&mut app, &ctx);
+        ctx.end_pass().drop_without_applying_deltas();
+
+        begin(&ctx, Vec::new(), false);
+        ctx.input_mut(|input| {
+            input.events.push(egui::Event::Key {
+                key: egui::Key::V,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            });
+        });
+        assert_not_dispatched(&mut app, &ctx);
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn shell_paste_ctrl_v_synthetic_tap_submits_after_timeline_release() {
+        use crate::key_input::{SyntheticKeyCommand, SyntheticModifiers, SyntheticNavigationKey};
+        let mut app = ready();
+        let ctx = egui::Context::default();
+        let worker = install_worker(&mut app);
+        crate::key_input::arm_test_synthetic_input(1, egui::ViewportId::ROOT);
+        let at = Instant::now() - Duration::from_secs(1);
+        crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down_for_target(
+            at,
+            SyntheticNavigationKey::V,
+            SyntheticModifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            crate::key_input::SyntheticRoutingTarget {
+                hwnd: 1,
+                viewport: egui::ViewportId::ROOT,
+            },
+        ));
+        crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::up(
+            at,
+            SyntheticNavigationKey::V,
+        ));
+        crate::key_input::advance_test_synthetic_input(Instant::now());
+        begin(&ctx, Vec::new(), true);
+        for vk in [0x11, 0x56] {
+            assert!(!crate::key_input::physical_key_down(
+                crate::key_input::PhysicalKeySlot::new(vk, false)
+            ));
+        }
+        dispatch_files(&mut app, &ctx);
+        worker.entered.recv_timeout(WAIT).unwrap();
+        assert_eq!(
+            app.shell_paste_request.as_ref().unwrap().origin,
+            ShellPasteOrigin::CtrlV
+        );
+        finish_paste(&mut app, &ctx, &worker, true);
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn shell_paste_ctrl_v_keeps_copy_cut_precedence_and_semantic_focus_gate() {
+        use crate::native_context_menu::ShellClipboardVerb;
+        for (keys, verb) in [
+            (vec![0x43], ShellClipboardVerb::Copy),
+            (vec![0x58], ShellClipboardVerb::Cut),
+            (vec![0x43, 0x58], ShellClipboardVerb::Cut),
+        ] {
+            let app = ready();
+            let ctx = egui::Context::default();
+            let mut edges = tap(true);
+            for vk in keys {
+                edges.extend([edge(vk, true, true), edge(vk, false, true)]);
+            }
+            begin(&ctx, edges, false);
+            assert_eq!(app.grid_clipboard_requests(&ctx), Some((Some(verb), true)));
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+
+        let app = ready();
+        let ctx = egui::Context::default();
+        // An unrelated stamped ROOT key must not give generic clipboard events
+        // ownership in an unfocused pass.
+        begin(&ctx, vec![edge(0x41, true, false)], false);
+        ctx.input_mut(|input| input.events.extend([egui::Event::Copy, egui::Event::Cut]));
+        assert_eq!(app.grid_clipboard_requests(&ctx), Some((None, false)));
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+}
+
 fn transfer(folder: PathBuf) -> ShellTransferRequest {
     ShellTransferRequest {
         sources: vec![folder.join("source.jpg")],

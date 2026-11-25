@@ -303,7 +303,7 @@
   - 再発防止: テストビルドの物理キー入口は、呼び出したスレッドに入力ロックが無ければ、`lock_test_input()` を取るよう伝えて panic する。別テストのロックや有効な timeline で通過させない。nextest の別プロセス実行と cargo test の同一プロセス並列実行で規則を揃え、App を動かす子スレッドは自身でロックを取る。OS reader の配線テストだけは private helper に偽の reader を注入して検査し、実キーボードを読むテストは残さない。解放の既定値・clear/reset 後・未取得・別スレッド所有の回帰を追加した。今回の実装担当は指示に従い compiler / runner を実行していない。
   - 追補 (Round 2): 初回修正 `8c840ac64` の通常 lib 全件では、未取得 panic が 294 件残った（実行・観測は load-flakes-814g の ClaudeCode）。全キー押下にしても結果が変わらない読み手があり、120 件の一覧だけでは足りなかった。共通 `AppTestEnv` と履歴 `CaseEnv` が入力 guard を所有する形へ変更した。同じスレッドの明示 guard は `Rc` の scope を共有し、fixture の前後どちらで取っても再取得で停止せず、途中の guard 破棄で入力を消さない。入力 → data-dir の順で取り、App と後処理・data-dir の後まで入力を保持する。子スレッド内の fixture 生成もそのスレッドで取得し、未取得 assert は緩めない。入れ子・破棄順・部分 move・子スレッドの回帰を追加し、統括のコンパイル・検証待ち。
   - 検証 (実行・観測は load-flakes-814g の ClaudeCode、どちらも run-heavy の `-FullTest`・12 並列): `b165a25c6` の通常の本体 lib 全件は 19,296 件すべて成功 (709 秒)。同じソースで、実キーを読む側を「全キー押下」に固定した 本体 lib 全件も 19,296 件すべて成功 (715 秒。修正前の同じ条件では 120 件が失敗)。CPU 負荷 (22 スレッド) の下の 7 件 × 20 回では、修正前に 1 回の反復で page_turn の 5 件が同時に落ちた (実キーの押下と同じ形)。
-  - 残る別件: `App::update` の固定 Ctrl+V は `GetAsyncKeyState` の下位の transition bit を使い、現在レベルだけの入口では同じ意味を保てないため変更しない。headless App フレームもこの直接呼び出しへ到達する。将来、Ctrl / V の生の i16 値を読む入口を分離し、製品では今と同じ API・呼出順、テストでは解放の既定値と明示的な transition 注入を使う案を検討する。
+  - 残る別件は実装で解消済み (2026-11-25、コンパイル・テスト・独立レビュー待ち): 一覧の固定 Ctrl+V も ROOT の配送済み non-repeat key-down edge へ移し、`GetAsyncKeyState` の transition bit の直接読取を撤去した。V がフレーム前に解放される短い打鍵を受け、headless は frame edge、clipboard capture の test_script は同じ合成 timeline を使う。観測・根拠・回帰は [ui-sync-853-plan.md §5.12](ui-sync-853-plan.md#512-一覧の-ctrlv-の取りこぼし) を参照。
 
 ### 1.809 UI 全般のマウス移動に伴う GPU 負荷を減らせるか確認する — 5ch >>805・810 (2026-11-18)
 

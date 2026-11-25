@@ -64803,14 +64803,17 @@ impl App {
         let _ = ctx;
     }
 
-    /// Sample this root pass's clipboard requests before any Shell I/O.
-    /// The Win32 transition bit, keymap and semantic events keep their old order.
+    /// Sample clipboard requests and claim paste dispatch before any Shell I/O.
+    /// Routed key-down edges survive release/focus loss before this pass runs.
     fn grid_clipboard_requests(
         &self,
         ctx: &egui::Context,
     ) -> Option<(Option<crate::native_context_menu::ShellClipboardVerb>, bool)> {
         let main_focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        if !main_focused
+        if ctx.viewport_id() != egui::ViewportId::ROOT
+            || crate::keyboard_input::keyboard_input_permits(ctx)
+                .discrete
+                .is_none()
             || self.shortcuts_blocked_by_text_input(ctx)
             || !self.grid_item_input_allowed()
         {
@@ -64823,14 +64826,15 @@ impl App {
         let ctrl_v = {
             #[cfg(windows)]
             {
-                // Clipboard paste depends on GetAsyncKeyState's transition low
-                // bit, which the keyboard level chokepoint intentionally does
-                // not model. Synthetic clipboard input is outside S1.
-                let ctrl =
-                    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x11) };
-                let v =
-                    unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(0x56) };
-                crate::keyboard_input::shell_paste_transition_requested(ctrl, v)
+                // Fixed Ctrl+V keeps its old Shift/Alt-insensitive meaning.
+                // Claim this dispatch once across layout replay, while leaving
+                // the edges available to later handlers.
+                !crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx)
+                    && crate::key_input::claim_key_down_dispatch(
+                        egui::ViewportId::ROOT,
+                        egui::Id::unique("grid_clipboard_paste"),
+                        |edge| edge.virtual_key == 0x56 && edge.ctrl && !edge.repeat,
+                    )
             }
             #[cfg(not(windows))]
             false
@@ -64845,9 +64849,9 @@ impl App {
             .effective_chords(KeyAction::GridCutFiles)
             .contains(&crate::keymap::Chord::ctrl(crate::keymap::KeyName::X));
         let copy_requested = self.keymap.pressed_action(ctx, KeyAction::GridCopyFiles)
-            || (egui_copy && copy_accepts_semantic_event);
+            || (main_focused && egui_copy && copy_accepts_semantic_event);
         let cut_requested = self.keymap.pressed_action(ctx, KeyAction::GridCutFiles)
-            || (egui_cut && cut_accepts_semantic_event);
+            || (main_focused && egui_cut && cut_accepts_semantic_event);
 
         let verb = if cut_requested {
             Some(crate::native_context_menu::ShellClipboardVerb::Cut)
@@ -64861,6 +64865,14 @@ impl App {
 
     /// Dispatch copy/cut before paste, at the original root UI checkpoint.
     fn handle_clipboard_shortcuts(&mut self, ctx: &egui::Context) {
+        self.handle_clipboard_shortcuts_with(ctx, crate::clipboard_capture::manual_kind);
+    }
+
+    fn handle_clipboard_shortcuts_with(
+        &mut self,
+        ctx: &egui::Context,
+        query: impl FnOnce() -> Result<crate::clipboard_capture::data::ClipboardKind, String>,
+    ) {
         let Some((verb, ctrl_v)) = self.grid_clipboard_requests(ctx) else {
             return;
         };
@@ -64876,7 +64888,7 @@ impl App {
         if ctrl_v {
             self.handle_clipboard_paste_with(
                 ctx,
-                crate::clipboard_capture::manual_kind,
+                query,
                 |app, ctx, kind, _hwnd, folder| match kind {
                     crate::clipboard_capture::data::ClipboardKind::Image
                     | crate::clipboard_capture::data::ClipboardKind::Html => {

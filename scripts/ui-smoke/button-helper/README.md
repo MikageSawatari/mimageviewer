@@ -5,7 +5,7 @@ This directory is the tracked external owner for the
 Down/Up gesture outside the application process, so it can release a Down that
 it inserted even when the disposable application exits or stops replying.
 
-`scripts/ui-smoke.ps1` loads these sources for `NativeTopPanoramaClick` and `ClipboardCapture`.
+`scripts/ui-smoke.ps1` loads these sources for `NativeTopPanoramaClick`.
 It launches the exact disposable App with a one-run pipe name, session nonce,
 and expected server PID, then starts the helper with the returned App PID. The
 App authenticates that endpoint and carries the gesture and step identity
@@ -28,19 +28,12 @@ clock for move completion, helper requests/replies and WndProc entry/match trace
 Hit-test samples are observations, not proof of OS delivery or release, and do
 not participate in preflight, receipt acceptance or the App-kill interlock.
 
-`ClipboardCapture` uses `ClipboardKeyHelperHandle` from this package as a
-separate keyboard owner. It reuses the pinned process lease, current-SID local
-pipe authentication and runner cleanup/join interlock. Its bounded 56-byte
-Begin/Release requests carry session, gesture ID, root HWND, App PID and backend
-token. Rust validates the current backend before requesting a gesture; the
-external driver validates exact process/HWND/foreground/desktop and initially
-released user modifiers before inserting Ctrl/V. The App waits for its actual
-GetAsyncKeyState paste consumer counter, then requests Release. Only inserted
-Down keys create release obligations. Death, disconnect, cancellation and a
-five-second held-key deadline run cleanup outside the App process. A desktop
-change or unconfirmed release keeps the existing App-kill interlock closed.
-The keyboard path has independent wire/owner logic; the mouse protocol and
-Response/WndProc receipt contract remain intact.
+`ClipboardCapture` now uses the application's synthetic Ctrl+V timeline and
+ROOT frame edges, with the paste consumer counter as its receipt. It no longer
+starts or connects to `ClipboardKeyHelperHandle`, or inserts OS key Down/Up.
+The old keyboard helper sources and their isolated tests remain in this package;
+they are not part of the ClipboardCapture runner path. The native mouse protocol,
+Response/WndProc receipt and cleanup/join interlock remain intact.
 
 The implementation was promoted from the independently reviewed ignored
 reducer/backend checkpoint under `target/v370-work`. The previously unexecuted

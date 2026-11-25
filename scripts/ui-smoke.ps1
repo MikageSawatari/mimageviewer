@@ -461,7 +461,7 @@ function Stop-ExactUiSmokeProcess {
 }
 
 function Finalize-UiSmokeButtonHelper {
-    if ($Scenario -notin @('NativeTopPanoramaClick', 'ClipboardCapture')) { return }
+    if ($Scenario -ne 'NativeTopPanoramaClick') { return }
     if (-not (Get-Command -Name 'Resolve-UiSmokeButtonHelperFinalization' -CommandType Function -ErrorAction SilentlyContinue)) {
         if ($script:buttonHelperStarted) {
             throw 'native button helper started without its runner finalization policy'
@@ -680,11 +680,11 @@ function Save-UiSmokeEvidence {
         executable_sha256 = $script:validatedExeHash
         failure = $script:failureMessage
         archive_errors = @($script:archiveErrors)
-        button_helper_required = ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture'))
+        button_helper_required = ($Scenario -eq 'NativeTopPanoramaClick')
         button_helper_pipe = $script:buttonHelperPipeName
         button_helper_session = $script:buttonHelperSession
-        button_helper_server_pid = if ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture')) { $PID } else { $null }
-        button_helper_expected_app_pid = if ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture')) { $script:startedPid } else { $null }
+        button_helper_server_pid = if ($Scenario -eq 'NativeTopPanoramaClick') { $PID } else { $null }
+        button_helper_expected_app_pid = if ($Scenario -eq 'NativeTopPanoramaClick') { $script:startedPid } else { $null }
         button_helper_started = $script:buttonHelperStarted
         button_helper_join_attempted = $script:buttonHelperJoinAttempted
         button_helper_joined = if ($null -ne $script:buttonHelperStatus) { [bool]$script:buttonHelperStatus.Joined } else { $null }
@@ -1827,7 +1827,7 @@ $arguments = @(
     if ($script:sharedAnalyzerPath) {
         Try-AddUiSmokeEvidenceFile $script:sharedAnalyzerPath 'inputs/shared-analyzer.py' 'shared-analyzer'
     }
-    if ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture')) {
+    if ($Scenario -eq 'NativeTopPanoramaClick') {
         if (-not (Test-Path -LiteralPath $buttonHelperIntegrationPath -PathType Leaf)) {
             throw '[ui-smoke] native button helper runner integration is missing'
         }
@@ -1855,7 +1855,7 @@ $arguments = @(
     $script:runPhase = 'running'
     $scenarioClock = [System.Diagnostics.Stopwatch]::StartNew()
     $timeoutMilliseconds = [long]$TimeoutSeconds * 1000L
-    if ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture')) {
+    if ($Scenario -eq 'NativeTopPanoramaClick') {
         $script:process = Invoke-WithUiSmokeButtonHelperEnvironment `
             $script:buttonHelperPipeName `
             $script:buttonHelperSession `
@@ -1872,7 +1872,7 @@ $arguments = @(
     }
     $null = $script:process.Handle # retain for both normal and button-helper launches
     $script:startedPid = $script:process.Id
-    if ($Scenario -in @('NativeTopPanoramaClick', 'ClipboardCapture')) {
+    if ($Scenario -eq 'NativeTopPanoramaClick') {
         $remainingAcceptMilliseconds = [long]$timeoutMilliseconds - $scenarioClock.ElapsedMilliseconds
         if ($remainingAcceptMilliseconds -le 0) {
             throw '[ui-smoke] scenario deadline expired before the native button helper could start'
@@ -1880,20 +1880,11 @@ $arguments = @(
         $acceptTimeoutMilliseconds = [int][Math]::Min(
             [long][int]::MaxValue,
             $remainingAcceptMilliseconds)
-        if ($Scenario -eq 'ClipboardCapture') {
-            $script:buttonHelperHandle = [Miv.UiSmoke.ButtonHelperDraft.ClipboardKeyHelperHandle]::Start(
-                $script:buttonHelperPipeName,
-                $script:buttonHelperSession,
-                [uint32]$script:startedPid,
-                $acceptTimeoutMilliseconds)
-        }
-        else {
         $script:buttonHelperHandle = [Miv.UiSmoke.ButtonHelperDraft.ButtonHelperRunnerApi]::Start(
             $script:buttonHelperPipeName,
             $script:buttonHelperSession,
             [uint32]$script:startedPid,
             $acceptTimeoutMilliseconds)
-        }
         $script:buttonHelperStarted = $true
         Write-UiSmokeEvent (
             'button helper started pipe={0} session={1} server_pid={2} expected_app_pid={3}' -f

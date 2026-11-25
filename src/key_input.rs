@@ -87,8 +87,8 @@ pub(crate) fn set_page_turn_ingress_instrumentation_enabled(enabled: bool) {
 ///
 /// `extended` is required because main Enter and numpad Enter share
 /// `VK_RETURN`. The initial synthetic-input surface deliberately exposes only
-/// [`SyntheticNavigationKey`]; characters, JIS punctuation, numpad keys,
-/// clipboard operations, and IME input are outside this stage.
+/// [`SyntheticNavigationKey`]; diagnostic G/V key edges are feature-gated.
+/// Text, JIS punctuation, numpad keys, clipboard contents and IME are outside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PhysicalKeySlot {
     pub vk: u32,
@@ -103,9 +103,9 @@ impl PhysicalKeySlot {
 
 /// Navigation keys, Backspace, and F12 supported by the synthetic-input timeline.
 ///
-/// G is supported for the diagnostic Ctrl+G chord; it does not inject text.
-/// Other printable keys, JIS symbols, numpad-specific keys, clipboard shortcuts,
-/// text events, and IME events are intentionally not representable here.
+/// G supports the diagnostic Ctrl+G chord and V the fixed clipboard paste chord;
+/// neither injects text or clipboard contents. Other printable keys, JIS symbols,
+/// numpad-specific keys, text events, and IME events are not representable here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyntheticNavigationKey {
     Right,
@@ -122,6 +122,8 @@ pub enum SyntheticNavigationKey {
     F12,
     #[cfg(any(test, feature = "test-script"))]
     G,
+    #[cfg(any(test, feature = "test-script"))]
+    V,
     #[cfg(test)]
     Tab,
     #[cfg(test)]
@@ -148,6 +150,8 @@ impl SyntheticNavigationKey {
             Self::F12 => "F12",
             #[cfg(any(test, feature = "test-script"))]
             Self::G => "G",
+            #[cfg(any(test, feature = "test-script"))]
+            Self::V => "V",
             #[cfg(test)]
             Self::Tab => "Tab",
             #[cfg(test)]
@@ -173,6 +177,8 @@ impl SyntheticNavigationKey {
             Self::F12 => PhysicalKeySlot::new(0x7B, false),
             #[cfg(any(test, feature = "test-script"))]
             Self::G => PhysicalKeySlot::new(0x47, false),
+            #[cfg(any(test, feature = "test-script"))]
+            Self::V => PhysicalKeySlot::new(0x56, false),
             #[cfg(test)]
             Self::Tab => PhysicalKeySlot::new(0x09, false),
             #[cfg(test)]
@@ -198,6 +204,8 @@ impl SyntheticNavigationKey {
             Self::F12 => 0x58,
             #[cfg(any(test, feature = "test-script"))]
             Self::G => 0x22,
+            #[cfg(any(test, feature = "test-script"))]
+            Self::V => 0x2F,
             #[cfg(test)]
             Self::Tab => 0x0F,
             #[cfg(test)]
@@ -223,6 +231,8 @@ impl SyntheticNavigationKey {
             Self::F12 => egui::Key::F12,
             #[cfg(any(test, feature = "test-script"))]
             Self::G => egui::Key::G,
+            #[cfg(any(test, feature = "test-script"))]
+            Self::V => egui::Key::V,
             #[cfg(test)]
             Self::Tab => egui::Key::Tab,
             #[cfg(test)]
@@ -271,6 +281,12 @@ pub enum SyntheticKeyCommandKind {
         key: SyntheticNavigationKey,
         modifiers: SyntheticModifiers,
     },
+    /// Reject routing changes instead of redirecting to another foreground target.
+    DownForTarget {
+        key: SyntheticNavigationKey,
+        modifiers: SyntheticModifiers,
+        target: SyntheticRoutingTarget,
+    },
     Up {
         key: SyntheticNavigationKey,
     },
@@ -286,6 +302,23 @@ pub struct SyntheticKeyCommand {
 }
 
 impl SyntheticKeyCommand {
+    pub const fn down_for_target(
+        at: Instant,
+        key: SyntheticNavigationKey,
+        modifiers: SyntheticModifiers,
+        target: SyntheticRoutingTarget,
+    ) -> Self {
+        Self {
+            at,
+            kind: SyntheticKeyCommandKind::DownForTarget {
+                key,
+                modifiers,
+                target,
+            },
+            hold_id: None,
+        }
+    }
+
     pub const fn down(
         at: Instant,
         key: SyntheticNavigationKey,
@@ -339,6 +372,10 @@ pub enum SyntheticRoutingTargetError {
 pub enum SyntheticInputIssue {
     WaitingForRouting(SyntheticRoutingTargetError),
     WaitingForFocus(SyntheticRoutingTarget),
+    KeyTargetMismatch {
+        expected: SyntheticRoutingTarget,
+        actual: Result<SyntheticRoutingTarget, SyntheticRoutingTargetError>,
+    },
     FocusLost {
         viewport: egui::ViewportId,
     },
@@ -2842,12 +2879,27 @@ impl SyntheticTimeline {
             // first, preserving Down -> due repeats -> Up after a sleeping UI.
             self.emit_repeats_through(queued.command.at, &mut events);
             match queued.command.kind {
-                SyntheticKeyCommandKind::Down { key, modifiers } => {
+                SyntheticKeyCommandKind::Down { key, modifiers }
+                | SyntheticKeyCommandKind::DownForTarget { key, modifiers, .. } => {
+                    let routing = resolve();
+                    if let SyntheticKeyCommandKind::DownForTarget { target, .. } =
+                        queued.command.kind
+                        && routing != Ok(target)
+                    {
+                        // A selected diagnostic owner is a constraint, not a
+                        // request to wait for or activate that window later.
+                        self.commands.clear();
+                        issue = Some(SyntheticInputIssue::KeyTargetMismatch {
+                            expected: target,
+                            actual: routing,
+                        });
+                        break;
+                    }
                     if self.held.iter().any(|held| held.key == key) {
                         self.commands.pop_front();
                         continue;
                     }
-                    let target = match resolve() {
+                    let target = match routing {
                         Ok(target) => target,
                         Err(error) => {
                             issue = Some(SyntheticInputIssue::WaitingForRouting(error));
@@ -2933,6 +2985,8 @@ struct KeyInputState {
     frame: Vec<KeyEdge>,
     /// Immutable delivery facts, including edges already claimed by handlers.
     operation_frame: Vec<KeyEdge>,
+    /// Per-dispatch-owner operation claims. Edges remain visible to other handlers.
+    key_down_dispatches: Vec<(egui::Id, KeyOperationId)>,
     ingress_batch: Option<u64>,
     ingress_ordinal: u64,
     frame_active_viewports: Vec<egui::ViewportId>,
@@ -4933,6 +4987,7 @@ pub fn begin_frame() {
 fn begin_frame_with_tracking(track_operations: bool) {
     if let Ok(mut guard) = state().lock() {
         guard.frame.clear();
+        guard.key_down_dispatches.clear();
         while let Some(edge) = guard.pending.pop_front() {
             guard.frame.push(edge);
         }
@@ -5183,6 +5238,7 @@ pub fn set_test_frame_for_viewport(viewport: egui::ViewportId, mut edges: Vec<Ke
         edge.source_viewport = viewport;
     }
     if let Ok(mut guard) = state().lock() {
+        guard.key_down_dispatches.clear();
         guard.ingress_batch = None;
         guard.ingress_ordinal = 0;
         guard.frame = edges
@@ -5199,6 +5255,7 @@ pub fn set_test_frame_for_viewport(viewport: egui::ViewportId, mut edges: Vec<Ke
 #[cfg(test)]
 pub(crate) fn set_test_routed_frame(edges: Vec<KeyEdge>) {
     if let Ok(mut guard) = state().lock() {
+        guard.key_down_dispatches.clear();
         guard.frame_active_viewports.clear();
         for edge in &edges {
             if !guard.frame_active_viewports.contains(&edge.source_viewport) {
@@ -5221,6 +5278,7 @@ pub(crate) fn set_test_routed_frame(edges: Vec<KeyEdge>) {
 pub fn clear_test_frame() {
     if let Ok(mut guard) = state().lock() {
         guard.frame.clear();
+        guard.key_down_dispatches.clear();
         guard.operation_frame.clear();
         guard.frame_active_viewports.clear();
         guard.return_keys.clear();
@@ -5464,6 +5522,40 @@ pub(crate) fn lock_test_input() -> TestInputGuard {
     TEST_INPUT_SCOPE.with(|owner| *owner.borrow_mut() = std::rc::Rc::downgrade(&scope));
     TEST_KEYBOARD_SOURCE.set(TestKeyboardSource::Released);
     TestInputGuard { _scope: scope }
+}
+
+/// Claim execution for matching key-down operations without consuming their edges.
+/// Coalesces matching presses on this call, like a boolean pressed query. Claims
+/// survive layout replay and expire only at the next backend frame boundary.
+/// A different dispatch owner can still observe and handle the same operations.
+pub(crate) fn claim_key_down_dispatch<F>(
+    viewport: egui::ViewportId,
+    owner: egui::Id,
+    predicate: F,
+) -> bool
+where
+    F: Fn(KeyEdge) -> bool,
+{
+    let Ok(mut guard) = state().lock() else {
+        return false;
+    };
+    let KeyInputState {
+        frame,
+        key_down_dispatches,
+        ..
+    } = &mut *guard;
+    let mut claimed = false;
+    for edge in frame
+        .iter()
+        .filter(|edge| edge.source_viewport == viewport && edge.pressed && predicate(**edge))
+    {
+        let claim = (owner, edge.operation_id);
+        if !key_down_dispatches.contains(&claim) {
+            key_down_dispatches.push(claim);
+            claimed = true;
+        }
+    }
+    claimed
 }
 
 pub fn pressed_key_down<F>(viewport: egui::ViewportId, predicate: F) -> bool
@@ -9470,6 +9562,34 @@ mod tests {
     }
 
     #[test]
+    fn key_down_dispatch_claim_preserves_edges_and_other_owners() {
+        let _serial = lock_test_input();
+        let root = egui::ViewportId::ROOT;
+        let child = egui::ViewportId::from_hash_of("dispatch_claim_child");
+        let owner = egui::Id::unique("dispatch_claim_owner");
+        let other_owner = egui::Id::unique("other_dispatch_claim_owner");
+        let edge = return_edge(false, true);
+        super::set_test_routed_frame(vec![
+            edge,
+            KeyEdge {
+                source_viewport: child,
+                ..edge
+            },
+        ]);
+        let matches = |edge: KeyEdge| edge.virtual_key == 0x0D;
+        assert!(super::claim_key_down_dispatch(root, owner, matches));
+        assert!(!super::claim_key_down_dispatch(root, owner, matches));
+        assert!(pressed_key_down(root, matches));
+        assert!(super::claim_key_down_dispatch(root, other_owner, matches));
+        assert!(super::claim_key_down_dispatch(child, owner, matches));
+        assert!(pressed_key_down(child, matches));
+
+        super::enqueue_test_pending_edge(edge);
+        super::begin_frame();
+        assert!(super::claim_key_down_dispatch(root, owner, matches));
+    }
+
+    #[test]
     fn native_operation_replay_keeps_identity_without_retriggering() {
         let _serial = lock_test_input();
         let viewport = egui::ViewportId::ROOT;
@@ -11367,6 +11487,62 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn synthetic_targeted_key_rejects_routing_changes_without_delivery_or_retry() {
+        let expected = super::SyntheticRoutingTarget {
+            hwnd: 101,
+            viewport: egui::ViewportId::ROOT,
+        };
+        let child = egui::ViewportId::from_hash_of("targeted_key_foreground_changed");
+        for actual in [
+            Ok(super::SyntheticRoutingTarget {
+                hwnd: 202,
+                viewport: child,
+            }),
+            Ok(super::SyntheticRoutingTarget {
+                hwnd: 202,
+                viewport: egui::ViewportId::ROOT,
+            }),
+            Ok(super::SyntheticRoutingTarget {
+                hwnd: 101,
+                viewport: child,
+            }),
+            Err(SyntheticRoutingTargetError::NoForegroundWindow),
+        ] {
+            let mut timeline = super::SyntheticTimeline::default();
+            timeline.arm();
+            let at = Instant::now();
+            timeline.enqueue(SyntheticKeyCommand::down_for_target(
+                at,
+                SyntheticNavigationKey::V,
+                SyntheticModifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+                expected,
+            ));
+            timeline.enqueue(SyntheticKeyCommand::up(at, SyntheticNavigationKey::V));
+            let rejected = timeline.materialize(at, || actual, |_| Some(true), false);
+            assert_eq!(
+                rejected.issue,
+                Some(SyntheticInputIssue::KeyTargetMismatch { expected, actual })
+            );
+            assert!(rejected.events.is_empty());
+            assert!(timeline.held.is_empty());
+            assert!(timeline.commands.is_empty());
+            let later = timeline.materialize(
+                at + Duration::from_secs(1),
+                || Ok(expected),
+                |_| Some(true),
+                false,
+            );
+            assert!(
+                later.events.is_empty(),
+                "rejection cannot become a delayed paste"
+            );
+        }
     }
 
     #[test]
