@@ -47,6 +47,7 @@
   - その後に起動した Claude Desktop が書いたのは `%LOCALAPPDATA%\Claude-Data\claude_pzs8sxrjxfjjc\claude_desktop_config.json` (coworkUserFilesPath と preferences だけ、mcpServers なし)。`%APPDATA%\Claude` は無い。
   - Claude Desktop の 設定 → 拡張機能 の「ローカル MCP サーバー」は「サーバーが追加されていません」。mIV の Claude Desktop の行は「登録済み」と表示 (実際は使えない)。
   - あわせて: 既定のデータの場所でも登録の args に `--data-dir <既定のパス>` が入っていた (メモ)。ChatGPT (Codex) の行の「設定を開く」は ChatGPT の設定のアカウントのページを開き、MCP の一覧ではなかった。
+  - 片付けで見つかったこと (同じ観測者): 「登録を外す」の後も「… を起動して、新しいチャットで mIV の tool が出るか確かめてください」の注記が出ていた。Codex の `config.toml.mimageviewer.bak` は 1 世代だけで、「登録を外す」の書き換えで登録前の元の .bak が上書きされ、登録前の内容と比べられなくなった (外す直前の .bak には `default_tools_approval_mode = "approve"` があった。mIV が書いたのか Codex が足したのかは未確認)。
 - 次: 今の Claude Desktop が読む設定ファイルの場所を公式の記述と実機で確かめ、登録先の決め方と「登録済み」の判定を直す (古い版の Claude Desktop との両立も)。AI 連携チュートリアル (aidoc-tut) の Claude 側の画像は、これが直ってから撮り直す。§1.894「AI で調べる」の登録済みの判定も同じ検出を使う。
 
 ### 1.894 ヘルプメニューに「AI で調べる」を足し、MCP のセットアップ・無料の AI への質問・設定済みの AI アプリを開く導線を作る — 利用者要望 (2026-11-25)
