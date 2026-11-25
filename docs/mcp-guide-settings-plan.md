@@ -1953,6 +1953,7 @@ tool を 2 本足す。どちらも本体と通信し、UI スレッドで実行
 - 操作名: `ini_name` と大文字小文字まで一致し (§20.4.2)、利用者に見せる操作であること。スロットの名前も小文字の綴りと
   完全一致。これで同じ操作・同じスロットを 2 つの名前で指すことは起きない (JSON の同じ鍵の重複は受け口の解析で拒む)。
 - キー: 各要素が `parse_chord_for_action(action, s)` で `Ok(Some(_))` (空・`none` は配列に入れさせない。割り当てなしは `[]`)。
+  検査で得た `Chord` を `settings_name()` の綴りに揃えてから、現在値との比較・保存・応答の `after` に使う。
   4 個以上は拒む。**同じ配列の中の重複は拒まず、そのまま保存する** (独立レビュー r2 P2。共有ファイルの取り込みは `["F13","F13"]`
   を保ち得る、`src/keymap.rs:10649`・`src/operation_customize_share.rs:182`。重複を拒むと、その状態の `before` を書き戻せない。
   重複は効き方を変えない)。保存済みの配列が今の検査を通らない場合 (DB を直接書き換えた等) は、その `before` の書き戻しは
@@ -2097,6 +2098,7 @@ UI スレッドで次を順に行う。
 - F は `operation_customize_agent` に置いた。スロットを型で列挙し、行・候補・検査を同じ列挙から作る。
   override は現在の位置で置き換え、同値の項目は写しにも書かない。ジェスチャーの順序・重複とキー配列の重複を保つ。
   `ring_bindings_for_key_action` とその内部 helper は `ring_shortcut` へ移し、窓も同じ関数を読む。
+  キー操作の表示名の短縮処理は `keymap::compact_key_action_label` に移し、窓と取得・検索・変更行で共用する。
   画面の投影は keymap の既存 scope・有限集合・ヘルプ例外を使い、全組一致のテストを置いた。detached の述語・viewport は変更していない。
 - G は `app/agent_operations` と既存の UI dispatch を使う。許可・Remote の読み取り拒否・書き込み受付を第 1 段と共有し、
   変更なしは保存・通知しない。項目と応答全体の予算を確定前に検査し、既存の `apply_operation_customize_bundle` で保存する。
@@ -2136,6 +2138,8 @@ operations_all_slot_kinds_and_duplicate_gestures_round_trip_public_values
 operations_every_slot_restores_public_values_and_null_resets_to_its_default
 operations_gesture_notation_round_trips_and_refuses_normalization
 operations_keys_validate_trigger_shapes_names_and_array_limits
+operations_key_chords_normalize_before_comparison_and_preserve_duplicates
+operations_labels_and_queries_use_the_customization_command_names
 operations_duplicate_key_arrays_restore_and_noop_preserves_override_order
 operations_right_drag_null_uses_explicit_default_without_legacy_inheritance
 operations_screens_match_overlap_for_every_action_pair_and_exceptions
@@ -2153,6 +2157,7 @@ operations_key_inputs_use_the_shared_ring_button_and_gesture_mapping
 
 ```text
 agent_operations_commit_updates_effective_keys_saves_once_and_publishes_readable_undo
+agent_operations_normalized_keys_save_canonical_values_and_skip_equivalent_writes
 agent_operations_noop_preserves_override_order_without_saving_or_notifying
 agent_operations_refuse_permission_startup_all_drafts_modals_and_remote_without_changes
 agent_operations_reads_live_assignments_during_drafts_and_dialog_reopens_with_new_values

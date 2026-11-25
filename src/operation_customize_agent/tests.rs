@@ -260,6 +260,68 @@ fn operations_keys_validate_trigger_shapes_names_and_array_limits() {
 }
 
 #[test]
+fn operations_key_chords_normalize_before_comparison_and_preserve_duplicates() {
+    let mut before = OperationCustomizeBundle::defaults();
+    before.keymap.overrides.push(KeyBindingOverride {
+        action: "GridCopyImage".into(),
+        chords: vec!["F14".into()],
+    });
+    let canonical = json!(["Ctrl+C", "F13", "F13"]);
+    let (after, result) = prepare_edits(
+        &before,
+        &edits(json!({"keys":{"FsCopyImage":[" ctrl + c ", " f13 ", " F13 "]}})),
+    )
+    .unwrap();
+    assert_eq!(result.changed.len(), 1);
+    assert_eq!(result.changed[0].before, Value::Null);
+    assert_eq!(result.changed[0].after, canonical);
+    assert_eq!(key_value(&after, KeyAction::FsCopyImage), canonical);
+    assert_eq!(after.keymap.overrides[0], before.keymap.overrides[0]);
+
+    let (same, result) = prepare_edits(
+        &after,
+        &edits(json!({"keys":{"FsCopyImage":["CTRL + C", "F13", "f13"]}})),
+    )
+    .unwrap();
+    assert!(result.changed.is_empty());
+    assert_eq!(result.unchanged.len(), 1);
+    assert_eq!(result.unchanged[0].before, canonical);
+    assert_eq!(result.unchanged[0].after, canonical);
+    assert_eq!(same.keymap, after.keymap);
+}
+
+#[test]
+fn operations_labels_and_queries_use_the_customization_command_names() {
+    let before = OperationCustomizeBundle::defaults();
+    let rows = key_rows(
+        get_operations(
+            &before,
+            &query(json!({"actions":["GlobalLocalSearch", "GridSelectAll"]})),
+        )
+        .unwrap(),
+    );
+    for (action, expected) in [
+        (KeyAction::GlobalLocalSearch, "現在地フィルタ"),
+        (KeyAction::GridSelectAll, "表示中を全チェック"),
+    ] {
+        assert_eq!(keymap::compact_key_action_label(action), expected);
+        let row = rows
+            .iter()
+            .find(|row| row.action == action.ini_name())
+            .unwrap();
+        assert_eq!(row.label, expected);
+        let found = key_rows(get_operations(&before, &query(json!({"query":expected}))).unwrap());
+        assert!(found.iter().any(|row| row.action == action.ini_name()));
+    }
+    let (_, result) = prepare_edits(
+        &before,
+        &edits(json!({"keys":{"GlobalLocalSearch":["F13"]}})),
+    )
+    .unwrap();
+    assert_eq!(result.changed[0].label, "キー: 現在地フィルタ (全体共通)");
+}
+
+#[test]
 fn operations_duplicate_key_arrays_restore_and_noop_preserves_override_order() {
     let mut before = OperationCustomizeBundle::defaults();
     before.keymap.overrides = vec![

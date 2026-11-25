@@ -96,6 +96,51 @@ fn agent_operations_commit_updates_effective_keys_saves_once_and_publishes_reada
 }
 
 #[test]
+fn agent_operations_normalized_keys_save_canonical_values_and_skip_equivalent_writes() {
+    let ctx = egui::Context::default();
+    let mut app = fixture(&ctx);
+    let canonical = json!(["Ctrl+C", "F13", "F13"]);
+    let result = app
+        .agent_set_operations(
+            &edits(json!({"keys":{"FsCopyImage":[" ctrl + c ", "f13", " F13 "]}})),
+            "normalized-first",
+        )
+        .unwrap();
+    assert_eq!(result.changed.len(), 1);
+    assert_eq!(result.changed[0].after, canonical);
+    let saved = crate::settings::Settings::load();
+    let binding = saved
+        .keymap
+        .overrides
+        .iter()
+        .find(|binding| binding.action == "FsCopyImage")
+        .unwrap();
+    assert_eq!(json!(binding.chords), canonical);
+    assert_eq!(saved.keymap, app.settings.keymap);
+    let expected = app.settings.keymap.clone();
+    let generation = crate::settings::save_generation();
+    let ui = app.agent_changes.as_ref().unwrap();
+    assert_eq!(ui.controller.records().lock().unwrap().entries().len(), 1);
+    assert!(ui.notices.try_recv().is_ok());
+
+    let result = app
+        .agent_set_operations(
+            &edits(json!({"keys":{"FsCopyImage":["CTRL+C", " F13", "f13 "]}})),
+            "normalized-same",
+        )
+        .unwrap();
+    assert!(result.changed.is_empty());
+    assert_eq!(result.unchanged.len(), 1);
+    assert_eq!(result.unchanged[0].before, canonical);
+    assert_eq!(result.unchanged[0].after, canonical);
+    assert_eq!(app.settings.keymap, expected);
+    assert_eq!(crate::settings::save_generation(), generation);
+    let ui = app.agent_changes.as_ref().unwrap();
+    assert_eq!(ui.controller.records().lock().unwrap().entries().len(), 1);
+    assert!(ui.notices.try_recv().is_err());
+}
+
+#[test]
 fn agent_operations_noop_preserves_override_order_without_saving_or_notifying() {
     let ctx = egui::Context::default();
     let mut app = fixture(&ctx);

@@ -108,7 +108,7 @@ mod webp_base64 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
         let encoded = String::deserialize(deserializer)?;
-        let max = super::MAX_THUMBNAIL_WIRE_IMAGE_BYTES;
+        let max = super::super::MAX_THUMBNAIL_WIRE_IMAGE_BYTES;
         if encoded.len() > max.div_ceil(3) * 4 {
             return Err(D::Error::custom("thumbnail exceeds image byte budget"));
         }

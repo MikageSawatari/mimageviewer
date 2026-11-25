@@ -22,26 +22,12 @@ fn shipped_hello_fixture_has_exact_adapter_bytes() {
     assert_eq!(v3_wire::AGENT_PROTOCOL_VERSION, 3);
     assert_eq!(current::AGENT_PROTOCOL_VERSION, 7);
     assert_eq!(current::MIN_ADAPTER_PROTOCOL_VERSION, 3);
-    for version in [
-        0,
-        2,
-        3,
-        4,
-        5,
-        6,
-        7,
-        current::AGENT_PROTOCOL_VERSION + 1,
-        u32::MAX,
-    ] {
+    for version in [0, 2, 3, 4, 5, 6, 7, 8, u32::MAX] {
         assert_eq!(
             current::supports_adapter_version(version),
-            (current::MIN_ADAPTER_PROTOCOL_VERSION..=current::AGENT_PROTOCOL_VERSION)
-                .contains(&version)
+            matches!(version, 3 | 4 | 5 | 6 | 7)
         );
-        assert_eq!(
-            current::check_version(version).is_ok(),
-            version == current::AGENT_PROTOCOL_VERSION
-        );
+        assert_eq!(current::check_version(version).is_ok(), version == 7);
     }
 }
 

@@ -512,41 +512,47 @@ pub(crate) fn prepare_edits(
     let mut changed_actions = Vec::new();
     for (name, value) in edits.keys.iter().flatten() {
         let action = action(name)?;
-        if !value.is_null() {
+        let target = if value.is_null() {
+            Value::Null
+        } else {
             let values = value.as_array().filter(|v| v.len() <= 3).ok_or_else(|| {
                 bad(format!(
                     "{name}: キーは 0～3 個の配列、既定に戻すときは null で指定してください"
                 ))
             })?;
+            let mut chords = Vec::with_capacity(values.len());
             for value in values {
                 let text = value
                     .as_str()
                     .ok_or_else(|| bad(format!("{name}: キーは文字列です")))?;
-                if keymap::parse_chord_for_action(action, text)
+                let chord = keymap::parse_chord_for_action(action, text)
                     .map_err(|error| bad(format!("{name}: {error}")))?
-                    .is_none()
-                {
-                    return Err(bad(format!(
-                        "{name}: 空と none は使えません。割り当てなしは [] です"
-                    )));
-                }
+                    .ok_or_else(|| {
+                        bad(format!(
+                            "{name}: 空と none は使えません。割り当てなしは [] です"
+                        ))
+                    })?;
+                // Preserve order and duplicates, but compare and persist only
+                // the canonical settings spelling, as the customization UI does.
+                chords.push(Value::String(chord.settings_name()));
             }
-        }
+            Value::Array(chords)
+        };
         let old = key_value(before, action);
         let change = OperationChange {
             name: name.clone(),
             label: format!(
                 "キー: {} ({})",
-                action.label(),
+                keymap::compact_key_action_label(action),
                 action.context().description()
             ),
             before: old,
-            after: value.clone(),
+            after: target,
         };
         if change.before == change.after {
             result.unchanged.push(change);
         } else {
-            assign_key(&mut candidate, action, value);
+            assign_key(&mut candidate, action, &change.after);
             changed_actions.push(action);
             result.changed.push(change);
         }
@@ -724,7 +730,7 @@ pub(crate) fn get_operations(
                             format!(
                                 "{} {} {}",
                                 action.ini_name(),
-                                action.label(),
+                                keymap::compact_key_action_label(*action),
                                 action.context().description()
                             )
                             .to_lowercase()
@@ -786,7 +792,7 @@ pub(crate) fn get_operations(
                         .collect();
                     OperationRow::Key(OperationKeyRow {
                         action: action.ini_name().into(),
-                        label: action.label().into(),
+                        label: keymap::compact_key_action_label(action),
                         context: action.context().ini_name().into(),
                         context_label: action.context().description().into(),
                         trigger: match action.trigger() {
