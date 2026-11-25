@@ -52,7 +52,7 @@
 
 ### 1.895 AI 連携の「登録する」で Claude Desktop に mimageviewer が出ない (今の Claude Desktop は別の場所の設定ファイルを読む) — AI 連携チュートリアルの撮影から (2026-11-25)
 
-- 状態: **v5.8.0 で直す (利用者決定 2026-11-25「v5.8.0 で直す」)、担当 mcp-keys-843**。以前の状態: 未着手、収録版未定 (リリース済みの動き、v5.7.0 で観測)。観測: サブ PC 担当 (2026-11-25 20:16〜、サブ PC2、mIV 5.7.0 のインストーラ版、Claude Desktop のパッケージ Claude_6.28899.6.0、読み取りだけで確認)。
+- 状態: **ブランチ `agent-reg-895` で実装済み (設計 [agent-registration-895-plan.md](agent-registration-895-plan.md)、設計の独立レビュー r3 ACCEPT・実装の独立レビュー r2 ACCEPT、関連テスト 78 件成功)。master 未取り込み、修正後の mIV での実機確認は未実施。v5.8.0 で直す (利用者決定 2026-11-25「v5.8.0 で直す」)**。サブ PC の確認 (2026-11-25 21:58〜、サブ PC 担当) で、今のパッケージ版は `Claude-Data` 側を読むことを確かめた。以前の状態: 未着手、収録版未定 (リリース済みの動き、v5.7.0 で観測)。観測: サブ PC 担当 (2026-11-25 20:16〜、サブ PC2、mIV 5.7.0 のインストーラ版、Claude Desktop のパッケージ Claude_6.28899.6.0、読み取りだけで確認)。
   - mIV の「登録する」→「書き換える」が書いたのは `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Roaming\Claude\claude_desktop_config.json` (mcpServers.mimageviewer、確認の窓の表示もこのパス)。
   - その後に起動した Claude Desktop が書いたのは `%LOCALAPPDATA%\Claude-Data\claude_pzs8sxrjxfjjc\claude_desktop_config.json` (coworkUserFilesPath と preferences だけ、mcpServers なし)。`%APPDATA%\Claude` は無い。
   - Claude Desktop の 設定 → 拡張機能 の「ローカル MCP サーバー」は「サーバーが追加されていません」。mIV の Claude Desktop の行は「登録済み」と表示 (実際は使えない)。

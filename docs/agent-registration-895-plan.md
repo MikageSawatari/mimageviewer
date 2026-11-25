@@ -1,6 +1,6 @@
 # §1.895 AI 連携の登録先を直す (Claude Desktop のパッケージ版・バックアップ・注記・ChatGPT の設定)
 
-状態: 設計の独立レビュー r3 ACCEPT、サブ PC の確認で §3.1 の規則を確認済み (§1・§7)、実装中 (2026-11-25)。担当: 設計・検収 ClaudeCode Opus 5.5、実装 Codex GPT-6.1 Sol / high。
+状態: 実装済み (2026-11-25)。設計の独立レビュー r3 ACCEPT、実装の独立レビュー r2 ACCEPT、関連テスト成功。サブ PC の確認で §3.1 の規則を確認済み (§1・§7)。master 未取り込み、修正後の mIV での実機確認は未実施。担当: 設計・検収 ClaudeCode Opus 5.5、実装 Codex GPT-6.1 Sol / high。
 ブランチ `agent-reg-895` (master `a57f23522` から)。正本の登録の設計は [mcp-integration-plan.md](mcp-integration-plan.md) の
 「AI アプリごとの行」の節で、本書はその変更点だけを書く。実装後に正本の該当の行を本書に合わせて直す。
 
@@ -208,3 +208,16 @@ ChatGPT (Codex) の登録先 (`CODEX_HOME` / `.codex`) も同じ関数の形で�
 - 設計の独立レビュー r2 (同じ担当、16059f5d0): ACCEPT WITH CHANGES、P2 1 件。登録後の注記だけでは、既に登録済みで Claude が
   更新された利用者に案内が出ない → LocalCache 側を選んだ検出の行の `message` に案内を載せる (§3.1)。テストを §6 に足した。
 - 設計の独立レビュー r3 (同じ担当、e7399c399): ACCEPT (§7 の実機確認待ちを前提とする判定)、新しい指摘なし。
+- 実装 (Codex GPT-6.1 Sol / high): 6f8e6ef3e (登録先の解決の共通化・書き込み前の再解決・2 つのバックアップ・操作ごとの成功の文)、
+  300d98c9d (「手順を見る」と ChatGPT の「設定を開く」のメニュー名)、cbc3aad09 (複数の入り方の候補にも Claude-Data の規則)。
+  設計担当は 1 件だけテストを直した: フォルダ名の綴りの比較が path の文字列全体を比べていて、区切り文字の違いで落ちていた。
+- 実装の独立レビュー r1 (GPT-6.1 Sol / xhigh、実装者とは別の担当、300d98c9d): REVISE、P2 2 件・P3 1 件。
+  - P2: 複数の入り方のときの候補が LocalCache のまま → cbc3aad09 で直した。
+  - P2: privacy で `.orig.bak` を登録前の原本と断定していた → 3f06fa8d8 で直した。
+  - P3: 正本の手順の順序・成功の文・メニュー名が古い → 3f06fa8d8 で直した。
+- 実装の独立レビュー r2 (同じ担当、cbc3aad09): ACCEPT、新しい指摘なし。
+- 検証 (設計担当、共有 runner):
+  - lib の filter `agent_registration::|ui_dialogs::agent_integration::`: cbc3aad09 で 78/78 成功。
+  - ui_snapshot の filter `agent_integration|agent_registration`: 300d98c9d で 11/11 成功。画像の更新はない (フィクスチャは「手順を見る」も成功の文も表示しない)。
+  - `check_ui_glyphs` は成功。本体 lib の全件は未実行 (取り込みの後に統括)。
+  - 修正後の mIV で Claude Desktop・ChatGPT へ登録する実機確認は、まだ誰も行っていない。
