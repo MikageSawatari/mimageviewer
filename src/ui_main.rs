@@ -10930,6 +10930,10 @@ impl App {
                                                 ui.close();
                                             }
                                         }
+                                        MenuCommandId::HelpAskAi => {
+                                            let label = self.keymap.menu_command_label(MenuCommandId::HelpAskAi);
+                                            ui.menu_button(label, |ui| self.draw_ask_ai_menu(ui));
+                                        }
                                         MenuCommandId::HelpOpenLogs => {
                                             ui.separator();
                                             if ui.button(&help_open_logs_menu_label).clicked() {

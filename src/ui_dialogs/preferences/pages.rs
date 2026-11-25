@@ -6011,6 +6011,34 @@ enum MenuLayoutEdit {
     SetCommandVisible(MenuCommandId, bool),
 }
 
+#[cfg(test)]
+#[test]
+fn ask_ai_preferences_menu_customization_lists_reorders_and_hides_command() {
+    let mut layout = MenuLayoutSettings::default();
+    let command = MenuCommandId::HelpAskAi;
+    let order = menu_layout_command_order(&layout, TopMenuId::Help);
+    let index = order.iter().position(|id| *id == command).unwrap();
+    assert_eq!(order[index - 1], MenuCommandId::HelpOpenManual);
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::MoveCommand(TopMenuId::Help, index, -1),
+    );
+    assert_eq!(
+        menu_layout_command_order(&layout, TopMenuId::Help)[index - 1],
+        command
+    );
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::SetCommandVisible(command, false),
+    );
+    assert!(menu_layout_hidden_set(&layout).contains(&command));
+    apply_menu_layout_edit(
+        &mut layout,
+        MenuLayoutEdit::SetCommandVisible(command, true),
+    );
+    assert!(!menu_layout_hidden_set(&layout).contains(&command));
+}
+
 fn apply_menu_layout_edit(layout: &mut MenuLayoutSettings, edit: MenuLayoutEdit) {
     match edit {
         MenuLayoutEdit::Reset => {

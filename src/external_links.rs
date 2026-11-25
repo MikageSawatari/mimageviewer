@@ -1,17 +1,72 @@
 //! External URL validation and fire-and-forget Shell opening helpers.
 //!
-//! Metadata can be user-provided, so only browser-safe HTTP(S) URLs are allowed
-//! through this module. Shell calls run on short-lived STA workers; callers
+//! Metadata can be user-provided, so its URLs must be browser-safe HTTP(S).
+//! AI app schemes are constructed only from typed, fixed destinations.
+//! Shell calls run on short-lived STA workers; callers
 //! never wait for Shell handlers and workers never borrow App state.
 
+use crate::ui_dialogs::context_menu::{ClipboardImageWriteResult, EditedClipboardWriteRequest};
 use std::path::PathBuf;
 use std::sync::mpsc;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AiAppLink {
+    ClaudeNew { prompt: String },
+    CodexNew { prompt: String },
+    CodexSettings,
+}
+
+impl AiAppLink {
+    fn url(&self) -> Result<String, String> {
+        // RFC 3986 unreserved bytes only. In particular, a space is %20, never +.
+        const ENCODE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+            .remove(b'-')
+            .remove(b'.')
+            .remove(b'_')
+            .remove(b'~');
+        let encode =
+            |prompt: &str| percent_encoding::utf8_percent_encode(prompt, ENCODE).to_string();
+        let url = match self {
+            Self::ClaudeNew { prompt } => format!("claude://claude.ai/new?q={}", encode(prompt)),
+            Self::CodexNew { prompt } => format!("codex://new?prompt={}", encode(prompt)),
+            Self::CodexSettings => "codex://settings".into(),
+        };
+        if url.len() > MAX_EXTERNAL_URL_LEN {
+            Err("AI app URL too long".into())
+        } else {
+            Ok(url)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AiWebSite {
+    Google,
+    ChatGpt,
+    Claude,
+}
+
+impl AiWebSite {
+    pub(crate) fn url(self) -> &'static str {
+        match self {
+            Self::Google => "https://google.com/ai",
+            Self::ChatGpt => "https://chatgpt.com/",
+            Self::Claude => "https://claude.ai/",
+        }
+    }
+}
 
 pub(crate) enum OpenTarget {
     Url(String),
     Player(PathBuf),
     Tweet(String),
     Map(String),
+    AiApp(AiAppLink),
+    AiWeb {
+        site: AiWebSite,
+        text: String,
+        clipboard_seq: EditedClipboardWriteRequest,
+    },
 }
 
 impl OpenTarget {
@@ -21,6 +76,8 @@ impl OpenTarget {
             Self::Player(_) => "player",
             Self::Tweet(_) => "tweet",
             Self::Map(_) => "map",
+            Self::AiApp(_) => "ai_app",
+            Self::AiWeb { .. } => "ai_web",
         }
     }
 
@@ -32,6 +89,18 @@ impl OpenTarget {
             Self::Url(raw) => Self::Url(normalize(raw)?),
             Self::Tweet(raw) => Self::Tweet(normalize(raw)?),
             Self::Map(raw) => Self::Map(normalize(raw)?),
+            target @ Self::AiApp(_) => {
+                if let Self::AiApp(link) = &target {
+                    link.url()?;
+                }
+                target
+            }
+            target @ Self::AiWeb { .. } => {
+                if let Self::AiWeb { site, .. } = &target {
+                    normalize(site.url().into())?;
+                }
+                target
+            }
             target @ Self::Player(_) => target,
         })
     }
@@ -40,13 +109,34 @@ impl OpenTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExternalOpenFailure {
     GoogleMaps,
+    ClaudeApp,
+    ChatGptApp,
+    AiWebClipboardWritten,
+    AiWebClipboardSkipped,
+    AiWebClipboardFailed,
 }
 
 impl ExternalOpenFailure {
     pub(crate) fn message(self) -> &'static str {
         match self {
             Self::GoogleMaps => "Google マップを開けませんでした",
+            Self::ClaudeApp => "Claude Desktop を開けませんでした",
+            Self::ChatGptApp => "ChatGPT のアプリを開けませんでした",
+            Self::AiWebClipboardWritten => {
+                "案内の文をコピーしました。開いたページの入力欄に貼り付けて (Ctrl+V)、続けて質問を書いてください"
+            }
+            Self::AiWebClipboardSkipped => {
+                "ほかのコピーがあったため、案内の文はクリップボードに入れていません"
+            }
+            Self::AiWebClipboardFailed => "案内の文をクリップボードに入れられませんでした",
         }
+    }
+
+    pub(crate) fn is_warning(self) -> bool {
+        !matches!(
+            self,
+            Self::AiWebClipboardWritten | Self::AiWebClipboardSkipped
+        )
     }
 }
 
@@ -56,16 +146,31 @@ pub(crate) struct FailureSink {
     pub(crate) ctx: egui::Context,
 }
 
-fn report_failure(kind: &str, error: &str, sink: Option<&FailureSink>) {
-    // Opener errors may embed the target. GPS coordinates must never enter logs.
-    if kind == "map" {
-        crate::logger::log("external_open map failed");
-    } else {
-        crate::logger::log(format!("external_open {kind} failed: {error}"));
-    }
+fn notify(result: ExternalOpenFailure, sink: Option<&FailureSink>) {
     if let Some(sink) = sink {
-        let _ = sink.tx.send(ExternalOpenFailure::GoogleMaps);
+        let _ = sink.tx.send(result);
         sink.ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+}
+
+fn report_failure(
+    kind: &str,
+    error: &str,
+    failure: Option<ExternalOpenFailure>,
+    sink: Option<&FailureSink>,
+) {
+    // Opener errors may embed the target. GPS coordinates must never enter logs.
+    crate::logger::log(failure_log(kind, error));
+    if let Some(failure) = failure {
+        notify(failure, sink);
+    }
+}
+
+fn failure_log(kind: &str, error: &str) -> String {
+    if matches!(kind, "map" | "ai_app" | "ai_web") {
+        format!("external_open {kind} failed")
+    } else {
+        format!("external_open {kind} failed: {error}")
     }
 }
 
@@ -77,10 +182,17 @@ pub(crate) fn spawn_open(
     on_failure: Option<FailureSink>,
 ) -> Result<(), String> {
     let kind = target.kind();
+    let failure = match &target {
+        OpenTarget::Map(_) => Some(ExternalOpenFailure::GoogleMaps),
+        OpenTarget::AiApp(AiAppLink::ClaudeNew { .. }) => Some(ExternalOpenFailure::ClaudeApp),
+        OpenTarget::AiApp(_) => Some(ExternalOpenFailure::ChatGptApp),
+        _ => None,
+    };
     let target = target.normalize().inspect_err(|error| {
-        report_failure(kind, error, on_failure.as_ref());
+        report_failure(kind, error, failure, on_failure.as_ref());
     })?;
     let opener = WorkerOpener::for_caller();
+    let clipboard = WorkerClipboard::for_caller(&target);
     #[cfg(test)]
     TEST_SPAWNS.with(|count| count.set(count.get() + 1));
     let worker_sink = on_failure.clone();
@@ -88,6 +200,28 @@ pub(crate) fn spawn_open(
         .name(format!("external-open-{kind}"))
         .spawn(move || {
             let started = std::time::Instant::now();
+            if let OpenTarget::AiWeb {
+                text,
+                clipboard_seq,
+                ..
+            } = &target
+            {
+                let result = clipboard.write(text, *clipboard_seq);
+                let notification = match result {
+                    ClipboardImageWriteResult::Written => {
+                        ExternalOpenFailure::AiWebClipboardWritten
+                    }
+                    ClipboardImageWriteResult::Superseded
+                    | ClipboardImageWriteResult::ClipboardChanged => {
+                        ExternalOpenFailure::AiWebClipboardSkipped
+                    }
+                    ClipboardImageWriteResult::Failed(_) => {
+                        crate::logger::log("external_open ai_web clipboard failed");
+                        ExternalOpenFailure::AiWebClipboardFailed
+                    }
+                };
+                notify(notification, worker_sink.as_ref());
+            }
             let result = opener.open(&target);
             if crate::perf::is_enabled() {
                 crate::perf::event(
@@ -104,14 +238,75 @@ pub(crate) fn spawn_open(
                 );
             }
             if let Err(error) = result {
-                report_failure(kind, &error, worker_sink.as_ref());
+                report_failure(kind, &error, failure, worker_sink.as_ref());
             }
         });
     spawn_result.map(|_| ()).map_err(|error| {
         let error = format!("worker start failed: {error}");
-        report_failure(kind, &error, on_failure.as_ref());
+        report_failure(kind, &error, failure, on_failure.as_ref());
         error
     })
+}
+
+struct WorkerClipboard {
+    #[cfg(test)]
+    writer: Option<TestClipboardWriter>,
+}
+
+impl WorkerClipboard {
+    fn for_caller(_target: &OpenTarget) -> Self {
+        #[cfg(test)]
+        let writer = TEST_CLIPBOARD.with(|slot| slot.borrow().clone());
+        #[cfg(test)]
+        assert!(
+            !matches!(_target, OpenTarget::AiWeb { .. }) || writer.is_some(),
+            "headless AI web opening requires an injected clipboard writer"
+        );
+        Self {
+            #[cfg(test)]
+            writer,
+        }
+    }
+
+    fn write(self, text: &str, request: EditedClipboardWriteRequest) -> ClipboardImageWriteResult {
+        #[cfg(test)]
+        if let Some(writer) = self.writer {
+            return writer(text, request);
+        }
+        crate::ui_dialogs::context_menu::write_text_clipboard_if_latest(text, request)
+    }
+}
+
+#[cfg(test)]
+type TestClipboardWriter = std::sync::Arc<
+    dyn Fn(&str, EditedClipboardWriteRequest) -> ClipboardImageWriteResult + Send + Sync,
+>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CLIPBOARD: std::cell::RefCell<Option<TestClipboardWriter>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct TestClipboardGuard(Option<TestClipboardWriter>);
+
+#[cfg(test)]
+impl TestClipboardGuard {
+    pub(crate) fn install(
+        writer: impl Fn(&str, EditedClipboardWriteRequest) -> ClipboardImageWriteResult
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self(TEST_CLIPBOARD.with(|slot| slot.replace(Some(std::sync::Arc::new(writer)))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestClipboardGuard {
+    fn drop(&mut self) {
+        TEST_CLIPBOARD.with(|slot| *slot.borrow_mut() = self.0.take());
+    }
 }
 
 struct WorkerOpener {
@@ -140,6 +335,8 @@ impl WorkerOpener {
                 opener::open(url)
             }
             OpenTarget::Player(path) => opener::open(path),
+            OpenTarget::AiApp(link) => opener::open(link.url()?),
+            OpenTarget::AiWeb { site, .. } => opener::open(site.url()),
         };
         result.map_err(|error| format!("open failed: {error}"))
     }
@@ -225,6 +422,138 @@ pub fn open_url(raw: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_ai_app_urls_encode_only_unreserved_bytes_and_enforce_limit() {
+        let fixed = crate::app::ask_ai::APP_PROMPT;
+        for prompt in [fixed, "質問: a b+c&d?#%/\"\nあ🙂-._~"] {
+            for (link, prefix) in [
+                (
+                    AiAppLink::ClaudeNew {
+                        prompt: prompt.into(),
+                    },
+                    "claude://claude.ai/new?q=",
+                ),
+                (
+                    AiAppLink::CodexNew {
+                        prompt: prompt.into(),
+                    },
+                    "codex://new?prompt=",
+                ),
+            ] {
+                let url = link.url().unwrap();
+                assert!(url.len() <= MAX_EXTERNAL_URL_LEN);
+                let encoded = url.strip_prefix(prefix).unwrap();
+                assert!(!encoded.contains('+'));
+                assert!(!encoded.contains(' '));
+                assert!(encoded.contains("%20"));
+                assert_eq!(
+                    percent_encoding::percent_decode_str(encoded)
+                        .decode_utf8()
+                        .unwrap(),
+                    prompt
+                );
+                assert!(
+                    encoded
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-._~%".contains(&byte))
+                );
+                assert!(!is_http_url(&url), "metadata must still reject app schemes");
+            }
+        }
+        assert_eq!(AiAppLink::CodexSettings.url().unwrap(), "codex://settings");
+        for link in [
+            AiAppLink::ClaudeNew {
+                prompt: "あ".repeat(4096),
+            },
+            AiAppLink::CodexNew {
+                prompt: "a".repeat(4096),
+            },
+        ] {
+            assert!(link.url().is_err());
+        }
+        assert_eq!(
+            AiAppLink::CodexNew {
+                prompt: "AZaz09-._~ +".into()
+            }
+            .url()
+            .unwrap(),
+            "codex://new?prompt=AZaz09-._~%20%2B"
+        );
+    }
+
+    #[test]
+    fn ask_ai_web_urls_and_prompts_are_fixed_and_single_line() {
+        for (site, url) in [
+            (AiWebSite::Google, "https://google.com/ai"),
+            (AiWebSite::ChatGpt, "https://chatgpt.com/"),
+            (AiWebSite::Claude, "https://claude.ai/"),
+        ] {
+            assert_eq!(site.url(), url);
+            assert_eq!(normalize_http_url(site.url()).as_deref(), Some(url));
+        }
+        let web = crate::app::ask_ai::web_prompt();
+        assert!(web.contains(env!("CARGO_PKG_VERSION")));
+        assert!(web.contains("https://www.mikage.to/mimageviewer/manual/"));
+        for prompt in [crate::app::ask_ai::APP_PROMPT, &web] {
+            assert!(prompt.ends_with("質問: "));
+            assert!(!prompt.contains(['\n', '\r']));
+        }
+    }
+
+    #[test]
+    fn ask_ai_app_failure_reports_typed_notification_without_prompt_in_log() {
+        for (link, expected, message) in [
+            (
+                AiAppLink::ClaudeNew {
+                    prompt: "private prompt".into(),
+                },
+                ExternalOpenFailure::ClaudeApp,
+                "Claude Desktop を開けませんでした",
+            ),
+            (
+                AiAppLink::CodexNew {
+                    prompt: "private prompt".into(),
+                },
+                ExternalOpenFailure::ChatGptApp,
+                "ChatGPT のアプリを開けませんでした",
+            ),
+            (
+                AiAppLink::CodexSettings,
+                ExternalOpenFailure::ChatGptApp,
+                "ChatGPT のアプリを開けませんでした",
+            ),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let caller = std::thread::current().id();
+            let _opener = TestOpenerGuard::install(move |target| {
+                assert_ne!(caller, std::thread::current().id());
+                assert_eq!(target.kind(), "ai_app");
+                let OpenTarget::AiApp(link) = target else {
+                    panic!("app link required")
+                };
+                Err(format!("failed {} private prompt", link.url().unwrap()))
+            });
+            spawn_open(
+                OpenTarget::AiApp(link),
+                Some(FailureSink {
+                    tx,
+                    ctx: egui::Context::default(),
+                }),
+            )
+            .unwrap();
+            let result = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert_eq!(result, expected);
+            assert_eq!(result.message(), message);
+            assert!(result.is_warning());
+        }
+        for kind in ["ai_app", "ai_web"] {
+            assert_eq!(
+                failure_log(kind, "claude://claude.ai/new?q=private prompt"),
+                format!("external_open {kind} failed")
+            );
+        }
+    }
 
     #[test]
     fn external_open_url_returns_before_shell_and_opens_once_on_worker() {

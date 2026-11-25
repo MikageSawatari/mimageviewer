@@ -315,6 +315,10 @@
       <li><strong>撮影地点を地図で開く</strong>: 情報パネルの GPS 欄で「Google マップで開く」を押したときだけ、既定のブラウザーが開き、撮影位置の緯度・経度が Google に渡ります。写真そのものやファイル名は渡しません。<a href="manual/fullscreen.html#exif">操作方法を見る</a></li>
       <li><strong>利用者が追加したユーザー VST</strong>: プラグイン独自の通信は各プラグインの動作に従います。利用前に提供元の説明をご確認ください。</li>
       <li><strong>音響調整の画面表示</strong>: 音響調整を開いている間、画面表示に使う Windows の機能 (WebView2) が、Microsoft に自身の更新を確認することがあります。曲名や画像は送信しません。</li>
+      <!-- §1.894: 実行時の挙動は未確認。サブ PC で確認予定。 -->
+      <li><strong>AI で調べる（ヘルプメニュー）</strong>: 選んだときだけ、AI アプリまたは既定のブラウザーが開きます。AI アプリでは、入力欄に mIV の MCP ツールでマニュアルを調べるよう頼む固定の案内の文が入ります。
+        Web の AI では、mIV の版と公式マニュアルの場所を含む固定の案内の文をクリップボードに入れ、各サービスの入口のページを開きます。案内の文に利用者のファイル・場所・設定は含めません。
+        mIV は質問を送信しません。入力欄の文を送ると、AI アプリやサービスの提供元へ渡り、その扱いは各社のプライバシーポリシーに従います。mIV の開発者には送られません。</li>
       <li><strong>AI アプリとの連携（既定では無効）</strong>: 許可がオフでも、mIV の機能の名前と説明は登録した AI アプリに見えます。連携が無効の間は、ファイルやライブラリの情報は渡しません。
         使い方の説明は連携が無効でも、mIV を起動していなくても渡します。公開のマニュアルと同じ内容で、利用者の情報は含みません。
         有効にすると、mImageViewer は同じ PC に登録した AI アプリへ PC 内で以下の情報を渡します。
@@ -614,6 +618,10 @@
       <li><strong>Opening a shooting location on a map</strong>: only when you press "Google マップで開く" (Open in Google Maps) in the GPS field of the information panel, your default browser opens and the latitude and longitude of the shooting location are passed to Google. The photo itself and its file name are not passed. <a href="manual/fullscreen.html#exif">Read the manual</a></li>
       <li><strong>User VST plug-ins you add</strong>: independent network activity follows each plug-in’s behavior. Check the provider’s documentation before use.</li>
       <li><strong>Audio adjustment display</strong>: while audio adjustment is open, the Windows feature used to display it (WebView2) may contact Microsoft to check for its own updates. It does not send song titles or artwork.</li>
+      <!-- §1.894: Runtime behavior is unverified; verification is planned on the secondary PC. -->
+      <li><strong>Ask AI (Help menu)</strong>: only when you select it, an AI app or your default browser opens. For an AI app, the input field is filled with fixed guidance asking it to consult the manual using mIV's MCP tools.
+        For web AI services, fixed guidance containing the mIV version and the official manual's address is copied to the clipboard, and the service's entry page opens. The guidance contains none of your files, locations, or settings.
+        mIV does not submit your question. When you send the text in the input field, it is passed to the AI app or service provider and handled under that provider's privacy policy. It is not sent to the mIV developer.</li>
       <li><strong>AI app integration (off by default)</strong>: even with permissions off, a registered AI app can see the names and descriptions of mIV's features. While integration is disabled, no file or library information is shared.
         Usage help is available even when integration is disabled or mIV is not running. It contains the same information as the public manual and no personal library information.
         When enabled, mImageViewer passes the following information locally to an AI app registered on the same PC.

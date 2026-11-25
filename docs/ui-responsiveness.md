@@ -4,7 +4,7 @@
 
 URL・外部プレイヤー・ツイート・Google マップの Shell 呼び出しは、COM STA を初期化した短命の
 `external-open-*` worker に置く。UI は HTTP(S) の検査と投入だけを行い、終了時も join しない。
-マップの失敗だけ App 共通の受信口へ返し、early return 前の root poll で従来の警告を出す。
+マップと AI アプリの失敗、Web の AI のコピー結果を App 共通の受信口へ返し、early return 前の root poll で警告・トーストを出す。
 `ext/open_end` の分類は予約キー `kind` と衝突しない `target_kind` に記録する。
 
 起動引数・activation・agent・main のブックマークと既定の場所は、既存 `startup-open-resolve` が解決から
@@ -22,6 +22,12 @@ main の走査中だけ旧一覧の項目入力を止め、500 ms 後に既存�
 通常の一覧フォルダ open・親移動・読み直し・「元の場所へ」は今回変更しない。
 `nav/startup_resolve_scan` に解決・走査時間と件数・source/outcome を記録する。Rust 検証・実機計測は未実施。
 詳細は [設計書 §1・§3](ui-sync-853-plan.md)。貼り付け (§1.859) の worker 化は本書 §4 と同設計書 §2 を参照。
+
+ヘルプの「AI で調べる」（§1.894）の型付き AI アプリ URL と、AI 連携の窓の Codex 設定も同じ
+`external-open-*` worker に乗せる。Web の AI はその worker 内で、画像コピーと共有する世代照合付きの
+テキスト書き込みを終え、結果を App の共通受信口へ送ってから開く。UI は世代の予約だけで mutex を待たない。
+登録検出はサブメニュー描画から AI 連携の窓と共通の worker を始め、結果の採用も描画時の `try_recv` だけで行う。
+追加部分の自動検証と実行時の挙動は未確認。共有 runner とサブ PC で確認予定。
 
 ## スタック用スクリプトのファイル操作（§1.843）
 
