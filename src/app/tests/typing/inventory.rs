@@ -388,6 +388,12 @@ const EXEMPTIONS: &[Entry] = &[
         "ページ内スクロールの入力所有 fixture",
     ),
     exempt(
+        "src/ui_metadata_panel/exif_copy_tests.rs",
+        "&mut text,",
+        2,
+        "EXIF コピー操作と入力欄のコピーの所有境界を検査する fixture",
+    ),
+    exempt(
         "src/ui_fullscreen.rs",
         "&mut state.basename",
         1,
