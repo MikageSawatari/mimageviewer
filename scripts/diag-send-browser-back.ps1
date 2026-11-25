@@ -1,8 +1,10 @@
 # Diagnostic helper for the section 1.864 Browser Back/Forward input trace.
 # This is not part of the product or any build/release procedure.
 # Enable the mIV mouse-seek trace separately, then focus its video fullscreen
-# window during the countdown. No key is sent unless the foreground process
-# name starts with mimageviewer. Run this helper manually on the user's PC.
+# window during the countdown. SendInput is global. The foreground process
+# check is best-effort and cannot guarantee mIV-only delivery if focus changes.
+# Do not touch other windows while it runs. Close browsers/forms you care about
+# or keep them unfocused. Run this helper manually on the user's PC.
 [CmdletBinding()]
 param(
     [ValidateRange(1, 2147483647)]
@@ -70,11 +72,6 @@ namespace MivBrowserKeyDiagnostic {
         public static uint SendPair(IntPtr expectedWindow, uint expectedProcess,
                                     ushort virtualKey, ushort scan, out int error) {
             error = 0;
-            uint currentProcess;
-            IntPtr currentWindow = GetForegroundWindow();
-            GetWindowThreadProcessId(currentWindow, out currentProcess);
-            if (currentWindow != expectedWindow || currentProcess != expectedProcess)
-                return 0;
             INPUT[] inputs = new INPUT[2];
             for (int i = 0; i < inputs.Length; ++i) {
                 inputs[i].type = 1; // INPUT_KEYBOARD
@@ -83,7 +80,14 @@ namespace MivBrowserKeyDiagnostic {
                 inputs[i].data.key.dwFlags = 0x0001u | (i == 1 ? 0x0002u : 0u);
                 // KEYEVENTF_EXTENDEDKEY, plus KEYEVENTF_KEYUP for the release.
             }
-            uint sent = SendInput(2, inputs, Marshal.SizeOf(typeof(INPUT)));
+            int inputSize = Marshal.SizeOf(typeof(INPUT));
+            // Best-effort only: focus can still change after this global check.
+            uint currentProcess;
+            IntPtr currentWindow = GetForegroundWindow();
+            GetWindowThreadProcessId(currentWindow, out currentProcess);
+            if (currentWindow != expectedWindow || currentProcess != expectedProcess)
+                return 0;
+            uint sent = SendInput(2, inputs, inputSize);
             if (sent != 2) error = Marshal.GetLastWin32Error();
             return sent;
         }
@@ -99,7 +103,9 @@ if ($browserScan -eq 0) {
     throw 'MapVirtualKeyW could not map the Browser key; nothing was sent.'
 }
 Write-Host ('Diagnostic: {0}, VK=0x{1:X2}, scan=0x{2:X2}, count={3}' -f $browserName, $browserVk, $browserScan, $Count)
+Write-Host 'SendInput is global. The foreground check is best-effort; mIV-only delivery is not guaranteed.'
 Write-Host 'Click the mIV video fullscreen window to focus it.'
+Write-Host 'Then do not touch other windows while it runs. Close browsers/forms you care about or keep them unfocused.'
 for ($remainingSeconds = $DelaySeconds; $remainingSeconds -gt 0; $remainingSeconds--) {
     Write-Host ('Starting in {0} second(s)...' -f $remainingSeconds)
     Start-Sleep -Seconds 1
