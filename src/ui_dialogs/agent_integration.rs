@@ -574,6 +574,19 @@ fn selectable_copy(ui: &mut egui::Ui, text: &str) {
     }
 }
 
+fn open_codex_settings(
+    state: &mut AgentIntegrationState,
+    open: impl FnOnce(&str) -> Result<(), String>,
+) {
+    // The only non-http URL accepted here is this fixed settings entry.
+    let result = open("codex://settings")
+        .map(|()| {
+            "設定が開いたら、左の「連携」→「プラグイン」→「MCP」のタブを選んでください".to_owned()
+        })
+        .map_err(|error| format!("設定を開けませんでした: {error}"));
+    state.feedback = Some((AppTarget::ChatGpt, result));
+}
+
 fn draw_app(
     ui: &mut egui::Ui,
     settings: &PermissionSelection,
@@ -609,8 +622,7 @@ fn draw_app(
             if ui.add_enabled(!matches!(state.detection, DetectionState::Checking(_)), egui::Button::new("再確認")).clicked() { state.start_detection(ui.ctx()); }
             if ui.button("手順を見る").clicked() { state.instructions = if state.instructions == Some(target) { None } else { Some(target) }; }
             if target == AppTarget::ChatGpt && ui.button("設定を開く").clicked() {
-                // The only non-http URL accepted here is this fixed settings entry.
-                if let Err(error) = opener::open("codex://settings") { state.feedback = Some((target, Err(format!("設定を開けませんでした: {error}")))); }
+                open_codex_settings(state, |url| opener::open(url).map_err(|error| error.to_string()));
             }
         });
         if let Some(action) = requested { state.confirm(target, action, ui.ctx().cumulative_frame_nr()); }
@@ -619,8 +631,8 @@ fn draw_app(
         }
         if state.instructions == Some(target) {
             ui.label(match target {
-                AppTarget::ClaudeDesktop => "Claude を終了 → 設定ファイルに追記 → Claude を起動。初回の確認画面で「常に許可」を選んでください。",
-                AppTarget::ChatGpt => "Settings > MCP servers > Add server > STDIO で登録し、再起動してください。",
+                AppTarget::ClaudeDesktop => "Claude を終了 → 設定ファイルに追記 → Claude を起動。Claude が読む設定ファイルは、Claude の 設定 →「デスクトップアプリ」→「拡張機能」の「管理」→「ローカル MCP サーバー」の「設定を編集」で開けます。下のパスと違う場合は、そちらに書いてください。確認の画面が出たら「常に許可」を選んでください。",
+                AppTarget::ChatGpt => "設定 →「連携」→「プラグイン」の「MCP」のタブでサーバーを追加し (STDIO)、再起動してください。",
             });
             if let DetectionState::Ready(_, detection) = &state.detection {
                 if let Some(row) = detection.apps.iter().find(|row| row.target == target) {
