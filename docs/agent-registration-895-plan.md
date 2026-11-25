@@ -251,3 +251,6 @@ TOML 1.0 の読み手との互換性を保つ。解除で空になった inline 
 登録前の状態の保存や、解除時にコメントを移す処理は追加しない。
 
 追加修正のビルド・テストは設計担当の共有 runner へ引き継ぐ。実装担当は cargo・製品起動・実設定ファイルへのアクセスを行わない。
+
+記録 (2026-11-26): 実装は Codex GPT-6.1 Sol / high (a88b39101、b403ed764)。独立実装レビュー (別の GPT-6.1 Sol / xhigh): r1 REVISE (P2: 空の TOML の親を消すとコメントも消える) → r2 ACCEPT WITH CHANGES (P3: mcp-integration-plan の記述に例外が無い、直した)。
+設計担当の共有 runner で lib の filter `agent_registration::|ui_dialogs::agent_integration::` が 91/91 成功 (b403ed764)。修正後の実機確認は未。

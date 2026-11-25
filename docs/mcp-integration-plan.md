@@ -1665,6 +1665,7 @@ tool searchで後から読むdescriptionは16,384文字だが、検索時にも�
      再確認の案内を続ける)、解除の成功は「登録を外しました。<アプリ> を起動し直すと mIV の tool は出なくなります」(§1.895)。
   - 失敗はまれな失敗の既定の割り切り (ログ + 表示、再試行しない)。ログに設定ファイルの中身は出さない。
   - 解除で `mimageviewer` を実際に消し、親の `mcpServers` / `mcp_servers` が空になった場合は親ごと消す (対象項目が無い場合は変更しない)。
+    ChatGPT の親に利用者のコメントが付いている場合は、空でも親を残す ([agent-registration-895-plan.md §9](agent-registration-895-plan.md#9-追加修正-解除で空になった親を残さない-2026-11-26))。
 - **Claude Desktop**:
   - **インストール形態と設定ファイルを対応させる** (設計レビュー 12 巡目 P2-4):
     - Squirrel 版 (`%LOCALAPPDATA%\AnthropicClaude` が在る) → `%APPDATA%\Claude\claude_desktop_config.json`。
