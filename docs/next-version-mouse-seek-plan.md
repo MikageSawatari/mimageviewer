@@ -440,3 +440,25 @@ browser `WM_KEYDOWN` と queue の WM_APPCOMMAND を数え、queue を通らな�
   `delivery=os_key_echo paired_receipt=...` で action にならないこと。写しが Peek / Translate frame の外で
   届いた場合は、`delivery` に届いた frame が出て二重が残る (入力は失わない)。キーボードの Browser Back
   キーがあれば、その長押しでも repeat ごとに 1 回であること。
+
+### 9.4 独立レビュー r7 と未決 (2026-11-25)
+
+r7 は REVISE。同方向の未組 press と Peek / Translate frame の組み合わせでも、同じ押下である保証にならない。
+反例: key message だけを送る producer の press A が未組で残る → 別の入力 B を、mIV のプロセスに入った
+同スレッドの `WH_GETMESSAGE` hook が PeekMessage の中で WM_APPCOMMAND に置き換えて同スレッド送信する
+→ 条件がそろい、A と組になって B が捨てられる。Peek frame は hook も動く範囲なので、OS 自身の生成の
+証明にならない。r7 はこれを「まれな失敗」ではなく通常の入力の組み合わせと見て、構造的な修正としての
+合意を出していない。
+
+設計担当の追加確認 (2026-09-09 の AHK trace `current.log`、111 組): 逆順の 13 組はすべて、APPCOMMAND が
+KEYDOWN の直後 (+0 ms) に届き、KEYUP はその 4〜10 ms 後に届いた。presenter は browser KEYDOWN を
+`DefWindowProcW` に渡していないので、写しは mIV の KEYUP 処理からではなく、OS が入力の押下から作って
+いる。KEYUP も処理済みにして写しを止める案は成り立たない。
+
+どの案にも残る場合がある。
+- 組で識別する案 (§9.2): key だけの producer と、キーを WM_APPCOMMAND に置き換える同スレッドの hook を
+  同時に使う環境で、入力 1 回を落とし得る。
+- WM_APPCOMMAND だけを入口にする案 (不採用 (b)): key message だけを送る producer が動画全画面で効かなくなる。
+- 何もしない: 本物の入力の browser key は、動画全画面で毎回 2 回動作する (今回の記録)。
+
+採否は利用者の判断を待つ。
