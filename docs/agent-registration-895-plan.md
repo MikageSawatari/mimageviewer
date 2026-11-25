@@ -1,6 +1,6 @@
 # §1.895 AI 連携の登録先を直す (Claude Desktop のパッケージ版・バックアップ・注記・ChatGPT の設定)
 
-状態: 設計中 (2026-11-25)。担当: 設計・検収 ClaudeCode Opus 5.5、実装 Codex GPT-6.1 Sol / high。
+状態: 設計の独立レビュー r3 ACCEPT (§7 の実機確認待ちを前提)、実装中 (2026-11-25)。担当: 設計・検収 ClaudeCode Opus 5.5、実装 Codex GPT-6.1 Sol / high。
 ブランチ `agent-reg-895` (master `a57f23522` から)。正本の登録の設計は [mcp-integration-plan.md](mcp-integration-plan.md) の
 「AI アプリごとの行」の節で、本書はその変更点だけを書く。実装後に正本の該当の行を本書に合わせて直す。
 
@@ -193,3 +193,4 @@ ChatGPT (Codex) の登録先 (`CODEX_HOME` / `.codex`) も同じ関数の形で�
   ファイルを空の控えで表し、以前の版の `.bak` を写す場合は原本を保証しないと明記。テストを §6 に足した。
 - 設計の独立レビュー r2 (同じ担当、16059f5d0): ACCEPT WITH CHANGES、P2 1 件。登録後の注記だけでは、既に登録済みで Claude が
   更新された利用者に案内が出ない → LocalCache 側を選んだ検出の行の `message` に案内を載せる (§3.1)。テストを §6 に足した。
+- 設計の独立レビュー r3 (同じ担当、e7399c399): ACCEPT (§7 の実機確認待ちを前提とする判定)、新しい指摘なし。
