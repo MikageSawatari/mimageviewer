@@ -814,8 +814,17 @@ impl BookBookmarkDb {
         mappings: &[(PathBuf, PathBuf)],
         journal_id: Option<&str>,
     ) -> Result<usize, rusqlite::Error> {
+        self.migrate_paths_with_effects(mappings, journal_id)
+            .map(|(rows, _)| rows)
+    }
+
+    fn migrate_paths_with_effects(
+        &mut self,
+        mappings: &[(PathBuf, PathBuf)],
+        journal_id: Option<&str>,
+    ) -> Result<(usize, Vec<usize>), rusqlite::Error> {
         if mappings.is_empty() && journal_id.is_none() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
         // A journaled completion must use the durable mapping, not the UI
         // message copy. This keeps filesystem and bookmark identity coupled
@@ -846,16 +855,38 @@ impl BookBookmarkDb {
             None
         };
         let mappings = PathMappingIndex::new(journal_mappings.as_deref().unwrap_or(mappings));
-        let targets: Vec<_> = self
-            .list_all()?
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let bookmarks = tx
+            .prepare(
+                "SELECT id, container_key, container_path, container_kind, page_kind,
+                    page_value, page_index_hint, created_at_ms, title FROM book_bookmarks",
+            )?
+            .query_map([], row_to_bookmark)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut changed_pairs = std::collections::BTreeSet::new();
+        let targets: Vec<_> = bookmarks
             .into_iter()
-            .filter_map(|bookmark| migration_target(&bookmark, &mappings))
+            .filter_map(|bookmark| {
+                let target = migration_target(&bookmark, &mappings)?;
+                if let Some(index) = mappings.mapping_index(&bookmark.container_path) {
+                    changed_pairs.insert(index);
+                }
+                if let PageIdentity::RelativePath(relative) = &bookmark.page_identity {
+                    if let Some(index) =
+                        mappings.mapping_index(&bookmark.container_path.join(relative))
+                    {
+                        changed_pairs.insert(index);
+                    }
+                }
+                Some(target)
+            })
             .collect();
         if targets.is_empty() && journal_id.is_none() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
 
-        let tx = self.conn.transaction()?;
         for target in &targets {
             tx.execute(
                 "UPDATE book_bookmarks SET container_key = ?1 WHERE id = ?2",
@@ -912,7 +943,7 @@ impl BookBookmarkDb {
             )?;
         }
         tx.commit()?;
-        Ok(targets.len())
+        Ok((targets.len(), changed_pairs.into_iter().collect()))
     }
 
     fn recover_path_migration_journal(&mut self) -> usize {
@@ -1229,24 +1260,32 @@ fn migration_target(
 struct PathMappingIndex {
     /// 製本の全ページ並べ替えでも bookmark × mapping の全走査をしない。exact は O(1)、
     /// フォルダ rename は path の ancestor (通常は数段) だけを調べる。
-    by_from: HashMap<String, (usize, PathBuf)>,
+    by_from: HashMap<String, (usize, PathBuf, usize)>,
 }
 
 impl PathMappingIndex {
     fn new(mappings: &[(PathBuf, PathBuf)]) -> Self {
         let mut by_from = HashMap::with_capacity(mappings.len());
-        for (from, to) in mappings {
+        for (index, (from, to)) in mappings.iter().enumerate() {
             by_from
                 .entry(crate::path_key::normalize_keep_drive(from))
-                .or_insert_with(|| (from.components().count(), to.clone()));
+                .or_insert_with(|| (from.components().count(), to.clone(), index));
         }
         Self { by_from }
+    }
+
+    fn mapping_index(&self, path: &Path) -> Option<usize> {
+        path.ancestors().find_map(|candidate| {
+            self.by_from
+                .get(&crate::path_key::normalize_keep_drive(candidate))
+                .map(|(_, _, index)| *index)
+        })
     }
 
     fn map_path(&self, path: &Path) -> (PathBuf, bool) {
         for candidate in path.ancestors() {
             let key = crate::path_key::normalize_keep_drive(candidate);
-            let Some((component_count, to)) = self.by_from.get(&key) else {
+            let Some((component_count, to, _)) = self.by_from.get(&key) else {
                 continue;
             };
             if candidate == path {
@@ -1560,6 +1599,13 @@ pub fn ensure_schema_at(path: &Path) -> Result<(), rusqlite::Error> {
 /// アプリ内の共通リネーム worker 用。コンテナ path と画像フォルダ内ページ identity の
 /// 両方を同じ transaction で追従させる。削除時は missing 行を保持する仕様なので、
 /// `rename_key_migration::STORES` の hard-purge 対象には加えない。
+pub(crate) fn migrate_paths_with_changed_at(
+    db_path: &Path,
+    mappings: &[(PathBuf, PathBuf)],
+) -> Result<(usize, Vec<usize>), rusqlite::Error> {
+    BookBookmarkDb::open_at(db_path)?.migrate_paths_with_effects(mappings, None)
+}
+
 pub fn migrate_paths_at(
     db_path: &Path,
     mappings: &[(PathBuf, PathBuf)],

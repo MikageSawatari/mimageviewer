@@ -577,6 +577,7 @@ mod cache_ops;
 mod color_filter;
 mod content_identity_detection;
 pub(crate) mod content_identity_restore;
+mod converted_archive_rename;
 #[cfg(windows)]
 mod detached_activation;
 #[cfg(windows)]
@@ -49359,6 +49360,8 @@ impl App {
         &mut self,
         prefix_path: &std::path::Path,
     ) {
+        #[cfg(test)]
+        converted_archive_rename::SYNC_REHYDRATIONS.with(|count| count.set(count.get() + 1));
         self.clear_page_edit_state();
 
         let prefix = crate::adjustment_db::normalize_path(prefix_path);
@@ -51477,7 +51480,7 @@ impl App {
     }
 
     /// リネーム移行が使う data_dir (テストでは tempdir に差し替え可能)。
-    fn rename_migration_data_dir(&self) -> std::path::PathBuf {
+    pub(crate) fn rename_migration_data_dir(&self) -> std::path::PathBuf {
         #[cfg(test)]
         if let Some(dir) = &self.rename_migration_data_dir_override {
             return dir.clone();
@@ -52071,6 +52074,10 @@ impl App {
 
     /// Called only at mIV-owned filesystem mutation producers, before a worker or viewer release.
     pub(crate) fn admit_rename_migration_source_change(&mut self, ctx: &egui::Context) -> bool {
+        if self.rename_pending.is_some() {
+            self.show_feedback_warning("名前の変更が完了するまでお待ちください".into());
+            return false;
+        }
         if self.viewer_mutation_modal_active() {
             return false;
         }
@@ -52171,14 +52178,29 @@ impl App {
         new_path: std::path::PathBuf,
         scope: crate::collection_store::CollectionSourceMigrationScope,
     ) {
-        self.ensure_rename_migration_journal_loaded();
-        self.rename_migration_queue.push_back(
-            crate::rename_key_migration::PathMigrationJob::shell_rename(
-                old_path,
-                new_path,
-                scope == crate::collection_store::CollectionSourceMigrationScope::Tree,
-            ),
+        self.spawn_rename_key_migration_with_converted_archives(
+            old_path,
+            new_path,
+            scope,
+            Vec::new(),
         );
+    }
+
+    pub(crate) fn spawn_rename_key_migration_with_converted_archives(
+        &mut self,
+        old_path: std::path::PathBuf,
+        new_path: std::path::PathBuf,
+        scope: crate::collection_store::CollectionSourceMigrationScope,
+        converted_archive_rels: Vec<std::path::PathBuf>,
+    ) {
+        self.ensure_rename_migration_journal_loaded();
+        let mut job = crate::rename_key_migration::PathMigrationJob::shell_rename(
+            old_path,
+            new_path,
+            scope == crate::collection_store::CollectionSourceMigrationScope::Tree,
+        );
+        job.converted_archive_rels = converted_archive_rels;
+        self.rename_migration_queue.push_back(job);
         self.persist_rename_migration_journal();
         self.try_start_next_rename_migration();
     }
@@ -52310,15 +52332,22 @@ impl App {
             let worker_old = old_path;
             let worker_new = new_path;
             let worker_tree = job.mappings[0].tree;
+            let worker_rels = job.converted_archive_rels.clone();
+            #[cfg(test)]
+            let test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::capture();
             match std::thread::Builder::new()
                 .name("rename-key-migration".into())
                 .spawn(move || {
+                    #[cfg(test)]
+                    let _test_epoch_scope =
+                        test_epoch_scope.map(crate::page_edit_write_epoch::TestEpochScope::enter);
                     let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::rename_key_migration::run_at_with_shape(
+                        crate::rename_key_migration::run_at_with_converted_archives(
                             &data_dir,
                             &worker_old,
                             &worker_new,
                             worker_tree,
+                            &worker_rels,
                         )
                     }))
                     .unwrap_or_else(|_| {
@@ -52328,6 +52357,7 @@ impl App {
                         store_mutations: crate::rename_key_migration::StoreMutationEffects::
                             for_content_identity_index_stale(),
                         panicked: true,
+                        converted_cache_pairs: Vec::new(),
                     }
                     });
                     let _ = tx.send(report);
@@ -52502,6 +52532,10 @@ impl App {
                             &mapping.old_path,
                             &mapping.new_path,
                         );
+                        // Bookmark notification advances page_edit_revision, even outside a
+                        // Smart view. Finish that invalidation before creating any edit prepare;
+                        // otherwise its Building/Running owner is obsolete in this same handler.
+                        self.invalidate_book_bookmarks_after_path_migration();
                         // idx キーのページ編集 state は「リネームに関係する文脈」だけ再構築する。
                         // 旧実装の全文脈 clear_page_edit_state は、無関係な画像の編集中ドラッグ値
                         // まで消し、離した瞬間に既存の保存済み補正を削除する実害があった
@@ -52510,9 +52544,9 @@ impl App {
                             &mapping.old_path,
                             &mapping.new_path,
                         );
-                        // 共通リネーム worker は book_bookmarks.db も更新する。現在の本の
-                        // 左パネルと横断一覧が旧 identity を保持し続けないよう再読込する。
-                        self.invalidate_book_bookmarks_after_path_migration();
+                        self.apply_converted_archive_rename_completion(
+                            &report.converted_cache_pairs,
+                        );
                         self.book_resume_meters
                             .remove_scopes(&[mapping.old_path.clone(), mapping.new_path.clone()]);
                         self.reload_book_resume_meters();

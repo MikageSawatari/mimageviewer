@@ -228,6 +228,8 @@ metadata_transfer は 2 と 4 が同時に存在するとエラーにする (imp
 > `C:\a\x.rar` と `D:\a\x.rar` は同じキャッシュ ZIP を指す。別ドライブの同一相対パスへコピーした
 > 場合、3 / 4 のキーは元から一致していてコピーが no-op になる。**正しい挙動だがテストで明示する。**
 
+mIV の中での改名・移動でも、同じ予測で 3 / 4 の面を移す ([converted-archive-rename-keys-plan.md](converted-archive-rename-keys-plan.md)、§1.886)。
+
 同じ理由で `book_resume` / `spread` / `view_trim_books` も drive-stripped キー
 (`StoreKeyNormalization::DriveStripped`) なので、ストアごとの正規化は `STORES` 表の
 `normalization` に従うこと。自前で正規化を選ばない。
