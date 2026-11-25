@@ -2346,8 +2346,38 @@ MCP経由のヘルプでは、そのあたりをユーザにうまく説明し�
 - **E1 環境設定の外の画面が持つほかの設定 (ツールバーなど約 170) を、この段 (v5.8.0) に含めるか**: 推奨は「含めない
   (操作カスタマイズだけで v5.8.0 に出し、残りは第 2 段の後半として別に設計)」。確定の入口が画面ごとに別で、操作カスタマイズと
   共有する部分が無く、同じ枝に入れると規模と検査の組み合わせが大きくなる。
+  **2026-11-25 利用者決定 (統括経由、master の backlog `d1eb95220`): 含めない**。一覧の見た目・詳細一覧の列・ボタンの表示は
+  「今後、優先度は低め」。利用者の言葉:「1,2，３は今後で良さそうです。ユーザが画面を見てすぐに把握できそうな項目は、AIに画面右クリック
+  してメニューから設定できます、と案内させることができれば一旦は十分かとおもい、優先度を低くしても良いと考えています。」
+  利用者のデータ (スマートフォルダ・クイックフォルダ・ピン留めなど) は「後々早めに」、ツールバーの並びは次の段 (backlog §1.843)。
+  これに合わせ、設定の tool に無い表示の項目を AI がマニュアルで画面の場所を調べて案内するよう、instructions と `get_settings` の
+  説明に一言足す (§20.16)。
 - 通常の使い方が不便になる変更・利用者の作ったデータが失われる点: 無い見込み (割り当ての値は応答と記録の変更前の値で戻せる。
   ジェスチャーは列全体で戻せる、§20.4.1)。
+
+### 20.16 設定の tool に無い表示の項目の案内 (2026-11-25、E1 の決定を受けて)
+
+**確かめたこと (master `d1eb95220` のコード)**:
+
+- INSTRUCTIONS (`crates/mcp-server/src/lib.rs:28-32`) は「機能・操作・設定の質問はまず search_help / get_help」「許可があれば
+  get_view_state / get_settings / get_operations を先に見る」と書くだけで、**設定の tool に無い項目 (環境設定の外の画面で変える表示の
+  設定) をどう扱うか**は書いていない。`get_settings` の説明も同じ。AI が `get_settings` で見つからない項目を「mIV では変えられない」と
+  答えてしまう余地がある。
+- `set_settings` にその鍵を渡せば「この設定は、まだ AI からは変えられません (理由)」が返る (`src/settings_transfer/stage1.rs:260`) が、
+  AI はふつう鍵の名前を知らないので、そこまで届かない。
+- INSTRUCTIONS は client が渡さないことがある (親文書 §15.4) ので、tool の説明にも短く書く。
+- マニュアルには、利用者が挙げた 3 つの画面の場所が書かれている: ツールバーのセクション・並び・表示形式 (`manual/grid.html:93`、
+  `manual/settings.html#toolbar`)、詳細表示の列 (`manual/grid.html:264`、列ヘッダの右クリック)、一覧の先頭 / 末尾のボタン
+  (`manual/grid.html:339`、右クリックのメニュー)。絞り込みバーの表示 (`grid.html:311`) も同様。足りない記述は見つからなかった
+  (3 つの例と、その周りの節を読んだ範囲。約 170 項目を全部突き合わせてはいない)。
+
+**足すもの** (文言は英語の短文。予算の内):
+
+- INSTRUCTIONS の 3 行目に 1 文:「Display settings changed only on screen (toolbar, list/detail columns, buttons, panels) are not in
+  get_settings/get_operations: say so, then use search_help/get_help to find where to change them (often a right-click menu) and guide
+  the user.」
+- `get_settings` の説明に 1 句:「On-screen display options (toolbar, columns, buttons) are absent: guide via get_help.」
+- テスト: INSTRUCTIONS と `get_settings` の説明にこの案内が入っていることを確かめる 1 件 (既存の字数・予算の検査はそのまま)。
 
 ### 20.15 独立レビューの記録
 
