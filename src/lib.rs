@@ -349,6 +349,7 @@ mod vram_budget;
 pub mod db_backup;
 #[cfg(feature = "portable")]
 pub mod native_assets;
+pub(crate) mod operation_customize_agent;
 pub mod operation_customize_share;
 pub mod pdf_loader;
 pub mod pdf_passwords;

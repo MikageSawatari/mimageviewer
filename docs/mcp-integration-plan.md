@@ -226,9 +226,9 @@ list_changed通知・listChanged広告は削除する。再試行・push・別�
   tool の説明に書き、cursor の版が合わなければ「最初からやり直してください」の error にする。
   件数とは別に**データ応答全体の文字数上限 (text の JSON を含めて 40,000 文字)** を設け、超える前に
   打ち切って cursor を返す (Claude Code は既定 25k token、50,000 文字超はファイル退避)。
-  tools/listだけは別のdiscovery予算48,000文字（既存の余裕512文字もこの枠で検査）とする。
+  tools/listだけは別のdiscovery予算52,000文字（既存の余裕512文字もこの枠で検査）とする。
   toolの数に比例するセッション開始時の一覧であり、操作条件の削減による誤用を避け、T2の検索拡張等も見込む
-  （設計担当決定、2026-11-14）。データ応答のページ計算とbyte上限は変えない。
+  （初回 48,000 は 2026-11-14、52,000 への改定は 2026-11-25 の設計担当決定。詳細は §15.4）。データ応答のページ計算とbyte上限は変えない。
   MCP 用には必要な列だけを返す投影を作る (TagItems のサムネイル用 sidecar 走査は通さない。
   headless 検索の `stars` は常に 0 なので★は rating DB から別に引く)。
 - まれな失敗 (DB を開けない等) は既定の割り切り: tool error として理由を返し、ログに残す。
@@ -1300,9 +1300,10 @@ tool の数を増やしすぎない (AI アプリの文脈を圧迫し、選び�
 返す内容の意味、権限、untrusted dataの注意）は各toolのdescriptionに残す。
 initializeのinstructionsをモデルへ渡すかはclient任意なので、そこへ条件を移して依存しない。
 instructionsには共通のページ上限・cursor・too_long等の補足を集約し、予算調整は条件を保った重複削減で行う。
-tools/listにはadapterの `MAX_MCP_DISCOVERY_CHARS = 48_000` を別に適用する（設計担当決定、2026-11-14）。
+tools/listにはadapterの `MAX_MCP_DISCOVERY_CHARS = 52_000` を別に適用する（2026-11-25、§1.843 第 2 段で 48,000 から改定）。
+get_operations / set_operations の追加に必要な枠を確保する。第 1 段では既存説明の重複を削減済みで、条件をさらに削らずに増やす設計担当の決定。
 tool数に比例するセッション開始時の一覧なので、操作条件を削るより、T2等の拡張を含む別枠を確保する。
-全権限・プロトコル・IDの組合せで実際の送信形の最終JSONを測り、48,000文字以内に既存の512文字の余裕も確保する。
+全権限・プロトコル・IDの組合せで実際の送信形の最終JSONを測り、52,000文字以内に既存の512文字の余裕も確保する。
 種別はtools/listの結果を作る経路からwriterへ渡し、本文のキーや文字列では推測しない。
 initialize・server/discover・通知・エラー・tools/callにはこの別枠を適用しない。全種別でbyte上限も引き続き検査する。
 
@@ -1311,7 +1312,7 @@ client側の根拠は [Claude Code公式MCP文書](https://code.claude.com/docs/
 [Tool search for MCP server authors](https://code.claude.com/docs/en/mcp#tool-search-for-mcp-server-authors)
 （2026-11-14確認）。`MAX_MCP_OUTPUT_TOKENS` の既定25,000トークンと、既定50,000文字超でのファイル退避は
 tools/callの結果に対する扱いであり、tools/list総量に同じ文字数上限が文書化されているわけではない。
-これを踏まえ、mIVではデータ応答40,000文字と、操作条件を保つdiscovery 48,000文字を分ける。
+これを踏まえ、mIVではデータ応答40,000文字と、操作条件を保つdiscovery 52,000文字を分ける。
 
 一方、server instructionsと最初から読み込まれる各toolのdescriptionは、既定4,096文字で切り詰められる。
 tool searchで後から読むdescriptionは16,384文字だが、検索時にも短い方の範囲が使われるため、その大きい枠には依存しない。
@@ -1333,7 +1334,7 @@ tool searchで後から読むdescriptionは16,384文字だが、検索時にも�
   | 項目 | 12,000 文字 | 1 項目の MCP での大きさ |
   | ページ (core) | 40,000 − envelope の予約 (2,000) 文字 | cursor・`truncated` を含むページ全体の MCP での大きさ |
   | データ応答の非画像の最終 JSON (MCP exe) | 40,000 文字 | `structuredContent`・text・escape・envelope を含む全体。画像 block の data は除く |
-  | tools/list の最終 JSON (MCP exe) | 48,000 文字 | toolの説明・schema・envelope・modernのttlMs/cacheScopeを含む。検査では512文字の余裕も確保 |
+  | tools/list の最終 JSON (MCP exe) | 52,000 文字 | toolの説明・schema・envelope・modernのttlMs/cacheScopeを含む。検査では512文字の余裕も確保 |
   | 画像 1 件 | 256 KiB | WebP の bytes |
   | 画像の合計 | 1 MiB | WebP の bytes の合計 (base64 で約 1.4 MB) |
   | agent IPC の frame | 4 MiB | 段階 0 の 1 MiB から引き上げ |

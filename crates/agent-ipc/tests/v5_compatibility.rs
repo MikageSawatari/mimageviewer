@@ -17,7 +17,7 @@ fn frozen_v5_hello_keeps_exact_frame_and_is_still_accepted_by_v6_core() {
     v5_wire::write_frame(&mut bytes, &request).unwrap();
     assert_eq!(bytes, include_bytes!("v5_wire/hello.frame"));
     assert_eq!(v5_wire::AGENT_PROTOCOL_VERSION, 5);
-    assert_eq!(current::AGENT_PROTOCOL_VERSION, 6);
+    assert_eq!(current::AGENT_PROTOCOL_VERSION, 7);
     assert_eq!(current::MIN_ADAPTER_PROTOCOL_VERSION, 3);
     assert!(current::supports_adapter_version(5));
     assert!(

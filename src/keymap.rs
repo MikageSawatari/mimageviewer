@@ -7650,6 +7650,83 @@ impl PageTurnConsumeResult {
     }
 }
 
+/// Compact operation names shared by the customization UI and agent views.
+pub(crate) fn compact_key_action_label(action: KeyAction) -> String {
+    let desc = action.description();
+    let label = match action {
+        KeyAction::GlobalLocalSearch => "現在地フィルタ",
+        KeyAction::GlobalFavSearch => "コンテナ検索",
+        KeyAction::GlobalMetadataSearch => "アイテム検索",
+        KeyAction::GlobalOpenFolder => "フォルダを開く",
+        KeyAction::ClearVideoMediaMemory => "再生位置・視聴済み・音声トラック選択を全件クリア",
+        KeyAction::ClearBookResumePositions => "本の読書位置を全件クリア",
+        KeyAction::ToggleDetachedViewerMode => "別ウィンドウ",
+        KeyAction::HelpShowContextShortcuts => "ショートカット一覧",
+        KeyAction::GridSelectAll => "表示中を全チェック",
+        _ => desc,
+    };
+    compact_operation_label(label)
+}
+
+const COMPACT_OPERATION_LABEL_SUFFIXES: &[&str] = &[
+    // 「順に」の副詞だけを残さない。一般の「…にする」は簡潔なラベルとして残す。
+    "を順に切り替える",
+    "を切り替える",
+    "に切り替える",
+    "を表示する",
+    "を開始または終了する",
+    "を開始または確定する",
+    "する",
+];
+
+pub(crate) fn compact_operation_label(label: &str) -> String {
+    compact_operation_label_with_suffixes(label, COMPACT_OPERATION_LABEL_SUFFIXES)
+}
+
+pub(crate) fn compact_operation_label_with_suffixes(label: &str, suffixes: &[&str]) -> String {
+    let mut compact = label
+        .replace("選択中またはチェック済みの", "")
+        .replace("選択中またはチェック済み画像の", "")
+        .replace("選択中またはチェック済み画像に", "")
+        .replace("現在の表示画像を", "")
+        .replace("現在の動画フレームを", "")
+        .replace("現在の動画を", "")
+        .replace("現在の再生位置を", "")
+        .replace("現在の画像または動画に", "")
+        .replace("現在の画像または動画の", "")
+        .replace("現在のフォルダまたはZIP/PDF本体に", "")
+        .replace("現在のフォルダまたはZIP/PDF本体の", "")
+        .replace("現在の画像の", "")
+        .replace("現在の画像を", "")
+        .replace("現在の項目を", "")
+        .replace("現在のページを", "")
+        .replace("現在ページの", "")
+        .replace("現在ページに", "")
+        .replace("選択中の画像を", "")
+        .replace("選択中の項目を", "")
+        .replace("選択中の", "")
+        .replace("表示中の", "");
+    for suffix in suffixes {
+        if compact.ends_with(suffix) {
+            let len = compact.len() - suffix.len();
+            compact.truncate(len);
+            break;
+        }
+    }
+    let compact = compact.trim();
+    const COMMAND_OVERVIEW_LABEL_MAX_CHARS: usize = 34;
+    if compact.chars().count() <= COMMAND_OVERVIEW_LABEL_MAX_CHARS {
+        compact.to_string()
+    } else {
+        let mut out: String = compact
+            .chars()
+            .take(COMMAND_OVERVIEW_LABEL_MAX_CHARS - 1)
+            .collect();
+        out.push('…');
+        out
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct KeymapSettings {
     #[serde(default)]
@@ -7737,24 +7814,11 @@ pub fn page_overview_action_allowed(action: KeyAction) -> bool {
     FS_PAGE_OVERVIEW_ACTION_PRIORITY.contains(&action)
 }
 
-const ACTIVE_SCOPE_SETS: &[&[CommandScope]] = &[
-    GRID_ACTIVE_SCOPES,
-    FS_IMAGE_ACTIVE_SCOPES,
-    FS_VIDEO_ACTIVE_SCOPES,
-    FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
-    &[KeyContext::Erase],
-    &[KeyContext::Conceal],
-    &[KeyContext::Crop],
-    &[KeyContext::SnsSplit],
-    &[KeyContext::Text],
-    &[KeyContext::LocalAdjust],
-];
-
 pub fn command_scopes_overlap(a: CommandScope, b: CommandScope) -> bool {
     a == b
-        || ACTIVE_SCOPE_SETS
+        || OPERATION_SCREENS
             .iter()
-            .any(|set| set.contains(&a) && set.contains(&b))
+            .any(|screen| screen.scopes.contains(&a) && screen.scopes.contains(&b))
 }
 
 fn native_video_shortcut_action(action: KeyAction) -> bool {
@@ -7787,7 +7851,7 @@ fn help_context_shortcuts_overlaps_scope(action: KeyAction, scope: CommandScope)
     action == KeyAction::HelpShowContextShortcuts && is_overlay_edit_scope(scope)
 }
 
-fn actions_can_overlap(first: KeyAction, second: KeyAction) -> bool {
+pub(crate) fn actions_can_overlap(first: KeyAction, second: KeyAction) -> bool {
     // Local overview actions coexist only with the finite executable set. The toggle
     // also exists in ordinary still-image viewing, but never in video or edit modes.
     if first.context() == KeyContext::FsPageOverview
@@ -7803,6 +7867,112 @@ fn actions_can_overlap(first: KeyAction, second: KeyAction) -> bool {
     command_scopes_overlap(first.context(), second.context())
         || help_context_shortcuts_overlaps_scope(first, second.context())
         || help_context_shortcuts_overlaps_scope(second, first.context())
+}
+
+/// One owner for screen identity, labels and simultaneously active scopes.
+/// This describes potential shortcuts, not runtime viewport admission.
+pub(crate) struct OperationScreen {
+    pub(crate) name: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) scopes: &'static [CommandScope],
+}
+
+pub(crate) const OPERATION_SCREENS: &[OperationScreen] = &[
+    OperationScreen {
+        name: "grid",
+        label: "サムネイル一覧",
+        scopes: GRID_ACTIVE_SCOPES,
+    },
+    OperationScreen {
+        name: "image_fullscreen",
+        label: "画像フルスクリーン",
+        scopes: FS_IMAGE_ACTIVE_SCOPES,
+    },
+    OperationScreen {
+        name: "video_fullscreen",
+        label: "動画フルスクリーン",
+        scopes: FS_VIDEO_ACTIVE_SCOPES,
+    },
+    OperationScreen {
+        name: "page_overview",
+        label: "ページ一覧",
+        scopes: FS_PAGE_OVERVIEW_ACTIVE_SCOPES,
+    },
+    OperationScreen {
+        name: "erase",
+        label: "消しゴム",
+        scopes: &[KeyContext::Erase],
+    },
+    OperationScreen {
+        name: "conceal",
+        label: "隠蔽加工",
+        scopes: &[KeyContext::Conceal],
+    },
+    OperationScreen {
+        name: "crop",
+        label: "切り抜き",
+        scopes: &[KeyContext::Crop],
+    },
+    OperationScreen {
+        name: "sns_split",
+        label: "SNS 分割",
+        scopes: &[KeyContext::SnsSplit],
+    },
+    OperationScreen {
+        name: "text",
+        label: "テキスト",
+        scopes: &[KeyContext::Text],
+    },
+    OperationScreen {
+        name: "local_adjust",
+        label: "補正レイヤー",
+        scopes: &[KeyContext::LocalAdjust],
+    },
+];
+
+pub(crate) fn action_active_on_screen(action: KeyAction, screen: &str) -> bool {
+    let Some(screen) = OPERATION_SCREENS.iter().find(|entry| entry.name == screen) else {
+        return false;
+    };
+    let scopes = screen.scopes;
+    if scopes.contains(&KeyContext::FsPageOverview) {
+        return page_overview_action_allowed(action);
+    }
+    if action == KeyAction::FsPageOverviewToggle {
+        return screen.name == "image_fullscreen";
+    }
+    scopes.contains(&action.context())
+        || scopes
+            .iter()
+            .any(|scope| help_context_shortcuts_overlaps_scope(action, *scope))
+}
+
+pub(crate) fn reserved_labels_for_screen(chord: Chord, screen: Option<&str>) -> Vec<String> {
+    RESERVED_BINDINGS
+        .iter()
+        .filter(|binding| {
+            binding.chord == chord
+                && screen.is_none_or(|screen| {
+                    OPERATION_SCREENS
+                        .iter()
+                        .find(|entry| entry.name == screen)
+                        .is_some_and(|entry| {
+                            binding.scope == KeyContext::Global
+                                || entry.scopes.contains(&binding.scope)
+                        })
+                })
+        })
+        .map(|binding| binding.kind.label().to_owned())
+        .collect()
+}
+
+/// Lookup accepts modifier-only chords too; action-specific validation is done
+/// separately for writes and conflict previews.
+pub(crate) fn parse_operation_chord(text: &str) -> Result<Chord, String> {
+    if text.trim().is_empty() || text.trim().eq_ignore_ascii_case("none") {
+        return Err("key にキーを 1 つ指定してください".into());
+    }
+    parse_chord(text)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -7969,6 +8139,25 @@ fn reserved_binding_overlaps_scope(
 impl Keymap {
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// Agent views resolve action names once for raw-value lookup and reuse
+    /// those identities here. Keep the normal chord parser and last-valid-row
+    /// semantics, without formatting discarded conflict warning strings.
+    pub(crate) fn from_resolved_overrides<'a>(
+        bindings: impl IntoIterator<Item = (KeyAction, &'a [String])>,
+    ) -> Self {
+        let mut warnings = Vec::new();
+        let mut overrides = HashMap::new();
+        for (action, names) in bindings {
+            if let Some(chords) = parse_setting_chords(action, names, &mut warnings) {
+                overrides.insert(action, chords);
+            }
+        }
+        Self {
+            overrides,
+            warnings,
+        }
     }
 
     pub fn from_settings(settings: &KeymapSettings) -> Self {

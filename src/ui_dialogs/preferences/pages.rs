@@ -3,12 +3,16 @@ use crate::context_menu_model::{
     ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuParentId, ContextMenuPreviewItemState,
     ContextMenuPreviewScenario, ContextMenuSeparatorBefore, context_menu_layout_preview,
 };
+#[cfg(test)]
+use crate::keymap::compact_operation_label_with_suffixes;
 use crate::keymap::{
     BindingConflict, BindingConflictKind, Chord, KeyAction, KeyContext, KeyName, KeyTrigger,
     Keymap, MenuCommandId, MenuCommandOrderSettings, MenuLayoutSettings, ModKind,
-    ReservedBindingKind, TopMenuId, menu_command_can_be_hidden, menu_command_spec,
-    menu_commands_for_parent, parse_chord_for_action, pin_settings_always_on_top_command,
+    ReservedBindingKind, TopMenuId, compact_key_action_label, compact_operation_label,
+    menu_command_can_be_hidden, menu_command_spec, menu_commands_for_parent,
+    parse_chord_for_action, pin_settings_always_on_top_command,
 };
+use crate::ring_shortcut::ring_bindings_for_key_action;
 use crate::ring_shortcut::{
     MouseGestureDirection, RightDragContext, RightDragMode, RingActionId, RingDirection,
     RingShortcutContext, RingShortcutSettings, ViewerShortRightClickAction,
@@ -2992,23 +2996,6 @@ fn natural_operation_label_cmp(a: &str, b: &str) -> Ordering {
         .then_with(|| a.cmp(b))
 }
 
-fn compact_key_action_label(action: KeyAction) -> String {
-    let desc = action.description();
-    let label = match action {
-        KeyAction::GlobalLocalSearch => "現在地フィルタ",
-        KeyAction::GlobalFavSearch => "コンテナ検索",
-        KeyAction::GlobalMetadataSearch => "アイテム検索",
-        KeyAction::GlobalOpenFolder => "フォルダを開く",
-        KeyAction::ClearVideoMediaMemory => "再生位置・視聴済み・音声トラック選択を全件クリア",
-        KeyAction::ClearBookResumePositions => "本の読書位置を全件クリア",
-        KeyAction::ToggleDetachedViewerMode => "別ウィンドウ",
-        KeyAction::HelpShowContextShortcuts => "ショートカット一覧",
-        KeyAction::GridSelectAll => "表示中を全チェック",
-        _ => desc,
-    };
-    compact_operation_label(label)
-}
-
 fn key_action_context_label(action: KeyAction) -> &'static str {
     operation_keyboard_context_filter_label(operation_keyboard_context_filter_for_context(
         action.context(),
@@ -3063,178 +3050,8 @@ fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext)
     }
 }
 
-fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, RingActionId)> {
-    let mut out = Vec::new();
-    if let Some(ring_action) = RingActionId::for_saved_group_key_action(action) {
-        for &context in RingShortcutContext::all() {
-            push_ring_binding_if_available(&mut out, context, ring_action.clone());
-        }
-        return out;
-    }
-    if action == KeyAction::FsPageOverviewToggle {
-        push_ring_binding_if_available(
-            &mut out,
-            RingShortcutContext::ImageFullscreen,
-            RingActionId::ImagePageOverview,
-        );
-        return out;
-    }
-    if let Some(slot) = action.favorite_slot_number()
-        && let Some(ring_action) = RingActionId::favorite_slot_action(slot)
-    {
-        push_ring_binding_if_available(&mut out, RingShortcutContext::Grid, ring_action.clone());
-        push_ring_binding_if_available(
-            &mut out,
-            RingShortcutContext::ImageFullscreen,
-            ring_action.clone(),
-        );
-        push_ring_binding_if_available(&mut out, RingShortcutContext::VideoFullscreen, ring_action);
-        return out;
-    }
-    if let Some(letter) = action.drive_letter()
-        && let Some(ring_action) = RingActionId::drive_action(letter)
-    {
-        push_ring_binding_if_available(&mut out, RingShortcutContext::Grid, ring_action.clone());
-        push_ring_binding_if_available(
-            &mut out,
-            RingShortcutContext::ImageFullscreen,
-            ring_action.clone(),
-        );
-        push_ring_binding_if_available(&mut out, RingShortcutContext::VideoFullscreen, ring_action);
-        return out;
-    }
-    if let Some(ring_action) = location_ring_action_for_key_action(action) {
-        push_ring_binding_if_available(&mut out, RingShortcutContext::Grid, ring_action.clone());
-        push_ring_binding_if_available(
-            &mut out,
-            RingShortcutContext::ImageFullscreen,
-            ring_action.clone(),
-        );
-        push_ring_binding_if_available(&mut out, RingShortcutContext::VideoFullscreen, ring_action);
-        return out;
-    }
-
-    let context = match action.context() {
-        crate::keymap::KeyContext::Grid => RingShortcutContext::Grid,
-        crate::keymap::KeyContext::FsImage => RingShortcutContext::ImageFullscreen,
-        crate::keymap::KeyContext::FsVideo => RingShortcutContext::VideoFullscreen,
-        _ => return out,
-    };
-    let ring_action = match action {
-        KeyAction::GridCopyFiles | KeyAction::FsCopyFiles => RingActionId::CopyFiles,
-        KeyAction::GridCopyPath | KeyAction::FsCopyPath => RingActionId::ImageCopyPath,
-        KeyAction::GridCopyFileName | KeyAction::FsCopyFileName => RingActionId::ImageCopyFileName,
-        KeyAction::GridCopyImage | KeyAction::FsCopyImage => RingActionId::ImageCopyToClipboard,
-        KeyAction::GridCopyEditedImage | KeyAction::FsCopyEditedImage => {
-            RingActionId::CopyEditedImage
-        }
-        KeyAction::GridParentFolder => RingActionId::GridParentFolder,
-        KeyAction::GridPhysicalParentFolder => RingActionId::GridPhysicalParentFolder,
-        KeyAction::GridTreeFolderPrev => RingActionId::TreeFolderPrev,
-        KeyAction::GridTreeFolderNext => RingActionId::TreeFolderNext,
-        KeyAction::GridSiblingFolderPrev => RingActionId::SiblingFolderPrev,
-        KeyAction::GridSiblingFolderNext => RingActionId::SiblingFolderNext,
-        KeyAction::GridToggleCheck => RingActionId::GridToggleCheck,
-        KeyAction::GridSelectAll => RingActionId::GridSelectAll,
-        KeyAction::GridOrganizeFiles => RingActionId::GridOrganizeFiles,
-        KeyAction::GridOpenSelectedAsPage => RingActionId::GridOpenSelectedAsPage,
-        KeyAction::GridOpenSelectedAsList => RingActionId::GridOpenSelectedAsList,
-        KeyAction::GridToggleDetailsView => RingActionId::GridToggleDetails,
-        KeyAction::GridOpenPreferences => RingActionId::OpenPreferences,
-        KeyAction::GridOpenOperationCustomize => RingActionId::OpenOperationCustomize,
-        KeyAction::GridClearRecentFolders => RingActionId::ClearRecentFolders,
-        KeyAction::GridClearSearchInputHistory => RingActionId::ClearSearchInputHistory,
-        KeyAction::GridClearReadingHistory => RingActionId::ClearReadingHistory,
-        KeyAction::GridClearQuickFolderSlots => RingActionId::ClearQuickFolderSlots,
-        KeyAction::GridToggleMaximize => RingActionId::ToggleMaximize,
-        KeyAction::GridColumnCount1 => RingActionId::GridColumnCount1,
-        KeyAction::GridColumnCount2 => RingActionId::GridColumnCount2,
-        KeyAction::GridColumnCount3 => RingActionId::GridColumnCount3,
-        KeyAction::GridColumnCount4 => RingActionId::GridColumnCount4,
-        KeyAction::GridColumnCount5 => RingActionId::GridColumnCount5,
-        KeyAction::GridColumnCount6 => RingActionId::GridColumnCount6,
-        KeyAction::GridColumnCount7 => RingActionId::GridColumnCount7,
-        KeyAction::GridColumnCount8 => RingActionId::GridColumnCount8,
-        KeyAction::GridColumnCount9 => RingActionId::GridColumnCount9,
-        KeyAction::GridColumnCount10 => RingActionId::GridColumnCount10,
-        KeyAction::GridColumnCount11 => RingActionId::GridColumnCount11,
-        KeyAction::GridColumnCount12 => RingActionId::GridColumnCount12,
-        KeyAction::GridColumnCount13 => RingActionId::GridColumnCount13,
-        KeyAction::GridColumnCount14 => RingActionId::GridColumnCount14,
-        KeyAction::GridColumnCount15 => RingActionId::GridColumnCount15,
-        KeyAction::GridColumnCount16 => RingActionId::GridColumnCount16,
-        KeyAction::GridColumnCount17 => RingActionId::GridColumnCount17,
-        KeyAction::GridColumnCount18 => RingActionId::GridColumnCount18,
-        KeyAction::GridColumnCount19 => RingActionId::GridColumnCount19,
-        KeyAction::GridColumnCount20 => RingActionId::GridColumnCount20,
-        KeyAction::FsClose => RingActionId::CloseFullscreen,
-        KeyAction::FsToggleMetadata => RingActionId::ImageToggleMetadata,
-        KeyAction::FsToggleWindowMode => RingActionId::ToggleWindowMode,
-        KeyAction::FsSpreadShiftLeft => RingActionId::ImageSpreadShiftLeft,
-        KeyAction::FsSpreadShiftRight => RingActionId::ImageSpreadShiftRight,
-        KeyAction::FsSpreadShiftPrev => RingActionId::ImageSpreadShiftPrev,
-        KeyAction::FsSpreadShiftNext => RingActionId::ImageSpreadShiftNext,
-        KeyAction::FsSpreadStepPrev => RingActionId::ImageSpreadStepPrev,
-        KeyAction::FsSpreadStepNext => RingActionId::ImageSpreadStepNext,
-        KeyAction::FsRotateCw => RingActionId::ImageRotateRight,
-        KeyAction::FsRotateCcw => RingActionId::ImageRotateLeft,
-        KeyAction::FsCapture => RingActionId::ImageCapture,
-        KeyAction::FsSlideshow => RingActionId::ImageSlideshow,
-        KeyAction::FsZoomMode => RingActionId::ImageZoomMode,
-        KeyAction::FsPixelGrid => RingActionId::ImagePixelGrid,
-        KeyAction::FsBgCycle => RingActionId::ImageBackgroundCycle,
-        KeyAction::FsFitModeCycle => RingActionId::ImageFitModeCycle,
-        KeyAction::FsCompareToggle => RingActionId::ImageComparePin,
-        KeyAction::VideoCapture => RingActionId::VideoCapture,
-        KeyAction::VideoMute => RingActionId::VideoMute,
-        KeyAction::VideoLoop => RingActionId::VideoLoop,
-        KeyAction::VideoBookmark => RingActionId::VideoBookmark,
-        KeyAction::VideoMarkerPrev => RingActionId::VideoMarkerPrev,
-        KeyAction::VideoMarkerNext => RingActionId::VideoMarkerNext,
-        KeyAction::VideoSeekBackSmall => RingActionId::VideoSeekBackSmall,
-        KeyAction::VideoSeekForwardSmall => RingActionId::VideoSeekForwardSmall,
-        KeyAction::VideoSeekBackMedium => RingActionId::VideoSeekBackMedium,
-        KeyAction::VideoSeekForwardMedium => RingActionId::VideoSeekForwardMedium,
-        KeyAction::VideoSeekBackLarge => RingActionId::VideoSeekBackLarge,
-        KeyAction::VideoSeekForwardLarge => RingActionId::VideoSeekForwardLarge,
-        KeyAction::VideoTileMode => RingActionId::VideoTileMode,
-        KeyAction::VideoExternalPlayer => RingActionId::VideoExternalPlayer,
-        KeyAction::VideoCloseFullscreen => RingActionId::CloseFullscreen,
-        _ => return out,
-    };
-    push_ring_binding_if_available(&mut out, context, ring_action);
-    out
-}
-
 fn ring_binding_for_key_action(action: KeyAction) -> Option<(RingShortcutContext, RingActionId)> {
     ring_bindings_for_key_action(action).into_iter().next()
-}
-
-fn push_ring_binding_if_available(
-    out: &mut Vec<(RingShortcutContext, RingActionId)>,
-    context: RingShortcutContext,
-    action: RingActionId,
-) {
-    if RingActionId::available_for_context(context).contains(&action) {
-        out.push((context, action));
-    }
-}
-
-fn location_ring_action_for_key_action(action: KeyAction) -> Option<RingActionId> {
-    Some(match action {
-        KeyAction::GridOpenLocationDriveList => RingActionId::OpenLocationDriveList,
-        KeyAction::GridOpenLocationReadingHistory => RingActionId::OpenLocationReadingHistory,
-        KeyAction::GridOpenLocationRating1 => RingActionId::OpenLocationRating1,
-        KeyAction::GridOpenLocationRating2 => RingActionId::OpenLocationRating2,
-        KeyAction::GridOpenLocationRating3 => RingActionId::OpenLocationRating3,
-        KeyAction::GridOpenLocationRating4 => RingActionId::OpenLocationRating4,
-        KeyAction::GridOpenLocationRating5 => RingActionId::OpenLocationRating5,
-        KeyAction::GridOpenLocationBooksRoot => RingActionId::OpenLocationBooksRoot,
-        KeyAction::GridOpenLocationDesktop => RingActionId::OpenLocationDesktop,
-        KeyAction::GridOpenLocationPictures => RingActionId::OpenLocationPictures,
-        KeyAction::GridOpenLocationDownloads => RingActionId::OpenLocationDownloads,
-        _ => return None,
-    })
 }
 
 fn ring_action_has_key_action(context: RingShortcutContext, action: &RingActionId) -> bool {
@@ -3260,65 +3077,6 @@ fn contextual_assignment_labels(
             .collect()
     } else {
         labels
-    }
-}
-
-const COMPACT_OPERATION_LABEL_SUFFIXES: &[&str] = &[
-    // 「順に」の副詞だけを残さない。一般の「…にする」は簡潔なラベルとして残す。
-    "を順に切り替える",
-    "を切り替える",
-    "に切り替える",
-    "を表示する",
-    "を開始または終了する",
-    "を開始または確定する",
-    "する",
-];
-
-fn compact_operation_label(label: &str) -> String {
-    compact_operation_label_with_suffixes(label, COMPACT_OPERATION_LABEL_SUFFIXES)
-}
-
-fn compact_operation_label_with_suffixes(label: &str, suffixes: &[&str]) -> String {
-    let mut compact = label
-        .replace("選択中またはチェック済みの", "")
-        .replace("選択中またはチェック済み画像の", "")
-        .replace("選択中またはチェック済み画像に", "")
-        .replace("現在の表示画像を", "")
-        .replace("現在の動画フレームを", "")
-        .replace("現在の動画を", "")
-        .replace("現在の再生位置を", "")
-        .replace("現在の画像または動画に", "")
-        .replace("現在の画像または動画の", "")
-        .replace("現在のフォルダまたはZIP/PDF本体に", "")
-        .replace("現在のフォルダまたはZIP/PDF本体の", "")
-        .replace("現在の画像の", "")
-        .replace("現在の画像を", "")
-        .replace("現在の項目を", "")
-        .replace("現在のページを", "")
-        .replace("現在ページの", "")
-        .replace("現在ページに", "")
-        .replace("選択中の画像を", "")
-        .replace("選択中の項目を", "")
-        .replace("選択中の", "")
-        .replace("表示中の", "");
-    for suffix in suffixes {
-        if compact.ends_with(suffix) {
-            let len = compact.len() - suffix.len();
-            compact.truncate(len);
-            break;
-        }
-    }
-    let compact = compact.trim();
-    const COMMAND_OVERVIEW_LABEL_MAX_CHARS: usize = 34;
-    if compact.chars().count() <= COMMAND_OVERVIEW_LABEL_MAX_CHARS {
-        compact.to_string()
-    } else {
-        let mut out: String = compact
-            .chars()
-            .take(COMMAND_OVERVIEW_LABEL_MAX_CHARS - 1)
-            .collect();
-        out.push('…');
-        out
     }
 }
 

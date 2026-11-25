@@ -235,6 +235,8 @@ impl App {
             }
             UiRequestKind::Open(_)
             | UiRequestKind::GetViewState { .. }
+            | UiRequestKind::GetOperations(_)
+            | UiRequestKind::SetOperations { .. }
             | UiRequestKind::GetSettings { .. }
             | UiRequestKind::SetSettings { .. }
             | UiRequestKind::SetFavorite(_)

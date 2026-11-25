@@ -49,6 +49,7 @@ pub(crate) enum UiOpenOutcome {
     Admitted,
     Read(mimageviewer_agent_ipc::ViewState),
     Settings(mimageviewer_agent_ipc::SettingsPage),
+    Operations(mimageviewer_agent_ipc::OperationsPage),
     StackScriptAdmitted { enabled: bool },
     Written(Result<mimageviewer_agent_ipc::Payload, AgentError>),
     Refused(AgentError),
@@ -63,6 +64,11 @@ pub(crate) enum UiRequestKind {
         query: Option<String>,
         keys: Option<Vec<String>>,
         page: Option<u32>,
+    },
+    GetOperations(mimageviewer_agent_ipc::OperationsQuery),
+    SetOperations {
+        args: mimageviewer_agent_ipc::OperationEdits,
+        client_name: String,
     },
     SetSettings {
         changes: serde_json::Map<String, serde_json::Value>,
@@ -206,6 +212,12 @@ impl OpenController {
         dispatch: Arc<UiRequestDispatch>,
     ) -> Result<UiOpenOutcome, AgentError> {
         self.dispatch_request(&ctx.cancel, dispatch, UI_REPLY_TIMEOUT, || match command {
+            mimageviewer_agent_ipc::Command::SetOperations(args) => {
+                args.validate()
+                    .map_err(|message| AgentError::new(ErrorCode::BadRequest, message))?;
+                ctx.checkpoint()?;
+                Ok(UiRequestKind::SetOperations { args, client_name })
+            }
             mimageviewer_agent_ipc::Command::SetSettings { changes } => {
                 if changes.is_empty() || changes.len() > mimageviewer_agent_ipc::MAX_SETTINGS_KEYS {
                     return Err(super::error(
@@ -235,6 +247,26 @@ impl OpenController {
                 super::metadata_write::prepare(other, ctx, client_name).map(UiRequestKind::from)
             }
         })
+    }
+
+    pub(super) fn execute_operations_read(
+        self: &Arc<Self>,
+        args: mimageviewer_agent_ipc::OperationsQuery,
+        ctx: &super::ReadContext,
+    ) -> Result<mimageviewer_agent_ipc::OperationsPage, AgentError> {
+        args.validate()
+            .map_err(|message| AgentError::new(ErrorCode::BadRequest, message))?;
+        ctx.checkpoint()?;
+        match self.dispatch_request(
+            &ctx.cancel,
+            Arc::new(UiRequestDispatch::pending()),
+            UI_REPLY_TIMEOUT,
+            || Ok(UiRequestKind::GetOperations(args)),
+        )? {
+            UiOpenOutcome::Operations(page) => Ok(page),
+            UiOpenOutcome::Refused(error) => Err(error),
+            _ => Err(super::internal()),
+        }
     }
 
     pub(super) fn execute_settings_read(
@@ -488,6 +520,7 @@ fn outcome_result(reply: UiOpenOutcome) -> Result<OpenResult, AgentError> {
         UiOpenOutcome::Refused(error) => Err(error),
         UiOpenOutcome::Written(_)
         | UiOpenOutcome::Read(_)
+        | UiOpenOutcome::Operations(_)
         | UiOpenOutcome::Settings(_)
         | UiOpenOutcome::StackScriptAdmitted { .. } => Err(open_failed()),
     }
