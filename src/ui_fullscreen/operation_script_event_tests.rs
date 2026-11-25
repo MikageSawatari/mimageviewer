@@ -313,7 +313,7 @@ fn operation_script_event_open_only_split_rotation_reconciles_once_then_rejects_
             CompiledOperationScript::compile(&format!(
                 r#"fn slots() {{ [] }} fn on_event(s) {{
                 if "open" in s.events {{ #{{run:["{}"],notice:"open accepted"}} }}
-                else if s.events == ["page"] {{ ["{}"] }}
+                else if s.events.len() == 1 && s.events[0] == "page" {{ ["{}"] }}
                 else {{ ["unexpected event set"] }}
             }}"#,
                 action.ini_name(),
@@ -427,7 +427,7 @@ fn operation_script_event_open_only_late_page_can_run_synchronous_a_without_anot
         app.operation_script.state = OperationScriptState::Ready(Box::new(CompiledOperationScript::compile(&format!(
             r#"fn slots() {{ [] }} fn on_event(s) {{
                 if "open" in s.events {{ ["{}"] }}
-                else if s.events == ["page"] {{ #{{run:["FsZoomIn"],notice:"late page synchronous"}} }}
+                else if s.events.len() == 1 && s.events[0] == "page" {{ #{{run:["FsZoomIn"],notice:"late page synchronous"}} }}
                 else {{ ["unexpected event set"] }}
             }}"#, action.ini_name()
         )).unwrap()));
@@ -517,16 +517,18 @@ fn operation_script_event_open_only_container_change_accepts_open_page_without_v
     ] {
         let ctx = egui::Context::default();
         let mut app = open_only_ready(&ctx, action, false, false);
+        // Prepare a different container before any material is accepted. After
+        // the first draw, use real navigation without replacing adopted rows.
+        app.items[1] = GridItem::Image(PathBuf::from("c:/another-book/1.png"));
         app.operation_script.state = OperationScriptState::Ready(Box::new(
             CompiledOperationScript::compile("fn slots() { [] } fn on_event(s) { [] }").unwrap(),
         ));
         ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
             .drop_without_applying_deltas();
-        app.items[0] = GridItem::Image(PathBuf::from("c:/another-book/0.png"));
         app.operation_script.state = OperationScriptState::Ready(Box::new(
             CompiledOperationScript::compile(&format!(
                 r#"fn slots() {{ [] }} fn on_event(s) {{
-                if s.events == ["open","page"] {{ #{{run:["{}"],notice:"open page accepted"}} }}
+                if s.events.len() == 2 && s.events[0] == "open" && s.events[1] == "page" {{ #{{run:["{}"],notice:"open page accepted"}} }}
                 else {{ ["unexpected event set"] }}
             }}"#,
                 action.ini_name()
@@ -534,8 +536,23 @@ fn operation_script_event_open_only_container_change_accepts_open_page_without_v
             .unwrap(),
         ));
         let before = (app.reading_direction, app.effective_fullscreen_fit_mode());
-        ctx.run_ui(raw(), |ui| app.render_fullscreen_viewport(ui))
-            .drop_without_applying_deltas();
+        ctx.run_ui(raw(), |ui| {
+            app.handle_fs_navigation_with_operation(
+                ui.ctx(),
+                false,
+                false,
+                None,
+                None,
+                None,
+                FsPageNav::Target(1),
+                None,
+                0,
+                None,
+            );
+            assert_eq!(app.fullscreen_idx, Some(1));
+            app.render_fullscreen_viewport(ui);
+        })
+        .drop_without_applying_deltas();
         assert_eq!(
             app.fs_feedback_toast.as_ref().unwrap().0,
             "open page accepted"

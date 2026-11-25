@@ -1214,7 +1214,7 @@ native 動画の右クリックメニューからのスクリプトの実行は�
   (印の根拠のテスト。§3.3 の r11 の形)。
 - r12のOpenOnlyは、Split＋自由回転の実イベント→同frame取り直し→残り実描画/保留/完了→遅れたPage一回の拒否→以後無しを両操作で通す。
   非Split/自由回転無しでは余分Page無し。Open+Page許可、Page単独/View単独と前後同期Aのmixedは全件拒否。
-  s.eventsと戻り値のeventsを偽装しても拒否する。遅れPageで同期Aを実行しても再発火せず、一覧を挟む同じ本への再入場は再Openを許す。
+  s変数そのものへの再代入と戻り値のeventsで偽装しても拒否する（s.eventsへの直接代入は段1のsyntax検査で拒否）。遅れPageで同期Aを実行しても再発火せず、一覧を挟む同じ本への再入場は再Openを許す。
   寸法未判明や検出休止から戻った場合も、独立した移動が無ければOpenを増やさない。
 - 割り当て: `KeyAction` / `RingActionId` の対応の恒久テスト (既存のパリティテストへ追加)。
 - 別ウィンドウ・編集モード・ページ一覧・Remote の取得中・読み込み中・OFF で動かないこと。
@@ -1446,7 +1446,7 @@ detached の合意を得た (記録と引用は detached-rework-plan.md §11)。
 
 11月25日の実装にr12を反映した。既存r11のClaudeCode実行結果・nested表記修正と今回r12差分の引継ぎは末尾の11月26日追記を参照。
 
-**r11識別＋r12のイベント権限を実装済み。今回r12差分のRustコンパイル・テスト・release計測・実機・独立実装レビューは未実施。**
+**r11識別＋r12のイベント権限を実装済み。最新の回帰修正後のRust検証・release計測・実機・独立実装レビューは未実施。修正前の利用者提供heavy結果は末尾追記を参照。**
 利用者の指示によりcargo build/test/check、アプリ起動、コミットを行っていない。確認はbare cargo fmt、
 UI glyph checker、差分の空白確認だけ。新しい受入・review結果やdetachedの実装合意は記録していない。
 
@@ -1468,7 +1468,7 @@ open/pageを無しへ、viewer中はselectを持ち越し、observeとイベン�
 Rhai評価→並び全件validate→許可されたAをslotと同じ実行関数で順に実行→同frame再snapshot。
 入力slotはイベント基準を更新しない。B〜E/印無しAが混ざればprefixも実行しない。10起動/rolling1秒の超過は捨て、予約/再生しない。
 イベント権限はEventPermissionの3種。ScriptInvocation::Eventが検出Vecのtyped sliceを借り、Rhaiへはsnapshot.eventsの写しを渡す。
-OpenOnlyの判定は全件validateに含め、s.eventsの改変や戻り値によって検出済み集合を変更できない。slot Inputにはこの制約を足さない。
+OpenOnlyの判定は全件validateに含め、s変数の再代入や戻り値によって検出済み集合を変更できない。s.eventsへの直接代入はsyntax検査で拒否する。slot Inputにはこの制約を足さない。
 
 構成のbaselineは強いArcを保持。同allocationは定数比較、別allocationはscope/direction/cover/complete/visible pages/overridesの
 意味で比べ、token/prepared rotationsは除く。equalでも新Arcへ進む。AcceptedCompositionProjectionのsemantic値にinterior mutationは無く、
@@ -1519,31 +1519,31 @@ main一覧継続の回帰を残す。r11の独立設計合意の履歴は§3.3�
 
 `src/app/operation_script_runtime/tests/events.rs`:
 
-- `event_r11_faces_reentry_and_select_baseline_survive_viewer_in_observe_and_finish` (`src/app/operation_script_runtime/tests/events.rs:80`)
-- `event_initial_empty_grid_has_only_view_and_location_changes_do_not_select` (`src/app/operation_script_runtime/tests/events.rs:134`)
-- `event_view_changes_grid_image_video_and_audio_shares_video_context` (`src/app/operation_script_runtime/tests/events.rs:151`)
-- `event_r11_container_is_item_only_for_folders_pdf_epub_nested_and_converted_zip` (`src/app/operation_script_runtime/tests/events.rs:178`)
-- `event_nonviewer_row_variants_have_no_fabricated_book_container` (`src/app/operation_script_runtime/tests/events.rs:284`)
-- `event_r11_open_ignores_zip_subfolders_and_pending_source_but_follows_item_containers` (`src/app/operation_script_runtime/tests/events.rs:333`)
-- `event_nested_container_appends_literal_entry_without_host_path_replacement` (`src/app/operation_script_runtime/tests/events.rs:382`)
-- `event_and_slot_invocations_publish_the_same_item_container_book_path` (`src/app/operation_script_runtime/tests/events.rs:415`)
-- `event_r11_pdf_pages_halves_and_unit_scalars_fire_but_reader_order_does_not` (`src/app/operation_script_runtime/tests/events.rs:445`)
-- `event_composition_strong_arc_memo_semantics_and_equal_republication` (`src/app/operation_script_runtime/tests/events.rs:498`)
-- `event_runtime_grid_executes_before_keys_once_and_inputs_still_change_next_frame` (`src/app/operation_script_runtime/tests/events.rs:581`)
-- `event_grid_actual_key_slot_navigation_is_observed_only_next_frame` (`src/app/operation_script_runtime/tests/events.rs:611`)
-- `event_runtime_rejects_entire_mixed_batch_and_never_publishes_success_notice` (`src/app/operation_script_runtime/tests/events.rs:659`)
-- `event_runtime_rate_limit_drops_batches_notifies_once_and_does_not_replay` (`src/app/operation_script_runtime/tests/events.rs:680`)
-- `event_detection_cache_misses_do_not_read_rating_or_tag_databases` (`src/app/operation_script_runtime/tests/events.rs:729`)
-- `event_limit_is_rolling_ten_attempts_and_notification_is_lifetime_once` (`src/app/operation_script_runtime/tests/events.rs:742`)
-- `event_rate_drop_advances_baseline_and_never_queues_a_late_replay` (`src/app/operation_script_runtime/tests/events.rs:780`)
-- `event_detection_off_absent_loading_and_failed_do_not_claim_the_frame` (`src/app/operation_script_runtime/tests/events.rs:814`)
-- `event_detection_mounted_context_and_linked_detached_skip_without_touching_main_owner` (`src/app/operation_script_runtime/tests/events.rs:839`)
-- `event_detection_linked_f12_and_transition_skip_viewer_but_main_list_continues` (`src/app/operation_script_runtime/tests/events.rs:873`)
-- `event_detection_edit_and_page_overview_coalesce_after_exit` (`src/app/operation_script_runtime/tests/events.rs:901`)
-- `event_detection_native_overlay_uses_existing_snapshot_and_does_not_claim_blocked_frame` (`src/app/operation_script_runtime/tests/events.rs:955`)
-- `event_native_poll_video_hook_executes_and_overlay_snapshot_blocks_before_evaluation` (`src/app/operation_script_runtime/tests/events.rs:976`)
-- `event_safe_grid_actions_preserve_all_four_identity_components_even_from_details` (`src/app/operation_script_runtime/tests/events.rs:1007`)
-- `event_safe_video_actions_preserve_all_four_identity_components_for_native_and_music` (`src/app/operation_script_runtime/tests/events.rs:1043`)
+- `event_r11_faces_reentry_and_select_baseline_survive_viewer_in_observe_and_finish` (`src/app/operation_script_runtime/tests/events.rs:88`)
+- `event_initial_empty_grid_has_only_view_and_location_changes_do_not_select` (`src/app/operation_script_runtime/tests/events.rs:142`)
+- `event_view_changes_grid_image_video_and_audio_shares_video_context` (`src/app/operation_script_runtime/tests/events.rs:159`)
+- `event_r11_container_is_item_only_for_folders_pdf_epub_nested_and_converted_zip` (`src/app/operation_script_runtime/tests/events.rs:186`)
+- `event_nonviewer_row_variants_have_no_fabricated_book_container` (`src/app/operation_script_runtime/tests/events.rs:292`)
+- `event_r11_open_ignores_zip_subfolders_and_pending_source_but_follows_item_containers` (`src/app/operation_script_runtime/tests/events.rs:341`)
+- `event_nested_container_appends_literal_entry_without_host_path_replacement` (`src/app/operation_script_runtime/tests/events.rs:390`)
+- `event_and_slot_invocations_publish_the_same_item_container_book_path` (`src/app/operation_script_runtime/tests/events.rs:423`)
+- `event_r11_pdf_pages_halves_and_unit_scalars_fire_but_reader_order_does_not` (`src/app/operation_script_runtime/tests/events.rs:453`)
+- `event_composition_strong_arc_memo_semantics_and_equal_republication` (`src/app/operation_script_runtime/tests/events.rs:506`)
+- `event_runtime_grid_executes_before_keys_once_and_inputs_still_change_next_frame` (`src/app/operation_script_runtime/tests/events.rs:589`)
+- `event_grid_actual_key_slot_navigation_is_observed_only_next_frame` (`src/app/operation_script_runtime/tests/events.rs:619`)
+- `event_runtime_rejects_entire_mixed_batch_and_never_publishes_success_notice` (`src/app/operation_script_runtime/tests/events.rs:667`)
+- `event_runtime_rate_limit_drops_batches_notifies_once_and_does_not_replay` (`src/app/operation_script_runtime/tests/events.rs:688`)
+- `event_detection_cache_misses_do_not_read_rating_or_tag_databases` (`src/app/operation_script_runtime/tests/events.rs:737`)
+- `event_limit_is_rolling_ten_attempts_and_notification_is_lifetime_once` (`src/app/operation_script_runtime/tests/events.rs:750`)
+- `event_rate_drop_advances_baseline_and_never_queues_a_late_replay` (`src/app/operation_script_runtime/tests/events.rs:788`)
+- `event_detection_off_absent_loading_and_failed_do_not_claim_the_frame` (`src/app/operation_script_runtime/tests/events.rs:822`)
+- `event_detection_mounted_context_and_linked_detached_skip_without_touching_main_owner` (`src/app/operation_script_runtime/tests/events.rs:847`)
+- `event_detection_linked_f12_and_transition_skip_viewer_but_main_list_continues` (`src/app/operation_script_runtime/tests/events.rs:881`)
+- `event_detection_edit_and_page_overview_coalesce_after_exit` (`src/app/operation_script_runtime/tests/events.rs:909`)
+- `event_detection_native_overlay_uses_existing_snapshot_and_does_not_claim_blocked_frame` (`src/app/operation_script_runtime/tests/events.rs:963`)
+- `event_native_poll_video_hook_executes_and_overlay_snapshot_blocks_before_evaluation` (`src/app/operation_script_runtime/tests/events.rs:984`)
+- `event_safe_grid_actions_preserve_all_four_identity_components_even_from_details` (`src/app/operation_script_runtime/tests/events.rs:1015`)
+- `event_safe_video_actions_preserve_all_four_identity_components_for_native_and_music` (`src/app/operation_script_runtime/tests/events.rs:1051`)
 
 `src/ui_fullscreen/operation_script_event_tests.rs`:
 
@@ -1551,9 +1551,9 @@ main一覧継続の回帰を残す。r11の独立設計合意の履歴は§3.3�
 - `operation_script_event_background_and_analysis_pixel_absorb_unresolved_anchor_synchronously` (`src/ui_fullscreen/operation_script_event_tests.rs:121`)
 - `operation_script_event_loading_cache_arrival_does_not_retrigger_safe_a` (`src/ui_fullscreen/operation_script_event_tests.rs:174`)
 - `operation_script_event_direction_fit_and_single_have_late_slice_counterexamples` (`src/ui_fullscreen/operation_script_event_tests.rs:201`)
-- `operation_script_event_embedded_detection_precedes_normal_key_and_slot_change_fires_next_frame` (`src/ui_fullscreen/operation_script_event_tests.rs:659`)
-- `operation_script_event_child_pass_uses_child_text_focus_and_root_frame_number` (`src/ui_fullscreen/operation_script_event_tests.rs:695`)
-- `operation_script_event_hook_is_before_forwarded_overview_and_normal_key_paths` (`src/ui_fullscreen/operation_script_event_tests.rs:760`)
+- `operation_script_event_embedded_detection_precedes_normal_key_and_slot_change_fires_next_frame` (`src/ui_fullscreen/operation_script_event_tests.rs:676`)
+- `operation_script_event_child_pass_uses_child_text_focus_and_root_frame_number` (`src/ui_fullscreen/operation_script_event_tests.rs:712`)
+- `operation_script_event_hook_is_before_forwarded_overview_and_normal_key_paths` (`src/ui_fullscreen/operation_script_event_tests.rs:777`)
 
 `src/ui_fullscreen/page_turn/slide_tests.rs`:
 
@@ -1631,7 +1631,7 @@ cargo build/test/check・実機・独立実装reviewは未実施。回帰の実�
 EventPermissionをForbidden / Synchronous / OpenOnlyの3種類へ統一し、従来のoperation_scriptのevent_allowed boolは撤去。
 同期可41操作の範囲は維持。ReadingDirectionToggle / FitModeCycleだけをOpenOnlyへ移し、見開き6はForbiddenのまま。
 検出側が確定したVecを保持し、ScriptInvocation::Eventのtyped sliceをvalidate_outputへ渡す。
-Rhaiへ渡すsnapshot.eventsは別の写しであり、s.events改変・戻り値のeventsフィールドから権限を得られない。
+Rhaiへ渡すsnapshot.eventsは別の写しであり、s変数の再代入・戻り値のeventsフィールドから権限を得られない。s.eventsへの直接代入は既存syntax検査がコンパイル時に拒否する。
 全件の検査が成功して初めて共用実行関数へ渡すので、Open無しのmixedは同期Aのprefixもsuffixも実行しない。
 Inputは従来の制約を維持し、イベント権限でキー起動を狭めない。実行済み操作を追う新状態や症状guardは足していない。
 
@@ -1668,8 +1668,43 @@ bare cargo fmt、UI glyph checker、git diff --checkはexit 0。UI文字列の�
 | `operation_script_event_open_only_late_page_can_run_synchronous_a_without_another_event` | `src/ui_fullscreen/operation_script_event_tests.rs:419` |
 | `operation_script_event_open_only_grid_reentry_allows_the_same_container_again` | `src/ui_fullscreen/operation_script_event_tests.rs:463` |
 | `operation_script_event_open_only_container_change_accepts_open_page_without_view` | `src/ui_fullscreen/operation_script_event_tests.rs:512` |
-| `operation_script_event_open_only_unknown_dimensions_coalesce_page_without_another_open` | `src/ui_fullscreen/operation_script_event_tests.rs:557` |
-| `operation_script_event_open_only_detection_pause_resumes_with_page_without_open` | `src/ui_fullscreen/operation_script_event_tests.rs:613` |
+| `operation_script_event_open_only_unknown_dimensions_coalesce_page_without_another_open` | `src/ui_fullscreen/operation_script_event_tests.rs:574` |
+| `operation_script_event_open_only_detection_pause_resumes_with_page_without_open` | `src/ui_fullscreen/operation_script_event_tests.rs:630` |
 
 ClaudeCodeへの検証filterは`operation_script`（変更moduleの既存contract/loader/runtime/画像実描画回帰を含む）。
 今回追加分だけを先に絞るなら`open_only`。既存slide/poll_video/ignored性能testの依頼は上の検証節を維持する。
+
+### 2026-11-26追記: r12の新規回帰4失敗への対応
+
+利用者から共有された修正前HEAD `9e8180f0f` のrun-heavy結果は5,122件中5,118成功・4失敗。
+失敗はすべて今回追加したテストで、次のテスト土台の誤りだった。修正後のRust再実行は行っていない。
+
+1. `event_open_only_cannot_forge_open_or_execute_a_mixed_prefix`:
+   `s.events = ...`は段1のsyntax検査で禁止されるため、イベント評価前のコンパイルで失敗した。
+   `src/operation_script/syntax.rs:36`はVariableそのものへの代入だけを許可する。
+   直接のプロパティ代入はコンパイル拒否される回帰を追加し、実行する偽造ケースは許可された`s = #{events:["open"]}`へ変更。
+   偽造した値を`if "open" in s.events`の判断と返却mapのeventsに使い、スクリプト内ではOpenと見えても、
+   元の検出集合で前後同期Aを含むmixedが全件拒否される意味を維持した。
+2. `operation_script_event_open_only_split_rotation_reconciles_once_then_rejects_page` /
+   `operation_script_event_open_only_late_page_can_run_synchronous_a_without_another_event`:
+   最小Rhai engineにArray同士の等価比較は無い（`src/operation_script/engine.rs:471`の既存回帰）。
+   r12新規テストの同型表現3箇所を棚卸しし、登録済みlen（`:118`）と各要素の文字列比較へ変更。
+   Pageだけ、またはOpen→Pageの2要素だけという検査は維持した。
+3. `operation_script_event_open_only_container_change_accepts_open_page_without_view`:
+   初回描画後に同idx0/同items世代の項目だけを差し替えたため、古いfinal_compositeのitem_idと食い違った。
+   これは製品の移動による不具合ではなく、採用ownerを飛ばしたfixtureの誤り。
+   `src/app.rs:22647` / `:22661`の照合と`:23085` / `:23101`の報告・assertが正しく検知した。
+   製品の列交換はinstall_new_items_inner（`:46649`）でitems採用（`:46669`）と世代bump（`:46685`）を通す。
+   fixtureは初回描画前に未描画item1を別親folderの画像として準備し、以後は既存
+   `handle_fs_navigation_with_operation`（`src/ui_fullscreen.rs:46494`）のTarget(1)でidx0から実移動する。
+   製品経路はTarget分岐（`:47050`）→着地（`:47132` / `:26805`）→open受付（`:45391`）。
+   初回seed前の型変更は既存fixture（`:102504`）、同handlerの使用は既存slide_testsにもある。
+   世代の場当たりbump・cache clear・assert弱化は行わず、Open+Pageのみ・操作許可・次frameで再発火無しの検査を保持した。
+
+今回の編集はruntime tests/events.rs、ui_fullscreen/operation_script_event_tests.rs、本書の3ファイルだけ。
+製品コード・detached経路・検出/入力順は変更していない。再検証filterは`open_only`、変更moduleの既存回帰を含める場合は`operation_script`。
+UI文字列の変更は無いためglyph checkerは再実行しない。Rust build/test/check・アプリ起動・commit・独立実装reviewは未実施。
+
+変更file:lineは`src/app/operation_script_runtime/tests/events.rs:24`（禁止syntax拒否）/ `:49`（変数再代入で偽装し判断）、
+`src/ui_fullscreen/operation_script_event_tests.rs:316` / `:430`（Pageだけの比較）、`:522`（初回描画前の準備）/ `:531`（Open+Pageだけの比較）/ `:540`（実移動）、本追記。
+bare `cargo fmt`と`git diff --check`はexit 0。Rustでの修正確認はClaudeCodeの再実行待ち。

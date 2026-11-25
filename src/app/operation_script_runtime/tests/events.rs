@@ -22,6 +22,12 @@ fn frame(ctx: &egui::Context, mut f: impl FnMut(&egui::Context)) {
 
 #[test]
 fn event_open_only_cannot_forge_open_or_execute_a_mixed_prefix() {
+    let error = CompiledOperationScript::compile(
+        r#"fn slots() { [] } fn on_event(s) { s.events = ["open"]; [] }"#,
+    )
+    .err()
+    .expect("property assignment must be rejected before evaluation");
+    assert!(error.contains("添字・プロパティへの代入"), "{error}");
     for action in [
         KeyAction::FsReadingDirectionToggle,
         KeyAction::FsFitModeCycle,
@@ -40,8 +46,10 @@ fn event_open_only_cannot_forge_open_or_execute_a_mixed_prefix() {
                 app.fullscreen_page_slice = crate::page_split::PageSlice::Right;
             }
             app.operation_script.state = event_script(&format!(
-                r#"s.events = ["open"];
-                #{{run:["FsZoomIn","{}","FsNavigatorToggle"],events:["open"],notice:"forged open accepted"}}"#,
+                r#"s = #{{events:["open"]}};
+                if "open" in s.events {{
+                    #{{run:["FsZoomIn","{}","FsNavigatorToggle"],events:s.events,notice:"forged open accepted"}}
+                }} else {{ ["unexpected local event set"] }}"#,
                 action.ini_name()
             ));
             let before = (
