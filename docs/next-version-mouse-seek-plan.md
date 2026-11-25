@@ -428,7 +428,8 @@ browser `WM_KEYDOWN` と queue の WM_APPCOMMAND を数え、queue を通らな�
 ### 9.3 確認
 
 - handler-level test は本物の presenter WndProc (既存の hidden production HWND fixture) を
-  SendMessage / PostMessage で駆動し、event sink に届いた action 件数を固定する。旧コードで落ちること:
+  SendMessage / PostMessage で駆動し、event sink に届く KeyDown の件数を固定する (App の dispatcher は通さないので、最終 action の
+  回数は実機確認で見る)。旧コードで落ちること:
   同じ方向の browser KEYDOWN の後に、ポンプの Peek / Translate frame の中で同スレッドから届いた
   `FAPPCOMMAND_KEY` WM_APPCOMMAND は、旧 handler では 2 件、新 handler では 1 件。
 - 1 件のまま変わらないこと: 対になる press のない WM_APPCOMMAND、queued、同スレッド sent

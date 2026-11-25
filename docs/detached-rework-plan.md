@@ -1466,6 +1466,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   AppCommand だけを既存 press と組にして処理済みで返す。HUD と raw XButton の動作は維持する。
 - detached の述語・viewport・lifecycle・placement は変更しない。FIFO は既存 WindowState と同じ寿命を持つ。
   同スレッド hook と key-only producer の併用で残る場合は、§9.4 の利用者決定に従う。
+- 構造的な修正であることの合意: ClaudeCode (設計・検収) と Codex の独立レビュー (GPT-6.1 Sol / xhigh、
+  実装レビュー r8、df123c1bb) が、§9.4 の利用者決定の範囲で「共有 presenter WndProc を単一の入力所有境界とし、
+  HWND 寿命の FIFO と pump frame で重複を解く構造的修正であり、症状パッチではない」ことに合意した。
+  r6・r7 の設計レビューは、残る場合を理由にこの合意を出していなかった。
 
 ### 2026-11-25: 起動 resolver の main 走査の段階（§1.853、実装・検証待ち）
 
