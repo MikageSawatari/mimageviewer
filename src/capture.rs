@@ -265,9 +265,12 @@ pub fn reveal_path_async(path: PathBuf) {
         .spawn(move || {
             #[cfg(windows)]
             {
-                let arg = format!("/select,{}", path.display());
-                if let Err(err) = std::process::Command::new("explorer.exe").arg(arg).spawn() {
-                    crate::logger::log(format!("capture reveal failed: {}: {err}", path.display()));
+                if let Err(err) = reveal_path_in_shell(&path) {
+                    crate::logger::log(format!(
+                        "capture reveal failed: {}: HRESULT=0x{:08X}: {err}",
+                        path.display(),
+                        err.code().0
+                    ));
                     if let Some(parent) = path.parent() {
                         let _ = std::process::Command::new("explorer.exe")
                             .arg(parent)
@@ -281,6 +284,37 @@ pub fn reveal_path_async(path: PathBuf) {
             }
         })
         .ok();
+}
+
+#[cfg(windows)]
+fn reveal_path_wide(path: &Path) -> Vec<u16> {
+    crate::ui_dialogs::context_menu::native_path_text(path)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+fn reveal_path_in_shell(path: &Path) -> windows::core::Result<()> {
+    use windows::Win32::Foundation::E_FAIL;
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+    use windows::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
+    use windows::core::{Error, PCWSTR};
+
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok()?;
+    let wide = reveal_path_wide(path);
+    let pidl = unsafe { ILCreateFromPathW(PCWSTR(wide.as_ptr())) };
+    let result = if pidl.is_null() {
+        // This API returns no HRESULT; identify its null result explicitly.
+        Err(Error::new(E_FAIL, "ILCreateFromPathW returned null"))
+    } else {
+        // With no child list, the absolute PIDL names the item to select.
+        let result = unsafe { SHOpenFolderAndSelectItems(pidl, None, 0) };
+        unsafe { ILFree(Some(pidl)) };
+        result
+    };
+    unsafe { CoUninitialize() };
+    result
 }
 
 pub fn basename_for_path(path: &Path) -> String {
@@ -838,6 +872,14 @@ pub(crate) fn flatten_rgba_to_rgb(rgba: &[u8], width: u32, matte: JpegMatte) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn reveal_path_wide_normalizes_slashes_and_terminates_utf16() {
+        let wide = reveal_path_wide(Path::new("C:/画像/out/photo.jpg"));
+        let expected: Vec<u16> = "C:\\画像\\out\\photo.jpg\0".encode_utf16().collect();
+        assert_eq!(wide, expected);
+    }
 
     fn sample_rgba() -> Vec<u8> {
         vec![
