@@ -353,3 +353,71 @@ clear し、時間窓、detached 専用 guard、App-global fallback state を追
 親と独立 reviewer は着手前に、main / F12 の同じ bundle lifecycle へ入力 state を置く構造修正であり、
 §2 が禁じる症状パッチではないと合意した。完成範囲を `docs/detached-rework-plan.md` §11へ記録する。
 AHK / hook の未解決 producer 契約はこの state へ推測で合流させず、別の coherent stage とする。
+
+## 9. browser key と OS の APPCOMMAND の二重 (§1.864、2026-11-25)
+
+### 9.1 記録
+
+サブ PC2 の Claude が master 14a448b3a の build で記録した (`MIV_MOUSE_SEEK_DEBUG=1`、
+`scripts/diag-send-browser-back.ps1` の SendInput 5 回、前面は presenter)。1 回の送信ごとに presenter の
+同じ HWND へ次の 2 receipt が届き、各々が App で 1 回ずつ `apply_mouse_back_forward_button` を実行した
+(`[native-video-key]` seq 1〜10、行き先は既定割当のフォルダ履歴)。
+
+- scan 付き `WM_KEYDOWN` (vk 0xA6、scan 0x6A、extended)
+- `WM_APPCOMMAND` command 1、device `FAPPCOMMAND_KEY`、key state 0、`in_send_flags=0`、
+  `dispatching=false`、`outer=none` (`delivery=unknown`)
+
+APPCOMMAND は presenter のポンプの `DispatchMessageW` から配られておらず、別スレッドからの送信でもなく、
+presenter / HUD の WndProc の中で入れ子に起きたものでもない。すなわち USER32 / win32k がこのスレッドへ
+自分で配った message である。設計担当の単独窓の試験 (Python ctypes、全体への入力注入なし) では、
+`DefWindowProcW(WM_KEYDOWN/WM_KEYUP, VK_BROWSER_BACK)` の直接呼び出しも、同じ key message の
+`PostMessageW` + `TranslateMessage` + `DispatchMessageW` も、同期・非同期のどちらでも WM_APPCOMMAND を
+作らなかった。presenter は 2026-09 から browser `WM_KEYDOWN` を `DefWindowProcW` へ渡していないが、
+記録でも APPCOMMAND は届いている。したがってこの APPCOMMAND は、本物の入力の app-command key から
+OS が生成する写し (Microsoft の WM_APPCOMMAND の説明の「when the user types an application command key」) で
+あり、mIV の key 処理の戻り値では止められない。Mozilla の bug 865561 の trace でも、自動 repeat の
+`WM_KEYDOWN` ごとに WM_APPCOMMAND が 1 回ずつ対になる。§1 の AHK trace (111/111) と同じ形である。
+
+動画全画面で browser key の行き先がフォルダ履歴になるのは仕様どおり (keymap-spec の動画フルスクリーン
+「マウス戻る / 進む / ホイールクリック」: 新規環境と既定リセットは戻る / 進むがフォルダ履歴)。
+
+### 9.2 ownership の決定
+
+presenter では、**browser key の 1 押下は key message が持つ**。OS が key から作った写しの
+WM_APPCOMMAND は action にしない。写しの判定は時刻ではなく配送の出どころで行う:
+
+- command が 1 / 2、device が `FAPPCOMMAND_KEY`、かつ
+- `InSendMessageEx` の送信 flag なし (別スレッドからの送信でない)、追跡中の `DispatchMessageW` の
+  message でない (queue に post されたものでない)、presenter / HUD の WndProc の入れ子でない
+
+この 3 条件がそろう配送は、このスレッドの mIV のコードからは起きず、OS が配ったものに限られる。
+写しの WM_APPCOMMAND は従来どおり処理済み (TRUE) で返す。未処理で返すと OS が別の key message を
+足す実装がある (Mozilla 865561) ため、戻り値は変えない。
+
+次は従来どおり action にする (§3 の不変条件 3 を保つ):
+
+- queue に post された WM_APPCOMMAND (`delivery=queued`)、別スレッドからの送信 (`sent_cross_thread`)
+- device が `FAPPCOMMAND_MOUSE` / `FAPPCOMMAND_OEM` の WM_APPCOMMAND
+- 出どころを決められない配送 (入れ子など)。二重は残り得るが、取りこぼすより安全側として、
+  ログの `delivery=` で後から特定できる
+
+HUD は `WS_EX_NOACTIVATE` で keyboard focus を取らず key message を受けないので、OS の写しも届かない。
+HUD の WM_APPCOMMAND は従来どおり全部 action にする (HUD に写しの規則を当てると唯一の入口を失う)。
+
+この規則はメイン窓の現行の経路と同じ持ち主の決め方である。メイン窓の `WH_GETMESSAGE` hook は
+browser `WM_KEYDOWN` と queue の WM_APPCOMMAND を数え、OS が送った写しは queue を通らないので数えない。
+
+不採用: (a) 時間 debounce、scan 0 / device 0 の一律破棄 — §1 のとおり。
+(b) presenter で browser key message を捨て、WM_APPCOMMAND だけを入口にする — Windows 標準の
+ブラウザやエクスプローラに近い。だが、key message だけを送る producer を壊し、§3 の不変条件 3 に反する。
+(c) KEYDOWN と APPCOMMAND を順序で組にする — 写しが KEYDOWN の前後どちらにも来るため (98 / 13 組)、
+組の未成立を扱う状態と期限が要り、状態の組み合わせを増やす。
+
+### 9.3 確認
+
+- handler-level test: 旧コードで、写しの条件の WM_APPCOMMAND が action になることを確かめる。
+  新コードで action にならず、queued / cross-thread / mouse / OEM の WM_APPCOMMAND は従来どおり
+  1 回ずつ action になる。key message の press 1 回は action 1 回。
+- 実機: 同じ記録手順で、1 回の送信に `[native-video-key]` の action が 1 回だけになり、写しの receipt は
+  `delivery=os_key_echo` で action にならないこと。キーボードの Browser Back キーがあれば、その長押しでも
+  repeat ごとに 1 回であること。
