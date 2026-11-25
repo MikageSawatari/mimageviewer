@@ -551,6 +551,7 @@ mod tests {
 
     fn favorite(id: u128, path: &str, on: bool) -> FavoriteEntry {
         FavoriteEntry {
+            cover_auto_crop: Default::default(),
             id: Uuid::from_u128(id),
             name: format!("favorite-{id}"),
             path: path.into(),

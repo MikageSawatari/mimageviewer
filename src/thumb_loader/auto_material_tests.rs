@@ -107,12 +107,14 @@ fn auto_material_candidate(
     key: &str,
 ) -> Option<CachedPinnedFolderThumb> {
     let policy = crate::file_type_visibility::FileTypeVisibility::default();
+    let scope = crate::cover_auto_crop::CoverAutoCropScope::for_identity(Some(
+        crate::cover_auto_crop::AutoCropIdentity::new(crate::settings::ReadingDirection::Rtl),
+    ));
     let mut context = FolderResolveContext {
         cache_dir: cache,
         policy: &policy,
-        auto_cover_crop: Some(crate::cover_auto_crop::AutoCropIdentity::new(
-            crate::settings::ReadingDirection::Rtl,
-        )),
+        cover_auto_crop_scope: &scope,
+        direct_image_auto_crop: None,
         pin_db: None,
         cancel: None,
         catalogs: HashMap::new(),
@@ -457,6 +459,7 @@ fn auto_material_v4_source_rebuilds_v3_with_preexisting_saved_body_rotation() {
             binding: crate::settings::ReadingDirection::Rtl,
             folders: is_folder,
         }));
+        request.cover_auto_crop_scope = crate::cover_auto_crop::CoverAutoCropScope::for_identity(request.auto_cover_crop);
         let key = cache_key_for_request(&request).unwrap().into_owned();
         assert_eq!(key, format!("{base}|autocrop:{}:rtl", if is_folder { "v4f" } else { "v4" }));
         assert!(run_cover_crop_request(&mut request, &catalog, None)

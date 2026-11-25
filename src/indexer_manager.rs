@@ -1389,7 +1389,7 @@ mod tests {
                 (
                     "settings.db",
                     "CREATE TABLE settings_kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                     CREATE TABLE favorites(id BLOB PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, sort_index INTEGER NOT NULL, auto_index_structure INTEGER NOT NULL DEFAULT 0, auto_index_metadata INTEGER NOT NULL DEFAULT 0, auto_index_thumbs INTEGER NOT NULL DEFAULT 0, auto_index_similar INTEGER NOT NULL DEFAULT 0);
+                     CREATE TABLE favorites(id BLOB PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, sort_index INTEGER NOT NULL, auto_index_structure INTEGER NOT NULL DEFAULT 0, auto_index_metadata INTEGER NOT NULL DEFAULT 0, auto_index_thumbs INTEGER NOT NULL DEFAULT 0, auto_index_similar INTEGER NOT NULL DEFAULT 0, cover_auto_crop INTEGER NOT NULL DEFAULT 0);
                      INSERT INTO settings_kv VALUES('show_hidden_files','true');
                      INSERT INTO favorites(id,name,path,sort_index,auto_index_metadata) VALUES(x'00000000000000000000000000000001','User favorite','C:/User/Book',0,1);",
                 ),

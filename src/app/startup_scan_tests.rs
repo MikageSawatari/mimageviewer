@@ -453,7 +453,7 @@ fn start_policy_rescan(
 
 fn obsolete_scan_result(app: &App, target: &Path) -> StartupOpenPathResolveResult {
     let mut policy = app.folder_scan_policy();
-    policy.susie_extensions_generation = policy.susie_extensions_generation.wrapping_add(1);
+    policy.susie_pool_revision = policy.susie_pool_revision.wrapping_add(1);
     StartupOpenPathResolveResult {
         requested: target.to_path_buf(),
         resolved: Some(crate::folder_tree::OpenablePathResolution {

@@ -477,27 +477,78 @@ pub(crate) fn materialize_local_folder_listing_with_order_and_duration(
     settings: &crate::settings::Settings,
     request: crate::rating_sort::ListingOrderRequest,
     read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
+    read_duration: impl FnMut(
+        &std::path::Path,
+        crate::settings::ListingSortMetadata,
+    ) -> Option<crate::settings::ListingDuration>,
+) -> MaterializedFolderListing {
+    let fingerprint = scan
+        .page_count_facts
+        .as_ref()
+        .map_or(0, |facts| facts.fingerprint());
+    materialize_local_folder_listing_with_order_and_metadata(
+        path,
+        scan,
+        settings,
+        request,
+        read_rating,
+        read_duration,
+        fingerprint,
+        |_, _| None,
+    )
+}
+
+/// Materialization reads memory and worker facts only. Page-count memory must
+/// validate the display stamp and current recognition fingerprint.
+pub(crate) fn materialize_local_folder_listing_with_order_and_metadata(
+    path: &std::path::Path,
+    scan: ScannedDir,
+    settings: &crate::settings::Settings,
+    request: crate::rating_sort::ListingOrderRequest,
+    read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
     mut read_duration: impl FnMut(
         &std::path::Path,
         crate::settings::ListingSortMetadata,
     ) -> Option<crate::settings::ListingDuration>,
+    page_count_fingerprint: i64,
+    mut read_page_count: impl FnMut(&GridItem, (i64, i64)) -> Option<crate::settings::ListingPageCount>,
 ) -> MaterializedFolderListing {
     let mut scan = scan;
     let precise_stamps = std::mem::take(&mut scan.precise_stamps);
     project_scanned_directory(&mut scan, &settings.file_type_visibility);
     let duration_facts = scan.duration_facts;
+    let page_count_facts = scan
+        .page_count_facts
+        .filter(|facts| facts.fingerprint() == page_count_fingerprint);
     let mut auxiliary_media = scan.auxiliary_media;
     let mut omitted = scan.omitted;
     let mut folders = Vec::with_capacity(scan.folders.len());
     let mut metas = Vec::with_capacity(scan.folders.len());
     let mut sort_metas = Vec::with_capacity(scan.folders.len() + scan.all_media.len());
-    for entry in scan.folders {
+    let compiled = crate::books::is_direct_book_folder(&settings.books_root_path(), path);
+    let page_count_sort = !compiled
+        && matches!(request, crate::rating_sort::ListingOrderRequest::Standard(sort)
+            if sort.lazy_metric() == Some(crate::settings::LazyMetric::PageCount));
+    for mut entry in scan.folders {
+        entry.sort_meta.page_count = crate::settings::ListingPageCount::Missing;
+        if page_count_sort
+            && super::folder_scan::listing_page_count_path(&entry.item).is_some()
+            && let Some(stamp) = entry.display_meta
+        {
+            entry.sort_meta.page_count = read_page_count(&entry.item, stamp)
+                .filter(|value| *value != crate::settings::ListingPageCount::Missing)
+                .or_else(|| {
+                    page_count_facts
+                        .as_ref()?
+                        .page_count_for(&entry.item, stamp)
+                })
+                .unwrap_or(crate::settings::ListingPageCount::Missing);
+        }
         folders.push(entry.item);
         metas.push(entry.display_meta);
         sort_metas.push(entry.sort_meta);
     }
     let mut all_media = scan.all_media;
-    let compiled = crate::books::is_direct_book_folder(&settings.books_root_path(), path);
     if compiled {
         folders.clear();
         metas.clear();

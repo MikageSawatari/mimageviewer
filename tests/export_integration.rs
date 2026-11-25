@@ -894,7 +894,7 @@ fn batch_item(
 }
 
 #[test]
-fn batch_export_still_uses_the_shared_composite_writer() {
+fn batch_export_still_uses_the_shared_saved_edit_compositor() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source.png");
     let output = temp.path().join("output");
@@ -902,9 +902,12 @@ fn batch_export_still_uses_the_shared_composite_writer() {
 
     let pending = mimageviewer::export_batch::spawn_batch_export_worker(
         mimageviewer::export_batch::BatchExportRequest {
-            output_dir: output.clone(),
-            template: "<dirname>_<filename>".to_string(),
-            scale: ExportScale::Half,
+            options: mimageviewer::export_batch::BatchExportOptions::from_legacy(
+                output.clone(),
+                "<dirname>_<filename>".into(),
+                mimageviewer::capture::CaptureFormat::Png,
+                ExportScale::Half,
+            ),
             items: vec![
                 batch_item(&source, "page", mimageviewer::capture::CaptureFormat::Png),
                 batch_item(&source, "page", mimageviewer::capture::CaptureFormat::Png),
@@ -939,9 +942,12 @@ fn batch_export_keeps_going_after_a_missing_source() {
 
     let pending = mimageviewer::export_batch::spawn_batch_export_worker(
         mimageviewer::export_batch::BatchExportRequest {
-            output_dir: output.clone(),
-            template: "<filename>".to_string(),
-            scale: ExportScale::Full,
+            options: mimageviewer::export_batch::BatchExportOptions::from_legacy(
+                output.clone(),
+                "<filename>".into(),
+                mimageviewer::capture::CaptureFormat::Jpeg85,
+                ExportScale::Full,
+            ),
             items: vec![
                 batch_item(
                     &missing,

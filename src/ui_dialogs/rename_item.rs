@@ -188,13 +188,23 @@ impl App {
                     &outcome.new_path,
                 );
                 self.rewrite_page_edit_presence_for_rename(&outcome.target, &outcome.new_path);
+                let cache_pairs = crate::rename_key_migration::converted_archive_cache_pairs(
+                    &self.rename_migration_data_dir(),
+                    &outcome.target,
+                    &outcome.new_path,
+                    pending.collection_scope
+                        == crate::collection_store::CollectionSourceMigrationScope::Tree,
+                    &outcome.converted_archive_rels,
+                );
+                self.rewrite_converted_archive_presence(&cache_pairs);
                 self.remove_paths_from_smart_folder_snapshots(std::slice::from_ref(
                     &outcome.target,
                 ));
-                self.spawn_rename_key_migration(
+                self.spawn_rename_key_migration_with_converted_archives(
                     outcome.target.clone(),
                     outcome.new_path.clone(),
                     pending.collection_scope,
+                    outcome.converted_archive_rels,
                 );
                 let current_matches_parent = outcome.target.parent().is_some_and(|parent| {
                     self.current_folder
@@ -211,6 +221,9 @@ impl App {
                     self.pending_reload = true;
                 }
                 self.show_feedback_toast(rename_success_message(&outcome.new_path));
+                if outcome.converted_archive_enumeration_incomplete {
+                    self.show_feedback_warning("一部の設定を引き継げませんでした".to_owned());
+                }
             }
             Ok(Err(message)) => {
                 self.clear_rename_dialog_state();

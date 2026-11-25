@@ -13,7 +13,7 @@
 use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
 use image::{DynamicImage, RgbImage, RgbaImage};
 
-/// リサイズ品質。Triangle 相当 (`Bilinear`) と Lanczos3 の 2 択。
+/// リサイズ品質。既存の Bilinear / Lanczos3 のフィルタは変えない。
 ///
 /// - `Bilinear`: 2-tap 線形補間。GPU 上限クランプなど「縮小前提 & 速度優先」用。
 ///   image crate の `FilterType::Triangle` と同じフィルタ。
@@ -22,13 +22,17 @@ use image::{DynamicImage, RgbImage, RgbaImage};
 pub enum Quality {
     Bilinear,
     Lanczos3,
+    CatmullRom,
+    Nearest,
 }
 
-impl From<Quality> for FilterType {
-    fn from(q: Quality) -> FilterType {
+impl From<Quality> for ResizeAlg {
+    fn from(q: Quality) -> ResizeAlg {
         match q {
-            Quality::Bilinear => FilterType::Bilinear,
-            Quality::Lanczos3 => FilterType::Lanczos3,
+            Quality::Bilinear => ResizeAlg::Convolution(FilterType::Bilinear),
+            Quality::Lanczos3 => ResizeAlg::Convolution(FilterType::Lanczos3),
+            Quality::CatmullRom => ResizeAlg::Convolution(FilterType::CatmullRom),
+            Quality::Nearest => ResizeAlg::Nearest,
         }
     }
 }
@@ -37,7 +41,7 @@ impl From<Quality> for FilterType {
 pub fn resize_rgba8_exact(src: &RgbaImage, new_w: u32, new_h: u32, quality: Quality) -> RgbaImage {
     let mut dst = RgbaImage::new(new_w.max(1), new_h.max(1));
     let mut resizer = Resizer::new();
-    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(quality.into()));
+    let opts = ResizeOptions::new().resize_alg(quality.into());
     // src/dst とも `image` feature 経由で `IntoImageView`/`IntoImageViewMut`。
     // U8x4 はアルファプレマルしない (Convolution は独立 4 ch として扱う)。
     resizer
@@ -50,7 +54,7 @@ pub fn resize_rgba8_exact(src: &RgbaImage, new_w: u32, new_h: u32, quality: Qual
 pub fn resize_rgb8_exact(src: &RgbImage, new_w: u32, new_h: u32, quality: Quality) -> RgbImage {
     let mut dst = RgbImage::new(new_w.max(1), new_h.max(1));
     let mut resizer = Resizer::new();
-    let opts = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(quality.into()));
+    let opts = ResizeOptions::new().resize_alg(quality.into());
     resizer
         .resize(src, &mut dst, &opts)
         .expect("fast_image_resize: rgb8 resize must succeed for matching pixel types");
@@ -293,6 +297,42 @@ mod tests {
         let src = RgbImage::from_pixel(500, 300, image::Rgb([128, 64, 200]));
         let out = resize_rgb8_exact(&src, 100, 60, Quality::Lanczos3);
         assert_eq!(out.dimensions(), (100, 60));
+    }
+
+    #[test]
+    fn catmull_rom_and_nearest_resize_both_pixel_types() {
+        for quality in [Quality::CatmullRom, Quality::Nearest] {
+            let rgba = RgbaImage::from_pixel(9, 5, image::Rgba([80, 60, 40, 255]));
+            let rgb = RgbImage::from_pixel(9, 5, image::Rgb([80, 60, 40]));
+            let rgba = resize_rgba8_exact(&rgba, 3, 2, quality);
+            let rgb = resize_rgb8_exact(&rgb, 3, 2, quality);
+            assert_eq!(rgba.dimensions(), (3, 2));
+            assert_eq!(rgb.dimensions(), (3, 2));
+            assert!(rgba.pixels().all(|p| p.0 == [80, 60, 40, 255]));
+            assert!(rgb.pixels().all(|p| p.0 == [80, 60, 40]));
+        }
+    }
+
+    #[test]
+    fn nearest_keeps_source_colors_when_upscaling() {
+        let rgba = RgbaImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                image::Rgba([255, 0, 0, 255])
+            } else {
+                image::Rgba([0, 0, 255, 255])
+            }
+        });
+        let output = resize_rgba8_exact(&rgba, 8, 4, Quality::Nearest);
+        for (x, _, pixel) in output.enumerate_pixels() {
+            assert_eq!(
+                pixel.0,
+                if x < 4 {
+                    [255, 0, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                }
+            );
+        }
     }
 
     #[test]

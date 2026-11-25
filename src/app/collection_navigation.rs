@@ -1252,6 +1252,7 @@ impl App {
         password: Option<String>,
     ) -> Result<PhysicalHistoryPreflight, String> {
         let duration_wanted = self.listing_may_sort_by_duration();
+        let page_count_fingerprint = self.listing_page_count_facts_fingerprint();
         let duration_cache_dir = crate::catalog::default_cache_dir();
         let tree_options = crate::folder_tree::FolderTreeOptions::from_settings(&self.settings);
         let show_hidden_files = self.settings.show_hidden_files;
@@ -1314,7 +1315,7 @@ impl App {
                                 Some(worker_cancel.flag()),
                             )
                             .map(|mut scan| {
-                                super::folder_scan::collect_folder_duration_facts(&path, &mut scan, &duration_cache_dir, duration_wanted);
+                                super::folder_scan::collect_folder_listing_metadata_facts(&path, &mut scan, &duration_cache_dir, duration_wanted, page_count_fingerprint);
                                 PhysicalHistoryPreflightPayload::Folder(scan)
                             })
                             .map_err(|error| format!("フォルダを読み込めません: {error}"))
@@ -7002,7 +7003,7 @@ mod tests {
                 .map(|(key, source)| (key, source.into()))
                 .collect();
         let sources = prepared_thumbnail_sources(CollectionGridThumbnailSources {
-            auto_cover_crop: None,
+            cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope::for_identity(None),
             folder_pin_map: folder_pins.clone(),
             video_folder_pin_seeds: Arc::clone(&seeds),
             video_sidecars: std::collections::HashMap::from([(
@@ -7230,7 +7231,7 @@ mod tests {
             vec![7; MAX_RETAINED_COLLECTION_PIN_BLOB_BYTES + 1],
         )]));
         let delivery = prepared_thumbnail_sources(CollectionGridThumbnailSources {
-            auto_cover_crop: None,
+            cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope::for_identity(None),
             folder_pin_map: Default::default(),
             video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::new(),
@@ -7901,7 +7902,9 @@ mod tests {
             &app,
             &prepared,
             prepared_thumbnail_sources(CollectionGridThumbnailSources {
-                auto_cover_crop: None,
+                cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope::for_identity(
+                    None,
+                ),
                 folder_pin_map: Default::default(),
                 video_folder_pin_seeds: Default::default(),
                 video_sidecars: std::collections::HashMap::from([(
@@ -8174,7 +8177,7 @@ mod tests {
         );
         let prepared = prepare_snapshot(&added.snapshot);
         let sources_a = CollectionGridThumbnailSources {
-            auto_cover_crop: None,
+            cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope::for_identity(None),
             folder_pin_map: Default::default(),
             video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::from([(
@@ -8257,7 +8260,7 @@ mod tests {
 
         std::fs::write(&sidecar_a, b"same-path-sidecar-updated").unwrap();
         let sidecar_changed = CollectionGridThumbnailSources {
-            auto_cover_crop: None,
+            cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope::for_identity(None),
             folder_pin_map: Default::default(),
             video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::from([(
@@ -8292,7 +8295,7 @@ mod tests {
         assert_eq!(app.video_thumb_overrides.get("video-key"), Some(&sidecar_a));
 
         let pin_changed = CollectionGridThumbnailSources {
-            auto_cover_crop: None,
+            cover_auto_crop_scope: crate::cover_auto_crop::CoverAutoCropScope::for_identity(None),
             folder_pin_map: Default::default(),
             video_folder_pin_seeds: Default::default(),
             video_sidecars: std::collections::HashMap::from([(

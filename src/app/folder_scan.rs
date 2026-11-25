@@ -4,7 +4,7 @@ use crate::grid_item::GridItem;
 
 /// Memory-only snapshot shared by pane scans and startup resolution workers.
 /// Susie recognition remains live while scanning, so startup adoption must also
-/// compare its generation before/after scanning and against this snapshot.
+/// compare its revision before/after scanning and against this snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FolderScanPolicy {
     include_convertible_archives: bool,
@@ -12,14 +12,16 @@ pub(crate) struct FolderScanPolicy {
     show_hidden_files: bool,
     file_type_visibility: crate::file_type_visibility::FileTypeVisibility,
     duration_wanted: bool,
+    page_count_fingerprint: Option<i64>,
     duration_cache_dir: PathBuf,
-    pub(crate) susie_extensions_generation: u64,
+    pub(crate) susie_pool_revision: u64,
 }
 
 impl FolderScanPolicy {
     pub(crate) fn capture(
         settings: &crate::settings::Settings,
         duration_wanted: bool,
+        page_count_fingerprint: Option<i64>,
         duration_cache_dir: PathBuf,
     ) -> Self {
         Self {
@@ -28,12 +30,13 @@ impl FolderScanPolicy {
             show_hidden_files: settings.show_hidden_files,
             file_type_visibility: settings.file_type_visibility.clone(),
             duration_wanted,
+            page_count_fingerprint,
             duration_cache_dir,
-            susie_extensions_generation: crate::susie_loader::extensions_generation(),
+            susie_pool_revision: crate::susie_loader::pool_revision(),
         }
     }
 
-    /// Worker-only: directory metadata and optional read-only duration catalog.
+    /// Worker-only: directory metadata and optional read-only listing metadata catalog.
     pub(crate) fn scan(
         &self,
         path: &std::path::Path,
@@ -53,11 +56,12 @@ impl FolderScanPolicy {
             &self.file_type_visibility,
             cancel,
         )?;
-        collect_folder_duration_facts(
+        collect_folder_listing_metadata_facts(
             path,
             &mut scan,
             &self.duration_cache_dir,
             self.duration_wanted,
+            self.page_count_fingerprint,
         );
         Ok(scan)
     }
@@ -70,15 +74,22 @@ mod folder_scan_policy_tests {
     #[test]
     fn section1853_policy_snapshot_tracks_all_scan_inputs() {
         let mut settings = crate::settings::Settings::default();
-        let policy = FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-a"));
+        let policy = FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-a"));
         assert_eq!(
             policy,
-            FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-a"))
+            FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-a"))
+        );
+        let with_pages =
+            FolderScanPolicy::capture(&settings, false, Some(883), PathBuf::from("cache-a"));
+        assert_ne!(policy, with_pages);
+        assert_ne!(
+            with_pages,
+            FolderScanPolicy::capture(&settings, false, Some(884), PathBuf::from("cache-a"))
         );
         settings.show_hidden_files = !settings.show_hidden_files;
         assert_ne!(
             policy,
-            FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-a"))
+            FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-a"))
         );
         // The snapshot owns its visibility set rather than sharing later edits.
         settings
@@ -91,32 +102,81 @@ mod folder_scan_policy_tests {
                 .excluded_extensions
                 .contains("jpg")
         );
-        let captured = FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-a"));
+        let captured = FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-a"));
         settings.show_hidden_files = !settings.show_hidden_files;
         settings.file_type_visibility.excluded_extensions.clear();
         assert_ne!(captured, policy);
         assert_ne!(
             policy,
-            FolderScanPolicy::capture(&settings, true, PathBuf::from("cache-a"))
+            FolderScanPolicy::capture(&settings, true, None, PathBuf::from("cache-a"))
         );
         assert_ne!(
             policy,
-            FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-b"))
+            FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-b"))
         );
         settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ignore;
         assert_ne!(
             policy,
-            FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-a"))
+            FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-a"))
         );
         settings.archive_file_handling = crate::settings::ArchiveFileHandling::Ask;
         settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
         assert_ne!(
             policy,
-            FolderScanPolicy::capture(&settings, false, PathBuf::from("cache-a"))
+            FolderScanPolicy::capture(&settings, false, None, PathBuf::from("cache-a"))
         );
         let mut changed = policy.clone();
-        changed.susie_extensions_generation = changed.susie_extensions_generation.wrapping_add(1);
+        changed.susie_pool_revision = changed.susie_pool_revision.wrapping_add(1);
         assert_ne!(changed, policy);
+    }
+
+    #[test]
+    fn section1853_policy_scan_collects_page_count_facts_with_captured_fingerprint() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("books");
+        let images = root.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::write(images.join("one.jpg"), b"fixture").unwrap();
+        let settings = crate::settings::Settings::default();
+        let cache = temp.path().join("cache");
+        let policy = FolderScanPolicy::capture(&settings, false, None, cache.clone());
+        let scan = policy.scan(&root, None).unwrap();
+        let item = GridItem::Folder(images);
+        let stamp = scan
+            .folders
+            .iter()
+            .find(|entry| entry.item == item)
+            .unwrap()
+            .display_meta
+            .unwrap();
+        assert!(scan.page_count_facts.is_none());
+        let writer = crate::catalog::CatalogDb::open(&cache, &root).unwrap();
+        writer
+            .set_container_page_meta(
+                "images",
+                crate::catalog::ContainerPageKind::Folder,
+                stamp.0,
+                stamp.1,
+                883,
+                Some(1),
+            )
+            .unwrap();
+        drop(writer);
+        // The worker uses the captured request identity, including stale values.
+        // Materialization rejects a row whose fingerprint does not match it.
+        for fingerprint in [883, 884] {
+            let policy =
+                FolderScanPolicy::capture(&settings, false, Some(fingerprint), cache.clone());
+            let scan = policy.scan(&root, None).unwrap();
+            assert!(scan.duration_facts.is_none());
+            let facts = scan.page_count_facts.unwrap();
+            assert_eq!(facts.fingerprint(), fingerprint);
+            assert_eq!(
+                facts.page_count_for(&item, stamp),
+                (fingerprint == 883).then_some(crate::settings::ListingPageCount::Known(1))
+            );
+        }
+        assert!(policy.scan(&root, None).unwrap().page_count_facts.is_none());
     }
 
     #[test]
@@ -135,7 +195,7 @@ mod folder_scan_policy_tests {
             .excluded_extensions
             .insert("png".into());
         let cache = temp.path().join("no-catalog-created");
-        let policy = FolderScanPolicy::capture(&settings, false, cache.clone());
+        let policy = FolderScanPolicy::capture(&settings, false, None, cache.clone());
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let scan = policy.scan(temp.path(), Some(&cancel)).unwrap();
         assert_eq!(scan.all_media.len(), 1);
@@ -660,6 +720,7 @@ pub(crate) fn is_system_metadata_name(name: &str) -> bool {
 pub(crate) struct ScannedDir {
     /// Worker-only, read-only catalog snapshot. Synchronous UI scans leave this absent.
     pub(crate) duration_facts: Option<FolderDurationFacts>,
+    pub(crate) page_count_facts: Option<FolderPageCountFacts>,
     pub(crate) precise_stamps: std::collections::HashMap<u64, Option<(std::time::SystemTime, u64)>>,
     pub(crate) reconcile: Option<FolderScanReconcile>,
     pub(crate) complete_audio_inventory: Option<std::collections::HashSet<String>>,
@@ -680,6 +741,84 @@ pub(crate) struct ScannedDir {
 /// normalized physical path plus the exact source stamp; unknown sizes never match.
 pub(crate) type FolderDurationSnapshot =
     std::collections::HashMap<(String, i64, i64), crate::settings::ListingDuration>;
+
+pub(crate) type FolderPageCountSnapshot =
+    std::collections::HashMap<(String, i64, i64), crate::settings::ListingPageCount>;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FolderListingMetadataSnapshot {
+    pub(crate) duration: FolderDurationSnapshot,
+    pub(crate) page_count: FolderPageCountSnapshot,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FolderPageCountFacts {
+    fingerprint: i64,
+    containers: std::collections::HashMap<(String, i64), crate::catalog::ContainerPageCountFact>,
+    pdfs: std::collections::HashMap<String, crate::catalog::PdfPageCountFact>,
+}
+
+/// Only physical book rows can supply lazy page counts. EPUB is memory-only.
+pub(crate) fn listing_page_count_path(item: &GridItem) -> Option<&std::path::Path> {
+    match item {
+        GridItem::Folder(path) | GridItem::ZipFile(path) | GridItem::PdfFile(path) => Some(path),
+        GridItem::ConvertibleArchive {
+            path,
+            format: crate::archive_converter::ArchiveFormat::Rar,
+        } => Some(path),
+        _ => None,
+    }
+}
+
+impl FolderPageCountFacts {
+    pub(crate) fn fingerprint(&self) -> i64 {
+        self.fingerprint
+    }
+
+    pub(crate) fn page_count_for(
+        &self,
+        item: &GridItem,
+        stamp: (i64, i64),
+    ) -> Option<crate::settings::ListingPageCount> {
+        use crate::catalog::ContainerPageKind;
+        use crate::settings::ListingPageCount;
+        let path = listing_page_count_path(item)?;
+        let name = path.file_name()?.to_str()?;
+        let count = match item {
+            GridItem::PdfFile(_) => {
+                if path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+                {
+                    return None;
+                }
+                let row = self.pdfs.get(name)?;
+                if row.password_required || (row.mtime, row.file_size) != stamp {
+                    return None;
+                }
+                Some(row.page_count)
+            }
+            _ => {
+                let kind = match item {
+                    GridItem::Folder(_) => ContainerPageKind::Folder,
+                    GridItem::ZipFile(_) => ContainerPageKind::Zip,
+                    GridItem::ConvertibleArchive { .. } => ContainerPageKind::Archive,
+                    _ => return None,
+                };
+                let row = self.containers.get(&(name.to_owned(), kind as i64))?;
+                if (row.mtime, row.file_size) != stamp || row.fingerprint != self.fingerprint {
+                    return None;
+                }
+                row.page_count
+            }
+        };
+        Some(match count {
+            Some(count) if count > 0 => ListingPageCount::Known(count),
+            _ => ListingPageCount::Unavailable,
+        })
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct FolderDurationFacts {
@@ -706,51 +845,137 @@ impl FolderDurationFacts {
 }
 
 /// Only call from a scan worker. Ordinary scans incur no additional catalog I/O.
+#[cfg(test)]
 pub(crate) fn collect_folder_duration_facts(
     path: &std::path::Path,
     scan: &mut ScannedDir,
     cache_dir: &std::path::Path,
     wanted: bool,
 ) {
+    collect_folder_listing_metadata_facts(path, scan, cache_dir, wanted, None);
+}
+
+/// Only scan workers call this; both lazy metrics share one read-only open.
+pub(crate) fn collect_folder_listing_metadata_facts(
+    path: &std::path::Path,
+    scan: &mut ScannedDir,
+    cache_dir: &std::path::Path,
+    duration_wanted: bool,
+    page_count_fingerprint: Option<i64>,
+) {
+    collect_folder_listing_metadata_facts_with_open(
+        scan,
+        duration_wanted,
+        page_count_fingerprint,
+        || crate::catalog::CatalogDb::open_existing_read_only(cache_dir, path),
+    );
+}
+
+fn collect_folder_listing_metadata_facts_with_open(
+    scan: &mut ScannedDir,
+    duration_wanted: bool,
+    page_count_fingerprint: Option<i64>,
+    open_catalog: impl FnOnce() -> rusqlite::Result<Option<crate::catalog::CatalogDb>>,
+) {
     scan.duration_facts = None;
-    if !wanted
-        || !scan
+    scan.page_count_facts = None;
+    let duration_wanted = duration_wanted
+        && scan
             .all_media
             .iter()
-            .any(|entry| matches!(entry.kind, ScanMediaKind::Video | ScanMediaKind::Audio))
-    {
+            .any(|entry| matches!(entry.kind, ScanMediaKind::Video | ScanMediaKind::Audio));
+    let page_count_fingerprint = page_count_fingerprint.filter(|_| {
+        scan.folders
+            .iter()
+            .any(|entry| listing_page_count_path(&entry.item).is_some())
+    });
+    if !duration_wanted && page_count_fingerprint.is_none() {
         return;
     }
     let started = std::time::Instant::now();
-    let result = crate::catalog::CatalogDb::open_existing_read_only(cache_dir, path)
-        .and_then(|db| db.map(|db| db.load_video_duration_facts()).transpose());
-    let (rows, failed) = match result {
-        Ok(rows) => (rows.unwrap_or_default(), false),
-        Err(error) => {
-            log::warn!("Folder duration catalog read failed: {error}");
-            (Vec::new(), true)
-        }
-    };
-    crate::perf::event(
-        "folder_scan",
-        "duration_facts",
-        None,
-        0,
-        &[
-            ("rows", serde_json::Value::from(rows.len())),
-            (
-                "ms",
-                serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
-            ),
-            ("failed", serde_json::Value::from(failed)),
-        ],
-    );
-    scan.duration_facts = Some(FolderDurationFacts {
-        rows: rows
-            .into_iter()
-            .map(|row| (row.filename.clone(), row))
-            .collect(),
-    });
+    let catalog = open_catalog();
+    if duration_wanted {
+        let result = match &catalog {
+            Ok(Some(db)) => db
+                .load_video_duration_facts()
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        };
+        let (rows, failed) = match result {
+            Ok(rows) => (rows.unwrap_or_default(), false),
+            Err(error) => {
+                log::warn!("Folder duration catalog read failed: {error}");
+                (Vec::new(), true)
+            }
+        };
+        crate::perf::event(
+            "folder_scan",
+            "duration_facts",
+            None,
+            0,
+            &[
+                ("rows", serde_json::Value::from(rows.len())),
+                (
+                    "ms",
+                    serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                ),
+                ("failed", serde_json::Value::from(failed)),
+            ],
+        );
+        scan.duration_facts = Some(FolderDurationFacts {
+            rows: rows
+                .into_iter()
+                .map(|row| (row.filename.clone(), row))
+                .collect(),
+        });
+    }
+    if let Some(fingerprint) = page_count_fingerprint {
+        let result = match &catalog {
+            Ok(Some(db)) => db
+                .load_listing_page_count_facts()
+                .map(Some)
+                .map_err(|error| error.to_string()),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error.to_string()),
+        };
+        let ((containers, pdfs), failed) = match result {
+            Ok(rows) => (rows.unwrap_or_default(), false),
+            Err(error) => {
+                log::warn!("Folder page-count catalog read failed: {error}");
+                (Default::default(), true)
+            }
+        };
+        crate::perf::event(
+            "listing",
+            "page_count_facts",
+            None,
+            0,
+            &[
+                (
+                    "rows",
+                    serde_json::Value::from(containers.len() + pdfs.len()),
+                ),
+                (
+                    "ms",
+                    serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+                ),
+                ("failed", serde_json::Value::from(failed)),
+            ],
+        );
+        scan.page_count_facts = Some(FolderPageCountFacts {
+            fingerprint,
+            containers: containers
+                .into_iter()
+                .map(|row| ((row.filename.clone(), row.kind), row))
+                .collect(),
+            pdfs: pdfs
+                .into_iter()
+                .map(|row| (row.filename.clone(), row))
+                .collect(),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -772,6 +997,7 @@ mod duration_tests {
     fn scan() -> ScannedDir {
         ScannedDir {
             duration_facts: None,
+            page_count_facts: None,
             precise_stamps: Default::default(),
             reconcile: None,
             complete_audio_inventory: None,
@@ -1164,6 +1390,7 @@ pub(crate) fn discover_aggregate_video_sidecars_while(
 pub(crate) use super::book_materialization::{
     materialize_local_folder_listing, materialize_local_folder_listing_with_order,
     materialize_local_folder_listing_with_order_and_duration,
+    materialize_local_folder_listing_with_order_and_metadata,
 };
 
 #[derive(Clone, Debug)]
@@ -1175,6 +1402,7 @@ pub(crate) struct ImageFolderPageCountOptions {
     pub(crate) skip_duplicate_images: bool,
     pub(crate) image_ext_priority: Vec<String>,
     pub(crate) fingerprint: i64,
+    pub(crate) pool_revision: u64,
 }
 
 pub(crate) fn image_folder_page_count_options(
@@ -1183,6 +1411,7 @@ pub(crate) fn image_folder_page_count_options(
     // Page-count metadata is independent of auto-opening image-only folders.
     // Even when auto-open is disabled, image-only child folders should expose
     // the same background-loaded page count as ZIP and PDF containers.
+    let (pool, pool_revision) = crate::susie_loader::pool_snapshot();
     ImageFolderPageCountOptions {
         file_type_visibility: settings.file_type_visibility.clone(),
         include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
@@ -1190,7 +1419,12 @@ pub(crate) fn image_folder_page_count_options(
         show_hidden_files: settings.show_hidden_files,
         skip_duplicate_images: settings.skip_duplicate_images,
         image_ext_priority: settings.image_ext_priority.clone(),
-        fingerprint: image_page_recognition_fingerprint(settings),
+        fingerprint: image_page_recognition_fingerprint_with_pool(
+            settings,
+            crate::folder_tree::SUPPORTED_EXTENSIONS,
+            pool.as_deref(),
+        ),
+        pool_revision,
     }
 }
 
@@ -1207,6 +1441,15 @@ pub(crate) fn image_page_recognition_fingerprint(settings: &crate::settings::Set
 fn image_page_recognition_fingerprint_with_native_extensions(
     settings: &crate::settings::Settings,
     native_extensions: &[&str],
+) -> i64 {
+    let (pool, _) = crate::susie_loader::pool_snapshot();
+    image_page_recognition_fingerprint_with_pool(settings, native_extensions, pool.as_deref())
+}
+
+fn image_page_recognition_fingerprint_with_pool(
+    settings: &crate::settings::Settings,
+    native_extensions: &[&str],
+    pool: Option<&crate::susie_loader::SusieWorkerPool>,
 ) -> i64 {
     // 永続 cache 用の決定的 FNV-1a。拡張子以外の判定規則を変えたときは version bytes を上げる。
     let mut hash = 0xcbf29ce484222325u64;
@@ -1241,7 +1484,7 @@ fn image_page_recognition_fingerprint_with_native_extensions(
         mix(extension.as_bytes());
         mix(&[0]);
     }
-    if let Some(pool) = crate::susie_loader::try_get_pool() {
+    if let Some(pool) = pool {
         for extension in pool.extensions() {
             mix(extension.as_bytes());
             mix(&[0]);
@@ -1252,10 +1495,25 @@ fn image_page_recognition_fingerprint_with_native_extensions(
 
 /// 通常フォルダを実際の一覧走査と同じ規則で分類し、本扱いなら表示ページ数を返す。
 /// `Ok(None)` は走査成功だが画像だけの本ではない、`Err` は走査自体の失敗。
+#[cfg(test)]
 pub(crate) fn image_folder_page_count(
     path: &std::path::Path,
     options: &ImageFolderPageCountOptions,
 ) -> std::io::Result<Option<u32>> {
+    image_folder_page_count_with_cancel(path, options, None)
+}
+
+pub(crate) fn image_folder_page_count_with_cancel(
+    path: &std::path::Path,
+    options: &ImageFolderPageCountOptions,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> std::io::Result<Option<u32>> {
+    if cancel.is_some_and(|token| token.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "page count cancelled",
+        ));
+    }
     // ページ数取得では走査失敗を空フォルダとして cache できないため Result を維持する。
     // 取得済み ReadDir をそのまま共通分類へ渡し、同じディレクトリを二度開かない。
     let entries = std::fs::read_dir(path)?;
@@ -1265,7 +1523,7 @@ pub(crate) fn image_folder_page_count(
         options.include_epub,
         options.show_hidden_files,
         &options.file_type_visibility,
-        None,
+        cancel,
     )?;
     project_scanned_directory(&mut scan, &options.file_type_visibility);
     if !is_image_only_book_contents(!scan.folders.is_empty(), &scan.all_media) {
@@ -1311,6 +1569,7 @@ pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     scan_directory_with_convertible_archives(path, true, true, false).unwrap_or_else(|_| {
         ScannedDir {
             duration_facts: None,
+            page_count_facts: None,
             precise_stamps: Default::default(),
             reconcile: None,
             complete_audio_inventory: None,
@@ -1662,6 +1921,7 @@ where
         AuxiliaryMediaCandidates::capture(&all_media, policy, &entry_file_names_ci);
     let mut scan = ScannedDir {
         duration_facts: None,
+        page_count_facts: None,
         precise_stamps,
         reconcile: None,
         complete_audio_inventory,
@@ -2259,6 +2519,7 @@ impl ScannedDir {
     pub(crate) fn clone_for_projection(&self) -> Self {
         Self {
             duration_facts: self.duration_facts.clone(),
+            page_count_facts: self.page_count_facts.clone(),
             precise_stamps: self.precise_stamps.clone(),
             reconcile: None,
             complete_audio_inventory: None,
@@ -2422,6 +2683,7 @@ pub(crate) mod signature_tests {
         .collect();
         ScannedDir {
             duration_facts: None,
+            page_count_facts: None,
             precise_stamps: Default::default(),
             reconcile: None,
             complete_audio_inventory: None,
@@ -2659,7 +2921,45 @@ mod page_count_tests {
             skip_duplicate_images,
             image_ext_priority: vec!["png".to_owned(), "jpg".to_owned()],
             fingerprint: 1,
+            pool_revision: crate::susie_loader::pool_revision(),
         }
+    }
+
+    #[test]
+    fn image_folder_page_count_cancellation_is_not_an_empty_book() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("page.jpg"), b"image").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let error =
+            image_folder_page_count_with_cancel(temp.path(), &options(false), Some(&cancel))
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn page_count_scan_cancellation_discards_a_partially_enumerated_folder() {
+        let temp = tempfile::TempDir::new().unwrap();
+        for name in ["one.jpg", "two.jpg"] {
+            std::fs::write(temp.path().join(name), b"image").unwrap();
+        }
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let yielded = std::cell::Cell::new(0usize);
+        let entries = std::fs::read_dir(temp.path()).unwrap().inspect(|_| {
+            yielded.set(yielded.get() + 1);
+            if yielded.get() == 2 {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let result = scan_directory_entries(
+            entries,
+            true,
+            true,
+            true,
+            &Default::default(),
+            Some(&cancel),
+        );
+        assert_eq!(yielded.get(), 2);
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::Interrupted));
     }
 
     #[test]
@@ -2848,6 +3148,7 @@ mod page_count_tests {
         db.set_user_rating(&key("a.jpg"), 4, None).unwrap();
         let scan = || ScannedDir {
             duration_facts: None,
+            page_count_facts: None,
             precise_stamps: Default::default(),
             reconcile: None,
             complete_audio_inventory: None,
@@ -2968,6 +3269,7 @@ mod page_count_tests {
         };
         let scan = || ScannedDir {
             duration_facts: None,
+            page_count_facts: None,
             precise_stamps: Default::default(),
             reconcile: None,
             complete_audio_inventory: None,
@@ -4120,5 +4422,520 @@ mod section1375_scan_perf_tests {
             });
             worker.join().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod page_count_listing_883_tests {
+    use super::*;
+    use crate::catalog::{ContainerPageCountFact, ContainerPageKind, PdfPageCountFact};
+    use crate::settings::{ListingDuration, ListingPageCount, ListingSortMetadata, SortOrder};
+    use std::path::Path;
+
+    const FINGERPRINT: i64 = 77;
+    const ROOT: &str = r"C:\page-count-883";
+
+    fn item(name: &str) -> GridItem {
+        let path = Path::new(ROOT).join(name);
+        match name.rsplit('.').next().unwrap() {
+            "zip" => GridItem::ZipFile(path),
+            "pdf" | "epub" | "EPUB" => GridItem::PdfFile(path),
+            "rar" => GridItem::ConvertibleArchive {
+                path,
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+            "7z" => GridItem::ConvertibleArchive {
+                path,
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            },
+            _ => GridItem::Folder(path),
+        }
+    }
+
+    fn scan() -> ScannedDir {
+        ScannedDir {
+            duration_facts: None,
+            page_count_facts: None,
+            precise_stamps: Default::default(),
+            reconcile: None,
+            complete_audio_inventory: None,
+            folders: [
+                "memory.zip",
+                "catalog.zip",
+                "images",
+                "ordinary",
+                "book.rar",
+                "book.pdf",
+                "locked.pdf",
+                "book.epub",
+                "stale.zip",
+                "unknown.zip",
+                "unsupported.7z",
+            ]
+            .into_iter()
+            .map(|name| {
+                let item = item(name);
+                let folder = matches!(&item, GridItem::Folder(_));
+                ScannedFolderEntry {
+                    item,
+                    display_meta: Some((7, if folder { 0 } else { 10 })),
+                    sort_meta: ListingSortMetadata::new(7, if folder { None } else { Some(10) }),
+                }
+            })
+            .collect(),
+            all_media: vec![ScannedMediaEntry {
+                path: Path::new(ROOT).join("movie.mp4"),
+                kind: ScanMediaKind::Video,
+                mtime: 7,
+                file_size: 10,
+                sort_meta: ListingSortMetadata::new(7, Some(10)),
+            }],
+            omitted: Default::default(),
+            auxiliary_media: Default::default(),
+        }
+    }
+
+    fn facts() -> FolderPageCountFacts {
+        let containers = [
+            ("memory.zip", ContainerPageKind::Zip, 10, Some(99)),
+            ("catalog.zip", ContainerPageKind::Zip, 10, Some(4)),
+            ("images", ContainerPageKind::Folder, 0, Some(3)),
+            ("ordinary", ContainerPageKind::Folder, 0, None),
+            ("book.rar", ContainerPageKind::Archive, 10, Some(5)),
+            ("stale.zip", ContainerPageKind::Zip, 11, Some(1)),
+            ("unsupported.7z", ContainerPageKind::Archive, 10, Some(1)),
+        ]
+        .into_iter()
+        .map(|(filename, kind, file_size, page_count)| {
+            let row = ContainerPageCountFact {
+                filename: filename.into(),
+                kind: kind as i64,
+                mtime: 7,
+                file_size,
+                fingerprint: FINGERPRINT,
+                page_count,
+            };
+            ((row.filename.clone(), row.kind), row)
+        })
+        .collect();
+        let pdfs = [
+            ("book.pdf", false),
+            ("locked.pdf", true),
+            ("book.epub", false),
+        ]
+        .into_iter()
+        .map(|(filename, password_required)| {
+            let row = PdfPageCountFact {
+                filename: filename.into(),
+                mtime: 7,
+                file_size: 10,
+                page_count: 6,
+                password_required,
+            };
+            (row.filename.clone(), row)
+        })
+        .collect();
+        FolderPageCountFacts {
+            fingerprint: FINGERPRINT,
+            containers,
+            pdfs,
+        }
+    }
+
+    fn materialize(
+        input: ScannedDir,
+        fingerprint: i64,
+        read_page: impl FnMut(&GridItem, (i64, i64)) -> Option<ListingPageCount>,
+    ) -> MaterializedFolderListing {
+        let mut settings = crate::settings::Settings::default();
+        settings.skip_epub_if_pdf_exists = false;
+        materialize_local_folder_listing_with_order_and_metadata(
+            Path::new(ROOT),
+            input,
+            &settings,
+            crate::rating_sort::ListingOrderRequest::Standard(SortOrder::PageCountAsc),
+            |_| panic!("page count must not read ratings"),
+            |_, _| panic!("page count must not read duration"),
+            fingerprint,
+            read_page,
+        )
+    }
+
+    #[test]
+    fn page_count_883_facts_match_kind_stamp_and_fingerprint_but_exclude_epub_and_password_pdf() {
+        let mut facts = facts();
+        assert_eq!(
+            facts.page_count_for(&item("images"), (7, 0)),
+            Some(ListingPageCount::Known(3))
+        );
+        assert_eq!(
+            facts.page_count_for(&item("ordinary"), (7, 0)),
+            Some(ListingPageCount::Unavailable)
+        );
+        assert_eq!(
+            facts.page_count_for(&item("catalog.zip"), (7, 10)),
+            Some(ListingPageCount::Known(4))
+        );
+        assert_eq!(
+            facts.page_count_for(&item("book.rar"), (7, 10)),
+            Some(ListingPageCount::Known(5))
+        );
+        assert_eq!(
+            facts.page_count_for(&item("book.pdf"), (7, 10)),
+            Some(ListingPageCount::Known(6))
+        );
+        for name in [
+            "locked.pdf",
+            "book.epub",
+            "unsupported.7z",
+            "unknown.zip",
+            "stale.zip",
+        ] {
+            assert_eq!(facts.page_count_for(&item(name), (7, 10)), None, "{name}");
+        }
+        for stamp in [(8, 0), (7, 10)] {
+            assert_eq!(facts.page_count_for(&item("images"), stamp), None);
+        }
+        facts
+            .containers
+            .get_mut(&("catalog.zip".into(), ContainerPageKind::Zip as i64))
+            .unwrap()
+            .fingerprint += 1;
+        assert_eq!(facts.page_count_for(&item("catalog.zip"), (7, 10)), None);
+        assert_eq!(
+            facts.page_count_for(
+                &GridItem::Folder(Path::new(ROOT).join("catalog.zip")),
+                (7, 10)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn page_count_883_materialized_memory_facts_missing_and_worker_snapshot_agree() {
+        let mut input = scan();
+        input.page_count_facts = Some(facts());
+        let mut memory = FolderListingMetadataSnapshot::default();
+        for (name, value) in [
+            ("memory.zip", ListingPageCount::Known(2)),
+            ("catalog.zip", ListingPageCount::Missing),
+            ("locked.pdf", ListingPageCount::Unavailable),
+            ("book.epub", ListingPageCount::Known(1)),
+        ] {
+            memory.page_count.insert(
+                (
+                    crate::adjustment_db::normalize_path(&Path::new(ROOT).join(name)),
+                    7,
+                    10,
+                ),
+                value,
+            );
+        }
+        memory.duration.insert(
+            ("duration-kept".into(), 7, 10),
+            ListingDuration::Known(1000),
+        );
+        let read = |memory: &FolderListingMetadataSnapshot, item: &GridItem, (mtime, size)| {
+            let path = listing_page_count_path(item).unwrap();
+            memory
+                .page_count
+                .get(&(crate::adjustment_db::normalize_path(path), mtime, size))
+                .copied()
+        };
+        let ui = materialize(input.clone_for_projection(), FINGERPRINT, |path, stamp| {
+            read(&memory, path, stamp)
+        });
+        let worker_memory = std::sync::Arc::new(memory);
+        let worker = materialize(input, FINGERPRINT, |path, stamp| {
+            read(&worker_memory, path, stamp)
+        });
+        assert_eq!(ui.items, worker.items);
+        assert_eq!(ui.sort_metas, worker.sort_metas);
+        assert_eq!(
+            worker_memory.duration.values().next(),
+            Some(&ListingDuration::Known(1000))
+        );
+        let names = ui
+            .items
+            .iter()
+            .map(|row| row.name().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &names[..6],
+            [
+                "book.epub",
+                "memory.zip",
+                "images",
+                "catalog.zip",
+                "book.rar",
+                "book.pdf"
+            ]
+        );
+        let values = ui
+            .items
+            .iter()
+            .zip(ui.sort_metas.iter())
+            .map(|(item, meta)| (item.name().into_owned(), *meta))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(values["memory.zip"].page_count, ListingPageCount::Known(2));
+        assert_eq!(values["catalog.zip"].page_count, ListingPageCount::Known(4));
+        assert_eq!(values["images"].page_count, ListingPageCount::Known(3));
+        assert_eq!(
+            values["images"].file_size, None,
+            "page identity must not turn directory size into known zero"
+        );
+        assert_eq!(values["ordinary"].page_count, ListingPageCount::Unavailable);
+        assert_eq!(
+            values["locked.pdf"].page_count,
+            ListingPageCount::Unavailable
+        );
+        for name in ["stale.zip", "unknown.zip", "unsupported.7z", "movie.mp4"] {
+            assert_eq!(values[name].page_count, ListingPageCount::Missing, "{name}");
+        }
+    }
+
+    #[test]
+    fn page_count_883_materialized_stale_facts_and_absent_facts_use_only_memory() {
+        for stale in [false, true] {
+            let mut input = scan();
+            if stale {
+                input.page_count_facts = Some(facts());
+            }
+            let listing = materialize(input, FINGERPRINT + 1, |item, stamp| {
+                let path = listing_page_count_path(item).unwrap();
+                assert_eq!(stamp.0, 7);
+                if path.file_name().unwrap() == "images" {
+                    assert_eq!(stamp.1, 0);
+                    Some(ListingPageCount::Known(2))
+                } else {
+                    None
+                }
+            });
+            assert_eq!(listing.items[0].name(), "images");
+            for (row, meta) in listing.items.iter().zip(&listing.sort_metas) {
+                assert_eq!(
+                    meta.page_count,
+                    if row.name() == "images" {
+                        ListingPageCount::Known(2)
+                    } else {
+                        ListingPageCount::Missing
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn page_count_883_unavailable_memory_overrides_known_catalog_value() {
+        let mut input = scan();
+        input.page_count_facts = Some(facts());
+        let listing = materialize(input, FINGERPRINT, |item, _| {
+            let path = listing_page_count_path(item).unwrap();
+            (path.file_name().unwrap() == "memory.zip").then_some(ListingPageCount::Unavailable)
+        });
+        let meta = listing
+            .items
+            .iter()
+            .zip(&listing.sort_metas)
+            .find(|(item, _)| item.name() == "memory.zip")
+            .unwrap()
+            .1;
+        assert_eq!(meta.page_count, ListingPageCount::Unavailable);
+    }
+
+    #[test]
+    fn page_count_883_real_folder_scan_matches_details_catalog_stamp_without_known_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("books");
+        let images = root.join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::write(images.join("one.jpg"), b"image").unwrap();
+        std::fs::write(images.join("two.jpg"), b"image").unwrap();
+        let settings = crate::settings::Settings::default();
+        let options = image_folder_page_count_options(&settings);
+        let mut input = scan_directory_with_settings(&root, &settings).unwrap();
+        assert!(
+            input.page_count_facts.is_none(),
+            "synchronous scans do not open catalogs"
+        );
+        let entry = input
+            .folders
+            .iter()
+            .find(|entry| entry.item == GridItem::Folder(images.clone()))
+            .unwrap();
+        let stamp = entry.display_meta.unwrap();
+        assert_eq!(stamp.1, 0);
+        assert_eq!(entry.sort_meta.file_size, None);
+        let count = image_folder_page_count(&images, &options).unwrap();
+        assert_eq!(count, Some(2));
+        let cache = temp.path().join("cache");
+        let writer = crate::catalog::CatalogDb::open(&cache, &root).unwrap();
+        writer
+            .set_container_page_meta(
+                "images",
+                ContainerPageKind::Folder,
+                stamp.0,
+                stamp.1,
+                options.fingerprint,
+                count,
+            )
+            .unwrap();
+        collect_folder_listing_metadata_facts(
+            &root,
+            &mut input,
+            &cache,
+            false,
+            Some(options.fingerprint),
+        );
+        let materialize = |input, from_memory: bool| {
+            materialize_local_folder_listing_with_order_and_metadata(
+                &root,
+                input,
+                &settings,
+                crate::rating_sort::ListingOrderRequest::Standard(SortOrder::PageCountAsc),
+                |_| panic!("page order must not read ratings"),
+                |_, _| panic!("page order must not read duration"),
+                options.fingerprint,
+                |item, received_stamp| {
+                    assert_eq!(item, &GridItem::Folder(images.clone()));
+                    assert_eq!(received_stamp, stamp);
+                    from_memory.then_some(ListingPageCount::Known(2))
+                },
+            )
+        };
+        let memory = materialize(input.clone_for_projection(), true);
+        let catalog = materialize(input, false);
+        assert_eq!(memory.sort_metas, catalog.sort_metas);
+        assert_eq!(catalog.sort_metas[0].page_count, ListingPageCount::Known(2));
+        assert_eq!(catalog.sort_metas[0].file_size, None);
+    }
+
+    #[test]
+    fn page_count_883_non_page_sorts_never_read_page_memory() {
+        for sort in [
+            SortOrder::FileName,
+            SortOrder::SizeAsc,
+            SortOrder::DurationAsc,
+        ] {
+            let mut input = scan();
+            input.page_count_facts = Some(facts());
+            let listing = materialize_local_folder_listing_with_order_and_metadata(
+                Path::new(ROOT),
+                input,
+                &Default::default(),
+                crate::rating_sort::ListingOrderRequest::Standard(sort),
+                |_| panic!("these sorts must not read ratings"),
+                |_, _| None,
+                FINGERPRINT,
+                |_, _| panic!("non-page sort must not read page count"),
+            );
+            assert!(
+                listing
+                    .sort_metas
+                    .iter()
+                    .all(|meta| meta.page_count == ListingPageCount::Missing)
+            );
+        }
+    }
+
+    #[test]
+    fn page_count_883_catalog_collection_skips_unwanted_and_empty_and_missing_catalog_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("cache");
+        let folder = temp.path().join("books");
+        let mut input = scan();
+        collect_folder_listing_metadata_facts_with_open(&mut input, false, None, || {
+            panic!("unwanted facts must not open a catalog")
+        });
+        assert!(input.page_count_facts.is_none());
+        let mut empty = scan();
+        empty.folders.clear();
+        empty.all_media.clear();
+        collect_folder_listing_metadata_facts_with_open(
+            &mut empty,
+            true,
+            Some(FINGERPRINT),
+            || panic!("empty inventory must not open a catalog"),
+        );
+        assert!(empty.duration_facts.is_none());
+        assert!(empty.page_count_facts.is_none());
+        collect_folder_listing_metadata_facts(
+            &folder,
+            &mut input,
+            &cache,
+            false,
+            Some(FINGERPRINT),
+        );
+        let facts = input.page_count_facts.unwrap();
+        assert!(facts.containers.is_empty() && facts.pdfs.is_empty());
+        assert!(!cache.exists(), "read-only facts must not create a catalog");
+    }
+
+    #[test]
+    fn page_count_883_duration_and_page_catalog_facts_share_exactly_one_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("books");
+        std::fs::create_dir(&folder).unwrap();
+        let movie = folder.join("movie.mp4");
+        std::fs::write(&movie, b"media").unwrap();
+        let (mtime, size) = crate::catalog::file_stamp(&std::fs::metadata(&movie).unwrap());
+        let writer = crate::catalog::CatalogDb::open(temp.path(), &folder).unwrap();
+        writer
+            .set_container_page_meta(
+                "images",
+                ContainerPageKind::Folder,
+                7,
+                0,
+                FINGERPRINT,
+                Some(3),
+            )
+            .unwrap();
+        writer.set_pdf_meta("book.pdf", 7, 10, 6, false).unwrap();
+        assert!(
+            writer
+                .set_video_meta(
+                    &movie,
+                    "movie.mp4",
+                    mtime,
+                    size,
+                    &crate::catalog::VideoMeta::Read {
+                        duration_secs: Some(1.25),
+                        dims: None,
+                        codec: None,
+                    },
+                    &std::sync::atomic::AtomicBool::new(false)
+                )
+                .unwrap()
+        );
+        let mut input = scan();
+        input.all_media[0].path = movie.clone();
+        input.all_media[0].sort_meta = ListingSortMetadata::new(mtime, Some(size));
+        let mut opens = 0;
+        collect_folder_listing_metadata_facts_with_open(
+            &mut input,
+            true,
+            Some(FINGERPRINT),
+            || {
+                opens += 1;
+                crate::catalog::CatalogDb::open_existing_read_only(temp.path(), &folder)
+            },
+        );
+        assert_eq!(opens, 1);
+        assert_eq!(
+            input
+                .duration_facts
+                .unwrap()
+                .duration_for(&movie, ListingSortMetadata::new(mtime, Some(size))),
+            Some(ListingDuration::Known(1250))
+        );
+        let facts = input.page_count_facts.unwrap();
+        assert_eq!(
+            facts.page_count_for(&item("images"), (7, 0)),
+            Some(ListingPageCount::Known(3))
+        );
+        assert_eq!(
+            facts.page_count_for(&item("book.pdf"), (7, 10)),
+            Some(ListingPageCount::Known(6))
+        );
     }
 }

@@ -114,11 +114,15 @@ enum Change {
     Archive,
     Epub,
     SusiePublication,
+    PageCountFingerprint,
     Mixed,
 }
 
 fn check_policy_refresh(change: Change) {
     let (mut app, target) = fixture();
+    if matches!(change, Change::PageCountFingerprint) {
+        app.settings.sort_order = crate::settings::SortOrder::PageCountAsc;
+    }
     let mut old = scanned_result(&app, &target);
     let (mut request, tx) = pending(target.clone());
     let proof = app.copied_destination_source_proof();
@@ -153,7 +157,13 @@ fn check_policy_refresh(change: Change) {
         // susie_loader state test.
         Change::SusiePublication => {
             let stale = old.scan_policy.as_mut().unwrap();
-            stale.susie_extensions_generation = stale.susie_extensions_generation.wrapping_sub(1);
+            stale.susie_pool_revision = stale.susie_pool_revision.wrapping_sub(1);
+        }
+        Change::PageCountFingerprint => {
+            let before = app.listing_page_count_facts_fingerprint();
+            assert!(before.is_some());
+            app.settings.skip_duplicate_images = !app.settings.skip_duplicate_images;
+            assert_ne!(before, app.listing_page_count_facts_fingerprint());
         }
         Change::Mixed => old.scan_policy_mixed = true,
     }
@@ -259,6 +269,11 @@ fn section1853_epub_setting_rescans_same_request_before_adoption() {
 #[test]
 fn section1853_susie_publication_rescans_same_request_before_adoption() {
     check_policy_refresh(Change::SusiePublication);
+}
+
+#[test]
+fn section1853_page_count_fingerprint_rescans_same_request_before_adoption() {
+    check_policy_refresh(Change::PageCountFingerprint);
 }
 
 #[test]

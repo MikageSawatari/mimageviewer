@@ -1438,7 +1438,8 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.checkbox(
             &mut state.settings.thumb_cover_auto_crop,
             "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)",
-        );
+        )
+        .on_hover_text("お気に入りごとの入/切は「お気に入り」→「編集」で変えられます。");
         ui.add_enabled_ui(state.settings.thumb_cover_auto_crop, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.label("綴じ方向:");
@@ -1592,6 +1593,9 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
         draw_audio_thumbnail_indicator_settings(ui, &mut state.settings);
     });
     draw_media_duration_settings(ui, &mut state.settings);
+    anchored(ui, state, "thumbnail/page-count", |ui, state| {
+        draw_page_count_settings(ui, &mut state.settings);
+    });
 
     ui.add_space(8.0);
     anchored(ui, state, "thumbnail/resume-meter", |ui, state| {
@@ -1888,6 +1892,15 @@ pub(super) fn draw_media_duration_settings(ui: &mut egui::Ui, settings: &mut set
         "動画・音声の長さをサムネイルに表示する",
     );
     ui.small("右下に分:秒、1 時間以上は時:分:秒で表示します。フィルタ一致数や他の表示と重なる場合は上へ移し、収まらない場合は表示しません。");
+}
+
+pub(super) fn draw_page_count_settings(ui: &mut egui::Ui, settings: &mut settings::Settings) {
+    ui.add_space(6.0);
+    ui.checkbox(
+        &mut settings.thumb_show_page_count,
+        "本のページ数をサムネイルに表示する",
+    );
+    ui.small("ZIP・PDF・画像だけのフォルダなどの右下にページ数を表示します。初めて表示する本は中を数えるため、少し遅れて表示されます。フィルタ一致数や他の表示と重なる場合は上へ移し、収まらない場合は表示しません。");
 }
 
 pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {

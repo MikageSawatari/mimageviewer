@@ -590,6 +590,7 @@ impl App {
         &self,
         idx: usize,
         scope_signature: Option<crate::color_search::ScanScopeSignature>,
+        crop_scope: &crate::cover_auto_crop::CoverAutoCropScope,
     ) -> bool {
         if !self.color_filter.enabled {
             return true;
@@ -600,7 +601,9 @@ impl App {
         if self.color_filter.applied_scope_signature != Some(scope_signature) {
             return true;
         }
-        let Some((key, mtime, file_size)) = self.color_identity_for_idx(idx) else {
+        let Some((key, mtime, file_size)) =
+            self.color_identity_for_idx_with_crop_scope(idx, crop_scope)
+        else {
             return false;
         };
         let Some(entry) = self
@@ -621,6 +624,7 @@ impl App {
         &mut self,
     ) -> Option<crate::color_search::ScanScopeSignature> {
         let indices = self.color_scan_candidate_indices();
+        let crop_scope = self.thumbnail_auto_crop_scope();
         if indices.is_empty() {
             return None;
         }
@@ -628,7 +632,7 @@ impl App {
         for idx in indices {
             let item = self.items.get(idx)?;
             let key = self
-                .color_identity_for_idx(idx)
+                .color_identity_for_idx_with_crop_scope(idx, &crop_scope)
                 .map(|identity| identity.0)
                 .unwrap_or_else(|| item.perf_key());
             let (mtime, file_size) = self
@@ -684,9 +688,12 @@ impl App {
 
     fn color_missing_work_items(&mut self) -> Vec<ColorScanWorkItem> {
         let indices = self.color_scan_candidate_indices();
+        let crop_scope = self.thumbnail_auto_crop_scope();
         let mut work = Vec::new();
         for idx in indices {
-            let Some((key, req)) = self.color_work_identity_for_idx(idx) else {
+            let Some((key, req)) =
+                self.color_work_identity_for_idx_with_crop_scope(idx, &crop_scope)
+            else {
                 continue;
             };
             if self
@@ -720,6 +727,22 @@ impl App {
         &self,
         idx: usize,
     ) -> Option<(crate::color_search::ColorPaletteKey, i64, i64)> {
+        self.color_identity_for_idx_with_crop_scope(idx, &self.thumbnail_auto_crop_scope())
+    }
+
+    #[cfg(test)]
+    fn color_work_identity_for_idx(
+        &self,
+        idx: usize,
+    ) -> Option<(crate::color_search::ColorPaletteKey, LoadRequest)> {
+        self.color_work_identity_for_idx_with_crop_scope(idx, &self.thumbnail_auto_crop_scope())
+    }
+
+    fn color_identity_for_idx_with_crop_scope(
+        &self,
+        idx: usize,
+        crop_scope: &crate::cover_auto_crop::CoverAutoCropScope,
+    ) -> Option<(crate::color_search::ColorPaletteKey, i64, i64)> {
         let item = self.items.get(idx)?;
         if !color_filter_item_supported(item) {
             return None;
@@ -736,7 +759,13 @@ impl App {
                 self.folder_pin_map
                     .get(&crate::path_key::normalize_keep_drive(path))
             });
-            let auto = self.thumbnail_auto_crop_identity().filter(|_| {
+            let auto = cover_auto_crop_for_item(
+                crop_scope,
+                item,
+                self.archive_source_override.as_deref(),
+                self.current_folder.as_deref(),
+            )
+            .filter(|_| {
                 pin.is_none_or(|pin| {
                     let mut probe = LoadRequest {
                         cover_crop: pin.cover_crop,
@@ -780,9 +809,10 @@ impl App {
         Some((key, mtime, file_size))
     }
 
-    fn color_work_identity_for_idx(
+    fn color_work_identity_for_idx_with_crop_scope(
         &self,
         idx: usize,
+        crop_scope: &crate::cover_auto_crop::CoverAutoCropScope,
     ) -> Option<(crate::color_search::ColorPaletteKey, LoadRequest)> {
         let item = self.items.get(idx)?;
         if !color_filter_item_supported(item) {
@@ -790,7 +820,7 @@ impl App {
         }
         let (mtime, file_size) = self.image_metas.get(idx).copied().flatten()?;
         let empty_pins = std::collections::HashMap::new();
-        let mut req = make_load_request_with_auto_crop(
+        let mut req = make_load_request_with_crop_scope(
             item,
             idx,
             mtime,
@@ -811,11 +841,15 @@ impl App {
             self.video_pin_db.as_ref(),
             self.use_full_path_cache_keys(),
             self.listing_file_type_visibility(),
-            self.thumbnail_auto_crop_identity(),
+            crop_scope,
         )?;
         req.relative_page_provenance = self.relative_page_provenance_for_idx(idx);
         self.attach_viewer_thumbnail_context(&mut req);
-        Some((self.color_identity_for_idx(idx)?.0, req))
+        Some((
+            self.color_identity_for_idx_with_crop_scope(idx, crop_scope)?
+                .0,
+            req,
+        ))
     }
 
     fn color_view_kind(&self) -> &'static str {
@@ -1126,8 +1160,8 @@ mod tests {
             COLOR_SCAN_CONFIRM_MISSING_THRESHOLD
         );
         assert!(env.color_filter.pending.is_none());
-        assert!(env.passes_color_filter_for_scope(0, scope));
-        assert!(env.passes_color_filter_for_scope(1, scope));
+        assert!(env.passes_color_filter_for_scope(0, scope, &env.thumbnail_auto_crop_scope()));
+        assert!(env.passes_color_filter_for_scope(1, scope, &env.thumbnail_auto_crop_scope()));
         env.cancel_large_color_scan_confirmation();
         assert!(!env.color_filter.enabled);
     }
@@ -1264,6 +1298,35 @@ mod tests {
         assert!(!manual.contains("|autocrop:"));
         app.settings.thumb_cover_auto_crop_binding = crate::settings::ReadingDirection::Ltr;
         assert_eq!(app.color_identity_for_idx(0).unwrap().0, manual);
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_color_keys_and_work_resolve_item_locations() {
+        use crate::settings::{FavoriteCoverAutoCropPreference, FavoriteEntry};
+        let mut app = setup_app_for_test();
+        let root = app.tmp.path().join("photos");
+        let mut favorite = FavoriteEntry::new("photos".into(), root.clone());
+        favorite.cover_auto_crop = FavoriteCoverAutoCropPreference::Off;
+        app.settings.favorites = vec![favorite];
+        app.settings.thumb_cover_auto_crop = true;
+        app.items = vec![
+            GridItem::ZipFile(root.join("book.zip")),
+            GridItem::ZipFile(app.tmp.path().join("book.zip")),
+        ];
+        app.image_metas = vec![Some((17, 23)); 2];
+        let scope = app.thumbnail_auto_crop_scope();
+        for idx in 0..2 {
+            let palette = app
+                .color_identity_for_idx_with_crop_scope(idx, &scope)
+                .unwrap()
+                .0;
+            let (work_palette, request) = app
+                .color_work_identity_for_idx_with_crop_scope(idx, &scope)
+                .unwrap();
+            assert_eq!(palette, work_palette);
+            assert_eq!(palette.contains("|autocrop:"), idx == 1);
+            assert_eq!(request.auto_cover_crop.is_some(), idx == 1);
+        }
     }
 
     #[test]

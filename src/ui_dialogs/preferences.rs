@@ -24,8 +24,8 @@ thread_local! {
 }
 
 fn cover_auto_crop_changed(before: &Settings, after: &Settings) -> bool {
-    crate::app::configured_thumbnail_auto_crop(before)
-        != crate::app::configured_thumbnail_auto_crop(after)
+    crate::cover_auto_crop::CoverAutoCropScope::from_settings(before)
+        != crate::cover_auto_crop::CoverAutoCropScope::from_settings(after)
 }
 
 pub(crate) fn draw_same_name_folder_book_settings(
@@ -2778,9 +2778,10 @@ impl App {
                 settings.raw_develop_parallelism = requested_raw_parallelism;
             }
         }
-        let thumbnail_media_requirements_changed = self.settings.thumb_show_media_duration
+        let thumbnail_badge_requirements_changed = self.settings.thumb_show_media_duration
             != settings.thumb_show_media_duration
-            || self.settings.thumb_show_resume_meter != settings.thumb_show_resume_meter;
+            || self.settings.thumb_show_resume_meter != settings.thumb_show_resume_meter
+            || self.settings.thumb_show_page_count != settings.thumb_show_page_count;
         // Fit mode is shared across contexts. End the selected continuous unit
         // at the setting boundary, including parked owners that will not draw
         // between a mode exit and a later re-entry.
@@ -2815,7 +2816,7 @@ impl App {
                 .slot
                 .set_pre_limiter_enabled(self.settings.effetune_pre_limiter_enabled);
         }
-        if thumbnail_media_requirements_changed {
+        if thumbnail_badge_requirements_changed {
             self.invalidate_details_meta_requirements();
         }
         if books_root_changed {
@@ -3072,7 +3073,6 @@ impl App {
             let old_show_hidden_files = self.settings.show_hidden_files;
             let file_type_visibility_changed =
                 self.settings.file_type_visibility != state.settings.file_type_visibility;
-            let cover_auto_crop_changed = cover_auto_crop_changed(&self.settings, &state.settings);
             let old_exif = self.settings.exif_hidden_tags.clone();
 
             let old_susie = (
@@ -3169,6 +3169,7 @@ impl App {
                 self.advance_media_memory_clear_generation();
             }
             prepare_preferences_state_settings_for_commit(&mut state, &mut self.settings);
+            let cover_auto_crop_changed = cover_auto_crop_changed(&self.settings, &state.settings);
             self.install_preferences_settings(state.settings);
             if old_thumb_container_icon_kinds != self.settings.thumb_container_icon_kinds {
                 let new = self.settings.thumb_container_icon_kinds;
@@ -6769,6 +6770,25 @@ mod tests {
     }
 
     #[test]
+    fn favorite_cover_auto_crop_preferences_reload_uses_live_favorite_on_scope() {
+        use crate::settings::{FavoriteCoverAutoCropPreference, FavoriteEntry};
+        let mut before = Settings::default();
+        before.thumb_cover_auto_crop = false;
+        let mut favorite = FavoriteEntry::new("books".into(), PathBuf::from(r"C:\books"));
+        favorite.cover_auto_crop = FavoriteCoverAutoCropPreference::On;
+        before.favorites.push(favorite);
+        let mut after = before.clone();
+        after.thumb_cover_auto_crop_binding = crate::settings::ReadingDirection::Ltr;
+        assert!(cover_auto_crop_changed(&before, &after));
+        after = before.clone();
+        after.thumb_cover_auto_crop_folders = !before.thumb_cover_auto_crop_folders;
+        assert!(cover_auto_crop_changed(&before, &after));
+        after = before.clone();
+        after.favorites[0].cover_auto_crop = FavoriteCoverAutoCropPreference::Off;
+        assert!(cover_auto_crop_changed(&before, &after));
+    }
+
+    #[test]
     fn thumb_cover_auto_crop_binding_reload_ignores_reading_direction_and_disabled_binding() {
         use crate::settings::ReadingDirection::{Ltr, Rtl};
         for enabled in [false, true] {
@@ -7347,6 +7367,7 @@ mod tests {
                     false,
                     None,
                     None,
+                    None,
                     false,
                     ThumbnailNameStyle::from_settings(&harness.state().settings),
                     false,
@@ -7442,6 +7463,50 @@ mod tests {
     }
 
     #[test]
+    fn page_count_883_preferences_toggle_invalidates_requirements_and_unchanged_ok_preserves_state()
+    {
+        use crate::app::LazyColumnState;
+        use crate::grid_item::GridItem;
+
+        let mut app = crate::app::setup_app_for_test();
+        app.install_new_items(
+            vec![GridItem::ZipFile(std::path::PathBuf::from("book.zip"))],
+            vec![Some((1, 10))],
+        );
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+        app.settings.thumb_show_media_duration = false;
+        app.settings.thumb_show_resume_meter = false;
+        app.settings.thumb_show_page_count = false;
+        app.settings.selection_info_display_mode =
+            crate::settings::SelectionInfoDisplayMode::Hidden;
+        app.selected = None;
+        app.items_are_drive_list = false;
+        app.ai_model_facet_requested = false;
+        app.details_image_dims_state = LazyColumnState::Disabled;
+
+        let mut state = preferences_state_for_test(&app.settings);
+        state.settings.thumb_show_page_count = true;
+        prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+        app.install_preferences_settings(state.settings);
+        assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
+        assert!(app.settings.thumb_show_page_count);
+
+        app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+        let unchanged_settings = app.settings.clone();
+        app.install_preferences_settings(unchanged_settings);
+        assert_eq!(
+            app.details_image_dims_state,
+            LazyColumnState::Ready { failed: 0 }
+        );
+
+        let mut state = preferences_state_for_test(&app.settings);
+        state.settings.thumb_show_page_count = false;
+        prepare_preferences_state_settings_for_commit(&mut state, &mut app.settings);
+        app.install_preferences_settings(state.settings);
+        assert_eq!(app.details_image_dims_state, LazyColumnState::Disabled);
+    }
+
+    #[test]
     fn resume_meter_preferences_toggle_requeues_media_metadata_with_duration_badge_off() {
         use crate::app::LazyColumnState;
         use crate::grid_item::GridItem;
@@ -7454,6 +7519,7 @@ mod tests {
             app.install_new_items(vec![item], vec![Some((1, 10))]);
             app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
             app.settings.thumb_show_media_duration = false;
+            app.settings.thumb_show_page_count = false;
             app.settings.thumb_show_resume_meter = false;
             app.selected = None;
             app.items_are_drive_list = false;

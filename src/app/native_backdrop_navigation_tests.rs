@@ -341,6 +341,7 @@ fn install_video_backdrop(app: &mut App, transitioning: bool) {
 
 fn confirm_favorite(app: &mut App, ctx: &egui::Context, target: &Path) -> AddressBarNav {
     app.settings.favorites = vec![crate::settings::FavoriteEntry {
+        cover_auto_crop: Default::default(),
         id: uuid::Uuid::new_v4(),
         name: "native test favorite".into(),
         path: target.to_path_buf(),

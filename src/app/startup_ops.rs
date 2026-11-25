@@ -775,6 +775,7 @@ impl App {
         folder_scan::FolderScanPolicy::capture(
             &self.settings,
             self.listing_may_sort_by_duration(),
+            self.listing_page_count_facts_fingerprint(),
             crate::catalog::default_cache_dir(),
         )
     }
@@ -3306,10 +3307,10 @@ fn scan_startup_resolved_target(
         let span = correlation.map(|id| {
             event_span(Lane::Navigation, Stage::InitialTargetScan, id).watched_optional(watch)
         });
-        let before = crate::susie_loader::extensions_generation();
+        let before = crate::susie_loader::pool_revision();
         let scan = policy.scan(&result.resolved.as_ref().unwrap().path, Some(cancel));
-        let after = crate::susie_loader::extensions_generation();
-        result.scan_policy_mixed = before != after || before != policy.susie_extensions_generation;
+        let after = crate::susie_loader::pool_revision();
+        result.scan_policy_mixed = before != after || before != policy.susie_pool_revision;
         if let Some(span) = span {
             span.finish(if cancel.load(Ordering::Relaxed) {
                 Outcome::Cancelled

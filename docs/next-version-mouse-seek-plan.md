@@ -60,6 +60,11 @@ close 契約では stale event を捨てる下限である。テスト fixture �
 
 ### 2.1 presenter / HUD の native route
 
+AppCommand receipt は `in_send_flags`（`InSendMessageEx` の生値）、`dispatching`（追跡中の DispatchMessage と一致）、`outer_hwnd` / `outer_message`（入れ子の外側の wndproc）を記録する。
+`delivery=queued` は追跡したポンプからの配送、`sent_cross_thread` は ISMEX の送信フラグで確認した別スレッドからの送信を示す。
+`in_send_flags=0`・`dispatching=false`・外側ありは `nested_untracked_during` とする。`outer_message=0x0101` でも WM_KEYUP 中の同期呼出しか、USER32 のモーダルループが配送した posted message かは区別できない。
+一致も送信フラグも外側もない場合は `unknown` とする。presenter と HUD の TLS scope は入れ子を復元するが、追跡外の配送は断定しない。生成元は次の実ログで判断する。
+
 `src/video/native_window.rs::wnd_proc` は presenter HWND の `WM_KEYDOWN/WM_SYSKEYDOWN` を
 `NativeVideoKeyEvent` に変換し、lossless route へ送る。browser key は enqueue 後に
 `DefWindowProcW` へ渡さない。`WM_APPCOMMAND` の command 1 / 2 は、それぞれ scan 0 の
@@ -165,7 +170,7 @@ key と raw mouse button の両方に、optional field ではない共通
 
 - `Win32Key { window_source, receiver_hwnd, message }`
 - `Win32AppCommand { window_source, receiver_hwnd, command_source_hwnd, command, device,
-  key_state }`
+  key_state, delivery { in_send_flags, dispatching, outer } }`
 - `Win32MouseButton { window_source, receiver_hwnd, message, button }`
 - `Win32MouseCleanup { window_source, receiver_hwnd, cause_message }`
 - `EguiBackdrop { viewport_id }`

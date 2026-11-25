@@ -31,8 +31,8 @@
     "applicationCategory": "MultimediaApplication",
     "applicationSubCategory": "画像ビューア",
     "operatingSystem": "Windows 11 (64bit)",
-    "softwareVersion": "5.6.0",
-    "dateModified": "2026-11-23",
+    "softwareVersion": "5.7.0",
+    "dateModified": "2026-11-25",
     "inLanguage": "ja",
     "description": "フォルダを開くだけで、数十万枚でもサムネイルで一覧できる Windows 用の画像ビューア。ZIP・PDF はディスクに展開せずに中のページを閲覧でき、長い動画はタイル表示で全体を見渡せます。RAW・HEIC・AVIF に対応し、AI アップスケールと非破壊編集を内蔵します。mImageViewer 本体の画像 AI 処理は利用者の PC 内で完結します。",
     "screenshot": "https://mikage.to/mimageviewer/ogp.jpg",
@@ -1174,6 +1174,7 @@
       <li><strong>画像の比較</strong> — ワイプ・差分強調・ピン画像の切り替えで見比べられます。比較中に右Ctrlを押している間は、両側を元画像で確認できます</li>
       <li><strong>SNS 分割書き出し</strong> — 1 枚の絵を 2〜20 枚に切り分け、複数枚投稿で 1 枚の絵に見せるための画像を作成</li>
       <li><strong>バリエーション一括エクスポート</strong> — 補正・消しゴム・隠蔽の結果を JPEG/PNG/WebP で別ファイル保存</li>
+      <li><strong>一覧からの一括エクスポート</strong> — 形式・品質・サイズを指定し、選んだフォルダや元の場所へまとめて書き出し。文字やロゴの透かし、元の情報や更新日時の保持、同名ファイルの扱いも選べ、設定一式を名前付きプリセットで呼び出せます</li>
       <li><strong>キャプチャコピー</strong> — 表示中の画像 / ページや、ドラッグした範囲をクリップボードへコピー</li>
       <li><strong>編集を反映した画像をコピー</strong> — 補正・切り取り・注釈などを反映して他のアプリへ貼り付け。見開きは 1 枚につなげてコピー。<a href="manual/export.html#edited-copy">使い方を見る</a></li>
       <li><strong>外部ツール連携</strong> — よく使うアプリを登録し、右クリックやキー 1 つで選択したフォルダーや表示中のページを渡して開く。ファイルと一緒にチェックしたフォルダーは除き、フォルダーだけならそのまま渡します。ZIP / PDF の中のページや動画のコマも渡せます。複数の対象はファイルの一覧を書いたリストでも渡せます</li>
@@ -1195,6 +1196,7 @@
       <li><strong>XMP ツイート情報表示</strong> — 埋め込まれたツイート ID・投稿者・本文・日時を表示</li>
       <li><strong>外部メタデータ (サイドカー)</strong> — 画像の隣の同名 JSON / テキストを読み取って表示</li>
       <li><strong>動画・音声の長さ表示</strong> — サムネイルの右下で長さを確認</li>
+      <li><strong>本のページ数表示</strong> — ZIP・PDF・画像だけのフォルダなどのページ数をサムネイルで確認</li>
       <li><strong>音楽のジャケット表示</strong> — 同名画像を優先し、MP3 は先頭 ID3v2 タグの埋め込み画像も一覧・mIV Remote に表示。音符・文字バッジ・マークなしを選択</li>
       <li><strong>動画タイルモード</strong> — 動画全体を等間隔サムネで一覧し、クリック位置から再生</li>
       <li><strong>VST3 プラグイン対応</strong> — 動画・音楽の音声を VST3 チェーンに通して分析・加工（別プロセスで隔離）</li>
@@ -1287,13 +1289,13 @@
     <h2>ダウンロード</h2>
     <div class="download-box" style="flex-direction:column; align-items:stretch;">
       <div class="download-info" style="text-align:center;">
-        <div class="version">mImageViewer v5.6.0</div>
-        <div class="meta">Windows 11（64bit） &nbsp;·&nbsp; 最終更新: 2026-11-23</div>
+        <div class="version">mImageViewer v5.7.0</div>
+        <div class="meta">Windows 11（64bit） &nbsp;·&nbsp; 最終更新: 2026-11-25</div>
       </div>
       <div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap;">
         <a class="btn-download" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_setup.exe">インストーラ版</a>
         <a class="btn-download" style="background:linear-gradient(135deg,#ffb0d9,#d63384);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mimageviewer.exe">単体 exe 版</a>
-        <a class="btn-download" style="background:linear-gradient(135deg,#7ee0c0,#1f9e7a);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_portable_v5.6.0.zip">ポータブル版（zip）</a>
+        <a class="btn-download" style="background:linear-gradient(135deg,#7ee0c0,#1f9e7a);" href="https://github.com/MikageSawatari/mimageviewer/releases/latest/download/mImageViewer_portable_v5.7.0.zip">ポータブル版（zip）</a>
       </div>
 
       <!-- Microsoft Store（副導線） -->

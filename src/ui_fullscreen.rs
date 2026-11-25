@@ -38241,7 +38241,7 @@ impl App {
         // 実効方向かを設定で選べる。Ctrl/Shift+左右などの明示コマンドは従来どおり
         // ページ表示の綴じ方向を使い、この設定へ巻き込まない。
         // 入力の左右は読み順で決める。ペア並び順 (`is_rtl`) は別の問い。
-        let page_rtl = self.spread_mode.advances_right_to_left();
+        let page_rtl = self.input_advances_right_to_left();
         let seek_bar_rtl = self
             .settings
             .fullscreen_seek_direction
@@ -41850,7 +41850,7 @@ impl App {
                         // resolver as FsPageNext/FsPagePrev.
                         let base = fullscreen_click_nav_delta_for_side(
                             left,
-                            self.spread_mode.advances_right_to_left(),
+                            self.input_advances_right_to_left(),
                         );
                         page_nav = self.spread_page_nav(base).into();
                         *navigation_operation = self
@@ -43259,7 +43259,7 @@ impl App {
                 FsCanvasClickAction::PageSide(fullscreen_click_nav_base_delta(
                     pos.x,
                     full_rect.center().x,
-                    self.spread_mode.advances_right_to_left(),
+                    self.input_advances_right_to_left(),
                 ))
             }
         }
@@ -48334,6 +48334,16 @@ impl App {
         self.adjust_spread_target = None;
         self.similar_panel.reset_info_target();
         true
+    }
+
+    /// 左右入力の前後を決める、現在の viewer context の実効読み方向。
+    /// 単ページなど方向を持たないモードでは、独立した読み方向の設定を使う。
+    /// 見開きのペア並び順や、シークバーに合わせるカーソル設定とは別の判定。
+    pub(crate) fn input_advances_right_to_left(&self) -> bool {
+        self.spread_mode
+            .canonical_reading_direction()
+            .unwrap_or(self.reading_direction)
+            == ReadingDirection::Rtl
     }
 
     pub(crate) fn set_reading_direction_for_fullscreen(
@@ -59228,13 +59238,9 @@ impl App {
             rotation,
             self.settings.bake_stage_export_batch,
         )?;
-        Ok(Some(crate::export_batch::BatchExportItem {
-            filename,
-            dirname,
-            source,
-            edits,
-            composition_check: self.output_composition_check(idx),
-        }))
+        let mut item = crate::export_batch::BatchExportItem::new(filename, dirname, source, edits);
+        item.composition_check = self.output_composition_check(idx);
+        Ok(Some(item))
     }
 
     /// スタックメンバー (集約ビューでは `items` に現れない実ファイル)。idx を持たない
@@ -59257,15 +59263,14 @@ impl App {
             rotation,
             self.settings.bake_stage_export_batch,
         )?;
-        Ok(crate::export_batch::BatchExportItem {
-            filename: crate::capture::basename_for_path(path),
-            dirname: Self::batch_export_dirname_for_path(path),
-            source: crate::books::CompositeSource::File {
+        Ok(crate::export_batch::BatchExportItem::new(
+            crate::capture::basename_for_path(path),
+            Self::batch_export_dirname_for_path(path),
+            crate::books::CompositeSource::File {
                 path: path.to_path_buf(),
             },
             edits,
-            composition_check: None,
-        })
+        ))
     }
 
     /// `<dirname>` に入る名前。ZIP 内画像と PDF ページは、書庫そのものではなく
@@ -59993,63 +59998,8 @@ impl App {
         let Some(pending) = self.export_pending.as_mut() else {
             return;
         };
-        let mut dismiss_finished = false;
-        let mut request_cancel = false;
-        let progress = if pending.total == 0 {
-            0.0
-        } else {
-            pending.done as f32 / pending.total as f32
-        };
-
-        // CLAUDE.md「ダイアログ (egui::Window)」: anchor() はドラッグ不可になるため
-        // 必ず default_pos() を使う。
-        let progress_default_pos = ctx.content_rect().center() - egui::vec2(190.0, 100.0);
-        egui::Window::new("エクスポート進行状況")
-            .drag_area(egui::WindowDrag::Anywhere)
-            .collapsible(false)
-            .resizable(false)
-            .default_pos(progress_default_pos)
-            .show(ctx, |ui| {
-                ui.set_min_width(380.0);
-                ui.label(&pending.last_message);
-                ui.add(
-                    egui::ProgressBar::new(progress)
-                        .show_percentage()
-                        .text(format!("{} / {}", pending.done, pending.total)),
-                );
-                if !pending.errors.is_empty() {
-                    ui.add_space(8.0);
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 140, 140),
-                        format!("{} 件のエラー", pending.errors.len()),
-                    );
-                    egui::ScrollArea::vertical()
-                        .scroll_source(egui::scroll_area::ScrollSource {
-                            drag: egui::scroll_area::DragScroll::Always,
-                            ..Default::default()
-                        })
-                        .max_height(120.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            for err in &pending.errors {
-                                ui.small(format!("{}: {}", err.label, err.message));
-                            }
-                        });
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if pending.finished {
-                        if ui.button("閉じる").clicked() {
-                            dismiss_finished = true;
-                        }
-                    } else if pending.cancel_requested {
-                        ui.add_enabled(false, egui::Button::new("キャンセル中..."));
-                    } else if ui.button("キャンセル").clicked() {
-                        request_cancel = true;
-                    }
-                });
-            });
-
+        let (dismiss_finished, request_cancel) =
+            crate::ui_dialogs::export_batch::draw_progress_window(ctx, pending);
         if request_cancel {
             pending.cancel_requested = true;
             pending
@@ -60091,37 +60041,44 @@ impl App {
                     pending.last_message = format!("保存に失敗: {}", err.label);
                     pending.errors.push(err);
                 }
+                Ok(crate::export_dialog::ExportEvent::Skipped { label, path }) => {
+                    pending.done = pending.done.saturating_add(1);
+                    pending.last_message = format!("スキップしました: {label}");
+                    pending
+                        .skipped
+                        .push(crate::export_dialog::ExportSuccess { label, path });
+                }
+                Ok(crate::export_dialog::ExportEvent::ThumbnailNotice { label, path, kinds }) => {
+                    pending
+                        .thumbnail_notices
+                        .push(crate::export_dialog::ExportThumbnailNotice { label, path, kinds });
+                }
                 Ok(crate::export_dialog::ExportEvent::Cancelled) => {
-                    toast = Some("エクスポートをキャンセルしました".to_string());
-                    // キャンセル時も既に書き出されたファイルがあれば refresh
-                    if !pending.successes.is_empty() {
-                        refresh_after_done = true;
+                    pending.end = Some(crate::export_dialog::ExportEnd::Cancelled);
+                    refresh_after_done = true;
+                    if pending.thumbnail_notices.is_empty() {
+                        toast = Some("エクスポートをキャンセルしました".to_string());
+                        clear_pending = true;
+                    } else {
+                        pending.last_message = export_end_summary(pending);
                     }
-                    clear_pending = true;
                     break;
                 }
                 Ok(crate::export_dialog::ExportEvent::AllDone) => {
-                    pending.finished = true;
-                    // batch 完了時にまとめて 1 回 refresh
-                    if !pending.successes.is_empty() {
-                        refresh_after_done = true;
-                    }
-                    if pending.errors.is_empty() {
-                        if pending.successes.len() == 1 {
+                    pending.end = Some(crate::export_dialog::ExportEnd::Done);
+                    refresh_after_done = true;
+                    if !pending.thumbnail_notices.is_empty() || !pending.errors.is_empty() {
+                        pending.last_message = export_end_summary(pending);
+                    } else {
+                        if pending.skipped.is_empty() && pending.successes.len() == 1 {
                             reveal_path = pending.successes.first().map(|s| s.path.clone());
                         } else {
-                            toast = Some(format!(
-                                "{} 件をエクスポートしました",
-                                pending.successes.len()
+                            toast = Some(export_done_message(
+                                pending.successes.len(),
+                                pending.skipped.len(),
                             ));
                         }
                         clear_pending = true;
-                    } else {
-                        pending.last_message = format!(
-                            "完了: 成功 {} / 失敗 {}",
-                            pending.successes.len(),
-                            pending.errors.len()
-                        );
                     }
                     break;
                 }
@@ -60130,8 +60087,8 @@ impl App {
                     // AllDone を既に受け取り済み (= worker は正常終了) の場合は、
                     // ここで「中断されました」toast を出すと AllDone エラー集計の
                     // 進捗ダイアログを 1 フレで上書きしてしまう。
-                    // finished が立っていればダイアログ表示を維持する。
-                    if !pending.finished {
+                    // 終了状態があればダイアログ表示を維持する。
+                    if pending.end.is_none() {
                         toast = Some("エクスポート worker が中断されました".to_string());
                         clear_pending = true;
                     }
@@ -60140,13 +60097,22 @@ impl App {
             }
         }
 
-        // 完了 (AllDone / Cancelled) で書き出されたファイルの parent をまとめて 1 件
-        // pending に積む。複数 success path はすべて同じ output_dir なので、最初の
-        // 成功 path だけを渡せば十分。
+        // Same-as-source can write into multiple folders. Refresh the displayed one once.
         let first_success_path = if refresh_after_done {
-            self.export_pending
-                .as_ref()
-                .and_then(|p| p.successes.first().map(|s| s.path.clone()))
+            let current = self.current_favorite_target();
+            self.export_pending.as_ref().and_then(|p| {
+                p.successes
+                    .iter()
+                    .find(|success| {
+                        current.as_ref().is_some_and(|current| {
+                            success
+                                .path
+                                .parent()
+                                .is_some_and(|parent| crate::folder_tree::path_eq(parent, current))
+                        })
+                    })
+                    .map(|success| success.path.clone())
+            })
         } else {
             None
         };
@@ -100924,6 +100890,259 @@ pub(crate) mod page_turn_submission_tests {
         }
     }
 
+    fn reading_direction_app(
+        ctx: &egui::Context,
+        mode: SpreadMode,
+        direction: ReadingDirection,
+        current: usize,
+    ) -> crate::app::AppTestEnvForTest {
+        let mut app = ready_app(ctx, mode);
+        app.settings.page_turn_animation_enabled = false;
+        assert_eq!(
+            app.settings.fullscreen_horizontal_cursor_direction,
+            crate::settings::FullscreenHorizontalCursorDirection::FollowPage
+        );
+        app.reading_direction = direction;
+        app.fullscreen_idx = Some(current);
+        app.selected = Some(current);
+        app
+    }
+
+    #[test]
+    fn input_direction_uses_each_spread_mode_or_the_viewer_reading_direction() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        for (mode, expected) in [
+            (SpreadMode::Single, [false, true]),
+            (SpreadMode::Vertical, [false, true]),
+            (SpreadMode::Ltr, [false, false]),
+            (SpreadMode::LtrCover, [false, false]),
+            (SpreadMode::Rtl, [true, true]),
+            (SpreadMode::RtlCover, [true, true]),
+            (SpreadMode::SplitLtr, [false, false]),
+            (SpreadMode::SplitRtl, [true, true]),
+        ] {
+            app.spread_mode = mode;
+            for (direction, expected) in [ReadingDirection::Ltr, ReadingDirection::Rtl]
+                .into_iter()
+                .zip(expected)
+            {
+                app.reading_direction = direction;
+                assert_eq!(
+                    app.input_advances_right_to_left(),
+                    expected,
+                    "{mode:?} {direction:?}"
+                );
+            }
+        }
+    }
+
+    fn reading_direction_key(app: &mut App, ctx: &egui::Context, key: egui::Key) {
+        let mut release = pressed(key);
+        if let egui::Event::Key { pressed, .. } = &mut release {
+            *pressed = false;
+        }
+        frame_with_events(ctx, vec![pressed(key), release], |ctx| {
+            crate::keyboard_input::cache_keyboard_owner(
+                ctx,
+                crate::keyboard_input::KeyboardOwner::ApplicationShortcut {
+                    scope: crate::keyboard_input::ShortcutScope::new(
+                        ctx.viewport_id(),
+                        crate::keyboard_input::ShortcutSurface::Fullscreen,
+                    ),
+                },
+            );
+            let current = app.fullscreen_idx.unwrap();
+            let mut operation = None;
+            let action = app.handle_fs_key_input_with_operation(
+                ctx,
+                current,
+                app.spread_mode.is_spread(),
+                &mut operation,
+            );
+            app.handle_fs_navigation_with_operation(
+                ctx,
+                action.close,
+                action.close_to_page_list,
+                action.ctrl_nav,
+                action.sibling_nav,
+                action.mouse_nav,
+                action.page_nav,
+                action.jump_to,
+                current,
+                operation,
+            );
+        });
+    }
+
+    #[test]
+    fn single_rtl_arrow_right_goes_to_previous_page() {
+        let ctx = egui::Context::default();
+        let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Rtl, 1);
+        reading_direction_key(&mut app, &ctx, egui::Key::ArrowRight);
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+
+    #[test]
+    fn single_rtl_arrow_left_goes_to_next_page() {
+        let ctx = egui::Context::default();
+        let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Rtl, 1);
+        reading_direction_key(&mut app, &ctx, egui::Key::ArrowLeft);
+        assert_eq!(app.fullscreen_idx, Some(2));
+    }
+
+    #[test]
+    fn single_ltr_arrow_right_still_goes_to_next_page() {
+        let ctx = egui::Context::default();
+        let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Ltr, 1);
+        reading_direction_key(&mut app, &ctx, egui::Key::ArrowRight);
+        assert_eq!(app.fullscreen_idx, Some(2));
+    }
+
+    #[test]
+    fn single_rtl_arrow_right_can_still_follow_a_left_to_right_seek_bar() {
+        let ctx = egui::Context::default();
+        let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Rtl, 1);
+        app.settings.fullscreen_horizontal_cursor_direction =
+            crate::settings::FullscreenHorizontalCursorDirection::FollowSeekBar;
+        app.settings.fullscreen_seek_direction =
+            crate::settings::FullscreenSeekDirection::LeftToRight;
+        reading_direction_key(&mut app, &ctx, egui::Key::ArrowRight);
+        assert_eq!(app.fullscreen_idx, Some(2));
+    }
+
+    #[test]
+    fn rtl_spread_arrow_right_still_goes_to_previous_spread() {
+        let ctx = egui::Context::default();
+        // The spread's own direction takes precedence over the Single-mode direction.
+        let mut app = reading_direction_app(&ctx, SpreadMode::Rtl, ReadingDirection::Ltr, 2);
+        reading_direction_key(&mut app, &ctx, egui::Key::ArrowRight);
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+
+    #[test]
+    fn single_reading_direction_key_flips_arrow_right_navigation() {
+        let ctx = egui::Context::default();
+        let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Ltr, 1);
+        // Inspect the handler's requests at a fixed middle page so display-readiness
+        // waits from a preceding navigation do not become part of this state test.
+        for (key, direction, expected_nav) in [
+            (
+                egui::Key::ArrowRight,
+                ReadingDirection::Ltr,
+                FsPageNav::Delta(1),
+            ),
+            (egui::Key::Num7, ReadingDirection::Rtl, FsPageNav::None),
+            (
+                egui::Key::ArrowRight,
+                ReadingDirection::Rtl,
+                FsPageNav::Delta(-1),
+            ),
+            (egui::Key::Num7, ReadingDirection::Ltr, FsPageNav::None),
+            (
+                egui::Key::ArrowRight,
+                ReadingDirection::Ltr,
+                FsPageNav::Delta(1),
+            ),
+        ] {
+            let mut release = pressed(key);
+            if let egui::Event::Key { pressed, .. } = &mut release {
+                *pressed = false;
+            }
+            frame_with_events(&ctx, vec![pressed(key), release], |ctx| {
+                crate::keyboard_input::cache_keyboard_owner(
+                    ctx,
+                    crate::keyboard_input::KeyboardOwner::ApplicationShortcut {
+                        scope: crate::keyboard_input::ShortcutScope::new(
+                            ctx.viewport_id(),
+                            crate::keyboard_input::ShortcutSurface::Fullscreen,
+                        ),
+                    },
+                );
+                let action = app.handle_fs_key_input(ctx, 1, false);
+                assert_eq!(app.spread_mode, SpreadMode::Single);
+                assert_eq!(app.reading_direction, direction, "key={key:?}");
+                assert_eq!(action.page_nav, expected_nav, "key={key:?}");
+                assert_eq!(app.fullscreen_idx, Some(1));
+            });
+        }
+    }
+
+    fn single_rtl_canvas_click(pos: egui::Pos2, expected: usize) {
+        let ctx = egui::Context::default();
+        install_fs_navigator_input_tracking(&ctx);
+        let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Rtl, 1);
+        app.settings.fullscreen_primary_click =
+            crate::settings::FullscreenPrimaryClickMode::PageTurn;
+        app.settings.touch_still_chrome_learned = true;
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+        // Use the begin-pass tracking and full-rect CentralPanel setup from
+        // fullscreen_right_drag_left_cancel_consumes_release_and_keeps_normal_click.
+        // Establish the backing widget, then drive an actual press/release through
+        // the fullscreen canvas handler, rather than supplying its RTL argument.
+        for frame in 0..3 {
+            let mut events = vec![egui::Event::PointerMoved(pos)];
+            if frame > 0 {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: frame == 1,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            app.frame_counter += 1;
+            ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    time: Some(frame as f64 * 0.05),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().frame(egui::Frame::NONE).show(root_ui, |ui| {
+                            let state = app.prepare_fullscreen_state(ctx, 1, FsPageTurnDecision::normal());
+                            let (nav, close) = app.handle_fs_wheel_and_click_with_geometry(
+                                ui,
+                                ctx,
+                                rect,
+                                &state,
+                                StillSeekGeometry::bar_only(),
+                                false,
+                                0,
+                                &mut None,
+                                None,
+                                false,
+                            );
+                            assert!(!close);
+                            if frame < 2 {
+                                assert!(nav.is_none());
+                            } else {
+                                assert_eq!(nav, FsPageNav::Delta(expected as i32 - 1),
+                                    "the released click must follow Single-mode RTL reading direction");
+                                app.handle_fs_navigation(
+                                    ctx, false, false, None, None, None, nav, None, 1,
+                                );
+                            }
+                        });
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(app.fullscreen_idx, Some(expected));
+    }
+
+    #[test]
+    fn single_rtl_right_canvas_click_goes_to_previous_page() {
+        single_rtl_canvas_click(egui::pos2(450.0, 200.0), 0);
+    }
+
+    #[test]
+    fn single_rtl_left_canvas_click_goes_to_next_page() {
+        single_rtl_canvas_click(egui::pos2(150.0, 200.0), 2);
+    }
+
     #[test]
     fn page_turn_actual_navigation_waits_for_adopted_flat_then_bookmark_uses_new_page() {
         #[cfg(windows)]
@@ -103776,3 +103995,25 @@ mod manual_nav_wrap_tests;
 
 #[cfg(all(test, windows))]
 mod conceal_preview_tests;
+
+fn export_end_summary(pending: &crate::export_dialog::ExportPending) -> String {
+    let heading = if pending.end == Some(crate::export_dialog::ExportEnd::Cancelled) {
+        "キャンセルしました"
+    } else {
+        "完了"
+    };
+    format!(
+        "{heading}: 成功 {} / スキップ {} / 失敗 {}",
+        pending.successes.len(),
+        pending.skipped.len(),
+        pending.errors.len()
+    )
+}
+
+fn export_done_message(success: usize, skipped: usize) -> String {
+    match (success, skipped) {
+        (_, 0) => format!("{success} 件をエクスポートしました"),
+        (0, _) => format!("既にある {skipped} 件をスキップしました (書き出した画像はありません)"),
+        _ => format!("{success} 件をエクスポートしました (既にある {skipped} 件はスキップ)"),
+    }
+}

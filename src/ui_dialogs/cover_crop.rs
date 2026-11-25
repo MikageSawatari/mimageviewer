@@ -13,6 +13,8 @@ use crate::app::book_cover::{
     resolve_logical_book_cover,
 };
 use crate::context_menu_model::ContextMenuActionState;
+#[cfg(test)]
+use crate::cover_auto_crop::CoverAutoCropScope;
 use crate::export_crop::{CropHandle, CropRect};
 use crate::folder_thumb_pins::{CoverCrop, FolderPin, FolderPinSource};
 use crate::grid_item::GridItem;
@@ -488,6 +490,7 @@ fn prepare_cover_inner(
     cancel: &Arc<AtomicBool>,
 ) -> Result<PreparedCover, String> {
     use crate::thumb_loader::ReadLocation;
+    let configured_auto_crop = env.cover_auto_crop_scope.identity_for(&container.path);
     let cover = match resolve_logical_book_cover(container, source, env) {
         BookCover::Readable(cover) => cover,
         BookCover::VideoFrame { .. } => return Err("動画は範囲を指定できません".into()),
@@ -520,7 +523,7 @@ fn prepare_cover_inner(
     let image = match &cover.location {
         ReadLocation::File(path)
             if cover.cover_crop.is_none()
-                && env.auto_cover_crop.is_some()
+                && configured_auto_crop.is_some()
                 && (container.kind != BookKind::Folder || cover.auto_cover_crop.is_ok())
                 && path
                     .extension()
@@ -646,7 +649,7 @@ fn prepare_cover_inner(
                 .is_some()
             });
     let auto_detection = if let Some(stop) =
-        AutoStop::for_source(&cover.auto_cover_crop, env.auto_cover_crop.is_some())
+        AutoStop::for_source(&cover.auto_cover_crop, configured_auto_crop.is_some())
     {
         AutoDetection::Stopped(stop)
     } else if has_edit_preview {
@@ -1383,8 +1386,10 @@ mod tests {
         let env = BookCoverEnv {
             books_root: Some(app.tmp.path().join("unused-books")),
             pin_db: Some(db.clone()),
-            auto_cover_crop: Some(crate::cover_auto_crop::AutoCropIdentity::new(
-                crate::settings::ReadingDirection::Rtl,
+            cover_auto_crop_scope: CoverAutoCropScope::for_identity(Some(
+                crate::cover_auto_crop::AutoCropIdentity::new(
+                    crate::settings::ReadingDirection::Rtl,
+                ),
             )),
             ..Default::default()
         };
@@ -1449,7 +1454,7 @@ mod tests {
             crate::folder_thumb_pins::PinKeyMode::Exact,
             None,
         );
-        request.set_auto_cover_crop(env.auto_cover_crop);
+        request.set_auto_cover_crop(env.cover_auto_crop_scope.identity_for(&container.path));
         let key = request.cache_key_override.as_deref().unwrap();
         assert!(key.starts_with("archivethumb:rar:jacket.rar#pin:"), "{key}");
         assert!(!key.contains("|autocrop:"), "manual crop wins: {key}");

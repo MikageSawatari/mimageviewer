@@ -4,9 +4,9 @@
 
 `startup-open-resolve` は既存 pending 一つで、明示の起動入力と既定の場所の typed input を扱う。
 worker が known-folder 解決・祖先探索・分類・要求ファイルの準備を済ませ、main の Directory なら同じ cancel token で
-走査と長さ順の材料収集まで行う。ツリーと共有する `FolderScanPolicy` は在メモリ設定と Susie の公開拡張子世代を控える。
-Susie は pool と世代を同じ短い publication lock 内で公開し、旧 pool の終了は lock 外で行う。
-worker は世代を走査の前後で照合する。root poll は設定不一致・混在結果を採らず、pending を take する前に
+走査と長さ・ページ数順の材料収集まで行う。ツリーと共有する `FolderScanPolicy` は在メモリ設定・ページ数の事実の fingerprint と Susie の pool revision を控える。
+Susie は `PoolState` の pool と revision を同じ短い publication lock 内で公開し、旧 pool の終了は lock 外で行う。
+worker は revision を走査の前後で照合する。root poll は設定不一致・混在結果を採らず、pending を take する前に
 走査だけの worker を出して受信口を交換する。元の resolved payload、requested lease、owner/navigation、held activation、
 cancel token、診断 span、走査の段階の開始時刻をすべて保持し、受付や解決を繰り返さない。
 atomic 一つの走査開始時刻を `main_startup_scan_elapsed()` が main 投影・detached lease 不在とともに読む。
@@ -41,6 +41,16 @@ take / 戻しでは番号を保ち、後から作られた新規フォルダ・�
 `shell_paste/submit` の `origin`、`shell_paste/end` の `origin`・`ms`・`outcome` は perf 有効時だけ記録する。
 通常の呼び出し失敗はログ、開始失敗と受信口切断はログと通知で終端し、再試行しない。
 詳細は [設計書 §2・実装の記録](ui-sync-853-plan.md)。コンパイル・Rust テスト・実 Shell 検証は未実施。
+
+## 一括エクスポートの透かし（§1.362 段 B、検証待ち）
+
+`ctrl-e-batch-export` worker は開始時に透かしのフォントまたはロゴを 1 回読む。
+素材の読み込みに失敗した場合は全項目を同じ理由で失敗にし、出力を作らない。
+画像の縮小結果は直前の寸法について 1 件だけ保持し、リサイズ後に straight RGBA へ合成して保存する。
+ダイアログの `logo_check` はパスと `Pending(Receiver)` / Found / Missing / Unsupported の組を 1 つ持つ。
+存在確認だけを短命 `export-logo-check` スレッドの metadata 1 回で行い、専用 channel で結果を返す。
+確認の開始ごとに receiver を置き換え、閉じると破棄する。スレッドの join や UI の待機はしない。
+worker は最後に実際の画像を読み、事前確認後の削除も全件失敗として扱う。
 
 ## フォルダ変更中の囲い（§1.858 B、段1・検証待ち）
 

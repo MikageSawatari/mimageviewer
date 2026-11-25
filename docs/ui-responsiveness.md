@@ -32,6 +32,21 @@ AI 側の読取り・コンパイル・結果待ちは agent worker に留める
 既存の `open_with::shell_execute_open` を表示ありで使う。反映はスタック表示の開き直し・フォルダ再読込を使い、
 表示中のスタックのライブ再構成や専用 repaint は足さない。
 
+## 本のページ数バッジとページ数順 (§1.883)
+
+サムネイルのページ数は可視 + 先読み範囲だけを既存 details-meta worker で数え、
+既存 catalog の記録を再利用する。UI は最後のメモリ値を読むだけで I/O をしない。
+判定設定の fingerprint と EPUB の一覧世代は取り直しだけに使い、その間も最後の値を表示する。
+Susie のプール差し替えでは旧 session を破棄して NotRequested に戻し、完了の証明は立てない。
+RAR と画像フォルダの走査にも job の取消を伝える。
+ZipDir の数は build / project 時に集計済みの ZipTree ノードが所有し、UI では prefix の深さだけで読む。
+ZipDir は取得需要にも worker target にも含めない。
+ページ数順は表示設定と独立した全件要件を既存 worker / proof へ渡し、取得後も自動整列せず更新・再選択で並べ直す。
+catalog facts は必要な worker 走査だけで長さと同じ read-only 接続から読み、UI は stamp / fingerprint の合うメモリまたは準備済み snapshot だけを使う。
+`details_meta/load_done`・`load_cancelled` の種類別ページ数件数と cache hit・失敗・ms、
+200 ms 以上の `page_count_slow` と `listing/page_count_facts` で費用を確認できる。
+段 2 の実測・cargo 検証は設計担当の実施待ち。
+
 ## 一覧の動画・音声長さ順と絞り込み (§1.762)
 
 一覧は分かっている長さだけで直ちに並べ、長さの取得を待たない。後着の長さで自動では
@@ -653,6 +668,31 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 ---
 
 ## 4. 新機能追加時のチェックリスト
+
+§1.362 段 A の一括エクスポートは、出力先の作成・正規化・衝突判定、元の日時、
+デコード・編集合成・リサイズ・メタデータ検査・エンコード・書き込みを既存の専用workerに置く。
+UI準備に足した情報はsource_dir/source_extのパス・文字列演算だけ。
+既存の6ms予算で読む編集snapshot、保存先初期候補のis_dir確認、開始操作のsettings.saveは既存経路を維持する。
+新しい待機・UIのファイル読込・デコード・GPU操作は追加しない。
+取消tokenはデコードと合成へ引き継ぎ、書込前に確認する。`export_batch/prepare` と
+`export_batch/item` に準備、各処理区間、寸法・形式・結果を記録する。
+終了結果のpollは非blockingで、警告付き終了を保持しても一覧更新は終端採用時の1回だけ。
+自動検証・実機操作・性能測定は未実施で、設計担当の共有runnerへ引き継ぐ。
+
+段 B の透かしも同じ一括 worker が所有する。フォント・ロゴは開始時に 1 回読み、
+ロゴのデコード、アルファを考慮した縮小、文字描画と straight RGBA 合成は UI から呼ばない。
+同寸法のロゴは直前の縮小結果を再利用し、`export_batch/item` の `watermark_ms` に合成区間を記録する。
+素材読み込みは `export_batch/prepare` の時間に含む。UI の拡張子確認は文字列演算だけで、
+存在確認の metadata は短命 `export-logo-check` スレッドに置く。ダイアログの `logo_check` は
+確認ごとの専用 receiver を 1 つだけ持ち、選び直しや閉じる操作で旧 receiver を捨てる。
+UI は try_recv だけで採用し、確認中も開始可能。画像の実読込は worker が開始時に行う。
+段 B のコンパイル・自動テスト・実機確認は未実行。共有 runner での検証に引き継ぐ。
+
+段 C のプリセット呼び出しは `BatchExportOptions` の clone だけで、画像の透かしなら
+既存の `begin_logo_check` で確認ごとの receiver を置き換える。保存・削除の明示操作だけは
+設計書 §8 のとおり既存の設定保存経路 `Settings::save_checked()` を同期で呼ぶ。
+専用の書き込み worker や待機は追加せず、失敗はログと通知に残しメモリ上の変更を保持する。
+段 C のコンパイル・自動テスト・snapshot PNG の生成は共有 runner へ引き継ぐ (実装担当では未実行)。
 
 Ctrl+S / Ctrl+T（案 C）の最終列に対応する読書位置索引は検索workerで準備し、
 `search / page_identity_prepare` に `surface`・`items`・`ms` を記録する。

@@ -136,6 +136,7 @@ pub fn draw_container_type_icon_snapshot_fixture(ui: &mut egui::Ui) {
                         false,
                         None,
                         None,
+                        None,
                         false,
                         Default::default(),
                         true,

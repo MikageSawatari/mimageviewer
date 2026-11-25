@@ -301,6 +301,7 @@ pub use ui_dialogs::preferences::draw_diagnostics_export_snapshot_fixture;
 pub mod depth_export;
 pub mod depth_parallax;
 pub mod depth_parallax_wgpu;
+pub(crate) mod focus_debug;
 mod fs_exclusive_view;
 mod manual_mask_tools;
 pub mod margin_fit;

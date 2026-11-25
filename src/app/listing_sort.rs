@@ -3,10 +3,13 @@
 use super::book_materialization::ProjectionRecipe;
 use super::top_level_grid_view::TopLevelGridSurface;
 use super::{App, GridSortLockReason};
-use crate::settings::SortOrder;
+use crate::settings::{LazyMetric, SortOrder};
 
 pub(crate) const DURATION_SORT_UNSUPPORTED: &str =
     "この一覧では長さ順を使えません。詳細表示の長さ列で並べ替えられます";
+
+pub(crate) const PAGE_COUNT_SORT_UNSUPPORTED: &str =
+    "この一覧ではページ数順を使えません。詳細表示のページ数列で並べ替えられます";
 
 pub(crate) struct ListingSortContext<'a> {
     pub(crate) surface: &'a TopLevelGridSurface,
@@ -19,7 +22,7 @@ pub(crate) struct ListingSortContext<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ListingSortCapabilities {
-    pub(crate) duration_allowed: bool,
+    pub(crate) lazy_metric_allowed: bool,
     pub(crate) sort_locked_reason: Option<GridSortLockReason>,
     rating_disabled_reason: Option<&'static str>,
 }
@@ -28,8 +31,11 @@ impl ListingSortCapabilities {
     pub(crate) fn disabled_reason(self, order: SortOrder) -> Option<&'static str> {
         if let Some(reason) = self.sort_locked_reason {
             Some(reason.tooltip())
-        } else if order.is_duration() && !self.duration_allowed {
-            Some(DURATION_SORT_UNSUPPORTED)
+        } else if let Some(metric) = order.lazy_metric().filter(|_| !self.lazy_metric_allowed) {
+            Some(match metric {
+                LazyMetric::Duration => DURATION_SORT_UNSUPPORTED,
+                LazyMetric::PageCount => PAGE_COUNT_SORT_UNSUPPORTED,
+            })
         } else if order.is_rating() {
             self.rating_disabled_reason
         } else {
@@ -38,32 +44,32 @@ impl ListingSortCapabilities {
     }
 
     /// Header sorting can own presentation without changing the underlying rows.
-    /// Only unsupported duration requests are normalized at producer boundaries.
+    /// Only unsupported lazy metric requests are normalized at producer boundaries.
     pub(crate) fn effective_order(self, order: SortOrder) -> SortOrder {
-        if !self.duration_allowed {
-            without_duration_order(order)
+        if !self.lazy_metric_allowed {
+            without_lazy_metric_order(order)
         } else {
             order
         }
     }
 }
 
-/// Captured requests for aggregate listings and Remote cannot acquire duration facts.
+/// Captured requests for aggregate listings and Remote cannot acquire lazy metric facts.
 /// Keep their existing order policy, normalizing only the unsupported new variants.
-pub(crate) fn without_duration_order(order: SortOrder) -> SortOrder {
-    if order.is_duration() {
+pub(crate) fn without_lazy_metric_order(order: SortOrder) -> SortOrder {
+    if order.lazy_metric().is_some() {
         SortOrder::FileName
     } else {
         order
     }
 }
 
-pub(crate) fn without_duration_request(
+pub(crate) fn without_lazy_metric_request(
     request: crate::rating_sort::ListingOrderRequest,
 ) -> crate::rating_sort::ListingOrderRequest {
     match request {
         crate::rating_sort::ListingOrderRequest::Standard(order) => {
-            crate::rating_sort::ListingOrderRequest::Standard(without_duration_order(order))
+            crate::rating_sort::ListingOrderRequest::Standard(without_lazy_metric_order(order))
         }
         request => request,
     }
@@ -72,7 +78,7 @@ pub(crate) fn without_duration_request(
 pub(crate) fn listing_sort_capabilities(
     context: ListingSortContext<'_>,
 ) -> ListingSortCapabilities {
-    let duration_allowed = matches!(context.surface, TopLevelGridSurface::Folder)
+    let lazy_metric_allowed = matches!(context.surface, TopLevelGridSurface::Folder)
         && matches!(context.recipe, ProjectionRecipe::OrdinaryList)
         && !context.page_order_locked
         && !context.collection_root;
@@ -93,7 +99,7 @@ pub(crate) fn listing_sort_capabilities(
         None
     };
     ListingSortCapabilities {
-        duration_allowed,
+        lazy_metric_allowed,
         sort_locked_reason,
         rating_disabled_reason,
     }
@@ -174,15 +180,33 @@ mod tests {
         ] {
             let result = capabilities(&surface);
             let supported = matches!(surface, TopLevelGridSurface::Folder);
-            assert_eq!(result.duration_allowed, supported);
-            assert_eq!(
-                result.effective_order(SortOrder::DurationDesc),
-                if supported {
-                    SortOrder::DurationDesc
-                } else {
-                    SortOrder::FileName
-                }
-            );
+            assert_eq!(result.lazy_metric_allowed, supported);
+            for order in [
+                SortOrder::DurationAsc,
+                SortOrder::DurationDesc,
+                SortOrder::PageCountAsc,
+                SortOrder::PageCountDesc,
+            ] {
+                assert_eq!(
+                    result.effective_order(order),
+                    if supported {
+                        order
+                    } else {
+                        SortOrder::FileName
+                    }
+                );
+                assert_eq!(
+                    result.disabled_reason(order),
+                    if supported {
+                        None
+                    } else {
+                        Some(match order.lazy_metric().unwrap() {
+                            LazyMetric::Duration => DURATION_SORT_UNSUPPORTED,
+                            LazyMetric::PageCount => PAGE_COUNT_SORT_UNSUPPORTED,
+                        })
+                    }
+                );
+            }
             assert_eq!(
                 result.effective_order(SortOrder::SizeAsc),
                 SortOrder::SizeAsc
@@ -205,10 +229,14 @@ mod tests {
                 collection_root: false,
                 existing_lock: None,
             });
-            assert!(!result.duration_allowed);
+            assert!(!result.lazy_metric_allowed);
             assert_eq!(
                 result.disabled_reason(SortOrder::DurationAsc),
                 Some(DURATION_SORT_UNSUPPORTED)
+            );
+            assert_eq!(
+                result.disabled_reason(SortOrder::PageCountAsc),
+                Some(PAGE_COUNT_SORT_UNSUPPORTED)
             );
         }
     }
@@ -227,7 +255,7 @@ mod tests {
             result.sort_locked_reason,
             Some(GridSortLockReason::FixedOrder)
         );
-        assert!(!result.duration_allowed);
+        assert!(!result.lazy_metric_allowed);
         assert_eq!(
             result.disabled_reason(SortOrder::SizeAsc),
             Some(GridSortLockReason::FixedOrder.tooltip())
@@ -235,12 +263,16 @@ mod tests {
         let mut result = capabilities(&TopLevelGridSurface::Folder);
         result.sort_locked_reason = Some(GridSortLockReason::DetailsHeaderSort);
         assert!(
-            result.duration_allowed,
+            result.lazy_metric_allowed,
             "a header sort must not alter row producer capabilities"
         );
         assert_eq!(
             result.effective_order(SortOrder::DurationAsc),
             SortOrder::DurationAsc
+        );
+        assert_eq!(
+            result.effective_order(SortOrder::PageCountAsc),
+            SortOrder::PageCountAsc
         );
         let result = listing_sort_capabilities(ListingSortContext {
             surface: &TopLevelGridSurface::Folder,
@@ -254,6 +286,10 @@ mod tests {
             result.disabled_reason(SortOrder::RatingDesc),
             Some("コレクションでは評価順を使えません。手動の並べ替えで順番を変えられます")
         );
+        assert_eq!(
+            result.disabled_reason(SortOrder::PageCountDesc),
+            Some(PAGE_COUNT_SORT_UNSUPPORTED)
+        );
     }
 
     #[test]
@@ -261,8 +297,8 @@ mod tests {
         use crate::rating_sort::ListingOrderRequest;
         for order in SortOrder::all() {
             let request = ListingOrderRequest::from_sort(*order, Default::default());
-            let effective = without_duration_request(request);
-            if order.is_duration() {
+            let effective = without_lazy_metric_request(request);
+            if order.lazy_metric().is_some() {
                 assert_eq!(
                     effective,
                     ListingOrderRequest::Standard(SortOrder::FileName)

@@ -3,14 +3,17 @@ use super::*;
 use crate::app::duration_metadata::{ListingMetaRequirements, ListingMetaScanProof};
 
 const LENGTHS: ListingMetaRequirements = ListingMetaRequirements {
+    page_count: false,
     duration: true,
     ai: false,
 };
 const AI: ListingMetaRequirements = ListingMetaRequirements {
+    page_count: false,
     duration: false,
     ai: true,
 };
 const BOTH: ListingMetaRequirements = ListingMetaRequirements {
+    page_count: false,
     duration: true,
     ai: true,
 };
@@ -348,27 +351,26 @@ fn facet_835_empty_and_all_cache_completion_store_ai_in_integrated_proof() {
     assert!(proof.matches(&app));
 }
 
-fn add_warm_zip_page_count(app: &mut App, zip_path: PathBuf) -> usize {
-    let entries = ["book.zip/001.jpg", "book.zip/002.jpg", "book.zip/003.jpg"]
-        .into_iter()
-        .map(|entry_name| crate::zip_loader::ZipImageEntry {
-            entry_name: entry_name.to_owned(),
-            uncompressed_size: 100,
-            mtime: 100,
-            container_ancestry: Vec::new(),
-        })
-        .collect();
-    let tree = Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
-    let (warm_items, warm_metas) =
-        tree.materialize_level(&[], crate::settings::SortOrder::FileName);
-    assert_eq!(warm_items.len(), 1);
+fn add_zip_page_count(app: &mut App, zip_path: PathBuf) -> usize {
+    use std::io::Write as _;
+
+    // ZipDir reads its tree directly; use a real ZIP to exercise the worker's
+    // visible-stage Item / Finished lifecycle after the AI proof is published.
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    for name in ["001.jpg", "002.jpg", "003.jpg"] {
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"page-count only; decoding is unnecessary")
+            .unwrap();
+    }
+    zip.finish().unwrap();
+    let stamp = crate::catalog::media_source_identity(&zip_path).unwrap();
     let idx = app.items.len();
     let mut items = app.items.clone();
-    items.extend(warm_items);
+    items.push(GridItem::ZipFile(zip_path));
     let mut metas = app.image_metas.clone();
-    metas.extend(warm_metas);
+    metas.push(Some(stamp));
     app.install_new_items(items, metas);
-    app.zip_nav = Some(crate::zip_tree::ZipNavState::new(tree));
     app.rebuild_visible_indices();
     app.details_tag_prewarm_indices = vec![0];
     idx
@@ -377,8 +379,9 @@ fn add_warm_zip_page_count(app: &mut App, zip_path: PathBuf) -> usize {
 fn ai_with_staged_columns(details: bool) {
     let mut app = real_images();
     let page_idx = if details {
-        let zip_path = app.tmp.path().join("memory-only.zip");
-        Some(add_warm_zip_page_count(&mut app, zip_path))
+        assert!(crate::catalog::default_cache_dir().starts_with(app.tmp.path()));
+        let zip_path = app.tmp.path().join("visible-page-count.zip");
+        Some(add_zip_page_count(&mut app, zip_path))
     } else {
         None
     };
@@ -413,9 +416,13 @@ fn ai_with_staged_columns(details: bool) {
     assert!(app.details_image_dims_state.is_ready());
 
     if let Some(page_idx) = page_idx {
-        // A real new visible range uses the warm ZipTree worker, after AI has
+        // A real new visible range counts the temporary ZIP, after AI has
         // proved the listing. It must not be repeatedly canceled for lacking a
         // whole-listing snapshot of its own.
+        assert!(
+            app.details_lazy_meta_for_idx(page_idx)
+                .is_none_or(|meta| !meta.page_count_checked)
+        );
         app.details_tag_prewarm_indices = vec![page_idx];
         assert!(app.details_visible_stage_needs_load());
         app.reconcile_details_lazy_session_after_grid(&ctx);

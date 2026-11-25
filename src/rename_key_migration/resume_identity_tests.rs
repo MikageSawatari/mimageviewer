@@ -12,11 +12,11 @@ use crate::{
     grid_item::GridItem,
 };
 
-const SAVED_PAGE: usize = 2;
-const PAGE_COUNT: usize = 4;
+pub(crate) const SAVED_PAGE: usize = 2;
+pub(crate) const PAGE_COUNT: usize = 4;
 
 // Use the same pure worker materializers as book open; no image decoding or GUI.
-fn archive_pages(backing: &Path, prefix: &[String]) -> Vec<GridItem> {
+pub(crate) fn archive_pages(backing: &Path, prefix: &[String]) -> Vec<GridItem> {
     let base = if prefix.is_empty() {
         String::new()
     } else {
@@ -46,7 +46,7 @@ fn image_pages(folder: &Path) -> Vec<GridItem> {
         .collect()
 }
 
-fn record_position(
+pub(crate) fn record_position(
     data: &Path,
     key: &BookResumeKey,
     pages: &[GridItem],
@@ -70,13 +70,13 @@ fn record_position(
     position
 }
 
-fn read_position(data: &Path, key: &BookResumeKey) -> Option<ReadingPosition> {
+pub(crate) fn read_position(data: &Path, key: &BookResumeKey) -> Option<ReadingPosition> {
     BookResumeDb::open_at(&data.join("book_resume.db"))
         .unwrap()
         .get_position_key(key)
 }
 
-fn assert_restored(
+pub(crate) fn assert_restored(
     data: &Path,
     key: &BookResumeKey,
     pages: &[GridItem],
@@ -130,6 +130,346 @@ fn copy_book(data: &Path, old: &Path, new: &Path) {
 fn rename_book(data: &Path, old: &Path, new: &Path) {
     let report = run_at(data, old, new);
     assert!(report.errors.is_empty(), "{:?}", report.errors);
+}
+
+#[test]
+fn section1886_file_rename_restores_logical_and_cache_identities() {
+    for extension in ["rar", "cbr", "7z", "cb7", "lzh", "lha", "zip", "cbz"] {
+        for logical_identity in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let old = PathBuf::from(format!("C:/section1886/old.{extension}"));
+            let new = PathBuf::from(format!("C:/section1886/new.{extension}"));
+            let old_cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), &old);
+            let new_cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), &new);
+            let old_key = BookResumeKey::legacy(&old_cache);
+            record_position(
+                temp.path(),
+                &old_key,
+                &archive_pages(&old_cache, &[]),
+                logical_identity.then_some(old.as_path()),
+                SAVED_PAGE,
+            );
+            let report = run_at_with_shape(temp.path(), &old, &new, false);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert_eq!(
+                report.converted_cache_pairs,
+                vec![(old_cache, new_cache.clone())]
+            );
+            assert!(read_position(temp.path(), &old_key).is_none());
+            assert_restored(
+                temp.path(),
+                &BookResumeKey::legacy(&new_cache),
+                &archive_pages(&new_cache, &[]),
+                logical_identity.then_some(new.as_path()),
+                SAVED_PAGE,
+            );
+        }
+    }
+}
+
+#[test]
+fn section1886_folder_snapshot_moves_two_books_and_preserves_outside_books() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let old = temp.path().join("old");
+    let new = temp.path().join("new");
+    std::fs::create_dir_all(new.join("nested")).unwrap();
+    for relative in ["one.rar", "nested/two.7z", "plain.zip", "photo.jpg"] {
+        std::fs::write(new.join(relative), b"fixture").unwrap();
+    }
+    let enumeration = collect_converted_archive_rels(&new);
+    assert!(!enumeration.incomplete);
+    assert_eq!(enumeration.converted_archive_rels.len(), 3);
+    for relative in ["one.rar", "nested/two.7z"] {
+        let source = old.join(relative);
+        let cache = crate::archive_cache::cache_zip_path_for_data_dir(&data, &source);
+        record_position(
+            &data,
+            &BookResumeKey::legacy(&cache),
+            &archive_pages(&cache, &[]),
+            Some(&source),
+            SAVED_PAGE,
+        );
+    }
+    let plain_old = old.join("plain.zip");
+    record_position(
+        &data,
+        &BookResumeKey::legacy(&plain_old),
+        &archive_pages(&plain_old, &[]),
+        None,
+        1,
+    );
+    let outside = temp.path().join("outside.rar");
+    let outside_cache = crate::archive_cache::cache_zip_path_for_data_dir(&data, &outside);
+    let outside_before = record_position(
+        &data,
+        &BookResumeKey::legacy(&outside_cache),
+        &archive_pages(&outside_cache, &[]),
+        Some(&outside),
+        1,
+    );
+    let report = run_at_with_converted_archives(
+        &data,
+        &old,
+        &new,
+        true,
+        &enumeration.converted_archive_rels,
+    );
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_eq!(
+        report.converted_cache_pairs.len(),
+        2,
+        "the unopened ordinary ZIP has no cache rows"
+    );
+    for relative in ["one.rar", "nested/two.7z"] {
+        let source = new.join(relative);
+        let cache = crate::archive_cache::cache_zip_path_for_data_dir(&data, &source);
+        assert_restored(
+            &data,
+            &BookResumeKey::legacy(&cache),
+            &archive_pages(&cache, &[]),
+            Some(&source),
+            SAVED_PAGE,
+        );
+        let old_cache =
+            crate::archive_cache::cache_zip_path_for_data_dir(&data, &old.join(relative));
+        assert!(read_position(&data, &BookResumeKey::legacy(&old_cache)).is_none());
+    }
+    let plain_new = new.join("plain.zip");
+    assert_restored(
+        &data,
+        &BookResumeKey::legacy(&plain_new),
+        &archive_pages(&plain_new, &[]),
+        None,
+        1,
+    );
+    assert_eq!(
+        read_position(&data, &BookResumeKey::legacy(&outside_cache)),
+        Some(outside_before)
+    );
+}
+
+#[test]
+fn section1886_shared_drive_stripped_cache_row_follows_renamed_side() {
+    let temp = tempfile::tempdir().unwrap();
+    let old = Path::new("C:/section1886/parent/book.rar");
+    let other_drive = Path::new("D:/section1886/parent/book.rar");
+    let new = Path::new("C:/section1886/renamed/book.rar");
+    let cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), old);
+    assert_eq!(
+        cache,
+        crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), other_drive)
+    );
+    record_position(
+        temp.path(),
+        &BookResumeKey::legacy(&cache),
+        &archive_pages(&cache, &[]),
+        None,
+        SAVED_PAGE,
+    );
+    let report = run_at_with_converted_archives(
+        temp.path(),
+        old.parent().unwrap(),
+        new.parent().unwrap(),
+        true,
+        &[PathBuf::from("book.rar")],
+    );
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let destination = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), new);
+    assert_restored(
+        temp.path(),
+        &BookResumeKey::legacy(&destination),
+        &archive_pages(&destination, &[]),
+        None,
+        SAVED_PAGE,
+    );
+    assert!(read_position(temp.path(), &BookResumeKey::legacy(&cache)).is_none());
+}
+
+#[test]
+fn section1886_namespace_identity_is_rewritten_once_for_files_and_folders() {
+    for tree in [false, true] {
+        for logical_identity in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let old_root = Path::new("C:/section1886/old");
+            // Destination inside the old spelling exposes accidental second rewrites.
+            let new_root = Path::new("C:/section1886/old/new");
+            let old = old_root.join("book.rar");
+            let new = new_root.join("book.rar");
+            let old_cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), &old);
+            let new_cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), &new);
+            let prefix = vec!["Chapter".into(), "nested.zip".into()];
+            let old_key = BookResumeKey::archive(&old, &prefix).unwrap();
+            record_position(
+                temp.path(),
+                &old_key,
+                &archive_pages(&old_cache, &prefix),
+                logical_identity.then_some(old.as_path()),
+                SAVED_PAGE,
+            );
+            let report = if tree {
+                run_at_with_converted_archives(
+                    temp.path(),
+                    old_root,
+                    new_root,
+                    true,
+                    &[PathBuf::from("book.rar")],
+                )
+            } else {
+                run_at_with_shape(temp.path(), &old, &new, false)
+            };
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert!(read_position(temp.path(), &old_key).is_none());
+            assert_restored(
+                temp.path(),
+                &BookResumeKey::archive(&new, &prefix).unwrap(),
+                &archive_pages(&new_cache, &prefix),
+                logical_identity.then_some(new.as_path()),
+                SAVED_PAGE,
+            );
+            assert_eq!(
+                report.converted_cache_pairs.len(),
+                usize::from(!logical_identity)
+            );
+        }
+    }
+}
+
+#[test]
+fn section1886_case_only_cache_keys_are_noop_and_position_stays_restored() {
+    for logical_identity in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let old = Path::new("C:/section1886/Book.RAR");
+        let new = Path::new("C:/section1886/book.rar");
+        let cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), old);
+        record_position(
+            temp.path(),
+            &BookResumeKey::legacy(&cache),
+            &archive_pages(&cache, &[]),
+            logical_identity.then_some(old),
+            SAVED_PAGE,
+        );
+        let report = run_at_with_shape(temp.path(), old, new, false);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.converted_cache_pairs.is_empty());
+        assert_eq!(report.rows, 0);
+        let new_cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), new);
+        assert_restored(
+            temp.path(),
+            &BookResumeKey::legacy(&new_cache),
+            &archive_pages(&new_cache, &[]),
+            logical_identity.then_some(new),
+            SAVED_PAGE,
+        );
+    }
+}
+
+#[test]
+fn section1886_resume_destination_wins_preserves_page_meter_and_identity() {
+    for logical_identity in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let old = Path::new("C:/section1886/old.rar");
+        let new = Path::new("C:/section1886/new.rar");
+        let old_cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), old);
+        let new_cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), new);
+        record_position(
+            temp.path(),
+            &BookResumeKey::legacy(&old_cache),
+            &archive_pages(&old_cache, &[]),
+            logical_identity.then_some(old),
+            SAVED_PAGE,
+        );
+        let expected = record_position(
+            temp.path(),
+            &BookResumeKey::legacy(&new_cache),
+            &archive_pages(&new_cache, &[]),
+            logical_identity.then_some(new),
+            1,
+        );
+        let report = run_at_with_shape(temp.path(), old, new, false);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(read_position(temp.path(), &BookResumeKey::legacy(&old_cache)).is_none());
+        assert_eq!(
+            read_position(temp.path(), &BookResumeKey::legacy(&new_cache)),
+            Some(expected)
+        );
+        assert_restored(
+            temp.path(),
+            &BookResumeKey::legacy(&new_cache),
+            &archive_pages(&new_cache, &[]),
+            logical_identity.then_some(new),
+            1,
+        );
+    }
+}
+
+#[test]
+fn section1886_resume_identity_updates_when_drive_stripped_cache_key_does_not_move() {
+    let temp = tempfile::tempdir().unwrap();
+    let old = Path::new("C:/section1886/book.rar");
+    let new = Path::new("D:/section1886/book.rar");
+    let cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), old);
+    assert_eq!(
+        cache,
+        crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), new)
+    );
+    record_position(
+        temp.path(),
+        &BookResumeKey::legacy(&cache),
+        &archive_pages(&cache, &[]),
+        Some(old),
+        SAVED_PAGE,
+    );
+    let report = run_at(temp.path(), old, new);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert_restored(
+        temp.path(),
+        &BookResumeKey::legacy(&cache),
+        &archive_pages(&cache, &[]),
+        Some(new),
+        SAVED_PAGE,
+    );
+    assert_eq!(report.converted_cache_pairs, vec![(cache.clone(), cache)]);
+}
+
+#[test]
+fn section1886_resume_rolls_back_logical_and_cache_rows_if_identity_rewrite_fails() {
+    let temp = tempfile::tempdir().unwrap();
+    let old = Path::new("C:/section1886/old.rar");
+    let new = Path::new("C:/section1886/new.rar");
+    let old_cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), old);
+    let new_cache = crate::archive_cache::cache_zip_path_for_data_dir(temp.path(), new);
+    let logical_key = BookResumeKey::legacy(old);
+    let old_key = BookResumeKey::legacy(&old_cache);
+    let logical_before =
+        record_position(temp.path(), &logical_key, &archive_pages(old, &[]), None, 1);
+    let cache_before = record_position(
+        temp.path(),
+        &old_key,
+        &archive_pages(&old_cache, &[]),
+        Some(old),
+        SAVED_PAGE,
+    );
+    let conn = rusqlite::Connection::open(temp.path().join("book_resume.db")).unwrap();
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER fail_cache_identity BEFORE UPDATE OF page_identity ON book_resume
+        WHEN NEW.path='{}' BEGIN SELECT RAISE(ABORT,'identity failure'); END;",
+        BookResumeKey::legacy(&new_cache)
+            .storage_key()
+            .replace('\'', "''")
+    ))
+    .unwrap();
+    let report = run_at(temp.path(), old, new);
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(report.converted_cache_pairs.is_empty());
+    assert_eq!(
+        read_position(temp.path(), &logical_key),
+        Some(logical_before)
+    );
+    assert_eq!(read_position(temp.path(), &old_key), Some(cache_before));
+    assert!(read_position(temp.path(), &BookResumeKey::legacy(new)).is_none());
+    assert!(read_position(temp.path(), &BookResumeKey::legacy(&new_cache)).is_none());
 }
 
 #[test]

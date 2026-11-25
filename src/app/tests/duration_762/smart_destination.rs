@@ -105,7 +105,7 @@ fn assert_name_sorted_smart_child(app: &App, child: &Path, id: uuid::Uuid) {
         ["a-long.mp4", "b-short.mp4"],
         "Smart physical children use name order even with a common duration sort",
     );
-    assert!(!app.listing_sort_capabilities().duration_allowed);
+    assert!(!app.listing_sort_capabilities().lazy_metric_allowed);
 }
 
 #[test]
@@ -117,7 +117,7 @@ fn duration_762_offscreen_smart_history_child_uses_destination_name_sort() {
         app.top_level_grid_view.surface(),
         TopLevelGridSurface::Folder,
     ));
-    assert!(app.listing_sort_capabilities().duration_allowed);
+    assert!(app.listing_sort_capabilities().lazy_metric_allowed);
     let mut target = SmartFolderViewState::root(id, vec![child.clone()]);
     target.position = SmartFolderPosition::Scoped {
         entry_index: 0,

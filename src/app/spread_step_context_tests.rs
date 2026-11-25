@@ -17,6 +17,33 @@ fn seed_step_context(app: &mut App, start: usize) {
 
 #[cfg(windows)]
 #[test]
+fn input_reading_direction_uses_only_the_mounted_viewer_context() {
+    use crate::settings::{ReadingDirection, SpreadMode};
+    let mut app = crate::app::setup_app_for_test();
+    app.spread_mode = SpreadMode::Single;
+    app.reading_direction = ReadingDirection::Ltr;
+    let sibling = app.build_window_context_for_test(1746, |owner| {
+        owner.spread_mode = SpreadMode::Single;
+        owner.reading_direction = ReadingDirection::Rtl;
+    });
+    assert!(!app.input_advances_right_to_left());
+    app.with_viewer_context(sibling, |owner| {
+        assert!(owner.input_advances_right_to_left());
+        owner.reading_direction = ReadingDirection::Ltr;
+        assert!(!owner.input_advances_right_to_left());
+    })
+    .unwrap();
+    assert!(!app.input_advances_right_to_left());
+    app.reading_direction = ReadingDirection::Rtl;
+    app.with_viewer_context(sibling, |owner| {
+        assert!(!owner.input_advances_right_to_left());
+    })
+    .unwrap();
+    assert!(app.input_advances_right_to_left());
+}
+
+#[cfg(windows)]
+#[test]
 fn spread_step_context_materialized_fork_omits_step_and_effective_projection() {
     let mut app = crate::app::setup_app_for_test();
     seed_step_context(&mut app, 1);

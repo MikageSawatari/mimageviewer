@@ -10047,6 +10047,7 @@ fn install_snapshot_details_pending(
     let (event_tx, event_rx) = std::sync::mpsc::channel();
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        pool_revision: crate::susie_loader::pool_revision(),
         scan_scope: DetailsMetaScanScope::AllRequirements,
         listing_meta_scan: None,
         visible_revision: app.details_lazy_visible_revision,
@@ -22061,6 +22062,7 @@ mod folder_pane_open_nav_tests {
     fn empty_scan() -> ScannedDir {
         ScannedDir {
             duration_facts: None,
+            page_count_facts: None,
             precise_stamps: Default::default(),
             reconcile: None,
             auxiliary_media: Default::default(),
@@ -26112,6 +26114,7 @@ mod phase_c_folder_nav_history_tests {
             };
             let mut scan = crate::app::folder_scan::ScannedDir {
                 duration_facts: None,
+                page_count_facts: None,
                 precise_stamps: Default::default(),
                 reconcile: None,
                 auxiliary_media: Default::default(),
@@ -46314,6 +46317,7 @@ mod favorite_adjustment_defaults_tests {
             rx,
         });
         tx.send(crate::rename_key_migration::RenameMigrationReport {
+            converted_cache_pairs: Vec::new(),
             rows: 0,
             errors: Vec::new(),
             store_mutations: Default::default(),
@@ -46345,6 +46349,8 @@ mod favorite_adjustment_defaults_tests {
         app.rename_target = None;
         app.rename_target_is_file = false;
         tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
+            converted_archive_rels: Vec::new(),
+            converted_archive_enumeration_incomplete: false,
             target: app.tmp.path().join("before.jpg"),
             new_path: app.tmp.path().join("after.jpg"),
             operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(0, Ok(false), 0),
@@ -46392,6 +46398,8 @@ mod favorite_adjustment_defaults_tests {
         });
         app.rename_target_is_file = true; // The dialog field must not override captured scope.
         tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
+            converted_archive_rels: Vec::new(),
+            converted_archive_enumeration_incomplete: false,
             target: app.tmp.path().join("old-folder"),
             new_path: app.tmp.path().join("new-folder"),
             operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(0, Ok(false), 0),
@@ -46403,6 +46411,8 @@ mod favorite_adjustment_defaults_tests {
 
         for result in [
             Ok(crate::shell_file_ops::ShellRenameOutcome {
+                converted_archive_rels: Vec::new(),
+                converted_archive_enumeration_incomplete: false,
                 target: app.tmp.path().join("cancelled"),
                 new_path: app.tmp.path().join("cancelled-new"),
                 operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(
@@ -46461,6 +46471,8 @@ mod favorite_adjustment_defaults_tests {
                 collection_scope: crate::collection_store::CollectionSourceMigrationScope::Exact,
             });
             tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
+                converted_archive_rels: Vec::new(),
+                converted_archive_enumeration_incomplete: false,
                 target: app.tmp.path().join("before.jpg"),
                 new_path: app.tmp.path().join("after.jpg"),
                 operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(
@@ -51678,7 +51690,9 @@ mod favorite_adjustment_defaults_tests {
                 }
                 crate::export_dialog::ExportEvent::AllDone => break,
                 crate::export_dialog::ExportEvent::Started { .. }
-                | crate::export_dialog::ExportEvent::Failed(_) => {}
+                | crate::export_dialog::ExportEvent::Failed(_)
+                | crate::export_dialog::ExportEvent::Skipped { .. }
+                | crate::export_dialog::ExportEvent::ThumbnailNotice { .. } => {}
             }
         }
         assert_eq!(completed, 5);
@@ -51716,7 +51730,9 @@ mod favorite_adjustment_defaults_tests {
             last_message: "準備中".to_string(),
             successes: Vec::new(),
             errors: Vec::new(),
-            finished: false,
+            skipped: Vec::new(),
+            thumbnail_notices: Vec::new(),
+            end: None,
             cancel_requested: false,
         });
         tx.send(crate::export_dialog::ExportEvent::Completed(
@@ -77868,6 +77884,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let (_event_tx, event_rx) = mpsc::channel();
         let (priority_tx, _priority_rx) = mpsc::channel();
         app.details_meta_pending = Some(DetailsMetaPending {
+            pool_revision: crate::susie_loader::pool_revision(),
             scan_scope: DetailsMetaScanScope::AllRequirements,
             listing_meta_scan: None,
             visible_revision: app.details_lazy_visible_revision,
@@ -82429,6 +82446,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             rx,
         });
         tx.send(crate::rename_key_migration::RenameMigrationReport {
+            converted_cache_pairs: Vec::new(),
             rows: 1,
             errors: Vec::new(),
             store_mutations: Default::default(),
@@ -82471,6 +82489,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             rx,
         });
         tx.send(crate::rename_key_migration::RenameMigrationReport {
+            converted_cache_pairs: Vec::new(),
             rows: 1,
             errors: Vec::new(),
             store_mutations: Default::default(),
@@ -82543,6 +82562,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             rx,
         });
         tx.send(crate::rename_key_migration::RenameMigrationReport {
+            converted_cache_pairs: Vec::new(),
             rows: 1,
             errors: Vec::new(),
             store_mutations: Default::default(),
@@ -82584,6 +82604,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         });
         app.persist_rename_migration_journal();
         tx.send(crate::rename_key_migration::RenameMigrationReport {
+            converted_cache_pairs: Vec::new(),
             rows: 0,
             errors: vec!["worker panicked".to_string()],
             store_mutations: Default::default(),
@@ -107529,6 +107550,8 @@ fn video_audio_transition_resets_music_left_session_but_keeps_same_file_right_st
 #[test]
 fn pdf_page_count_auth_result_becomes_stale_after_saved_credential_changes() {
     let mut app = phase_c_support::setup_app();
+    let page_count_fingerprint =
+        crate::app::folder_scan::image_page_recognition_fingerprint(&app.settings);
     let pdf_path = PathBuf::from(r"C:\Books\protected.pdf");
     app.install_new_items(
         vec![GridItem::PdfFile(pdf_path.clone())],
@@ -107541,6 +107564,7 @@ fn pdf_page_count_auth_result_becomes_stale_after_saved_credential_changes() {
         source_mtime: 1_700_000_000,
         source_size: 4096,
         page_count_checked: true,
+        page_count_fingerprint,
         page_count_failed: true,
         page_count_pdf_password_revision: Some(0),
         ..Default::default()
@@ -107624,6 +107648,8 @@ fn page_count_only_target_is_staged_unless_explicitly_allowed() {
 #[test]
 fn details_lazy_session_stays_active_between_consecutive_page_count_jobs() {
     let mut app = phase_c_support::setup_app();
+    let page_count_fingerprint =
+        crate::app::folder_scan::image_page_recognition_fingerprint(&app.settings);
     app.install_new_items(
         vec![
             GridItem::ZipFile(PathBuf::from(r"C:\Books\first.cbz")),
@@ -107647,6 +107673,7 @@ fn details_lazy_session_stays_active_between_consecutive_page_count_jobs() {
             source_size: 10,
             page_count: Some(10),
             page_count_checked: true,
+            page_count_fingerprint,
             ..Default::default()
         },
     );
@@ -107659,6 +107686,7 @@ fn details_lazy_session_stays_active_between_consecutive_page_count_jobs() {
     .unwrap();
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        pool_revision: crate::susie_loader::pool_revision(),
         scan_scope: DetailsMetaScanScope::AllRequirements,
         listing_meta_scan: None,
         visible_revision: app.details_lazy_visible_revision,
@@ -107692,6 +107720,8 @@ fn details_lazy_session_stays_active_between_consecutive_page_count_jobs() {
 #[test]
 fn details_lazy_session_completes_after_post_grid_scope_is_satisfied() {
     let mut app = phase_c_support::setup_app();
+    let page_count_fingerprint =
+        crate::app::folder_scan::image_page_recognition_fingerprint(&app.settings);
     app.install_new_items(
         vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.cbz"))],
         vec![Some((1, 10))],
@@ -107707,6 +107737,7 @@ fn details_lazy_session_completes_after_post_grid_scope_is_satisfied() {
             source_size: 10,
             page_count: Some(10),
             page_count_checked: true,
+            page_count_fingerprint,
             ..Default::default()
         },
     );
@@ -107728,6 +107759,8 @@ fn details_lazy_session_completes_after_post_grid_scope_is_satisfied() {
 #[test]
 fn details_lazy_session_cancel_resume_preserves_cache_and_revision() {
     let mut app = phase_c_support::setup_app();
+    let page_count_fingerprint =
+        crate::app::folder_scan::image_page_recognition_fingerprint(&app.settings);
     app.install_new_items(
         vec![GridItem::ZipFile(PathBuf::from(r"C:\Books\book.cbz"))],
         vec![Some((1, 10))],
@@ -107742,6 +107775,7 @@ fn details_lazy_session_cancel_resume_preserves_cache_and_revision() {
             source_size: 10,
             page_count: Some(10),
             page_count_checked: true,
+            page_count_fingerprint,
             ..Default::default()
         },
     );
@@ -107919,6 +107953,7 @@ fn thumbnail_selection_info_keeps_single_target_fast_path() {
     let mut app = phase_c_support::setup_app();
     app.settings.thumb_show_media_duration = false;
     app.settings.thumb_show_resume_meter = false;
+    app.settings.thumb_show_page_count = false;
     app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
     app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::BottomBar;
     app.settings.thumb_tooltip_show_created = false;
@@ -107962,7 +107997,7 @@ fn image_folder_page_count_is_available_without_auto_open() {
 }
 
 #[test]
-fn child_archive_page_count_uses_warm_zip_tree_total() {
+fn child_archive_page_count_reads_zip_tree_total_without_worker_target() {
     let mut app = phase_c_support::setup_app();
     let zip_path = PathBuf::from(r"C:\Books\outer.zip");
     let entries = [
@@ -107994,10 +108029,16 @@ fn child_archive_page_count_uses_warm_zip_tree_total() {
         .position(|item| matches!(item, GridItem::ZipDir { dir_prefix, .. } if dir_prefix == "book-a.zip/"))
         .expect("child ZIP cell");
     assert!(app.details_item_supports_page_count(idx));
-    let target = app
-        .details_meta_target_for_idx(idx, &std::collections::HashSet::from([idx]), true)
-        .expect("child ZIP page-count target");
-    assert_eq!(target.warm_page_count, Some(3));
+    assert!(!app.details_item_page_count_needs_fetch(idx));
+    assert!(
+        app.details_meta_target_for_idx(idx, &std::collections::HashSet::from([idx]), true)
+            .is_none()
+    );
+    assert_eq!(
+        app.details_page_count_value(idx),
+        Some(PageCountValue::Known(3))
+    );
+    assert_eq!(app.details_page_count_text(idx), "3");
 }
 
 #[test]
@@ -108018,7 +108059,6 @@ fn direct_rar_is_a_background_page_count_target() {
         .details_meta_target_for_idx(0, &std::collections::HashSet::from([0]), true)
         .expect("RAR page-count target");
     assert!(target.load_page_count);
-    assert_eq!(target.warm_page_count, None);
     assert_eq!(target.catalog_key.as_deref(), Some("book.rar"));
 }
 
@@ -108068,6 +108108,7 @@ fn leaving_page_count_sort_cancels_full_load_and_returns_to_staged_loading() {
     let (_tx, rx) = std::sync::mpsc::channel();
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        pool_revision: crate::susie_loader::pool_revision(),
         scan_scope: DetailsMetaScanScope::AllRequirements,
         listing_meta_scan: None,
         visible_revision: app.details_lazy_visible_revision,
@@ -108159,6 +108200,7 @@ fn changing_lazy_columns_discards_old_finished_event_and_requeues_new_requiremen
     .expect("queue old Finished event");
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        pool_revision: crate::susie_loader::pool_revision(),
         scan_scope: DetailsMetaScanScope::AllRequirements,
         listing_meta_scan: None,
         visible_revision: old_revision,
@@ -108366,6 +108408,8 @@ fn pdf_page_count_does_not_use_session_only_password() {
 #[test]
 fn saving_pdf_password_invalidates_cached_page_count_result() {
     let mut app = phase_c_support::setup_app();
+    let page_count_fingerprint =
+        crate::app::folder_scan::image_page_recognition_fingerprint(&app.settings);
     let pdf_path = PathBuf::from(r"C:\Books\protected.pdf");
     app.install_new_items(
         vec![GridItem::PdfFile(pdf_path.clone())],
@@ -108381,6 +108425,7 @@ fn saving_pdf_password_invalidates_cached_page_count_result() {
             source_mtime: 1_700_000_000,
             source_size: 4096,
             page_count_checked: true,
+            page_count_fingerprint,
             page_count_failed: true,
             page_count_pdf_password_revision: Some(0),
             ..Default::default()
@@ -108396,6 +108441,8 @@ fn saving_pdf_password_invalidates_cached_page_count_result() {
 #[test]
 fn details_cell_content_revisions_follow_only_changed_cache_columns() {
     let mut app = phase_c_support::setup_app();
+    let page_count_fingerprint =
+        crate::app::folder_scan::image_page_recognition_fingerprint(&app.settings);
     let initial = app.details_cell_content_revisions;
 
     assert!(app.set_tags_cache_entry("tag-key".to_string(), vec!["long-tag".to_string()]));
@@ -108416,6 +108463,7 @@ fn details_cell_content_revisions_follow_only_changed_cache_columns() {
             source_size: 2,
             page_count: Some(123_456),
             page_count_checked: true,
+            page_count_fingerprint,
             ..Default::default()
         },
         DetailsLazyFieldFlags {
@@ -112389,6 +112437,7 @@ fn setup_media_duration_thumbnail_app() -> phase_c_support::AppTestEnv {
     let mut app = phase_c_support::setup_app();
     app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
     app.settings.thumb_show_media_duration = true;
+    app.settings.thumb_show_page_count = false;
     app.settings.selection_info_display_mode = crate::settings::SelectionInfoDisplayMode::Hidden;
     app.install_new_items(
         vec![
@@ -112424,6 +112473,7 @@ fn media_duration_thumbnail_targets_only_near_video_and_audio() {
     }
     app.settings.thumb_show_media_duration = false;
     app.settings.thumb_show_resume_meter = false;
+    app.settings.thumb_show_page_count = false;
     assert!(!app.details_lazy_columns_visible());
     for idx in 0..5 {
         assert!(app.details_meta_target_for_idx(idx, &near, true).is_none());
@@ -112449,6 +112499,7 @@ fn install_fake_media_duration_pending(app: &mut App) -> Arc<AtomicBool> {
     let (_tx, rx) = mpsc::channel();
     let (priority_tx, _priority_rx) = mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
+        pool_revision: crate::susie_loader::pool_revision(),
         scan_scope: DetailsMetaScanScope::AllRequirements,
         listing_meta_scan: app
             .whole_listing_meta_scan_wanted()
@@ -114299,6 +114350,7 @@ mod background_click_scroll_regression_tests {
                 false,
                 None,
                 None,
+                None,
                 app.settings.thumb_show_resume_meter,
                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                 false,
@@ -114609,6 +114661,7 @@ mod background_click_scroll_regression_tests {
             app.settings.video_thumbnail_indicator,
             app.settings.audio_thumbnail_indicator,
             false,
+            None,
             None,
             None,
             app.settings.thumb_show_resume_meter,
@@ -115090,6 +115143,7 @@ mod background_click_scroll_regression_tests {
                 app.settings.video_thumbnail_indicator,
                 app.settings.audio_thumbnail_indicator,
                 check,
+                None,
                 None,
                 None,
                 app.settings.thumb_show_resume_meter,
@@ -116531,6 +116585,8 @@ fn detached_backend_hwnd_reuse_retires_host_claim_and_reseeds_same_handle() {
 
 mod duration_762;
 mod facet_835;
+mod page_badge_883;
+mod page_sort_883;
 
 #[path = "tests/prepared_search_adoption.rs"]
 mod prepared_search_adoption;

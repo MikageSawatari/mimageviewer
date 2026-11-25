@@ -443,6 +443,7 @@ enum DetailsMetaCancelReason {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetailsMetaEventKind {
+    Stale,
     Item,
     Progress,
     Finished,
@@ -451,6 +452,7 @@ enum DetailsMetaEventKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetailsMetaWorkerExit {
     Completed,
+    Stale,
     Cancelled(DetailsMetaCancelReason),
     ReceiverDisconnected(DetailsMetaEventKind),
 }
@@ -458,7 +460,90 @@ enum DetailsMetaWorkerExit {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetailsPageCountError {
     Failed,
+    Stale,
     Cancelled(DetailsMetaCancelReason),
+}
+
+fn ensure_page_count_revision(
+    config: &DetailsPageCountConfig,
+) -> Result<(), DetailsPageCountError> {
+    ensure_page_count_revision_at(config, crate::susie_loader::pool_revision())
+}
+
+fn ensure_page_count_revision_at(
+    config: &DetailsPageCountConfig,
+    current: u64,
+) -> Result<(), DetailsPageCountError> {
+    if config.pool_revision == current {
+        Ok(())
+    } else {
+        Err(DetailsPageCountError::Stale)
+    }
+}
+
+fn finish_stale_details_session(
+    generation: u64,
+    tx: &mpsc::Sender<DetailsMetaEvent>,
+) -> DetailsMetaWorkerExit {
+    if tx.send(DetailsMetaEvent::Stale { generation }).is_err() {
+        DetailsMetaWorkerExit::ReceiverDisconnected(DetailsMetaEventKind::Stale)
+    } else {
+        DetailsMetaWorkerExit::Stale
+    }
+}
+
+const PAGE_COUNT_KINDS: [&str; 6] = ["zip", "zip_nested", "folder", "rar", "pdf", "epub"];
+
+#[derive(Default)]
+struct DetailsPageCountTrace {
+    cache_hit: bool,
+    nested_zip: bool,
+}
+
+#[derive(Default)]
+struct DetailsPageCountPerf {
+    targets: [usize; 6],
+    cache_hits: [usize; 6],
+    counted: [usize; 6],
+    failed: usize,
+    ms: f64,
+}
+
+impl DetailsPageCountPerf {
+    fn kind(item: &GridItem, trace: &DetailsPageCountTrace) -> usize {
+        match item {
+            GridItem::ZipFile(_) => usize::from(trace.nested_zip),
+            GridItem::Folder(_) => 2,
+            GridItem::ConvertibleArchive { .. } => 3,
+            GridItem::PdfFile(path)
+                if path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("epub")) =>
+            {
+                5
+            }
+            _ => 4,
+        }
+    }
+
+    fn fields(&self) -> Vec<(&'static str, serde_json::Value)> {
+        let by_kind = |values: &[usize; 6]| {
+            serde_json::Value::Object(
+                PAGE_COUNT_KINDS
+                    .iter()
+                    .zip(values)
+                    .map(|(kind, value)| ((*kind).to_owned(), serde_json::Value::from(*value)))
+                    .collect(),
+            )
+        };
+        vec![
+            ("page_targets", by_kind(&self.targets)),
+            ("page_cache_hits", by_kind(&self.cache_hits)),
+            ("page_counted", by_kind(&self.counted)),
+            ("page_failed", self.failed.into()),
+            ("page_ms", self.ms.into()),
+        ]
+    }
 }
 
 impl From<()> for DetailsPageCountError {
@@ -478,9 +563,13 @@ fn details_pdf_catalog_stamp(
     }
 }
 
-fn record_details_meta_worker_exit(generation: u64, exit: DetailsMetaWorkerExit) {
+fn record_details_meta_worker_exit(
+    generation: u64,
+    exit: DetailsMetaWorkerExit,
+    page_perf: &DetailsPageCountPerf,
+) {
     match exit {
-        DetailsMetaWorkerExit::Completed => {}
+        DetailsMetaWorkerExit::Completed | DetailsMetaWorkerExit::Stale => {}
         DetailsMetaWorkerExit::Cancelled(reason) => {
             let reason = format!("{reason:?}");
             crate::logger::log(format!(
@@ -492,7 +581,10 @@ fn record_details_meta_worker_exit(generation: u64, exit: DetailsMetaWorkerExit)
                     "load_cancelled",
                     None,
                     generation,
-                    &[("reason", serde_json::Value::from(reason))],
+                    &[("reason", serde_json::Value::from(reason))]
+                        .into_iter()
+                        .chain(page_perf.fields())
+                        .collect::<Vec<_>>(),
                 );
             }
         }
@@ -520,6 +612,7 @@ pub(super) fn run_details_meta_load(
     priority_rx: mpsc::Receiver<Vec<DetailsMetaTarget>>,
     page_count_config: DetailsPageCountConfig,
 ) {
+    let mut page_perf = DetailsPageCountPerf::default();
     let exit = run_details_meta_load_inner(
         generation,
         visible_targets,
@@ -534,8 +627,9 @@ pub(super) fn run_details_meta_load(
         tx,
         priority_rx,
         page_count_config,
+        &mut page_perf,
     );
-    record_details_meta_worker_exit(generation, exit);
+    record_details_meta_worker_exit(generation, exit, &page_perf);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -553,6 +647,7 @@ fn run_details_meta_load_inner(
     tx: mpsc::Sender<DetailsMetaEvent>,
     priority_rx: mpsc::Receiver<Vec<DetailsMetaTarget>>,
     page_count_config: DetailsPageCountConfig,
+    page_perf: &mut DetailsPageCountPerf,
 ) -> DetailsMetaWorkerExit {
     const SLOW_AI_METADATA_ITEM_MS: f64 = 100.0;
 
@@ -651,17 +746,54 @@ fn run_details_meta_load_inner(
         };
         let mut video_probe = DetailsMediaProbeOutcome::Unreadable;
         if target.load_page_count {
-            match load_details_page_count(
+            let page_t0 = perf_on.then(std::time::Instant::now);
+            let mut trace = DetailsPageCountTrace::default();
+            let result = load_details_page_count_traced(
                 &target,
                 &cache_dir,
                 &mut container_catalogs,
                 &io_sem,
                 &cancel,
                 &page_count_config,
-            ) {
+                &mut trace,
+            );
+            if let Some(t0) = page_t0 {
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let kind = DetailsPageCountPerf::kind(&target.item, &trace);
+                page_perf.targets[kind] += 1;
+                page_perf.ms += ms;
+                if trace.cache_hit {
+                    page_perf.cache_hits[kind] += 1;
+                } else if result.is_ok() {
+                    page_perf.counted[kind] += 1;
+                }
+                if matches!(result, Err(DetailsPageCountError::Failed)) {
+                    page_perf.failed += 1;
+                }
+                if ms >= 200.0 {
+                    crate::perf::event(
+                        "details_meta",
+                        "page_count_slow",
+                        None,
+                        generation,
+                        &[
+                            ("kind", PAGE_COUNT_KINDS[kind].into()),
+                            ("ms", ms.into()),
+                            ("cache", trace.cache_hit.into()),
+                        ],
+                    );
+                }
+            }
+            if ensure_page_count_revision(&page_count_config).is_err() {
+                return finish_stale_details_session(generation, &tx);
+            }
+            match result {
                 Ok(count) => {
                     page_count = count;
                     page_count_checked = true;
+                }
+                Err(DetailsPageCountError::Stale) => {
+                    return finish_stale_details_session(generation, &tx);
                 }
                 Err(DetailsPageCountError::Cancelled(reason)) => {
                     return DetailsMetaWorkerExit::Cancelled(reason);
@@ -993,6 +1125,10 @@ fn run_details_meta_load_inner(
             meta.page_count_checked = page_count_checked;
             meta.page_count_failed = page_count_failed;
             meta.page_count_pdf_password_revision = target.pdf_password_revision;
+            meta.page_count_fingerprint = page_count_config.fingerprint;
+            meta.page_count_generation = matches!(&target.item, GridItem::PdfFile(path)
+                if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("epub")))
+            .then_some(generation);
         }
         if target.load_image_dims {
             meta.image_dims = dims;
@@ -1006,6 +1142,9 @@ fn run_details_meta_load_inner(
                     DetailsMediaMeta::RetryLater { generation }
                 }
             };
+        }
+        if ensure_page_count_revision(&page_count_config).is_err() {
+            return finish_stale_details_session(generation, &tx);
         }
         if tx
             .send(DetailsMetaEvent::Item {
@@ -1040,6 +1179,9 @@ fn run_details_meta_load_inner(
 
     if cancel.load(Ordering::Relaxed) {
         return DetailsMetaWorkerExit::Cancelled(DetailsMetaCancelReason::BeforeFinished);
+    }
+    if ensure_page_count_revision(&page_count_config).is_err() {
+        return finish_stale_details_session(generation, &tx);
     }
     if let Some(t0) = worker_t0 {
         crate::perf::event(
@@ -1090,7 +1232,11 @@ fn run_details_meta_load_inner(
                     serde_json::Value::from(ai_extract_ms_max),
                 ),
                 ("ai_slow_items", serde_json::Value::from(ai_slow_items)),
-            ],
+            ]
+            .into_iter()
+            .chain(page_perf.fields())
+            .collect::<Vec<_>>()
+            .as_slice(),
         );
     }
     if tx
@@ -1204,7 +1350,6 @@ mod relative_page_tests {
             catalog_folder: None,
             catalog_key: None,
             warm_image_dims: None,
-            warm_page_count: None,
             pdf_password_revision: None,
             load_page_count: false,
             load_created_at: false,
@@ -1228,6 +1373,7 @@ mod relative_page_tests {
             tx,
             mpsc::channel().1,
             DetailsPageCountConfig {
+                pool_revision: crate::susie_loader::pool_revision(),
                 fingerprint: 0,
                 image_folder_options: None,
                 pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
@@ -1245,6 +1391,7 @@ mod relative_page_tests {
     }
 }
 
+#[cfg(test)]
 fn load_details_page_count(
     target: &DetailsMetaTarget,
     cache_dir: &Path,
@@ -1253,13 +1400,36 @@ fn load_details_page_count(
     cancel: &Arc<AtomicBool>,
     config: &DetailsPageCountConfig,
 ) -> Result<Option<u32>, DetailsPageCountError> {
-    load_details_page_count_with_pdf_enumerator(
+    load_details_page_count_traced(
         target,
         cache_dir,
         catalogs,
         io_sem,
         cancel,
         config,
+        &mut DetailsPageCountTrace::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_details_page_count_traced(
+    target: &DetailsMetaTarget,
+    cache_dir: &Path,
+    catalogs: &mut ContainerCatalogCache,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+    cancel: &Arc<AtomicBool>,
+    config: &DetailsPageCountConfig,
+    trace: &mut DetailsPageCountTrace,
+) -> Result<Option<u32>, DetailsPageCountError> {
+    load_details_page_count_with_pdf_enumerator_traced(
+        target,
+        cache_dir,
+        catalogs,
+        io_sem,
+        cancel,
+        config,
+        trace,
+        crate::susie_loader::pool_revision,
         |path, read, password, cancel| {
             let pages = if let Some(read) = read {
                 crate::pdf_loader::enumerate_pages_with_read_target(
@@ -1302,6 +1472,7 @@ fn visible_archive_page_count(
     .map_err(|_| DetailsPageCountError::Failed)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn load_details_page_count_with_pdf_enumerator(
     target: &DetailsMetaTarget,
@@ -1317,14 +1488,42 @@ fn load_details_page_count_with_pdf_enumerator(
         &Arc<AtomicBool>,
     ) -> Result<u32, ()>,
 ) -> Result<Option<u32>, DetailsPageCountError> {
+    load_details_page_count_with_pdf_enumerator_traced(
+        target,
+        cache_dir,
+        catalogs,
+        io_sem,
+        cancel,
+        config,
+        &mut DetailsPageCountTrace::default(),
+        crate::susie_loader::pool_revision,
+        enumerate_pdf,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_details_page_count_with_pdf_enumerator_traced(
+    target: &DetailsMetaTarget,
+    cache_dir: &Path,
+    catalogs: &mut ContainerCatalogCache,
+    io_sem: &crate::io_semaphore::GlobalIoSemaphore,
+    cancel: &Arc<AtomicBool>,
+    config: &DetailsPageCountConfig,
+    trace: &mut DetailsPageCountTrace,
+    current_pool_revision: impl Fn() -> u64,
+    enumerate_pdf: impl FnOnce(
+        &Path,
+        Option<&crate::pdf_loader::ReadTarget>,
+        Option<&str>,
+        &Arc<AtomicBool>,
+    ) -> Result<u32, ()>,
+) -> Result<Option<u32>, DetailsPageCountError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(DetailsPageCountError::Cancelled(
             DetailsMetaCancelReason::BeforeTarget,
         ));
     }
-    if let Some(count) = target.warm_page_count {
-        return Ok(Some(count));
-    }
+    ensure_page_count_revision_at(config, current_pool_revision())?;
     let default_visibility = crate::file_type_visibility::FileTypeVisibility::default();
     let visibility = config
         .image_folder_options
@@ -1370,6 +1569,8 @@ fn load_details_page_count_with_pdf_enumerator(
                     )
                 };
                 if let Ok(Some(meta)) = cached {
+                    trace.cache_hit = true;
+                    ensure_page_count_revision_at(config, current_pool_revision())?;
                     return Ok(meta.page_count);
                 }
             }
@@ -1395,6 +1596,10 @@ fn load_details_page_count_with_pdf_enumerator(
                     DetailsMetaCancelReason::AfterIo(DetailsMetaIoStage::ZipEnumerate),
                 ));
             }
+            trace.nested_zip = entries
+                .entries
+                .iter()
+                .any(|entry| !entry.container_ancestry.is_empty());
             let count = visible_archive_page_count(&entries.entries, visibility)?;
             if let Some(catalog) = catalog {
                 let Some(_permit) = io_sem.acquire_cancellable(target.priority, cancel) else {
@@ -1402,6 +1607,7 @@ fn load_details_page_count_with_pdf_enumerator(
                         DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::ZipCatalogWrite),
                     ));
                 };
+                ensure_page_count_revision_at(config, current_pool_revision())?;
                 let _ = catalog.set_container_page_meta(
                     key,
                     crate::catalog::ContainerPageKind::Zip,
@@ -1433,6 +1639,8 @@ fn load_details_page_count_with_pdf_enumerator(
                     )
                 };
                 if let Ok(Some(meta)) = cached {
+                    trace.cache_hit = true;
+                    ensure_page_count_revision_at(config, current_pool_revision())?;
                     return Ok(meta.page_count);
                 }
             }
@@ -1442,7 +1650,20 @@ fn load_details_page_count_with_pdf_enumerator(
                         DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::FolderCount),
                     ));
                 };
-                crate::app::folder_scan::image_folder_page_count(path, options).map_err(|_| ())?
+                crate::app::folder_scan::image_folder_page_count_with_cancel(
+                    path,
+                    options,
+                    Some(cancel),
+                )
+                .map_err(|_| {
+                    if cancel.load(Ordering::Relaxed) {
+                        DetailsPageCountError::Cancelled(DetailsMetaCancelReason::AfterIo(
+                            DetailsMetaIoStage::FolderCount,
+                        ))
+                    } else {
+                        DetailsPageCountError::Failed
+                    }
+                })?
             };
             if cancel.load(Ordering::Relaxed) {
                 return Err(DetailsPageCountError::Cancelled(
@@ -1455,6 +1676,7 @@ fn load_details_page_count_with_pdf_enumerator(
                         DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::FolderCatalogWrite),
                     ));
                 };
+                ensure_page_count_revision_at(config, current_pool_revision())?;
                 let _ = catalog.set_container_page_meta(
                     key,
                     crate::catalog::ContainerPageKind::Folder,
@@ -1486,6 +1708,8 @@ fn load_details_page_count_with_pdf_enumerator(
                     )
                 };
                 if let Ok(Some(meta)) = cached {
+                    trace.cache_hit = true;
+                    ensure_page_count_revision_at(config, current_pool_revision())?;
                     return Ok(meta.page_count);
                 }
             }
@@ -1495,8 +1719,18 @@ fn load_details_page_count_with_pdf_enumerator(
                         DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::RarInspect),
                     ));
                 };
-                let inspection =
-                    crate::rar_loader::inspect_for_direct_read(path).map_err(|_| ())?;
+                let inspection = crate::rar_loader::inspect_for_direct_read_cancelable(
+                    path, cancel,
+                )
+                .map_err(|_| {
+                    if cancel.load(Ordering::Relaxed) {
+                        DetailsPageCountError::Cancelled(DetailsMetaCancelReason::AfterIo(
+                            DetailsMetaIoStage::RarInspect,
+                        ))
+                    } else {
+                        DetailsPageCountError::Failed
+                    }
+                })?;
                 if inspection.decision != crate::rar_loader::RarDirectReadDecision::Direct {
                     None
                 } else if visibility.is_all_visible() {
@@ -1531,6 +1765,7 @@ fn load_details_page_count_with_pdf_enumerator(
                         DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::RarCatalogWrite),
                     ));
                 };
+                ensure_page_count_revision_at(config, current_pool_revision())?;
                 let _ = catalog.set_container_page_meta(
                     key,
                     crate::catalog::ContainerPageKind::Archive,
@@ -1570,11 +1805,13 @@ fn load_details_page_count_with_pdf_enumerator(
                     catalog.get_pdf_meta(key, stamp_mtime, stamp_size)
                 };
                 if let Ok(Some((count, password_required))) = cached {
-                    if password_required && pdf_password.is_none() {
-                        return Ok(None);
-                    }
-                    if count > 0 {
-                        return Ok(Some(count));
+                    if (password_required && pdf_password.is_none()) || count > 0 {
+                        trace.cache_hit = true;
+                        ensure_page_count_revision_at(config, current_pool_revision())?;
+                        return Ok(
+                            (count > 0 && (!password_required || pdf_password.is_some()))
+                                .then_some(count),
+                        );
                     }
                 }
             }
@@ -1600,6 +1837,7 @@ fn load_details_page_count_with_pdf_enumerator(
                         DetailsMetaCancelReason::PermitWait(DetailsMetaIoStage::PdfCatalogWrite),
                     ));
                 };
+                ensure_page_count_revision_at(config, current_pool_revision())?;
                 let _ = catalog.set_pdf_meta(
                     key,
                     stamp_mtime,
@@ -3050,7 +3288,6 @@ mod tests {
             catalog_folder: Some(folder.to_path_buf()),
             catalog_key: Some(key.into()),
             warm_image_dims: None,
-            warm_page_count: None,
             pdf_password_revision: None,
             load_page_count: true,
             load_created_at: false,
@@ -3063,6 +3300,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut catalogs = ContainerCatalogCache::new(8, &cache_dir);
         let config = DetailsPageCountConfig {
+            pool_revision: crate::susie_loader::pool_revision(),
             fingerprint: 0,
             image_folder_options: None,
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
@@ -3181,7 +3419,6 @@ mod tests {
             catalog_folder: Some(temp.path().to_path_buf()),
             catalog_key: Some("book.zip".to_owned()),
             warm_image_dims: None,
-            warm_page_count: None,
             pdf_password_revision: None,
             load_page_count: true,
             load_created_at: false,
@@ -3195,38 +3432,47 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut catalogs = ContainerCatalogCache::new(8, &cache_dir);
         let mut config = DetailsPageCountConfig {
+            pool_revision: crate::susie_loader::pool_revision(),
             fingerprint: 77,
             image_folder_options: None,
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
         };
 
+        let mut first_trace = DetailsPageCountTrace::default();
         assert_eq!(
-            load_details_page_count(
+            load_details_page_count_traced(
                 &target,
                 &cache_dir,
                 &mut catalogs,
                 &io_sem,
                 &cancel,
                 &config,
+                &mut first_trace,
             ),
             Ok(Some(2)),
             "外側画像と実 nested ZIP 内画像を同じ閲覧ページ列として数える"
         );
 
+        assert!(first_trace.nested_zip);
+        assert!(!first_trace.cache_hit);
+
         // 元 ZIP を壊しても同じ identity なら永続 catalog hit から値を返す。
         std::fs::write(&path, b"broken after cache").unwrap();
+        let mut cached_trace = DetailsPageCountTrace::default();
         assert_eq!(
-            load_details_page_count(
+            load_details_page_count_traced(
                 &target,
                 &cache_dir,
                 &mut catalogs,
                 &io_sem,
                 &cancel,
                 &config,
+                &mut cached_trace,
             ),
             Ok(Some(2))
         );
 
+        assert!(cached_trace.cache_hit);
         config.fingerprint += 1;
         assert_eq!(
             load_details_page_count(
@@ -3274,7 +3520,6 @@ mod tests {
             catalog_folder: Some(temp.path().to_path_buf()),
             catalog_key: Some("real-split-control.part1.rar".to_owned()),
             warm_image_dims: None,
-            warm_page_count: None,
             pdf_password_revision: None,
             load_page_count: true,
             load_created_at: false,
@@ -3288,6 +3533,7 @@ mod tests {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut catalogs = ContainerCatalogCache::new(8, &cache_dir);
         let config = DetailsPageCountConfig {
+            pool_revision: crate::susie_loader::pool_revision(),
             fingerprint: 88,
             image_folder_options: None,
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
@@ -3339,13 +3585,177 @@ mod tests {
             file_type_visibility: policy,
             ..Default::default()
         };
+        let options = crate::app::folder_scan::image_folder_page_count_options(&settings);
         DetailsPageCountConfig {
-            fingerprint: crate::app::folder_scan::image_page_recognition_fingerprint(&settings),
-            image_folder_options: Some(crate::app::folder_scan::image_folder_page_count_options(
-                &settings,
-            )),
+            pool_revision: options.pool_revision,
+            fingerprint: options.fingerprint,
+            image_folder_options: Some(options),
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
         }
+    }
+
+    #[test]
+    fn page_count_revision_change_during_enumeration_never_writes_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("book.pdf");
+        std::fs::write(&path, b"pdf source").unwrap();
+        let target = archive_details_target(&path, GridItem::PdfFile(path.clone()));
+        let config = archive_details_config(Default::default());
+        let revision = std::cell::Cell::new(config.pool_revision);
+        let cache_dir = temp.path().join("cache");
+        let mut catalogs = ContainerCatalogCache::new(8, &cache_dir);
+        let result = load_details_page_count_with_pdf_enumerator_traced(
+            &target,
+            &cache_dir,
+            &mut catalogs,
+            &crate::io_semaphore::GlobalIoSemaphore::new(1),
+            &Arc::new(AtomicBool::new(false)),
+            &config,
+            &mut DetailsPageCountTrace::default(),
+            || revision.get(),
+            |_, _, _, _| {
+                revision.set(config.pool_revision.wrapping_add(1));
+                Ok(7)
+            },
+        );
+        assert_eq!(result, Err(DetailsPageCountError::Stale));
+        let catalog = crate::catalog::CatalogDb::open(&cache_dir, temp.path()).unwrap();
+        assert_eq!(
+            catalog
+                .get_pdf_meta("book.pdf", target.source_mtime(), target.source_size())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn page_count_cancelled_during_enumeration_never_writes_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("book.pdf");
+        std::fs::write(&path, b"pdf source").unwrap();
+        let target = archive_details_target(&path, GridItem::PdfFile(path.clone()));
+        let config = archive_details_config(Default::default());
+        let cache_dir = temp.path().join("cache");
+        let mut catalogs = ContainerCatalogCache::new(8, &cache_dir);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = load_details_page_count_with_pdf_enumerator(
+            &target,
+            &cache_dir,
+            &mut catalogs,
+            &crate::io_semaphore::GlobalIoSemaphore::new(1),
+            &cancel,
+            &config,
+            |_, _, _, token| {
+                token.store(true, Ordering::Relaxed);
+                Ok(7)
+            },
+        );
+        assert!(matches!(result, Err(DetailsPageCountError::Cancelled(_))));
+        let catalog = crate::catalog::CatalogDb::open(&cache_dir, temp.path()).unwrap();
+        assert_eq!(
+            catalog
+                .get_pdf_meta("book.pdf", target.source_mtime(), target.source_size())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn precancelled_rar_and_folder_page_workers_publish_no_checked_value_or_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let rar = temp.path().join("book.rar");
+        std::fs::write(&rar, crate::rar_loader::direct_read_test_fixture_bytes()).unwrap();
+        let folder = temp.path().join("pages");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("one.jpg"), b"image").unwrap();
+        let cache_dir = temp.path().join("cache");
+        let catalog = crate::catalog::CatalogDb::open(&cache_dir, temp.path()).unwrap();
+        for (path, item, kind) in [
+            (
+                rar.clone(),
+                GridItem::ConvertibleArchive {
+                    path: rar,
+                    format: crate::archive_converter::ArchiveFormat::Rar,
+                },
+                crate::catalog::ContainerPageKind::Archive,
+            ),
+            (
+                folder.clone(),
+                GridItem::Folder(folder),
+                crate::catalog::ContainerPageKind::Folder,
+            ),
+        ] {
+            let target = archive_details_target(&path, item);
+            let source_mtime = target.source_mtime();
+            let source_size = target.source_size();
+            let config = archive_details_config(Default::default());
+            let fingerprint = config.fingerprint;
+            let (tx, rx) = mpsc::channel();
+            run_details_meta_load(
+                82,
+                vec![target],
+                Vec::new(),
+                0,
+                0,
+                1,
+                cache_dir.clone(),
+                crate::catalog::CatalogAccess::for_cache_dir(&cache_dir).admit(),
+                Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
+                Arc::new(AtomicBool::new(true)),
+                tx,
+                mpsc::channel().1,
+                config,
+            );
+            assert!(
+                rx.into_iter().next().is_none(),
+                "a cancelled worker must publish neither checked metadata nor a completion proof"
+            );
+            assert!(
+                catalog
+                    .get_container_page_meta(
+                        path.file_name().unwrap().to_str().unwrap(),
+                        kind,
+                        source_mtime,
+                        source_size,
+                        fingerprint,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn stale_page_count_worker_emits_no_item_or_finished_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path().join("cache");
+        let mut config = archive_details_config(Default::default());
+        config.pool_revision = config.pool_revision.wrapping_add(1);
+        let mut target = no_io_details_target(0);
+        target.load_ai_metadata = false;
+        target.load_page_count = true;
+        let (tx, rx) = mpsc::channel();
+        run_details_meta_load(
+            81,
+            vec![target],
+            Vec::new(),
+            0,
+            0,
+            1,
+            cache_dir.clone(),
+            crate::catalog::CatalogAccess::for_cache_dir(&cache_dir).admit(),
+            Arc::new(crate::io_semaphore::GlobalIoSemaphore::new(1)),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+            mpsc::channel().1,
+            config,
+        );
+        let events: Vec<_> = rx.into_iter().collect();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            DetailsMetaEvent::Stale { generation: 81 }
+        ));
     }
 
     #[test]
@@ -3531,7 +3941,6 @@ mod tests {
             catalog_folder: None,
             catalog_key: None,
             warm_image_dims: None,
-            warm_page_count: None,
             pdf_password_revision: None,
             load_page_count: false,
             load_created_at: false,
@@ -3580,6 +3989,7 @@ mod tests {
                 tx,
                 mpsc::channel().1,
                 DetailsPageCountConfig {
+                    pool_revision: crate::susie_loader::pool_revision(),
                     fingerprint: 0,
                     image_folder_options: None,
                     pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
@@ -3646,6 +4056,7 @@ mod tests {
             tx,
             priority_rx,
             DetailsPageCountConfig {
+                pool_revision: crate::susie_loader::pool_revision(),
                 fingerprint: 0,
                 image_folder_options: None,
                 pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
@@ -3689,7 +4100,6 @@ mod tests {
             catalog_folder: None,
             catalog_key: None,
             warm_image_dims: None,
-            warm_page_count: None,
             pdf_password_revision: None,
             load_page_count: false,
             load_created_at: true,
@@ -3713,6 +4123,7 @@ mod tests {
             tx,
             mpsc::channel().1,
             DetailsPageCountConfig {
+                pool_revision: crate::susie_loader::pool_revision(),
                 fingerprint: 0,
                 image_folder_options: None,
                 pdf_passwords: crate::pdf_passwords::PdfPasswordStore::empty_for_test(),
@@ -4218,7 +4629,6 @@ mod tests {
             catalog_folder: Some(folder.to_path_buf()),
             catalog_key: Some(name.into()),
             warm_image_dims: None,
-            warm_page_count: None,
             pdf_password_revision: None,
             load_page_count: false,
             load_created_at: false,

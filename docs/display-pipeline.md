@@ -554,6 +554,7 @@ PDF は高さ1024、その他は全体 decode とする。表示サイズの設�
 類似画像索引には従来どおり全体の raster を渡す。全方向の範囲の有効長辺が表示では `display_px`、保存では `thumb_px` に届く全体画素を持ち、
 全体長辺4096を上限とする。必要なら同じ bytes / PDF lease から大きい画像を一度だけ得る。
 基本キーは種類設定の後、pin の前に `|autocrop:v4:rtl` / `|autocrop:v4:ltr` を持つ。手動範囲には付けない。
+自動の入/切は `CoverAutoCropScope` がアイテムの論理パスから解決し、指定のある最深のお気に入りを優先する。要求・存続集合・色・本の代表で同じ値を使い、K2 は子の行を子のパスの値で読む。全体/お気に入りの変更は同じ scope 比較と既存の一覧読み直しを使う。入れ子変更後の親の代表と保持中の別 context の反映制約は [お気に入り別の設計](cover-crop-per-favorite-plan.md) §5〜§6 を参照。
 RAR/CBRの本（`archivethumb:rar:`）と、物理の読み取り先がRARのZipDirは `|autocrop:v4r:{binding}` を使う。
 単一の `auto_token` に要求path／`tree.zip_path`を渡して印を選ぶため、変換ZIPの中のZipDirはv4のまま、RARの本のキーはDirect/CachedZip/Pendingで共通になる。
 RARの標本もZIPと同じ名前順・近傍の最大8枚を選び、一覧サイズで1枚32MiB・合計64MiBの読む集合を先に固定して1回のopenで展開する。

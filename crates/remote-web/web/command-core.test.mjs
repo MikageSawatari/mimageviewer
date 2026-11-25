@@ -1230,8 +1230,9 @@ test("RTL reverses only physical horizontal viewer keys and tap zones", () => {
 });
 
 // Exercise the actual app keyboard adapter as well as the pure command mapping.
-// This catches passing readingDirection (or effectiveSpreadMode) at the call site.
-function remoteHorizontalKey(keyName, configuredSpreadMode, effectiveSpreadMode = configuredSpreadMode) {
+// This catches omitting the viewer direction or using the portrait-only mode.
+function remoteHorizontalKey(keyName, configuredSpreadMode,
+  readingDirection = ReadingDirection.RTL, effectiveSpreadMode = configuredSpreadMode) {
   const source = readFileSync(new URL("./app.js", import.meta.url), "utf8");
   const handler = source.slice(source.indexOf("function onGlobalKeyDown(event) {"),
     source.indexOf("function updateKeyboardAvailability()"));
@@ -1241,7 +1242,7 @@ function remoteHorizontalKey(keyName, configuredSpreadMode, effectiveSpreadMode 
     state: {
       authenticated: true, keyboardInputSeen: true, screenContext: "viewer",
       spreadMode: configuredSpreadMode, effectiveSpreadMode,
-      readingDirection: ReadingDirection.RTL,
+      readingDirection,
     },
     event: { ...key(keyName), preventDefault() {} },
     isCommandInteractiveTarget: () => false,
@@ -1251,42 +1252,53 @@ function remoteHorizontalKey(keyName, configuredSpreadMode, effectiveSpreadMode 
   return requested.name;
 }
 
-test("remote Single with saved RTL advances on ArrowRight", () => {
-  assert.equal(remoteHorizontalKey("ArrowRight", SpreadMode.SINGLE), CommandName.NEXT_PAGE);
-  assert.equal(remoteHorizontalKey("ArrowLeft", SpreadMode.SINGLE), CommandName.PREV_PAGE);
+test("remote Single with saved RTL advances on ArrowLeft", () => {
+  assert.equal(remoteHorizontalKey("ArrowRight", SpreadMode.SINGLE), CommandName.PREV_PAGE);
+  assert.equal(remoteHorizontalKey("ArrowLeft", SpreadMode.SINGLE), CommandName.NEXT_PAGE);
 });
 
-test("configured mode owns horizontal keys, taps, buttons, labels and swipes", () => {
+test("remote Single with saved LTR advances on ArrowRight", () => {
+  assert.equal(remoteHorizontalKey("ArrowRight", SpreadMode.SINGLE, ReadingDirection.LTR), CommandName.NEXT_PAGE);
+  assert.equal(remoteHorizontalKey("ArrowLeft", SpreadMode.SINGLE, ReadingDirection.LTR), CommandName.PREV_PAGE);
+});
+
+test("configured mode and viewer direction govern horizontal keys, taps, buttons, labels and swipes", () => {
   for (const mode of Object.values(SpreadMode)) {
-    const expectedRtl = [SpreadMode.RTL, SpreadMode.RTL_COVER, SpreadMode.SPLIT_RTL].includes(mode);
-    const rtl = commandCore.inputAdvancesRightToLeft(mode);
-    assert.equal(rtl, expectedRtl, mode);
-    const left = expectedRtl ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE;
-    const right = expectedRtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE;
-    assert.equal(remoteHorizontalKey("ArrowLeft", mode), left, mode);
-    assert.equal(remoteHorizontalKey("ArrowRight", mode), right, mode);
-    assert.equal(viewerTapCommand(10, 300, rtl).name, left, mode);
-    assert.equal(viewerTapCommand(290, 300, rtl).name, right, mode);
-    assert.deepEqual(commandCore.viewerPageButtonState("left", rtl), {
-      commandName: left, label: expectedRtl ? "次の画像" : "前の画像",
-    }, mode);
-    assert.deepEqual(commandCore.viewerPageButtonState("right", rtl), {
-      commandName: right, label: expectedRtl ? "前の画像" : "次の画像",
-    }, mode);
-    // A swipe moves the page with the finger, opposite to a tap on that side.
-    assert.equal(commandCore.viewerSwipeCommand(ViewerGesture.SWIPE_LEFT, rtl).name, right, mode);
-    assert.equal(commandCore.viewerSwipeCommand(ViewerGesture.SWIPE_RIGHT, rtl).name, left, mode);
-    assert.equal(viewerBoundaryMessage({ currentIndex: 0, count: 2, delta: -1, rtl }),
-      expectedRtl ? "先頭ページです（右→左綴じ：次は左をタップ）" : "先頭ページです", mode);
-    assert.equal(commandFromKey(key("ArrowDown", { rtl }), "viewer").name, CommandName.NEXT_PAGE);
-    assert.equal(commandFromKey(key("PageUp", { rtl }), "viewer").name, CommandName.PREV_PAGE);
+    for (const direction of Object.values(ReadingDirection)) {
+      const context = `${mode}/${direction}`;
+      const expectedRtl = mode === SpreadMode.SINGLE ? direction === ReadingDirection.RTL
+        : [SpreadMode.RTL, SpreadMode.RTL_COVER, SpreadMode.SPLIT_RTL].includes(mode);
+      const rtl = commandCore.inputAdvancesRightToLeft(mode, direction);
+      assert.equal(rtl, expectedRtl, context);
+      const left = expectedRtl ? CommandName.NEXT_PAGE : CommandName.PREV_PAGE;
+      const right = expectedRtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE;
+      assert.equal(remoteHorizontalKey("ArrowLeft", mode, direction), left, context);
+      assert.equal(remoteHorizontalKey("ArrowRight", mode, direction), right, context);
+      assert.equal(viewerTapCommand(10, 300, rtl).name, left, context);
+      assert.equal(viewerTapCommand(290, 300, rtl).name, right, context);
+      assert.deepEqual(commandCore.viewerPageButtonState("left", rtl), {
+        commandName: left, label: expectedRtl ? "次の画像" : "前の画像",
+      }, context);
+      assert.deepEqual(commandCore.viewerPageButtonState("right", rtl), {
+        commandName: right, label: expectedRtl ? "前の画像" : "次の画像",
+      }, context);
+      // A swipe moves the page with the finger, opposite to a tap on that side.
+      assert.equal(commandCore.viewerSwipeCommand(ViewerGesture.SWIPE_LEFT, rtl).name, right, context);
+      assert.equal(commandCore.viewerSwipeCommand(ViewerGesture.SWIPE_RIGHT, rtl).name, left, context);
+      assert.equal(viewerBoundaryMessage({ currentIndex: 0, count: 2, delta: -1, rtl }),
+        expectedRtl ? "先頭ページです（右→左綴じ：次は左をタップ）" : "先頭ページです", context);
+      assert.equal(commandFromKey(key("ArrowDown", { rtl }), "viewer").name, CommandName.NEXT_PAGE);
+      assert.equal(commandFromKey(key("PageUp", { rtl }), "viewer").name, CommandName.PREV_PAGE);
+    }
   }
 });
 
 test("portrait display-only Single keeps configured RTL horizontal input", () => {
   for (const mode of [SpreadMode.RTL, SpreadMode.RTL_COVER, SpreadMode.SPLIT_RTL]) {
-    assert.equal(remoteHorizontalKey("ArrowLeft", mode, SpreadMode.SINGLE), CommandName.NEXT_PAGE);
-    assert.equal(remoteHorizontalKey("ArrowRight", mode, SpreadMode.SINGLE), CommandName.PREV_PAGE);
+    for (const direction of Object.values(ReadingDirection)) {
+      assert.equal(remoteHorizontalKey("ArrowLeft", mode, direction, SpreadMode.SINGLE), CommandName.NEXT_PAGE);
+      assert.equal(remoteHorizontalKey("ArrowRight", mode, direction, SpreadMode.SINGLE), CommandName.PREV_PAGE);
+    }
   }
 });
 
@@ -1313,15 +1325,15 @@ test("mode-only normalization follows binding while explicit spread follows the 
   }
 });
 
-test("RTL to Single releases input reversal while saved reading direction keeps seek RTL", () => {
+test("RTL to Single keeps input reversal and seek RTL from the saved reading direction", () => {
   let mode = SpreadMode.RTL;
   const direction = ReadingDirection.RTL;
-  for (const expectedRtl of [true, false]) {
-    const rtl = commandCore.inputAdvancesRightToLeft(mode);
-    assert.equal(rtl, expectedRtl);
-    assert.equal(remoteHorizontalKey("ArrowRight", mode), expectedRtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
-    assert.equal(viewerTapCommand(290, 300, rtl).name, expectedRtl ? CommandName.PREV_PAGE : CommandName.NEXT_PAGE);
-    assert.equal(commandCore.viewerPageButtonState("right", rtl).label, expectedRtl ? "前の画像" : "次の画像");
+  for (let step = 0; step < 2; step += 1) {
+    const rtl = commandCore.inputAdvancesRightToLeft(mode, direction);
+    assert.equal(rtl, true);
+    assert.equal(remoteHorizontalKey("ArrowRight", mode), CommandName.PREV_PAGE);
+    assert.equal(viewerTapCommand(290, 300, rtl).name, CommandName.PREV_PAGE);
+    assert.equal(commandCore.viewerPageButtonState("right", rtl).label, "前の画像");
     assert.equal(viewerSeekState({ groupPageIndexes: [[0], [1]], currentGroupIndex: 0,
       pageCount: 2, rtl: isRtlReadingDirection(direction) }).direction, ReadingDirection.RTL);
     mode = SpreadMode.SINGLE;

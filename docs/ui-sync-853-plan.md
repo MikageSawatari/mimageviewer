@@ -748,3 +748,22 @@ waiting_does_not_expire_while_files_keep_arriving
 ignored の `shell_paste_native_hdrop_copy_uses_resident_sta` と `shell_paste_native_local_cut_completes_on_original_sta` を、
 設計担当が開発機 (メイン PC) で run-heavy 経由・1 件ずつ (`--run-ignored only --test-threads 1`) 流し、2 件とも成功した
 (c89d38eb0)。製品は起動していない。衝突・取消の Windows の画面の確認 (§2.6 の実機で見る項目) は未実施。
+
+### 5.10 master との merge (v5.7.0 後)
+
+Susie の公開状態は master の `PoolState` / `replace()` / `pool_snapshot()` / `pool_revision()` に統一し、
+本ブランチの `PublishedPool` / `publish()` / `extensions_generation()` を廃止した。起動走査の前後照合と
+`FolderScanPolicy` は同じ pool revision を使う。版は master の `checked_add` を維持し、pool と同じ lock 内で
+更新する。初期化・reload とも旧 pool の Drop は write lock を離してから行う。二つの publication テストは
+認識規則・revision・保持済み Arc の関係を確認する一つの `PoolState` テストにまとめた。
+
+ツリーの worker は本ブランチの `scan_policy.scan()` を残し、policy に UI 側で捕捉した
+`page_count_fingerprint: Option<i64>` を加えた。等価比較にも含め、走査後は master の
+`collect_folder_listing_metadata_facts` で長さ・ページ数の事実を一緒に収集する。起動 Directory・既定先・
+前回の一覧の復元も同じ policy を通す。場所移動・アドレス入力の Worker 経路と、自動 merge 済みの
+分類・DFS/兄弟移動・外部変更・物理履歴 preflight は、事実を持つ `ScannedDir` を既存の採用経路へ渡す。
+master の同期 loader は catalog を読まないまま維持した。policy の fingerprint 比較・事実収集と、
+ページ数の認識設定変更時に同じ起動要求を再走査する回帰テストを追加した。
+
+`async-architecture.md` は本ブランチの二節と master の一括エクスポートの透かしの節を残し、
+Susie の記述を統合後の名前へ揃えた。本作業では cargo・rustfmt・製品起動・コミット操作は行っていない。
