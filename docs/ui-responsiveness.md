@@ -645,6 +645,31 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+§1.362 段 A の一括エクスポートは、出力先の作成・正規化・衝突判定、元の日時、
+デコード・編集合成・リサイズ・メタデータ検査・エンコード・書き込みを既存の専用workerに置く。
+UI準備に足した情報はsource_dir/source_extのパス・文字列演算だけ。
+既存の6ms予算で読む編集snapshot、保存先初期候補のis_dir確認、開始操作のsettings.saveは既存経路を維持する。
+新しい待機・UIのファイル読込・デコード・GPU操作は追加しない。
+取消tokenはデコードと合成へ引き継ぎ、書込前に確認する。`export_batch/prepare` と
+`export_batch/item` に準備、各処理区間、寸法・形式・結果を記録する。
+終了結果のpollは非blockingで、警告付き終了を保持しても一覧更新は終端採用時の1回だけ。
+自動検証・実機操作・性能測定は未実施で、設計担当の共有runnerへ引き継ぐ。
+
+段 B の透かしも同じ一括 worker が所有する。フォント・ロゴは開始時に 1 回読み、
+ロゴのデコード、アルファを考慮した縮小、文字描画と straight RGBA 合成は UI から呼ばない。
+同寸法のロゴは直前の縮小結果を再利用し、`export_batch/item` の `watermark_ms` に合成区間を記録する。
+素材読み込みは `export_batch/prepare` の時間に含む。UI の拡張子確認は文字列演算だけで、
+存在確認の metadata は短命 `export-logo-check` スレッドに置く。ダイアログの `logo_check` は
+確認ごとの専用 receiver を 1 つだけ持ち、選び直しや閉じる操作で旧 receiver を捨てる。
+UI は try_recv だけで採用し、確認中も開始可能。画像の実読込は worker が開始時に行う。
+段 B のコンパイル・自動テスト・実機確認は未実行。共有 runner での検証に引き継ぐ。
+
+段 C のプリセット呼び出しは `BatchExportOptions` の clone だけで、画像の透かしなら
+既存の `begin_logo_check` で確認ごとの receiver を置き換える。保存・削除の明示操作だけは
+設計書 §8 のとおり既存の設定保存経路 `Settings::save_checked()` を同期で呼ぶ。
+専用の書き込み worker や待機は追加せず、失敗はログと通知に残しメモリ上の変更を保持する。
+段 C のコンパイル・自動テスト・snapshot PNG の生成は共有 runner へ引き継ぐ (実装担当では未実行)。
+
 Ctrl+S / Ctrl+T（案 C）の最終列に対応する読書位置索引は検索workerで準備し、
 `search / page_identity_prepare` に `surface`・`items`・`ms` を記録する。
 Ctrl+S空クエリの空列だけは定数サイズの準備を同期実行する。完成結果の条件一致を確認し、

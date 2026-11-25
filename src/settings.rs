@@ -5897,6 +5897,12 @@ pub struct Settings {
     /// 一括エクスポートの出力サイズ。
     #[serde(default)]
     pub export_batch_scale: crate::export_dialog::ExportScale,
+    /// 一括出力の前回値。旧4欄はこの値が無い設定の移行元だけに使う。
+    #[serde(default)]
+    pub export_batch_options: Option<crate::export_batch::BatchExportOptions>,
+    /// 一括書き出しの保存形式プリセット (保存順、PC 固有パスを含む)。
+    #[serde(default)]
+    pub export_batch_presets: Vec<crate::export_batch::BatchExportPreset>,
 
     // ── SNS 分割 ──────────────────────────────────────────────
     /// 直前に選んだ投稿先 (`"x"` / `"instagram"`)。ページ固有の配置は保存しない。
@@ -8952,6 +8958,8 @@ impl Default for Settings {
             export_batch_template: default_export_batch_template(),
             export_batch_format: crate::capture::CaptureFormat::default(),
             export_batch_scale: crate::export_dialog::ExportScale::default(),
+            export_batch_options: None,
+            export_batch_presets: Vec::new(),
             sns_split_target: default_sns_split_target(),
             sns_split_count: default_sns_split_count(),
             sns_split_seam_permille: default_sns_split_seam_permille(),
@@ -11447,6 +11455,7 @@ impl Settings {
     /// `src` 側は Vec / String など大きいフィールドは `std::mem::take` で奪うので、
     /// 呼出後は空の既定値になる (呼出元はすぐ `*self = state.settings` で捨てる想定)。
     pub fn overwrite_non_preferences_from(&mut self, src: &mut Settings) {
+        self.export_batch_presets = std::mem::take(&mut src.export_batch_presets);
         // 通知を閉じる前の環境設定 draft で既読を巻き戻さない。
         self.whats_new_acknowledged_version
             .clone_from(&src.whats_new_acknowledged_version);

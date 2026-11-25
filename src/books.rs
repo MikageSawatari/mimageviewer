@@ -1869,6 +1869,32 @@ pub(crate) fn decode_composite_source_for_materialization(
     )
 }
 
+/// Batch metadata output reuses the ZIP entry bytes consumed by the decoder.
+/// Other callers retain the existing source-only materialization path.
+pub(crate) fn decode_composite_source_for_materialization_with_bytes(
+    source: &CompositeSource,
+    pdf_long_edge: u32,
+    cancel: Arc<AtomicBool>,
+    raw: Option<&crate::raw::RawDecodeContext>,
+) -> Result<(egui::ColorImage, Option<Vec<u8>>), String> {
+    ensure_materialization_not_cancelled(cancel.as_ref())?;
+    if let CompositeSource::ZipEntry {
+        zip_path,
+        entry_name,
+    } = source
+    {
+        let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name)
+            .map_err(|e| format!("ZIP 内画像を読み取れません: {entry_name}: {e}"))?;
+        ensure_materialization_not_cancelled(cancel.as_ref())?;
+        let image = decode_bytes_color_image(entry_name, &bytes, raw, &cancel)?;
+        ensure_materialization_not_cancelled(cancel.as_ref())?;
+        Ok((image, Some(bytes)))
+    } else {
+        decode_composite_source_for_materialization(source, pdf_long_edge, cancel, raw)
+            .map(|image| (image, None))
+    }
+}
+
 pub(crate) fn decode_composite_source_for_materialization_with_target(
     source: &CompositeSource,
     pdf_long_edge: u32,
@@ -2182,8 +2208,9 @@ fn compose_book_page_with_cancel(
 
 /// 1 ページぶんの「デコード → 合成 → 縮小 → エンコード → 書き出し」。
 ///
-/// 製本の Composited ページと Ctrl+E の一括エクスポートが共有する唯一の実体で、
-/// 戻り値は消しゴム補完が diffusion フォールバックしたか。本固有の事情 (ページ採番、
+/// 製本の Composited ページ用。戻り値は消しゴム補完が diffusion フォールバックしたか。
+/// 一括エクスポートは同じデコード・合成部品を使い、出力の選択肢は専用workerが持つ。
+/// 本固有の事情 (ページ採番、
 /// `MAX_BOOK_PAGES`、無編集時の byte copy、`restore_declines`、コピー集計) は
 /// `append_pages_at` 側に残し、ここは 1 件だけを見る。
 pub fn write_composited_page(

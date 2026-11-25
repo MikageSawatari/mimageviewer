@@ -51635,7 +51635,9 @@ mod favorite_adjustment_defaults_tests {
                 }
                 crate::export_dialog::ExportEvent::AllDone => break,
                 crate::export_dialog::ExportEvent::Started { .. }
-                | crate::export_dialog::ExportEvent::Failed(_) => {}
+                | crate::export_dialog::ExportEvent::Failed(_)
+                | crate::export_dialog::ExportEvent::Skipped { .. }
+                | crate::export_dialog::ExportEvent::ThumbnailNotice { .. } => {}
             }
         }
         assert_eq!(completed, 5);
@@ -51673,7 +51675,9 @@ mod favorite_adjustment_defaults_tests {
             last_message: "準備中".to_string(),
             successes: Vec::new(),
             errors: Vec::new(),
-            finished: false,
+            skipped: Vec::new(),
+            thumbnail_notices: Vec::new(),
+            end: None,
             cancel_requested: false,
         });
         tx.send(crate::export_dialog::ExportEvent::Completed(

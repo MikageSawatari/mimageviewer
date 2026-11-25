@@ -28774,7 +28774,7 @@ impl App {
         if self
             .export_pending
             .as_ref()
-            .is_some_and(|pending| !pending.finished)
+            .is_some_and(|pending| pending.end.is_none())
         {
             crate::logger::log(format!(
                 "external_rescan: reloading current folder while Ctrl+E export continues ({})",

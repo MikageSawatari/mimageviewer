@@ -59228,13 +59228,9 @@ impl App {
             rotation,
             self.settings.bake_stage_export_batch,
         )?;
-        Ok(Some(crate::export_batch::BatchExportItem {
-            filename,
-            dirname,
-            source,
-            edits,
-            composition_check: self.output_composition_check(idx),
-        }))
+        let mut item = crate::export_batch::BatchExportItem::new(filename, dirname, source, edits);
+        item.composition_check = self.output_composition_check(idx);
+        Ok(Some(item))
     }
 
     /// スタックメンバー (集約ビューでは `items` に現れない実ファイル)。idx を持たない
@@ -59257,15 +59253,14 @@ impl App {
             rotation,
             self.settings.bake_stage_export_batch,
         )?;
-        Ok(crate::export_batch::BatchExportItem {
-            filename: crate::capture::basename_for_path(path),
-            dirname: Self::batch_export_dirname_for_path(path),
-            source: crate::books::CompositeSource::File {
+        Ok(crate::export_batch::BatchExportItem::new(
+            crate::capture::basename_for_path(path),
+            Self::batch_export_dirname_for_path(path),
+            crate::books::CompositeSource::File {
                 path: path.to_path_buf(),
             },
             edits,
-            composition_check: None,
-        })
+        ))
     }
 
     /// `<dirname>` に入る名前。ZIP 内画像と PDF ページは、書庫そのものではなく
@@ -59993,63 +59988,8 @@ impl App {
         let Some(pending) = self.export_pending.as_mut() else {
             return;
         };
-        let mut dismiss_finished = false;
-        let mut request_cancel = false;
-        let progress = if pending.total == 0 {
-            0.0
-        } else {
-            pending.done as f32 / pending.total as f32
-        };
-
-        // CLAUDE.md「ダイアログ (egui::Window)」: anchor() はドラッグ不可になるため
-        // 必ず default_pos() を使う。
-        let progress_default_pos = ctx.content_rect().center() - egui::vec2(190.0, 100.0);
-        egui::Window::new("エクスポート進行状況")
-            .drag_area(egui::WindowDrag::Anywhere)
-            .collapsible(false)
-            .resizable(false)
-            .default_pos(progress_default_pos)
-            .show(ctx, |ui| {
-                ui.set_min_width(380.0);
-                ui.label(&pending.last_message);
-                ui.add(
-                    egui::ProgressBar::new(progress)
-                        .show_percentage()
-                        .text(format!("{} / {}", pending.done, pending.total)),
-                );
-                if !pending.errors.is_empty() {
-                    ui.add_space(8.0);
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 140, 140),
-                        format!("{} 件のエラー", pending.errors.len()),
-                    );
-                    egui::ScrollArea::vertical()
-                        .scroll_source(egui::scroll_area::ScrollSource {
-                            drag: egui::scroll_area::DragScroll::Always,
-                            ..Default::default()
-                        })
-                        .max_height(120.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            for err in &pending.errors {
-                                ui.small(format!("{}: {}", err.label, err.message));
-                            }
-                        });
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if pending.finished {
-                        if ui.button("閉じる").clicked() {
-                            dismiss_finished = true;
-                        }
-                    } else if pending.cancel_requested {
-                        ui.add_enabled(false, egui::Button::new("キャンセル中..."));
-                    } else if ui.button("キャンセル").clicked() {
-                        request_cancel = true;
-                    }
-                });
-            });
-
+        let (dismiss_finished, request_cancel) =
+            crate::ui_dialogs::export_batch::draw_progress_window(ctx, pending);
         if request_cancel {
             pending.cancel_requested = true;
             pending
@@ -60091,37 +60031,44 @@ impl App {
                     pending.last_message = format!("保存に失敗: {}", err.label);
                     pending.errors.push(err);
                 }
+                Ok(crate::export_dialog::ExportEvent::Skipped { label, path }) => {
+                    pending.done = pending.done.saturating_add(1);
+                    pending.last_message = format!("スキップしました: {label}");
+                    pending
+                        .skipped
+                        .push(crate::export_dialog::ExportSuccess { label, path });
+                }
+                Ok(crate::export_dialog::ExportEvent::ThumbnailNotice { label, path, kinds }) => {
+                    pending
+                        .thumbnail_notices
+                        .push(crate::export_dialog::ExportThumbnailNotice { label, path, kinds });
+                }
                 Ok(crate::export_dialog::ExportEvent::Cancelled) => {
-                    toast = Some("エクスポートをキャンセルしました".to_string());
-                    // キャンセル時も既に書き出されたファイルがあれば refresh
-                    if !pending.successes.is_empty() {
-                        refresh_after_done = true;
+                    pending.end = Some(crate::export_dialog::ExportEnd::Cancelled);
+                    refresh_after_done = true;
+                    if pending.thumbnail_notices.is_empty() {
+                        toast = Some("エクスポートをキャンセルしました".to_string());
+                        clear_pending = true;
+                    } else {
+                        pending.last_message = export_end_summary(pending);
                     }
-                    clear_pending = true;
                     break;
                 }
                 Ok(crate::export_dialog::ExportEvent::AllDone) => {
-                    pending.finished = true;
-                    // batch 完了時にまとめて 1 回 refresh
-                    if !pending.successes.is_empty() {
-                        refresh_after_done = true;
-                    }
-                    if pending.errors.is_empty() {
-                        if pending.successes.len() == 1 {
+                    pending.end = Some(crate::export_dialog::ExportEnd::Done);
+                    refresh_after_done = true;
+                    if !pending.thumbnail_notices.is_empty() || !pending.errors.is_empty() {
+                        pending.last_message = export_end_summary(pending);
+                    } else {
+                        if pending.skipped.is_empty() && pending.successes.len() == 1 {
                             reveal_path = pending.successes.first().map(|s| s.path.clone());
                         } else {
-                            toast = Some(format!(
-                                "{} 件をエクスポートしました",
-                                pending.successes.len()
+                            toast = Some(export_done_message(
+                                pending.successes.len(),
+                                pending.skipped.len(),
                             ));
                         }
                         clear_pending = true;
-                    } else {
-                        pending.last_message = format!(
-                            "完了: 成功 {} / 失敗 {}",
-                            pending.successes.len(),
-                            pending.errors.len()
-                        );
                     }
                     break;
                 }
@@ -60130,8 +60077,8 @@ impl App {
                     // AllDone を既に受け取り済み (= worker は正常終了) の場合は、
                     // ここで「中断されました」toast を出すと AllDone エラー集計の
                     // 進捗ダイアログを 1 フレで上書きしてしまう。
-                    // finished が立っていればダイアログ表示を維持する。
-                    if !pending.finished {
+                    // 終了状態があればダイアログ表示を維持する。
+                    if pending.end.is_none() {
                         toast = Some("エクスポート worker が中断されました".to_string());
                         clear_pending = true;
                     }
@@ -60140,13 +60087,22 @@ impl App {
             }
         }
 
-        // 完了 (AllDone / Cancelled) で書き出されたファイルの parent をまとめて 1 件
-        // pending に積む。複数 success path はすべて同じ output_dir なので、最初の
-        // 成功 path だけを渡せば十分。
+        // Same-as-source can write into multiple folders. Refresh the displayed one once.
         let first_success_path = if refresh_after_done {
-            self.export_pending
-                .as_ref()
-                .and_then(|p| p.successes.first().map(|s| s.path.clone()))
+            let current = self.current_favorite_target();
+            self.export_pending.as_ref().and_then(|p| {
+                p.successes
+                    .iter()
+                    .find(|success| {
+                        current.as_ref().is_some_and(|current| {
+                            success
+                                .path
+                                .parent()
+                                .is_some_and(|parent| crate::folder_tree::path_eq(parent, current))
+                        })
+                    })
+                    .map(|success| success.path.clone())
+            })
         } else {
             None
         };
@@ -103776,3 +103732,25 @@ mod manual_nav_wrap_tests;
 
 #[cfg(all(test, windows))]
 mod conceal_preview_tests;
+
+fn export_end_summary(pending: &crate::export_dialog::ExportPending) -> String {
+    let heading = if pending.end == Some(crate::export_dialog::ExportEnd::Cancelled) {
+        "キャンセルしました"
+    } else {
+        "完了"
+    };
+    format!(
+        "{heading}: 成功 {} / スキップ {} / 失敗 {}",
+        pending.successes.len(),
+        pending.skipped.len(),
+        pending.errors.len()
+    )
+}
+
+fn export_done_message(success: usize, skipped: usize) -> String {
+    match (success, skipped) {
+        (_, 0) => format!("{success} 件をエクスポートしました"),
+        (0, _) => format!("既にある {skipped} 件をスキップしました (書き出した画像はありません)"),
+        _ => format!("{success} 件をエクスポートしました (既にある {skipped} 件はスキップ)"),
+    }
+}
