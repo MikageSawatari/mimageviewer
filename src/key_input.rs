@@ -27,11 +27,12 @@ use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindow
 use windows::Win32::UI::WindowsAndMessaging::{
     HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLOSE, HTGROWBOX, HTHELP, HTLEFT,
     HTMAXBUTTON, HTMINBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, SC_CLOSE, SC_CONTEXTHELP,
-    SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_EXITSIZEMOVE,
-    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCDESTROY, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
-    WM_NCMOUSEMOVE, WM_NCPOINTERDOWN, WM_NCPOINTERUP, WM_NCPOINTERUPDATE, WM_POINTERCAPTURECHANGED,
-    WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, WM_ACTIVATE, WM_CANCELMODE, WM_CAPTURECHANGED,
+    WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCDESTROY, WM_NCLBUTTONDBLCLK,
+    WM_NCLBUTTONDOWN, WM_NCLBUTTONUP, WM_NCMOUSEMOVE, WM_NCPOINTERDOWN, WM_NCPOINTERUP,
+    WM_NCPOINTERUPDATE, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
 const MAX_PENDING_EVENTS: usize = 256;
@@ -6621,6 +6622,15 @@ unsafe extern "system" fn main_key_input_subclass_proc(
     _ref_data: usize,
 ) -> LRESULT {
     let hwnd_raw = hwnd.0 as u64;
+    if matches!(msg, WM_ACTIVATE | WM_MOUSEACTIVATE) && crate::focus_debug::is_enabled() {
+        let is_main = state().lock().ok().is_some_and(|guard| {
+            guard.installed_hwnds.owns_subclass(hwnd_raw, id)
+                && guard.installed_hwnds.viewport_for_hwnd(hwnd_raw) == Some(egui::ViewportId::ROOT)
+        });
+        if is_main {
+            crate::focus_debug::log_main_activation(hwnd_raw, msg, wparam.0, lparam.0);
+        }
+    }
     let native_interesting = native_detached_message_interesting(msg);
     let native_origin = native_mouse_origin(msg);
     let call = NativeDetachedCall::new(msg, wparam.0, native_origin);
