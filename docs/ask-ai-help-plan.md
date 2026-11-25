@@ -140,7 +140,8 @@ B の状態は「検出の結果の cache」になるので、古さの扱いを
   §1.895 で検出の側を直せば、このメニューは変更なしで従う。
 - 「登録済み」と見なすのは `RegistrationState::Registered` だけ。
   - `DifferentTarget` (別の mIV の exe を指している) は出さない。開いた先の AI アプリが古い・無い exe を起動し得るため。
-  - 検出の失敗 (`Failed`)・`Unreadable`・`Ambiguous` も出さない (始め方の区画は出るので、そこから AI 連携の窓へ進める)。
+  - 検出の失敗 (`Failed`)・`Unreadable`・`Ambiguous` も出さない。`Registered` のアプリが 1 つも無ければ始め方の区画が出るので、
+    そこから AI 連携の窓へ進める (片方が `Unreadable` 等でも、もう片方が `Registered` なら始め方は出ない。U1)。
   - 許可の範囲 (`agent_level`) は見ない。ヘルプの tool は連携が無効でも答える (`docs/mcp-guide-settings-plan.md` §4.3)。
 - AI 連携の窓で登録・解除した直後の反映は、次にサブメニューを開いたときの再検出に任せる (5 秒の間隔の内なら、その後)。
   窓からこの状態へ結果を流し込む経路は作らない。
