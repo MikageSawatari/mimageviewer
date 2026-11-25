@@ -40,6 +40,12 @@
 
 ## 1. 優先候補
 
+### 1.903 v5.8.0 の依存物の更新 (PDFium 8179・mIV Sound の元 (EffeTune Mixwright) 0.19.0・crate 22 件) — v5.7.0 のリリース時の確認から (2026-11-26)
+
+- 状態: **v5.8.0 で行う (利用者決定 2026-11-25「依存物の更新は、v5.8.0にしたいと思います」)、2026-11-26 に着手 (利用者「並行して着手可能でしょうか」)、担当 deps-903**。
+- 中身: v5.7.0 のリリースの Phase 2 (依存物の確認) で見つかった更新。PDFium 8179 (今の版から)、mIV Sound の元 (EffeTune Mixwright) の上流 0.19.0 (派生版の取り込み)、cargo の crate 22 件。手順は docs/native-dependencies.md と docs/release-checklist.md の Phase 2。
+- 注意: mIV Sound の DLL や VST3 host の中身が変わると、公開前のポータブル版の VirusTotal 検査が要る (release-checklist 12.6)。FFmpeg は LGPL の DLL のまま。
+
 ### 1.902 1 枚の書き出し (Ctrl+E) の JPEG で、「メタデータを保持」でも色のプロファイル (ICC) が残らない — §1.888 のサブ PC 確認から (2026-11-26)
 
 - 状態: **未着手、収録版未定 (リリース済みの動き、v5.7.0 から同じ)**。観測: サブ PC 担当 (2026-11-26、master 5e66f8df5、§1.888 の確認): 01_exif_ifd1.jpg (APP2 に ICC_PROFILE 604 バイト) を Ctrl+E で書き出すと、EXIF の他の項目は残るが ICC が出力に無い。export-362 の担当のコード読み: v5.7.0 (82b6c57e1) の 1 枚の書き出しの JPEG でも同じで、§1.888 の退行ではない。一括エクスポート (§1.362) は ICC を残す。
