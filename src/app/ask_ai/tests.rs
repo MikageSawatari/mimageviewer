@@ -243,12 +243,13 @@ fn ask_ai_pressed_destination_never_becomes_another_destination() {
             Destination::ClaudeWeb,
             Destination::Guide,
         ] {
-            if before == [false; 2]
-                && matches!(
-                    destination,
-                    Destination::ClaudeApp | Destination::ChatGptApp
-                )
-            {
+            // Only press destinations visible before the result arrives: apps
+            // while registered, Web and guide while unregistered (U1).
+            let is_app = matches!(
+                destination,
+                Destination::ClaudeApp | Destination::ChatGptApp
+            );
+            if is_app != (before == [true; 2]) {
                 continue;
             }
             let (tx, rx) = mpsc::channel();
