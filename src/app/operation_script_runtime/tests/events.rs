@@ -186,6 +186,20 @@ fn event_r11_container_is_item_only_for_folders_pdf_epub_nested_and_converted_zi
         ),
     ];
     for (item, expected, kind) in cases {
+        if let GridItem::ZipImage {
+            zip_path,
+            entry_name,
+        } = &item
+        {
+            let parts = crate::zip_loader::split_nested_zip_path(entry_name);
+            if parts.len() > 1 {
+                // Existing container PathBuf construction keeps a raw nested prefix
+                // as one segment: native outer boundary, literal internal slashes.
+                let raw_prefix = parts[..parts.len() - 1].join("/");
+                let existing = crate::spread_db::container_key(zip_path, &[raw_prefix]);
+                assert_eq!(expected.to_str(), existing.to_str());
+            }
+        }
         app.items[0] = item;
         // Unrelated/mid-load source state must never change the item container.
         app.current_folder = Some(root.join("pending.zip"));
@@ -314,11 +328,21 @@ fn event_nested_container_appends_literal_entry_without_host_path_replacement() 
     app.fullscreen_idx = Some(0);
     let outer = app.tmp.path().join("outer.zip");
     for prefix in ["/inner.zip", "C:/inner.zip", "//server/share/inner.zip"] {
+        let entry_name = format!("{prefix}/page.jpg");
         app.items[0] = GridItem::ZipImage {
             zip_path: outer.clone(),
-            entry_name: format!("{prefix}/page.jpg"),
+            entry_name: entry_name.clone(),
         };
-        let expected = format!("{}/{prefix}", outer.to_string_lossy());
+        let expected = format!(
+            "{}{separator}{prefix}",
+            outer.to_string_lossy(),
+            separator = std::path::MAIN_SEPARATOR_STR,
+        );
+        // Stage 2b still compares the physical root and raw entry separately.
+        assert_eq!(
+            app.operation_script_page_identity().scalars.item,
+            Some(ScriptItemIdentity::ZipImage(outer.clone(), entry_name))
+        );
         let snapshot = app.collect_operation_script_snapshot(ScriptInputSurface::Viewer);
         assert_eq!(snapshot.book.path.as_deref(), Some(expected.as_str()));
         assert!(
@@ -341,7 +365,7 @@ fn event_and_slot_invocations_publish_the_same_item_container_book_path() {
         zip_path: outer.clone(),
         entry_name: "nested.zip/sub/page.png".into(),
     };
-    let expected = format!("{}/nested.zip", outer.to_string_lossy());
+    let expected = outer.join("nested.zip").to_string_lossy().into_owned();
     app.operation_script.state = OperationScriptState::Ready(Box::new(
         CompiledOperationScript::compile(
             r#"fn slots() { [#{slot:1,label:"container",run:"entry"}] }

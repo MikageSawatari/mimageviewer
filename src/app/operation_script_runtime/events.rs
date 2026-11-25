@@ -53,10 +53,10 @@ impl ScriptContainer {
             ScriptItemIdentity::ZipImage(path, entry) => {
                 let parts = crate::zip_loader::split_nested_zip_path(entry);
                 let path = if parts.len() > 1 {
-                    // Entry names are literal archive identity, never a host path.
-                    // join() would replace the outer archive for / or drive prefixes.
+                    // Only the outer/entry boundary uses the host separator.
+                    // Preserve raw entry spelling; join() could replace the outer path.
                     let mut logical = path.as_os_str().to_owned();
-                    logical.push("/");
+                    logical.push(std::path::MAIN_SEPARATOR_STR);
                     logical.push(parts[..parts.len() - 1].join("/"));
                     PathBuf::from(logical)
                 } else {

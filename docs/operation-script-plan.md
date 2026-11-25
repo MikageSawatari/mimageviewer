@@ -549,14 +549,14 @@ r10 の独立設計レビュー (2026-11-25、GPT-6 Astra / medium、read-only�
 | --- | --- | --- |
 | Image / Video / Audio | ファイルの親folder、`folder` | typed file pathの物理親。検索/collection/directでも同じ |
 | ZipImage（通常） | `zip_path`、`zip` | typed外側ZIPファイル。entryのフォルダ階層は含めない |
-| ZipImage（nested ZIP/CBZ） | `zip_path` + entryの最内ZIP/CBZ境界まで、`zip` | 外側typed pathへraw entryを文字列として追記する論理path。hostのjoin/絶対path解釈をしない |
+| ZipImage（nested ZIP/CBZ） | `zip_path` + OS標準区切り + entryの最内ZIP/CBZ境界まで、`zip` | 外側typed pathとraw entryの境界だけ`MAIN_SEPARATOR_STR`、entry内部の`/`は保持する論理path。hostのjoin/絶対path解釈をしない |
 | ZipImage（変換書庫） | typed `zip_path`、`zip` | 現在の型が持つ物理cache ZIP。元RAR等への逆引き無し。cache ZIP差替えならopenが出る |
 | PdfPage（PDF） | `pdf_path`、`pdf` | typed PDF path |
 | PdfPage（EPUB） | `pdf_path`、`epub` | document_page_itemが保持する元EPUBの論理path（変換PDFのcache pathではない） |
 | Folder / ZipFile / PdfFile / ConvertibleArchive / ZipDir / Stack / SearchContainer / CollectionPlaceholder | 無し（book.path/kindは`()`） | viewerの表示ページでない型。親や代表の入れ物を推測しない。通常のopen/navが除外する既存仕様を保つ |
 
 通常ZIPの下位folderを移ってもopenは出ない。nestedの境界は既存 `split_nested_zip_path` と同じsuffix判定を使うため、
-`.zip`/`.cbz`と同名のfolderを区別しない既存の曖昧さを引き継ぐ。先頭slash・drive風entryもouterを失わずliteralに保持する。
+`.zip`/`.cbz`と同名のfolderを区別しない既存の曖昧さを引き継ぐ。先頭slash・drive風entryもouterを失わずliteralに保持する。通常relative prefixは既存`spread_db::container_key(root, &[raw_prefix])`と同じ文字列表記になる（§16の2026-11-26追記）。
 
 - **`s.book.path` / `s.book.kind` (r11 レビュー P2)**: 全画面の viewer の面では、`"open"` の識別と同じ入れ物の導出から作る
   (§4.3)。発火の理由と雛形の条件が同じ値を見る。
@@ -1391,6 +1391,8 @@ detached の合意を得た (記録と引用は detached-rework-plan.md §11)。
 
 ## 16. 段4の実装記録（2026-11-25）
 
+以下は11月25日時点の記録。後続のClaudeCode実行結果とnested表記修正は末尾の11月26日追記を参照。
+
 **r11に基づき実装済み、Rustコンパイル・テスト・release計測・実機・独立実装レビューは未実施。**
 利用者の指示によりcargo build/test/check、アプリ起動、コミットを行っていない。確認はbare cargo fmt、
 UI glyph checker、差分の空白確認だけ。新しい受入・review結果やdetachedの実装合意は記録していない。
@@ -1466,27 +1468,27 @@ main一覧継続の回帰を残す。r11の独立設計合意の履歴は§3.3�
 - `event_initial_empty_grid_has_only_view_and_location_changes_do_not_select` (`src/app/operation_script_runtime/tests/events.rs:78`)
 - `event_view_changes_grid_image_video_and_audio_shares_video_context` (`src/app/operation_script_runtime/tests/events.rs:95`)
 - `event_r11_container_is_item_only_for_folders_pdf_epub_nested_and_converted_zip` (`src/app/operation_script_runtime/tests/events.rs:122`)
-- `event_nonviewer_row_variants_have_no_fabricated_book_container` (`src/app/operation_script_runtime/tests/events.rs:214`)
-- `event_r11_open_ignores_zip_subfolders_and_pending_source_but_follows_item_containers` (`src/app/operation_script_runtime/tests/events.rs:263`)
-- `event_nested_container_appends_literal_entry_without_host_path_replacement` (`src/app/operation_script_runtime/tests/events.rs:312`)
-- `event_and_slot_invocations_publish_the_same_item_container_book_path` (`src/app/operation_script_runtime/tests/events.rs:335`)
-- `event_r11_pdf_pages_halves_and_unit_scalars_fire_but_reader_order_does_not` (`src/app/operation_script_runtime/tests/events.rs:365`)
-- `event_composition_strong_arc_memo_semantics_and_equal_republication` (`src/app/operation_script_runtime/tests/events.rs:418`)
-- `event_runtime_grid_executes_before_keys_once_and_inputs_still_change_next_frame` (`src/app/operation_script_runtime/tests/events.rs:501`)
-- `event_grid_actual_key_slot_navigation_is_observed_only_next_frame` (`src/app/operation_script_runtime/tests/events.rs:531`)
-- `event_runtime_rejects_entire_mixed_batch_and_never_publishes_success_notice` (`src/app/operation_script_runtime/tests/events.rs:579`)
-- `event_runtime_rate_limit_drops_batches_notifies_once_and_does_not_replay` (`src/app/operation_script_runtime/tests/events.rs:600`)
-- `event_detection_cache_misses_do_not_read_rating_or_tag_databases` (`src/app/operation_script_runtime/tests/events.rs:649`)
-- `event_limit_is_rolling_ten_attempts_and_notification_is_lifetime_once` (`src/app/operation_script_runtime/tests/events.rs:662`)
-- `event_rate_drop_advances_baseline_and_never_queues_a_late_replay` (`src/app/operation_script_runtime/tests/events.rs:700`)
-- `event_detection_off_absent_loading_and_failed_do_not_claim_the_frame` (`src/app/operation_script_runtime/tests/events.rs:734`)
-- `event_detection_mounted_context_and_linked_detached_skip_without_touching_main_owner` (`src/app/operation_script_runtime/tests/events.rs:759`)
-- `event_detection_linked_f12_and_transition_skip_viewer_but_main_list_continues` (`src/app/operation_script_runtime/tests/events.rs:793`)
-- `event_detection_edit_and_page_overview_coalesce_after_exit` (`src/app/operation_script_runtime/tests/events.rs:821`)
-- `event_detection_native_overlay_uses_existing_snapshot_and_does_not_claim_blocked_frame` (`src/app/operation_script_runtime/tests/events.rs:875`)
-- `event_native_poll_video_hook_executes_and_overlay_snapshot_blocks_before_evaluation` (`src/app/operation_script_runtime/tests/events.rs:896`)
-- `event_safe_grid_actions_preserve_all_four_identity_components_even_from_details` (`src/app/operation_script_runtime/tests/events.rs:927`)
-- `event_safe_video_actions_preserve_all_four_identity_components_for_native_and_music` (`src/app/operation_script_runtime/tests/events.rs:963`)
+- `event_nonviewer_row_variants_have_no_fabricated_book_container` (`src/app/operation_script_runtime/tests/events.rs:228`)
+- `event_r11_open_ignores_zip_subfolders_and_pending_source_but_follows_item_containers` (`src/app/operation_script_runtime/tests/events.rs:277`)
+- `event_nested_container_appends_literal_entry_without_host_path_replacement` (`src/app/operation_script_runtime/tests/events.rs:326`)
+- `event_and_slot_invocations_publish_the_same_item_container_book_path` (`src/app/operation_script_runtime/tests/events.rs:359`)
+- `event_r11_pdf_pages_halves_and_unit_scalars_fire_but_reader_order_does_not` (`src/app/operation_script_runtime/tests/events.rs:389`)
+- `event_composition_strong_arc_memo_semantics_and_equal_republication` (`src/app/operation_script_runtime/tests/events.rs:442`)
+- `event_runtime_grid_executes_before_keys_once_and_inputs_still_change_next_frame` (`src/app/operation_script_runtime/tests/events.rs:525`)
+- `event_grid_actual_key_slot_navigation_is_observed_only_next_frame` (`src/app/operation_script_runtime/tests/events.rs:555`)
+- `event_runtime_rejects_entire_mixed_batch_and_never_publishes_success_notice` (`src/app/operation_script_runtime/tests/events.rs:603`)
+- `event_runtime_rate_limit_drops_batches_notifies_once_and_does_not_replay` (`src/app/operation_script_runtime/tests/events.rs:624`)
+- `event_detection_cache_misses_do_not_read_rating_or_tag_databases` (`src/app/operation_script_runtime/tests/events.rs:673`)
+- `event_limit_is_rolling_ten_attempts_and_notification_is_lifetime_once` (`src/app/operation_script_runtime/tests/events.rs:686`)
+- `event_rate_drop_advances_baseline_and_never_queues_a_late_replay` (`src/app/operation_script_runtime/tests/events.rs:724`)
+- `event_detection_off_absent_loading_and_failed_do_not_claim_the_frame` (`src/app/operation_script_runtime/tests/events.rs:758`)
+- `event_detection_mounted_context_and_linked_detached_skip_without_touching_main_owner` (`src/app/operation_script_runtime/tests/events.rs:783`)
+- `event_detection_linked_f12_and_transition_skip_viewer_but_main_list_continues` (`src/app/operation_script_runtime/tests/events.rs:817`)
+- `event_detection_edit_and_page_overview_coalesce_after_exit` (`src/app/operation_script_runtime/tests/events.rs:845`)
+- `event_detection_native_overlay_uses_existing_snapshot_and_does_not_claim_blocked_frame` (`src/app/operation_script_runtime/tests/events.rs:899`)
+- `event_native_poll_video_hook_executes_and_overlay_snapshot_blocks_before_evaluation` (`src/app/operation_script_runtime/tests/events.rs:920`)
+- `event_safe_grid_actions_preserve_all_four_identity_components_even_from_details` (`src/app/operation_script_runtime/tests/events.rs:951`)
+- `event_safe_video_actions_preserve_all_four_identity_components_for_native_and_music` (`src/app/operation_script_runtime/tests/events.rs:987`)
 
 `src/ui_fullscreen/operation_script_event_tests.rs`:
 
@@ -1538,3 +1540,33 @@ main一覧継続の回帰を残す。r11の独立設計合意の履歴は§3.3�
   結果を再利用し、その後UI文字列は変更していない。
 - `git diff --check`と新規testファイルの空白確認を実施。削除した旧handoffへの参照残りも検索した。
   Rustの型確認・回帰の成否・実測値・実機結果・独立実装reviewはこの確認に含まれない。
+
+### 2026-11-26追記: nested書庫の外側/entry境界
+
+ClaudeCodeから共有された修正前HEAD `674af4986` のheavy結果は5,113件中5,112成功・1失敗。
+失敗は`event_r11_container_is_item_only_for_folders_pdf_epub_nested_and_converted_zip`のbook.path文字列比較で、
+製品が`cache.zip/dir/inner.zip`、Windowsの既存PathBuf構築に沿う期待が`cache.zip\dir/inner.zip`だった。
+これはテストの期待値だけの問題ではなく、製品が外側PathBufとraw entryの間を`/`固定で合成した境界の誤り。
+
+既存表現の確認根拠:
+
+- `src/zip_loader.rs:1059`のsplit_nested_zip_pathはraw entryの`.zip/` / `.cbz/`境界を分けるだけ。
+- `src/app/operation_script_runtime.rs:169` / `:177`の段2b typed identityはouter PathBufとraw entry Stringを分離し、
+  `:823`のviewer book.pathはPathBufをto_string_lossyで公開する。gridも従来のphysical_place（`:548`）由来のPathBufを公開する。
+- `src/spread_db.rs:155`のcontainer_keyはroot PathBufへ各raw segmentをpushする。
+  `src/app.rs:105486` / `:105495`の既存本コンテナ構築もPathBufを使う。
+  raw nested prefixを1segmentにすれば、outerとの境界はOS標準区切り、segment内部の`/`はそのままになる。
+- `src/grid_item.rs:399`の`zip:entry`はUI情報表示、`src/book_scope.rs:99`の正規化`/`はDB保存key、
+  `src/book_resume_key.rs:70`の`root::prefix`は履歴ラベル。今回のbook.pathの表記へ転用しない。
+
+修正は`src/app/operation_script_runtime/events.rs:59`で境界を`MAIN_SEPARATOR_STR`へ変更。
+raw prefix内部の`/`と大文字小文字は維持し、hostのjoin/pushへraw entryを渡さないため、先頭slash・drive風entryでもouterを失わない。
+段2bのtyped identity、既存のコンテナ関数、DB key、実I/O、detached経路は変更していない。r11対応表も`:552`へ明記した。
+
+回帰は既存のrelative/nested CBZのzip.join期待を維持し、
+`src/app/operation_script_runtime/tests/events.rs:122`へspread_db::container_keyとの独立した文字列表記比較を追加。
+`:326`のliteral/drive回帰は新しいnative境界の期待と段2b raw identity維持の確認を追加、
+`:359`のslot/event同値回帰も既存PathBuf構築に基づく期待へ更新した。
+再検証filterは上記3 test名、まとめて`operation_script`（変更moduleの既存testも含む）。
+この修正後のbare `cargo fmt`・`git diff --check`はexit 0。UI文字列の変更は無い。
+cargo build/test/check・実機・独立実装reviewは未実施。回帰の実行結果は確認後に追記する。
