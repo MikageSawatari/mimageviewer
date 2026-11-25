@@ -39,7 +39,7 @@
 <a href="license.html">MIT License</a>
   </nav></aside>
   <main class="content">
-    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/5ffca1b31e8a74ada7140aefd0c9c9fe4b7740da/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
+    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/0ffa5c709ed1f1c99e5c94149ccd45c15e501e9d/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
 <h1 id="visualizer" class="page-title">Visualizer</h1>
 <div class="box info"><div class="box-body">mImageViewer の音響調整を使用中は、再生中の曲名・アルバム名・アーティスト名と代表画像をこの表示へ自動で渡します。曲名が無ければ拡張子を除いたファイル名を使い、ほかの情報が無ければ空欄になります。画像は長辺1024ピクセルまでで、動く画像は最初の一枚を使います。先に文字を渡し、画像の準備ができたら表示します。音楽は同名画像・MP3表紙、動画は一覧と同じ代表画像を使います。一時停止やシークでは情報を残し、PCでの停止・閉じる・再生終了では消します。リモートは最後の曲が終わっても情報を残し、次曲への切替中は空になることがあります。Edit 中の文字は配置を調整するための見本です。自分で選ぶ背景画像も使用できます。</div></div>
 <p>Visualizerは、mIV Soundで処理した音声を自由にカスタマイズできる画面に表示します。波形、スペクトラム、流れるスペクトログラム、ステレオイメージ、音符のスペクトログラムを、代表画像や曲情報と並べて表示できます。表示を変えても音は変わりません。</p>
@@ -91,9 +91,11 @@
 <li><p><strong>色の種類</strong>: <strong>単色</strong>では色を1つ選びます。<strong>グラデーション</strong>では、色の停止点を編集でき、24種類のプリセットも使えます（プリセットを選んで<strong>適用</strong>をクリック）。<strong>グラデーションを反転</strong>は停止点の順序を逆にします。<strong>Hue</strong>は時間とともに色を変え、<strong>Scroll</strong>はグラデーションを動かします。どちらも<strong>速さ</strong>と<strong>色の動きを反転</strong>を調整できます。</p></li></ul>
 <p><strong>Title</strong>、<strong>Album</strong>、<strong>Artist</strong>では、フォント、サイズ、左右と上下の揃え位置、文字間隔、大文字/小文字、<strong>太字</strong>、<strong>斜体</strong>、<strong>縁取り</strong>、<strong>影</strong>を個別に設定できます。<strong>Artwork</strong>と<strong>Video</strong>は<strong>角を丸くする</strong>に対応しています。</p>
 
+
 <p>固定のラベルや部屋の名前を表示するには<strong>Text</strong>を追加します（最大4096文字、複数行に対応）。Titleと同じ文字、縁取り、影の設定を使えます。</p>
 <h3 id="miv-counter">Counter</h3>
 <p><strong>Counter</strong> は、mImageViewer が送る再生位置を、歌詞と同じ時刻で表示します。歌詞のない曲でも使えます。一時停止中は止まり、シーク・再生速度の変更・曲の切り替え・繰り返し再生に追従します。停止中やリモート配信中など、再生位置を受け取れないときは0を表示します。クリックしても表示時刻はリセットされず、再生位置も変わりません。</p>
+
 
 <ul>
 <li><p><strong>プレイリスト番号</strong>、<strong>時</strong>、<strong>分</strong>、<strong>秒</strong>、<strong>秒未満</strong>の表示を個別に切り替えられます。既定の表示は<code>hh:mm:ss.mmm</code>で、番号は非表示です。プレイリスト番号は00になります。表示する最上位の単位には合計時間を表示します。時を隠すと合計分、時と分を隠すと合計秒になります。</p></li>
@@ -159,7 +161,7 @@
 <p>歌詞の背後に落ち着いた背景を作るなら、彩度60%、明るさ−15%から試してください。黒を大きく浮かせずに暗いアートワークを見やすくするなら、ガンマ1.2が出発点になります。</p>
 <p><strong>Color Map</strong>は、暗い部分から明るい部分へパレットの色を割り当てます。初期設定は黒から白への連続したパレットです。色の位置を編集するかプリセットを適用し、<strong>グラデーションを反転</strong>で色順を逆にできます。既存の色の動きの設定も使えます。<strong>階調数</strong>は滑らかにつなぐ<strong>連続</strong>、または2～16段階を選びます。2段階では、<strong>しきい値</strong>（0～100%、既定値50%）で画像を暗部と明部に分け、それぞれに色を割り当てます。上げると暗部側の色になる部分が増えます。2色のポスター風にするなら、濃い青から金色へのパレットで2段階を選び、被写体が見えるようにしきい値を調整してください。柔らかく色を付けるなら、連続を選び、強さを下げます。</p>
 <h2 id="プリセット共有バックアップ表示設定">プリセット、共有、バックアップ、表示設定</h2>
-<p>プリセットダイアログでは、名前を付けたレイアウトの保存、読み込み、名前の変更、削除ができます。組み込みプリセットはいつでも使えます。<strong>設定 &gt; バックアップ / 復元</strong>では、保存したVisualizerプリセットとその背景画像をバックアップできますが、編集中の現在のレイアウトは含まれません。</p>
+<p>プリセットダイアログでは、名前を付けたレイアウトの保存、読み込み、名前の変更、削除ができます。組み込みプリセットはいつでも使えます。一覧が長いときは、ダイアログ上部の検索欄に名前の一部を入力して絞り込めます。<strong>設定 &gt; バックアップ / 復元</strong>では、保存したVisualizerプリセットとその背景画像をバックアップできますが、編集中の現在のレイアウトは含まれません。</p>
 <p>ツールバーの <strong>共有</strong> を選ぶと、現在のレイアウトのリンクをコピーできます。リンクには背景色は含まれますが、背景画像は含まれません。画像ごと渡したいときは <strong>バックアップ / 復元</strong> を使ってください。共有したリンクは 上流の Web アプリで開きます。mImageViewer の mIV Sound へ取り込むには、リンクをコピーしてツールバーの <strong>リンクを読み込む</strong> を選ぶか、Visualizerの表示中にCtrl+Vを押してください。Effect Pipelineの表示中に貼り付けても、Visualizerが開いて適用されます。読み込んだレイアウトは確認なしで現在のレイアウトを置き換えます。元のレイアウトに戻すには、<strong>Edit</strong> を開いて <strong>元に戻す</strong> を選んでください。</p>
 <p>音声グラフは mIV Sound に渡された音を表示します。リモート配信中は音響調整の窓が非表示になり、配信を終えると元の表示状態に戻ります。</p>
 <p><strong>設定 &gt; 環境設定... &gt; 表示</strong>の<strong>Visualizer HDR</strong>は、既定では無効です。HDR対応ディスプレイで明るい部分の輝きをより強く表現するには、OSの設定でHDRを有効にし、この項目を有効にします。表示に使う環境もHDR出力に対応している必要があります。HDR出力を利用できない場合はSDRで表示します。この設定はこの端末に記憶され、プリセットや共有リンクには含まれません。</p>

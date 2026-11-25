@@ -1286,3 +1286,46 @@ portable zip実物の生成・内容確認、署名あり配布とVirusTotal (�
 - サブ PC 担当の実機確認 (依頼 37b、候補 `a4bb8a04…9a91d`) で、旧名の段は開いた直後・プリセット読み込み後・再起動後の
   いずれも「SoundFont Note Player」と表示され、「?」も開き、状態ファイルも新しい名前になった。
   利用者の採用判断 (2026-11-14、統括経由) を受けて、この候補を 0.17.0-miv.1 として承認した。
+
+## 21. 0.19.0-miv.1 への更新 (2026-11-26)
+
+対象は `deps-903`（backlog §1.903）。この作業は説明書・公開文書・生成器と生成回帰の更新。
+設計担当による `config/miv-sound.rs` の VERSION / UPSTREAM_TAG の変更を保持し、DOCS_VERSION を `v0.19.0` にした。
+
+- 上流範囲は EffeTune Mixwright `v0.17.0` → `v0.19.0`（release `855ca5a9c931cfc67055c0f4aed77f157a0f7b38`）。
+  派生版 `G:\home\miv-sound` の `miv-0.19` は merge `42c7d49`、後続修正 `346c8b0`。
+  `external/effetune` は `0ffa5c709ed1f1c99e5c94149ccd45c15e501e9d`（EffeTune 2.19.0）。
+  同commitの日本語原文・LICENSE・4画像を新 snapshot `third_party/effetune-docs/0ffa5c70/` に保存し、旧 snapshot は保持する。
+  SOURCE.md に Mixwright release・submodule commit・mIV Sound `0.19.0-miv.1`・Docs version `v0.19.0` を記録した。
+- **利用者決定 (2026-11-26、統括経由)**:
+  1. 歌詞は派生版の方式を維持し、利用者から見える変更は行わない。
+  2. **Headphone EQ は AutoEQ ダウンロードを含めて同梱する**。検索欄の初回フォーカスで
+     `https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results/INDEX.md`、機種選択またはAutoEQリンク読込で測定CSVを取得する。
+     本文なしのGETで、検索語は端末内で照合する。音声・設定・端末内のファイル名や内容は送らない。
+     IPアドレスと通常のブラウザー要求情報（User-Agent、プラグインのlocal pageのOrigin / Referer）は通信先に伝わる。
+     他のリポジトリ／サイトのリンクは拒否し、ローカル測定ファイルの読込も維持する。
+  3. **Distortion Correction は追加候補から隠す**。必要な測定ページとマイクをmIV Soundは同梱しない。
+     保存済みのものは読み込めるが「Measurement not available」と表示する。**Live Audio Send / Receive は引き続き除去する**。
+     SoundFont Player の従来の扱いは維持する。
+  4. **0.19 → 0.17 のダウングレード互換は保証しない**。15Band PEQにMaster gain (`mg`) が追加された。
+     Master gainを変更したインスタンスに0.17の単体エフェクトプリセットを適用すると、現在のMaster gainが残る。
+     この上流挙動・制限を採用し、旧プリセットの適用時にMaster gainをリセットする独自処理は加えない。
+- 歌詞のmerge衝突では、上流の `EffeTune.NowPlayingLyrics` と ProcessContext による時計を派生版から除いた。
+  mIVのbridgeのProcessContextはメディアの再生位置ではないため、従来の派生版の歌詞・時計を維持する。
+  mIV host と `vst3-host` は変更しない。
+- WebView CSP の外部接続許可の追加先はAutoEQだけ。文字列は
+  `connect-src 'self' blob: https://raw.githubusercontent.com/jaakkopasanen/AutoEq/;`。
+  `headphone_eq.js` の一覧fetch・CSV fetch・検索処理と `tools/build-ui-assets.mjs` のCSP・URL制限・placeholderを再確認した。
+- 生成説明書はHeadphone EQを追加し、15Band PEQのMasterとPreamp読込を反映する。
+  Distortion Correction・Live Audio Receive / Send、独立版のブラウザ曲情報・測定画面からのコピー操作は除外・訂正する。
+  SoundFont Note Playerの旧公開URL、歌詞・Counter、既存フラグメントを維持する。
+  privacyの日英に通信の契機・取得先・送信内容と、測定カーブの保存を追記する。
+  製品ページの「安心して使えます」は今回も成立するため、カードは変更しない。
+- 候補: **候補・ctest・承認は設計担当が記録する (未記入)**。
+- ctest: **候補・ctest・承認は設計担当が記録する (未記入)**。
+- 承認: **候補・ctest・承認は設計担当が記録する (未記入)**。
+  本作業ではRust/C++のビルド・テスト、製品起動、コミットは行っていない。
+- 文書の検証: `test_gen_effetune_docs.py` **44件成功**、生成器 `--check` **139ファイル＋301一致**、
+  sitemap `--check` **220 URL一致**、`check_site_cards.py` **53枚・超過0**、`git diff --check` **成功**。
+  既存134 HTMLの650 IDに欠落なし。新snapshotの日本語原文30ファイル・LICENSE・4画像は参照元とバイト一致。
+  変更したテキストはUTF-8 BOMなし・改行混在なし。コミット後のsitemapの日付確定は設計担当へ引き継ぐ。
