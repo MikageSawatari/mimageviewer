@@ -2677,7 +2677,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 520);
+        assert_eq!(entries.len(), 522);
         assert_eq!(
             entries
                 .iter()
