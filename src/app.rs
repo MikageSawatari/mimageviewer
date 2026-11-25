@@ -7321,6 +7321,23 @@ pub(crate) struct MetadataLoadPending {
 }
 
 impl MetadataLoadPending {
+    #[cfg(test)]
+    pub(crate) fn controlled_for_test(
+        key: String,
+    ) -> (Self, Arc<AtomicBool>, mpsc::Sender<MetadataLoadResult>) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        (
+            Self {
+                key,
+                cancel: Arc::clone(&cancel),
+                rx,
+            },
+            cancel,
+            tx,
+        )
+    }
+
     pub(crate) fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -7340,6 +7357,20 @@ pub(crate) struct MetadataLoadResult {
     /// 外部メタデータサイドカー (同名 JSON/TXT) の右パネル表示用内容 (FS 画像のみ)。
     /// docs/sidecar-metadata-ingest.md §11。
     sidecar: Option<crate::external_metadata::SidecarDisplay>,
+}
+
+#[cfg(test)]
+impl MetadataLoadResult {
+    pub(crate) fn exif_for_test(key: String, exif: Option<crate::exif_reader::ExifInfo>) -> Self {
+        Self {
+            key,
+            metadata: None,
+            exif,
+            xmp: None,
+            panorama: None,
+            sidecar: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17368,6 +17399,7 @@ pub struct App {
         std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
     /// EXIF キャッシュ: 正規化キー → パース結果 (None = EXIF なし)
     /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
+    /// 非表示では絞らず保持し、表示・コピー時に最新設定で `ExifInfo::visible` を通す。
     pub(crate) exif_cache: std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
     /// XMP (mXD X/Twitter メタデータ) キャッシュ: 正規化キー → パース結果。
     /// mXD 以外のファイルには値が入らない前提なので None は「xtw:* なし」。
@@ -74563,7 +74595,6 @@ impl App {
             None => return,
         };
         let relative_page_provenance = self.relative_page_provenance_for_idx(idx);
-        let hidden: Vec<String> = self.settings.exif_hidden_tags.clone();
         let key_owned = key.clone();
         let repaint = self.edit_preview_repaint_ctx.clone();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -74573,13 +74604,8 @@ impl App {
         std::thread::Builder::new()
             .name(format!("metadata-load-{idx}"))
             .spawn(move || {
-                let result = run_metadata_load(
-                    key_owned,
-                    item,
-                    relative_page_provenance,
-                    &hidden,
-                    &cancel_w,
-                );
+                let result =
+                    run_metadata_load(key_owned, item, relative_page_provenance, &cancel_w);
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }

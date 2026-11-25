@@ -3073,7 +3073,6 @@ impl App {
             let old_show_hidden_files = self.settings.show_hidden_files;
             let file_type_visibility_changed =
                 self.settings.file_type_visibility != state.settings.file_type_visibility;
-            let old_exif = self.settings.exif_hidden_tags.clone();
 
             let old_susie = (
                 self.settings.susie_enabled,
@@ -3434,9 +3433,6 @@ impl App {
                 self.reload_current_folder_preserving_override();
             } else if grid_display_order_changed || rating_sort_position_changed {
                 self.apply_sort_change_reload();
-            }
-            if old_exif != self.settings.exif_hidden_tags {
-                self.exif_cache.clear();
             }
 
             // VST3 enable 状態 / チェーン構成の変化反映
