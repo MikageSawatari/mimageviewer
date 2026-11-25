@@ -1901,6 +1901,9 @@ tool を 2 本足す。どちらも本体と通信し、UI スレッドで実行
   (既定にあって今無い並びは `value: "none"`)。60 件ずつのページ。
 - **`conflicts`**: 今の競合の一覧 (`binding_conflicts`)。1 行 = `{ "key", "kind", "action", "other" }` (`other` は相手の操作名か
   予約の表示名)。`kind` は `same_context` (Hard) / `overlap` (ActiveOverlap) / `trigger_mismatch` / `reserved`。60 件ずつ。
+  - **試算**: `actions` (1 個) と `key` を併せて渡すと、「その操作にそのキーを足したら起きる競合」を、実行中の値の写しで
+    同じ `binding_conflicts` に計算して返す (何も変えない)。AI は割り当てる前に、相手の操作と文脈の重なりを利用者に説明できる。
+    文脈が重なるか (`actions_can_overlap`) は AI が操作の一覧から推測できないので、この試算を用意する。
 - **`choices`**: `slot` 1 つ (例 `mouse.image.back`) に入れられる値と表示名。`RingActionId` のスロットは、その文脈・入力の
   検査を通る候補 (`available_for_context` ほか、窓の候補と同じ関数)。
 
@@ -2046,6 +2049,32 @@ UI スレッドで次を順に行う。
   同じになるはず)。
 - tool 一覧・応答の実測の字数。
 - AI アプリが、`key` での引き当てと `conflicts` を使って、空きと競合を正しく説明するか (AI アプリ側の動き)。
+
+### 20.14a 受け入れのシナリオ (2026-11-25 統括の指示)
+
+利用者が ChatGPT の Codex で「ビューワー表示中に Ctrl+C で画像そのものをクリップボードへ入れられるか」と聞き、v5.7.0 の
+`search_help` / `get_help` (`shortcuts.html#copy-actions`) で「既定で未割り当て、操作カスタマイズで割り当てられる」と答えられた
+(観測は利用者、統括経由)。利用者の言葉:「次の段で設定までできるようになれば、ユーザのリクエストに応じすることができそうです。」
+第 2 段はこれを次の通り道で通す (コードの参照からの見込み。実行時の挙動は未観測):
+
+1. 今の割り当てを読む: `get_operations { key: "Ctrl+C" }` → 一覧の `GridCopyFiles` (文脈 Grid) が返る
+   (`docs/keymap.ini.default:240`)。`get_operations { actions: ["FsCopyImage"] }` → `keys: []`・`default: []`
+   (`:430`)、`inputs` に今のリング等の割り当て。
+2. 衝突を読む: `get_operations { view: "conflicts", actions: ["FsCopyImage"], key: "Ctrl+C" }` → 試算の競合。
+   一覧 (Grid) と画像の閲覧表示 (FsImage) が同時に効く文脈かは `actions_can_overlap` が決め、窓の警告と同じ結果になる。
+3. 割り当てる: 利用者が頼めば `set_operations { keys: { "FsCopyImage": ["Ctrl+C"] } }`。応答の `conflicts` と `before: null`
+   (既定に戻す値) が返り、通知と「AI による変更」に「キー: 画像をクリップボードにコピー (画像フルスクリーン): なし → Ctrl+C」が出る。
+4. 戻す: `set_operations { keys: { "FsCopyImage": null } }`。
+
+**衝突があるときの扱い**: 操作カスタマイズの窓の挙動 (警告を出し、保存は止めない。相手を直すかは利用者が決める、
+`pages.rs:3394`) に揃える。AI は 2 の試算で衝突を利用者へ説明し、「相手を外してから割り当てる」(相手の操作も同じ
+`set_operations` の 1 回に入れれば 1 回の確定) か「そのまま割り当てる」か「やめる」かを利用者に聞く。tool の説明にそう書く。
+検討した他の案と採らない理由:
+
+| 案 | 採らない理由 |
+| --- | --- |
+| 同じ文脈の衝突 (Hard) は拒む | 窓ではできる割り当てが AI ではできなくなる (利用者決定 (4)「AI だからできない」を作らない) |
+| 相手の割り当てを自動で外す | 頼まれていない操作のキーが消える。窓も自動では外さない |
 
 ### 20.14 統括・利用者への確認事項
 
