@@ -796,3 +796,36 @@ explorer は応答し、画面のロックも無かった。原因は未特定�
   §1.859 より前は、UI スレッドごと止まっていた。OS 側の異常なので、割り切りの方針どおり回避の仕組みは足さない。
 - 失敗した実行では、テストの panic の後もプロセスが終わらなかった (Shell の中で止まったスレッドが残るため)。
   直接起動した分は設計担当が止めた。
+
+### 5.11 master 取り込み後の 9 件
+
+Remote 返却の 1 件は非同期完了前の参照だったため、既存の
+`finish_startup_open_path_resolve_for_test` で完了後に検査する。RAR ナビゲーション 7 件の共通組み立てと
+検索画像の sidecar シナリオは、Specific の一時フォルダで実際の初回フレームを通し、resolver と一覧の
+hydration が終わってから detached 操作・検索一覧を組み立てる。本物の Desktop を走査しない。
+
+検索入口の退役漏れは確認されなかった。`open_global_search` は `take_origin_for_search_entry` →
+`retire_main_list_requests_for_surface_switch` → `retire_replaced_main_list_requests` →
+`cancel_unresolved_open_for_navigation` を既に通る。検索前に resolver が保留されている場合の既定先・明示パスの
+両方について、検索バーを開くだけで取消・pending 破棄・遅延結果の送信拒否・main 不変を確かめる状態遷移テストを追加。
+今回の検索シナリオは resolver の受付より前に検索一覧を作っていたため、その退役境界では防げなかった。
+
+設計担当から、fmt 後の関連 156 件では検索画像の sidecar シナリオだけが失敗したと報告を受けた。
+1 回目は起動の list hydration、設計担当が起動を sidecar 有効化の前へ移した後の 2 回目は親の Checking relay の待ちで
+10 秒の期限に達した。前回の「9 件ともテスト側」という記述は、この残件の解消を確認した結果ではなかった。
+
+追補のコード調査: sidecar が有効なら空の実フォルダも `PreparingPageIndex` → `Quiescing` → `Checking` を通る。
+無効なら空一覧は即時に表示を再開するため、設定順の変更で起動側の待ちを迂回できることは確認した。
+一方、`poll_sidecar_restore` だけのループは Quiescing が待つ別 owner の完了回収を進めない。通常フレームには
+spread-shift／bookmark の service、local-adjust／tag／rating 等の完了回収がある。
+当該 2 実行で残っていた phase・writer は既存の失敗ログに無く、特定していない。
+
+起動と検索一覧の hydration、親の relay 捕捉待ちを、既存 `ScenarioDriver::root` で実際の logic／UI フレームを回す形へ修正。
+sidecar は起動前から有効に戻し、設定順で待ちを迂回しない。親の走査後、最初の sidecar poll より前に relay を取り付ける
+順序は保持し、その restore の target context／generation が detached 親フォルダと一致すること、main の検索 origin・
+一覧・generation が最後まで保たれることを追加検査する。起動時の restore は検索を開く前に終端を検査する。
+再び期限に達した場合に phase／owner／writer の状態を残す診断もテストに加えた。親の relay の 10 秒は延長していない。
+
+製品コード・detached 述語・viewport 経路は変更していない。今回の追補差分のコンパイル・テスト・独立レビューは未実施。
+製品側の停止を確認した結果ではなく、修正後の通常フレーム進行での結果は設計担当の検証待ち。
+今回も cargo・rustfmt・製品起動・git index 操作・コミットは行っていない。
