@@ -2368,8 +2368,9 @@ MCP経由のヘルプでは、そのあたりをユーザにうまく説明し�
 - INSTRUCTIONS は client が渡さないことがある (親文書 §15.4) ので、tool の説明にも短く書く。
 - マニュアルには、利用者が挙げた 3 つの画面の場所が書かれている: ツールバーのセクション・並び・表示形式 (`manual/grid.html:93`、
   `manual/settings.html#toolbar`)、詳細表示の列 (`manual/grid.html:264`、列ヘッダの右クリック)、一覧の先頭 / 末尾のボタン
-  (`manual/grid.html:339`、右クリックのメニュー)。絞り込みバーの表示 (`grid.html:311`) も同様。足りない記述は見つからなかった
-  (3 つの例と、その周りの節を読んだ範囲。約 170 項目を全部突き合わせてはいない)。
+  (`manual/grid.html:339`、右クリックのメニュー。どこを右クリックするかは `manual/settings.html:268`・`:637` に具体的にある:
+  ツールバーの空き領域・上部の「ソート:」・絞り込みバーの「ソート:」・ボタン自体)。絞り込みバーの表示 (`grid.html:311`) も同様。
+  足りない記述は見つからなかった (3 つの例と、その周りの節を読んだ範囲。約 170 項目を全部突き合わせてはいない)。
 
 **足すもの** (文言は英語の短文。予算の内):
 
@@ -2378,6 +2379,9 @@ MCP経由のヘルプでは、そのあたりをユーザにうまく説明し�
   the user.」
 - `get_settings` の説明に 1 句:「On-screen display options (toolbar, columns, buttons) are absent: guide via get_help.」
 - テスト: INSTRUCTIONS と `get_settings` の説明にこの案内が入っていることを確かめる 1 件 (既存の字数・予算の検査はそのまま)。
+- **第 1 段の「INSTRUCTIONS に足す案内は 300 字まで」(§4.4、テスト `settings_instructions_keep_the_total_guide_addition_within_budget`)
+  を 520 字までに改める** (独立レビューの指摘。この一文で「For questions」以降が 490 字になる)。300 字は第 1 段で足す分の目安で、
+  client の上限 (INSTRUCTIONS 全体で UTF-16 4,096) から来た値ではない。全体は 1,342 で、4,096 の検査はそのまま残す。
 
 ### 20.15 独立レビューの記録
 
