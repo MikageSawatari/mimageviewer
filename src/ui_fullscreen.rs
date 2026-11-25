@@ -557,7 +557,7 @@ impl FsFrontPointerOwnership {
         ctx: &egui::Context,
         response: &egui::Response,
         front: &FsFrontPointerFrameInput,
-        suppressed: bool,
+        suppression: FullscreenPrimarySuppressionDecision,
         candidate: impl Fn(egui::Pos2, egui::Modifiers) -> bool,
     ) -> FsCloseModeClicks {
         let Some(mut boundary) = front.backing_clicks_at_start else {
@@ -605,7 +605,11 @@ impl FsFrontPointerOwnership {
                         if *owned
                             || *front_layer
                             || !focused
-                            || (*button == egui::PointerButton::Primary && suppressed)
+                            || (*button == egui::PointerButton::Primary
+                                && suppression
+                                    == FullscreenPrimarySuppressionDecision::Suppress(
+                                        FullscreenPrimarySuppressionReason::Other,
+                                    ))
                         {
                             boundary = FsBackingClickBoundary::default();
                             continue;
@@ -633,7 +637,11 @@ impl FsFrontPointerOwnership {
                         facts.double_clicked |= count == 2;
                         facts.close_double_clicked |=
                             count == 2 && previous_candidate && is_candidate;
-                        facts.last_click = Some((pos, *modifiers));
+                        // Focus reclaim contributes to the double-click sequence,
+                        // but cannot dismiss overflow or set a Depth focus alone.
+                        if !suppression.suppresses_current_frame() {
+                            facts.last_click = Some((pos, *modifiers));
+                        }
                         boundary.previous_close_candidate = is_candidate;
                     }
                     _ => {}
@@ -2694,13 +2702,29 @@ fn log_video_audio_exit_key_outcome(
 pub(crate) enum FullscreenPrimarySuppression {
     #[default]
     Idle,
-    PointerStream,
+    PointerStream(FullscreenPrimarySuppressionReason),
     TouchStream,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FullscreenPrimarySuppressionReason {
+    FocusRestore,
+    Other,
+}
+
+impl FullscreenPrimarySuppressionReason {
+    fn combined_with(self, next: Self) -> Self {
+        if self == Self::Other || next == Self::Other {
+            Self::Other
+        } else {
+            Self::FocusRestore
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FullscreenPrimarySuppressionEvent {
-    PointerStreamStarted,
+    PointerStreamStarted(FullscreenPrimarySuppressionReason),
     PointerFrame {
         released: bool,
     },
@@ -2716,19 +2740,25 @@ enum FullscreenPrimarySuppressionEvent {
 enum FullscreenPrimarySuppressionDecision {
     Preserve,
     Allow,
-    Suppress,
+    Suppress(FullscreenPrimarySuppressionReason),
 }
 
 impl FullscreenPrimarySuppressionDecision {
     fn overridden_by(self, next: Self) -> Self {
+        // Keep terminal-frame provenance even after its persistent owner was
+        // retired. Touch Allow still replaces a provisional pointer decision.
         match next {
             Self::Preserve => self,
-            Self::Allow | Self::Suppress => next,
+            Self::Allow => next,
+            Self::Suppress(next_reason) => match self {
+                Self::Suppress(reason) => Self::Suppress(reason.combined_with(next_reason)),
+                _ => next,
+            },
         }
     }
 
     fn suppresses_current_frame(self) -> bool {
-        self == Self::Suppress
+        matches!(self, Self::Suppress(_))
     }
 }
 
@@ -2738,7 +2768,15 @@ impl FullscreenPrimarySuppression {
     }
 
     pub(crate) fn arm_pointer_stream(&mut self) {
-        let _ = self.apply(FullscreenPrimarySuppressionEvent::PointerStreamStarted);
+        let _ = self.apply(FullscreenPrimarySuppressionEvent::PointerStreamStarted(
+            FullscreenPrimarySuppressionReason::Other,
+        ));
+    }
+
+    fn arm_focus_restore_pointer_stream(&mut self) -> FullscreenPrimarySuppressionDecision {
+        self.apply(FullscreenPrimarySuppressionEvent::PointerStreamStarted(
+            FullscreenPrimarySuppressionReason::FocusRestore,
+        ))
     }
 
     fn apply(
@@ -2746,17 +2784,26 @@ impl FullscreenPrimarySuppression {
         event: FullscreenPrimarySuppressionEvent,
     ) -> FullscreenPrimarySuppressionDecision {
         match event {
-            FullscreenPrimarySuppressionEvent::PointerStreamStarted => {
-                *self = Self::PointerStream;
-                FullscreenPrimarySuppressionDecision::Suppress
+            FullscreenPrimarySuppressionEvent::PointerStreamStarted(reason) => {
+                let reason = match *self {
+                    Self::Idle => reason,
+                    Self::PointerStream(current) => current.combined_with(reason),
+                    Self::TouchStream => FullscreenPrimarySuppressionReason::Other,
+                };
+                *self = Self::PointerStream(reason);
+                FullscreenPrimarySuppressionDecision::Suppress(reason)
             }
             FullscreenPrimarySuppressionEvent::PointerFrame { released } => {
-                let decision = if self.is_active() {
-                    FullscreenPrimarySuppressionDecision::Suppress
-                } else {
-                    FullscreenPrimarySuppressionDecision::Allow
+                let decision = match *self {
+                    Self::Idle => FullscreenPrimarySuppressionDecision::Allow,
+                    Self::PointerStream(reason) => {
+                        FullscreenPrimarySuppressionDecision::Suppress(reason)
+                    }
+                    Self::TouchStream => FullscreenPrimarySuppressionDecision::Suppress(
+                        FullscreenPrimarySuppressionReason::Other,
+                    ),
                 };
-                if released && matches!(self, Self::PointerStream) {
+                if released && matches!(self, Self::PointerStream(_)) {
                     *self = Self::Idle;
                 }
                 decision
@@ -2774,7 +2821,9 @@ impl FullscreenPrimarySuppression {
                 // suppressed by `suppresses_current_frame`.
                 let decision = if active || completed || cancelled || suppresses_current_frame {
                     if suppresses_current_frame {
-                        FullscreenPrimarySuppressionDecision::Suppress
+                        FullscreenPrimarySuppressionDecision::Suppress(
+                            FullscreenPrimarySuppressionReason::Other,
+                        )
                     } else {
                         FullscreenPrimarySuppressionDecision::Allow
                     }
@@ -2783,7 +2832,9 @@ impl FullscreenPrimarySuppression {
                 };
                 if cancelled || completed {
                     *self = Self::Idle;
-                } else if active && (*self == Self::PointerStream || suppresses_current_frame) {
+                } else if active
+                    && (matches!(self, Self::PointerStream(_)) || suppresses_current_frame)
+                {
                     // A positively correlated touch stream owns the same
                     // promoted primary pointer, including a focus-reclaim
                     // canvas gesture.
@@ -40984,7 +41035,9 @@ impl App {
     ) -> FsWheelFrameResult {
         *navigator_reservation = None;
         if self.retire_changed_drag_zoom(ctx) {
-            primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
+            primary_suppression = FullscreenPrimarySuppressionDecision::Suppress(
+                FullscreenPrimarySuppressionReason::Other,
+            );
         }
         let mut navigator_frame_input = FsNavigatorFrameInput::for_current_pass(ctx)
             .without_front_buttons(&overflow_pointer_input);
@@ -41099,6 +41152,27 @@ impl App {
                     }))
         });
 
+        let compare_wipe_active = matches!(
+            self.compare_view_mode,
+            crate::app::CompareViewMode::Wipe { .. }
+        );
+        let panel_fs_idx = self.fullscreen_idx;
+        let panorama_active =
+            panel_fs_idx.is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some());
+        let music_view_active = panel_fs_idx.is_some_and(|idx| self.fs_music_view_active(idx));
+        let side_panel_chrome_enabled =
+            still_side_panel_chrome_enabled(StillSidePanelChromeInputs {
+                is_music_view: music_view_active,
+                analysis_active: self.analysis_mode && !is_spread_double && !panorama_active,
+                is_video: state.is_video,
+                compare_wipe_active,
+                panorama_active,
+                overlay_edit_active: self.is_overlay_edit_mode_active(),
+                view_trim_active: self.view_trim_mode,
+                zoom_active: self.fs_zoom_mode_effective(),
+                animated: panel_fs_idx.is_some_and(|idx| self.fs_entry_is_animated(idx)),
+            });
+
         // VST editor windows are bridge-process native windows. In the
         // cross-process owner-popup case, egui can still report this viewport as
         // focused while Win32 sends keyboard input to the VST editor. Check the
@@ -41188,7 +41262,10 @@ impl App {
                     );
                 }
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
-                self.fs_primary_suppression.arm_pointer_stream();
+                primary_suppression = primary_suppression.overridden_by(
+                    self.fs_primary_suppression
+                        .arm_focus_restore_pointer_stream(),
+                );
                 let touch_scope = self.fullscreen_idx.map(|fs_idx| StillTouchChromeLatch {
                     fs_idx,
                     session_started_at: self.fullscreen_opened_at(),
@@ -41213,15 +41290,16 @@ impl App {
                     ctx.cumulative_frame_nr(),
                     true,
                 );
-                let _ = self.fs_primary_suppression.apply(
-                    FullscreenPrimarySuppressionEvent::TouchFrame {
-                        suppresses_current_frame: !touch_frame.commands().is_empty(),
-                        active: touch_frame.is_active(),
-                        completed: !touch_frame.is_active()
-                            && touch_frame.has_touch_derived_pointer_activity(),
-                        cancelled: touch_frame.touch_cancelled(),
-                    },
-                );
+                primary_suppression =
+                    primary_suppression.overridden_by(self.fs_primary_suppression.apply(
+                        FullscreenPrimarySuppressionEvent::TouchFrame {
+                            suppresses_current_frame: !touch_frame.commands().is_empty(),
+                            active: touch_frame.is_active(),
+                            completed: !touch_frame.is_active()
+                                && touch_frame.has_touch_derived_pointer_activity(),
+                            cancelled: touch_frame.touch_cancelled(),
+                        },
+                    ));
                 if let Some(scope) = touch_scope.filter(|_| !overflow_pointer_input.primary_owned) {
                     if help_phase.is_none()
                         && touch_frame
@@ -41262,30 +41340,52 @@ impl App {
                         StillTouchForegroundReclaimAction::None => {}
                     }
                 }
+                if self.fs_double_click_close_active(state.is_video) && !modal_input_blocked {
+                    let response = overflow_pointer_input.backing_response(ui.interact(
+                        full_rect,
+                        egui::Id::unique("fs_click"),
+                        egui::Sense::click_and_drag(),
+                    ));
+                    if touch_frame.should_suppress_response(&response) {
+                        primary_suppression = FullscreenPrimarySuppressionDecision::Suppress(
+                            FullscreenPrimarySuppressionReason::Other,
+                        );
+                    }
+                    let canvas_click = self.plan_fs_canvas_click(
+                        ctx,
+                        &response,
+                        full_rect,
+                        seek_geometry,
+                        state.is_video,
+                        primary_suppression.suppresses_current_frame(),
+                        continuous_active,
+                        side_panel_chrome_enabled,
+                        navigator_exclusion,
+                        seek_panel_interactive,
+                        self.fs_zoom,
+                        self.fs_pan,
+                        Some(&overflow_pointer_input),
+                        primary_suppression,
+                    );
+                    let close = self.apply_fs_canvas_click(
+                        canvas_click,
+                        &mut page_nav,
+                        navigation_operation,
+                        None,
+                    );
+                    return FsWheelFrameResult {
+                        close,
+                        primary_click_close: matches!(
+                            canvas_click,
+                            FsCanvasClickAction::CloseViewer
+                        ),
+                        ..Default::default()
+                    };
+                }
                 return FsWheelFrameResult::default();
             }
         }
 
-        let compare_wipe_active = matches!(
-            self.compare_view_mode,
-            crate::app::CompareViewMode::Wipe { .. }
-        );
-        let panel_fs_idx = self.fullscreen_idx;
-        let panorama_active =
-            panel_fs_idx.is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some());
-        let music_view_active = panel_fs_idx.is_some_and(|idx| self.fs_music_view_active(idx));
-        let side_panel_chrome_enabled =
-            still_side_panel_chrome_enabled(StillSidePanelChromeInputs {
-                is_music_view: music_view_active,
-                analysis_active: self.analysis_mode && !is_spread_double && !panorama_active,
-                is_video: state.is_video,
-                compare_wipe_active,
-                panorama_active,
-                overlay_edit_active: self.is_overlay_edit_mode_active(),
-                view_trim_active: self.view_trim_mode,
-                zoom_active: self.fs_zoom_mode_effective(),
-                animated: panel_fs_idx.is_some_and(|idx| self.fs_entry_is_animated(idx)),
-            });
         let passive_side_panel_hover_enabled =
             still_passive_side_panel_hover_enabled(self.cursor_hidden(), touch_chrome_latched);
         self.update_metadata_panel_hover_latch(
@@ -42034,12 +42134,16 @@ impl App {
             // Positive raw-event correlation is required before the
             // recognizer may suppress this response. This is terminal-frame
             // evidence, not a new cross-frame owner.
-            primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
+            primary_suppression = FullscreenPrimarySuppressionDecision::Suppress(
+                FullscreenPrimarySuppressionReason::Other,
+            );
         }
-        let close_mode_primary_suppressed = primary_suppression.suppresses_current_frame();
+        let close_mode_primary_suppression = primary_suppression;
         if overflow_pointer_input.primary_owned {
             // A terminal TouchFrame::Allow must not reuse the front widget's release.
-            primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
+            primary_suppression = FullscreenPrimarySuppressionDecision::Suppress(
+                FullscreenPrimarySuppressionReason::Other,
+            );
         }
         // ── フォーカス復帰クリック / touch replacement の抑制 ──
         self.fs_front_pointer
@@ -42242,7 +42346,7 @@ impl App {
             click_zoom,
             click_pan,
             Some(&overflow_pointer_input),
-            close_mode_primary_suppressed,
+            close_mode_primary_suppression,
         );
         // Input planning precedes source update and paint in both presentations.
         // The proposal may be applied after paint when wheel navigation is mixed.
@@ -42874,31 +42978,12 @@ impl App {
                 self.fs_rotation_drag_start = None;
             }
         }
-        // Depth shares ordinary image transform and click/reset ownership.
-        match canvas_click {
-            FsCanvasClickAction::None | FsCanvasClickAction::DepthFocusAt(_) => {}
-            FsCanvasClickAction::CloseViewer => close = true,
-            FsCanvasClickAction::ResetTransform => {
-                self.clear_fs_initial_placement_request();
-                self.fs_automatic_initial_view = None;
-                self.fs_zoom = 1.0;
-                self.fs_pan = egui::Vec2::ZERO;
-                self.fs_free_rotation = 0.0;
-                self.maybe_rerender_pdf(1.0);
-            }
-            FsCanvasClickAction::ToggleVideo(idx) => {
-                if let Some(player) = self.fs_video_player(idx) {
-                    player.toggle_play();
-                }
-            }
-            FsCanvasClickAction::DismissOverflow => {
-                self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
-            }
-            FsCanvasClickAction::PageSide(base) => {
-                page_nav = self.spread_page_nav(base).into();
-                *navigation_operation = input.pointer_navigation_operation;
-            }
-        }
+        close |= self.apply_fs_canvas_click(
+            canvas_click,
+            &mut page_nav,
+            navigation_operation,
+            input.pointer_navigation_operation,
+        );
         // 分析モード中は右クリックを色固定に使うため、終了トリガーにしない
         // コンテキストメニュー表示中は右クリック処理をスキップ
         // 表示モード / フィットのポップアップ表示中も、右クリックはメニューを閉じる
@@ -42942,6 +43027,43 @@ impl App {
             wheel_navigation_produced,
             deferred: None,
         }
+    }
+
+    /// Both the regular proposal and focus-reclaim early return apply the same
+    /// canvas action, including initial-placement retirement and PDF rerendering.
+    fn apply_fs_canvas_click(
+        &mut self,
+        canvas_click: FsCanvasClickAction,
+        page_nav: &mut FsPageNavRequest,
+        navigation_operation: &mut Option<ViewerOperationId>,
+        pointer_navigation_operation: Option<ViewerOperationId>,
+    ) -> bool {
+        let mut close = false;
+        match canvas_click {
+            FsCanvasClickAction::None | FsCanvasClickAction::DepthFocusAt(_) => {}
+            FsCanvasClickAction::CloseViewer => close = true,
+            FsCanvasClickAction::ResetTransform => {
+                self.clear_fs_initial_placement_request();
+                self.fs_automatic_initial_view = None;
+                self.fs_zoom = 1.0;
+                self.fs_pan = egui::Vec2::ZERO;
+                self.fs_free_rotation = 0.0;
+                self.maybe_rerender_pdf(1.0);
+            }
+            FsCanvasClickAction::ToggleVideo(idx) => {
+                if let Some(player) = self.fs_video_player(idx) {
+                    player.toggle_play();
+                }
+            }
+            FsCanvasClickAction::DismissOverflow => {
+                self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
+            }
+            FsCanvasClickAction::PageSide(base) => {
+                *page_nav = self.spread_page_nav(base).into();
+                *navigation_operation = pointer_navigation_operation;
+            }
+        }
+        close
     }
 
     fn propose_fs_wheel_click_transform(
@@ -43083,7 +43205,7 @@ impl App {
         zoom: f32,
         pan: egui::Vec2,
         front: Option<&FsFrontPointerFrameInput>,
-        close_mode_primary_suppressed: bool,
+        close_mode_primary_suppression: FullscreenPrimarySuppressionDecision,
     ) -> FsCanvasClickAction {
         let close_mode = self.fs_double_click_close_active(is_video);
         let excluded = self.is_overlay_edit_mode_active()
@@ -43136,7 +43258,7 @@ impl App {
                 _ctx,
                 response,
                 front.expect("close mode planning requires the owning pass's front input"),
-                close_mode_primary_suppressed,
+                close_mode_primary_suppression,
                 |pos, modifiers| surface.is_candidate(pos, modifiers),
             );
             // The reset uses accepted double clicks, independently of close
@@ -70783,7 +70905,7 @@ mod tests {
                             zoom,
                             egui::Vec2::ZERO,
                             None,
-                            false,
+                            FullscreenPrimarySuppressionDecision::Allow,
                         );
                         if frame == 2 {
                             assert!(response.clicked(), "zoom={zoom}");
@@ -83584,7 +83706,7 @@ mod tests {
         assert!(app.mouse_ring_flick.is_none());
         assert_eq!(
             app.fs_primary_suppression,
-            FullscreenPrimarySuppression::PointerStream
+            FullscreenPrimarySuppression::PointerStream(FullscreenPrimarySuppressionReason::Other)
         );
 
         let release_result = run_frame(
@@ -83630,17 +83752,27 @@ mod tests {
     fn fullscreen_primary_suppression_has_a_terminal_event_for_every_owner() {
         use FullscreenPrimarySuppressionDecision::{Allow, Preserve, Suppress};
         use FullscreenPrimarySuppressionEvent::{PointerFrame, PointerStreamStarted, TouchFrame};
+        use FullscreenPrimarySuppressionReason::Other;
 
         let mut suppression = FullscreenPrimarySuppression::default();
         assert_eq!(suppression.apply(PointerFrame { released: false }), Allow);
 
-        assert_eq!(suppression.apply(PointerStreamStarted), Suppress);
-        assert_eq!(suppression, FullscreenPrimarySuppression::PointerStream);
+        assert_eq!(
+            suppression.apply(PointerStreamStarted(Other)),
+            Suppress(Other),
+        );
+        assert_eq!(
+            suppression,
+            FullscreenPrimarySuppression::PointerStream(Other),
+        );
         assert_eq!(
             suppression.apply(PointerFrame { released: false }),
-            Suppress
+            Suppress(Other)
         );
-        assert_eq!(suppression.apply(PointerFrame { released: true }), Suppress);
+        assert_eq!(
+            suppression.apply(PointerFrame { released: true }),
+            Suppress(Other),
+        );
         assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
 
         assert_eq!(
@@ -83650,7 +83782,7 @@ mod tests {
                 completed: false,
                 cancelled: false,
             }),
-            Suppress
+            Suppress(Other)
         );
         assert_eq!(suppression, FullscreenPrimarySuppression::TouchStream);
         assert_eq!(
@@ -83660,7 +83792,7 @@ mod tests {
                 completed: true,
                 cancelled: false,
             }),
-            Suppress
+            Suppress(Other)
         );
         assert_eq!(
             suppression,
@@ -83676,7 +83808,7 @@ mod tests {
                     completed: true,
                     cancelled: false,
                 }),
-                Suppress
+                Suppress(Other)
             );
             assert_eq!(
                 suppression,
@@ -83692,7 +83824,7 @@ mod tests {
                 completed: false,
                 cancelled: false,
             }),
-            Suppress
+            Suppress(Other)
         );
         assert_eq!(
             suppression.apply(TouchFrame {
@@ -83708,7 +83840,10 @@ mod tests {
         // A focus-reclaim press is provisionally mouse-owned. Positive touch
         // correlation corrects that owner and replaces the pointer decision,
         // allowing canvas gestures for every active frame.
-        assert_eq!(suppression.apply(PointerStreamStarted), Suppress);
+        assert_eq!(
+            suppression.apply(PointerStreamStarted(Other)),
+            Suppress(Other),
+        );
         let pointer = suppression.apply(PointerFrame { released: false });
         let touch = suppression.apply(TouchFrame {
             suppresses_current_frame: false,
@@ -83740,7 +83875,10 @@ mod tests {
 
         // Correlated replacement/control input remains suppressed, and its
         // touch completion clears the corrected owner without a pointer edge.
-        assert_eq!(suppression.apply(PointerStreamStarted), Suppress);
+        assert_eq!(
+            suppression.apply(PointerStreamStarted(Other)),
+            Suppress(Other),
+        );
         assert_eq!(
             suppression.apply(TouchFrame {
                 suppresses_current_frame: true,
@@ -83748,7 +83886,7 @@ mod tests {
                 completed: false,
                 cancelled: false,
             }),
-            Suppress
+            Suppress(Other)
         );
         assert_eq!(suppression, FullscreenPrimarySuppression::TouchStream);
         assert_eq!(
@@ -83758,13 +83896,16 @@ mod tests {
                 completed: true,
                 cancelled: false,
             }),
-            Suppress
+            Suppress(Other)
         );
         assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
 
         // With no touch evidence, the touch query cannot weaken the existing
         // mouse reclaim contract. The release frame is still consumed.
-        assert_eq!(suppression.apply(PointerStreamStarted), Suppress);
+        assert_eq!(
+            suppression.apply(PointerStreamStarted(Other)),
+            Suppress(Other),
+        );
         let pointer = suppression.apply(PointerFrame { released: false });
         let touch = suppression.apply(TouchFrame {
             suppresses_current_frame: false,
@@ -83773,8 +83914,11 @@ mod tests {
             cancelled: false,
         });
         assert_eq!(touch, Preserve);
-        assert_eq!(pointer.overridden_by(touch), Suppress);
-        assert_eq!(suppression.apply(PointerFrame { released: true }), Suppress);
+        assert_eq!(pointer.overridden_by(touch), Suppress(Other),);
+        assert_eq!(
+            suppression.apply(PointerFrame { released: true }),
+            Suppress(Other),
+        );
         assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
     }
 
@@ -83824,7 +83968,8 @@ mod tests {
             )
             .drop_without_applying_deltas();
 
-        let mut suppression = FullscreenPrimarySuppression::PointerStream;
+        let mut suppression =
+            FullscreenPrimarySuppression::PointerStream(FullscreenPrimarySuppressionReason::Other);
         let mut probe = None;
         let _ = ctx
             .run_pass(
