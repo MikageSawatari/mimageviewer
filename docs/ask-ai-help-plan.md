@@ -314,3 +314,8 @@ B 案・App の検出の cache・検出と MockBackend の共通化・型付き 
   OS の世代の baseline も照合する。手順・型を画像と共有し、render_core の関数は移さない (§7.4)。
 - P2 書かなかったのに「コピーしました」と出る → worker の結果で通知を分ける (§7.4)。
 - P3 `push_id` では子の ID が親の順番に依存する → `UiBuilder::scope_id` (§4)。
+
+### 13.3 3 巡目 (2026-11-25、対象 `64682cab8`) — ACCEPT
+
+指摘なし。r2 の 3 点 (OS の世代の照合、結果ごとの通知、`scope_id`) は既存のコード (`context_menu.rs:2804`・`:3195`、
+`vendor/egui/src/ui.rs:256`) と整合するとされた。
