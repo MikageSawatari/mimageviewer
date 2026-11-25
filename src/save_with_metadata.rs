@@ -316,13 +316,11 @@ pub fn encode_rgba_with_metadata(
         return Err(SaveError::AnimatedWebpNotSupported);
     }
 
-    let mut encoding_options = options.clone();
-    // 転記と検出は profile ごとの共通処理で一度だけ行う。
-    encoding_options.include_metadata = false;
+    // 画素のエンコードと元の情報の転記は分け、転記はこの入口から一度だけ行う。
     let mut bytes = match &src_format {
-        SrcFormat::Jpeg => encode_jpeg_rgba(rgba, w, h, src_bytes_ref, &encoding_options),
-        SrcFormat::Png => encode_png_rgba(rgba, w, h, src_bytes_ref, &encoding_options),
-        SrcFormat::Webp => encode_webp_rgba(rgba, w, h, src_bytes_ref, &encoding_options),
+        SrcFormat::Jpeg => encode_jpeg_rgba(rgba, w, h, options),
+        SrcFormat::Png => encode_png_rgba(rgba, w, h),
+        SrcFormat::Webp => encode_webp_rgba(rgba, w, h, options),
         SrcFormat::Other(_) => unreachable!("filtered above"),
     }?;
     let mut thumbnail_notice = ThumbnailNoticeKinds::default();
@@ -400,7 +398,6 @@ fn encode_jpeg_rgba(
     rgba: &[u8],
     w: u32,
     h: u32,
-    src_bytes: Option<&[u8]>,
     options: &SaveOptions,
 ) -> Result<Vec<u8>, SaveError> {
     // RGBA → RGB (アルファは black-matte で flatten)。
@@ -413,28 +410,7 @@ fn encode_jpeg_rgba(
         options.jpeg_subsampling,
     )
     .map_err(|e| SaveError::EncodingFailed(format!("turbojpeg: {e}")))?;
-    let mut out: Vec<u8> = jpeg_bytes.as_ref().to_vec();
-
-    // メタデータ抽出: src JPEG の APP1 セグメントを SOI 直後に挿入。
-    if let Some(src) = src_bytes
-        && options.include_metadata
-    {
-        let mut app1_segments = extract_jpeg_app1_segments(src)?;
-        // EXIF APP1 の Orientation 処理 (Codex P1 / r2 P2)。
-        // - `caller_applied_orientation = true`: pixels は canonical 向きに回転
-        //   済みなので Orientation を 1 に書き換える (= viewer の二重回転防止)。
-        // - `caller_applied_orientation = false`: pixels は未回転の呼び出し元向け。
-        //   Orientation を温存し、viewer 側に元通りの自動回転を任せる。
-        if options.caller_applied_orientation {
-            for seg in app1_segments.iter_mut() {
-                reset_exif_orientation_in_app1(seg);
-            }
-        }
-        if !app1_segments.is_empty() {
-            out = splice_jpeg_app1_segments(&out, &app1_segments)?;
-        }
-    }
-    Ok(out)
+    Ok(jpeg_bytes.as_ref().to_vec())
 }
 
 /// JPEG バイト列から APP1 セグメントを**生バイト**でそのまま取り出す。
@@ -651,26 +627,12 @@ fn splice_jpeg_app1_segments(jpeg: &[u8], app1: &[Vec<u8>]) -> Result<Vec<u8>, S
 
 // ── PNG ───────────────────────────────────────────────────────────────
 
-fn encode_png_rgba(
-    rgba: &[u8],
-    w: u32,
-    h: u32,
-    src_bytes: Option<&[u8]>,
-    options: &SaveOptions,
-) -> Result<Vec<u8>, SaveError> {
+fn encode_png_rgba(rgba: &[u8], w: u32, h: u32) -> Result<Vec<u8>, SaveError> {
     use image::ImageEncoder;
     let mut out: Vec<u8> = Vec::new();
     image::codecs::png::PngEncoder::new(&mut out)
         .write_image(rgba, w, h, image::ColorType::Rgba8.into())
         .map_err(|e| SaveError::EncodingFailed(format!("PNG encoder: {e}")))?;
-    if let Some(src) = src_bytes
-        && options.include_metadata
-    {
-        let chunks = extract_png_text_chunks_raw(src)?;
-        if !chunks.is_empty() {
-            out = splice_png_text_chunks(&out, &chunks)?;
-        }
-    }
     Ok(out)
 }
 
@@ -790,7 +752,6 @@ fn encode_webp_rgba(
     rgba: &[u8],
     w: u32,
     h: u32,
-    src_bytes: Option<&[u8]>,
     options: &SaveOptions,
 ) -> Result<Vec<u8>, SaveError> {
     let encoder = webp::Encoder::from_rgba(rgba, w, h);
@@ -800,22 +761,7 @@ fn encode_webp_rgba(
         encoder.encode_simple(false, options.webp_quality.clamp(1.0, 100.0))
     }
     .map_err(|e| SaveError::EncodingFailed(format!("WebP encoder: {e:?}")))?;
-    let mut out: Vec<u8> = encoded.to_vec();
-
-    if let Some(src) = src_bytes
-        && options.include_metadata
-    {
-        // 元 WebP がアニメーションだったら拒否 (= モザイクは静止画前提)
-        // src がアニメーションなら ANIM / ANMF チャンクが居る。
-        if webp_is_animated(src) {
-            return Err(SaveError::AnimatedWebpNotSupported);
-        }
-        let (iccp, exif, xmp) = extract_webp_metadata_chunks(src)?;
-        if iccp.is_some() || exif.is_some() || xmp.is_some() {
-            out = inject_webp_metadata(&out, iccp, exif, xmp)?;
-        }
-    }
-    Ok(out)
+    Ok(encoded.to_vec())
 }
 
 /// WebP RIFF から ICCP / EXIF / XMP の payload を取り出す。各 `Vec<u8>` はチャンク
@@ -1112,46 +1058,23 @@ fn flatten_rgba_to_rgb_black(rgba: &[u8], width: u32) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    fn encode_jpeg_with_metadata(
+    // 保存・書き出しと同じ入口で、転記・向き・アニメーション拒否も検査する。
+    fn encode_test_image(
+        format: SrcFormat,
         pixels: &ColorImage,
         src: Option<&[u8]>,
         options: &SaveOptions,
     ) -> Result<Vec<u8>, SaveError> {
-        encode_jpeg_rgba(
+        encode_rgba_with_metadata(
             &color_image_to_rgba(pixels),
             pixels.size[0] as u32,
             pixels.size[1] as u32,
+            None,
             src,
+            format,
             options,
         )
-    }
-
-    fn encode_png_with_metadata(
-        pixels: &ColorImage,
-        src: Option<&[u8]>,
-        options: &SaveOptions,
-    ) -> Result<Vec<u8>, SaveError> {
-        encode_png_rgba(
-            &color_image_to_rgba(pixels),
-            pixels.size[0] as u32,
-            pixels.size[1] as u32,
-            src,
-            options,
-        )
-    }
-
-    fn encode_webp_with_metadata(
-        pixels: &ColorImage,
-        src: Option<&[u8]>,
-        options: &SaveOptions,
-    ) -> Result<Vec<u8>, SaveError> {
-        encode_webp_rgba(
-            &color_image_to_rgba(pixels),
-            pixels.size[0] as u32,
-            pixels.size[1] as u32,
-            src,
-            options,
-        )
+        .map(|encoded| encoded.bytes)
     }
     use eframe::egui;
 
@@ -1227,7 +1150,7 @@ mod tests {
             include_metadata: true,
             ..Default::default()
         };
-        let out = encode_jpeg_with_metadata(&img, Some(&src_jpeg), &opts).unwrap();
+        let out = encode_test_image(SrcFormat::Jpeg, &img, Some(&src_jpeg), &opts).unwrap();
         // 出力 JPEG から APP1 を再抽出して同じ payload か確認
         let out_segs = extract_jpeg_app1_segments(&out).unwrap();
         assert_eq!(out_segs.len(), 1, "exactly one APP1 should be re-inserted");
@@ -1305,7 +1228,7 @@ mod tests {
             include_metadata: false,
             ..Default::default()
         };
-        let out = encode_jpeg_with_metadata(&img, Some(&src), &opts).unwrap();
+        let out = encode_test_image(SrcFormat::Jpeg, &img, Some(&src), &opts).unwrap();
         let segs = extract_jpeg_app1_segments(&out).unwrap();
         assert!(segs.is_empty(), "include_metadata=false should drop APP1");
     }
@@ -1342,7 +1265,7 @@ mod tests {
         let src = make_minimal_png_with_text_chunk("parameters", "test-prompt-1234");
         let img = sample_color_image(16, 16);
         let opts = SaveOptions::default();
-        let out = encode_png_with_metadata(&img, Some(&src), &opts).unwrap();
+        let out = encode_test_image(SrcFormat::Png, &img, Some(&src), &opts).unwrap();
         let chunks = extract_png_text_chunks_raw(&out).unwrap();
         assert_eq!(chunks.len(), 1);
         // chunk_data から keyword と text を取り出す
@@ -1373,7 +1296,7 @@ mod tests {
         .unwrap();
         // 同じ画像で save (= encode + 再 inject)
         let opts = SaveOptions::default();
-        let out = encode_webp_with_metadata(&img, Some(&src_with_meta), &opts).unwrap();
+        let out = encode_test_image(SrcFormat::Webp, &img, Some(&src_with_meta), &opts).unwrap();
         let (iccp, exif, xmp) = extract_webp_metadata_chunks(&out).unwrap();
         assert!(iccp.is_none());
         assert_eq!(exif.unwrap(), b"FAKE-EXIF-DATA");
@@ -1396,7 +1319,7 @@ mod tests {
 
         let img = sample_color_image(4, 4);
         let opts = SaveOptions::default();
-        let result = encode_webp_with_metadata(&img, Some(&bytes), &opts);
+        let result = encode_test_image(SrcFormat::Webp, &img, Some(&bytes), &opts);
         assert!(
             matches!(result, Err(SaveError::AnimatedWebpNotSupported)),
             "should reject animated WebP"
@@ -1471,8 +1394,16 @@ mod tests {
         malformed.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x01]); // APP1 length=1 (不正)
         malformed.extend_from_slice(&jpeg_bytes[2..]);
         // この malformed の APP1 を抽出すると、不正長で打ち切られて空 Vec を返すはず。
-        let segs = extract_jpeg_app1_segments(&malformed).unwrap();
+        let out = encode_test_image(
+            SrcFormat::Jpeg,
+            &img,
+            Some(&malformed),
+            &SaveOptions::default(),
+        )
+        .unwrap();
+        let segs = extract_jpeg_app1_segments(&out).unwrap();
         assert!(segs.is_empty(), "malformed APP1 should be skipped");
+        assert!(image::load_from_memory(&out).is_ok());
     }
 
     /// CRC が壊れた tEXt チャンクが出力に転写されないことを確認 (Codex P2)。
@@ -1514,7 +1445,14 @@ mod tests {
         bad_chunk.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes()); // 不正 CRC
 
         let with_chunks = splice_png_text_chunks(&bytes, &[ok_chunk, bad_chunk]).unwrap();
-        let extracted = extract_png_text_chunks_raw(&with_chunks).unwrap();
+        let out = encode_test_image(
+            SrcFormat::Png,
+            &img,
+            Some(&with_chunks),
+            &SaveOptions::default(),
+        )
+        .unwrap();
+        let extracted = extract_png_text_chunks_raw(&out).unwrap();
         assert_eq!(extracted.len(), 1, "only the good CRC chunk should remain");
         // ok_chunk であることを確認 (= "good\0value" を含む)
         let c = &extracted[0];
@@ -1565,7 +1503,7 @@ mod tests {
 
         // encode 経由で Orientation が 1 に書き換わっているか確認
         let opts = SaveOptions::default();
-        let out = encode_jpeg_with_metadata(&img, Some(&src), &opts).unwrap();
+        let out = encode_test_image(SrcFormat::Jpeg, &img, Some(&src), &opts).unwrap();
         let segs = extract_jpeg_app1_segments(&out).unwrap();
         assert_eq!(segs.len(), 1);
         let seg = &segs[0];
@@ -1614,7 +1552,7 @@ mod tests {
         .unwrap();
         // 半透明入力 + XMP メタデータの結合で encode
         let opts = SaveOptions::default();
-        let out = encode_webp_with_metadata(&img, Some(&src_with_meta), &opts).unwrap();
+        let out = encode_test_image(SrcFormat::Webp, &img, Some(&src_with_meta), &opts).unwrap();
         // VP8X の出現回数を数える
         let mut vp8x_count = 0;
         let mut pos = 12;
@@ -1668,7 +1606,7 @@ mod tests {
             caller_applied_orientation: false,
             ..Default::default()
         };
-        let out = encode_jpeg_with_metadata(&img, Some(&src), &opts).unwrap();
+        let out = encode_test_image(SrcFormat::Jpeg, &img, Some(&src), &opts).unwrap();
         let segs = extract_jpeg_app1_segments(&out).unwrap();
         let seg = &segs[0];
         let entry = 10 + 8 + 2;
@@ -1696,17 +1634,13 @@ mod tests {
         let bogus_value = 0xDEADBEEFu32.to_le_bytes();
         payload.extend_from_slice(&bogus_value);
         payload.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
-        let snapshot = payload.clone();
-        let mut wrapped = Vec::with_capacity(4 + payload.len());
-        wrapped.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x00]);
-        let len = payload.len() + 2;
-        wrapped[2] = (len >> 8) as u8;
-        wrapped[3] = (len & 0xFF) as u8;
-        wrapped.extend_from_slice(&payload);
-
-        reset_exif_orientation_in_app1(&mut wrapped);
-        // payload (= APP1 marker / length を抜いた中身) が変わっていないこと
-        assert_eq!(&wrapped[4..], &snapshot[..]);
+        let src = build_jpeg_with_app1(&payload);
+        let img = sample_color_image(8, 8);
+        let out =
+            encode_test_image(SrcFormat::Jpeg, &img, Some(&src), &SaveOptions::default()).unwrap();
+        let segments = extract_jpeg_app1_segments(&out).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(&segments[0][4..], payload.as_slice());
     }
 
     /// 透過 VP8L (= 透過 lossless WebP) からメタデータ付き export したとき、
@@ -1738,21 +1672,22 @@ mod tests {
             Some(b"<x:xmpmeta>FAKE</x:xmpmeta>".to_vec()),
         )
         .unwrap();
+        let options = SaveOptions {
+            webp_lossless: true,
+            ..Default::default()
+        };
+        let out = encode_test_image(SrcFormat::Webp, &img, Some(&src_with_xmp), &options).unwrap();
         // この出力に VP8X が含まれていること、かつ alpha bit が立っていること
         // を確認する。
         let mut pos = 12;
         let mut found_vp8x = false;
-        while pos + 8 <= src_with_xmp.len() {
-            let fourcc = &src_with_xmp[pos..pos + 4];
-            let size = u32::from_le_bytes([
-                src_with_xmp[pos + 4],
-                src_with_xmp[pos + 5],
-                src_with_xmp[pos + 6],
-                src_with_xmp[pos + 7],
-            ]) as usize;
+        while pos + 8 <= out.len() {
+            let fourcc = &out[pos..pos + 4];
+            let size = u32::from_le_bytes([out[pos + 4], out[pos + 5], out[pos + 6], out[pos + 7]])
+                as usize;
             if fourcc == b"VP8X" {
                 found_vp8x = true;
-                let flags = src_with_xmp[pos + 8];
+                let flags = out[pos + 8];
                 assert!(
                     flags & 0x10 != 0,
                     "alpha bit (0x10) should be set on new VP8X, got flags=0x{:02X}",

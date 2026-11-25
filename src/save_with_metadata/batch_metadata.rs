@@ -55,6 +55,7 @@ pub(super) fn transfer(
             };
             let mut total = 0;
             let mut retained = Vec::new();
+            let mut raw_app1_xmp = Vec::new();
             for mut chunk in chunks {
                 let kind = chunk[4..8].to_vec();
                 match kind.as_slice() {
@@ -84,13 +85,20 @@ pub(super) fn transfer(
                         }
                     }
                     _ => {
-                        if !process_png_text(&mut chunk, &mut total, options, &mut notice)? {
+                        if !process_png_text(
+                            &mut chunk,
+                            &mut total,
+                            options,
+                            &mut notice,
+                            &mut raw_app1_xmp,
+                        )? {
                             continue;
                         }
                     }
                 }
                 retained.push(chunk);
             }
+            notice.xmp |= xmp_payloads_thumbnail(raw_app1_xmp.iter().map(Vec::as_slice));
             splice_png_text_chunks(encoded, &retained)?
         }
         SrcFormat::Webp => {
@@ -120,9 +128,13 @@ pub(super) fn transfer(
 }
 
 fn jpeg_xmp_thumbnail(segments: &[Vec<u8>]) -> bool {
+    xmp_payloads_thumbnail(segments.iter().map(|seg| &seg[4..]))
+}
+
+// JPEG APP1 と PNG Raw APP1 は同じ見出し・断片の結合規則を使う。
+fn xmp_payloads_thumbnail<'a>(payloads: impl IntoIterator<Item = &'a [u8]>) -> bool {
     let mut groups: BTreeMap<&[u8], Vec<(u32, &[u8])>> = BTreeMap::new();
-    for seg in segments {
-        let payload = &seg[4..];
+    for payload in payloads {
         if let Some(body) = payload.strip_prefix(XMP_STANDARD) {
             if has_thumbnail(body) {
                 return true;
@@ -261,9 +273,8 @@ fn hex_digit(b: u8) -> Option<u8> {
     }
 }
 
-// ImageMagick: 改行・種類名・改行・10進長・改行・空白区切りの16進。
-// 宣言より後ろのデータも含めて、桁数が厳密に一致することを確認する。
-fn raw_profile(body: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
+// 長さの行と16進の開始位置。長さの妥当性は厳密な読み取り側で調べる。
+fn raw_profile_layout(body: &[u8]) -> Option<(&[u8], usize)> {
     let body_start = if body.starts_with(b"\r\n") {
         2
     } else if body.starts_with(b"\n") {
@@ -280,15 +291,20 @@ fn raw_profile(body: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
     }
     let length_start = type_end + 1;
     let length_end = body[length_start..].iter().position(|&b| b == b'\n')? + length_start;
-    let length_text = std::str::from_utf8(&body[length_start..length_end])
-        .ok()?
-        .trim();
+    Some((&body[length_start..length_end], length_end + 1))
+}
+
+// ImageMagick: 改行・種類名・改行・10進長・改行・空白区切りの16進。
+// 宣言より後ろのデータも含めて、桁数が厳密に一致することを確認する。
+fn raw_profile(body: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
+    let (length_line, hex_start) = raw_profile_layout(body)?;
+    let length_text = std::str::from_utf8(length_line).ok()?.trim();
     if length_text.is_empty() || !length_text.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let length: usize = length_text.parse().ok()?;
     let digits = length.checked_mul(2)?;
-    let positions: Vec<usize> = (length_end + 1..body.len())
+    let positions: Vec<usize> = (hex_start..body.len())
         .filter(|&i| !body[i].is_ascii_whitespace())
         .collect();
     if positions.len() != digits {
@@ -299,6 +315,52 @@ fn raw_profile(body: &[u8]) -> Option<(Vec<u8>, Vec<usize>)> {
         .map(|p| Some((hex_digit(body[p[0]])? << 4) | hex_digit(body[p[1]])?))
         .collect::<Option<Vec<_>>>()?;
     Some((bytes, positions))
+}
+
+// 厳密な解析に失敗した APP1 の分類専用。長さの宣言は信用せず、
+// XMP の見出しに必要な先頭の数字だけ戻す。本体の検査・転記には使わない。
+fn raw_profile_has_xmp_header(body: &[u8]) -> bool {
+    let Some((_, hex_start)) = raw_profile_layout(body) else {
+        return false;
+    };
+    let mut digits = body[hex_start..]
+        .iter()
+        .copied()
+        .filter(|b| !b.is_ascii_whitespace());
+    let header_len = XMP_STANDARD.len().max(XMP_EXTENDED.len());
+    let mut prefix = Vec::with_capacity(header_len);
+    for _ in 0..header_len {
+        let Some(high) = digits.next().and_then(hex_digit) else {
+            return false;
+        };
+        let Some(low) = digits.next().and_then(hex_digit) else {
+            return false;
+        };
+        prefix.push((high << 4) | low);
+        if prefix.as_slice() == XMP_STANDARD || prefix.as_slice() == XMP_EXTENDED {
+            return true;
+        }
+        if !XMP_STANDARD.starts_with(&prefix) && !XMP_EXTENDED.starts_with(&prefix) {
+            return false;
+        }
+    }
+    false
+}
+
+fn keep_uninspectable_png_text(
+    raw_exif: bool,
+    options: &SaveOptions,
+    notice: &mut ThumbnailNoticeKinds,
+) -> bool {
+    if raw_exif {
+        if options.metadata_profile == MetadataProfile::Batch {
+            return false;
+        }
+        notice.exif_uninspectable = true;
+    } else {
+        notice.xmp_uninspectable = true;
+    }
+    true
 }
 
 fn patch_raw_profile(body: &mut [u8], positions: &[usize], original: &[u8], cleaned: &[u8]) {
@@ -329,6 +391,7 @@ fn process_png_text(
     total: &mut usize,
     options: &SaveOptions,
     notice: &mut ThumbnailNoticeKinds,
+    raw_app1_xmp: &mut Vec<Vec<u8>>,
 ) -> Result<bool, SaveError> {
     let data = &chunk[8..chunk.len() - 4];
     let Some(key_end) = data.iter().position(|&b| b == 0) else {
@@ -344,28 +407,31 @@ fn process_png_text(
     let decoded = png_text_layout(chunk, key_end).and_then(|(start, compressed)| {
         decode_png_text(&data[start..], compressed, total).map(|body| (start, compressed, body))
     });
-    let parsed = decoded.and_then(|(start, compressed, body)| {
-        if raw_exif || raw_xmp {
-            let (bytes, positions) = raw_profile(&body)?;
-            Some((start, compressed, body, bytes, positions))
-        } else {
-            Some((start, compressed, Vec::new(), body, Vec::new()))
-        }
-    });
-    let Some((start, compressed, mut body, bytes, positions)) = parsed else {
-        if raw_exif {
-            if options.metadata_profile == MetadataProfile::Batch {
-                return Ok(false);
+    let Some((start, compressed, mut body)) = decoded else {
+        return Ok(keep_uninspectable_png_text(raw_exif, options, notice));
+    };
+    if !raw_exif && !raw_xmp {
+        notice.xmp |= has_thumbnail(&body);
+        return Ok(true);
+    }
+    let (bytes, positions) = match raw_profile(&body) {
+        Some(parsed) => parsed,
+        None => {
+            if raw_app1 && raw_profile_has_xmp_header(&body) {
+                notice.xmp_uninspectable = true;
+                return Ok(true);
             }
-            notice.exif_uninspectable = true;
-        } else {
-            notice.xmp_uninspectable = true;
+            return Ok(keep_uninspectable_png_text(raw_exif, options, notice));
+        }
+    };
+    if raw_app1 && (bytes.starts_with(XMP_STANDARD) || bytes.starts_with(XMP_EXTENDED)) {
+        notice.xmp |= xmp_payloads_thumbnail(std::iter::once(bytes.as_slice()));
+        if bytes.starts_with(XMP_EXTENDED) {
+            raw_app1_xmp.push(bytes);
         }
         return Ok(true);
-    };
-    if !raw_exif
-        || (raw_app1 && (bytes.starts_with(XMP_STANDARD) || bytes.starts_with(XMP_EXTENDED)))
-    {
+    }
+    if raw_xmp {
         notice.xmp |= has_thumbnail(&bytes);
         return Ok(true);
     }

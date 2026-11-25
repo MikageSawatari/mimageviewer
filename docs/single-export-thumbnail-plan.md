@@ -1,6 +1,6 @@
 # 1 枚の書き出し (Ctrl+E) の元の縮小画像の扱い 設計 (§1.888)
 
-状態: export-888 ブランチで実装済み・未テスト (2026-11-25)。
+状態: export-888 ブランチで実装済み、master 未統合・実機未確認 (2026-11-25)。ad7b47611 の関連テストは設計担当が共有 runner で lib の `save_with_metadata::` / `export_batch::tests::` / `ui_dialogs::export_batch::tests::` / `export_dialog::` (133 件) と `export_integration` (23 件) の成功を確認。警告画面のスナップショットは再生成・目視確認済み。今回の追補差分は未テスト。
 関連: [一括エクスポートの設計](batch-export-plan.md) §3.6 (EXIF の共通処理)・§3.7 (縮小画像の警告)・§13 Q3、
 [バックログ §1.888](next-release-backlog.md)。
 

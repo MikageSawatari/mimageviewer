@@ -402,6 +402,100 @@ fn jpeg_extended_xmp_short_header_checks_available_body() {
 }
 
 #[test]
+fn png_raw_app1_extended_xmp_joins_same_guid_fragments_and_preserves_chunks() {
+    let a = [b'A'; 32];
+    let b = [b'B'; 32];
+    let split = 15;
+    let first = extended(&a, 0, &XMP_IMAGE_NS[..split]);
+    let second = extended(&a, 200, &XMP_IMAGE_NS[split..]);
+    let other = extended(&b, 100, b"another GUID");
+    let different_guid = extended(&b, 0, &XMP_IMAGE_NS[split..]);
+    let mut short = XMP_EXTENDED.to_vec();
+    short.extend_from_slice(XMP_IMAGE_NS);
+    let short = app(0xE1, &short);
+    for opts in [single_options(false), options(false)] {
+        for (fragments, expected) in [
+            (vec![&second, &other, &first], true),
+            (vec![&first, &different_guid], false),
+            (vec![&short], true),
+        ] {
+            let chunks: Vec<_> = fragments
+                .iter()
+                .enumerate()
+                .map(|(i, segment)| {
+                    let payload = &segment[4..];
+                    let kind = [b"tEXt", b"zTXt", b"iTXt"][i % 3];
+                    raw_text(
+                        kind,
+                        b"Raw profile type APP1",
+                        &raw_body(payload, payload.len()),
+                        true,
+                    )
+                })
+                .collect();
+            let src = splice_png_text_chunks(&bare(SrcFormat::Png), &chunks).unwrap();
+            let result = encode(SrcFormat::Png, Some(&src), &opts);
+            assert_eq!(result.thumbnail_notice.xmp, expected);
+            assert!(!result.thumbnail_notice.xmp_uninspectable);
+            assert!(!result.thumbnail_notice.exif_uninspectable);
+            assert_eq!(extract_png_text_chunks_raw(&result.bytes).unwrap(), chunks);
+        }
+    }
+}
+
+#[test]
+fn png_raw_app1_unreadable_xmp_keeps_chunks_and_warns_in_both_profiles() {
+    for opts in [single_options(false), options(false)] {
+        for header in [XMP_STANDARD, XMP_EXTENDED] {
+            let payload = [header, XMP_IMAGE_NS].concat();
+            let short_length = raw_body(&payload, 1);
+            let long_length = raw_body(&payload, payload.len() + 1);
+            let mut bad_tail = raw_body(&payload, payload.len());
+            bad_tail.extend_from_slice(b"zz");
+            let mut odd_tail = raw_body(&payload, payload.len());
+            odd_tail.push(b'f');
+            // An invalid decimal declaration must not hide a recognizable XMP header.
+            let invalid_length = raw_body(&payload, payload.len());
+            let length_line = format!("{:8}", payload.len());
+            let invalid_length = String::from_utf8(invalid_length)
+                .unwrap()
+                .replacen(length_line.as_str(), "invalid length", 1)
+                .into_bytes();
+            for body in [
+                short_length,
+                long_length,
+                bad_tail,
+                odd_tail,
+                invalid_length,
+            ] {
+                for (kind, compression) in [
+                    (b"tEXt", false),
+                    (b"zTXt", true),
+                    (b"iTXt", false),
+                    (b"iTXt", true),
+                ] {
+                    let chunk = raw_text(kind, b"rAw PrOfIlE tYpE aPp1", &body, compression);
+                    let src =
+                        splice_png_text_chunks(&bare(SrcFormat::Png), &[chunk.clone()]).unwrap();
+                    let result = encode(SrcFormat::Png, Some(&src), &opts);
+                    assert_eq!(
+                        result.thumbnail_notice,
+                        ThumbnailNoticeKinds {
+                            xmp_uninspectable: true,
+                            ..Default::default()
+                        }
+                    );
+                    assert_eq!(
+                        extract_png_text_chunks_raw(&result.bytes).unwrap(),
+                        vec![chunk]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn exif_stripped_thumbnail_ranges_are_erased_and_malformed_offsets_rejected() {
     let mut bytes = tiff(true);
     put16(&mut bytes, 58, 0x0111, true);
