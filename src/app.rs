@@ -17303,6 +17303,12 @@ pub struct App {
     pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
     pub(crate) combine_session: Option<crate::ui_dialogs::image_combine::CombineSession>,
     pub(crate) combine_request_sequence: u64,
+    /// Snapshot owned by one open Tools menu; cleared when its body closes.
+    pub(crate) combine_tools_menu_owner:
+        Option<crate::ui_dialogs::context_menu::GridContextMenuOwner>,
+    #[cfg(test)]
+    pub(crate) combine_eligibility_work:
+        std::cell::Cell<crate::ui_dialogs::image_combine::CombineEligibilityWork>,
     /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。単ページと一括の両方が使う。
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
     /// OS-global clipboard output; intentionally stays outside viewer context bundles.
@@ -21356,6 +21362,9 @@ impl App {
             export_batch_dialog: None,
             combine_session: None,
             combine_request_sequence: 0,
+            combine_tools_menu_owner: None,
+            #[cfg(test)]
+            combine_eligibility_work: Default::default(),
             export_pending: None,
             edited_clipboard_copy: None,
             folder_refresh_pending: None,
@@ -28682,6 +28691,29 @@ impl App {
                     self.retire_smart_folder_payloads([
                         Box::new(previous) as smart_folder::RetiredSmartFolderPayload
                     ]);
+                }
+                // Outputs may already have been adopted by a watcher before
+                // the operation reports completion. Equal has no installation
+                // pass to apply its pending selection, so do it here as well.
+                if owner_context_id == main_context_id && self.post_operation_selection.is_some() {
+                    if self.viewer_session_blocks_main_window()
+                        || self.document_open_modal_admission_blocked()
+                    {
+                        self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest {
+                            folder: folder.clone(),
+                            cause: book_append_refresh::FolderRefreshCause::Operation,
+                        });
+                    } else {
+                        let request = self.post_operation_selection.as_ref().unwrap();
+                        if request.still_owns_selection(
+                            self.selected_real_file_path().as_deref(),
+                            &self.checked_real_file_paths(),
+                        ) {
+                            self.apply_post_operation_selection();
+                        } else {
+                            self.cancel_post_operation_selection("user_changed_selection");
+                        }
+                    }
                 }
                 true
             }
@@ -87134,6 +87166,8 @@ impl App {
 
     /// ページの正規化キーを返す（DB 保存用）。
     pub(crate) fn page_path_key(&self, idx: usize) -> Option<String> {
+        #[cfg(test)]
+        self.note_combine_work(|work| work.page_keys += 1);
         crate::edit_source::page_key_for_grid_item(self.items.get(idx)?)
     }
 

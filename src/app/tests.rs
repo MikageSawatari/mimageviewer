@@ -116593,3 +116593,6 @@ mod page_sort_883;
 
 #[path = "tests/prepared_search_adoption.rs"]
 mod prepared_search_adoption;
+
+#[path = "tests/image_combine_equal_refresh.rs"]
+mod image_combine_equal_refresh;

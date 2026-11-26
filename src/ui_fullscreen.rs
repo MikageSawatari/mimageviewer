@@ -59199,6 +59199,8 @@ impl App {
         std::collections::VecDeque<crate::ui_dialogs::export_batch::ExportBatchTarget>,
         usize,
     ) {
+        #[cfg(test)]
+        self.note_combine_work(|work| work.materializations += 1);
         use crate::ui_dialogs::export_batch::ExportBatchTarget;
         let mut targets = std::collections::VecDeque::new();
         let mut skipped = 0usize;

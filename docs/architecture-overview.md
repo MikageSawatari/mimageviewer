@@ -880,6 +880,9 @@ Dialog / Writing の単独所有者で、Dialog は共通モーダルと documen
 `ExportOrigin::Combine` の終端・切断・完了後の閉じるは同じ finish handlerへ入り、sessionのtakeで1回だけ採用する。
 保存通知の OpenInViewer は既存の明示パス activation へ渡す。前回値とプリセットは Settings 内にあり、
 構成のDB・索引・再編集はstage Cの範囲 (stage BはDBを作らず `save_recipe_stage_c_hook` だけを置く)。
+メニューの可否は借用した選択とスタックの索引から101件で打ち切って数え、メニューの所有者に保持する。
+対象キュー・ページキー・メンバーのパスは受付後に作る。操作の出力が監視によって先に一覧へ入った場合も、
+共有のEqual再走査が一覧の所有条件を確認して既存の操作後選択ヘルパーへ渡す。
 
 
 | モジュール | 役割 |

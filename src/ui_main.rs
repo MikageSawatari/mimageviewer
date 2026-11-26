@@ -10438,8 +10438,7 @@ impl App {
                         }
                         TopMenuId::Tools => {
                             let response = ui.menu_button(TopMenuId::Tools.label(), |ui| {
-                                // Resolve targets only while the menu body is open, not on idle frames.
-                                let combine_reason = self.grid_combine_disabled_reason();
+                                let combine_reason = self.combine_tools_menu_disabled_reason();
                                 let state = crate::ui_tools_menu::ToolsMenuState {
                                     combine_disabled_reason: combine_reason.as_deref(),
                                     convert_enabled: self.grid_item_input_allowed() && convert_target_count > 0
@@ -10454,6 +10453,9 @@ impl App {
                                 };
                                 crate::ui_tools_menu::draw(ui, &resolved_top_menu.commands, &self.keymap, state)
                             });
+                            if response.inner.is_none() {
+                                self.combine_tools_menu_owner = None;
+                            }
                             if let Some(Some(command)) = response.inner {
                                 match command {
                                     MenuCommandId::ConvertToZip => self.start_batch_convert_to_zip(),

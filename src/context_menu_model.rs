@@ -1081,7 +1081,7 @@ pub struct ContextMenuInput {
     pub checked_count: usize,
     pub checked_file_operation_selection: CheckedFileOperationSelection,
     pub can_use_folder_commands: bool,
-    /// Eligible targets after expansion of checked stack members.
+    /// Count-only eligibility after stack expansion, capped at 101 (>100).
     pub combine_target_count: usize,
     /// Computed from the same effective selection/direct-folder targets as admission.
     pub combine_disabled_reason: Option<String>,

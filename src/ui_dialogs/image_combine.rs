@@ -21,6 +21,16 @@ pub(crate) enum CombineSession {
     Writing { request: u64 },
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CombineEligibilityWork {
+    pub passes: usize,
+    pub rows: usize,
+    pub stack_lookups: usize,
+    pub materializations: usize,
+    pub page_keys: usize,
+}
+
 impl CombineSession {
     pub(crate) fn modal(&self) -> bool {
         matches!(self, Self::Dialog(_))
@@ -515,7 +525,7 @@ pub(crate) fn entry_disabled_reason(
     } else if count == 0 {
         Some("選択の中に結合できる画像・ページがありません".into())
     } else if count > 100 {
-        Some(format!("結合できるのは 100 枚までです ({count} 枚選択中)"))
+        Some("結合できるのは 100 枚までです (101 枚以上選択中)".into())
     } else {
         None
     }
@@ -553,7 +563,75 @@ impl App {
     }
 
     pub(crate) fn grid_combine_disabled_reason(&self) -> Option<String> {
-        self.combine_disabled_reason_for_count(self.grid_batch_export_targets().0.len())
+        self.combine_disabled_reason_for_count(
+            self.image_combine_target_count(self.selected, false),
+        )
+    }
+
+    /// Admission only: no sorting, page keys, member paths or target queues.
+    /// 101 represents every over-limit selection, not an exact cardinality.
+    pub(crate) fn image_combine_target_count(
+        &self,
+        clicked: Option<usize>,
+        background: bool,
+    ) -> usize {
+        #[cfg(test)]
+        self.note_combine_work(|work| work.passes += 1);
+        if background {
+            return 0;
+        }
+        let mut count = 0usize;
+        let single = clicked.filter(|_| self.checked.is_empty());
+        for index in self.checked.iter().copied().chain(single) {
+            #[cfg(test)]
+            self.note_combine_work(|work| work.rows += 1);
+            if !self.smart_folder_rule_qualifies_index(index) {
+                continue;
+            }
+            count += match self.items.get(index) {
+                Some(
+                    crate::grid_item::GridItem::Image(_)
+                    | crate::grid_item::GridItem::ZipImage { .. }
+                    | crate::grid_item::GridItem::PdfPage { .. },
+                ) => 1,
+                Some(crate::grid_item::GridItem::Stack { key, .. }) => {
+                    #[cfg(test)]
+                    self.note_combine_work(|work| work.stack_lookups += 1);
+                    self.stack_view
+                        .as_ref()
+                        .map_or(0, |view| view.image_count_for_group_key(key))
+                }
+                _ => 0,
+            };
+            if count > 100 {
+                return 101;
+            }
+        }
+        count
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_combine_work(&self, update: impl FnOnce(&mut CombineEligibilityWork)) {
+        let mut work = self.combine_eligibility_work.get();
+        update(&mut work);
+        self.combine_eligibility_work.set(work);
+    }
+
+    pub(crate) fn combine_tools_menu_disabled_reason(&mut self) -> Option<String> {
+        let context_id = self.collection_grid_context_id();
+        if self.combine_tools_menu_owner.is_none_or(|owner| {
+            owner.context_id != context_id || owner.items_generation != self.items_generation
+        }) {
+            self.combine_tools_menu_owner = Some(super::context_menu::GridContextMenuOwner {
+                index: self.selected.unwrap_or(usize::MAX),
+                context_id,
+                items_generation: self.items_generation,
+                combine_target_count: self.image_combine_target_count(self.selected, false),
+            });
+        }
+        self.combine_disabled_reason_for_count(
+            self.combine_tools_menu_owner.unwrap().combine_target_count,
+        )
     }
 
     pub(crate) fn combine_disabled_reason_for_count(&self, count: usize) -> Option<String> {
@@ -566,6 +644,10 @@ impl App {
     }
 
     pub(crate) fn open_image_combine_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(reason) = self.grid_combine_disabled_reason() {
+            self.show_feedback_warning(reason);
+            return;
+        }
         let (targets, _) = self.grid_batch_export_targets();
         self.open_image_combine_with_targets(ctx, targets);
     }
@@ -591,6 +673,12 @@ impl App {
         clicked: Option<usize>,
         is_folder_context: bool,
     ) {
+        if let Some(reason) = self.combine_disabled_reason_for_count(
+            self.image_combine_target_count(clicked, is_folder_context),
+        ) {
+            self.show_feedback_warning(reason);
+            return;
+        }
         let targets = self.image_combine_context_targets(clicked, is_folder_context);
         self.open_image_combine_with_targets(ctx, targets);
     }
