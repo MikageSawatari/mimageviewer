@@ -614,3 +614,14 @@ Smart root の履歴採用後、定義の範囲外にある新しい通常物理
   旧ソート方針とページ順固定への変更を覆う回帰 7 件を追加した。既存 3 件の期待値は変更しない。
   設計からの逸脱や既存機能の変更はない。コンパイル・テスト実行・コミットは利用者指定により行わない。
   `cargo fmt`（引数なし）と `git diff --check` を実施した。
+
+#### App の格納サイズ (2026-11-27)
+
+- 設計担当から `d669a3ef3` の本体 lib 全 20934 件中、App の既存サイズ検査だけが失敗し、
+  実測が 110408 bytes だったとの報告を受けた。上限 110000 bytes は変更しない。
+- App の `folder_order`、process 所有の service、reset confirmation を Box へ置き、
+  `ViewerContextBundle` でも同じ Box 型を swap / fork する。fork の clone は独立した状態の写しを作る。
+  App に inline で載る SnapshotState の saved_folder_order も Box に揃え、退避・復元で移す。
+  worker の materialize 結果は従来の値型を保ち、採用時に App が持つ Box の内容へ書き込む。
+- 既存の cold-owner 検査へ 3 field のポインタサイズ検査を追加し、history-transition のサイズ検査へ
+  storage / payload の診断出力を追加した。コンパイル・テスト・コミットは利用者指定により実施しない。

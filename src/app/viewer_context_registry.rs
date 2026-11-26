@@ -1931,7 +1931,7 @@ pub(in crate::app) struct ViewerContextBundle {
     archive_source_override: Option<PathBuf>,
     zip_nav: Option<crate::zip_tree::ZipNavState>,
     pub(in crate::app) list_order: Option<Arc<super::ListOrderSnapshot>>,
-    pub(in crate::app) folder_order: crate::folder_order::FolderOrderState,
+    pub(in crate::app) folder_order: Box<crate::folder_order::FolderOrderState>,
     stack_mode_requested: bool,
     stack_view: Option<std::sync::Arc<crate::filename_stack::StackView>>,
     stack_showing_flat: bool,

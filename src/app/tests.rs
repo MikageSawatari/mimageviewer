@@ -3714,6 +3714,15 @@ fn cold_dialog_owners_keep_app_stack_footprint_bounded() {
             field_size(|app| &app.settings_restore_state),
         ),
         ("book_reorder", field_size(|app| &app.book_reorder)),
+        ("folder_order", field_size(|app| &app.folder_order)),
+        (
+            "folder_order_service",
+            field_size(|app| &app.folder_order_service),
+        ),
+        (
+            "folder_order_reset_confirmation",
+            field_size(|app| &app.folder_order_reset_confirmation),
+        ),
     ] {
         println!("cold owner {name}={bytes}");
         assert_eq!(
@@ -3764,6 +3773,16 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         storage(|app| &app.settings.thumb_cover_auto_crop_folders),
         storage(|app| &app.settings.video_resume_positions),
         size_of::<HashMap<String, f64>>(),
+    );
+    println!(
+        "folder-order storage folder_order={} folder_order_service={} folder_order_reset_confirmation={}; payload FolderOrderState={} FolderOrderService={} FolderOrderResetConfirmation={} SnapshotState={}",
+        storage(|app| &app.folder_order),
+        storage(|app| &app.folder_order_service),
+        storage(|app| &app.folder_order_reset_confirmation),
+        size_of::<crate::folder_order::FolderOrderState>(),
+        size_of::<crate::folder_order::FolderOrderService>(),
+        size_of::<folder_manual_order::FolderOrderResetConfirmation>(),
+        size_of::<crate::snapshot::SnapshotState>(),
     );
     // A staged history request is rarely active and must not be stored inline in every App.
     // The capture/fullscreen input test creates several App values on a default test stack.

@@ -97,7 +97,9 @@ enum SnapshotArchiveCacheDestination {
 }
 
 impl App {
-    pub(super) fn capture_snapshot_folder_order(&self) -> crate::folder_order::FolderOrderState {
+    pub(super) fn capture_snapshot_folder_order(
+        &self,
+    ) -> Box<crate::folder_order::FolderOrderState> {
         let mut saved = self.folder_order.clone();
         // The fixed list keeps recorded positions with its saved physical rows. The
         // transient unrecorded selection ends when leaving that physical listing.
@@ -3086,7 +3088,7 @@ mod tests {
                 let _ = state.enter_manual();
             }
             state.order_revision = 40;
-            app.folder_order = state.clone();
+            *app.folder_order = state.clone();
             app.visible_indices = vec![0];
             app.activate_snapshot(SnapshotSourceLabel::Mixed);
             assert!(app.is_snapshot_active());

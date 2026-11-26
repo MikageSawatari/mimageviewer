@@ -8289,3 +8289,7 @@ fork 先は空、元 context は cache と proof を保持する。detached の�
 - 2026-11-27 の関連テスト失敗対応で、固定内の通常物理 child を解除するときの surface 退役も成功採用へ揃えた。
   `take_return_origin` による早期の Folder 化を避け、worker の Read 待機中は旧 items と Snapshot surface・戻り先の所有を保つ。
   origin の復元と対象外 child の即時経路、detached の述語・viewport 配送・窓の寿命は変更しない。
+- 2026-11-27 の App サイズ検査への対応で、手動状態を App / ViewerContextBundle / SnapshotState の
+  すべてで Box に揃えた。swap は Box の移動、fork は Box の clone による独立した状態の複製で、
+  同じ items 所有境界を維持する。inline payload の配置だけを変える構造上の修正で、
+  detached の述語・viewport 配送・窓の寿命は変更しない。

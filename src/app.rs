@@ -16638,10 +16638,11 @@ pub struct App {
     folder_nav_pending: Option<FolderNavPending>,
     /// Context-owned frozen book rows; no stored current position.
     pub(crate) list_order: Option<Arc<ListOrderSnapshot>>,
-    pub(crate) folder_order: crate::folder_order::FolderOrderState,
-    pub(crate) folder_order_service: Option<crate::folder_order::FolderOrderService>,
+    // Keep folder-order payloads off the App stack, including saved snapshot copies.
+    pub(crate) folder_order: Box<crate::folder_order::FolderOrderState>,
+    pub(crate) folder_order_service: Option<Box<crate::folder_order::FolderOrderService>>,
     pub(crate) folder_order_reset_confirmation:
-        Option<folder_manual_order::FolderOrderResetConfirmation>,
+        Option<Box<folder_manual_order::FolderOrderResetConfirmation>>,
     /// 実フォルダ open の worker scan 待ち ([`FolderPaneOpenPending`])。
     /// folder pane と detached image open のどちらも bundle ownership で保持する。
     folder_pane_open_pending: Option<FolderPaneOpenPending>,
@@ -20121,7 +20122,7 @@ impl Drop for App {
         // actor DB before AppTestEnv releases its disposable directory override.
         #[cfg(test)]
         if let Some(service) = self.folder_order_service.take() {
-            service.shutdown();
+            (*service).shutdown();
         }
     }
 }
@@ -33509,7 +33510,7 @@ impl App {
             );
         let projection_key =
             folder_manual_order::projection_key(projection_key, &folder_order, manual_applied);
-        self.folder_order = folder_order;
+        *self.folder_order = folder_order;
         self.notify_folder_order_read_failure();
         // The shared write predicate can now validate the adopted folder itself,
         // before hydration starts any content-identity detection.
@@ -105108,7 +105109,7 @@ impl eframe::App for App {
         // 後段の本物の on_exit に処理を委譲する (trait impl は 1 つしか書けないため、
         // helper メソッド群は trait impl の外の `impl App` ブロックへ逃がしてある)。
         if let Some(service) = self.folder_order_service.take() {
-            service.shutdown();
+            (*service).shutdown();
         }
         self.on_exit_inner();
         #[cfg(all(windows, feature = "test-script"))]

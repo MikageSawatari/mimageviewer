@@ -16,9 +16,9 @@ pub(crate) struct FolderOrderResetConfirmation {
     folder_key: String,
 }
 
-pub(super) fn start_service() -> Option<FolderOrderService> {
+pub(super) fn start_service() -> Option<Box<FolderOrderService>> {
     match FolderOrderService::start() {
-        Ok(service) => Some(service),
+        Ok(service) => Some(Box::new(service)),
         Err(error) => {
             crate::logger::log(format!("folder_order: actor startup failed: {error}"));
             None
@@ -98,10 +98,10 @@ impl App {
 
     pub(crate) fn request_folder_order_reset_confirmation(&mut self) {
         if self.folder_order_reset_available() {
-            self.folder_order_reset_confirmation = Some(FolderOrderResetConfirmation {
+            self.folder_order_reset_confirmation = Some(Box::new(FolderOrderResetConfirmation {
                 context: self.projected_viewer_context_id(),
                 folder_key: self.folder_order.folder_key.clone().unwrap(),
-            });
+            }));
         }
     }
 
@@ -135,7 +135,7 @@ impl App {
             .order_revision
             .checked_add(1)
             .expect("folder order revision exhausted");
-        self.folder_order = FolderOrderState {
+        *self.folder_order = FolderOrderState {
             order_revision: revision,
             ..Default::default()
         };
@@ -685,13 +685,13 @@ mod tests {
     #[test]
     fn folder_manual_order_sync_unprepared_index_defers_unrecorded_destination() {
         let (mut app, origin) = fixture();
-        app.folder_order_service.take().unwrap().shutdown();
+        (*app.folder_order_service.take().unwrap()).shutdown();
         let (service, start) = FolderOrderService::start_at_paused_for_test(
             app.tmp.path().join(crate::folder_order::DB_NAME),
         )
         .unwrap();
         let handle = service.handle.clone();
-        app.folder_order_service = Some(service);
+        app.folder_order_service = Some(Box::new(service));
         let destination = app.tmp.path().join("sync-startup-pending");
         std::fs::create_dir(&destination).unwrap();
         std::fs::write(destination.join("a.jpg"), b"fixture").unwrap();
