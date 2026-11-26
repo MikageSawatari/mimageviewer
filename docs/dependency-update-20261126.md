@@ -163,3 +163,10 @@ mIV の自動テストは PDF の描画結果の画素や音を比べないの�
   パスワード付き PDF、About の版 `160.0.8179.0`。すべて期待どおり。
 - mIV Sound: 版の表示、Headphone EQ (検索・取得・断り・ファイル読み込み・再起動後の保持)、歌詞と Counter、0.17 の保存データ。
   期待どおり。**音を耳で聞く確認は未実施**。
+
+## v5.8.0 の公開 (2026-11-26、統括)
+
+- 配布ビルド: `build-dist.ps1 -SkipVst3Bridge` (入力 2e1489110 = タグ v5.8.0)。全体テストのビルドがコミットの上限 (os error 1455) で 2 回止まり、`CARGO_BUILD_JOBS=8` で通した (バックログ §1.908〜§1.910)。
+- VirusTotal (リリース手順 12.6、利用者の了承を得て利用者がアップロード): `mIV Sound.vst3` (ポータブル版の `effetune/mIV Sound.vst3/Contents/x86_64-win/mIV Sound.vst3`、8,368,728 バイト、署名済み) SHA-256 `e0cf5e349b0649d8e818511b98d3d0387f5f88d60b59bbc4e6dbbcfd1f675d71`、**0/70**、Google・Microsoft とも Undetected (2026-11-26 に統括が結果のページで確認)。https://www.virustotal.com/gui/file/e0cf5e349b0649d8e818511b98d3d0387f5f88d60b59bbc4e6dbbcfd1f675d71 。VST3 host は C++ のソースが v5.7.0 から変わらず再署名のみなので検査を省いた (中身は前回検査の版と同じ)。
+- ReleaseChecks (サブ PC、キット relcheck-2e1489110-20261126-061933、manifest ab081a90…187f、artifact 2e1489110): PASS_WITH_WARNINGS (exit 0)。idle 5 ケースは PASS、perf 2 ケースは drawn <16ms 比率の WARN のみ (v5.7.0 と同じ種類)。メイン PC の Receive-ReleaseCheckResult でも一致。
+- 派生版のブランチ miv-0.19 (801ca2a) と miv-0.17 (e96bd95) を、利用者の了承 (「両方 push する」) を得て GitHub の MikageSawatari/miv-sound へ push した。
