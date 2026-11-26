@@ -147,9 +147,19 @@ python scripts/generate-pdfium-license.py --check
 - `python scripts/generate-pdfium-license.py --check`: 成功。
 - `cargo nextest run -p mimageviewer --lib -E 'test(/pdf/) | test(/pdfium/) | test(/about/)'`: 609 件すべて成功 (About の `pdfium_notices_match_all_vendor_files_and_version` を含む)。
 
-## 未確認 (実機)
+### mIV Sound 0.19.0-miv.1 の承認 (254e895a4)
 
-mIV の自動テストは PDF の描画結果の画素を比べない。利用者 (サブ PC) の実機で次を見てもらう必要がある。
+- `effetune-distribution.ps1 -ValidateSource <vendor\miv-sound の絶対パス>`: 成功 (相対パスで渡すと .NET の現在フォルダ基準で別の作業ツリーを見るので注意)。
+- `test-effetune-distribution.ps1`・`test-miv-sound-candidate.ps1`: PASS。`test_gen_effetune_docs.py`: 44 件成功。`gen-effetune-docs.py --check`: 最新。
+- 本体 lib 全件 (`.\scripts\test-lib-full.ps1`、run-heavy `-FullTest`): **20,796 件すべて成功 / 106 skipped** (795.4 秒)。
+  `MIV_SOUND_CANDIDATE` なしでビルドした (承認後の vendor をそのまま使う形)。
 
-- PDF: サムネイル (表紙)、ページ送り・見開き・拡大、文字の多い PDF (縦書き・横書き)、図形・半透明・クリップの多い PDF、スキャン画像の PDF、
-  パスワード付き PDF。About の PDFium の版が `160.0.8179.0`。
+## 実機確認 (サブ PC)
+
+mIV の自動テストは PDF の描画結果の画素や音を比べないので、サブ PC で確認した (2026-11-26、サブ PC 担当の観測、
+`C:\home\mimageviewer-subpc\deps903\results\notes.md`)。
+
+- PDF (PDFium 8179): 合成データ 5 本 (§1.816 と同じ) のサムネイル、ページ送り・見開き (両方向)・拡大、スキャン画像の白地に黒い文字、
+  パスワード付き PDF、About の版 `160.0.8179.0`。すべて期待どおり。
+- mIV Sound: 版の表示、Headphone EQ (検索・取得・断り・ファイル読み込み・再起動後の保持)、歌詞と Counter、0.17 の保存データ。
+  期待どおり。**音を耳で聞く確認は未実施**。
