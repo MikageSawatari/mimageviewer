@@ -653,6 +653,14 @@ runner自体は `powershell -NoProfile -File scripts/test-live-windows-runner.ps
 
 ### 自動 gate の実行内容
 
+ビルドの同時数はスクリプト内で上限 **8** に制限する (§1.910)。呼び出し側の
+`CARGO_BUILD_JOBS` が 8 以下の正の整数ならその小さい値を優先し、未設定・上限超過・
+不正な値は 8 にする。不正な値の置き換えと実際に使う値を `[test-full]` の行に表示し、
+終了時は成功・失敗とも元の環境変数へ戻す (未設定なら未設定)。テストの実行並列数は変更しない。
+`build-dist.ps1` が別プロセスで呼ぶ全体テストにも効くため、手動で上限を付ける必要はない。
+release のビルドと、本体 lib だけを対象にする `test-lib-full.ps1` には上限を追加しない。
+根拠は [テストのビルドメモリ対策 §2.3・§3](test-build-memory-plan.md#23-1910-ビルドの同時数の上限) を参照。
+
 `test-full.ps1` はnextestの存在を確認してから次のコマンドを順に実行する。
 未導入なら `cargo install cargo-nextest --locked` を案内して非ゼロ終了し、cargo testへ代替しない。
 各段のexit codeを検査し、失敗した段より後は実行しない。nextest各段には共通で
