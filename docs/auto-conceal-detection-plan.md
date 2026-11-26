@@ -153,10 +153,14 @@
 
 - **Ultralytics 系**: 長辺を `imgsz` に合わせて縮め、余りを灰色 (114) で埋める (letterbox)。RGB、0..1、NCHW。
   出力の座標から余白を引き、縮めた倍率で割って元の画像座標へ戻す。
-- **輪郭**: 元マスクの解像度で 0/1 を作り、箱の外を捨て、§4.2 の余白ぶん太らせてから元の解像度へ拡大する。
-  結果は **検出ごとの小さなパッチ** (画像座標の矩形 + その範囲のビット列) にする (§6.3 の UI スレッドの負荷のため)。
+- **輪郭**: 元マスクの解像度で 0/1 を作り、箱の外と letterbox の余白を捨て、元の画像の解像度へ拡大してから、
+  §4.2 の余白 (**元の画像の px**) ぶん太らせる。結果は **検出ごとの小さなパッチ** (画像座標の矩形 + その範囲の
+  ビット列) にする (§7.4 の UI スレッドの負荷のため)。
 - **YuNet**: 顔の大きさが 10〜300px の範囲に入るよう、**長辺 640 と 1920 (元が小さければ元の大きさ) の 2 段**で検出し、
   合わせて重なりを除く。段の数と大きさは段 0 の測定で決める (大きな集合写真の小さな顔と、近い顔の両方を拾うため)。
+  入力は OpenCV の `FaceDetectorYN` に合わせる見込み (BGR、0..255 のまま、縦横を 32 の倍数へ右下に埋める。
+  出力の stride の計算は埋めた後の大きさを使う)。**段 0 で OpenCV の実装と、非正方形・端数の大きさの画像で
+  同じ箱になることを確かめてから確定する** (Sol レビュー P3、2026-11-26)。
 
 ### 5.4 閾値
 
@@ -199,10 +203,16 @@
 
 ### 6.3 同梱する YuNet
 
-- `face_detection_yunet_2026may.onnx` (約 0.23MB、入力が可変) を `vendor/models/` に置き、既存の `EMBEDDED_MODELS`
-  で exe に入れて `<data_dir>\models\` へ展開する。取得は `scripts/bootstrap-vendor.sh` に足す
-  (`raw.githubusercontent.com` は LFS のポインタを返すので `media.githubusercontent.com/media/...` から取る)。
-  `vendor/models/` は再取得できない扱いの場所なので、置いたらバックアップへも実ファイルでコピーする。
+- `face_detection_yunet_2026may.onnx` (約 0.23MB、入力が可変) を `vendor/models/` に置く。取得は
+  `scripts/bootstrap-vendor.sh` に足す (`raw.githubusercontent.com` は LFS のポインタを返すので
+  `media.githubusercontent.com/media/...` から取る)。`vendor/models/` は再取得できない扱いの場所なので、
+  置いたらバックアップへも実ファイルでコピーする。
+- 今の `EmbeddedModel` は `kind: ModelKind` が必須で、パスの取得も `ModelKind` の表に依存している
+  (`src/ai/model_manager.rs`)。**同梱物の識別と推論用の `ModelKind` を分ける小さな変更を範囲に入れる**:
+  同梱物を `ModelKind` ではなく同梱物の識別子 (例: 既存モデル = `ModelKind` を包む、YuNet = 専用の値) で
+  持ち、通常版 (`<data_dir>\models\` へ展開) とポータブル版 (exe 隣の `models\` から直接読む) の両方で
+  パスを返す。あわせて `scripts/build-portable.ps1` の同梱一覧と `build.rs` の依存物の検査に YuNet を足す
+  (Sol レビュー P2、2026-11-26)。推論は §6.2 の外部モデルの経路で、このパスを渡して読む。
 - ライセンス表記: 環境設定のソフトウェア情報・`installer/readme.txt`・同梱の第三者ライセンス一覧に
   「YuNet face detector — MIT License, Copyright (c) 2020 Shiqi Yu」を足す。
 
@@ -213,19 +223,37 @@
 検出の途中にページ移動・ツール操作・Undo・モード終了・別の検出が入ると、結果を足す先が変わる。これを全部
 扱う仕組みは作らず、**検出中はモーダル**にする (CLAUDE.md「設計の簡素化」)。
 
-- 進行表示は `common_modal_dialog_open` に「今表示されているか」を返す helper で登録する。
-  これで一覧・全画面・パネル・キーの入力が止まる。
+- 設定ダイアログと進行表示は `common_modal_dialog_open` に「今表示されているか」を返す helper で登録する。
+  これで止まるのは**キー入力と、共通のモーダル判定を見ている画面だけ**。隠蔽加工のキャンバス
+  (`handle_conceal_paint` は `canvas_pointer_inputs` に常に有効を渡している) とパネル (無効化は
+  `book_structural_op` のときだけ) は止まらない (Sol レビュー P1、2026-11-26)。
+- そこで **隠蔽加工の入力を止める述語を 1 つ作る**: `conceal_input_blocked()` =
+  本の構造操作中 || 自動検出のダイアログが開いている || 検出の待ちがある。パネルの `ui.disable()`、
+  キャンバスの `canvas_pointer_inputs` の有効フラグ、隠蔽加工のキー処理 (ツール切替・Undo・スロット・
+  プリセット・モード終了) の 3 か所が、この述語だけを見る。今の `book_structural_op` の個別判定もこの述語へ
+  寄せる。止まっている間も描画は続ける (進行表示とプレビューは出す)。[自動検出…] ボタン自体もこの述語で無効になり、
+  検出の二重受付はここで起きない。
 - 検出は短い (顔は数十 ms、Ultralytics の nano は数百 ms の見込み。xl の 1280 や初回のセッション作成は数秒)。
   待つ時間がモーダルで困るほど長くならない見込みだが、段 0 で測る。
-- それでも外から来る変化 (フォルダの監視による一覧の読み直し、別ウィンドウ、リモート操作) は止まらないので、
-  結果を足す前に **持ち主を照合する** (§7.2)。合わなければ捨てて「画像が変わったため中止しました」と出す。
+- それでも外から来る変化 (フォルダの監視による一覧の読み直し、裏で終わった消しゴムの補完や補正レイヤーの
+  再計算、別ウィンドウ、リモート操作) は止まらないので、結果を足す前に **開始時の条件と照合する** (§7.2)。
+  合わなければ捨てて「画像が変わったため中止しました」と出す。
 
 ### 7.2 待ちの状態
 
 ```rust
+/// 開始時に確定し、あとから書き換えない (表示位置の付け直しの対象にしない)。
+pub(crate) struct ConcealDetectRequest {
+    context: ViewerContextId,
+    page_key: String,
+    items_generation: u64,
+    conceal_session: u64,              // 隠蔽加工モードに入るたびに進める番号 (新規)
+    source: Arc<egui::ColorImage>,     // 検出に渡した画素 (current_conceal_source_pixels の結果)
+    source_kind: &'static str,         // "fs" / "erase_result" / "local_adjust"
+    mask_size: [usize; 2],
+}
 pub(crate) struct ConcealDetectPending {
-    owner: PageEditOwner,          // context + page_key + items_generation (既存の型)
-    conceal_session: u64,          // 隠蔽加工モードに入るたびに進める番号 (新規)
+    request: ConcealDetectRequest,
     cancel: Arc<AtomicBool>,
     rx: mpsc::Receiver<Result<ConcealDetectOutput, String>>,
 }
@@ -234,18 +262,34 @@ impl Drop for ConcealDetectPending { fn drop(&mut self) { self.cancel.store(true
 
 - 置き場は **viewer context の bundle** (既存の `local_adjust_segmentation_pending` と同じ扱い)。
   複数ウィンドウでは各 context が自分の 1 つだけを持つ。
-- 先例 `local_adjust_segmentation_pending` と同じ箇所に入れる: bundle の保存・復元、`page_edit_owner.rs` の
-  持ち主の付け直し、各 lifecycle での破棄 (フォルダ切替・context を閉じる・モード終了)、`book_append_undo` の
-  待ち判定、`prepared_edit`、`update_phases` の再描画要求、idle の判定。**実装担当は先例の出現箇所を全部たどって
-  同じ箇所に入れる**こと (一部だけ入れると、閉じた context の結果が別の context に入る)。
-- 受け取り (`poll_conceal_detect`、毎フレーム `try_recv`) では、`owner`・`conceal_session` が
-  今と一致し、隠蔽加工モード中のときだけ結果を足す。一致しなければ捨てる。マスクの版の照合は持たない
-  (検出中はモーダルで、同じ context のマスクを変える操作が入らないため)。
+- 先例 `local_adjust_segmentation_pending` の出現箇所を全部たどり、同じ箇所に入れる: bundle の保存・復元、
+  各 lifecycle での破棄 (フォルダ切替・context を閉じる・モード終了)、`book_append_undo` の待ち判定、
+  `prepared_edit`、全 context の poll、`update_phases` の再描画要求、idle・停止の判定 (一部だけ入れると、
+  閉じた context の結果が別の context に入る)。
+- **ただし `page_edit_owner.rs` の付け直し (`reproject_page_edit_owners`) には入れない**。先例の付け直しは
+  `owner.items_generation` を今の値へ書き換えるので、入れると開始時の条件が失われる (Sol レビュー P1)。
+  一覧が読み直されたら (`items_generation` が変わったら) 結果は捨てる。待つのは短いので、追いかける価値が無い。
+- 受け取り (`poll_conceal_detect`、毎フレーム `try_recv`) では、次が**全部**今と一致するときだけ結果を足す:
+  context、隠蔽加工モード中で `conceal_session` が同じ、`items_generation` が同じ、編集対象の page_key が同じ、
+  `conceal_mask_size` が `mask_size` と同じ、**今の `current_conceal_source_pixels` が開始時と同じ `Arc`
+  (`Arc::ptr_eq`) で `source_kind` も同じ**。一致しなければ捨てる。
+- 画素の照合を `input_generation` にしないのは、本番で `input_generation` が進むのが元画像の読み直し
+  (`bump_input_generation_for_fs_cache_reload`) だけで、消しゴムの補完や補正レイヤーの結果が変わっても
+  進まないため (`bump_input_generation` は本番から呼ばれていない、2026-11-26 のコード)。`Arc` の同一性なら
+  raw / erase / local-adjust のどれが差し替わっても捨てられる。中身が同じで `Arc` だけ替わった場合も捨てるが、
+  利用者がもう一度押せば済むので、それで良い。**変化が無ければ `Arc` が保たれる** (毎フレーム作り直されない)
+  ことを、実装時にテストで確かめる。
+- マスクの版の照合は持たない。検出中は `conceal_input_blocked()` で同じ context のマスクを変える入力が全部
+  止まるため (§7.1)。
 
 ### 7.3 worker
 
 - `std::thread::Builder` で 1 回ごとに 1 本 (先例と同じ)。`ai_runtime_init.wait_terminal_while(!cancel)` で
   ランタイムの準備を待つ。キャンセルは検出器ごと・YuNet の段ごとの区切りで見る。
+- **worker は `local_ai_activity_lease()` を取り、ランタイム待ちから終わるまで持つ** (先例と同じ。Sol レビュー P2)。
+  推論の途中ではキャンセルが効かないので、待ちの状態を捨てた後も worker は少し残る。リモートへの引き渡しは
+  この活動数を見て停止の完了を判断しているので、lease が無いと引き渡しが推論中に進む。新しい待ち合わせの
+  仕組みは作らず、既存の lease を使う。
 - worker の中で完結させるもの: セッションの用意、前処理、推論、出力の読み取り、座標の変換、輪郭パッチの作成。
 - 結果: `ConcealDetectOutput { shapes: Vec<Shape>, patches: Vec<MaskPatch>, counts: Vec<(String, usize)> }`。
 
@@ -256,13 +300,20 @@ impl Drop for ConcealDetectPending { fn drop(&mut self) { self.cancel.store(true
    何個足しても 1 回で戻る)。
 3. 箱 → `Shape::Rect` / `Shape::Ellipse` (`ShapeOp::Add`) を `conceal_shapes` の**末尾**に足す。
 4. 輪郭 → 各パッチの範囲だけ `conceal_mask` に OR する (全体を舐めない)。
-5. `conceal_mask_texture` の部分更新範囲を足し、`clear_conceal_caches(idx)` で再合成させる。
+5. マスクの表示用テクスチャを更新し、`clear_conceal_caches(idx)` で再合成させる。図形を足したときは、既存の
+   図形の確定 (`commit_conceal_shape`) と同じく `conceal_mask_texture = None` にする。輪郭だけのときは
+   パッチごとの範囲で部分更新する (離れたパッチを 1 つの大きな範囲にまとめない)。
 6. 選択中の図形は外す (`conceal_selected_shape = None`)。
 
 - 合成の順序 (ビットマップを下地に図形を作成順に適用) は変えない。そのため **輪郭で足した部分に、前からある
   消去 (`Subtract`) の図形が重なると、そこは抜けたまま**になる。バケツと同じ既存の規則なので、変えずに
   マニュアルに書く。箱から作る図形は末尾に足すので、前の消去の図形より後で効く。
-- UI スレッドの仕事は図形の追加とパッチの範囲の OR だけ。大きな画像でも全画素を回さない。
+- **UI スレッドの費用 (Sol レビュー P2 で見積もりを直した)**: 結果の追加そのものは図形の push とパッチの範囲の
+  OR だけだが、手順 2 の Undo はマスク全体を複製し、図形を足したときの表示用テクスチャは全体を作り直す。
+  どちらも **既存の 1 回の筆・図形の確定と同じ費用で、1 回の検出につき 1 回**。手描きの操作で既に払っている
+  費用なので、検出のために worker 側で状態を準備する仕組みは作らない。大きな画像 (例 8000×6000) で
+  この 1 回が目立つかは段 0 と実装時の perf ログで測り、目立つなら既存の手描きの操作と一緒に直す
+  (検出だけの別経路は作らない)。
 
 ### 7.5 まれな失敗
 
@@ -294,7 +345,8 @@ impl Drop for ConcealDetectPending { fn drop(&mut self) { self.cancel.store(true
   `bump_conceal_generation` は呼ばない。
 - **ZIP・PDF・見開き**: 隠蔽加工は対象ページ 1 枚 (`target_idx`) で動いている。検出も同じ 1 枚に行う。分岐は足さない。
 - **アップスケール後の解像度**: 隠蔽はアップスケールより前段 (元の解像度) なので、検出も元の解像度で行う。
-- **リモート操作中**: 先例と同じく `remote_session_blocks_local_control()` で止める。
+- **リモート操作中**: 先例と同じく `remote_session_blocks_local_control()` で止める。worker は
+  `local_ai_activity_lease()` を終わるまで持ち、リモートへの引き渡しは推論が終わるまで完了しない (§7.3)。
 - **detached viewer**: 待ちの状態は context の bundle に置き、持ち主の context でだけ受け取る。detached の
   述語・viewport の経路には触れない予定。触れる必要が出たら、detached リワークの規則 (双方のレビューで構造的な
   修正であることに合意し、[detached-rework-plan.md](detached-rework-plan.md) に記録) に従う。
@@ -306,7 +358,7 @@ impl Drop for ConcealDetectPending { fn drop(&mut self) { self.cancel.store(true
 | 検出器フォルダの read_dir・ONNX のメタデータ | worker (ダイアログを開いたとき・読み直し) |
 | セッションの作成・推論・後処理 | 検出 worker |
 | ソース画素 | `Arc` の clone だけ (複製しない) |
-| 結果の追加 | 図形の push とパッチ範囲の OR だけ |
+| 結果の追加 | 図形の push とパッチ範囲の OR。Undo の複製と表示用テクスチャの作り直しは既存の 1 操作と同じ費用で 1 回 (§7.4) |
 | 再合成 | 既存の `conceal-materialize` worker |
 
 `perf::event` を「検出の開始」「セッション準備」「推論」「後処理」「結果の追加」に入れる。
@@ -323,6 +375,10 @@ impl Drop for ConcealDetectPending { fn drop(&mut self) { self.cancel.store(true
 - §2 の局部の検出器 (01miku nano・deepghs・NudeNet 320n) は、**灰色の画像などを入れて出力の形とメタデータだけ**
   確かめる。成人向けの画像は集めない・使わない。実際の検出の様子は利用者の確認に回す。
 - 検出にかかる時間 (初回のセッション作成を含む) を測り、§7.1 のモーダルで困らないかを判断する。
+- **前処理の約束を確定する**: YuNet は入力の色の順・値の範囲・32 の倍数への埋め方を、OpenCV の
+  `FaceDetectorYN` と非正方形・端数の大きさの画像で比べて同じ箱になること。Ultralytics 系は letterbox の
+  余白の除き方と、輪郭の余白 (元の画像の px) の座標系を、汎用モデルの書き出しで確かめること。
+- 大きな画像 (例 8000×6000) で、結果の追加の 1 回 (Undo の複製 + 表示用テクスチャ) にかかる時間を測る (§7.4)。
 - DirectML で読めないものがあるかを確かめ、§6.2 の扱いを決める。
 
 ### 段 1 — 顔の自動検出 (同梱)
@@ -352,7 +408,14 @@ YuNet の同梱、外部モデルのセッション、検出 worker とモーダ
 - **App レベル** (`page_edit_owner_tests` などの先例に倣う):
   - 結果を足すと図形とビットマップが増え、Undo 1 回で両方とも戻る。`conceal_cache` の該当ページが無効になる。
   - 持ち主 (context・page_key・items_generation)・`conceal_session` のどれかが違う結果は捨てる。
-  - 検出中はモーダルとして登録され、ページ移動のキーが効かない。キャンセルで待ちが消える。
+  - 検出中 (とダイアログ表示中) は `conceal_input_blocked()` が真になり、**キーだけでなく、キャンバスの生の
+    ポインター入力 (筆・バケツ・図形・選択の操作) とパネルの操作 (スロット・プリセット・閉じる) も効かない**。
+    [自動検出…] を続けて押しても 2 本目が始まらない。キャンセルで待ちが消える。
+  - 開始後に同じページの画素が差し替わる (消しゴムの補完の完了・補正レイヤーの再計算・元画像の読み直し) と、
+    `Arc` の照合で結果を捨てる。差し替わらなければ (`Arc` が保たれ) 結果を足す。一覧の読み直し
+    (`items_generation` の変化) でも捨てる。
+  - キャンセルで待ちが消えた後も、worker が終わるまでは活動の lease が残り、リモートへの引き渡しの停止判定が
+    完了しない。
   - context を閉じる・フォルダを替える・モードを出ると待ちが消え、worker のキャンセルが立つ。
     **別の context の隠蔽マスクは変わらない** (複数ウィンドウ)。
   - リモート操作中・本の追加の後続待ち中は始まらない。
@@ -397,3 +460,18 @@ YuNet の同梱、外部モデルのセッション、検出 worker とモーダ
 - **外部モデルを `AiRuntime` に置く**: セッションの持ち主を 1 つにし、`ModelKind` の固定の表 (TensorRT・診断) に
   手を入れない。同梱の YuNet も同じ経路にして、読み方を 1 つにする。
 - **隠蔽加工だけ**: 局部の検出結果を補完につなげない。v1 では顔も含めて分けない (用途が薄く、経路を 1 つにできる)。
+
+## 16. レビューの記録
+
+- **R1 (2026-11-26、Sol gpt-6.1-sol / xhigh、対象 cfc58c9bf)**: REJECT (段 0 は進めてよい)。指摘と対応:
+  - P1 モーダル登録だけでは隠蔽加工のキャンバス・パネルが止まらない → §7.1 に `conceal_input_blocked()` を 1 つ作り、
+    パネル・キャンバス・キー処理がそれだけを見る形にした。§12 にポインター・パネルの遮断を追加。
+  - P1 owner と `conceal_session` だけでは画素の差し替えを検出できず、先例の付け直しは `items_generation` を書き換える
+    → §7.2 を開始時に確定する `ConcealDetectRequest` にし、付け直しの対象から外した。画素は `Arc::ptr_eq` で照合
+    (`input_generation` は raw の読み直しでしか進まないことをコードで確認したため)。
+  - P2 UI スレッドの費用の見積もり (Undo の全体複製・テクスチャの作り直し) → §7.4 で既存の 1 操作と同じ費用で
+    1 回と明記し、段 0 で大きな画像を測る。
+  - P2 `EmbeddedModel` が `ModelKind` 必須、ポータブル版の配置が別 → §6.3 に同梱物の識別子の分離、
+    `build-portable.ps1`・`build.rs` の更新を追加。
+  - P2 worker の活動 lease → §7.3・§9 に `local_ai_activity_lease()` の保持を追加。§12 に回帰テスト。
+  - P3 前処理の約束 → §5.3・段 0 に YuNet の入力の約束と OpenCV との比較、輪郭の余白の座標系を追加。
