@@ -873,6 +873,29 @@ detachedは既存の共通パネルを使い、述語・viewport・bundleの交�
 
 ### UI オーバーレイ / ダイアログ
 
+画像の結合 (§1.904) は `image_combine/` の options / layout / label / render / worker / store と、
+`ui_dialogs/image_combine.rs` (設定欄・プリセット・やり直しは子モジュール) を使う。
+App は `image_combine: Box<ImageCombineState>` の1ポインタを持ち、session・要求番号・索引・Tools メニューの判定用 snapshot
+(テスト時の作業量カウンタも含む) をその中にまとめる。`image_combine.session` が
+ReopenLoading / ReopenMissing / Dialog / Writing の単独所有者で、書き出し以外は共通モーダルと document-open admission の両方へ登録する。
+専用スレッド1本が batch の編集snapshotを下見から出力まで保持し、共通 `ExportPending` へ Step / Completed / 終端を送る。
+`ExportOrigin::Combine` の終端・切断・完了後の閉じるは同じ finish handlerへ入り、sessionのtakeで1回だけ採用する。
+保存通知の OpenInViewer は既存の明示パス activation へ渡す。前回値とプリセットは Settings 内にあり、
+構成は worker が `combine.db` へ保存し、画像・フォルダ側サイドカー・設定の持ち運び・メタ情報転送には入れない。
+各元画像の `composition_identity` 欄は必須とし、変換キャッシュのパスとは別に論理的な出力権限の識別子を保持する。
+欄が欠けた構成は読み込まず、理由を通知してログに残し、DB の行は保持する。
+元画像ごとの `annotation_space` は実際に使った snapshot の注釈座標基準を保存し、再読込で同じ基準を使う。
+記録がなく正確に基準を得られない注釈付きベクター PDF は対象ごとの読込失敗にし、推定した寸法で合成しない。
+`image_combine.index` は構成のある出力キーだけを持つ。書き出し完了・構成なしの再確認・STORES の変更確定後に
+全件を非同期で読み直し、最新世代だけを採用する。右クリックのやり直し可否はこの索引から I/O なしで決める。
+改名・移動は出力キーだけを引き継ぎ、削除は行を消す。構成内の元画像の絶対パスは変更しない。
+やり直しは worker が構成と元画像の有無を読み、既存の編集snapshot規則で下見へ渡す。置き換えは形式・場所・名前を
+元の出力へ固定し、元画像を上書きしない保護を経て書く。
+メニューの可否は借用した選択とスタックの索引から101件で打ち切って数え、メニューの所有者に保持する。
+対象キュー・ページキー・メンバーのパスは受付後に作る。操作の出力が監視によって先に一覧へ入った場合も、
+共有のEqual再走査が一覧の所有条件を確認して既存の操作後選択ヘルパーへ渡す。
+
+
 | モジュール | 役割 |
 | --- | --- |
 | `ui_adjustment_panel.rs` | 画像フルスクリーン左パネル。`画像補正 / 表示トリム / ブックマーク` の 3 タブを持つ。画像補正はプリセット切替・AI 設定・保存スロットを扱い、ヘッダーの 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り アイコンからそれぞれ `×` 付き独立左パネルを開く。ブックマークは現在の本のサムネイル一覧、ページ移動、DB 行削除を扱う。エクスポートアイコンは `Ctrl+E` と同じダイアログへ合流する。補正レイヤーは `local_adjust_lab` と同じ左パネル + 右ツールパネル構成で、効果 UI、マスク編集、U²-Netp 被写体生成、クラシック領域分割生成を UI thread 外の worker 経由で扱う |
@@ -1021,6 +1044,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `local_adjust.db` | 補正レイヤーのページ単位 JSON。中央 DB が authoritative で、`mimageviewer.dat` の `local_adjust_layers` はフォルダ移動時の復元用バックアップ | `local_adjust_db.rs` + `sidecar.rs` |
 | `export_crop.db` | 最後段 crop のページ単位矩形と、その座標を作成した基準ラスタ寸法 (`source_width` / `source_height`)。中央 DB が authoritative で、`mimageviewer.dat` の `export_crop` は同じ自己記述設定を持つフォルダ移動時の復元用バックアップ | `export_crop.rs` + `sidecar.rs` |
 | `view_trim.db` | 表示専用トリム。`view_trim_books` に本ごとの基本適用モード / 本全体設定、`view_trim_pages` にページ個別設定を JSON で保存する。手動設定では enabled なページ行そのものが永続する「このページ」選択を表し、ページ表示時に本全体より優先される。出力用 crop とは独立し、コピー / 保存 / Ctrl+E には焼き込まない | `view_trim_db.rs` + `ui_view_trim.rs` |
+| `combine.db` | 結合出力の正規化パスをキーに、設定・元画像の絶対パス・順序・ラベルを JSON で保持する。画像には埋め込まず、出力キーの改名・移動・削除は STORES で追従する。元画像のパスは引き継がない | `image_combine/store.rs` + `image_combine/worker.rs` |
 | `comic.db` | Ctrl+T テキスト注釈のページ単位 JSON。吹き出し・テキスト・ウィンドウ・スタンプ配置の正本で、ユーザー画像スタンプは配置先の注釈に `Embedded` として埋め込む | `comic_db.rs` + `ui_text.rs` + `sidecar.rs` |
 | `comic_user_stamps.db` | Ctrl+T スタンプピッカーのユーザー画像履歴。配置時の長辺 1024px 上限 PNG を再利用用 MRU として保持する。履歴から選んでも配置先には `Embedded` をコピーするため、履歴削除は既存注釈に影響しない | `comic_user_stamps.rs` + `ui_text.rs` |
 | `spread.db` | フォルダ別表示モード (ページ構成、連結方式、綴じ方向、末尾表紙補助、見開き端の単ページ配置) | `spread_db.rs` |

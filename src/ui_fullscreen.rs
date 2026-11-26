@@ -57134,7 +57134,7 @@ impl App {
         if let Some(action) = self.fs_feedback_toast_action.clone() {
             let resp = action.response(&toast_ui, toast_rect);
             if resp.clicked() {
-                action.activate(ctx);
+                self.activate_feedback_action(&action, ctx);
                 self.fs_feedback_toast = None;
                 self.fs_feedback_toast_action = None;
                 self.fs_feedback_toast_surface = None;
@@ -58868,7 +58868,7 @@ impl App {
 
     /// `stage` は**呼び出し側が渡す**。同じ builder を製本と一括エクスポートが共有しており、
     /// 出力ごとに欲しい段が違うため (製本 = 編集まで / Ctrl+E = 表示用補正まで が既定)。
-    fn book_baked_edit_snapshot(
+    pub(crate) fn book_baked_edit_snapshot(
         &mut self,
         key: &str,
         idx: Option<usize>,
@@ -59226,10 +59226,22 @@ impl App {
         std::collections::VecDeque<crate::ui_dialogs::export_batch::ExportBatchTarget>,
         usize,
     ) {
+        self.grid_batch_export_targets_for_indices(self.grid_selection_indices())
+    }
+
+    pub(crate) fn grid_batch_export_targets_for_indices(
+        &self,
+        indices: impl IntoIterator<Item = usize>,
+    ) -> (
+        std::collections::VecDeque<crate::ui_dialogs::export_batch::ExportBatchTarget>,
+        usize,
+    ) {
+        #[cfg(test)]
+        self.note_combine_work(|work| work.materializations += 1);
         use crate::ui_dialogs::export_batch::ExportBatchTarget;
         let mut targets = std::collections::VecDeque::new();
         let mut skipped = 0usize;
-        for idx in self.grid_selection_indices() {
+        for idx in indices {
             // スタックの集約セルは、本への追加と同じくメンバーを 1 枚ずつ展開する
             // (1 idx = N メンバーなので idx ベースの経路には乗らない)。
             if let Some(member_paths) = self.stack_member_paths(idx) {
@@ -59374,7 +59386,7 @@ impl App {
     }
 
     /// `Ok(None)` は対象外 (フォルダ / 動画 / 音声 / アーカイブ本体など)。
-    fn batch_export_item_for_idx(
+    pub(crate) fn batch_export_item_for_idx(
         &mut self,
         idx: usize,
     ) -> Result<Option<crate::export_batch::BatchExportItem>, String> {
@@ -59451,7 +59463,7 @@ impl App {
         }
     }
 
-    fn batch_export_dirname_for_path(path: &std::path::Path) -> String {
+    pub(crate) fn batch_export_dirname_for_path(path: &std::path::Path) -> String {
         path.parent()
             .and_then(|parent| parent.file_name())
             .and_then(|name| name.to_str())
@@ -60161,6 +60173,9 @@ impl App {
     }
 
     pub(crate) fn draw_export_progress_dialog(&mut self, ctx: &egui::Context) {
+        if self.export_pending.is_some() {
+            self.reject_busy_image_combine_shortcut(ctx);
+        }
         let Some(pending) = self.export_pending.as_mut() else {
             return;
         };
@@ -60175,6 +60190,14 @@ impl App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         if dismiss_finished {
+            if pending.origin == crate::export_dialog::ExportOrigin::Combine
+                && matches!(
+                    self.image_combine.session,
+                    Some(crate::ui_dialogs::image_combine::CombineSession::Writing { .. })
+                )
+            {
+                self.finish_combine_write(ctx);
+            }
             self.export_pending = None;
         }
     }
@@ -60183,6 +60206,7 @@ impl App {
         let Some(pending) = self.export_pending.as_mut() else {
             return;
         };
+        let combine = pending.origin == crate::export_dialog::ExportOrigin::Combine;
         let mut clear_pending = false;
         let mut toast: Option<String> = None;
         let mut reveal_path: Option<std::path::PathBuf> = None;
@@ -60196,6 +60220,10 @@ impl App {
             match pending.rx.try_recv() {
                 Ok(crate::export_dialog::ExportEvent::Started { label }) => {
                     pending.last_message = format!("{label} を保存中");
+                }
+                Ok(crate::export_dialog::ExportEvent::Step { label }) => {
+                    pending.done = pending.done.saturating_add(1);
+                    pending.last_message = format!("処理しました: {label}");
                 }
                 Ok(crate::export_dialog::ExportEvent::Completed(success)) => {
                     pending.done = pending.done.saturating_add(1);
@@ -60236,7 +60264,9 @@ impl App {
                     if !pending.thumbnail_notices.is_empty() || !pending.errors.is_empty() {
                         pending.last_message = export_end_summary(pending);
                     } else {
-                        if pending.skipped.is_empty() && pending.successes.len() == 1 {
+                        if combine {
+                            // The combine finish handler publishes its own mIV-open toast.
+                        } else if pending.skipped.is_empty() && pending.successes.len() == 1 {
                             reveal_path = pending.successes.first().map(|s| s.path.clone());
                         } else {
                             toast = Some(export_done_message(
@@ -60255,6 +60285,7 @@ impl App {
                     // 進捗ダイアログを 1 フレで上書きしてしまう。
                     // 終了状態があればダイアログ表示を維持する。
                     if pending.end.is_none() {
+                        crate::logger::log("export worker disconnected without terminal event");
                         toast = Some("エクスポート worker が中断されました".to_string());
                         clear_pending = true;
                     }
@@ -60264,18 +60295,14 @@ impl App {
         }
 
         // Same-as-source can write into multiple folders. Refresh the displayed one once.
-        let first_success_path = if refresh_after_done {
-            let current = self.current_favorite_target();
+        // Combine schedules its operation rescan and selection in its finish handler.
+        let first_success_path = if refresh_after_done && !combine {
             self.export_pending.as_ref().and_then(|p| {
                 p.successes
                     .iter()
                     .find(|success| {
-                        current.as_ref().is_some_and(|current| {
-                            success
-                                .path
-                                .parent()
-                                .is_some_and(|parent| crate::folder_tree::path_eq(parent, current))
-                        })
+                        self.operation_output_listing_folder(&success.path)
+                            .is_some()
                     })
                     .map(|success| success.path.clone())
             })
@@ -60283,6 +60310,15 @@ impl App {
             None
         };
 
+        if combine
+            && (refresh_after_done || clear_pending)
+            && matches!(
+                self.image_combine.session,
+                Some(crate::ui_dialogs::image_combine::CombineSession::Writing { .. })
+            )
+        {
+            self.finish_combine_write(ctx);
+        }
         if clear_pending {
             self.export_pending = None;
         } else if self.export_pending.is_some() {

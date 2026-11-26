@@ -280,6 +280,8 @@
 # GridAddToActiveBook = Ctrl+B ; 選択中またはチェック済みのページを追加先の本へ追加する
 # GridAddToCollectionTarget = none ; 選択中またはチェック済みの実項目を追加先のコレクションへ追加する
 # GridExportSelection = Ctrl+E ; 選択中またはチェック済みの画像をまとめて書き出す
+# grid_combine_selection = none ; 画像を結合...
+# grid_combine_reopen = none ; 結合をやり直す...
 # GridColumnCount1.1 = Alt+1 ; サムネイル列数を1列にする
 # GridColumnCount1.2 = Alt+Numpad1 ; サムネイル列数を1列にする
 # GridColumnCount2.1 = Alt+2 ; サムネイル列数を2列にする

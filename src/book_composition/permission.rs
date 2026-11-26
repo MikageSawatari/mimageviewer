@@ -828,6 +828,15 @@ pub(crate) const COMPOSITION_OUTPUT_HIDDEN_NOTICE: &str =
     "本の構成で非表示に設定されているため、出力から除外しました";
 
 impl CompositionOutputCheck {
+    pub(crate) fn identity(&self) -> &crate::book_resume_db::PageIdentity {
+        &self.candidate.identity
+    }
+
+    pub(crate) fn with_identity(mut self, identity: crate::book_resume_db::PageIdentity) -> Self {
+        self.candidate.identity = identity;
+        self
+    }
+
     pub(crate) fn new(service: super::BookCompositionService, candidate: CandidatePage) -> Self {
         Self { service, candidate }
     }

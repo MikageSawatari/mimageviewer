@@ -431,6 +431,10 @@ function Get-MivChangedPaths {
 
 # Add a field's drawing/input/result-adoption files here when adding a typing adapter.
 $script:MivTypingProductPaths = @(
+    "src/ui_dialogs/image_combine.rs",
+    "src/ui_dialogs/image_combine/options_ui.rs",
+    "src/ui_dialogs/image_combine/presets.rs",
+    "src/image_combine/worker.rs",
     'src/ui_dialogs/preferences/browser_integration.rs',
     'src/browser_integration/mod.rs',
     'src/browser_integration/backend.rs',

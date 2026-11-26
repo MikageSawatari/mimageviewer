@@ -286,6 +286,9 @@ pub struct StackView {
     pub(crate) passthrough_sort_metas: Vec<ListingSortMetadata>,
     /// メディアグループ (表示順)。
     pub groups: Vec<StackGroup>,
+    /// Derived with the materialized index maps, including after removals.
+    group_by_key: HashMap<String, usize>,
+    group_image_counts: Vec<usize>,
     /// カテゴリ並べ替え後の index 写像。構築時に 1 回だけ計算し、ナビ操作では再ソートしない。
     flat_group_by_index: Vec<Option<usize>>,
     flat_group_starts: Vec<Option<usize>>,
@@ -404,6 +407,8 @@ impl StackView {
             passthrough_metas,
             passthrough_sort_metas,
             groups,
+            group_by_key: HashMap::new(),
+            group_image_counts: Vec::new(),
             flat_group_by_index: Vec::new(),
             flat_group_starts: Vec::new(),
             aggregated_group_by_index: Vec::new(),
@@ -590,7 +595,7 @@ impl StackView {
     }
 
     pub(crate) fn aggregated_index_for_group_key(&self, key: &str) -> Option<usize> {
-        let group = self.groups.iter().position(|group| group.key == key)?;
+        let group = self.group_index_by_key(key)?;
         Some(self.aggregated_index_of_group(group))
     }
 
@@ -636,10 +641,16 @@ impl StackView {
             std::collections::HashMap::new();
         let mut group_by_stack_key: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
+        let mut group_by_key = HashMap::with_capacity(self.groups.len());
+        let mut group_image_counts = Vec::with_capacity(self.groups.len());
         for (group_idx, group) in self.groups.iter().enumerate() {
+            group_by_key.entry(group.key.clone()).or_insert(group_idx);
+            let mut images = 0;
             for member in &group.members {
                 group_by_path.insert(member.path.as_path(), group_idx);
+                images += usize::from(!member.is_video);
             }
+            group_image_counts.push(images);
             if group.is_stack() {
                 group_by_stack_key.insert(group.key.as_str(), group_idx);
             }
@@ -682,11 +693,19 @@ impl StackView {
         self.flat_group_starts = flat_group_starts;
         self.aggregated_group_by_index = aggregated_group_by_index;
         self.aggregated_group_indices = aggregated_group_indices;
+        self.group_by_key = group_by_key;
+        self.group_image_counts = group_image_counts;
     }
 
     /// `key` を持つグループの index を返す。
     pub fn group_index_by_key(&self, key: &str) -> Option<usize> {
-        self.groups.iter().position(|g| g.key == key)
+        self.group_by_key.get(key).copied()
+    }
+
+    pub(crate) fn image_count_for_group_key(&self, key: &str) -> usize {
+        self.group_index_by_key(key)
+            .and_then(|group| self.group_image_counts.get(group).copied())
+            .unwrap_or(0)
     }
 
     /// `path` をメンバーに含むグループの集約ビュー index を返す。スタックトグル時に「カーソル
@@ -718,6 +737,51 @@ fn sort_members(members: &mut [StackMember], sort: SortOrder) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_combine_stack_key_and_member_count_indexes_follow_removals_and_clones() {
+        let view = StackView::build(
+            PathBuf::from(r"C:\dl"),
+            Vec::new(),
+            Vec::new(),
+            vec![
+                img("a_0.png"),
+                img("a_1.png"),
+                img("b_0.png"),
+                img("b_1.png"),
+                vid("movie.mp4"),
+            ],
+            '_',
+            SortOrder::FileName,
+        );
+        for (index, group) in view.groups.iter().enumerate() {
+            assert_eq!(view.group_index_by_key(&group.key), Some(index));
+            assert_eq!(
+                view.image_count_for_group_key(&group.key),
+                group
+                    .members
+                    .iter()
+                    .filter(|member| !member.is_video)
+                    .count()
+            );
+        }
+        assert_eq!(view.image_count_for_group_key("a"), 2);
+        let removed = view.without_removed_paths(&[
+            img("a_0.png").path,
+            img("a_1.png").path,
+            img("b_0.png").path,
+        ]);
+        assert!(removed.group_index_by_key("a").is_none());
+        assert_eq!(removed.image_count_for_group_key("a"), 0);
+        let b = removed.group_index_by_key("b").unwrap();
+        assert_eq!(removed.groups[b].members[0].path, img("b_1.png").path);
+        assert_eq!(removed.image_count_for_group_key("b"), 1);
+        assert_eq!(view.image_count_for_group_key("b"), 2);
+        assert_eq!(
+            view.clone().group_index_by_key("b"),
+            view.group_index_by_key("b")
+        );
+    }
 
     fn img(name: &str) -> StackMember {
         StackMember {

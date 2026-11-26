@@ -1669,6 +1669,8 @@ pub enum KeyAction {
     GridAddToActiveBook,
     GridAddToCollectionTarget,
     GridExportSelection,
+    GridCombineSelection,
+    GridCombineReopen,
     GridColumnCount1,
     GridColumnCount2,
     GridColumnCount3,
@@ -2296,6 +2298,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridAddToActiveBook,
     KeyAction::GridAddToCollectionTarget,
     KeyAction::GridExportSelection,
+    KeyAction::GridCombineSelection,
+    KeyAction::GridCombineReopen,
     KeyAction::GridColumnCount1,
     KeyAction::GridColumnCount2,
     KeyAction::GridColumnCount3,
@@ -2815,6 +2819,8 @@ pub enum MenuCommandId {
     TagsManagePinned,
     TagsTagView,
     ConvertToZip,
+    ToolsCombineImages,
+    ToolsCombineReopen,
     ToolsCreateAiCaptions,
     ToolsShowCaptionProgress,
     ToolsCreateTranscripts,
@@ -2879,6 +2885,8 @@ impl MenuCommandId {
         Self::TagsManagePinned,
         Self::TagsTagView,
         Self::ConvertToZip,
+        Self::ToolsCombineImages,
+        Self::ToolsCombineReopen,
         Self::ToolsCreateAiCaptions,
         Self::ToolsShowCaptionProgress,
         Self::ToolsCreateTranscripts,
@@ -2941,6 +2949,8 @@ impl MenuCommandId {
             MenuCommandId::CollectionsRemoveMissingCurrent => "CollectionsRemoveMissingCurrent",
             MenuCommandId::CollectionsManage => "CollectionsManage",
             MenuCommandId::ConvertToZip => "ConvertToZip",
+            MenuCommandId::ToolsCombineImages => "ToolsCombineImages",
+            MenuCommandId::ToolsCombineReopen => "ToolsCombineReopen",
             MenuCommandId::ToolsCreateAiCaptions => "ToolsCreateAiCaptions",
             MenuCommandId::ToolsShowCaptionProgress => "ToolsShowCaptionProgress",
             MenuCommandId::ToolsCreateTranscripts => "ToolsCreateTranscripts",
@@ -3210,6 +3220,18 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         parent: TopMenuId::Tools,
         label: "ZIP ファイルに変換",
         action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::ToolsCombineImages,
+        parent: TopMenuId::Tools,
+        label: "画像を結合...",
+        action: Some(KeyAction::GridCombineSelection),
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::ToolsCombineReopen,
+        parent: TopMenuId::Tools,
+        label: "結合をやり直す...",
+        action: Some(KeyAction::GridCombineReopen),
     },
     MenuCommandSpec {
         id: MenuCommandId::ToolsCreateAiCaptions,
@@ -4584,6 +4606,8 @@ impl KeyAction {
             GridAddToActiveBook => "GridAddToActiveBook",
             GridAddToCollectionTarget => "GridAddToCollectionTarget",
             GridExportSelection => "GridExportSelection",
+            GridCombineSelection => "grid_combine_selection",
+            GridCombineReopen => "grid_combine_reopen",
             GridColumnCount1 => "GridColumnCount1",
             GridColumnCount2 => "GridColumnCount2",
             GridColumnCount3 => "GridColumnCount3",
@@ -5376,6 +5400,8 @@ impl KeyAction {
                 "選択中またはチェック済みの実項目を追加先のコレクションへ追加する"
             }
             GridExportSelection => "選択中またはチェック済みの画像をまとめて書き出す",
+            GridCombineSelection => "画像を結合...",
+            GridCombineReopen => "結合をやり直す...",
             GridColumnCount1 => "サムネイル列数を1列にする",
             GridColumnCount2 => "サムネイル列数を2列にする",
             GridColumnCount3 => "サムネイル列数を3列にする",
@@ -5992,6 +6018,8 @@ impl KeyAction {
             | GridAddToActiveBook
             | GridAddToCollectionTarget
             | GridExportSelection
+            | GridCombineSelection
+            | GridCombineReopen
             | GridColumnCount1
             | GridColumnCount2
             | GridColumnCount3
@@ -6561,6 +6589,8 @@ impl KeyAction {
             | GridAddToActiveBook
             | GridAddToCollectionTarget
             | GridExportSelection
+            | GridCombineSelection
+            | GridCombineReopen
             | GridColumnCount1
             | GridColumnCount2
             | GridColumnCount3
@@ -7161,6 +7191,7 @@ impl KeyAction {
             // 一方へまとめると、利用者が保存済みの上書き (action 名がキー) の意味が
             // 黙って変わる。
             GridExportSelection => ChordList::one(Chord::ctrl(E)),
+            GridCombineSelection | GridCombineReopen => ChordList::EMPTY,
             GridColumnCount1 => alt_digit_pair(Num1, Numpad1),
             GridColumnCount2 => alt_digit_pair(Num2, Numpad2),
             GridColumnCount3 => alt_digit_pair(Num3, Numpad3),
@@ -12392,6 +12423,39 @@ mod tests {
     }
 
     #[test]
+    fn image_combine_is_unbound_grid_press_and_in_both_catalogs() {
+        for (action, ini_name, command_id) in [
+            (
+                KeyAction::GridCombineSelection,
+                "grid_combine_selection",
+                MenuCommandId::ToolsCombineImages,
+            ),
+            (
+                KeyAction::GridCombineReopen,
+                "grid_combine_reopen",
+                MenuCommandId::ToolsCombineReopen,
+            ),
+        ] {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(action.ini_name(), ini_name);
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+            assert_eq!(action.context(), KeyContext::Grid);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().iter().next().is_none());
+            let mut settings = KeymapSettings::default();
+            settings.set_override_chords(action, vec![Chord::ctrl_shift(KeyName::J)]);
+            let keymap = Keymap::from_settings(&settings);
+            assert_eq!(
+                keymap.effective_chords(action),
+                vec![Chord::ctrl_shift(KeyName::J)]
+            );
+            let command = menu_command_spec(command_id).unwrap();
+            assert_eq!(command.action, Some(action));
+            assert_eq!(command.parent, TopMenuId::Tools);
+        }
+    }
+
+    #[test]
     fn edited_image_copy_is_an_unbound_rebindable_fullscreen_press_action() {
         let action = KeyAction::FsCopyEditedImage;
         assert!(KeyAction::all().contains(&action));
@@ -13106,6 +13170,8 @@ mod tests {
             commands,
             vec![
                 MenuCommandId::ConvertToZip,
+                MenuCommandId::ToolsCombineImages,
+                MenuCommandId::ToolsCombineReopen,
                 MenuCommandId::ToolsCreateAiCaptions,
                 MenuCommandId::ToolsShowCaptionProgress,
                 MenuCommandId::ToolsCreateTranscripts,

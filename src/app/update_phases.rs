@@ -885,6 +885,7 @@ impl App {
         }
         self.show_toolbar_reset_confirm_dialog(ctx);
         self.show_tray_enabled_notice_dialog(ctx);
+        self.draw_image_combine_dialog(ctx);
         if self.main_window_should_draw_export_dialogs() {
             self.draw_export_dialog(ctx);
             self.draw_export_batch_dialog(ctx);
@@ -1038,6 +1039,20 @@ impl App {
                     .consume_action(ctx, KeyAction::GridExportSelection)
             {
                 self.open_export_batch_dialog(ctx);
+            }
+            if self.fullscreen_idx.is_none()
+                && self
+                    .keymap
+                    .consume_action(ctx, KeyAction::GridCombineSelection)
+            {
+                self.open_image_combine_dialog(ctx);
+            }
+            if self.fullscreen_idx.is_none()
+                && self
+                    .keymap
+                    .consume_action(ctx, KeyAction::GridCombineReopen)
+            {
+                self.open_image_combine_reopen_context_dialog(ctx, self.selected, false);
             }
         }
 

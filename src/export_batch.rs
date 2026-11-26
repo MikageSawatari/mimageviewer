@@ -203,6 +203,7 @@ pub fn spawn_batch_export_worker(request: BatchExportRequest) -> Result<ExportPe
         })
         .map_err(|e| format!("一括エクスポート worker を開始できません: {e}"))?;
     Ok(ExportPending {
+        origin: crate::export_dialog::ExportOrigin::Batch,
         cancel,
         rx,
         total,
@@ -580,7 +581,7 @@ fn local_datetime(time: SystemTime) -> Result<(String, String), String> {
     ))
 }
 
-fn set_replacement_file_time(
+pub(crate) fn set_replacement_file_time(
     path: &Path,
     previous: Option<SystemTime>,
     written: SystemTime,
@@ -607,7 +608,7 @@ fn set_replacement_file_time(
         .map_err(|e| format!("出力の更新日時を設定できません: {e}"))
 }
 
-fn write_output(path: &Path, bytes: &[u8], replace: bool) -> Result<(), String> {
+pub(crate) fn write_output(path: &Path, bytes: &[u8], replace: bool) -> Result<(), String> {
     use std::io::Write;
     if replace {
         let parent = path.parent().ok_or("保存先フォルダがありません")?;

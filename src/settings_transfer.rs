@@ -746,6 +746,8 @@ preferences_policy! {
         export_batch_directory => "起動・保存・整理先の PC 固有パス";
         export_batch_template => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         export_batch_format => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        combine_options => "環境設定外で管理する結合の前回値 (PC 固有パスを含む)";
+        combine_presets => "環境設定外で管理する結合のプリセット (PC 固有パスを含む)";
         export_batch_options => "環境設定外で管理する一括書き出しの前回値 (PC 固有パスを含む)";
         export_batch_presets => "環境設定外で管理する一括書き出しのプリセット (保存先・ロゴの PC 固有パスを含む)";
         export_batch_scale => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -2666,7 +2668,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 522);
+        assert_eq!(entries.len(), 524);
         assert_eq!(
             entries
                 .iter()
@@ -2679,7 +2681,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            348
+            350
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2749,6 +2751,34 @@ mod tests {
                 .collect::<HashSet<_>>(),
             wire.into_iter().collect()
         );
+    }
+
+    #[test]
+    fn image_combine_paths_and_presets_are_excluded_from_transfer() {
+        let entries = classifications();
+        let wire = wire_keys();
+        for field in ["combine_options", "combine_presets"] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(name, reason)| *name == field && reason.is_some())
+            );
+            assert!(!wire.contains(&field));
+        }
+        let mut live = Settings::default();
+        live.combine_options = Some(crate::image_combine::CombineOptions {
+            margin: 20,
+            ..Default::default()
+        });
+        live.combine_presets
+            .push(crate::image_combine::CombinePreset {
+                name: "sample".into(),
+                options: Default::default(),
+            });
+        let mut draft = Settings::default();
+        draft.overwrite_non_preferences_from(&mut live);
+        assert_eq!(draft.combine_options.unwrap().margin, 20);
+        assert_eq!(draft.combine_presets[0].name, "sample");
     }
 
     #[test]

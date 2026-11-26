@@ -237,6 +237,7 @@ pub mod filename_stack;
 pub mod filename_stack_script;
 mod final_composite;
 pub mod folder_cell_background;
+pub mod image_combine;
 mod image_folder_zip;
 mod image_folder_zip_job;
 mod image_folder_zip_metadata;
@@ -2872,3 +2873,7 @@ pub mod image_decode;
 pub use ui_dialogs::cover_crop::{
     draw_cover_auto_crop_snapshot_fixture, draw_cover_crop_snapshot_fixture,
 };
+
+pub use ui_dialogs::image_combine::draw_image_combine_reopen_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::image_combine::draw_image_combine_snapshot_fixture;

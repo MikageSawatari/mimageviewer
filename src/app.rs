@@ -17301,6 +17301,8 @@ pub struct App {
     pub(crate) export_dialog: Option<Box<crate::export_dialog::ExportDialogState>>,
     /// Ctrl+E / グリッド選択の一括エクスポートのダイアログ状態。
     pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
+    /// Grid image-combine state stays off the App stack, including menu snapshots.
+    pub(crate) image_combine: Box<crate::ui_dialogs::image_combine::ImageCombineState>,
     /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。単ページと一括の両方が使う。
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
     /// OS-global clipboard output; intentionally stays outside viewer context bundles.
@@ -21352,6 +21354,7 @@ impl App {
             pipeline_debug_export_pending: None,
             export_dialog: None,
             export_batch_dialog: None,
+            image_combine: Default::default(),
             export_pending: None,
             edited_clipboard_copy: None,
             folder_refresh_pending: None,
@@ -24402,6 +24405,7 @@ impl App {
             self.export_dialog.is_some() => "export_dialog",
             self.depth_export_dialog_open() => "depth_export",
             self.export_batch_dialog.is_some() => "export_batch_dialog",
+            self.combine_dialog_modal() => "image_combine",
             self.export_pending.is_some() => "export_pending",
             self.local_adjust_add_layer_dialog_open => "local_adjust_add_layer",
             self.local_adjust_change_mask_dialog_open => "local_adjust_change_mask",
@@ -28677,6 +28681,29 @@ impl App {
                     self.retire_smart_folder_payloads([
                         Box::new(previous) as smart_folder::RetiredSmartFolderPayload
                     ]);
+                }
+                // Outputs may already have been adopted by a watcher before
+                // the operation reports completion. Equal has no installation
+                // pass to apply its pending selection, so do it here as well.
+                if owner_context_id == main_context_id && self.post_operation_selection.is_some() {
+                    if self.viewer_session_blocks_main_window()
+                        || self.document_open_modal_admission_blocked()
+                    {
+                        self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest {
+                            folder: folder.clone(),
+                            cause: book_append_refresh::FolderRefreshCause::Operation,
+                        });
+                    } else {
+                        let request = self.post_operation_selection.as_ref().unwrap();
+                        if request.still_owns_selection(
+                            self.selected_real_file_path().as_deref(),
+                            &self.checked_real_file_paths(),
+                        ) {
+                            self.apply_post_operation_selection();
+                        } else {
+                            self.cancel_post_operation_selection("user_changed_selection");
+                        }
+                    }
                 }
                 true
             }
@@ -43898,7 +43925,8 @@ impl App {
     }
 
     pub(crate) fn document_open_modal_admission_blocked(&self) -> bool {
-        self.book_structural_op.is_some()
+        self.combine_dialog_modal()
+            || self.book_structural_op.is_some()
             || self.depth_export_dialog_open()
             || self.depth_independent_addon_modal_owner().is_some()
             || self.book_append_undo_in_progress()
@@ -48421,30 +48449,59 @@ impl App {
         })
     }
 
+    /// The accepted physical listing, independent of favorite/search-root eligibility.
+    /// Transitional and virtual views must not refresh a previous physical folder.
+    fn current_physical_listing_folder(&self) -> Option<PathBuf> {
+        if !self.current_listing_accepts_folder_scan()
+            || self.current_folder_last_mtime.is_none()
+            || self.pdf_enumerate_pending.is_some()
+            || self.zip_enumerate_pending.is_some()
+            || self.pdf_password_dialog_path().is_some()
+            || self.favsearch.on_results_grid()
+            || self.tag_view.on_results_grid()
+        {
+            return None;
+        }
+        self.current_folder.clone()
+    }
+
+    /// An operation's output refreshes only its currently displayed physical parent.
+    /// The book root and its descendants are valid physical listings too.
+    pub(crate) fn operation_output_listing_folder(&self, output: &Path) -> Option<PathBuf> {
+        let parent = output.parent()?;
+        self.current_physical_listing_folder()
+            .filter(|folder| crate::folder_tree::path_eq(parent, folder))
+    }
+
     /// Ctrl+E エクスポートが現在表示中の実フォルダへ書き出したら、一覧復帰時の
     /// 再読み込み対象として記録する。ZIP / PDF / 検索結果などの仮想ビューでは
     /// 一覧文脈が変わってしまうため、ここでは何もしない。
     pub(crate) fn note_exported_file_for_folder_refresh(&mut self, path: &Path) {
-        if self.items_are_global_search_view
-            || self.global_search.active
-            || self.favsearch.on_results_grid()
-            || self.items_are_tag_view
-            || self.tag_view.on_results_grid()
-        {
-            return;
-        }
-        let Some(parent) = path.parent() else {
+        let Some(folder) = self.operation_output_listing_folder(path) else {
             return;
         };
-        let Some(cur) = self.current_favorite_target() else {
+        self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest {
+            folder,
+            cause: book_append_refresh::FolderRefreshCause::Operation,
+        });
+    }
+
+    /// Combine owns its completion selection and operation rescan together.
+    /// A physical listing below the book root need not be a favorite target.
+    pub(crate) fn refresh_image_combine_output(&mut self, ctx: &egui::Context, path: &Path) {
+        let Some(folder) = self.operation_output_listing_folder(path) else {
             return;
         };
-        if crate::folder_tree::path_eq(parent, &cur) {
-            self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest {
-                folder: cur,
-                cause: book_append_refresh::FolderRefreshCause::Operation,
-            });
-        }
+        self.request_post_operation_selection(
+            folder.clone(),
+            crate::post_operation_selection::ExpectedOutputs::Known(vec![path.to_path_buf()]),
+        );
+        self.start_external_rescan_with_cause(
+            ctx,
+            folder,
+            std::time::SystemTime::UNIX_EPOCH,
+            book_append_refresh::FolderRefreshCause::Operation,
+        );
     }
 
     /// 先送りされた現在フォルダの変更をグリッドへ反映する。
@@ -48456,7 +48513,7 @@ impl App {
         if request.cause.is_append_delivery() || self.current_folder_is_book_folder() {
             self.current_folder.clone()
         } else {
-            self.current_favorite_target()
+            self.current_physical_listing_folder()
         }
     }
 
@@ -87100,6 +87157,8 @@ impl App {
 
     /// ページの正規化キーを返す（DB 保存用）。
     pub(crate) fn page_path_key(&self, idx: usize) -> Option<String> {
+        #[cfg(test)]
+        self.note_combine_work(|work| work.page_keys += 1);
         crate::edit_source::page_key_for_grid_item(self.items.get(idx)?)
     }
 

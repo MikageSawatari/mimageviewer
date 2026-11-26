@@ -3760,6 +3760,12 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         storage(|app| &app.settings.video_resume_positions),
         size_of::<HashMap<String, f64>>(),
     );
+    println!(
+        "image combine storage={} payload={}",
+        storage(|app| &app.image_combine),
+        size_of::<crate::ui_dialogs::image_combine::ImageCombineState>(),
+    );
+    assert_eq!(storage(|app| &app.image_combine), size_of::<usize>());
     // A staged history request is rarely active and must not be stored inline in every App.
     // The capture/fullscreen input test creates several App values on a default test stack.
     assert_eq!(
@@ -51692,6 +51698,7 @@ mod favorite_adjustment_defaults_tests {
                 }
                 crate::export_dialog::ExportEvent::AllDone => break,
                 crate::export_dialog::ExportEvent::Started { .. }
+                | crate::export_dialog::ExportEvent::Step { .. }
                 | crate::export_dialog::ExportEvent::Failed(_)
                 | crate::export_dialog::ExportEvent::Skipped { .. }
                 | crate::export_dialog::ExportEvent::ThumbnailNotice { .. } => {}
@@ -51725,6 +51732,7 @@ mod favorite_adjustment_defaults_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.export_pending = Some(crate::export_dialog::ExportPending {
+            origin: crate::export_dialog::ExportOrigin::Single,
             cancel,
             rx,
             total: 1,
@@ -116593,3 +116601,6 @@ mod page_sort_883;
 
 #[path = "tests/prepared_search_adoption.rs"]
 mod prepared_search_adoption;
+
+#[path = "tests/image_combine_equal_refresh.rs"]
+mod image_combine_equal_refresh;

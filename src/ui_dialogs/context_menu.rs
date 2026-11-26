@@ -1,6 +1,10 @@
 //! サムネイルグリッドの右クリックコンテキストメニュー。
 
 use eframe::egui;
+
+#[cfg(test)]
+#[path = "context_menu/image_combine_eligibility_tests.rs"]
+mod image_combine_eligibility_tests;
 use std::path::{Path, PathBuf};
 
 use crate::app::is_synthetic_view_path;
@@ -73,12 +77,24 @@ pub(crate) struct JumpToFolderRequest {
 
 /// The grid menu belongs to one viewer context and one immutable item generation.
 /// An index alone can name another collection entry after an async install.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct GridContextMenuOwner {
     pub(crate) index: usize,
     pub(crate) context_id: crate::app::ViewerContextId,
     pub(crate) items_generation: u64,
+    /// Count-only admission snapshot for this menu open, capped at 101.
+    pub(crate) combine_target_count: usize,
 }
+
+// Derived menu snapshots do not change the existing owner identity.
+impl PartialEq for GridContextMenuOwner {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.context_id == other.context_id
+            && self.items_generation == other.items_generation
+    }
+}
+impl Eq for GridContextMenuOwner {}
 
 fn jump_to_folder_request(item: &GridItem) -> Option<JumpToFolderRequest> {
     use crate::grid_item::SearchContainerKind;
@@ -1044,6 +1060,10 @@ impl crate::app::App {
             index,
             context_id: self.collection_grid_context_id(),
             items_generation: self.items_generation,
+            combine_target_count: self.image_combine_target_count(
+                (index != usize::MAX).then_some(index),
+                index == usize::MAX,
+            ),
         }
     }
 
@@ -1617,6 +1637,19 @@ impl crate::app::App {
                     local: availability(crate::ui_pinned_search::PinnedSearchKind::Local),
                 }
             });
+        let combine_target_count = if target.surface == ContextMenuSurface::Grid {
+            self.context_menu_idx
+                .filter(|owner| {
+                    owner.index == target.item_index.unwrap_or(usize::MAX)
+                        && self.grid_context_menu_owner_is_current(*owner)
+                })
+                .map_or_else(
+                    || self.image_combine_target_count(target.item_index, target.is_folder_context),
+                    |owner| owner.combine_target_count,
+                )
+        } else {
+            0
+        };
         let input = ContextMenuInput {
             search_by_name,
             kind: ContextMenuItemKind::from_grid_item(&target.item),
@@ -1633,6 +1666,15 @@ impl crate::app::App {
             checked_count: target.checked_count,
             checked_file_operation_selection: target.checked_file_operation_selection,
             can_use_folder_commands: target.folder_command_target.is_some(),
+            combine_target_count,
+            combine_disabled_reason: if target.surface == ContextMenuSurface::Grid {
+                self.combine_disabled_reason_for_count(combine_target_count)
+            } else {None},
+            combine_reopen_visible: target.surface == ContextMenuSurface::Grid
+                && self.image_combine_reopen_visible(target.item_index, target.is_folder_context),
+            combine_reopen_disabled_reason: self.image_combine_reopen_disabled_reason(
+                target.item_index, target.is_folder_context,
+            ),
             caption_creation_disabled_reason: if target.surface == ContextMenuSurface::Grid {
                 self.caption_creation_disabled_reason(target.is_folder_context)
                     .map(str::to_owned)
@@ -1700,6 +1742,8 @@ impl crate::app::App {
                     ),
                 };
                 crate::context_menu_model::ContextMenuShortcutLabels {
+                    combine: self.keymap.first_chord_label(crate::keymap::KeyAction::GridCombineSelection),
+                    combine_reopen: self.keymap.first_chord_label(crate::keymap::KeyAction::GridCombineReopen),
                     cut: cut.and_then(|action| self.keymap.first_chord_label(action)),
                     copy: copy.and_then(|action| self.keymap.first_chord_label(action)),
                     organize: (target.surface == ContextMenuSurface::Grid)
@@ -1978,6 +2022,26 @@ impl crate::app::App {
             MenuCommand::DeleteTranscripts => {
                 if target.surface == ContextMenuSurface::Grid {
                     self.request_delete_transcripts(ctx, target.is_folder_context);
+                }
+                None
+            }
+            MenuCommand::CombineSelection => {
+                if target.surface == ContextMenuSurface::Grid {
+                    self.open_image_combine_context_dialog(
+                        ctx,
+                        target.item_index,
+                        target.is_folder_context,
+                    );
+                }
+                None
+            }
+            MenuCommand::CombineReopen => {
+                if target.surface == ContextMenuSurface::Grid {
+                    self.open_image_combine_reopen_context_dialog(
+                        ctx,
+                        target.item_index,
+                        target.is_folder_context,
+                    );
                 }
                 None
             }

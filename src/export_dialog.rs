@@ -686,6 +686,10 @@ pub enum ExportEvent {
     Started {
         label: String,
     },
+    /// Combine card completed; advances work without counting an output.
+    Step {
+        label: String,
+    },
     Completed(ExportSuccess),
     Failed(ExportFailure),
     Skipped {
@@ -714,7 +718,15 @@ pub struct ExportThumbnailNotice {
     pub kinds: crate::save_with_metadata::ThumbnailNoticeKinds,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportOrigin {
+    Single,
+    Batch,
+    Combine,
+}
+
 pub struct ExportPending {
+    pub origin: ExportOrigin,
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<ExportEvent>,
     pub total: usize,
@@ -741,6 +753,7 @@ pub fn spawn_export_worker(request: ExportRequest) -> Result<ExportPending, Stri
         .spawn(move || run_export(request, worker_cancel, tx))
         .map_err(|e| format!("エクスポート worker を開始できません: {e}"))?;
     Ok(ExportPending {
+        origin: ExportOrigin::Single,
         cancel,
         rx,
         total,

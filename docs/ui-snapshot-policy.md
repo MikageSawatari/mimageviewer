@@ -721,3 +721,9 @@ geometryの全組合せへPNGを増やさない。
 実装担当が4枚を目視し、通常幅の折り返し、狭幅、選択行と通常行の区別を確認した。
 一時バーとフォルダバーの既存PNGは変更していない。更新指定あり/なしで各251件成功。
 追補の検証記録は設計書§12。
+
+画像の結合 (§1.904 stage B) は `tests/ui_snapshot.rs` に
+`image_combine_dialog_default_light` / `image_combine_dialog_band_dark` / `image_combine_dialog_small_200` を定義する。
+1093×614で製品と同じWindow・メモリ内の色見本を使い、App・worker・実ファイルは使わない。
+PNGの生成・目視・通常比較は共有runnerへ引き継ぐ。既存の `tools_menu_dark/light` と右クリックメニューの見本も新項目の追加対象。
+小画面の末尾到達と固定操作行、Enter/Esc、generationと進捗の採用は別のheadlessテストで検査する。
