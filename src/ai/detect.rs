@@ -575,6 +575,27 @@ mod tests {
     }
 
     #[test]
+    fn detect_nms_uses_the_given_iou_threshold() {
+        // IoU = 50 / 150 = 1/3: merged at 0.3, both kept at 0.5 (catches a wrong threshold).
+        let a = face(0.9, [0.0, 0.0, 10.0, 10.0]);
+        let b = face(0.8, [5.0, 0.0, 15.0, 10.0]);
+        assert!((detect_iou(&a.rect, &b.rect) - 1.0 / 3.0).abs() < 1e-6);
+        assert_eq!(detect_nms(vec![a.clone(), b.clone()], 0.3), vec![a.clone()]);
+        assert_eq!(detect_nms(vec![a.clone(), b.clone()], 0.5), vec![a, b]);
+    }
+
+    #[test]
+    fn detect_restores_both_axes_with_their_own_scale() {
+        // Stage 640x480 of a 1280x1440 original: x scale 2, y scale 3, no clipping.
+        let result = restore_face_coordinates(
+            vec![face(0.9, [100.0, 50.0, 200.0, 150.0])],
+            [640, 480],
+            [1280, 1440],
+        );
+        assert_eq!(result, vec![face(0.9, [200.0, 150.0, 400.0, 450.0])]);
+    }
+
+    #[test]
     fn detect_restores_each_axis_clips_image_and_drops_padding_only_boxes() {
         let boxes = vec![
             face(0.9, [-10.0, 10.0, 650.0, 490.0]),
