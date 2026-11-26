@@ -1,5 +1,7 @@
 # 自動マスク作成 (領域検出 → 隠蔽/消しゴムマスク) 設計案 — v1.1.0
 
+> **2026-11-26: [../../auto-conceal-detection-plan.md](../../auto-conceal-detection-plan.md) (§1.914) が後継。** この文書は経緯として残す。
+>
 > ステータス: **Claude 案 / 未着手**。実装前にユーザーレビュー → 必要なら Codex レビューを経て着手する。
 > このドキュメントは [../../preset-and-adjustment.md](../../preset-and-adjustment.md)（マスク系・キャッシュ無効化）と
 > [../../async-architecture.md](../../async-architecture.md)（worker / cancel）を前提にしている。先にそちらを参照のこと。
