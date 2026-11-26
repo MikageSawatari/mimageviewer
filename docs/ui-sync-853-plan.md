@@ -1000,11 +1000,12 @@ P2-2 `InvokeCommand` の戻りは Shell の画面の役目が終わった証拠�
 
 **R3-3 の結論 (2026-11-26): 直さずに閉じる**。サブ PC の 3 回目 (v580c2 の D、サブ PC のエージェント) の記録で、閉じた直後の前面は Shell の進行状況の窓 (OperationStatusWindow) で、約 0.9 秒後に mIV へ戻ると → が効いた (候補 (a))。Explorer で同じ操作をした比べは、サブ PC では画面操作のツールが Explorer へキーを送れず未確認 (v580d の D)。利用者が自分の PC の Explorer で試した結果 (利用者の言葉、2026-11-26): 「スキップを押したあと、そのダイアログがまだしばらく残っており、下のウィンドウに戻るまでに1秒くらいはありました。その間の右キーは無視されますが、ダイアログが閉じてフォーカスが戻ればききました。」Explorer と同じ動きなので、mIV 側で前面を戻す仕組みは足さない (OS と挙動を一致させる方針)。
 
+
 ---
 
 ## 6. §1.853 の残り C・D・E (v5.9.0 予定、ブランチ `ui-scan-853b`)
 
-状態: 設計 r1 (2026-11-26)。担当: 設計・検収 = ClaudeCode Opus 5.5 (uiscan-853b)、実装 = Codex GPT-6.1 Sol / high、
+状態: 設計 r2 (2026-11-26、設計レビュー r1 の指摘を反映。§6.9)。担当: 設計・検収 = ClaudeCode Opus 5.5 (uiscan-853b)、実装 = Codex GPT-6.1 Sol / high、
 独立レビュー = GPT-6.1 Sol / xhigh。作業ツリー `G:\home\mimageviewer-uiscan853b`。コードの記述は master `451ad09db` の読み取り。
 本担当は実行時の挙動を観測していない。時間の数字はサブ PC 担当の perf ログ (§1.853、3004 件のネットワークフォルダで約 7.6 秒)。
 
@@ -1040,10 +1041,7 @@ main の context で同期走査に届く入口 (今回の対象):
 | C2 | 親へ: BS・⬆・背景・ゲームパッド B (`physical_grid_parent_action`、`grid_parent.rs` 596) → `Direct(parent, ExplicitList)`。サブフォルダ展開の戻り・スマートフォルダの物理の親 (`subfolder_expansion.rs` 1998、`smart_folder.rs` 8843) | Navigation / ExplicitList | `select_after_load` (子の名前) を先に置く |
 | C3 | コレクションの物理元: Enter・BS (`collection_grid.rs` 1592・1367) → `CollectionSource` | **CollectionGridPhysical** / 各 intent | なし |
 | C4 | フォルダを開くダイアログ (`open_folder_nav` → `dispatch_favorite_navigation` → `Direct`、印なし) | Navigation / ExplicitList | なし |
-| C5 | 全画面を閉じる即時経路 `dispatch_main_input_nav_immediate` の `Direct` / `CollectionSource` (`app.rs` 25208・25241): 閉じて親へ戻る (`close_return.rs` 407)、トレイ閉じ (`startup_list_restore.rs` 469、ResumeList)、Everything の物理の親、動画の背景での移動 | Navigation または CollectionGridPhysical / ExplicitList・ResumeList | 子の名前を先に置く。読込後は outcome のログだけ |
 | D1 | 本棚のルート `open_books_root` (`app.rs` 56021)、本の管理の「開く」(`location_jump.rs` 30) → `load_folder` | Navigation / ExplicitList | なし |
-| D2 | お気に入り検索の BS・Ctrl+↑↓ (`favsearch_back` 35896、`favsearch_navigate_sibling` 35874)、タグ表示の BS (`tag_view_back` 35466) | Navigation / ExplicitList・`container_open(false)` | 読込の前に検索の積み上げを変え、後にアドレスを更新。`Classifying` は今も `Loaded` と同じ扱い |
-| D3 | スマートフォルダの取消・定義削除 (`smart_folder.rs` 8299・8373)、サブフォルダ展開の切替・終了 (`subfolder_expansion.rs` 1801・1986) → `load_folder` | Navigation / ExplicitList | 通知だけ |
 | D4 | 「ZIP を作成」完了時の親の読み直し (`ui_dialogs/archive_convert.rs` 1185) | Navigation / PreservePresentation | 出力名の `select_after_load` を先に置く |
 | D5 | 読み直しの fallback (`reload_current_physical_list_with_intent`、`app.rs` 29068): main の実フォルダは既に staged の preflight (29049) で非同期。`current_folder_last_mtime` が無いとき (メタデータの取得失敗、スマートフォルダが mtime を消した後 `smart_folder.rs` 8657) だけ同期 | Navigation・CollectionGridPhysical・RatingPhysical / RefreshList | **読込の直後に `address`・`archive_source_override` を書き換える** (29077〜29084) |
 | E | 「元の場所へ」の ArchiveContainer (`app.rs` 61972〜62012): main で `classified_kind` が無く、`.zip`/`.pdf` 風の名前の実フォルダが今の一覧に Folder として出ているときだけ | Navigation / ExplicitList | なし |
@@ -1052,15 +1050,22 @@ main の context で同期走査に届く入口 (今回の対象):
 
 | 入口 | 理由 |
 | --- | --- |
-| ★固定の移動 `snapshot_load_and_open` (`snapshot_ops.rs` 2135)・`snapshot_navigate_grid_inner` (2870) | 読込の直後に `self.items` から対象の葉を探して全画面を開き、スライドショーを再開する (2136〜2195)。`snapshot_internal_nav` の guard と `items_generation` の照合 (2675) も同期を前提にしている。続きを型で運ぶ設計 (既存の `RequiredFullscreenTarget` が候補) が要り、範囲を超える。**別項目の候補として統括へ報告する** |
+| C5 全画面を閉じる即時経路 `dispatch_main_input_nav_immediate` の `Direct` / `CollectionSource` (`app.rs` 25208・25241): 「ページを直接開く」で閉じて親へ戻る (`close_return.rs` 407)、トレイ閉じ (`startup_list_restore.rs` 469)、Everything の物理の親、動画の背景での移動 | ページ一覧を 1 フレームも見せないため、全画面を閉じる処理を親の読込の中で行っている (`app.rs` 84398〜84412 の doc、設計レビュー r1 P1)。worker にすると、待ちの間に全画面を残すか先に閉じるかを新しく決め、残すなら全画面側の待機表示と待ちの間の全画面のキーの扱いを作る必要がある。**統括へ判断を求めた (2026-11-26)。回答までは同期のまま** |
+| D2 お気に入り検索の BS・Ctrl+↑↓ (`favsearch_back` 35896、`favsearch_navigate_sibling` 35874)、タグ表示の BS (`tag_view_back` 35466) | 読込の前に検索の積み上げを変える。通常裁定は拒否される後続でも旧走査を取り消す (§1.805 r10、`direct_navigation_worker_scan.rs` 1040) ので、「BS → 待ち → 拒否される移動」で子の一覧に親の積み上げが残る (設計レビュー r1 P2-2)。積み上げの変更を採用の時点へ移す作りが要る |
+| D3 スマートフォルダの取消・定義削除 (`smart_folder.rs` 8299・8373)、サブフォルダ展開の切替・終了 (`subfolder_expansion.rs` 1801・1986) | 読込の前に表示中の合成一覧の状態を消す (`smart_folder.rs` 8297・8371、`subfolder_expansion.rs` 1984)。待ちが取り消されると、行は残るのに状態と帰路が消えている (設計レビュー r1 P2-3)。表示中の owner の退役を採用の時点へ移す作りが要る |
+| ★固定の移動 `snapshot_load_and_open` (`snapshot_ops.rs` 2135)・`snapshot_navigate_grid_inner` (2870) | 読込の直後に `self.items` から対象の葉を探して全画面を開き、スライドショーを再開する (2136〜2195)。`snapshot_internal_nav` の guard と `items_generation` の照合 (2675) も同期を前提にしている。続きを型で運ぶ設計 (既存の `RequiredFullscreenTarget` が候補) が要る |
 | 再生試験 `poll_play_test` (`app.rs` 34375) | 診断用の CLI。非同期にすると採用までの毎フレームに読込を出し直す |
 | test-script の ReleaseChecks の「開く」(`release_checks.rs` 212) | 試験の自動操作。結果の bool を同期で返す契約 |
 | main 以外の context (detached・投影中の別 context) の全入口 (表の C・D の各入口と、§1.805 の印付き入口の detached 側、`restore_view_return_origin` 35338、起動 resolver の detached lease の bookmark `startup_ops.rs` 2124・2275・2592) | detached viewer はリワーク中で凍結 (CLAUDE.md)。今回の分岐は main の述語だけで判定し、main 以外は従来どおり同期のまま |
 | 既に `pre_scan` を持つ・ファイル/書庫だけの入口 (外部再走査、DFS、分類 worker、ツリー、JumpToPhysicalFolder、view-order refresh、起動 resolver の main、ZIP/PDF/変換書庫) | UI での走査が無い |
 
+C5・D2・D3・★固定の移動は、どれも「読込の前後に変える状態 (全画面の close・検索の積み上げ・合成一覧の owner・
+対象の葉) を、採用の時点へ移す」作りが要る。今回の「同じ呼び出しを遅らせる」形では、呼び出しの外で変えた状態を
+運べない。**まとめて別項目の候補として統括へ報告する** (番号は統括が master で取る)。
+
 ### 6.3 設計: 同期走査点で「同じ呼び出しを走査の後へ遅らせる」
 
-§1.805 は生成点に印 (`DirectoryScanRoute::Worker`) を付けて入口ごとに worker へ回した。今回は対象が約 20 の生成点と
+§1.805 は生成点に印 (`DirectoryScanRoute::Worker`) を付けて入口ごとに worker へ回した。今回は対象が十数の生成点と
 2 つの入口にまたがり、印で選ぶと付け忘れた入口が同期のまま残る。**判定を同期走査点そのものに置き、既定を反転する**
 (CLAUDE.md「設計の簡素化」: 1 つの所有者・1 つの確定の時点)。
 
@@ -1085,14 +1090,27 @@ main の context で同期走査に届く入口 (今回の対象):
 3. **完了**: 既存の pane pending の poll → 通常 nav 裁定 (`post_render_main_navigation`、より優先の nav が同じフレームに
    あれば負ける) → `main_list_navigation_is_current` の照合 (規則 3) はそのまま。owner が `CollectionGridPhysical` なら
    `collection_grid_physical_load_owner_is_current` も照合し、古ければ捨てる (`GridFolderCandidate` と同じ)。
+   r2 (設計レビュー r1 P2-4): 今の §1.805 の完了は `open_direct_navigation_target_at_stage` へ再入して claim を通り直すので、
+   claim 冒頭の `document_open_modal_admission_blocked()` (`app.rs` 32054。兄弟 context の PDF パスワード等も含む) が
+   完了でも効いている。遅らせた呼び出しは claim を通らないので、**採用の直前に同じ述語を評価し、塞がっていれば今の再入と
+   同じ結果 (要求を捨てる。通知も今と同じ) にする**。claim のその他の照合 (rating・Quick Folder・コレクションの owner の
+   現在性) は、遅らせた呼び出しの中の `open_request_owner_is_current` が同じ判定をしているかを実装担当が確かめ、
+   抜ける照合があれば同じく採用の直前に置く。claim の取消の副作用 (変換中・起動 resolver・ブックマークの退役) は
+   受付で済んでいるので繰り返さない。
+   r2 (設計レビュー r1 P2-5): **走査の設定と Susie の世代の照合**を §3.2 と共有する。worker は走査に使った
+   `FolderScanPolicy` (Susie の対応拡張子の世代を含む、走査の前後で読む) を結果に付け、採用の直前に今の設定の policy と
+   比べる。違えば結果を捨て、同じ pending を取り出さずに今の policy で走査だけをやり直す (§3.2 の「走査だけの続き」と同じ:
+   continuation・cancel token・開始時刻はそのまま、受付は繰り返さない)。設定の変更・「プラグインを再読み込み」は通常の
+   操作なので、割り切りではなく構造で扱う。§1.805 の入口 (お気に入り等) も同じ完了を通るので一緒に直る。
    採用では、予約を `pending_auto_fs_open` に戻した直後に、**預けた引数と `pre_scan = Some(scan)` で同じ
    `load_folder_with_scan_claimed_with_search_origin` を呼ぶ**。受付・claim はやり直さない (済んでいる。§1.805 の
    「Admission is complete」と同じ)。走査の失敗は今の同期の失敗と同じ処理 (ログ・予約の破棄・`cancel_folder_pane_open`・
    `release_fs_nav_lock`・「フォルダを読み取れませんでした」) にし、UI で走査し直さない。
 4. **例外 (同期のまま)**: 走査経路の型を「既定 = main は worker」と「理由付きの UI 走査」の 2 値にする
-   (例: `DirectoryScanRoute::{MainWorker, UiThread(UiThreadScanReason)}`、理由は `SnapshotLeafOpen`・`PlayTest`・
-   `ReleaseCheck`)。今の `DirectoryScanRoute::UiThread` の 12 か所と `load_folder` 系の wrapper は既定になり、§6.2 の
-   対象外の 3 入口だけが理由を渡す。理由は 2 つの入口から同期走査点まで引数で運ぶ (App の flag で運ばない)。
+   (例: `DirectoryScanRoute::{MainWorker, UiThread(UiThreadScanReason)}`、理由は `FullscreenCloseReturn` (C5)・
+   `SearchDrillStack` (D2)・`SyntheticViewExit` (D3)・`SnapshotLeafOpen`・`PlayTest`・`ReleaseCheck`)。今の
+   `DirectoryScanRoute::UiThread` の 12 か所と `load_folder` 系の wrapper は既定になり、§6.2 の対象外の入口だけが理由を渡す。
+   理由は「この入口はまだ続きを運べない」の印で、別項目で続きを運べるようにしたら外す。理由は 2 つの入口から同期走査点まで引数で運ぶ (App の flag で運ばない)。
    main 以外の context は経路の型にかかわらず従来どおり同期 (1 の述語で決まる)。
 5. **§1.805 の分岐を 1 つにまとめる**: `direct_navigation_uses_worker_scan` の早い分岐と `DirectoryScanRoute::Worker` の
    印は、1 の判定に吸収して撤去する (同じ意味を 2 か所に書かない)。お気に入り・アドレス欄 Enter・最近開いたフォルダの
@@ -1107,10 +1125,10 @@ main の context で同期走査に届く入口 (今回の対象):
    `address`・`archive_source_override` を書き換える同期前提 (29077〜29084) は、main ではこの経路を通らなくなる。
    staged の経路が mtime 無しを扱えない理由がコードにあれば、実装担当は設計担当へ返す (同期のまま残さない)。
    main 以外は従来どおり。
-7. **D2 (検索の BS・Ctrl+↑↓) の積み上げ**: 呼び出し側は読込の前に `favsearch.nav_stack`・`tag_view.nav_stack` を変え、
-   後にアドレスを更新する。結果が `Classifying` のときの扱いは今もある (EPUB 等の分類待ち) ので、新しい組み合わせの種類は
-   増えない。走査の失敗 (まれ) で積み上げが一覧と食い違うのは割り切る。待ちの間に一覧の外の移動で退役した場合は、
-   その移動の採用が検索の状態を決める (実装担当はこの前提をコードで確かめ、成り立たない移動があれば返す)。
+7. **呼び出しの外で状態を変える入口の点検**: 実装担当は、既定が worker になる入口 (§6.2 の対象の表) のすべてについて、
+   呼び出しの前に App の状態 (表示中の合成一覧の owner・検索の積み上げ・アドレス・選択のヒント・全画面) を変えていないか、
+   後に読込の結果を前提にした処理をしていないかを確かめる。D2・D3 と同じ形のものが見つかったら、理由付きの例外にして
+   設計担当へ返す (黙って worker にしない)。
 
 ### 6.4 待ちの間の入力・表示
 
@@ -1118,16 +1136,13 @@ main の context で同期走査に届く入口 (今回の対象):
   `direct_navigation_scan_pending()` → `GridItemInputBlock::DirectNavigationScan` がそのまま効く (§1.805 §4.4 の規則 1〜3、
   Esc・スタック切替キーの扱いも同じ)。新しい停止理由・述語は作らない。
 - 表示: 走査中は今の一覧のまま。500 ms を超えたら既存の「移動先を読み込み中…」(`DIRECT_NAVIGATION_WAIT_GRACE`)。
-- 全画面を閉じる即時経路 (C5): 全画面は今どおりすぐ閉じ、走査の間は閉じる前の一覧 (見ていたフォルダ) が見えて、
-  採用で親の一覧に替わる。速いフォルダでは替わるまでが短く、遅い共有フォルダでは「移動先を読み込み中…」が出る。
-  今は閉じる操作の中で走査が終わるまで UI が止まっていた。この見え方の変化は利用者決定 (§6.1) の範囲 (お気に入りと同じ
-  見え方) と判断し、サブ PC の確認項目に入れる。
+- 全画面からの入口は今回 worker にしない (C5 は §6.2 の対象外)。
 
 ### 6.5 計測
 
 - worker の既存 `nav/folder_open_scan` (`ms`・`purpose`・`folders`・`media`・`failed`・`cancelled`) に、continuation から
-  `owner` (`navigation|collection|rating`)・`intent` (restore_intent の種類)・`search` (`favsearch|tag|none`)・
-  `auto_fs` (予約の有無) を足す。生成点の名前は同期走査点では分からないので記録しない。
+  `owner` (`navigation|collection|rating`)・`intent` (restore_intent の種類)・`auto_fs` (予約の有無)・
+  `rescan` (設定の不一致で走査し直した回数) を足す。生成点の名前は同期走査点では分からないので記録しない。
 - 採用時の `nav/lf_scan` は `pre_scanned=true`。`scripts/analyze_perf.py` の nav の内訳に新しい extras を足す。
 - UI スレッドの同期走査の cfg(test) 計数 (§1.805 で足したもの) を使い、対象の入口で 0 回であることをテストで確かめる。
 
@@ -1136,29 +1151,37 @@ main の context で同期走査に届く入口 (今回の対象):
 テストは既定と `--features test-script` の両方で流す (v5.8.0 の §1.853 では test-script 側の数え上げの期待値の誤りが
 全件まで見つからなかった)。
 
-1. §6.2 の対象の各入口 (C1〜C5・D1〜D5・E) で、dispatch したフレームと採用のフレームの UI 同期走査が 0 回。worker 完了 +
+1. §6.2 の対象の各入口 (C1〜C4・D1・D4・D5・E) で、dispatch したフレームと採用のフレームの UI 同期走査が 0 回。worker 完了 +
    poll で、今の同期経路と同じ一覧・選択 (子の名前・出力名)・履歴・アドレス・カーソルが採用される。
 2. 全画面の予約: 画像フォルダを Enter で開く (自動全画面が有効) と、採用後に全画面が開く。待ちの間に別の移動で退役・
-   走査失敗・コレクションの owner の失効のどれでも、予約は次の無関係な読込に残らない。
+   走査失敗・`Disconnected`・コレクションの owner の失効・bundle の破棄のどれでも、予約と選択のヒントは次の無関係な読込に
+   残らない。
 3. 入力: 待ちの間は一覧の項目入力が止まり (Enter・↓・ダブルクリック・ゲームパッド)、待ちの間に押したキーは採用後の一覧に
    届かない。ツリー・お気に入り・アドレス欄・戻るは後勝ちで、遅れて完了した旧要求は採用されない。500 ms 未満では
    待機表示を出さない。
-4. C5: 全画面を閉じて親へ戻る・トレイ閉じ・コレクションの物理元の閉じ戻りが、worker 完了後に従来と同じ選択で採用される。
-5. D2: お気に入り検索・タグ表示の BS と Ctrl+↑↓ が従来と同じ積み上げ・アドレス・選択になる。待ちの間にツリーで別の
-   場所へ移ったときの検索の状態が、その移動の採用どおりになる。
+4. modal: main の走査待ちの間に兄弟 context が document modal (PDF パスワード等) に入ったら、完了は今の §1.805 の再入と
+   同じ結果になる (採用しない)。
+5. 走査の設定: 走査中に隠しファイル・種類の表示・書庫/EPUB の扱い・Susie の再読み込みを変えると、古い結果を採らず、
+   同じ要求のまま今の設定で走査し直して採用する (受付・test-script の要求数・履歴は 1 回分)。お気に入りの入口でも同じ。
 6. D5: mtime の無い main の読み直しが staged の経路で採用され、変換書庫のアドレス (`archive_source_override`) が
    従来どおり保たれる。
 7. E: `.zip` という名前の実フォルダへの「元の場所へ」が worker で走査される。
-8. 例外: ★固定の移動・再生試験・ReleaseChecks は同期のまま (計数 1 回)。main 以外の context の各入口も同期のまま。
-9. §1.805 の既存テスト (お気に入り・アドレス欄・最近開いたフォルダ・退役・DFS・saved-group・待機表示) が期待値を変えずに通る。
+8. 例外: C5・D2・D3・★固定の移動・再生試験・ReleaseChecks は同期のまま (計数 1 回)。main 以外の context の各入口も同期のまま。
+9. 兄弟 context・lifecycle: detached を投影している間は main の待ちで入力を止めない (§1.805 と同じ述語)。sidecar 復元中の
+   完了は保留 (既存)。Quick Folder の A→B→A の往復、待ちの間の DFS・saved-group は §1.805 の規則のまま。
 10. test-script の要求数: 受付時の 1 回だけ (採用の再入で数え直さない)。取消された受理済み要求も 1 回。
-11. 既存テストのうち、対象の入口の直後に同期採用を前提にしていたもの (§1.805 §3.2 の 39 件: history_parent_1473・
+11. §1.805 の既存テストのうち、**意図して期待値を変えるもの**は次の 2 種だけ。実装担当は該当するテストを名前で列挙し、
+    変える理由をテストのコメントと記録に書く: (a) 全画面の予約を要求が持つようになったこと (例:
+    `direct_navigation_worker_admission_does_not_take_global_fullscreen_reservation`、`direct_navigation_worker_scan.rs` 302)、
+    (b) 印の無い入口が同期で採用される前提 (例: `direct_navigation_worker_preserves_unmarked_presentation_intents`、同 1251。
+    一覧・履歴・intent の期待値は保つ)。それ以外の §1.805 のテストは期待値を変えずに通ること。
+12. 既存テストのうち、対象の入口の直後に同期採用を前提にしていたもの (§1.805 §3.2 の 39 件: history_parent_1473・
     ratingnav649・same_position_double_click・section1328 等) は、worker 完了 + `post_render_main_navigation` を回す helper を
-    通す形に直す。**期待値は変えない**。期待値を変えないと通らないものは、実装担当が理由を添えて設計担当へ返す。
+    通す形に直す。**一覧・選択・履歴の期待値は変えない**。変えないと通らないものは、実装担当が理由を添えて設計担当へ返す。
 
 ### 6.7 文書の更新 (実装時)
 
-- [ui-responsiveness.md](ui-responsiveness.md): 冒頭の §1.853 の節に C・D・E を追記。対象外 (★固定の移動・診断・
+- [ui-responsiveness.md](ui-responsiveness.md): 冒頭の §1.853 の節に C・D・E を追記。対象外 (C5・D2・D3・★固定の移動・診断・
   main 以外) を明記。
 - [async-architecture.md](async-architecture.md): 物理フォルダの事前走査の行に、同期走査点の既定の反転と continuation。
 - [direct-navigation-worker-scan-plan.md](direct-navigation-worker-scan-plan.md) §7: 一覧側の後続候補を本書 §6 で実施したと記録。
@@ -1174,4 +1197,21 @@ main の context で同期走査に届く入口 (今回の対象):
   (利用者決定 §6.1)。
 - 採用: 全画面の予約は App の flag から要求の持ち物へ移す。flag と pending の 2 か所で同じ予約を持たない。
 - 不採用: モーダル化。移動の入力 (ツリー・お気に入り・戻る) まで止める理由がない (§1.805 §3 の D と同じ)。
-- 不採用: ★固定の移動まで今回広げること。続きを型で運ぶ設計が別に要る (§6.2)。
+- 不採用: C5・D2・D3・★固定の移動まで今回広げること。呼び出しの外で変えた状態を採用の時点へ移す作りが別に要る (§6.2)。
+
+### 6.9 設計レビュー r1 (GPT-6.1 Sol / xhigh、read-only、30ee454c7、2026-11-26): REJECT
+
+P1×1・P2×4・P3×1。設計担当がコードで照合し、すべて妥当と判断して r2 で直した。detached の境界は「構造的修正であって
+症状パッチではない」に **AGREE** (main の既存 context／scope 述語で走査の責務を分けるため。§11 への記録は必要)。
+追加の同期走査の入口は無く、対象外の分類は概ね妥当、D5 の staged の経路は mtime を要さず 3 つの owner を扱える、
+選択のヒントは navigation が既に `take()` している (`app.rs` 25912)、という所見もあった。
+
+| 指摘 | 対応 (r2) |
+| --- | --- |
+| P1 C5 は全画面を閉じる処理が読込の中にあり、`Classifying` では全画面が残って採用もされない | C5 を対象外にし、待ちの間の全画面の扱いを統括へ質問 (§6.2) |
+| P2-2 D2 の積み上げの先行変更が、拒否される後続での取消で一覧と食い違う | D2 を対象外 (§6.2)。採用の時点へ移す作りは別項目 |
+| P2-3 D3 は表示中の合成一覧の状態を先に消す | D3 を対象外 (§6.2)。同上 |
+| P2-4 claim の再実行を外すと完了時の document modal の拒否が消える | 採用の直前に同じ述語を評価し、今の再入と同じ結果にする (§6.3 の 3) |
+| P2-5 走査の設定・Susie の世代の照合が無い | §3.2 の policy 照合と走査だけのやり直しを共有 (§6.3 の 3) |
+| P3-6 「§1.805 の既存テストは期待値を変えない」が新仕様と矛盾 | 意図して変える 2 種を明記 (§6.6 の 11)。兄弟投影・sidecar・Quick Folder・取消/切断のテストを追加 (§6.6 の 2・9) |
+
