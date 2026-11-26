@@ -58831,7 +58831,7 @@ impl App {
 
     /// `stage` は**呼び出し側が渡す**。同じ builder を製本と一括エクスポートが共有しており、
     /// 出力ごとに欲しい段が違うため (製本 = 編集まで / Ctrl+E = 表示用補正まで が既定)。
-    fn book_baked_edit_snapshot(
+    pub(crate) fn book_baked_edit_snapshot(
         &mut self,
         key: &str,
         idx: Option<usize>,
@@ -59349,7 +59349,7 @@ impl App {
     }
 
     /// `Ok(None)` は対象外 (フォルダ / 動画 / 音声 / アーカイブ本体など)。
-    fn batch_export_item_for_idx(
+    pub(crate) fn batch_export_item_for_idx(
         &mut self,
         idx: usize,
     ) -> Result<Option<crate::export_batch::BatchExportItem>, String> {
@@ -59426,7 +59426,7 @@ impl App {
         }
     }
 
-    fn batch_export_dirname_for_path(path: &std::path::Path) -> String {
+    pub(crate) fn batch_export_dirname_for_path(path: &std::path::Path) -> String {
         path.parent()
             .and_then(|parent| parent.file_name())
             .and_then(|name| name.to_str())

@@ -1670,6 +1670,11 @@ impl crate::app::App {
             combine_disabled_reason: if target.surface == ContextMenuSurface::Grid {
                 self.combine_disabled_reason_for_count(combine_target_count)
             } else {None},
+            combine_reopen_visible: target.surface == ContextMenuSurface::Grid
+                && self.image_combine_reopen_visible(target.item_index, target.is_folder_context),
+            combine_reopen_disabled_reason: self.image_combine_reopen_disabled_reason(
+                target.item_index, target.is_folder_context,
+            ),
             caption_creation_disabled_reason: if target.surface == ContextMenuSurface::Grid {
                 self.caption_creation_disabled_reason(target.is_folder_context)
                     .map(str::to_owned)
@@ -1738,6 +1743,7 @@ impl crate::app::App {
                 };
                 crate::context_menu_model::ContextMenuShortcutLabels {
                     combine: self.keymap.first_chord_label(crate::keymap::KeyAction::GridCombineSelection),
+                    combine_reopen: self.keymap.first_chord_label(crate::keymap::KeyAction::GridCombineReopen),
                     cut: cut.and_then(|action| self.keymap.first_chord_label(action)),
                     copy: copy.and_then(|action| self.keymap.first_chord_label(action)),
                     organize: (target.surface == ContextMenuSurface::Grid)
@@ -2022,6 +2028,16 @@ impl crate::app::App {
             MenuCommand::CombineSelection => {
                 if target.surface == ContextMenuSurface::Grid {
                     self.open_image_combine_context_dialog(
+                        ctx,
+                        target.item_index,
+                        target.is_folder_context,
+                    );
+                }
+                None
+            }
+            MenuCommand::CombineReopen => {
+                if target.surface == ContextMenuSurface::Grid {
+                    self.open_image_combine_reopen_context_dialog(
                         ctx,
                         target.item_index,
                         target.is_folder_context,

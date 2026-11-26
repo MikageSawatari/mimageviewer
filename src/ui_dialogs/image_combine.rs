@@ -15,8 +15,28 @@ use std::sync::atomic::Ordering;
 mod image_combine_tests;
 mod options_ui;
 mod presets;
+mod reopen;
+mod resolver;
+
+enum PreparationTarget {
+    Selection(ExportBatchTarget),
+    Reopen {
+        source: CombineSourceRef,
+        annotation_space: Option<[u32; 2]>,
+        prepared: Result<resolver::SourcePreparation, String>,
+    },
+}
+
+struct ReopenedOutput {
+    path: PathBuf,
+    format: CombineFormat,
+    replace: bool,
+    has_edits: bool,
+}
 
 pub(crate) enum CombineSession {
+    ReopenLoading(Box<reopen::ReopenRequest>),
+    ReopenMissing(Box<reopen::ReopenLoaded>),
     Dialog(Box<CombineDialogState>),
     Writing { request: u64 },
 }
@@ -33,7 +53,7 @@ pub(crate) struct CombineEligibilityWork {
 
 impl CombineSession {
     pub(crate) fn modal(&self) -> bool {
-        matches!(self, Self::Dialog(_))
+        !matches!(self, Self::Writing { .. })
     }
 }
 
@@ -109,7 +129,8 @@ pub(crate) struct CombineDialogState {
     request: u64,
     options: CombineOptions,
     items: Vec<DialogItem>,
-    pending: VecDeque<(usize, ExportBatchTarget)>,
+    pending: VecDeque<(usize, PreparationTarget)>,
+    reopened: Option<ReopenedOutput>,
     /// Taken on transfer to Writing; Drop otherwise cancels the dialog worker.
     worker: Option<worker::Connection>,
     /// Stable image ID inside this dialog, independent of App's grid cursor.
@@ -141,6 +162,52 @@ impl Drop for CombineDialogState {
 }
 
 impl CombineDialogState {
+    fn replacement_path(&self) -> Option<&Path> {
+        self.reopened
+            .as_ref()
+            .filter(|output| output.replace)
+            .map(|output| output.path.as_path())
+    }
+
+    fn replacement_is_source(&self) -> bool {
+        self.reopened.as_ref().is_some_and(|output| {
+            let key = crate::adjustment_db::normalize_path(&output.path);
+            self.items.iter().any(|item| {
+                crate::adjustment_db::normalize_path(source_path(&item.spec.source)) == key
+            })
+        })
+    }
+
+    /// Preset recall and toggling replacement use the same fixed-target boundary.
+    fn enforce_replacement_target(&mut self) {
+        let Some(output) = self.reopened.as_ref().filter(|output| output.replace) else {
+            return;
+        };
+        self.options.format = match (output.format, self.options.format) {
+            (CombineFormat::Jpeg { .. }, CombineFormat::Jpeg { quality }) => {
+                CombineFormat::Jpeg { quality }
+            }
+            (CombineFormat::Webp { lossless, .. }, CombineFormat::Webp { quality, .. }) => {
+                CombineFormat::Webp { quality, lossless }
+            }
+            (format, _) => format,
+        };
+        self.options.destination =
+            Destination::Folder(output.path.parent().unwrap_or(Path::new("")).to_path_buf());
+        self.folder_text = output
+            .path
+            .parent()
+            .unwrap_or(Path::new(""))
+            .display()
+            .to_string();
+        self.name = output
+            .path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+    }
+
     fn spec(&self) -> RenderSpec {
         #[cfg(test)]
         self.spec_builds.set(self.spec_builds.get() + 1);
@@ -267,6 +334,9 @@ impl CombineDialogState {
     }
 
     fn output_validation(&self) -> Result<(), String> {
+        if self.replacement_path().is_some() && self.replacement_is_source() {
+            return Err("元の結合画像が素材に含まれるため、置き換えできません".into());
+        }
         if self.name.trim().is_empty() {
             return Err("出力の名前を入力してください".into());
         }
@@ -702,6 +772,7 @@ impl App {
                     id,
                     name: source_name(&source, false),
                     spec: CombineItemSpec {
+                        annotation_space: None,
                         source,
                         label_override: None,
                     },
@@ -757,7 +828,12 @@ impl App {
             options,
             selected_item_id: items.first().map(|item| item.id),
             items,
-            pending: targets.into_iter().enumerate().collect(),
+            pending: targets
+                .into_iter()
+                .enumerate()
+                .map(|(id, target)| (id, PreparationTarget::Selection(target)))
+                .collect(),
+            reopened: None,
             worker: Some(worker),
             dragging: None,
             preview: None,
@@ -787,9 +863,12 @@ impl App {
             && !self.shortcuts_blocked_by_text_input(ctx)
             && !self.ime_input_active(ctx)
             && !egui::Popup::is_any_open(ctx)
-            && self
+            && (self
                 .keymap
                 .consume_action(ctx, crate::keymap::KeyAction::GridCombineSelection)
+                || self
+                    .keymap
+                    .consume_action(ctx, crate::keymap::KeyAction::GridCombineReopen))
         {
             let reason = if self.combine_session.is_some() {
                 "結合の操作中です"
@@ -803,9 +882,18 @@ impl App {
     fn advance_image_combine_preparation(&mut self, state: &mut CombineDialogState) {
         let start = std::time::Instant::now();
         while let Some((id, target)) = state.pending.pop_front() {
-            let result = self
-                .batch_export_item_for_target(&target)
-                .and_then(|item| item.ok_or_else(|| "この対象は結合できません".into()));
+            let result = match target {
+                PreparationTarget::Selection(target) => self
+                    .batch_export_item_for_target(&target)
+                    .and_then(|item| item.ok_or_else(|| "この対象は結合できません".into())),
+                PreparationTarget::Reopen {
+                    source,
+                    annotation_space,
+                    prepared,
+                } => prepared.and_then(|prepared| {
+                    self.image_combine_item_for_source(&source, &prepared, annotation_space)
+                }),
+            };
             let status = match result {
                 Ok(item) => match state.worker.as_ref().unwrap().tx.send(Command::Prepare {
                     id,
@@ -829,11 +917,16 @@ impl App {
     }
 
     pub(crate) fn draw_image_combine_dialog(&mut self, ctx: &egui::Context) {
+        self.combine_index.poll(&crate::data_dir::get(), ctx);
         if self.combine_session.is_some() {
             self.reject_busy_image_combine_shortcut(ctx);
         }
         let Some(session) = self.combine_session.take() else {
             return;
+        };
+        let session = match self.advance_image_combine_reopen(ctx, session) {
+            Some(session) => session,
+            None => return,
         };
         let CombineSession::Dialog(mut state) = session else {
             self.combine_session = Some(session);
@@ -851,6 +944,7 @@ impl App {
         if let Some(action) = action.preset {
             self.apply_combine_preset(&mut state, action);
         }
+        state.enforce_replacement_target();
         if action.pick_folder {
             if let Some(path) = rfd::FileDialog::new()
                 .set_directory(state.output_dir())
@@ -863,12 +957,13 @@ impl App {
         state.invalidate_and_request(ctx);
         if action.write && state.can_write() {
             let spec = state.spec();
-            match state
-                .worker
-                .as_ref()
-                .unwrap()
-                .write(spec, state.output_dir(), state.name.clone())
-            {
+            match state.worker.as_ref().unwrap().write_with_target(
+                spec,
+                state.output_dir(),
+                state.name.clone(),
+                state.replacement_path().map(Path::to_path_buf),
+                crate::data_dir::get(),
+            ) {
                 Ok(pending) => {
                     self.settings.combine_options = Some(state.options.clone());
                     if !self.settings.save_checked() {
@@ -906,6 +1001,7 @@ impl App {
             .and_then(|pending| pending.successes.first())
             .map(|success| success.path.clone());
         if let Some(path) = path {
+            self.combine_index.mark_stale();
             self.refresh_image_combine_output(ctx, &path);
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             self.show_saved_output_feedback(format!("結合しました: {name}"));
@@ -978,32 +1074,68 @@ fn draw_window_with_enter(
     presets: &[CombinePreset],
     enter: bool,
 ) -> Action {
+    state.enforce_replacement_target();
     let mut action = Action {
         field_enter: enter,
         ..Default::default()
     };
     let mut open = true;
     let screen = ctx.content_rect();
-    let size = egui::vec2(
-        1000.0_f32.min((screen.width() - 56.0).max(1.0)),
-        680.0_f32.min((screen.height() - 72.0).max(1.0)),
+    let margin = egui::vec2(20.0, 20.0);
+    let available_size = egui::vec2(
+        (screen.width() - 56.0).max(1.0),
+        (screen.height() - 2.0 * margin.y).max(1.0),
     );
+    let size = egui::vec2(1000.0, 680.0).min(available_size);
     egui::Window::new(format!("画像を結合 ({} 枚)", state.items.len()))
         .id(egui::Id::unique("image_combine_dialog"))
         .collapsible(false)
         .resizable(true)
-        .default_pos(screen.min + egui::vec2(20.0, 20.0))
+        .default_pos(screen.min + margin)
         .default_size(size)
-        .min_size(egui::vec2(300.0, 220.0))
-        .max_size(size.max(egui::vec2(screen.width() - 56.0, screen.height() - 72.0)))
+        .min_size(egui::vec2(300.0, 220.0).min(available_size))
+        .max_size(available_size)
         .open(&mut open)
         .show(ctx, |ui| {
+            #[cfg(test)]
+            let header_top = ui.cursor().top();
             presets::draw(ui, state, presets, &mut action);
+            state.enforce_replacement_target();
             ui.separator();
-            let footer = footer_height(ui, state);
-            let height = (ui.available_height() - footer).max(1.0);
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), height),
+            let content_rect = ui.available_rect_before_wrap();
+            #[cfg(test)]
+            let header_rect = egui::Rect::from_min_max(
+                egui::pos2(content_rect.left(), header_top),
+                content_rect.right_top(),
+            );
+            // Lay out the real fixed widgets first. Their wrapped text and
+            // actual control heights consume space before the body gets any.
+            let mut reserved = ui.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("image_combine_fixed_footer")
+                    .max_rect(content_rect)
+                    .layout(egui::Layout::bottom_up(egui::Align::Min)),
+            );
+            draw_footer(&mut reserved, state, &mut action);
+            let footer_rect = reserved.min_rect();
+            // Use the widgets' actual boundary, not the rounded next-cursor
+            // rectangle. Header/body/footer must share the same partition.
+            let body_bottom =
+                (footer_rect.top() - ui.spacing().item_spacing.y).max(content_rect.top());
+            let body_rect = egui::Rect::from_min_max(
+                content_rect.min,
+                egui::pos2(content_rect.right(), body_bottom),
+            );
+            let mut body = reserved.new_child(
+                egui::UiBuilder::new()
+                    .id_salt("image_combine_body")
+                    .max_rect(body_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+            );
+            body.set_clip_rect(body_rect.intersect(ui.clip_rect()));
+            let height = body_rect.height();
+            body.allocate_ui_with_layout(
+                egui::vec2(body.available_width(), height),
                 egui::Layout::left_to_right(egui::Align::Min),
                 |ui| {
                     let left_width = (ui.available_width() * 0.57).max(1.0);
@@ -1038,11 +1170,12 @@ fn draw_window_with_enter(
                             draw_preview(
                                 ui,
                                 state,
-                                (height - controls - ui.spacing().item_spacing.y).max(1.0),
+                                (height - controls - ui.spacing().item_spacing.y).max(0.0),
                             );
                             egui::ScrollArea::vertical()
                                 .id_salt("image_combine_item_controls")
                                 .max_height(controls)
+                                .min_scrolled_height(0.0)
                                 .auto_shrink([false, true])
                                 .show(ui, |ui| draw_item_controls(ui, state));
                         },
@@ -1056,6 +1189,7 @@ fn draw_window_with_enter(
                             let output = egui::ScrollArea::vertical()
                                 .id_salt("image_combine_settings")
                                 .max_height(height)
+                                .min_scrolled_height(0.0)
                                 .auto_shrink([false, true])
                                 .show(ui, |ui| options_ui::draw(ui, state, &mut action));
                             #[cfg(test)]
@@ -1073,7 +1207,16 @@ fn draw_window_with_enter(
                     );
                 },
             );
-            draw_footer(ui, state, &mut action);
+            #[cfg(test)]
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::unique("image_combine_fixed_layout"),
+                    [header_rect, body_rect, footer_rect],
+                )
+            });
+            // Scroll content must not enlarge the next frame's finite Window.
+            drop(body);
+            ui.advance_cursor_after_rect(content_rect);
             // Popup pickers/combos consume wheel before the parent dialog.
             if egui::Popup::is_any_open(ctx) {
                 crate::wheel_input::consume_popup_wheel_input(ctx);
@@ -1103,52 +1246,8 @@ fn footer_error(state: &CombineDialogState) -> Option<String> {
         .or_else(|| state.output_validation().err())
 }
 
-fn footer_height(ui: &egui::Ui, state: &CombineDialogState) -> f32 {
-    let line = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
-    let error = footer_error(state).map_or(0.0, |s| {
-        egui::WidgetText::from(s)
-            .into_galley(
-                ui,
-                Some(egui::TextWrapMode::Wrap),
-                ui.available_width(),
-                egui::TextStyle::Body,
-            )
-            .size()
-            .y
-            + ui.spacing().item_spacing.y
-    });
-    // Name, dimensions/status, destination and a wrapping button row remain fixed.
-    let warning = if state
-        .preview
-        .as_ref()
-        .is_some_and(|preview| preview.not_drawn > 0)
-    {
-        line
-    } else {
-        0.0
-    };
-    let name_row = ui.spacing().interact_size.y.max(line);
-    let status = egui::WidgetText::from(status_text(state))
-        .into_galley(
-            ui,
-            Some(egui::TextWrapMode::Wrap),
-            ui.available_width(),
-            egui::TextStyle::Body,
-        )
-        .size()
-        .y
-        + ui.spacing().item_spacing.y;
-    name_row
-        + line
-        + status
-        + warning
-        + super::startup_dialog_footer_height(ui, &["書き出す", "キャンセル"], 8.0)
-        + error
-        + 12.0
-}
-
 fn status_text(state: &CombineDialogState) -> String {
-    if let Ok(layout) = &state.validation().result {
+    let status = if let Ok(layout) = &state.validation().result {
         format!(
             "出力 {} × {} px・切り取り 最大 {:.0}%{}",
             layout.canvas_size.0,
@@ -1167,41 +1266,91 @@ fn status_text(state: &CombineDialogState) -> String {
             .filter(|item| matches!(item.status, ItemStatus::Loaded(_) | ItemStatus::Failed(_)))
             .count();
         format!("読み込み中 {loaded}/{}", state.items.len())
+    };
+    if let Some(path) = state.replacement_path() {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        format!("{status}\n元の結合画像を置き換えます (元に戻せません): {name}")
+    } else {
+        status
     }
 }
 
 fn draw_footer(ui: &mut egui::Ui, state: &mut CombineDialogState, action: &mut Action) {
-    ui.separator();
-    ui.horizontal(|ui| {
-        ui.label("名前");
-        text(
-            ui,
-            &mut state.name,
-            "image_combine_name",
-            (ui.available_width() - 8.0).max(1.0),
-        );
-    });
-    ui.label(status_text(state));
-    if let Some(preview) = &state.preview {
-        if preview.not_drawn > 0 {
-            ui.colored_label(
-                ui.visuals().warn_fg_color,
-                format!("収まらないラベル: {} 件", preview.not_drawn),
-            );
-        }
+    enum Row {
+        Separator,
+        Name,
+        Status,
+        Warning,
+        Destination,
+        Buttons,
+        Error,
     }
-    let path = state.output_dir().display().to_string();
-    ui.add(egui::Label::new(format!("保存先: {path}")).truncate())
-        .on_hover_text(path);
-    ui.horizontal_wrapped(|ui| {
-        // Disable keyboard activation of this one button, including focused Enter.
-        let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
-        let response = ui.add_enabled(state.can_write(), egui::Button::new("書き出す"));
-        action.write |= response.clicked() && !enter;
-        action.cancel |= ui.button("キャンセル").clicked();
-    });
-    if let Some(error) = footer_error(state) {
-        ui.colored_label(ui.visuals().error_fg_color, error);
+    let mut rows = [
+        Row::Separator,
+        Row::Name,
+        Row::Status,
+        Row::Warning,
+        Row::Destination,
+        Row::Buttons,
+        Row::Error,
+    ];
+    // Preserve the same reading order in a bottom-anchored Window footer and
+    // the top-down output-control fixture. Every widget is drawn only once.
+    if ui.layout().main_dir() == egui::Direction::BottomUp {
+        rows.reverse();
+    }
+    for row in rows {
+        match row {
+            Row::Separator => {
+                ui.separator();
+            }
+            Row::Name => {
+                ui.horizontal(|ui| {
+                    ui.label("名前");
+                    let replacing = state.replacement_path().is_some();
+                    ui.add_enabled_ui(!replacing, |ui| {
+                        text(
+                            ui,
+                            &mut state.name,
+                            "image_combine_name",
+                            (ui.available_width() - 8.0).max(1.0),
+                        )
+                    });
+                });
+            }
+            Row::Status => {
+                ui.add(egui::Label::new(status_text(state)).wrap());
+            }
+            Row::Warning => {
+                if let Some(preview) = &state.preview {
+                    if preview.not_drawn > 0 {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            format!("収まらないラベル: {} 件", preview.not_drawn),
+                        );
+                    }
+                }
+            }
+            Row::Destination => {
+                let path = state.output_dir().display().to_string();
+                ui.add(egui::Label::new(format!("保存先: {path}")).truncate())
+                    .on_hover_text(path);
+            }
+            Row::Buttons => {
+                ui.horizontal_wrapped(|ui| {
+                    // Disable focused Enter activation of this one button.
+                    let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    let response = ui.add_enabled(state.can_write(), egui::Button::new("書き出す"));
+                    action.write |= response.clicked() && !enter;
+                    action.cancel |= ui.button("キャンセル").clicked();
+                });
+            }
+            Row::Error => {
+                if let Some(error) = footer_error(state) {
+                    ui.colored_label(ui.visuals().error_fg_color, error);
+                }
+            }
+        }
     }
 }
 
@@ -1441,6 +1590,7 @@ fn fixture_state_with_fonts(
         .map(|id| DialogItem {
             id,
             spec: CombineItemSpec {
+                annotation_space: None,
                 source: CombineSourceRef::File {
                     path: PathBuf::from(format!("C:/Pictures/商品{}.png", id + 1)),
                 },
@@ -1493,6 +1643,7 @@ fn fixture_state_with_fonts(
         options,
         items,
         pending: VecDeque::new(),
+        reopened: None,
         worker: None,
         selected_item_id: Some(2),
         dragging: None,
@@ -1556,6 +1707,27 @@ pub fn draw_image_combine_snapshot_fixture(ctx: &egui::Context, band: bool) {
             band,
             fonts.as_ref(),
         )));
+        ctx.data_mut(|data| data.insert_temp(id, state.clone()));
+        state
+    });
+    draw_window(ctx, &mut state.lock().unwrap(), &[]);
+}
+
+/// Production reopened dialog fixture without disk reads or a running worker.
+#[doc(hidden)]
+pub fn draw_image_combine_reopen_snapshot_fixture(ctx: &egui::Context) {
+    let id = egui::Id::unique("image_combine_reopen_fixture");
+    let state = ctx
+        .data_mut(|data| data.get_temp::<std::sync::Arc<std::sync::Mutex<CombineDialogState>>>(id));
+    let state = state.unwrap_or_else(|| {
+        let mut state = fixture_state(ctx, false);
+        state.reopened = Some(ReopenedOutput {
+            path: PathBuf::from("C:/Pictures/商品1_結合.jpg"),
+            format: CombineFormat::Jpeg { quality: 95 },
+            replace: true,
+            has_edits: true,
+        });
+        let state = std::sync::Arc::new(std::sync::Mutex::new(state));
         ctx.data_mut(|data| data.insert_temp(id, state.clone()));
         state
     });

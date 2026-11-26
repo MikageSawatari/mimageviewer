@@ -380,6 +380,9 @@ pub struct CombineItemSpec {
     pub source: CombineSourceRef,
     #[serde(default)]
     pub label_override: Option<String>,
+    /// Source-pixel canvas used by the saved annotation snapshot, never output size.
+    #[serde(default)]
+    pub annotation_space: Option<[u32; 2]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

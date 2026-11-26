@@ -26,6 +26,8 @@ pub(crate) struct WriteSpec {
     pub render: RenderSpec,
     pub directory: PathBuf,
     pub name: String,
+    pub replace: Option<PathBuf>,
+    pub data_dir: PathBuf,
     pub progress: mpsc::Sender<ExportEvent>,
 }
 
@@ -79,6 +81,17 @@ impl Connection {
         directory: PathBuf,
         name: String,
     ) -> Result<ExportPending, String> {
+        self.write_with_target(spec, directory, name, None, crate::data_dir::get())
+    }
+
+    pub fn write_with_target(
+        &self,
+        spec: RenderSpec,
+        directory: PathBuf,
+        name: String,
+        replace: Option<PathBuf>,
+        data_dir: PathBuf,
+    ) -> Result<ExportPending, String> {
         let total = spec.items.len() + 1;
         let (progress, rx) = mpsc::channel();
         self.tx
@@ -86,6 +99,8 @@ impl Connection {
                 render: spec,
                 directory,
                 name,
+                replace,
+                data_dir,
                 progress,
             }))
             .map_err(|_| "結合 worker が中断されました".to_string())?;
@@ -123,6 +138,11 @@ pub(crate) fn spawn(
             let mut worker = Worker {
                 items: HashMap::new(),
                 load: Box::new(move |item, cancel| materialize(item, raw.as_ref(), cancel)),
+                analyze_pdf: Box::new(|path, page, password, cancel| {
+                    crate::pdf_loader::analyze_page_content_type(path, page, password, Some(cancel))
+                        .map(|analysis| analysis.content_type)
+                        .map_err(|error| format!("PDF ページを解析できません: {error}"))
+                }),
                 cancel: worker_cancel,
                 #[cfg(test)]
                 before_encode: None,
@@ -146,6 +166,16 @@ struct LoadedItem {
 type Materializer =
     Box<dyn FnMut(&BatchExportItem, &Arc<AtomicBool>) -> Result<LoadedPixels, String> + Send>;
 
+type PdfAnalyzer = Box<
+    dyn FnMut(
+            &Path,
+            u32,
+            Option<&str>,
+            Arc<AtomicBool>,
+        ) -> Result<crate::pdf_loader::PdfPageContentType, String>
+        + Send,
+>;
+
 struct LoadedPixels {
     image: RgbaImage,
     decode_ms: f64,
@@ -166,6 +196,7 @@ impl Drop for ImageCountGuard {
 struct Worker {
     items: HashMap<usize, LoadedItem>,
     load: Materializer,
+    analyze_pdf: PdfAnalyzer,
     cancel: Arc<AtomicBool>,
     #[cfg(test)]
     before_encode: Option<Box<dyn FnMut(&AtomicBool) + Send>>,
@@ -201,7 +232,8 @@ fn materialize(
         4096,
         cancel.clone(),
         raw,
-    )?;
+    )
+    .map_err(|message| source_load_error(&item.source, message))?;
     let decode_ms = start.elapsed().as_secs_f64() * 1000.0;
     let start = Instant::now();
     let pixels =
@@ -223,7 +255,50 @@ fn materialize(
     })
 }
 
+fn source_load_error(source: &crate::books::CompositeSource, message: String) -> String {
+    if matches!(
+        source,
+        crate::books::CompositeSource::PdfPage { password: None, .. }
+    ) && (message.to_ascii_lowercase().contains("password") || message.contains("パスワード"))
+    {
+        "パスワードが必要です (一度 PDF を開いて入力してください)".to_string()
+    } else {
+        message
+    }
+}
+
 impl Worker {
+    /// Complete an absent page's annotation coordinate space once, before the
+    /// snapshot is accepted. Preview and output then keep that same snapshot.
+    fn prepare_pdf_comic_snapshot(&mut self, item: &mut BatchExportItem) -> Result<(), String> {
+        if item.edits.comic.is_none() || item.edits.comic_source_dims.is_some() {
+            return Ok(());
+        }
+        let crate::books::CompositeSource::PdfPage {
+            pdf_path,
+            page_num,
+            password,
+        } = &item.source
+        else {
+            return Ok(());
+        };
+        check_cancel(&self.cancel)?;
+        let content_type = (self.analyze_pdf)(
+            pdf_path,
+            *page_num,
+            password.as_deref(),
+            self.cancel.clone(),
+        )
+        .map_err(|message| source_load_error(&item.source, message))?;
+        check_cancel(&self.cancel)?;
+        item.edits.comic_source_dims = crate::pdf_loader::canonical_pdf_raster_dims(content_type)
+            .map(|[width, height]| [width as usize, height as usize]);
+        if item.edits.comic_source_dims.is_none() {
+            return Err("注釈の位置を再現できません。一覧から結合し直してください".into());
+        }
+        Ok(())
+    }
+
     fn run(
         &mut self,
         commands: mpsc::Receiver<Command>,
@@ -236,9 +311,12 @@ impl Worker {
             // Drain only queued requests, preserving Prepare/Remove/Write ordering.
             while let Some(command) = next {
                 match command {
-                    Command::Prepare { id, item } => {
+                    Command::Prepare { id, mut item } => {
                         let start = Instant::now();
-                        let event = match (self.load)(&item, &self.cancel) {
+                        let loaded = self
+                            .prepare_pdf_comic_snapshot(&mut item)
+                            .and_then(|()| (self.load)(&item, &self.cancel));
+                        let event = match loaded {
                             Ok(pixels) => {
                                 let image = &pixels.image;
                                 let dims = image.dimensions();
@@ -282,6 +360,8 @@ impl Worker {
                         let progress = spec.progress.clone();
                         match self.write(&spec) {
                             Ok(Some(path)) => {
+                                let recipe_error =
+                                    save_recipe_stage_c_hook(&path, &spec, &self.items).err();
                                 let _ = progress.send(ExportEvent::Completed(ExportSuccess {
                                     label: path
                                         .file_name()
@@ -290,6 +370,15 @@ impl Worker {
                                         .into_owned(),
                                     path,
                                 }));
+                                if let Some(message) = recipe_error {
+                                    crate::logger::log(format!(
+                                        "image combine recipe save failed: {message}"
+                                    ));
+                                    let _ = progress.send(ExportEvent::Failed(ExportFailure {
+                                        label: "構成の保存".into(),
+                                        message: format!("構成を保存できませんでした。やり直しは使えません: {message}"),
+                                    }));
+                                }
                                 let _ = progress.send(ExportEvent::AllDone);
                             }
                             Ok(None) => {
@@ -509,6 +598,10 @@ impl Worker {
     }
 
     fn write(&mut self, spec: &WriteSpec) -> Result<Option<PathBuf>, String> {
+        // Establish the protected identities before materializing any source.
+        if let Some(path) = &spec.replace {
+            protect_replace_sources(path, &spec.render)?;
+        }
         let encoded = match self.encode(spec) {
             Ok(bytes) => bytes,
             Err(_) if self.cancel.load(Ordering::Relaxed) => return Ok(None),
@@ -519,17 +612,34 @@ impl Worker {
             hook(&self.cancel);
         }
         let (_, extension, _) = encoding_options(spec.render.options.format);
-        let path = write_new(
+        if let Some(path) = &spec.replace {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            let previous = match std::fs::metadata(path) {
+                Ok(metadata) => Some(metadata.modified().map_err(|e| e.to_string())?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.to_string()),
+            };
+            // Final cancellation boundary: once the temporary file starts, finish the write.
+            if self.cancel.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
+            crate::export_batch::write_output(path, &encoded, true)?;
+            crate::export_batch::set_replacement_file_time(
+                path,
+                previous,
+                std::time::SystemTime::now(),
+            )?;
+            return Ok(Some(path.clone()));
+        }
+        write_new(
             &spec.directory,
             &spec.name,
             extension,
             &encoded,
             &self.cancel,
-        )?;
-        if let Some(path) = &path {
-            save_recipe_stage_c_hook(path, &spec.render);
-        }
-        Ok(path)
+        )
     }
 }
 
@@ -610,9 +720,70 @@ fn write_new_with(
     Err("同名ファイルが多すぎます".into())
 }
 
-/// Stage B intentionally does nothing. Stage C stores the recipe here, after
-/// file writing succeeds and before Completed; this seam must not create a DB yet.
-fn save_recipe_stage_c_hook(_path: &Path, _spec: &RenderSpec) {}
+fn save_recipe_stage_c_hook(
+    path: &Path,
+    spec: &WriteSpec,
+    snapshots: &HashMap<usize, LoadedItem>,
+) -> Result<(), String> {
+    // The worker's accepted snapshots are authoritative. UI specs only own the
+    // current order and labels; their recorded canvas may predate this write.
+    let items = spec
+        .render
+        .items
+        .iter()
+        .map(|(id, spec)| {
+            let loaded = snapshots.get(id).ok_or("構成の元画像を特定できません")?;
+            let mut spec = spec.clone();
+            spec.annotation_space = loaded
+                .item
+                .edits
+                .comic_source_dims
+                .map(|[width, height]| {
+                    Ok::<_, String>([
+                        u32::try_from(width).map_err(|_| "注釈の基準寸法が大きすぎます")?,
+                        u32::try_from(height).map_err(|_| "注釈の基準寸法が大きすぎます")?,
+                    ])
+                })
+                .transpose()?;
+            Ok(spec)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    super::store::save_recipe(
+        &spec.data_dir,
+        path,
+        &CombineRecipe {
+            v: 1,
+            options: spec.render.options.clone(),
+            format: spec.render.options.format,
+            items,
+        },
+    )
+}
+
+fn protect_replace_sources(output: &Path, spec: &RenderSpec) -> Result<(), String> {
+    let output_key = crate::adjustment_db::normalize_path(
+        &std::path::absolute(output).map_err(|e| e.to_string())?,
+    );
+    let canonical_output = match output.canonicalize() {
+        Ok(path) => Some(crate::adjustment_db::normalize_path(&path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("保存先を確認できません: {error}")),
+    };
+    for (_, item) in &spec.items {
+        let source = super::store::source_path(&item.source);
+        let absolute = std::path::absolute(source).map_err(|e| e.to_string())?;
+        let canonical = source
+            .canonicalize()
+            .map_err(|e| format!("元ファイルを確認できません: {}: {e}", source.display()))?;
+        if output_key == crate::adjustment_db::normalize_path(&absolute)
+            || canonical_output.as_deref()
+                == Some(crate::adjustment_db::normalize_path(&canonical).as_str())
+        {
+            return Err("元ファイルは上書きしません".into());
+        }
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod image_combine_tests;

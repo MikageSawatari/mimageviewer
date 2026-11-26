@@ -116,6 +116,115 @@ fn image_combine_one_large_stack_production_menu_reads_one_cached_member_count()
 }
 
 #[test]
+fn image_combine_reopen_production_menu_requires_one_real_image_and_uses_checked_target() {
+    let mut app = crate::app::setup_app_for_test();
+    app.items = vec![
+        GridItem::Image(PathBuf::from("C:/images/a.png")),
+        GridItem::Image(PathBuf::from("C:/images/b.png")),
+        GridItem::Video(PathBuf::from("C:/images/c.mp4")),
+        GridItem::ZipImage {
+            zip_path: PathBuf::from("C:/images/book.zip"),
+            entry_name: "page.png".into(),
+        },
+    ];
+    app.visible_indices = (0..app.items.len()).collect();
+    app.move_grid_cursor(Some(0), crate::app::GridCursorIntent::Automatic);
+    app.cached_handlers.insert(".png".into(), Vec::new());
+    app.cached_handlers.insert(".mp4".into(), Vec::new());
+    let ctx = egui::Context::default();
+    for (checked, clicked, expected) in [
+        (vec![], 0, true),
+        (vec![], 2, false),
+        (vec![], 3, false),
+        (vec![1], 2, true),
+        (vec![2], 0, false),
+        (vec![0, 1], 0, false),
+    ] {
+        app.checked = checked.into_iter().collect();
+        assert_eq!(
+            app.image_combine_reopen_visible(Some(clicked), false),
+            expected
+        );
+        let target = app.context_menu_target(
+            clicked,
+            app.items[clicked].clone(),
+            false,
+            !app.checked.is_empty(),
+            None,
+            ContextMenuSurface::Grid,
+            None,
+        );
+        let shown = app.context_menu_nodes(&ctx, &target, false);
+        assert_eq!(
+            shown.iter().any(|node| matches!(
+                node,
+                MenuNode::Item {
+                    command: MenuCommand::CombineReopen,
+                    enabled: true,
+                    ..
+                }
+            )),
+            expected
+        );
+    }
+}
+
+#[test]
+fn image_combine_reopen_production_menu_uses_loaded_index_for_the_effective_image() {
+    let mut app = crate::app::setup_app_for_test();
+    let first = PathBuf::from("C:/images/a.png");
+    let second = PathBuf::from("C:/images/b.png");
+    app.items = vec![
+        GridItem::Image(first.clone()),
+        GridItem::Image(second.clone()),
+    ];
+    app.visible_indices = vec![0, 1];
+    app.move_grid_cursor(Some(0), crate::app::GridCursorIntent::Automatic);
+    app.cached_handlers.insert(".png".into(), Vec::new());
+    app.combine_index.set_keys_for_test(
+        [crate::adjustment_db::normalize_path(&second)]
+            .into_iter()
+            .collect(),
+    );
+    assert!(!app.image_combine_reopen_visible(Some(0), false));
+    assert!(
+        app.image_combine_reopen_disabled_reason(Some(0), false)
+            .is_some()
+    );
+    let ctx = egui::Context::default();
+    for (checked, expected) in [(vec![], false), (vec![1], true)] {
+        app.checked = checked.into_iter().collect();
+        let target = app.context_menu_target(
+            0,
+            app.items[0].clone(),
+            false,
+            !app.checked.is_empty(),
+            None,
+            ContextMenuSurface::Grid,
+            None,
+        );
+        let shown = app.context_menu_nodes(&ctx, &target, false);
+        assert_eq!(
+            shown.iter().any(|node| matches!(
+                node,
+                MenuNode::Item {
+                    command: MenuCommand::CombineReopen,
+                    enabled: true,
+                    ..
+                }
+            )),
+            expected
+        );
+    }
+    app.combine_index.set_keys_for_test(Default::default());
+    assert!(!app.image_combine_reopen_visible(Some(0), false));
+    assert!(
+        app.image_combine_reopen_disabled_reason(Some(0), false)
+            .is_some()
+    );
+}
+
+#[test]
 fn image_combine_tools_production_menu_reuses_snapshot_and_recounts_after_close() {
     let mut app = images();
     let ctx = egui::Context::default();
@@ -137,6 +246,7 @@ fn image_combine_tools_production_menu_reuses_snapshot_and_recounts_after_close(
                 crate::ui_tools_menu::ToolsMenuState {
                     convert_enabled: false,
                     combine_disabled_reason: reason.as_deref(),
+                    combine_reopen_disabled_reason: None,
                     caption_disabled_reason: None,
                     caption_progress_available: false,
                     transcript_disabled_reason: None,

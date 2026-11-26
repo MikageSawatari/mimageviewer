@@ -4,6 +4,7 @@ pub mod label;
 pub mod layout;
 pub mod options;
 pub mod render;
+pub(crate) mod store;
 pub(crate) mod worker;
 
 pub use label::{LabelLayout, PlacedLabel, label_layout, resolve_label};

@@ -5,6 +5,14 @@ pub(super) struct PresetUi {
     selected: Option<String>,
     editing: Option<String>,
 }
+
+#[cfg(test)]
+impl PresetUi {
+    pub(super) fn selected_for_test(&self) -> Option<&str> {
+        self.selected.as_deref()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum PresetAction {
     Save,

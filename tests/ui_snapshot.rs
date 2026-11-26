@@ -30,20 +30,37 @@ use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
 fn image_combine_dialog_default_light() {
-    image_combine_snapshot("image_combine_dialog_default_light", false, true, 1.0);
+    image_combine_snapshot(
+        "image_combine_dialog_default_light",
+        false,
+        true,
+        1.0,
+        false,
+    );
 }
 
 #[test]
 fn image_combine_dialog_band_dark() {
-    image_combine_snapshot("image_combine_dialog_band_dark", true, false, 1.0);
+    image_combine_snapshot("image_combine_dialog_band_dark", true, false, 1.0, false);
 }
 
 #[test]
 fn image_combine_dialog_small_200() {
-    image_combine_snapshot("image_combine_dialog_small_200", true, false, 2.0);
+    image_combine_snapshot("image_combine_dialog_small_200", true, false, 2.0, false);
 }
 
-fn image_combine_snapshot(name: &str, band: bool, light: bool, scale: f32) {
+#[test]
+fn image_combine_dialog_reopen_replace_light() {
+    image_combine_snapshot(
+        "image_combine_dialog_reopen_replace_light",
+        false,
+        true,
+        1.0,
+        true,
+    );
+}
+
+fn image_combine_snapshot(name: &str, band: bool, light: bool, scale: f32, reopen: bool) {
     let mut ready = false;
     let mut harness = test_ui::builder()
         .with_size(egui::vec2(1093.0, 614.0))
@@ -67,7 +84,11 @@ fn image_combine_snapshot(name: &str, band: bool, light: bool, scale: f32) {
             test_ui::full_viewport_ui(ui, |ui| {
                 egui::CentralPanel::default().show(ui, |_| {});
             });
-            mimageviewer::draw_image_combine_snapshot_fixture(ctx, band);
+            if reopen {
+                mimageviewer::draw_image_combine_reopen_snapshot_fixture(ctx);
+            } else {
+                mimageviewer::draw_image_combine_snapshot_fixture(ctx, band);
+            }
         });
     harness.run_steps(12);
     for label in ["書き出す", "キャンセル", "Close window"] {
@@ -77,6 +98,11 @@ fn image_combine_snapshot(name: &str, band: bool, light: bool, scale: f32) {
                 .content_rect()
                 .contains_rect(harness.get_by_label(label).rect())
         );
+    }
+    if reopen {
+        let notice = harness
+            .get_by_label_contains("元の結合画像を置き換えます (元に戻せません): 商品1_結合.jpg");
+        assert!(harness.ctx.content_rect().contains_rect(notice.rect()));
     }
     harness.snapshot(name);
 }

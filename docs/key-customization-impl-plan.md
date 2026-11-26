@@ -767,6 +767,8 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
 ### Grid (Ph4)
 - `GridCombineSelection` は Grid / Press、既定未割り当て、ini 名 `grid_combine_selection`。
   一覧の右クリック・ツールメニューと同じ結合受付を使う。結合ダイアログの Enter は書き出しに使わない。
+- `GridCombineReopen` も Grid / Press、既定未割り当て、ini 名 `grid_combine_reopen`。
+  1件の通常画像の保存済み構成を開く「結合をやり直す...」へ合流し、新規結合とは別に割り当てられる。
 
 - GridSearchNameEverything / GridSearchNameMetadata / GridSearchNameLocal は既定なしのPress（§1.690）。
   既存の検索欄へ名前を入れるだけで、検索を始めない。

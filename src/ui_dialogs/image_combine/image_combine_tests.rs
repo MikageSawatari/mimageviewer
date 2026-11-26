@@ -238,10 +238,10 @@ fn image_combine_preparation_failure_is_retained_until_explicit_removal() {
     let count = state.items.len();
     state.pending.push_back((
         0,
-        ExportBatchTarget::Item {
+        PreparationTarget::Selection(ExportBatchTarget::Item {
             idx: usize::MAX,
             page_key: "missing".into(),
-        },
+        }),
     ));
     app.advance_image_combine_preparation(&mut state);
     assert_eq!(state.items.len(), count);
@@ -348,6 +348,49 @@ fn image_combine_poll_step_finish_refresh_selection_and_toast_exactly_once() {
             .unwrap()
             .restart_requested
     );
+}
+
+#[test]
+fn image_combine_recipe_only_failure_adopts_output_and_requests_index_reload() {
+    let mut app = crate::app::setup_app_for_test();
+    let temp = tempfile::tempdir().unwrap();
+    let output = temp.path().join("joined.png");
+    let stale = "old-output-key".to_string();
+    app.combine_index.set_keys_for_test([stale.clone()].into());
+    app.combine_session = Some(CombineSession::Writing { request: 8 });
+    let (pending, tx) = pending();
+    app.export_pending = Some(pending);
+    tx.send(ExportEvent::Completed(ExportSuccess {
+        label: "joined.png".into(),
+        path: output.clone(),
+    }))
+    .unwrap();
+    tx.send(ExportEvent::Failed(ExportFailure {
+        label: "構成の保存".into(),
+        message: "構成を保存できませんでした。やり直しは使えません".into(),
+    }))
+    .unwrap();
+    tx.send(ExportEvent::AllDone).unwrap();
+    let ctx = egui::Context::default();
+    app.poll_export_pending(&ctx);
+    assert!(app.combine_session.is_none());
+    assert_eq!(
+        app.export_pending.as_ref().unwrap().successes[0].path,
+        output
+    );
+    assert_eq!(
+        app.export_pending.as_ref().unwrap().errors[0].label,
+        "構成の保存"
+    );
+    assert!(
+        matches!(&app.fs_feedback_toast_action, Some(crate::feedback::FeedbackAction::OpenInViewer(path)) if path == &output)
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.combine_index.contains_or_unloaded(&stale) {
+        app.combine_index.poll(temp.path(), &ctx);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -713,6 +756,37 @@ fn image_combine_small_viewports_keep_controls_and_settings_scroll_to_end() {
             let mut h = harness(size, scale, true);
             h.run_steps(12);
             let bounds = h.ctx.content_rect();
+            let [header, body, footer] = h
+                .ctx
+                .data(|data| {
+                    data.get_temp::<[egui::Rect; 3]>(egui::Id::unique("image_combine_fixed_layout"))
+                })
+                .unwrap();
+            assert!(
+                bounds.contains_rect(header),
+                "{size:?}/{scale}: fixed header"
+            );
+            assert!(
+                bounds.contains_rect(footer),
+                "{size:?}/{scale}: fixed footer"
+            );
+            assert!(
+                body.top() >= header.bottom(),
+                "{size:?}/{scale}: header={header:?}, body={body:?}"
+            );
+            assert!(
+                body.bottom() <= footer.top(),
+                "{size:?}/{scale}: body={body:?}, footer={footer:?}"
+            );
+            let window = h
+                .ctx
+                .memory(|memory| memory.area_rect(egui::Id::unique("image_combine_dialog")))
+                .unwrap();
+            let expected_height = 680.0_f32.min(bounds.height() - 40.0);
+            assert!(
+                (window.height() - expected_height).abs() <= 1.0,
+                "{size:?}/{scale}: window={window:?}, bounds={bounds:?}"
+            );
             for label in ["Close window", "書き出す", "キャンセル", "保存..."] {
                 assert!(
                     bounds.contains_rect(h.get_by_label(label).rect()),
@@ -750,6 +824,104 @@ fn image_combine_small_viewports_keep_controls_and_settings_scroll_to_end() {
             h.get_by_label("キャンセル").click();
             h.run_steps(2);
             assert!(h.state().cancels > 0);
+        }
+    }
+}
+
+#[test]
+fn image_combine_reopen_replace_footer_notice_is_fixed_and_tracks_replace() {
+    for size in [egui::vec2(1093.0, 614.0), egui::vec2(1366.0, 728.0)] {
+        for scale in [1.0, 2.0] {
+            let mut h = harness(size, scale, false);
+            h.run_steps(12);
+            let plain_body_height = h
+                .ctx
+                .data(|data| {
+                    data.get_temp::<[egui::Rect; 3]>(egui::Id::unique("image_combine_fixed_layout"))
+                })
+                .unwrap()[1]
+                .height();
+            h.state_mut().dialog.as_mut().unwrap().reopened = Some(ReopenedOutput {
+                path: PathBuf::from("C:/Pictures/元の結合画像_商品一覧.jpg"),
+                format: CombineFormat::Jpeg { quality: 95 },
+                replace: true,
+                has_edits: false,
+            });
+            h.run_steps(12);
+            let notice = "元の結合画像を置き換えます (元に戻せません): 元の結合画像_商品一覧.jpg";
+            let rect = h.get_by_label_contains(notice).rect();
+            let bounds = h.ctx.content_rect();
+            let [header, body, footer] = h
+                .ctx
+                .data(|data| {
+                    data.get_temp::<[egui::Rect; 3]>(egui::Id::unique("image_combine_fixed_layout"))
+                })
+                .unwrap();
+            assert!(
+                bounds.contains_rect(header),
+                "{size:?}/{scale}: fixed header"
+            );
+            assert!(
+                bounds.contains_rect(footer),
+                "{size:?}/{scale}: fixed footer"
+            );
+            assert!(
+                body.top() >= header.bottom(),
+                "{size:?}/{scale}: header={header:?}, body={body:?}"
+            );
+            assert!(
+                body.bottom() <= footer.top(),
+                "{size:?}/{scale}: body={body:?}, footer={footer:?}"
+            );
+            let window = h
+                .ctx
+                .memory(|memory| memory.area_rect(egui::Id::unique("image_combine_dialog")))
+                .unwrap();
+            let expected_height = 680.0_f32.min(bounds.height() - 40.0);
+            assert!(
+                (window.height() - expected_height).abs() <= 1.0,
+                "{size:?}/{scale}: window={window:?}, bounds={bounds:?}"
+            );
+            assert!(
+                body.height() < plain_body_height,
+                "notice must shrink the body rather than expand the Window"
+            );
+            assert!(
+                bounds.contains_rect(rect),
+                "{size:?}/{scale}: replacement notice"
+            );
+            for label in ["書き出す", "キャンセル", "Close window", "保存..."] {
+                assert!(
+                    bounds.contains_rect(h.get_by_label(label).rect()),
+                    "{size:?}/{scale}: {label}"
+                );
+            }
+            let scroll = h
+                .ctx
+                .data(|data| {
+                    data.get_temp::<ScrollLayout>(egui::Id::unique("image_combine_scroll_layout"))
+                })
+                .unwrap();
+            assert!(
+                !scroll.inner.intersects(rect),
+                "replacement notice belongs to the fixed footer"
+            );
+            let state = h.state_mut().dialog.as_mut().unwrap();
+            assert!(status_text(state).starts_with("出力 "));
+            state.reopened.as_mut().unwrap().replace = false;
+            h.run_steps(12);
+            let restored_body_height = h
+                .ctx
+                .data(|data| {
+                    data.get_temp::<[egui::Rect; 3]>(egui::Id::unique("image_combine_fixed_layout"))
+                })
+                .unwrap()[1]
+                .height();
+            assert!(restored_body_height > body.height());
+            assert!(
+                h.query_by_label_contains("元の結合画像を置き換えます")
+                    .is_none()
+            );
         }
     }
 }

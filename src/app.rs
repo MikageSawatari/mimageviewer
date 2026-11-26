@@ -17303,6 +17303,7 @@ pub struct App {
     pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
     pub(crate) combine_session: Option<crate::ui_dialogs::image_combine::CombineSession>,
     pub(crate) combine_request_sequence: u64,
+    pub(crate) combine_index: Box<crate::image_combine::store::CombineIndex>,
     /// Snapshot owned by one open Tools menu; cleared when its body closes.
     pub(crate) combine_tools_menu_owner:
         Option<crate::ui_dialogs::context_menu::GridContextMenuOwner>,
@@ -21362,6 +21363,7 @@ impl App {
             export_batch_dialog: None,
             combine_session: None,
             combine_request_sequence: 0,
+            combine_index: Default::default(),
             combine_tools_menu_owner: None,
             #[cfg(test)]
             combine_eligibility_work: Default::default(),

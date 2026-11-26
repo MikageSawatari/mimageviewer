@@ -399,6 +399,26 @@ fn draw_labels(ui: &mut egui::Ui, o: &mut LabelOptions) {
 
 fn draw_output(ui: &mut egui::Ui, state: &mut CombineDialogState, action: &mut Action) {
     ui.strong("出力");
+    let blocked = state.replacement_is_source();
+    if let Some(output) = &mut state.reopened {
+        ui.add_enabled_ui(!blocked, |ui| {
+            ui.checkbox(&mut output.replace, "元の結合画像を置き換える");
+        });
+        if blocked {
+            ui.small("元の結合画像が素材に含まれるため、置き換えできません");
+        }
+        if output.replace {
+            ui.small("元の画像を書き換えます。この操作は元に戻せません");
+            if output.has_edits {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "この画像の注釈などの編集は残ります。配置を変えると位置がずれます",
+                );
+            }
+        }
+    }
+    state.enforce_replacement_target();
+    let replacing = state.replacement_path().is_some();
     let o = &mut state.options;
     let (mut mode, mut size) = match o.output_size {
         OutputSize::Original => (0, 2048),
@@ -427,12 +447,14 @@ fn draw_output(ui: &mut egui::Ui, state: &mut CombineDialogState, action: &mut A
         CombineFormat::Webp { .. } => 2,
     };
     let previous = format;
-    combo(
-        ui,
-        "形式",
-        &mut format,
-        &[(0, "PNG"), (1, "JPEG"), (2, "WebP")],
-    );
+    ui.add_enabled_ui(!replacing, |ui| {
+        combo(
+            ui,
+            "形式",
+            &mut format,
+            &[(0, "PNG"), (1, "JPEG"), (2, "WebP")],
+        )
+    });
     if previous != format {
         o.format = match format {
             1 => CombineFormat::Jpeg { quality: 95 },
@@ -452,31 +474,102 @@ fn draw_output(ui: &mut egui::Ui, state: &mut CombineDialogState, action: &mut A
         _ => {}
     }
     if let CombineFormat::Webp { lossless, .. } = &mut o.format {
-        ui.checkbox(lossless, "可逆圧縮");
+        ui.add_enabled_ui(!replacing, |ui| ui.checkbox(lossless, "可逆圧縮"));
     }
     if format == 1 && o.background == Background::Transparent {
         o.background = Background::Color([255; 3]);
     }
     ui.small("元の情報 (EXIF・AI プロンプトなど) は書きません");
-    let first = matches!(o.destination, Destination::FirstImageFolder);
-    if ui.radio(first, "先頭の画像のフォルダ").clicked() {
-        o.destination = Destination::FirstImageFolder;
-    }
-    if ui.radio(!first, "指定のフォルダ").clicked() {
-        o.destination = Destination::Folder(PathBuf::from(state.folder_text.trim()));
-    }
-    if let Destination::Folder(path) = &mut o.destination {
-        ui.label("保存先フォルダ");
-        if text(
-            ui,
-            &mut state.folder_text,
-            "image_combine_folder",
-            ui.available_width(),
-        )
-        .changed()
-        {
-            *path = PathBuf::from(state.folder_text.trim());
+    ui.add_enabled_ui(!replacing, |ui| {
+        let first = matches!(o.destination, Destination::FirstImageFolder);
+        if ui.radio(first, "先頭の画像のフォルダ").clicked() {
+            o.destination = Destination::FirstImageFolder;
         }
-        action.pick_folder |= ui.button("変更...").clicked();
+        if ui.radio(!first, "指定のフォルダ").clicked() {
+            o.destination = Destination::Folder(PathBuf::from(state.folder_text.trim()));
+        }
+        if let Destination::Folder(path) = &mut o.destination {
+            ui.label("保存先フォルダ");
+            if text(
+                ui,
+                &mut state.folder_text,
+                "image_combine_folder",
+                ui.available_width(),
+            )
+            .changed()
+            {
+                *path = PathBuf::from(state.folder_text.trim());
+            }
+            action.pick_folder |= ui.button("変更...").clicked();
+        }
+    });
+}
+
+#[cfg(test)]
+mod image_combine_tests {
+    use super::*;
+    use egui_kittest::kittest::{NodeT, Queryable};
+
+    #[test]
+    fn image_combine_replace_output_controls_lock_target_and_show_edit_warning() {
+        let ctx = egui::Context::default();
+        let mut state = super::super::fixture_state(&ctx, false);
+        state.reopened = Some(ReopenedOutput {
+            path: PathBuf::from("C:/Pictures/combined.jpg"),
+            format: CombineFormat::Jpeg { quality: 95 },
+            replace: true,
+            has_edits: true,
+        });
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(700.0, 900.0))
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .build_ui_state(
+                |ui, state: &mut CombineDialogState| {
+                    let mut action = Action::default();
+                    draw_output(ui, state, &mut action);
+                    super::super::draw_footer(ui, state, &mut action);
+                },
+                state,
+            );
+        harness.run();
+        assert!(
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::TextInput, "名前")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(
+            harness
+                .get_by_label("指定のフォルダ")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(
+            harness
+                .get_by_label("変更...")
+                .accesskit_node()
+                .is_disabled()
+        );
+        harness.get_by_label("この画像の注釈などの編集は残ります。配置を変えると位置がずれます");
+        assert!(
+            !harness
+                .get_by_label("元の結合画像を置き換える")
+                .accesskit_node()
+                .is_disabled()
+        );
+        harness.get_by_label("元の結合画像を置き換える").click();
+        harness.run();
+        assert!(
+            !harness
+                .get_by_role_and_label(egui::accesskit::Role::TextInput, "名前")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(
+            !harness
+                .get_by_label("変更...")
+                .accesskit_node()
+                .is_disabled()
+        );
     }
 }

@@ -1047,6 +1047,13 @@ impl App {
             {
                 self.open_image_combine_dialog(ctx);
             }
+            if self.fullscreen_idx.is_none()
+                && self
+                    .keymap
+                    .consume_action(ctx, KeyAction::GridCombineReopen)
+            {
+                self.open_image_combine_reopen_context_dialog(ctx, self.selected, false);
+            }
         }
 
         // ── Ctrl+S: お気に入り検索バー表示 ───────────────────────────

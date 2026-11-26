@@ -10439,8 +10439,10 @@ impl App {
                         TopMenuId::Tools => {
                             let response = ui.menu_button(TopMenuId::Tools.label(), |ui| {
                                 let combine_reason = self.combine_tools_menu_disabled_reason();
+                                let combine_reopen_reason = self.image_combine_reopen_disabled_reason(self.selected, false);
                                 let state = crate::ui_tools_menu::ToolsMenuState {
                                     combine_disabled_reason: combine_reason.as_deref(),
+                                    combine_reopen_disabled_reason: combine_reopen_reason.as_deref(),
                                     convert_enabled: self.grid_item_input_allowed() && convert_target_count > 0
                                         && self.archive_convert.is_none()
                                         && self.batch_convert.is_none()
@@ -10460,6 +10462,7 @@ impl App {
                                 match command {
                                     MenuCommandId::ConvertToZip => self.start_batch_convert_to_zip(),
                                     MenuCommandId::ToolsCombineImages => self.open_image_combine_dialog(ctx),
+                                    MenuCommandId::ToolsCombineReopen => self.open_image_combine_reopen_context_dialog(ctx, self.selected, false),
                                     MenuCommandId::ToolsCreateAiCaptions => self.request_create_ai_captions(ctx, false),
                                     MenuCommandId::ToolsShowCaptionProgress => self.show_caption_progress = true,
                                     MenuCommandId::ToolsCreateTranscripts => self.request_create_transcripts(ctx, false),

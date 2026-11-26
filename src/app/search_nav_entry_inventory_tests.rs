@@ -272,6 +272,7 @@ fn key_entry(action: KeyAction) -> Entry {
         | GridAddToActiveBook
         | GridAddToCollectionTarget
         | GridCombineSelection
+        | GridCombineReopen
         | GridExportSelection
         | GridColumnCount1
         | GridColumnCount2
@@ -674,6 +675,7 @@ fn menu_entry(action: MenuCommandId) -> MenuEntry {
         | TagsManagePinned
         | ConvertToZip
         | ToolsCombineImages
+        | ToolsCombineReopen
         | ToolsCreateAiCaptions
         | ToolsShowCaptionProgress
         | ToolsCreateTranscripts

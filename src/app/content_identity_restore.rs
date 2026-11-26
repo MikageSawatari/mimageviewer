@@ -417,6 +417,9 @@ impl App {
         // Successful restores publish ledger entries incrementally below; they
         // do not require an authoritative ledger reload. Captions are shared
         // across viewer contexts and must still reflect the committed copies.
+        if report.store_mutations.combine_index_stale() {
+            self.combine_index.mark_stale();
+        }
         self.caption_display.invalidate_rotation_keys(
             report
                 .store_mutations
@@ -892,6 +895,58 @@ mod tests {
             entry.tags.as_deref(),
             Some(["#current".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn image_combine_restore_completion_reloads_recipe_index_without_ledger_reload() {
+        let mut app = crate::app::setup_app_for_test();
+        if let Some(pending) = app.content_identity_index_load_pending.take() {
+            pending.cancel();
+        }
+        app.settings.edit_restore_prompt_enabled = true;
+        app.content_identity_ledger_state =
+            crate::content_identity::ContentIdentityLedgerState::Ready;
+        app.combine_index.set_keys_for_test(Default::default());
+        let output = app.tmp.path().join("restored.png");
+        let recipe = crate::image_combine::CombineRecipe {
+            v: 1,
+            options: Default::default(),
+            format: crate::image_combine::CombineFormat::Png,
+            items: vec![crate::image_combine::CombineItemSpec {
+                annotation_space: None,
+                source: crate::image_combine::CombineSourceRef::File {
+                    path: app.tmp.path().join("source.png"),
+                },
+                label_override: None,
+            }],
+        };
+        let data_dir = app.tmp.path().to_path_buf();
+        crate::image_combine::store::save_recipe(&data_dir, &output, &recipe).unwrap();
+        let mut effects = crate::rename_key_migration::StoreMutationEffects::default();
+        effects.record_rows_changed(
+            crate::rename_key_migration::STORES
+                .iter()
+                .find(|descriptor| descriptor.file == "combine.db")
+                .unwrap(),
+            1,
+        );
+        let (tx, rx) = mpsc::channel();
+        tx.send(crate::content_identity::ContentRestoreReport {
+            store_mutations: effects,
+            ..Default::default()
+        })
+        .unwrap();
+        app.content_identity_restore_pending = Some(ContentIdentityRestorePending { rx });
+        let ctx = egui::Context::default();
+        app.poll_content_identity_restore(&ctx);
+        assert!(app.content_identity_index_load_pending.is_none());
+        let key = crate::adjustment_db::normalize_path(&output);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !app.combine_index.contains_or_unloaded(&key) {
+            app.combine_index.poll(&data_dir, &ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
     }
 
     #[test]
