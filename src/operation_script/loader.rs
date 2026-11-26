@@ -244,7 +244,9 @@ impl OperationScriptLoader {
                     self.state = match result.script {
                         Ok(script) => OperationScriptState::Ready(Box::new(script)),
                         Err(error) => {
-                            crate::logger::log(format!("operation script: {error}"));
+                            // The result is consumed once. Share the Open/Reset
+                            // notification path; App logs and shows the error.
+                            notifications.push(format!("スクリプトを読み込めません: {error}"));
                             OperationScriptState::Failed(error)
                         }
                     };
@@ -650,8 +652,12 @@ mod tests {
                 .is_ok()
         );
         let notifications = loader.poll();
-        assert_eq!(notifications.len(), 1);
-        assert!(notifications[0].contains("after latest load"));
+        assert_eq!(notifications.len(), 2);
+        assert_eq!(
+            notifications[0],
+            "スクリプトを読み込めません: latest reason"
+        );
+        assert!(notifications[1].contains("after latest load"));
         assert!(
             matches!(&loader.state, OperationScriptState::Failed(reason) if reason == "latest reason")
         );
@@ -857,12 +863,15 @@ mod tests {
         let mut empty_loader = TestLoader::new(temp.path());
         empty_loader.sync_enabled(true, temp.path(), &ctx);
         empty_loader.finish();
-        assert!(empty_loader.poll().is_empty());
+        let notifications = empty_loader.poll();
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0].starts_with("スクリプトを読み込めません:"));
         assert!(matches!(
             empty_loader.state,
             OperationScriptState::Failed(_)
         ));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "");
+        assert!(empty_loader.poll().is_empty());
     }
 
     #[test]

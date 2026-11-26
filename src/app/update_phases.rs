@@ -2570,6 +2570,117 @@ impl App {
 mod operation_script_file_service_tests {
     use crate::operation_script::{OperationScriptLoader, OperationScriptState};
 
+    fn app_for_load_notification_test(source: &str) -> crate::app::AppTestEnvForTest {
+        // This fixture owns data-dir/DB isolation; never acquire its lock again.
+        let mut app = crate::app::setup_app_for_test();
+        let path = crate::operation_script::script_path(app.tmp.path());
+        std::fs::write(&path, source).unwrap();
+        app.settings.operation_script_enabled = true;
+        app.operation_script = OperationScriptLoader::with_file_worker(path, |_| Ok(()), || {});
+        app
+    }
+
+    #[test]
+    fn operation_script_current_load_failure_is_notified_once_as_error() {
+        let mut app = app_for_load_notification_test("fn slots( {");
+        let data_dir = app.tmp.path().to_path_buf();
+        let ctx = egui::Context::default();
+        app.operation_script.reload(&data_dir, &ctx);
+        // Complete all work before assertions or the isolated profile is dropped.
+        app.operation_script.shutdown_file_worker_for_test();
+        app.feedback_toasts_for_test.clear();
+        app.service_operation_script_files(&ctx);
+        let OperationScriptState::Failed(reason) = &app.operation_script.state else {
+            panic!("current failed load must be adopted");
+        };
+        assert!(reason.contains("コンパイル"));
+        assert_eq!(app.feedback_toasts_for_test.len(), 1);
+        assert_eq!(
+            app.feedback_toasts_for_test[0].0,
+            format!("スクリプトを読み込めません: {reason}")
+        );
+        assert_eq!(
+            app.feedback_toasts_for_test[0].1,
+            crate::feedback::FeedbackKind::Error
+        );
+        app.service_operation_script_files(&ctx);
+        app.service_operation_script_files(&ctx);
+        assert_eq!(app.feedback_toasts_for_test.len(), 1);
+    }
+
+    #[test]
+    fn operation_script_stale_load_failure_is_not_notified_before_latest_success() {
+        let mut app = app_for_load_notification_test("fn slots( {");
+        let data_dir = app.tmp.path().to_path_buf();
+        let path = crate::operation_script::script_path(&data_dir);
+        let replacement_path = path.clone();
+        let requests = std::cell::Cell::new(0);
+        app.operation_script = OperationScriptLoader::with_file_worker(
+            path,
+            |_| Ok(()),
+            move || {
+                let request = requests.get();
+                requests.set(request + 1);
+                if request == 1 {
+                    // Same FIFO: only the second load sees valid source. The first
+                    // failed result stays queued until both generations are complete.
+                    std::fs::write(&replacement_path, "fn slots() { [] }").unwrap();
+                }
+            },
+        );
+        let ctx = egui::Context::default();
+        app.operation_script.reload(&data_dir, &ctx);
+        app.operation_script.reload(&data_dir, &ctx);
+        app.operation_script.shutdown_file_worker_for_test();
+        app.feedback_toasts_for_test.clear();
+        app.service_operation_script_files(&ctx);
+        assert!(matches!(
+            app.operation_script.state,
+            OperationScriptState::Ready(_)
+        ));
+        assert!(app.feedback_toasts_for_test.is_empty());
+        app.service_operation_script_files(&ctx);
+        assert!(app.feedback_toasts_for_test.is_empty());
+    }
+
+    #[test]
+    fn operation_script_load_failure_received_after_off_is_not_notified() {
+        let mut app = app_for_load_notification_test("fn slots( {");
+        let data_dir = app.tmp.path().to_path_buf();
+        let ctx = egui::Context::default();
+        app.operation_script.reload(&data_dir, &ctx);
+        app.operation_script.shutdown_file_worker_for_test();
+        app.settings.operation_script_enabled = false;
+        app.feedback_toasts_for_test.clear();
+        // The production service invalidates the load before draining its result.
+        app.service_operation_script_files(&ctx);
+        assert!(matches!(
+            app.operation_script.state,
+            OperationScriptState::Disabled
+        ));
+        assert!(app.feedback_toasts_for_test.is_empty());
+        app.service_operation_script_files(&ctx);
+        assert!(app.feedback_toasts_for_test.is_empty());
+    }
+
+    #[test]
+    fn operation_script_successful_load_is_not_notified() {
+        let mut app = app_for_load_notification_test("fn slots() { [] }");
+        let data_dir = app.tmp.path().to_path_buf();
+        let ctx = egui::Context::default();
+        app.operation_script.reload(&data_dir, &ctx);
+        app.operation_script.shutdown_file_worker_for_test();
+        app.feedback_toasts_for_test.clear();
+        app.service_operation_script_files(&ctx);
+        assert!(matches!(
+            app.operation_script.state,
+            OperationScriptState::Ready(_)
+        ));
+        assert!(app.feedback_toasts_for_test.is_empty());
+        app.service_operation_script_files(&ctx);
+        assert!(app.feedback_toasts_for_test.is_empty());
+    }
+
     #[test]
     fn operation_script_file_failures_are_notified_while_disabled_and_drained_once() {
         // setup_app_for_test owns the single data-dir/DB isolation lock. The

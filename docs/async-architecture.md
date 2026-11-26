@@ -11,6 +11,7 @@ Loadは無ければcreate_newで雛形作成 → 読む → compile → slots()�
 
 ROOTのpollはDisabled / Loading / Ready / Failedに関係なく毎frame受け口をdrainする。
 Load結果は現在のLoadingのgenerationと一致する時だけ採用する。古い結果を捨てた後もdrainを続けて最新結果を採る。
+採用するLoad結果が失敗なら、その受信時に一度だけOpen/Resetと同じ経路でログと通知を出す。通知済みの状態は持たず、古い世代やOFF後の結果は通知しない。
 OFFでは世代を進めてLoad採用資格を失わせるが、workerとreceiverは保持する。
 Open / Resetの失敗はOFFや読み込み中でもログと通知にする。まれな失敗は復旧状態を増やさず通知で終える。
 初回の有効化・起動時・Reloadとも、ファイル欠落は雛形を作って読む。雛形のon_eventも実行対象となる。
