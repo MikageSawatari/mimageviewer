@@ -5,7 +5,7 @@
 - ブランチ / worktree: `fisheye-917` / `G:\home\mimageviewer-fisheye917` (基点 master `f2e332bb8`)。
 - 役割: 設計・作業指示・検収 = ClaudeCode Opus 5.5、実装 = Codex GPT-6.1 Sol / high、
   独立レビュー = 実装者とは別の GPT-6.1 Sol / xhigh (AGENTS.md)。
-- 状態: 設計 R1 (独立設計レビュー R1 の指摘を反映、§14)。製品コードは未変更。
+- 状態: 設計 R2 (独立設計レビュー R1・R2 の指摘を反映、§14)。製品コードは未変更。
 
 ## 0. 利用者の決定 (2026-11-27、設計担当のセッションで直接)
 
@@ -117,9 +117,19 @@ pub(crate) struct PlaneViewState {
 enum PlaneColorPhase {
     /// まだ写していない。描く frame は 2D (§5.2)。
     Empty,
-    /// 2D の素材の TextureHandle はあるが renderer への登録がまだ。前の写しがあればそれで描く。
-    Pending { texture_id: egui::TextureId, previous: Option<Arc<PlaneGpuResources>> },
-    Ready(Arc<PlaneGpuResources>),      // 鍵 = 写し元の TextureId
+    /// 選ばれた素材の TextureHandle はあるが renderer への登録がまだ。
+    /// 前の素材 (幾何と一体) があればそれで描く (§5.2)。
+    Pending { texture_id: egui::TextureId, previous: Option<Arc<PlaneMaterial>> },
+    Ready(Arc<PlaneMaterial>),
+}
+
+/// 写しと、その写しを正しく描くための幾何を一体で持つ。別々に持たない。
+struct PlaneMaterial {
+    texture_id: egui::TextureId,        // 写し元
+    gpu: PlaneGpuResources,             // mip の写しと、それを参照する不変の bind group (§5.3)
+    coverage: egui::Rect,               // 素材が収録する元画像の範囲 (部分素材なら全体の一部)
+    sampler_roi: egui::Rect,            // native の sampler の範囲 (2D の material_source の計算と同じ入力)
+    layout_basis: PlaneLayoutBasis,     // 2D の変換の解決に使う配置の基準 (layout source の寸法・表示の基準)
 }
 ```
 
@@ -144,9 +154,11 @@ enum PlaneColorPhase {
   (`fullscreen_wheel_zoom_step` の設定どおり)。**ズームの基準点はカーソルではなくレンズの中心**。レンズの中心は歪みの不動点で、
   そこでの倍率は 2D の倍率と同じ (§5.1) なので、2D の「基準点を固定するズーム」の計算がそのまま正しい。
   strength が 1 になった後は倍率だけ上がる。
-- **離れる (notches < 0)**: PlaneView 中なら `strength = max(0, strength + notches / 8)`、倍率も同じ量だけ下げる
-  (基準点はレンズの中心)。strength が 0 になったら PlaneView を終え、その segment の残りの量は使わない。
-  PlaneView でないときは何もしない (今と同じ)。
+- **離れる (notches < 0)**: PlaneView 中なら、先に使う量 `used = max(notches, −8 × strength)` を決め、
+  `strength = strength + used / 8`、倍率も `used` ぶんだけ下げる (`apply_wheel_zoom` に `used × WHEEL_ZOOM_POINTS_PER_NOTCH`
+  を渡す。基準点はレンズの中心)。strength が 0 になったら PlaneView を終え、残り (`notches − used`) は使わない。
+  これで分割した segment と合算した segment が同じ結果になる。PlaneView でないときは何もしない (今と同じ)。
+- 既存の segment は逆向きのイベントも合算するので、「分割と合算で同じ結果」は同じ向き・飽和しない範囲での性質とする (§10)。
 - 入口条件を満たさないときの寄る操作は何もしない (今と同じ)。理由は既存の `show_fullscreen_nav_noop` の流儀で出し、
   同じ理由の続けての表示の扱いも既存に従う (新しい時間窓は作らない)。
 - 先にホイールを取る既存のモード (360 度・Z の全画面ズーム・分析・編集モード・パネル上・ポップアップ) は今のまま
@@ -156,8 +168,15 @@ enum PlaneColorPhase {
 を作る。入力は「今の PlaneView (無し / strength・中心・anchor)・今の表示単位・zoom・pan・カーソル・canvas・`notches`・入口条件の結果」、
 出力は「PlaneView の有無・strength・中心・zoom・pan」。今の予測 (`predict_fs_wheel_frame`) と実適用
 (`apply_fs_wheel_frame_proposal`) の両方がこれを呼び、クリックの分類 (変換の有無) もこの出力を含めて決める
-(予測の結果に PlaneView の有無を足す)。実適用のループが途中の segment でページを移した場合、次の segment を処理する前に
-anchor を照合し、違えば PlaneView を終えてから次を処理する (古い anchor のまま次のページで強さを足さない)。
+(予測の結果に PlaneView の有無を足す)。
+
+**ページ送りをまたぐ frame の規則 (組み合わせを減らす)**: 同じ frame の segment の中で、ページ送りを要求する action の
+**後に来た** Ctrl+Shift の量と `FsFisheyeIn/Out` は、**予測でも実適用でも使わない** (捨てる)。予測は今のページのまま
+後続を評価するが、実適用はループの中で実際にページを移すので、ページ送りの後の魚眼の遷移は両者で食い違う
+(例: 適格な静止画 A → 通常のホイールで動画 B → Ctrl+Shift 上。予測は A で入場、実適用は B で拒否)。
+ページ送りの前の量は通常どおり使い、ページが移ったら §4.2 で PlaneView は終わる。クリックの分類は、その frame の
+計画元の表示単位に束縛し、実適用の時点で表示単位が変わっていれば予測の結果を再利用しない。
+実適用のループが途中でページを移した場合も、次の segment の前に anchor を照合し、違えば PlaneView を終える。
 
 魚眼中のほかのズーム入力 (Ctrl+ホイール・中ボタン・Ctrl+Space のスクラブはカーソル基準、`FsZoomIn/Out` は表示中央基準。
 ナビゲータは休止中) は strength を変えず、倍率だけを今の計算で変える。**既知の挙動**: 基準点がレンズの中心でないときは、
@@ -225,6 +244,8 @@ ParkedLive の snapshot 前、pause・park・terminal close。実装担当は De
 「Depth 専用の理由で終える経路」(モデル確認・書き出しの modal 等) と「表示の持ち主が変わるので終える経路」を分け、後者を
 `FsExclusiveView` の占有の値 (Depth と PlaneView) に共通の helper `retire_exclusive_view_for_owner_change` へまとめる。
 scoped mount で保持する経路は、Depth が保持しているものと同じにする。
+共通 helper の対象は **Depth と PlaneView だけ** とし、Panorama の既存の終了・intent の保持と、Depth の再入場の通知は変えない
+(独立設計レビュー R2 の合意の条件。実装レビューで確かめる)。
 
 ## 4. ほかの機能との関係 (状態の組み合わせを減らす)
 
@@ -314,11 +335,17 @@ Z の全画面ズーム (照準・確定)、紙めくりの最中、3D 写真・
 5. **2D の画面の点** `q = c + (R / k) · L`。
 6. `q` を 2D の逆写像にかける: 自由回転を戻した **paint 四角形の局所座標 `in_uv`** → 90 度回転 → トリム → source UV
    (3D 写真と同じ式)。
-7. 色は `textureSampleGrad(source_uv, dpdx(source_uv), dpdy(source_uv))`。微分は 1〜6 の非線形写像の結果に対して、
+7. **source UV → 素材の texture UV**: 2D の `SourceRegionTextureQuad` (displayed_image_transform.rs:986〜1005) と同じく、
+   `material_source = normalized_sub_rect(coverage, sampler_roi)` を使って
+   `tex_uv = (source_uv − material_source.min) / material_source.size` とする。`source_uv` が `coverage ∩ material_source` の外なら無効
+   (部分素材が収録していない範囲。例: coverage `[.25,.75]` で source UV `.3` は texture UV `.1`、source UV `.2` は無効)。
+   `coverage`・`sampler_roi` は描く素材の `PlaneMaterial` の値を uniform に渡す。
+8. 色は `textureSampleGrad(tex_uv, dpdx(tex_uv), dpdy(tex_uv))`。微分は 1〜7 の非線形写像の最終結果 (`tex_uv`) に対して、
    一様な制御フローで (分岐や早い return の前に) 取る。
-8. 最後に有効性の印を適用する: 1・3 の無効、または `in_uv ∉ [0,1]²` (**表示トリムの外を含む。source UV の範囲では判定しない**)
-   なら透明 (premultiplied で 0)。透過部分には下地 (黒・白・市松。画像の左上を原点とする升目は 3D 写真と同じ規則) を合成する。
-   透明の画素は egui が描いている背景がそのまま見える。
+9. 最後に有効性の印を適用する: 1・3・7 の無効、または `in_uv ∉ [0,1]²` (**表示トリムの外を含む。source UV の範囲では判定しない**)
+   なら透明 (premultiplied で 0)。透過部分には下地 (黒・白・市松) を合成する。下地は **canvas の物理座標** で計算する
+   (升目の原点は 2D の画像の左上、升目の大きさは画面の値のまま)。書き出しでも出力の画素を canvas の座標へ戻してから同じ式を使うので、
+   升目を出力の寸法の比で拡大縮小し直さない (§6.1)。透明の画素は egui が描いている背景がそのまま見える。
 
 性質 (テストで固定する):
 
@@ -341,9 +368,18 @@ Z の全画面ズーム (照準・確定)、紙めくりの最中、3D 写真・
   - PlaneView の採用は、単ページ描画の中で resampler の準備より前に決め (3D 写真の採用と同じ位置)、パン・初期配置の確定は
     共通の境界 (`commit_fs_single_page_placement`) を通す。PlaneView 中も 2D の素材選択 (final / provisional / 元画像の
     押している間 / RAW の現像前後 / PDF の再ラスタ前後) は変えない。
-  - 選ばれた素材の `TextureId` が `Ready` の鍵と同じなら、その写しで描く。違えば写し直す。renderer への登録がまだ
-    (`TexturePending` と同じ状況) なら `Pending` にし、前の写し (`previous`) があればそれで描く。無ければ (入った最初の frame 等)
-    その frame は 2D で描く。素材が `NativeOnly` 等で元の `TextureHandle` が無い場合も 2D で描き、PlaneView は続ける。
+  - 選ばれた素材の `TextureId` が `Ready` の鍵と同じなら、その `PlaneMaterial` で描く。違えば写し直して `Ready` を置き換える。
+  - renderer への登録がまだ (3D 写真の `TexturePending` と同じ状況。新しく読み込んだ素材は UI の処理の後に登録される) なら
+    `Pending` にし、**所有する viewport の次の pass を要求する** (`ctx.request_repaint_of(viewport)`、depth_view.rs:1470 と同じ。
+    タイマーや再試行ではなく、通常の登録の境界を進めるため)。その frame は:
+    - 前の素材 (`previous`) があり、その `layout_basis` が今の素材と同じなら、**前の素材と、その素材自身の幾何
+      (coverage・sampler_roi・layout_basis) と、今の表示状態 (zoom・pan・回転・canvas)** で 2D の変換を解決し直して描く。
+      PDF の倍率由来の再ラスタ・RAW の現像完了・補正の完了で、魚眼の途中に歪みの無い絵が 1 frame 挟まらないようにするため
+      (通常の操作で毎回起き得るので、まれな失敗ではない)。
+    - `previous` が無い、または `layout_basis` が違うなら、その frame は 2D で描く。
+  - 素材が `NativeOnly` 等で元の `TextureHandle` が無い場合は 2D で描き、PlaneView は続ける。
+  - **描いた結果の記録**: 各 frame の描画の確定時に、PlaneView で描いたなら `last_drawn = Some(snapshot)`、2D で描いたなら
+    `last_drawn = None` にする。2D で描いた frame の後に古い魚眼の snapshot を保存しないため (§6.1)。
   - 写しを作れない (形式が `Rgba8Unorm` でない等) ときは PlaneView を終えて理由を通知する (silent fallback にしない)。
 - sampler は linear + mipmap linear。異方性フィルタは使える環境なら 16 (実装担当が wgpu の features を確かめ、無ければ無し)。
 - 2D の `paint_image_underlay` は PlaneView で描いた frame では描かない (shader が描く)。2D で描いた frame は今どおり。
@@ -352,22 +388,27 @@ Z の全画面ズーム (照準・確定)、紙めくりの最中、3D 写真・
 
 ### 5.3 資源の持ち主と寿命
 
-- **共有するもの**: 不変の pipeline・blit / mip の copier (renderer ごとに 1 つ、`CallbackResources` に置いてよい)。
-- **context ごとのもの**: mip の写し・bind group は `Arc<PlaneGpuResources>` にまとめ、`PlaneColorPhase` が持つ。
+- **bind group を 2 つに分ける**: group 0 = 素材 (mip の写しの view と sampler。不変)、group 1 = uniform。
+  3D 写真の bind group は uniform を同じ group に含む (depth_parallax_wgpu.rs:785) ので、そのまま流用しない。
+- **共有するもの**: 不変の pipeline (**target format ごと**。画面の surface は `Bgra8Unorm` も選ばれ
+  (vendor/egui-wgpu/src/lib.rs:537)、書き出しは `Rgba8Unorm` 固定のため)・blit / mip の copier。renderer ごとに `CallbackResources`
+  に置いてよい。書き出しの worker には、書き出し用の format の pipeline の不変の `Arc` を渡す。
+- **context ごとのもの**: `PlaneMaterial` (mip の写し・group 0 の bind group・幾何) を `Arc` で `PlaneColorPhase` が持つ。
   egui_wgpu の `CallbackResources` に context 共通の slot を置かない (3D 写真の slot は 1 context 前提。PlaneView は複数の窓で
   同時に使え、同じ renderer を共有する viewport が並ぶ)。
-- **uniform は callback ごと**: 画面の callback は自分の uniform buffer を持ち (`Arc` で callback が保持)、`prepare` でそれに書く。
-  書き出しは別の uniform を持つ (§6)。画面と書き出しで uniform を共有しない。
-- **frame snapshot**: 描画で PlaneView を採用した frame で、`PlaneFrameSnapshot` (context・anchor の表示単位・素材の `TextureId`・
-  `Arc<PlaneGpuResources>`・canvas の物理矩形と `pixels_per_point`・5.1 の全 uniform の値・下地と背景の色) を不変の `Arc` として
-  確定し、callback と `PlaneViewState::last_drawn` が同じものを持つ。
+- **uniform は callback ごと**: 画面の callback は自分の uniform buffer と group 1 の bind group を持ち (`Arc` で callback が保持)、
+  `prepare` でそれに書く。書き出しは別の uniform と group 1 を持つ (§6)。画面と書き出しで uniform を共有しない。
+- **frame snapshot**: 描画で PlaneView を採用した frame で、`PlaneFrameSnapshot` (context・anchor の表示単位・
+  描いた `Arc<PlaneMaterial>` (実際に描いた素材。§5.2 の前の素材で描いた frame ではそれ)・canvas の物理矩形と `pixels_per_point`・
+  5.1 の全 uniform の値・下地と背景の色) を不変の `Arc` として確定し、callback と `PlaneViewState::last_drawn` が同じものを持つ。
 - 解放: PlaneView を抜けたとき (`set_fs_exclusive_view` で state が drop)、写し直したとき (前の写しは、それを持つ callback・
   snapshot・保存の要求が落ちた時点で解放)。callback が持つ Arc は描画の終わりで落ちる (Lanczos の出力の寿命と同じ考え方。
   [表示パイプライン §2.4.1](display-pipeline.md))。
 - **VRAM の会計**: `vram_accounting` に PlaneView の写しを足す。数えるのは実際の確保の寿命 (同じ `Arc` を複数の持ち主が持つときは
   重ねて数えない)。保存・コピー・書き出しの要求が持つ写しも、状態が終わった後に残る間は数える。
-- メモリ: 写し 1 枚は表示テクスチャの約 1.33 倍 (6000×4000 で約 128 MB)。PlaneView 1 つにつき通常 1 枚、写し直しの間と
-  保存の要求が残る間は一時的に 2 枚。
+- メモリ: 写し 1 枚は表示テクスチャの約 1.33 倍 (6000×4000 で約 128 MB)。PlaneView 1 つにつき通常 1 枚。写し直しの間と、
+  保存・コピー・書き出しの要求が旧い素材を持っている間は、**持たれている素材の世代の数だけ増える** (コピーは毎回 worker を作るので、
+  素材が変わるたびにコピーを続けると 3 世代以上になり得る)。会計は同じ `Arc` を重ねずに数える。
 
 ### 5.4 負荷
 
@@ -384,13 +425,15 @@ PlaneView 中だけ、3 つの出口の **元の素材を「見えていると�
 ### 6.1 何を出すか — 実際に描いた frame
 
 - 保存の操作は次の描画より前に処理されるので、要求は **`PlaneViewState::last_drawn` (直近に実際に描いた frame snapshot)** から作る。
-  snapshot の context・表示単位 (anchor)・素材の `TextureId` が今の PlaneView と一致しないとき、または snapshot が無いとき
-  (入った直後で 2D で描いた frame しかない等) は、保存せず「魚眼の表示の準備中です」と通知する (3D 写真の照合と同じ考え方)。
+  `last_drawn` が `None` (直近の frame を 2D で描いた。§5.2)、または snapshot の context・表示単位 (anchor) が今の PlaneView と
+  一致しないときは、保存せず「魚眼の表示の準備中です」と通知する (3D 写真の照合と同じ考え方)。
 - `PlaneFrameRequest` = snapshot の `Arc` + 出力の寸法 + 出力の画素から canvas の物理座標への写像。worker はこれだけを見る。
-- 出力の範囲は **canvas そのもの** (上下のバー・パネル・HUD は入れない)。canvas の原点が 0 でない場合 (MainWindow の一覧の中の閲覧など)
-  も、写像で canvas の左上を出力の原点に合わせる。縦横比は canvas と同じ。
-- 画像の外と透過部分は不透明に合成する (3D 写真の書き出しと同じ。JPEG・PNG で挙動を分けない)。画像の外の色は snapshot の背景の色、
-  透過部分の市松の升目は出力の寸法の比で拡大縮小する。
+- 出力の範囲は **canvas そのもの** (上下のバー・パネル・HUD は入れない)。縦横比は canvas と同じ。出力の画素 `o` は
+  `p_canvas = canvas.min + (o + 0.5) × canvas.size / output.size` で canvas の物理座標へ戻してから §5.1 を計算する
+  (canvas の原点が 0 でない MainWindow の一覧の中の閲覧でも、canvas の左上が出力の原点になる)。
+- 画像の外と透過部分は不透明に合成する (3D 写真の書き出しと同じ。JPEG・PNG で挙動を分けない)。画像の外の色は snapshot の背景の色。
+  透過部分の下地は §5.1 の 9 のとおり canvas の座標で計算するので、出力の寸法の比で升目を拡大縮小し直さない
+  (2 倍の出力では升目も 2 倍の画素になり、画面と同じ見た目になる)。
 
 ### 6.2 描画
 
@@ -463,7 +506,17 @@ PlaneView 中だけ、3 つの出口の **元の素材を「見えていると�
   フォーカス喪失・modal・ページ変更で所有が終わる、PlaneView でないときは今どおり (パン / 毎フレームの Ctrl で回転)。
 - 占有: ルーペ・ピクセルグリッド・ナビゲータを描かない、紙めくりの対象外、マウスのクリックとタッチの `PageSide` でページを送らない、
   ピンチは倍率だけ。Ctrl+Shift 中・右 Ctrl+Shift 中の押している間の操作の扱い (ルーペを描かない、元画像の素材をそのまま描く)、割り当てを変えた場合も同じ。
-- 素材: `TexturePending` で前の写しを使う / 無ければ 2D、素材の差し替え (PDF の再ラスタ・RAW の現像完了) で写し直す、写せない形式で終わって通知。
+- 素材: 登録待ちで次の pass を要求すること、前の素材をその素材自身の幾何で描くこと (`layout_basis` が同じとき) / 違えば・無ければ 2D、
+  素材の差し替え (PDF の再ラスタ・RAW の現像完了) で写し直す、写せない形式で終わって通知。
+- 部分素材: coverage が全体の一部の素材 (切り取り済みの編集プレビュー。回帰例は src/ui_fullscreen/coverage_tests.rs:16) で、
+  texture UV の変換と coverage の外の除外が 2D の `SourceRegionTextureQuad` と一致すること。
+- 保存の失効: 2D で描いた frame の後 (`last_drawn = None`) に保存しないこと。前の素材で描いた frame の snapshot は、実際に描いた素材を持つこと。
+- ページ送りをまたぐ frame: 「通常のホイールで魚眼の対象外のページ (動画) へ移る → 同じ frame の Ctrl+Shift 上」で、予測も実適用も
+  入場しないこと。クリックの分類が計画元の表示単位と違うときに再利用されないこと。
+- 離れる操作の量: `strength = 1/8` で `notches = −2` を 1 つの segment で渡した場合と `−1, −1` に分けた場合で、strength・倍率が同じになること。
+- 下地: 画面と 2 倍の出力で、市松の配置 (canvas の座標で見た升目の位置) が同じになること。
+- pipeline: 画面の target が `Bgra8Unorm` の場合と書き出しの `Rgba8Unorm` で、それぞれの format の pipeline を使うこと。
+- 会計: 3 世代以上の素材が要求に持たれている場合も、同じ `Arc` を重ねずに数えること。
 - 資源: 同じ renderer を共有する 2 つの context が同時に PlaneView を持ち、互いの状態・資源・uniform を変えないこと (sibling context 不変)。
   状態が drop された後も、callback・snapshot・保存の要求が持つ写しが生きていて、それらが落ちると解放されること。VRAM の会計が重ねて数えないこと。
 - 書き出し: canvas の原点が 0 でない場合、`pixels_per_point` が 1 でない場合、出力が canvas の 2 倍・1/2・長辺指定の場合に、
@@ -514,3 +567,19 @@ PlaneView 中だけ、3 つの出口の **元の素材を「見えていると�
 | P2-12 | 出力の寸法の説明が上限・既存の縮小段と食い違う | §6.2 の寸法の resolver、§6.3 で実寸の表示と縮小段を通さないこと |
 | P2-13 | VRAM の会計と、状態の後も残る要求の資源 | §5.3 の会計・共有と分離 (pipeline は共有、uniform は分離)、§5.4 の写しの CPU 時間の計測 |
 | P2-14 | 境界の受入テスト | §10 に追加 |
+
+### R2 (2026-11-27、同じセッションの継続、対象 `519418066`)
+
+判定: 要修正。R1 の 14 件は resolved 9・partially 5。新しい指摘は P1 3 件・P2 4 件・P3 1 件。設計担当がコードで確かめ、全件を正しいと判断した。
+§4.4 の構造上の追加への合意は維持 (条件: 共通 helper の対象は Depth / PlaneView だけで、Panorama と Depth の通知を変えない)。
+
+| # | 指摘 | 対応 (本書 R2) |
+| --- | --- | --- |
+| P1-1 | 部分素材の coverage が写像から抜けている (displayed_image_transform.rs:986〜1005) | §5.1 の 7 (source UV → texture UV、coverage の外を無効)、§3.1 の `PlaneMaterial` に coverage・sampler_roi・layout_basis |
+| P1-2 | 2D で描いた後も古い snapshot を保存できる。`Pending.previous` で選択と描画が分かれる | §5.2 の `last_drawn` を frame ごとに Some / None で記録。前の素材は幾何と一体の `PlaneMaterial` として持ち、その素材自身の幾何で描く (レビュー担当の 2 案のうち、PDF の再ラスタのたびに 2D が 1 frame 挟まるのを避けられる方を採った) |
+| P1-3 | ページ送りをまたぐ frame で予測と実適用が食い違う | §3.2 でページ送りの後の魚眼の量を予測・実適用とも捨てる。クリックの分類を計画元の表示単位に束縛 |
+| P2-4 | 登録待ちの後の次の pass の起床が無い | §5.2 で所有 viewport の次の pass を要求 |
+| P2-5 | 離れる操作の量が分割と合算で食い違う | §3.2 の `used = max(notches, −8 × strength)` |
+| P2-6 | 書き出しで升目を二重に拡大縮小する | §5.1 の 9・§6.1 で下地を canvas の座標に統一、出力の画素の写像を式で明記 |
+| P2-7 | bind group と target format の分け方 | §5.3 (group 0 = 素材、group 1 = uniform、pipeline は format ごと) |
+| P3-8 | 「一時的に 2 枚」は上限ではない | §5.3 の記述を訂正、§10 に 3 世代以上の会計のテスト |
