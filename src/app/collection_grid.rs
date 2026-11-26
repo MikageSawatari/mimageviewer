@@ -8492,6 +8492,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         app.search_query = "unsubmitted draft".into();
         let request = Arc::new(super::super::LocalSearchRequest {
+            cursor_policy: crate::app::LocalSearchCursorPolicy::Reset,
             submitted,
             list_identity: app.local_search_list_identity(),
         });

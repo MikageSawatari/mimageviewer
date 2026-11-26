@@ -660,6 +660,8 @@ pub(crate) mod book_preferred_rating;
 use book_preferred_rating::{ContainerRatingTarget, ContainerRatingToast};
 #[cfg(test)]
 mod book_preferred_rating_tests;
+#[cfg(test)]
+mod folder_manual_filter_tests;
 mod folder_manual_order;
 mod folder_order_drag;
 pub(crate) use folder_manual_order::FolderSortChoice;
@@ -1665,6 +1667,14 @@ pub(crate) struct MainListBoundaryReceipt {
 pub(crate) enum MainListInstallBoundary {
     UseInstallerBoundary,
     AlreadyHandled(MainListBoundaryReceipt),
+}
+
+/// An accepted same-folder manual refresh retains the user's color query, but
+/// retires workers and scope proofs belonging to the replaced item generation.
+#[derive(Clone, Copy)]
+enum MainListFilterPolicy {
+    Clear,
+    RetainCurrentPhysicalFolder,
 }
 
 impl MainListInstallBoundary {
@@ -8031,9 +8041,16 @@ struct LocalSearchListIdentity {
     items_generation: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalSearchCursorPolicy {
+    Reset,
+    Retain,
+}
+
 struct LocalSearchRequest {
     submitted: Arc<LocalSearchSubmission>,
     list_identity: LocalSearchListIdentity,
+    cursor_policy: LocalSearchCursorPolicy,
 }
 
 struct LocalSearchCompletion {
@@ -33482,6 +33499,20 @@ impl App {
         // The common installer retires the old stack presentation. The accepted
         // request's stack policy still owns this new physical projection's key.
         let requested_stack = self.stack_mode_requested;
+        let filter_policy = if !requested_stack
+            && folder_order.applies_to_physical_listing(&self.settings, &path, &items)
+            && self
+                .current_folder
+                .as_deref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &path))
+            && matches!(restore_intent.materialization_intent(), StartupListIntent::RefreshList {
+                target: crate::settings::StartupListTarget::PhysicalList { logical_path, zip_prefix: None }, ..
+            } if crate::folder_tree::path_eq(logical_path, &path))
+        {
+            MainListFilterPolicy::RetainCurrentPhysicalFolder
+        } else {
+            MainListFilterPolicy::Clear
+        };
         let mut hydration = self.install_loading_items_inner(
             path,
             items,
@@ -33497,6 +33528,7 @@ impl App {
             authority,
             prepared_visible,
             None,
+            filter_policy,
         );
         folder_order.order_revision = self
             .folder_order
@@ -36878,6 +36910,7 @@ impl App {
             VisibleInstallAuthority::Ordinary,
             token,
             None,
+            MainListFilterPolicy::Clear,
         );
         self.items_are_reading_history_view = true;
         self.top_level_grid_view.replace_surface(
@@ -39393,6 +39426,7 @@ impl App {
                     authority,
                     token,
                     None,
+                    MainListFilterPolicy::Clear,
                 );
                 if let Some((continuation, _)) = hydration.as_mut() {
                     continuation.restore_intent = restore_intent.clone();
@@ -40547,6 +40581,7 @@ impl App {
                 },
                 token,
                 None,
+                MainListFilterPolicy::Clear,
             );
             self.hydrate_installed_main_list(hydration);
         }
@@ -41614,6 +41649,7 @@ impl App {
             authority,
             prepared_visible,
             Some(nav),
+            MainListFilterPolicy::Clear,
         );
         let archive_key = crate::path_key::normalize_keep_drive(&zip_path);
         if let Some(trace) = self.archive_auto_fs_paint_trace.as_mut()
@@ -42842,6 +42878,7 @@ impl App {
                 VisibleInstallAuthority::Ordinary,
                 token.with_install_boundary(boundary),
                 None,
+                MainListFilterPolicy::Clear,
             );
             if let Some((continuation, _)) = hydration.as_mut() {
                 continuation.restore_intent = intent;
@@ -44729,6 +44766,7 @@ impl App {
             VisibleInstallAuthority::Projection { recipe },
             prepared_visible,
             None,
+            MainListFilterPolicy::Clear,
         );
         if let Some((continuation, _)) = hydration.as_mut() {
             continuation.restore_intent = hydration_intent;
@@ -44824,6 +44862,7 @@ impl App {
             },
             prepared_visible,
             None,
+            MainListFilterPolicy::Clear,
         )
     }
 
@@ -45024,6 +45063,7 @@ impl App {
             authority,
             prepared_visible,
             None,
+            MainListFilterPolicy::Clear,
         );
         self.hydrate_installed_main_list_with_search_index(hydration, prepared_search_index);
     }
@@ -45052,6 +45092,7 @@ impl App {
         authority: VisibleInstallAuthority<'_>,
         prepared_visible: PreparedVisibleInstall,
         prepared_zip_nav: Option<crate::zip_tree::ZipNavState>,
+        filter_policy: MainListFilterPolicy,
     ) -> MainListHydration {
         let detached_physical = self.navigation_scope.is_detached_physical();
         // Capture the departing logical position before cleanup can replace its
@@ -45104,8 +45145,13 @@ impl App {
         }
         self.cancel_media_navigation_pending_for_current_context("start_loading_items");
         if !detached_physical {
-            self.clear_color_filter_for_new_items();
-            self.color_filter_scope_refresh_pending = false;
+            match filter_policy {
+                MainListFilterPolicy::Clear => self.clear_color_filter_for_new_items(),
+                MainListFilterPolicy::RetainCurrentPhysicalFolder => {
+                    self.color_filter.cancel_pending();
+                    self.mark_color_filter_scope_dirty();
+                }
+            }
         }
         self.current_color_cache_map = None;
         self.current_color_catalog = None;
@@ -55223,6 +55269,7 @@ impl App {
             VisibleInstallAuthority::Ordinary,
             token,
             None,
+            MainListFilterPolicy::Clear,
         );
         self.items_are_bookmark_view = true;
         self.top_level_grid_view
@@ -55388,6 +55435,7 @@ impl App {
             VisibleInstallAuthority::Ordinary,
             token,
             None,
+            MainListFilterPolicy::Clear,
         );
         self.hydrate_installed_main_list(hydration);
         self.items_are_bookmark_view = true;
@@ -63263,6 +63311,14 @@ impl App {
             .selected
             .and_then(|index| self.items.get(index))
             .and_then(folder_manual_order::selection_key);
+        // A manual permutation is still the same filtered physical list. Use
+        // the existing typed search replay; ordinary sort changes keep their
+        // released PreservePresentation behavior.
+        let intent = if self.folder_manual_order_applied() {
+            self.current_list_refresh_intent()
+        } else {
+            StartupListIntent::PreservePresentation
+        };
         let accepted = if self.epub_batch_convert.is_some() {
             // The batch modal owns this same-location listing refresh. It is a completion of
             // accepted work, not a new open, so it must bypass the new-open admission gate.
@@ -63274,19 +63330,14 @@ impl App {
                     VisibleInstallAuthority::Ordinary,
                     None,
                     Some(OpenPathKind::Directory),
-                    crate::app::StartupListIntent::PreservePresentation,
+                    intent,
                     None,
                     MainListRequestStage::Continuation,
                 ),
                 FolderOpenOutcome::Loaded
             )
         } else {
-            self.load_folder_with_scan_owned(
-                path,
-                Some(scan),
-                owner,
-                crate::app::StartupListIntent::PreservePresentation,
-            )
+            self.load_folder_with_scan_owned(path, Some(scan), owner, intent)
         };
         if accepted {
             self.checked = self
@@ -79356,13 +79407,34 @@ impl App {
         ctx: &egui::Context,
         submitted: Arc<LocalSearchSubmission>,
     ) {
-        self.start_submitted_local_search(submitted);
+        self.execute_submitted_local_search_with_cursor(
+            ctx,
+            submitted,
+            LocalSearchCursorPolicy::Reset,
+        );
+    }
+
+    fn execute_submitted_local_search_with_cursor(
+        &mut self,
+        ctx: &egui::Context,
+        submitted: Arc<LocalSearchSubmission>,
+        cursor_policy: LocalSearchCursorPolicy,
+    ) {
+        self.start_submitted_local_search_with_cursor(submitted, cursor_policy);
         if self.search_pending.is_none() {
             self.refresh_color_filter_for_scope_change(ctx);
         }
     }
 
     fn start_submitted_local_search(&mut self, submitted: Arc<LocalSearchSubmission>) {
+        self.start_submitted_local_search_with_cursor(submitted, LocalSearchCursorPolicy::Reset);
+    }
+
+    fn start_submitted_local_search_with_cursor(
+        &mut self,
+        submitted: Arc<LocalSearchSubmission>,
+        cursor_policy: LocalSearchCursorPolicy,
+    ) {
         // 既存の in-flight 検索をキャンセル (新クエリ / 再 Enter)。
         if let Some(pending) = self.search_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
@@ -79426,6 +79498,7 @@ impl App {
         let request = Arc::new(LocalSearchRequest {
             submitted: submitted.clone(),
             list_identity: self.local_search_list_identity(),
+            cursor_policy,
         });
         let worker_request = request.clone();
         let (tx, rx) = mpsc::channel();
@@ -79533,6 +79606,7 @@ impl App {
                     matches,
                     xmp_additions,
                 } = completion.result;
+                let cursor_policy = pending.request.cursor_policy;
                 // ワーカーが新規に読み取った XMP をキャッシュにマージする。
                 // 既存キーは上書きしない (並行して別スレッドが先に書き込んだケースを尊重)。
                 for (key, xmp) in xmp_additions {
@@ -79543,10 +79617,18 @@ impl App {
                     submitted: pending.request.submitted.clone(),
                 });
                 self.search_filter_origin_folder = self.effective_folder();
+                let selected = self.selected;
                 self.rebuild_visible_indices();
-                self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
-                self.grid_scroll.set_position(0.0);
-                self.grid_scroll.clear_edge();
+                if cursor_policy == LocalSearchCursorPolicy::Reset {
+                    self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
+                    self.grid_scroll.set_position(0.0);
+                    self.grid_scroll.clear_edge();
+                } else {
+                    self.move_grid_cursor(
+                        selected.filter(|index| self.visible_indices.binary_search(index).is_ok()),
+                        crate::app::GridCursorIntent::Automatic,
+                    );
+                }
                 self.search_pending = None;
                 self.refresh_color_filter_for_scope_change(ctx);
             }

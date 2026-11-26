@@ -1353,8 +1353,8 @@ impl App {
     ///
     /// Fix-D (Codex P1-3): user が snapshot 内 child folder の中に居る状態で解除した
     /// 場合、saved_items を強制復元すると address/grid 不整合になる。current_folder が
-    /// origin と一致する場合のみ復元、不一致の場合は current_folder の通常 reload を
-    /// 行う (= snapshot state を捨てるだけ)。
+    /// origin と一致する場合のみ復元、不一致の場合は current_folder の items を維持する。
+    /// 物理 child に手動順の記録が有り得る場合だけ、Read 後の通常 reload へ渡す。
     pub(crate) fn deactivate_snapshot(&mut self) {
         let Some(snap) = self.snapshot.take() else {
             return;
@@ -1377,8 +1377,8 @@ impl App {
         let top_level_origin = if at_origin {
             self.top_level_grid_view.take_return_origin()
         } else {
-            // A physical child needs a worker Read before it can become a normal list.
-            // Keep the retained rows' surface and return owner until that adoption.
+            // Keep the return owner until the child branch decides whether it can
+            // release these rows immediately or needs a worker Read before adoption.
             self.top_level_grid_view.return_origin().cloned()
         };
         let top_level_return = top_level_origin
@@ -1592,16 +1592,40 @@ impl App {
                         &self.items,
                     )
             });
-            if let Some(folder) = physical {
+            if let Some(folder) = physical
+                .as_ref()
+                .filter(|folder| !self.folder_order_record_is_known_absent(folder))
+            {
                 // The retained fixed rows stay on the Snapshot surface while the existing
                 // restore worker reads the ordinary folder. Only its successful adoption
                 // publishes a normal physical listing with a completed Read input.
                 self.preserve_cursor_hint_for_reload();
                 self.restore_view_return_origin(super::top_level_grid_view::TopLevelGridOrigin {
-                    restore: super::top_level_grid_view::TopLevelGridRestore::Folder(folder),
+                    restore: super::top_level_grid_view::TopLevelGridRestore::Folder(
+                        folder.clone(),
+                    ),
                     route: self.facet_navigation.route().clone(),
                 });
             } else {
+                if let Some(folder) = physical {
+                    // The prepared index proves no record exists, so the already
+                    // scanned child is also the ordinary list. Its materializer
+                    // retained the complete pre-projection inventory even though
+                    // snapshot navigation suppressed the manual-order input.
+                    let revision = self
+                        .folder_order
+                        .order_revision
+                        .checked_add(1)
+                        .expect("folder order revision exhausted");
+                    let inventory = std::mem::take(&mut self.folder_order.inventory);
+                    *self.folder_order = crate::folder_order::FolderOrderState::from_listing(
+                        &folder,
+                        crate::folder_order::FolderOrderListingInput::from_read(Ok(None))
+                            .with_stack(self.stack_mode_requested),
+                        inventory,
+                    );
+                    self.folder_order.order_revision = revision;
+                }
                 let _ = self.top_level_grid_view.take_return_origin();
                 self.mark_color_filter_scope_dirty();
                 self.rebuild_visible_indices();
@@ -3119,6 +3143,177 @@ mod tests {
     }
 
     #[test]
+    fn folder_order_unlocking_known_absent_snapshot_child_preserves_current_listing() {
+        use crate::folder_order::{FolderOrderListingInput, FolderOrderMode, folder_key};
+
+        fn settle_color_filter(app: &mut App, ctx: &egui::Context) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                app.poll_color_scan(ctx);
+                if app.color_filter.pending.is_none() && !app.color_filter_scope_refresh_pending {
+                    assert!(app.color_filter.applied_scope_signature.is_some());
+                    return;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "snapshot child color filter did not settle"
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        let mut app = setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_image_folders = false;
+        let root = app.tmp.path().join("unrecorded-fixed-origin");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        for (name, rgb) in [("a.png", [255, 0, 0]), ("b.png", [0, 0, 255])] {
+            image::RgbImage::from_pixel(8, 8, image::Rgb(rgb))
+                .save(child.join(name))
+                .unwrap();
+        }
+        let inventory_only = folder_key(&child.join("notes.txt"));
+        std::fs::write(child.join("notes.txt"), b"not a listing item").unwrap();
+        app.load_folder(root);
+        app.finish_page_identity_preparation_for_test();
+        let actor = app.folder_order_handle().unwrap();
+        assert!(
+            actor
+                .read(&child)
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert!(actor.index_ready_for_test());
+        assert!(actor.record_is_known_absent(&child));
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        app.finish_page_identity_preparation_for_test();
+        app.snapshot_internal_nav = true;
+        app.app.load_folder(child.clone());
+        app.snapshot_internal_nav = false;
+        app.finish_page_identity_preparation_for_test();
+        assert!(app.is_snapshot_active());
+        assert!(matches!(
+            app.folder_order.input,
+            FolderOrderListingInput::NotApplicable
+        ));
+        let fixed_inventory = app.folder_order.inventory.clone();
+        assert!(fixed_inventory.contains(&inventory_only));
+        assert_eq!(fixed_inventory.len(), 3);
+        let ctx = egui::Context::default();
+        app.color_filter.tolerance = crate::color_search::MIN_TOLERANCE;
+        app.apply_image_color_filter_from_swatch([255, 0, 0], &ctx);
+        settle_color_filter(&mut app, &ctx);
+        let red_key = folder_key(&child.join("a.png"));
+        let visible_keys = |app: &App| {
+            app.visible_indices
+                .iter()
+                .filter_map(|&index| crate::folder_order::physical_item_key(&app.items[index]))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(visible_keys(&app), vec![red_key.clone()]);
+        let palette_keys = app
+            .color_filter
+            .palettes
+            .map
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(palette_keys.len(), 2);
+        let generation = app.items_generation;
+        let fixed_items = app.items.clone();
+        let fixed_identity = app.page_identity_index.clone();
+        let fixed_revision = app.folder_order.order_revision;
+        let reads = actor.read_request_count_for_test();
+        let scans = super::super::folder_scan::caller_scan_count_for_test();
+        app.deactivate_snapshot();
+        settle_color_filter(&mut app, &ctx);
+        assert!(!app.is_snapshot_active());
+        assert_eq!(app.current_folder.as_deref(), Some(child.as_path()));
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.items, fixed_items);
+        assert!(std::sync::Arc::ptr_eq(
+            &app.page_identity_index,
+            &fixed_identity
+        ));
+        assert_eq!(app.folder_order.folder_key, Some(folder_key(&child)));
+        assert_eq!(
+            app.folder_order.input,
+            FolderOrderListingInput::from_read(Ok(None))
+        );
+        assert_eq!(app.folder_order.mode, FolderOrderMode::Normal);
+        assert!(app.folder_order.record.is_none());
+        assert_eq!(app.folder_order.inventory, fixed_inventory);
+        assert!(app.folder_order.order_revision > fixed_revision);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            crate::app::top_level_grid_view::TopLevelGridSurface::Folder
+        ));
+        assert!(app.top_level_grid_view.return_origin().is_none());
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert!(app.top_level_grid_view.open_path_classification().is_none());
+        assert_eq!(actor.read_request_count_for_test(), reads);
+        assert_eq!(
+            super::super::folder_scan::caller_scan_count_for_test(),
+            scans
+        );
+        assert!(app.color_filter.enabled);
+        assert_eq!(app.color_filter.query_rgb, [255, 0, 0]);
+        assert_eq!(
+            app.color_filter.tolerance,
+            crate::color_search::MIN_TOLERANCE
+        );
+        assert_eq!(visible_keys(&app), vec![red_key]);
+        assert!(
+            palette_keys
+                .iter()
+                .all(|key| app.color_filter.palettes.map.contains_key(key))
+        );
+        let observation = app.folder_observation.as_ref().unwrap();
+        assert_eq!(observation.generation, generation);
+        assert_eq!(
+            observation.projection_key,
+            app.current_folder_projection_key(&child)
+        );
+
+        // The first reorder records listing items only; the scan's unsupported
+        // child remains inventory-only and acquires no saved position.
+        let full = app
+            .items
+            .iter()
+            .filter_map(crate::folder_order::physical_item_key)
+            .collect::<Vec<_>>();
+        assert_eq!(full.len(), 2);
+        let mut first_save = app.folder_order.clone();
+        assert!(first_save.enter_manual().is_none());
+        let reordered = full.iter().rev().cloned().collect::<Vec<_>>();
+        let intent = first_save
+            .commit_reorder(&full, &full.iter().cloned().collect(), &reordered)
+            .unwrap();
+        assert!(matches!(
+            intent,
+            Some(crate::folder_order::FolderOrderWriteIntent::Save(_))
+        ));
+        assert_eq!(first_save.record.as_ref().unwrap().items, reordered);
+        assert!(
+            !first_save
+                .record
+                .as_ref()
+                .unwrap()
+                .items
+                .contains(&inventory_only)
+        );
+        assert_eq!(first_save.inventory, fixed_inventory);
+    }
+
+    #[test]
     fn folder_order_unlocking_snapshot_child_reads_before_normal_listing_adoption() {
         use crate::folder_order::{FolderOrderListingInput, FolderOrderSave, folder_key};
         let mut app = setup_app_for_test();
@@ -3169,6 +3364,7 @@ mod tests {
         let fixed_order = app.folder_order.clone();
         let fixed_surface_generation = app.top_level_grid_view.generation();
         let fixed_return_origin = app.top_level_grid_view.return_origin().cloned();
+        let reads = actor.read_request_count_for_test();
         app.deactivate_snapshot();
         assert!(!app.is_snapshot_active());
         assert_eq!(app.items_generation, generation);
@@ -3205,6 +3401,7 @@ mod tests {
             vec![b, a]
         );
         assert_eq!(app.items_generation, generation + 1);
+        assert!(actor.read_request_count_for_test() > reads);
     }
 
     #[test]

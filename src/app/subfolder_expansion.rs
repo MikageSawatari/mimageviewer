@@ -2750,6 +2750,7 @@ impl App {
             },
             token,
             None,
+            crate::app::MainListFilterPolicy::Clear,
         );
         let position_key =
             super::top_level_grid_view::SubfolderExpansionPositionKey::new(&root, &roots);

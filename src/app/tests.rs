@@ -730,11 +730,13 @@ fn review_a_search_completion_requires_current_list_and_request_identity() {
             or_mode: false,
         });
         let request = Arc::new(LocalSearchRequest {
+            cursor_policy: crate::app::LocalSearchCursorPolicy::Reset,
             submitted: submitted.clone(),
             list_identity: identity,
         });
         let result_request = if case == "request" {
             Arc::new(LocalSearchRequest {
+                cursor_policy: crate::app::LocalSearchCursorPolicy::Reset,
                 submitted,
                 list_identity: identity,
             })
@@ -14830,6 +14832,7 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
     let (_tx, rx) = mpsc::channel();
     app.search_pending = Some(SearchPending {
         request: Arc::new(LocalSearchRequest {
+            cursor_policy: crate::app::LocalSearchCursorPolicy::Reset,
             submitted: Arc::new(LocalSearchSubmission {
                 query: "test".into(),
                 target: Default::default(),

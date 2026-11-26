@@ -686,3 +686,32 @@ Smart root の履歴採用後、定義の範囲外にある新しい通常物理
 - 本段は文書だけを変更し、コンパイル・Rust テスト・検証用ビルド・コミットは実施しない。
   `python scripts/check_site_cards.py` は 54 cards / 違反 0、`python scripts/check_ui_glyphs.py` と
   `git diff --check` も正常終了した。
+
+### 採用境界での状態保持（2026-11-27）
+
+- ★固定内の物理 child で解除するときも、記録索引の ready / known-absent で分岐する。
+  記録なしが確定した child は従来どおり items・世代・画像色フィルタを保って即時解除し、
+  入力を Read(Ok(None))、folder identity を child、revision を直前 + 1 にする。
+  記録あり・索引未準備の場合だけ既存の非同期 restore へ進む。
+- child の materializer は NotApplicable の場合も scan の inventory を保持していたため、
+  即時解除でその完全な inventory を引き継ぐ。名前を取り直す read_dir や items からの近似は加えない。
+  初回保存は previous record が空なので、inventory-only の未記録項目に位置を作らない。
+- snapshot 起点への復帰は saved rows と saved_folder_order の対を戻す経路を維持する。
+  検索／smart 起点の復帰は既存の typed restore と physical preflight、サブ展開の終了は
+  load_folder の索引分岐を使う。これらへ保持済み child と同じ無条件の再走査は加えない。
+- 通常の sort refresh は変更前（451ad09db）から PreservePresentation を使い、
+  共通 installer が画像色と Ctrl+F membership を消していた。通常順のこの契約は変更しない。
+  手動適用中の refresh は current_list_refresh_intent の RefreshList を使い、
+  確定済み検索条件と未確定の入力文を既存の再適用経路へ渡す。
+- 同じ物理フォルダの手動 RefreshList の採用だけ、共通 installer に RetainCurrentPhysicalFolder を明示する。
+  色の query・tolerance・palette は保持し、旧世代の worker を取り消して新しい scope の照合を要求する。
+  その他の installer 呼出元は Clear を明示し、検索／smart／書庫／サブ展開の既存契約を維持する。
+  App や bundle への field は増やさない。
+- 検索の完了時にも従来は cursor と scroll をリセットしていた。手動 refresh の再適用要求だけが
+  Arc の LocalSearchRequest 内に Retain 方針を持ち、現在の可視 cursor（未選択も含む）と scroll を保持する。
+  通常の明示検索は Reset のままで、古い context / generation / request の結果は従来どおり拒否する。
+- 実画像の色フィルタと Ctrl+F を使い、固定解除または並べ替えの採用と各 worker の完了後までを検査する
+  回帰を 7 件追加した。記録あり child の非同期採用の既存テストには actor Read の増加も加えた。
+  コンパイル・テスト実行・コミットは利用者指定により実施しない。
+  `cargo fmt`（引数なし）と `git diff --check` は正常終了。installer の全 17 呼出箇所と
+  既存テストの検索要求の型変更も、ソースを読んで引数・field の追随を確認した。

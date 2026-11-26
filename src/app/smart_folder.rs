@@ -4019,6 +4019,7 @@ impl App {
                     authority,
                     prepared_visible,
                     None,
+                    crate::app::MainListFilterPolicy::Clear,
                 );
                 if self.settings.follow_document_reading_direction {
                     let defaults = super::SpreadRestoreDefaults::for_book(&self.settings);
@@ -4088,6 +4089,7 @@ impl App {
                     authority,
                     prepared_visible,
                     None,
+                    crate::app::MainListFilterPolicy::Clear,
                 );
                 self.pdf_placeholder_count = Some(page_count);
                 let owner = super::OpenRequestOwner::MainGridArchive(
