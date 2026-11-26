@@ -51,6 +51,8 @@ impl Rect {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CardLayout {
+    /// Card/image/band endpoints are quantized output pixels. Only source_crop
+    /// remains fractional; the renderer scales these endpoints for previews.
     pub card: Rect,
     pub image: Rect,
     /// Coordinates in the full composed source, even when rendering preview sources.
@@ -219,33 +221,47 @@ impl Affine {
     }
 }
 
-/// Each end is computed once, then used both by its rectangle and the following
-/// gap/start. The last end is the shared enclosing edge, not an accumulated sum.
-fn partition(start: f64, end: f64, lengths: &[f64], gap: f64) -> Vec<(f64, f64)> {
-    let mut next = start;
+/// Round cumulative content lengths only. Fixed bands and gaps are then added
+/// as integers, so a half-pixel decision can change content by one pixel but
+/// cannot change a fixed part. The last content edge preserves the canvas sum.
+fn partition(start: f64, end: f64, lengths: &[f64], gap: f64, band: f64) -> Vec<(f64, f64)> {
+    debug_assert!([start, end, gap, band].iter().all(|n| n.fract() == 0.0));
+    let (start, end, gap, band) = (start as i64, end as i64, gap as i64, band as i64);
+    let content_total =
+        end - start - gap * (lengths.len() as i64 - 1) - band * lengths.len() as i64;
+    let mut content_sum = 0.0;
+    let mut previous = 0;
     lengths
         .iter()
         .enumerate()
         .map(|(i, &length)| {
-            let start = next;
-            let finish = if i + 1 == lengths.len() {
-                end
+            content_sum += length;
+            let content_end = if i + 1 == lengths.len() {
+                content_total
             } else {
-                start + length
+                content_sum.round() as i64
             };
-            next = finish + gap;
-            (start, finish)
+            let fixed_before = start + i as i64 * (gap + band);
+            let span = (
+                (fixed_before + previous) as f64,
+                (fixed_before + content_end + band) as f64,
+            );
+            previous = content_end;
+            span
         })
         .collect()
 }
 
 fn aligned_edges(start: f64, end: f64, length: f64, fraction: f64) -> (f64, f64) {
+    // Both the container and the chosen content size are output pixels. Round
+    // the offset once, then add the integer length instead of rounding two ends.
+    let length = length.round();
     if fraction == 0.0 {
         (start, start + length)
     } else if fraction == 1.0 {
         (end - length, end)
     } else {
-        let start = start + (end - start - length) * fraction;
+        let start = start + ((end - start - length) * fraction).round();
         (start, start + length)
     }
 }
@@ -438,6 +454,8 @@ fn solve(
         return Err(LayoutError::NonPositiveThickness);
     }
     let canvas_size = checked_canvas(w, h, o.format)?;
+    let inner_right = canvas_size.0 as f64 - m;
+    let inner_bottom = canvas_size.1 as f64 - m;
     let mut cells = Vec::with_capacity(n);
     match o.layout {
         CombineLayout::Row => {
@@ -451,9 +469,12 @@ fn solve(
                 })
                 .collect();
             let max_height = heights.iter().copied().fold(0.0, f64::max);
-            let card_bottom = h - m;
+            let card_bottom = inner_bottom;
             let image_bottom = card_bottom - t;
-            for (i, (left, right)) in partition(m, w - m, &lengths, gx).into_iter().enumerate() {
+            for (i, (left, right)) in partition(m, inner_right, &lengths, gx, 0.0)
+                .into_iter()
+                .enumerate()
+            {
                 let ih = if matched { s * k } else { heights[i] * s };
                 let (top, bottom) = if matched || heights[i] == max_height {
                     (m, image_bottom)
@@ -472,26 +493,29 @@ fn solve(
             let lengths: Vec<_> = (0..n)
                 .map(|i| {
                     if matched {
-                        s / aspects[i] + t
+                        s / aspects[i]
                     } else {
-                        heights[i] * s + t
+                        heights[i] * s
                     }
                 })
                 .collect();
             let max_width = widths.iter().copied().fold(0.0, f64::max);
-            for (i, (top, bottom)) in partition(m, h - m, &lengths, gy).into_iter().enumerate() {
+            for (i, (top, bottom)) in partition(m, inner_bottom, &lengths, gy, t)
+                .into_iter()
+                .enumerate()
+            {
                 let iw = if matched { s * k } else { widths[i] * s };
                 let (left, right) = if matched || widths[i] == max_width {
-                    (m, w - m)
+                    (m, inner_right)
                 } else {
-                    aligned_edges(m, w - m, iw, o.line_align.fraction())
+                    aligned_edges(m, inner_right, iw, o.line_align.fraction())
                 };
                 cells.push(Cell::new(left, top, right, bottom - t, bottom));
             }
         }
         CombineLayout::Grid => {
-            let xs = partition(m, w - m, &vec![s; columns], gx);
-            let ys = partition(m, h - m, &vec![s / r + t; rows], gy);
+            let xs = partition(m, inner_right, &vec![s; columns], gx, 0.0);
+            let ys = partition(m, inner_bottom, &vec![s / r; rows], gy, t);
             for i in 0..n {
                 let (left, right) = xs[i % columns];
                 let (top, bottom) = ys[i / columns];
@@ -507,15 +531,17 @@ fn solve(
                 }
                 bases.push(base);
             }
-            let cross_lengths: Vec<_> = bases
-                .iter()
-                .map(|base| if horizontal { base * k + t } else { base * k })
-                .collect();
+            let cross_lengths: Vec<_> = bases.iter().map(|base| base * k).collect();
             let cross_spans = partition(
                 m,
-                if horizontal { h - m } else { w - m },
+                if horizontal {
+                    inner_bottom
+                } else {
+                    inner_right
+                },
                 &cross_lengths,
                 if horizontal { gy } else { gx },
+                if horizontal { t } else { 0.0 },
             );
             let mut index = 0;
             for ((&count, &base), (cross_start, cross_end)) in
@@ -527,15 +553,20 @@ fn solve(
                         if horizontal {
                             aspect * base
                         } else {
-                            base / aspect + t
+                            base / aspect
                         }
                     })
                     .collect();
                 let spans = partition(
                     m,
-                    if horizontal { w - m } else { h - m },
+                    if horizontal {
+                        inner_right
+                    } else {
+                        inner_bottom
+                    },
                     &lengths,
                     if horizontal { gx } else { gy },
+                    if horizontal { 0.0 } else { t },
                 );
                 for (start, end) in spans {
                     if horizontal {
@@ -555,7 +586,7 @@ fn solve(
         let cell = placement.image_area;
         let size = dims[index];
         let full = Rect::new(0.0, 0.0, size.0 as f64, size.1 as f64);
-        let (mut image, crop) = if o.layout == CombineLayout::Grid && o.cell_fit == CellFit::Fit {
+        let mut image = if o.layout == CombineLayout::Grid && o.cell_fit == CellFit::Fit {
             let sx = cell.width() / full.width();
             let sy = cell.height() / full.height();
             let factor = sx.min(sy);
@@ -571,10 +602,16 @@ fn solve(
             } else {
                 aligned_edges(cell.y, cell.bottom(), ih, ay)
             };
-            (Rect::from_edges(left, top, right, bottom), full)
+            Rect::from_edges(left, top, right, bottom)
         } else {
-            (cell, fill_crop(full, cell, o.anchor))
+            cell
         };
+        if image.width() < 1.0 || image.height() < 1.0 {
+            return Err(LayoutError::ImageTooSmall { index });
+        }
+        // Derive sampling from the final pixel rectangle, including the small
+        // aspect change from quantization. Keep the requested source anchor.
+        let crop = fill_crop(full, image, o.anchor);
         let mut card = Rect::from_edges(cell.x, cell.y, cell.right(), placement.card_bottom);
         let mut band = (t > 0.0)
             .then(|| Rect::from_edges(cell.x, cell.bottom(), cell.right(), placement.card_bottom));
@@ -595,9 +632,6 @@ fn solve(
         }
         if ![cell, image, crop, card].iter().all(|r| r.finite()) {
             return Err(LayoutError::NonFinite);
-        }
-        if image.width() < 1.0 - 1e-9 || image.height() < 1.0 - 1e-9 {
-            return Err(LayoutError::ImageTooSmall { index });
         }
         max_crop = max_crop
             .max(1.0 - crop.width() / full.width())

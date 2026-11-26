@@ -843,6 +843,13 @@ fn label_boxes_pills_band_alignment_and_descenders_fit_decorated_bounds() {
             let labels = label_layout(&l, &[spec(Some("gy 商品A"))], &o, &fonts);
             assert_eq!(labels.not_drawn, 0);
             let label = labels.labels[0].as_ref().unwrap();
+            for rect in [label.rect, label.text_rect] {
+                assert!(
+                    [rect.x, rect.y, rect.right(), rect.bottom()]
+                        .iter()
+                        .all(|v| v.fract() == 0.0)
+                );
+            }
             let band = l.cards[0].band.unwrap();
             assert!(label.rect.y >= band.y && label.rect.bottom() <= band.bottom());
             assert!(
@@ -852,7 +859,7 @@ fn label_boxes_pills_band_alignment_and_descenders_fit_decorated_bounds() {
             match align {
                 HAlign::Left => close(label.rect.x, 16.0),
                 HAlign::Right => close(label.rect.right(), 584.0),
-                HAlign::Center => close(label.rect.x + label.rect.width() / 2.0, 300.0),
+                HAlign::Center => close(label.rect.x, (300.0 - label.rect.width() / 2.0).round()),
             }
             if style == BadgeStyle::Pill {
                 assert!(label.rect.width() >= label.rect.height());
@@ -886,8 +893,14 @@ fn label_overlay_nine_anchors_measure_margin_from_inside_border() {
         let labels = label_layout(&l, &[spec(None)], &o, &fonts);
         let label = labels.labels[0].as_ref().unwrap();
         let (ax, ay) = anchor.fractions();
-        close(label.rect.x, 24.0 + (452.0 - label.rect.width()) * ax);
-        close(label.rect.y, 24.0 + (352.0 - label.rect.height()) * ay);
+        close(
+            label.rect.x,
+            (24.0 + (452.0 - label.rect.width()) * ax).round(),
+        );
+        close(
+            label.rect.y,
+            (24.0 + (352.0 - label.rect.height()) * ay).round(),
+        );
     }
 }
 
@@ -1264,7 +1277,12 @@ fn fractional_grid_width_4093_has_no_background_seam() {
     for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
         o.direction = direction;
         let l = calculate(&o, &[(100, 100); 12]);
-        close(l.cards[0].card.width(), 4093.0 / 12.0);
+        assert!(
+            l.cards
+                .iter()
+                .all(|card| [341.0, 342.0].contains(&card.card.width()))
+        );
+        close(l.cards.iter().map(|card| card.card.width()).sum(), 4093.0);
         for pair in l.cards.windows(2) {
             if direction == CombineDirection::LeftToRight {
                 assert_eq!(pair[0].card.right(), pair[1].card.x);
@@ -1303,7 +1321,13 @@ fn justified_rows_fractional_widths_have_no_background_seam() {
     for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
         o.direction = direction;
         let l = calculate(&o, &[(100, 100); 12]);
-        assert!(l.cards.iter().any(|card| card.card.width().fract() != 0.0));
+        assert!(l.cards.iter().all(|card| card.card.width().fract() == 0.0));
+        assert!(
+            l.cards
+                .iter()
+                .any(|card| card.card.width() != l.cards[0].card.width())
+        );
+        close(l.cards.iter().map(|card| card.card.width()).sum(), 4093.0);
         for scale in [1.0, 0.37] {
             let image = render_all(
                 &l,
@@ -1408,14 +1432,22 @@ fn all_layouts_share_card_image_band_and_gap_endpoints() {
                                 if vertical {
                                     assert_eq!(a.bottom(), gap_rect.y);
                                     assert_eq!(gap_rect.bottom(), b.y);
-                                    if gap == 0 {
-                                        assert_eq!(a.bottom(), b.y);
+                                    if scale == 1.0 {
+                                        assert_eq!(b.y - a.bottom(), gap as f64);
+                                    } else {
+                                        assert!(
+                                            (b.y - a.bottom() - gap as f64 * scale).abs() <= 1.0
+                                        );
                                     }
                                 } else {
                                     assert_eq!(a.right(), gap_rect.x);
                                     assert_eq!(gap_rect.right(), b.x);
-                                    if gap == 0 {
-                                        assert_eq!(a.right(), b.x);
+                                    if scale == 1.0 {
+                                        assert_eq!(b.x - a.right(), gap as f64);
+                                    } else {
+                                        assert!(
+                                            (b.x - a.right() - gap as f64 * scale).abs() <= 1.0
+                                        );
                                     }
                                 }
                             }
@@ -1431,16 +1463,11 @@ fn all_layouts_share_card_image_band_and_gap_endpoints() {
                                 &comic_core::FontSet::default(),
                             )
                             .unwrap();
-                            // Test internal joins. The rounded canvas extent and
-                            // scaled unrounded outer edge may differ by one pixel.
                             for (x, y, pixel) in image.enumerate_pixels() {
-                                if x > 0 && y > 0 && x + 1 < image.width() && y + 1 < image.height()
-                                {
-                                    assert_eq!(
-                                        pixel[3], 255,
-                                        "{kind:?} {direction:?}, band {band_height}, scale {scale}, ({x},{y})"
-                                    );
-                                }
+                                assert_eq!(
+                                    pixel[3], 255,
+                                    "{kind:?} {direction:?}, band {band_height}, scale {scale}, ({x},{y})"
+                                );
                             }
                         }
                     }
@@ -1474,6 +1501,326 @@ fn thin_border_scan_visits_perimeter_instead_of_canvas_area() {
         },
     );
     assert!(rounded_visited <= visited + 4 * 20 * 20);
+}
+
+/// Find actual background runs, independently of the layout's recorded edges.
+fn background_runs(line: impl IntoIterator<Item = bool>) -> (usize, Vec<(usize, usize)>) {
+    let mut runs = Vec::new();
+    let mut start = None;
+    let mut length = 0;
+    for opaque in line {
+        match (opaque, start) {
+            (false, None) => start = Some(length),
+            (true, Some(begin)) => {
+                runs.push((begin, length));
+                start = None;
+            }
+            _ => {}
+        }
+        length += 1;
+    }
+    if let Some(begin) = start {
+        runs.push((begin, length));
+    }
+    (length, runs)
+}
+
+fn assert_pixel_gaps(line: impl IntoIterator<Item = bool>, margin: u32, gap: u32, count: usize) {
+    let (length, runs) = background_runs(line);
+    let mut expected = Vec::new();
+    if margin > 0 {
+        expected.push(margin as usize);
+    }
+    if gap > 0 {
+        expected.extend(std::iter::repeat_n(gap as usize, count - 1));
+    }
+    if margin > 0 {
+        expected.push(margin as usize);
+    }
+    assert_eq!(
+        runs.iter()
+            .map(|&(start, end)| end - start)
+            .collect::<Vec<_>>(),
+        expected
+    );
+    if margin > 0 {
+        assert_eq!(runs.first().unwrap().0, 0);
+        assert_eq!(runs.last().unwrap().1, length);
+    } else {
+        assert!(runs.iter().all(|&(start, end)| start > 0 && end < length));
+    }
+}
+
+#[test]
+fn grid_width_1363_keeps_all_seven_pixel_gaps() {
+    let mut o = options(CombineLayout::Grid);
+    o.grid_columns = Some(12);
+    o.cell_fit = CellFit::Fill;
+    o.output_size = OutputSize::Width(1363);
+    o.gap_x = 7;
+    o.background = Background::Transparent;
+    let sources = vec![RgbaImage::from_pixel(1, 1, Rgba([31, 107, 233, 255])); 12];
+    for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
+        o.direction = direction;
+        let l = calculate(&o, &[(100, 100); 12]);
+        let output = render_all(
+            &l,
+            &sources,
+            &o,
+            &no_labels(12),
+            1.0,
+            &comic_core::FontSet::default(),
+        )
+        .unwrap();
+        let y = output.height() / 2;
+        let (_, gaps) =
+            background_runs((0..output.width()).map(|x| output.get_pixel(x, y)[3] != 0));
+        assert_eq!(gaps.len(), 11);
+        assert!(
+            gaps.iter().all(|&(start, end)| end - start == 7),
+            "{direction:?}: {gaps:?}"
+        );
+    }
+}
+
+#[test]
+fn rendered_fixed_gaps_margins_and_bands_are_exact_in_all_layouts_and_directions() {
+    for kind in [
+        CombineLayout::Row,
+        CombineLayout::Column,
+        CombineLayout::Grid,
+        CombineLayout::JustifiedRows,
+        CombineLayout::JustifiedColumns,
+    ] {
+        let vertical = matches!(
+            kind,
+            CombineLayout::Column | CombineLayout::JustifiedColumns
+        );
+        let mut o = options(kind);
+        o.grid_columns = Some(4);
+        o.cell_fit = CellFit::Fill;
+        o.split = Split::Counts(vec![3, 4, 5]);
+        o.output_size = if vertical {
+            OutputSize::Height(1363)
+        } else {
+            OutputSize::Width(1363)
+        };
+        o.background = Background::Transparent;
+        o.labels.band_color = BandColor::Color([19, 61, 179]);
+        let sources = vec![RgbaImage::from_pixel(1, 1, Rgba([211, 73, 31, 255])); 12];
+        for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
+            o.direction = direction;
+            for margin in [0, 3] {
+                o.margin = margin;
+                for gap in [0, 7] {
+                    o.gap_x = gap;
+                    o.gap_y = gap;
+                    for band_height in [0, 13] {
+                        let l = layout(&o, &[(100, 100); 12], Some(band_height)).unwrap();
+                        let output = render_all(
+                            &l,
+                            &sources,
+                            &o,
+                            &no_labels(12),
+                            1.0,
+                            &comic_core::FontSet::default(),
+                        )
+                        .unwrap();
+                        let mut offset = 0;
+                        for &count in &l.split {
+                            let card = &l.cards[offset];
+                            // Sample through the group's images, then measure
+                            // transparent runs across the entire rendered axis.
+                            if vertical {
+                                let x = (card.image.x + card.image.width() / 2.0) as u32;
+                                assert_pixel_gaps(
+                                    (0..output.height()).map(|y| output.get_pixel(x, y)[3] != 0),
+                                    margin,
+                                    gap,
+                                    count as usize,
+                                );
+                            } else {
+                                let y = (card.image.y + card.image.height() / 2.0) as u32;
+                                assert_pixel_gaps(
+                                    (0..output.width()).map(|x| output.get_pixel(x, y)[3] != 0),
+                                    margin,
+                                    gap,
+                                    count as usize,
+                                );
+                            }
+                            offset += count as usize;
+                        }
+                        // Also measure the gaps between rows/columns. At the
+                        // leading inner edge every row/column contains a card.
+                        if kind == CombineLayout::JustifiedRows || kind == CombineLayout::Grid {
+                            assert_pixel_gaps(
+                                (0..output.height()).map(|y| output.get_pixel(margin, y)[3] != 0),
+                                margin,
+                                gap,
+                                l.split.len(),
+                            );
+                        } else if kind == CombineLayout::JustifiedColumns {
+                            assert_pixel_gaps(
+                                (0..output.width()).map(|x| output.get_pixel(x, margin)[3] != 0),
+                                margin,
+                                gap,
+                                l.split.len(),
+                            );
+                        }
+                        for card in &l.cards {
+                            for rect in [Some(card.card), Some(card.image), card.band]
+                                .into_iter()
+                                .flatten()
+                            {
+                                assert!(
+                                    [rect.x, rect.y, rect.right(), rect.bottom()]
+                                        .iter()
+                                        .all(|v| v.fract() == 0.0)
+                                );
+                                assert_eq!(render::scaled_rect(rect, 1.0), rect);
+                            }
+                            if let Some(band) = card.band {
+                                assert_eq!(band.height(), band_height as f64);
+                                let x = (band.x + band.width() / 2.0) as u32;
+                                assert!(
+                                    (band.y as u32..band.bottom() as u32).all(|y| *output
+                                        .get_pixel(x, y)
+                                        == Rgba([19, 61, 179, 255]))
+                                );
+                                assert_ne!(
+                                    *output.get_pixel(x, band.y as u32 - 1),
+                                    Rgba([19, 61, 179, 255])
+                                );
+                                if band.bottom() < output.height() as f64 {
+                                    assert_ne!(
+                                        *output.get_pixel(x, band.bottom() as u32),
+                                        Rgba([19, 61, 179, 255])
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn quantized_image_rectangles_recompute_crops_with_the_selected_anchor() {
+    let dims = [(100, 80), (99, 130), (175, 100)];
+    for kind in [
+        CombineLayout::Row,
+        CombineLayout::Column,
+        CombineLayout::Grid,
+        CombineLayout::JustifiedRows,
+        CombineLayout::JustifiedColumns,
+    ] {
+        let mut o = options(kind);
+        o.grid_columns = Some(2);
+        o.output_size = OutputSize::Width(317);
+        o.split = Split::Counts(vec![1, 2]);
+        o.gap_x = 7;
+        o.gap_y = 11;
+        o.margin = 3;
+        o.canvas_ratio = Some((5, 4));
+        for fit in [CellFit::Fit, CellFit::Fill] {
+            o.cell_fit = fit;
+            for anchor in Anchor9::ALL {
+                o.anchor = anchor;
+                let left = layout(&o, &dims, Some(13)).unwrap();
+                o.direction = CombineDirection::RightToLeft;
+                let right = layout(&o, &dims, Some(13)).unwrap();
+                o.direction = CombineDirection::LeftToRight;
+                let (ax, ay) = anchor.fractions();
+                for (a, b) in left.cards.iter().zip(&right.cards) {
+                    assert_eq!(a.source_crop, b.source_crop);
+                    let crop = a.source_crop;
+                    close(
+                        crop.width() * a.image.height(),
+                        crop.height() * a.image.width(),
+                    );
+                    close(crop.x, (a.source_size.0 as f64 - crop.width()) * ax);
+                    close(crop.y, (a.source_size.1 as f64 - crop.height()) * ay);
+                    assert!(crop.x >= -1e-9 && crop.y >= -1e-9);
+                    assert!(crop.right() <= a.source_size.0 as f64 + 1e-9);
+                    assert!(crop.bottom() <= a.source_size.1 as f64 + 1e-9);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn unmatched_fractional_rows_and_columns_keep_rendered_fixed_gaps() {
+    let dims: Vec<_> = [(100, 100), (150, 100), (100, 125)]
+        .into_iter()
+        .cycle()
+        .take(12)
+        .collect();
+    let sources = vec![RgbaImage::from_pixel(1, 1, Rgba([211, 73, 31, 255])); 12];
+    for kind in [CombineLayout::Row, CombineLayout::Column] {
+        let vertical = kind == CombineLayout::Column;
+        let mut o = options(kind);
+        o.line_size = LineSize::None;
+        o.margin = 3;
+        o.background = Background::Transparent;
+        o.labels.band_color = BandColor::Color([19, 61, 179]);
+        o.output_size = if vertical {
+            OutputSize::Height(1363)
+        } else {
+            OutputSize::Width(1363)
+        };
+        for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
+            o.direction = direction;
+            for align in [LineAlign::Start, LineAlign::Center, LineAlign::End] {
+                o.line_align = align;
+                for gap in [0, 7] {
+                    o.gap_x = gap;
+                    o.gap_y = gap;
+                    let l = layout(&o, &dims, Some(13)).unwrap();
+                    let output = render_all(
+                        &l,
+                        &sources,
+                        &o,
+                        &no_labels(12),
+                        1.0,
+                        &comic_core::FontSet::default(),
+                    )
+                    .unwrap();
+                    if vertical {
+                        let left = l.cards.iter().map(|card| card.image.x).fold(0.0, f64::max);
+                        let right = l
+                            .cards
+                            .iter()
+                            .map(|card| card.image.right())
+                            .fold(f64::INFINITY, f64::min);
+                        let x = ((left + right) / 2.0) as u32;
+                        assert_pixel_gaps(
+                            (0..output.height()).map(|y| output.get_pixel(x, y)[3] != 0),
+                            3,
+                            gap,
+                            12,
+                        );
+                    } else {
+                        let top = l.cards.iter().map(|card| card.image.y).fold(0.0, f64::max);
+                        let bottom = l
+                            .cards
+                            .iter()
+                            .map(|card| card.image.bottom())
+                            .fold(f64::INFINITY, f64::min);
+                        let y = ((top + bottom) / 2.0) as u32;
+                        assert_pixel_gaps(
+                            (0..output.width()).map(|x| output.get_pixel(x, y)[3] != 0),
+                            3,
+                            gap,
+                            12,
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

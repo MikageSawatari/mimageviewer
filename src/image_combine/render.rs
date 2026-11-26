@@ -35,8 +35,17 @@ fn check_scale(scale: f64) -> Result<(), RenderError> {
     }
 }
 
-/// Round edges, not widths: adjoining edges retain the same pixel boundary.
+/// Output layout endpoints are already quantized. Only previews round edges
+/// after scaling; widths must never be rounded independently of those edges.
 pub fn scaled_rect(rect: Rect, scale: f64) -> Rect {
+    if scale == 1.0 {
+        debug_assert!(
+            [rect.x, rect.y, rect.right(), rect.bottom()]
+                .iter()
+                .all(|v| v.fract() == 0.0)
+        );
+        return rect;
+    }
     let (x, y) = ((rect.x * scale).round(), (rect.y * scale).round());
     Rect::from_edges(
         x,
@@ -63,10 +72,14 @@ pub fn create_canvas(
     scale: f64,
 ) -> Result<RgbaImage, RenderError> {
     check_scale(scale)?;
-    let (w, h) = (
-        (layout.canvas_size.0 as f64 * scale).round().max(1.0) as u32,
-        (layout.canvas_size.1 as f64 * scale).round().max(1.0) as u32,
-    );
+    let (w, h) = if scale == 1.0 {
+        layout.canvas_size
+    } else {
+        (
+            (layout.canvas_size.0 as f64 * scale).round().max(1.0) as u32,
+            (layout.canvas_size.1 as f64 * scale).round().max(1.0) as u32,
+        )
+    };
     if layout.canvas_size.0 == 0
         || layout.canvas_size.1 == 0
         || w as u64 * h as u64 > MAX_CANVAS_PIXELS

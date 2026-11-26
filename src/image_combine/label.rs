@@ -216,6 +216,9 @@ fn fit_label(
         }
     };
     let (bounds, w, h) = measurement;
+    // Quantize label geometry here as well: output rendering consumes completed
+    // pixel rectangles, while previews only scale the same placement.
+    let (w, h) = (w.ceil(), h.ceil());
     let (ax, ay) = if o.placement == LabelPlacement::Band {
         (
             match o.band_align {
@@ -229,14 +232,14 @@ fn fit_label(
         o.overlay_anchor.fractions()
     };
     let rect = Rect::new(
-        area.x + (area.width() - w) * ax,
-        area.y + (area.height() - h) * ay,
+        (area.x + (area.width() - w) * ax).round(),
+        (area.y + (area.height() - h) * ay).round(),
         w,
         h,
     );
     let text_rect = Rect::new(
-        rect.x + (w - bounds.width()) * 0.5,
-        rect.y + (h - bounds.height()) * 0.5,
+        (rect.x + (w - bounds.width()) * 0.5).round(),
+        (rect.y + (h - bounds.height()) * 0.5).round(),
         bounds.width(),
         bounds.height(),
     );
