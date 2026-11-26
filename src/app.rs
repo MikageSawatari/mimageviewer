@@ -48449,46 +48449,47 @@ impl App {
         })
     }
 
+    /// The accepted physical listing, independent of favorite/search-root eligibility.
+    /// Transitional and virtual views must not refresh a previous physical folder.
+    fn current_physical_listing_folder(&self) -> Option<PathBuf> {
+        if !self.current_listing_accepts_folder_scan()
+            || self.current_folder_last_mtime.is_none()
+            || self.pdf_enumerate_pending.is_some()
+            || self.zip_enumerate_pending.is_some()
+            || self.pdf_password_dialog_path().is_some()
+            || self.favsearch.on_results_grid()
+            || self.tag_view.on_results_grid()
+        {
+            return None;
+        }
+        self.current_folder.clone()
+    }
+
+    /// An operation's output refreshes only its currently displayed physical parent.
+    /// The book root and its descendants are valid physical listings too.
+    pub(crate) fn operation_output_listing_folder(&self, output: &Path) -> Option<PathBuf> {
+        let parent = output.parent()?;
+        self.current_physical_listing_folder()
+            .filter(|folder| crate::folder_tree::path_eq(parent, folder))
+    }
+
     /// Ctrl+E エクスポートが現在表示中の実フォルダへ書き出したら、一覧復帰時の
     /// 再読み込み対象として記録する。ZIP / PDF / 検索結果などの仮想ビューでは
     /// 一覧文脈が変わってしまうため、ここでは何もしない。
     pub(crate) fn note_exported_file_for_folder_refresh(&mut self, path: &Path) {
-        if self.items_are_global_search_view
-            || self.global_search.active
-            || self.favsearch.on_results_grid()
-            || self.items_are_tag_view
-            || self.tag_view.on_results_grid()
-        {
-            return;
-        }
-        let Some(parent) = path.parent() else {
+        let Some(folder) = self.operation_output_listing_folder(path) else {
             return;
         };
-        let Some(cur) = self.current_favorite_target() else {
-            return;
-        };
-        if crate::folder_tree::path_eq(parent, &cur) {
-            self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest {
-                folder: cur,
-                cause: book_append_refresh::FolderRefreshCause::Operation,
-            });
-        }
+        self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest {
+            folder,
+            cause: book_append_refresh::FolderRefreshCause::Operation,
+        });
     }
 
     /// Combine owns its completion selection and operation rescan together.
     /// A physical listing below the book root need not be a favorite target.
     pub(crate) fn refresh_image_combine_output(&mut self, ctx: &egui::Context, path: &Path) {
-        if !self.current_listing_accepts_folder_scan()
-            || self.current_folder_last_mtime.is_none()
-            || self.favsearch.on_results_grid()
-            || self.tag_view.on_results_grid()
-        {
-            return;
-        }
-        let Some(folder) = self.current_folder.clone().filter(|folder| {
-            path.parent()
-                .is_some_and(|parent| crate::folder_tree::path_eq(parent, folder))
-        }) else {
+        let Some(folder) = self.operation_output_listing_folder(path) else {
             return;
         };
         self.request_post_operation_selection(
@@ -48512,7 +48513,7 @@ impl App {
         if request.cause.is_append_delivery() || self.current_folder_is_book_folder() {
             self.current_folder.clone()
         } else {
-            self.current_favorite_target()
+            self.current_physical_listing_folder()
         }
     }
 

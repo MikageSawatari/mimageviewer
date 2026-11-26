@@ -7,6 +7,7 @@ use egui_kittest::{
 };
 use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
+mod export_refresh_book_root_tests;
 mod preset_tests;
 mod watermark_tests;
 

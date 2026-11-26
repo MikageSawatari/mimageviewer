@@ -60297,17 +60297,12 @@ impl App {
         // Same-as-source can write into multiple folders. Refresh the displayed one once.
         // Combine schedules its operation rescan and selection in its finish handler.
         let first_success_path = if refresh_after_done && !combine {
-            let current = self.current_favorite_target();
             self.export_pending.as_ref().and_then(|p| {
                 p.successes
                     .iter()
                     .find(|success| {
-                        current.as_ref().is_some_and(|current| {
-                            success
-                                .path
-                                .parent()
-                                .is_some_and(|parent| crate::folder_tree::path_eq(parent, current))
-                        })
+                        self.operation_output_listing_folder(&success.path)
+                            .is_some()
                     })
                     .map(|success| success.path.clone())
             })
