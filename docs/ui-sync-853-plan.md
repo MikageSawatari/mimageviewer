@@ -2703,7 +2703,7 @@ section1876_row_two_pinned_tag_secondary_click_keeps_tag_action
   描画のテスト)。どちらも `de9b6a308` で追加した。detached の境界は構造的修正に **AGREE**。
 - r2 (同じ担当の継続、`d2768a9bb..5c870a954`): **ACCEPT**、指摘なし。
 
-dev-runtime の検証用バイナリ (`.\scriptsuild-dev.ps1`) は `5c870a954` で作成済み。製品の起動・実機での確認・perf の計測はしていない
+dev-runtime の検証用バイナリ (`.\scripts\build-dev.ps1`) は `5c870a954` で作成済み。製品の起動・実機での確認・perf の計測はしていない
 (サブ PC の確認は統括が行う)。
 
 残り・別項目の候補:
