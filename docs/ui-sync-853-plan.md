@@ -17,6 +17,7 @@
   お気に入りと同じく一覧へのキーを止める。残りの経路 (§3.5 の C・D) と「元の場所へ」(E) は別の項目にする
   (番号は統括が master で取る)。
 - §1.859: 「断るでよい (Recommended)」。貼り付けの処理中の 2 回目は、断って通知を出す。
+- §1.853 の残り C・D・E (2026-11-26): 「1. 待ちの間のキーを捨てる (推奨)」。お気に入り・アドレス欄 Enter と同じ規則 (§6.1)。
 - §1.861: 「案のとおり進めてください」。
 - §1.859 のクリップボードの扱い (2026-11-25、設計レビュー r3 の後に統括経由で質問): 「準備中は mIV の切り取りを断る
   (Recommended)」。貼るのは Shell が読む時点のクリップボード。貼り付けの準備中は、mIV 自身のファイルの切り取り・
@@ -998,3 +999,179 @@ P2-2 `InvokeCommand` の戻りは Shell の画面の役目が終わった証拠�
 承認の対象は診断と outcome の変更で、**R3-3 は未修正**。サブ PC の再確認で `shell_paste/foreground_after_invoke` を見て理由を判別してから直し方を決める。
 
 **R3-3 の結論 (2026-11-26): 直さずに閉じる**。サブ PC の 3 回目 (v580c2 の D、サブ PC のエージェント) の記録で、閉じた直後の前面は Shell の進行状況の窓 (OperationStatusWindow) で、約 0.9 秒後に mIV へ戻ると → が効いた (候補 (a))。Explorer で同じ操作をした比べは、サブ PC では画面操作のツールが Explorer へキーを送れず未確認 (v580d の D)。利用者が自分の PC の Explorer で試した結果 (利用者の言葉、2026-11-26): 「スキップを押したあと、そのダイアログがまだしばらく残っており、下のウィンドウに戻るまでに1秒くらいはありました。その間の右キーは無視されますが、ダイアログが閉じてフォーカスが戻ればききました。」Explorer と同じ動きなので、mIV 側で前面を戻す仕組みは足さない (OS と挙動を一致させる方針)。
+
+---
+
+## 6. §1.853 の残り C・D・E (v5.9.0 予定、ブランチ `ui-scan-853b`)
+
+状態: 設計 r1 (2026-11-26)。担当: 設計・検収 = ClaudeCode Opus 5.5 (uiscan-853b)、実装 = Codex GPT-6.1 Sol / high、
+独立レビュー = GPT-6.1 Sol / xhigh。作業ツリー `G:\home\mimageviewer-uiscan853b`。コードの記述は master `451ad09db` の読み取り。
+本担当は実行時の挙動を観測していない。時間の数字はサブ PC 担当の perf ログ (§1.853、3004 件のネットワークフォルダで約 7.6 秒)。
+
+まれな失敗 (走査の I/O エラー・worker の異常終了) は既定の割り切り (ログ + 通知)。再試行・回復の仕組みは足さない。
+
+### 6.1 利用者の決定 (2026-11-26、統括経由)
+
+設計担当が統括へ出した質問 (共有メモ `uiscan-853b-typeahead-question.md`) に、利用者は
+「1. 待ちの間のキーを捨てる (推奨)」を選んだ (統括の伝達、AskUserQuestion、2026-11-26)。質問での説明は
+「お気に入り・アドレス欄の Enter と同じ規則で、読み込み中に押したキーは押し直しが要る。速いローカルのフォルダでは
+待ちがごく短く、影響は主に遅い共有フォルダや件数の多いフォルダ」。
+
+したがって C・D・E の走査待ちは、§1.805 の「場所の移動待ち」(`GridItemInputBlock::DirectNavigationScan`) と同じ扱いにする。
+走査の間は今の一覧を表示したまま一覧の項目入力 (キー・ポインタ・タッチ・リング・ゲームパッド・メニュー) を止め、
+待ちの間に押したキーは新しい一覧へ渡さない。移動の入力 (ツリー・お気に入り・アドレス欄・戻る/進む等) は後勝ち。
+走査が 500 ms を超えたら「移動先を読み込み中…」を出す。どれも既存の仕組みで、新しい規則は作らない。
+2026-11-18 (§1.805 §3.2) に範囲から外した理由 (Enter 直後の先行入力) は、この決定で解消した。
+
+### 6.2 対象と対象外 (コードの棚卸し、master `451ad09db`)
+
+同期走査点は 1 つ: `load_folder_with_scan_claimed_with_search_origin` (`src/app.rs` 32692 付近) の
+`pre_scan = None` → `scan_directory_with_settings`。そこへ届く入口は 2 つ
+(`load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage` 31658 付近と
+`load_folder_with_scan_owned_with_search_origin` 31969 付近)。§1.805 の worker 分岐
+(`direct_navigation_uses_worker_scan`) は前者の入口にだけあり、owner が `Navigation`・navigation あり・
+印 `DirectoryScanRoute::Worker` のときだけ効く。
+
+main の context で同期走査に届く入口 (今回の対象):
+
+| 区分 | 入口 (生成点) | owner / intent / 全画面予約 | 読込後に使う状態 |
+| --- | --- | --- | --- |
+| C1 | 一覧のフォルダを開く: Enter (`accept_grid_container_open` → `grid_physical_navigation`、`collection_grid.rs` 1515・1603)、ダブルクリック (`ui_main.rs` 19510)、ゲームパッド A (`gamepad_input.rs` 10100) → post-render の `Direct` | Navigation / `container_open(auto)` / **`pending_auto_fs_open` を先に立てる** (`collection_grid.rs` 1546、`gamepad_input.rs` 10095) | なし |
+| C2 | 親へ: BS・⬆・背景・ゲームパッド B (`physical_grid_parent_action`、`grid_parent.rs` 596) → `Direct(parent, ExplicitList)`。サブフォルダ展開の戻り・スマートフォルダの物理の親 (`subfolder_expansion.rs` 1998、`smart_folder.rs` 8843) | Navigation / ExplicitList | `select_after_load` (子の名前) を先に置く |
+| C3 | コレクションの物理元: Enter・BS (`collection_grid.rs` 1592・1367) → `CollectionSource` | **CollectionGridPhysical** / 各 intent | なし |
+| C4 | フォルダを開くダイアログ (`open_folder_nav` → `dispatch_favorite_navigation` → `Direct`、印なし) | Navigation / ExplicitList | なし |
+| C5 | 全画面を閉じる即時経路 `dispatch_main_input_nav_immediate` の `Direct` / `CollectionSource` (`app.rs` 25208・25241): 閉じて親へ戻る (`close_return.rs` 407)、トレイ閉じ (`startup_list_restore.rs` 469、ResumeList)、Everything の物理の親、動画の背景での移動 | Navigation または CollectionGridPhysical / ExplicitList・ResumeList | 子の名前を先に置く。読込後は outcome のログだけ |
+| D1 | 本棚のルート `open_books_root` (`app.rs` 56021)、本の管理の「開く」(`location_jump.rs` 30) → `load_folder` | Navigation / ExplicitList | なし |
+| D2 | お気に入り検索の BS・Ctrl+↑↓ (`favsearch_back` 35896、`favsearch_navigate_sibling` 35874)、タグ表示の BS (`tag_view_back` 35466) | Navigation / ExplicitList・`container_open(false)` | 読込の前に検索の積み上げを変え、後にアドレスを更新。`Classifying` は今も `Loaded` と同じ扱い |
+| D3 | スマートフォルダの取消・定義削除 (`smart_folder.rs` 8299・8373)、サブフォルダ展開の切替・終了 (`subfolder_expansion.rs` 1801・1986) → `load_folder` | Navigation / ExplicitList | 通知だけ |
+| D4 | 「ZIP を作成」完了時の親の読み直し (`ui_dialogs/archive_convert.rs` 1185) | Navigation / PreservePresentation | 出力名の `select_after_load` を先に置く |
+| D5 | 読み直しの fallback (`reload_current_physical_list_with_intent`、`app.rs` 29068): main の実フォルダは既に staged の preflight (29049) で非同期。`current_folder_last_mtime` が無いとき (メタデータの取得失敗、スマートフォルダが mtime を消した後 `smart_folder.rs` 8657) だけ同期 | Navigation・CollectionGridPhysical・RatingPhysical / RefreshList | **読込の直後に `address`・`archive_source_override` を書き換える** (29077〜29084) |
+| E | 「元の場所へ」の ArchiveContainer (`app.rs` 61972〜62012): main で `classified_kind` が無く、`.zip`/`.pdf` 風の名前の実フォルダが今の一覧に Folder として出ているときだけ | Navigation / ExplicitList | なし |
+
+対象外 (理由):
+
+| 入口 | 理由 |
+| --- | --- |
+| ★固定の移動 `snapshot_load_and_open` (`snapshot_ops.rs` 2135)・`snapshot_navigate_grid_inner` (2870) | 読込の直後に `self.items` から対象の葉を探して全画面を開き、スライドショーを再開する (2136〜2195)。`snapshot_internal_nav` の guard と `items_generation` の照合 (2675) も同期を前提にしている。続きを型で運ぶ設計 (既存の `RequiredFullscreenTarget` が候補) が要り、範囲を超える。**別項目の候補として統括へ報告する** |
+| 再生試験 `poll_play_test` (`app.rs` 34375) | 診断用の CLI。非同期にすると採用までの毎フレームに読込を出し直す |
+| test-script の ReleaseChecks の「開く」(`release_checks.rs` 212) | 試験の自動操作。結果の bool を同期で返す契約 |
+| main 以外の context (detached・投影中の別 context) の全入口 (表の C・D の各入口と、§1.805 の印付き入口の detached 側、`restore_view_return_origin` 35338、起動 resolver の detached lease の bookmark `startup_ops.rs` 2124・2275・2592) | detached viewer はリワーク中で凍結 (CLAUDE.md)。今回の分岐は main の述語だけで判定し、main 以外は従来どおり同期のまま |
+| 既に `pre_scan` を持つ・ファイル/書庫だけの入口 (外部再走査、DFS、分類 worker、ツリー、JumpToPhysicalFolder、view-order refresh、起動 resolver の main、ZIP/PDF/変換書庫) | UI での走査が無い |
+
+### 6.3 設計: 同期走査点で「同じ呼び出しを走査の後へ遅らせる」
+
+§1.805 は生成点に印 (`DirectoryScanRoute::Worker`) を付けて入口ごとに worker へ回した。今回は対象が約 20 の生成点と
+2 つの入口にまたがり、印で選ぶと付け忘れた入口が同期のまま残る。**判定を同期走査点そのものに置き、既定を反転する**
+(CLAUDE.md「設計の簡素化」: 1 つの所有者・1 つの確定の時点)。
+
+1. **判定の位置**: `load_folder_with_scan_claimed_with_search_origin` の `pre_scan = None` で
+   `scan_directory_with_settings` を呼ぶ直前 (受付・拒否・claim・staged/PDF/ZIP の早期 return・test-script の数え上げを
+   全部通った後)。次をすべて満たすときは走査せず、worker に走査を出して `FolderOpenOutcome::Classifying` を返す:
+   - main の context (`main_folder_history_available()` かつ `!navigation_scope.is_detached_physical()`)
+   - navigation がある (main ではこの関数の冒頭で `capture_physical_open_navigation` が捕捉する。main で None に
+     なる経路が実在するなら、実装担当は設計担当へ返す。黙って同期にしない)
+   - 呼び出しの走査経路が例外 (下の 4) でない
+   - 権限が `VisibleInstallAuthority::Ordinary` (pre_scan = None で届く 2 入口はどちらも Ordinary。それ以外が来たら
+     設計担当へ返す)
+2. **預けるもの (`DirectNavigationContinuation`)**: 同期走査の後に `load_folder_with_scan_claimed_with_search_origin` が
+   使う引数を、`pre_scan` 以外全部そのまま持つ: `path`・`owner`・`grid_effects`・`classified_kind`・`restore_intent`・
+   `navigation` (test-script の `folder_load_recorded` を立てた後)・`stage`・`search_origin`・`tag_admission`。
+   加えて**全画面の予約**: `pending_auto_fs_open` を `std::mem::take` で受け取り、要求が持つ。保留中に App の flag に
+   残さないので、退役・取消・走査失敗で予約が次の無関係な読込へ漏れない (§1.805 §7 の `GridFolderCandidate` の既存の漏れと
+   同じ形をここでは作らない)。`select_after_load` は navigation の `selection_after_load` に捕捉済みであることを
+   実装担当がコードで確かめ、採用時に App の値を読まない (§5.4 の追補で起動の既定先に同じ問題があった)。
+   `FolderOpenScanPurpose::DirectNavigation` をこの continuation を持つ形 (`DirectNavigation(Box<DirectNavigationContinuation>)`)
+   に変える。
+3. **完了**: 既存の pane pending の poll → 通常 nav 裁定 (`post_render_main_navigation`、より優先の nav が同じフレームに
+   あれば負ける) → `main_list_navigation_is_current` の照合 (規則 3) はそのまま。owner が `CollectionGridPhysical` なら
+   `collection_grid_physical_load_owner_is_current` も照合し、古ければ捨てる (`GridFolderCandidate` と同じ)。
+   採用では、予約を `pending_auto_fs_open` に戻した直後に、**預けた引数と `pre_scan = Some(scan)` で同じ
+   `load_folder_with_scan_claimed_with_search_origin` を呼ぶ**。受付・claim はやり直さない (済んでいる。§1.805 の
+   「Admission is complete」と同じ)。走査の失敗は今の同期の失敗と同じ処理 (ログ・予約の破棄・`cancel_folder_pane_open`・
+   `release_fs_nav_lock`・「フォルダを読み取れませんでした」) にし、UI で走査し直さない。
+4. **例外 (同期のまま)**: 走査経路の型を「既定 = main は worker」と「理由付きの UI 走査」の 2 値にする
+   (例: `DirectoryScanRoute::{MainWorker, UiThread(UiThreadScanReason)}`、理由は `SnapshotLeafOpen`・`PlayTest`・
+   `ReleaseCheck`)。今の `DirectoryScanRoute::UiThread` の 12 か所と `load_folder` 系の wrapper は既定になり、§6.2 の
+   対象外の 3 入口だけが理由を渡す。理由は 2 つの入口から同期走査点まで引数で運ぶ (App の flag で運ばない)。
+   main 以外の context は経路の型にかかわらず従来どおり同期 (1 の述語で決まる)。
+5. **§1.805 の分岐を 1 つにまとめる**: `direct_navigation_uses_worker_scan` の早い分岐と `DirectoryScanRoute::Worker` の
+   印は、1 の判定に吸収して撤去する (同じ意味を 2 か所に書かない)。お気に入り・アドレス欄 Enter・最近開いたフォルダの
+   完了も 3 の「預けた同じ呼び出し」になる。§1.805 の分岐が今やっている受付時の後始末
+   (`retire_replaced_main_list_requests_with_startup_intent(Some(Pane), …)`、DFS の `folder_nav_pending` の取消、
+   `clear_pending_folder_nav_steps`、全画面の DFS holdover の `Superseded` 終了) は、1 の判定で worker を出す直前に同じ順で
+   行う。`AddressBarNav::WorkerFavorite`・`AddressEnterPhysical`・`RecentFolder` の値は、走査経路以外の意味
+   (位置・履歴の扱い) を持つなら残し、走査経路の印としての役目だけを外す。§1.805 の既存テストは期待値を変えずに通ること
+   が、このまとめの受け入れ条件。
+6. **D5 (読み直しの fallback) は staged の preflight に寄せる**: main で `current_folder_last_mtime` が無いときも、
+   既存の `start_physical_history_transition_classified_at_stage` (mtime がある場合と同じ経路) へ渡す。読込の直後に
+   `address`・`archive_source_override` を書き換える同期前提 (29077〜29084) は、main ではこの経路を通らなくなる。
+   staged の経路が mtime 無しを扱えない理由がコードにあれば、実装担当は設計担当へ返す (同期のまま残さない)。
+   main 以外は従来どおり。
+7. **D2 (検索の BS・Ctrl+↑↓) の積み上げ**: 呼び出し側は読込の前に `favsearch.nav_stack`・`tag_view.nav_stack` を変え、
+   後にアドレスを更新する。結果が `Classifying` のときの扱いは今もある (EPUB 等の分類待ち) ので、新しい組み合わせの種類は
+   増えない。走査の失敗 (まれ) で積み上げが一覧と食い違うのは割り切る。待ちの間に一覧の外の移動で退役した場合は、
+   その移動の採用が検索の状態を決める (実装担当はこの前提をコードで確かめ、成り立たない移動があれば返す)。
+
+### 6.4 待ちの間の入力・表示
+
+- 入力: 走査中は 3 の pending (`FolderOpenScanPurpose::DirectNavigation`) があるので、既存の
+  `direct_navigation_scan_pending()` → `GridItemInputBlock::DirectNavigationScan` がそのまま効く (§1.805 §4.4 の規則 1〜3、
+  Esc・スタック切替キーの扱いも同じ)。新しい停止理由・述語は作らない。
+- 表示: 走査中は今の一覧のまま。500 ms を超えたら既存の「移動先を読み込み中…」(`DIRECT_NAVIGATION_WAIT_GRACE`)。
+- 全画面を閉じる即時経路 (C5): 全画面は今どおりすぐ閉じ、走査の間は閉じる前の一覧 (見ていたフォルダ) が見えて、
+  採用で親の一覧に替わる。速いフォルダでは替わるまでが短く、遅い共有フォルダでは「移動先を読み込み中…」が出る。
+  今は閉じる操作の中で走査が終わるまで UI が止まっていた。この見え方の変化は利用者決定 (§6.1) の範囲 (お気に入りと同じ
+  見え方) と判断し、サブ PC の確認項目に入れる。
+
+### 6.5 計測
+
+- worker の既存 `nav/folder_open_scan` (`ms`・`purpose`・`folders`・`media`・`failed`・`cancelled`) に、continuation から
+  `owner` (`navigation|collection|rating`)・`intent` (restore_intent の種類)・`search` (`favsearch|tag|none`)・
+  `auto_fs` (予約の有無) を足す。生成点の名前は同期走査点では分からないので記録しない。
+- 採用時の `nav/lf_scan` は `pre_scanned=true`。`scripts/analyze_perf.py` の nav の内訳に新しい extras を足す。
+- UI スレッドの同期走査の cfg(test) 計数 (§1.805 で足したもの) を使い、対象の入口で 0 回であることをテストで確かめる。
+
+### 6.6 不変条件とテスト
+
+テストは既定と `--features test-script` の両方で流す (v5.8.0 の §1.853 では test-script 側の数え上げの期待値の誤りが
+全件まで見つからなかった)。
+
+1. §6.2 の対象の各入口 (C1〜C5・D1〜D5・E) で、dispatch したフレームと採用のフレームの UI 同期走査が 0 回。worker 完了 +
+   poll で、今の同期経路と同じ一覧・選択 (子の名前・出力名)・履歴・アドレス・カーソルが採用される。
+2. 全画面の予約: 画像フォルダを Enter で開く (自動全画面が有効) と、採用後に全画面が開く。待ちの間に別の移動で退役・
+   走査失敗・コレクションの owner の失効のどれでも、予約は次の無関係な読込に残らない。
+3. 入力: 待ちの間は一覧の項目入力が止まり (Enter・↓・ダブルクリック・ゲームパッド)、待ちの間に押したキーは採用後の一覧に
+   届かない。ツリー・お気に入り・アドレス欄・戻るは後勝ちで、遅れて完了した旧要求は採用されない。500 ms 未満では
+   待機表示を出さない。
+4. C5: 全画面を閉じて親へ戻る・トレイ閉じ・コレクションの物理元の閉じ戻りが、worker 完了後に従来と同じ選択で採用される。
+5. D2: お気に入り検索・タグ表示の BS と Ctrl+↑↓ が従来と同じ積み上げ・アドレス・選択になる。待ちの間にツリーで別の
+   場所へ移ったときの検索の状態が、その移動の採用どおりになる。
+6. D5: mtime の無い main の読み直しが staged の経路で採用され、変換書庫のアドレス (`archive_source_override`) が
+   従来どおり保たれる。
+7. E: `.zip` という名前の実フォルダへの「元の場所へ」が worker で走査される。
+8. 例外: ★固定の移動・再生試験・ReleaseChecks は同期のまま (計数 1 回)。main 以外の context の各入口も同期のまま。
+9. §1.805 の既存テスト (お気に入り・アドレス欄・最近開いたフォルダ・退役・DFS・saved-group・待機表示) が期待値を変えずに通る。
+10. test-script の要求数: 受付時の 1 回だけ (採用の再入で数え直さない)。取消された受理済み要求も 1 回。
+11. 既存テストのうち、対象の入口の直後に同期採用を前提にしていたもの (§1.805 §3.2 の 39 件: history_parent_1473・
+    ratingnav649・same_position_double_click・section1328 等) は、worker 完了 + `post_render_main_navigation` を回す helper を
+    通す形に直す。**期待値は変えない**。期待値を変えないと通らないものは、実装担当が理由を添えて設計担当へ返す。
+
+### 6.7 文書の更新 (実装時)
+
+- [ui-responsiveness.md](ui-responsiveness.md): 冒頭の §1.853 の節に C・D・E を追記。対象外 (★固定の移動・診断・
+  main 以外) を明記。
+- [async-architecture.md](async-architecture.md): 物理フォルダの事前走査の行に、同期走査点の既定の反転と continuation。
+- [direct-navigation-worker-scan-plan.md](direct-navigation-worker-scan-plan.md) §7: 一覧側の後続候補を本書 §6 で実施したと記録。
+- [detached-rework-plan.md](detached-rework-plan.md) §11: 判定は main の述語だけで、main 以外の context の経路は変えないこと。
+- htdocs のマニュアルに「読み込み中のキー」に触れた記述があれば合わせる (無ければ変えない)。
+- next-release-backlog の状態行は統括が更新する (本担当は変えない)。
+
+### 6.8 状態の組み合わせを減らす検討
+
+- 採用: 判定を同期走査点 1 か所に置き、入口ごとの印をやめる。付け忘れの入口が残らず、§1.805 の分岐も吸収して
+  完了の経路が 1 つになる。
+- 採用: 待ちの間の入力は既存の「場所の移動待ち」(停止理由 1 つ) に乗せる。新しい停止理由・入力の保留は作らない
+  (利用者決定 §6.1)。
+- 採用: 全画面の予約は App の flag から要求の持ち物へ移す。flag と pending の 2 か所で同じ予約を持たない。
+- 不採用: モーダル化。移動の入力 (ツリー・お気に入り・戻る) まで止める理由がない (§1.805 §3 の D と同じ)。
+- 不採用: ★固定の移動まで今回広げること。続きを型で運ぶ設計が別に要る (§6.2)。
