@@ -26,11 +26,18 @@ pub(super) fn start_service() -> Option<FolderOrderService> {
     }
 }
 
-pub(super) fn projection_key(base: u64, state: &FolderOrderState) -> u64 {
+/// Extend the ordinary projection only while this listing applies manual order.
+/// The caller supplies the requested listing's eligibility and stack decision;
+/// `state.input` can still describe the previously adopted stack presentation.
+pub(super) fn projection_key(base: u64, state: &FolderOrderState, manual_applied: bool) -> u64 {
+    if !manual_applied || !state.manual_active() || !state.input.is_read() {
+        return base;
+    }
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     base.hash(&mut hash);
     state.folder_key.hash(&mut hash);
+    state.mode.hash(&mut hash);
     state.order_revision.hash(&mut hash);
     hash.finish()
 }
@@ -1164,11 +1171,132 @@ mod tests {
         };
         assert!(completion_matches(&state, 11, &completion));
         assert!(!completion_matches(&state.clone(), 12, &completion));
-        let old_projection = projection_key(7, &state);
+        let old_projection = projection_key(7, &state, false);
         state.enter_manual();
         assert!(!completion_matches(&state, 11, &completion));
-        assert_ne!(old_projection, projection_key(7, &state));
+        assert_ne!(old_projection, projection_key(7, &state, true));
         state.folder_key = Some("c:/other".into());
         assert!(!completion_matches(&state, 11, &completion));
+    }
+
+    fn projection_state(input: FolderOrderListingInput) -> FolderOrderState {
+        FolderOrderState::from_listing(
+            Path::new("C:/folder"),
+            input,
+            ["c:/folder/a.jpg", "c:/folder/b.jpg", "c:/folder/hidden.jpg"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn folder_order_normal_projection_preserves_base_through_inventory_and_revision_changes() {
+        let inactive = FolderOrderRecord {
+            active: false,
+            revision: 12,
+            items: vec!["c:/folder/b.jpg".into(), "c:/folder/a.jpg".into()],
+        };
+        for input in [
+            FolderOrderListingInput::NotApplicable,
+            FolderOrderListingInput::from_read(Ok(None)),
+            FolderOrderListingInput::from_read(Ok(Some(inactive))),
+            FolderOrderListingInput::from_read(Err(FolderOrderError::new("read fixture"))),
+        ] {
+            let mut state = projection_state(input);
+            assert_eq!(state.mode, FolderOrderMode::Normal);
+            for base in [0, 7, u64::MAX] {
+                // Even an overly broad caller cannot give Normal or NotApplicable
+                // a manual identity merely because inventory/revision exists.
+                assert_eq!(projection_key(base, &state, true), base);
+            }
+            state.inventory.insert("c:/folder/added.jpg".into());
+            assert_eq!(projection_key(7, &state, true), 7);
+            let revision = state.order_revision;
+            assert!(state.delete(&["c:/folder/a.jpg".into()]));
+            assert!(state.order_revision > revision);
+            assert_eq!(projection_key(7, &state, true), 7);
+            let revision = state.order_revision;
+            assert!(state.rename(&[FolderOrderRename::new(
+                Path::new("c:/folder/b.jpg"),
+                Path::new("c:/folder/renamed.jpg"),
+                RenameScope::Exact,
+            )]));
+            assert!(state.order_revision > revision);
+            assert_eq!(projection_key(7, &state, true), 7);
+            if state.folder_key.is_some() {
+                let revision = state.order_revision;
+                let input = state.listing_input();
+                let inventory = state.inventory.clone();
+                state.adopt_listing(input, inventory);
+                assert!(state.order_revision > revision);
+                assert_eq!(projection_key(7, &state, true), 7);
+            }
+        }
+    }
+
+    #[test]
+    fn folder_order_manual_projection_tracks_mode_reorder_reset_rename_delete_and_exit() {
+        let base = 7;
+        let mut state = projection_state(FolderOrderListingInput::from_read(Ok(None)));
+        assert_eq!(projection_key(base, &state, true), base);
+        state.enter_manual();
+        let entered = projection_key(base, &state, true);
+        assert_ne!(entered, base);
+        state.enter_manual();
+        assert_eq!(projection_key(base, &state, true), entered);
+
+        let full = vec!["c:/folder/a.jpg".into(), "c:/folder/b.jpg".into()];
+        let visible = full.iter().cloned().collect();
+        let reordered = vec!["c:/folder/b.jpg".into(), "c:/folder/a.jpg".into()];
+        assert!(
+            state
+                .commit_reorder(&full, &visible, &reordered)
+                .unwrap()
+                .is_some()
+        );
+        let recorded = projection_key(base, &state, true);
+        assert_ne!(recorded, entered);
+        assert!(state.reset().is_some());
+        let reset = projection_key(base, &state, true);
+        assert_ne!(reset, recorded);
+        assert_ne!(reset, entered);
+        assert!(state.rename(&[FolderOrderRename::new(
+            Path::new("c:/folder/a.jpg"),
+            Path::new("c:/folder/renamed.jpg"),
+            RenameScope::Exact,
+        )]));
+        let renamed = projection_key(base, &state, true);
+        assert_ne!(renamed, reset);
+        assert!(state.delete(&["c:/folder/b.jpg".into()]));
+        assert_ne!(projection_key(base, &state, true), renamed);
+        state.leave_manual();
+        assert_eq!(projection_key(base, &state, true), base);
+    }
+
+    #[test]
+    fn folder_order_suppressed_manual_projection_preserves_base_and_snapshot() {
+        let mut state = projection_state(FolderOrderListingInput::from_read(Ok(Some(
+            FolderOrderRecord {
+                active: true,
+                revision: 12,
+                items: vec!["c:/folder/b.jpg".into(), "c:/folder/a.jpg".into()],
+            },
+        ))));
+        let manual = projection_key(7, &state, true);
+        assert_ne!(manual, 7);
+        let before = state.clone();
+        // Both an ineligible listing and a requested stack presentation suppress
+        // manual identity without deactivating the retained record.
+        assert_eq!(projection_key(7, &state, false), 7);
+        assert_eq!(state, before);
+        state.input = state.input.with_stack(true);
+        assert_eq!(projection_key(7, &state, false), 7);
+        // A new stack-off request uses its actual decision rather than the
+        // previous adopted input's stack bit.
+        assert_eq!(projection_key(7, &state, true), manual);
+        state.delete(&["c:/folder/a.jpg".into()]);
+        assert_eq!(projection_key(7, &state, false), 7);
+        assert_ne!(projection_key(7, &state, true), manual);
     }
 }

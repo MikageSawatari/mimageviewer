@@ -1484,6 +1484,217 @@ fn section1375_delete_mixed_directory_mtime_observes_without_display_sort_stamp_
     assert_eq!(app.image_metas[child_idx], displayed);
 }
 
+fn section1911_save_folder_order(app: &App, folder: &Path, names: &[&str]) {
+    let scan = scan_directory_with_settings(folder, &app.settings).unwrap();
+    app.folder_order_handle()
+        .unwrap()
+        .save(
+            folder,
+            crate::folder_order::FolderOrderSave {
+                listing_order: names
+                    .iter()
+                    .map(|name| crate::folder_order::folder_key(&folder.join(name)))
+                    .collect(),
+                inventory: scan.folder_order_inventory,
+                revision: 71,
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn section1911_stack_grouping_retains_normal_and_recorded_folder_order_owner() {
+    for recorded in [false, true] {
+        let (mut app, folder, ctx) = fixture(&["a_1.jpg", "b_1.jpg", "b_2.jpg", "c_1.jpg"]);
+        app.settings.auto_fullscreen_image_folders = false;
+        if recorded {
+            section1911_save_folder_order(
+                &app,
+                &folder,
+                &["c_1.jpg", "b_2.jpg", "b_1.jpg", "a_1.jpg"],
+            );
+        }
+        app.stack_mode_requested = true;
+        app.load_folder(folder.clone());
+        let owner = app.folder_order.clone();
+        assert_eq!(
+            owner.mode,
+            if recorded {
+                crate::folder_order::FolderOrderMode::ManualRecorded
+            } else {
+                crate::folder_order::FolderOrderMode::Normal
+            }
+        );
+        settle(&mut app, &ctx);
+        assert!(app.stack_view.is_some());
+        assert_eq!(
+            app.folder_order, owner,
+            "derived grouping keeps its physical owner"
+        );
+        assert!(!app.folder_manual_order_applied());
+        let base = folder_projection_key(&app.settings, true);
+        assert_eq!(app.current_folder_projection_key(&folder), base);
+        assert_eq!(
+            app.folder_observation.as_ref().unwrap().projection_key,
+            base
+        );
+        let removed = folder.join("a_1.jpg");
+        std::fs::remove_file(&removed).unwrap();
+        delete_terminal(&mut app, vec![removed.clone()]);
+        settle(&mut app, &ctx);
+        assert_eq!(app.folder_order.mode, owner.mode);
+        assert!(
+            !app.folder_order
+                .inventory
+                .contains(&crate::folder_order::folder_key(&removed))
+        );
+        let stable = app.items_generation;
+        app.check_external_folder_changes(&ctx, ExternalChangeCheck::Notified);
+        settle(&mut app, &ctx);
+        assert_eq!(app.items_generation, stable);
+        assert_eq!(app.current_folder_projection_key(&folder), base);
+    }
+}
+
+#[test]
+fn section1911_manual_delete_rebases_survivor_observation_without_changing_directory_stamp() {
+    let (mut app, folder, ctx) = fixture(&["a.jpg", "b.jpg"]);
+    app.settings.auto_fullscreen_image_folders = false;
+    app.settings.sort_order = crate::settings::SortOrder::DateDesc;
+    let child = folder.join("child");
+    let hidden = folder.join("hidden.txt");
+    std::fs::create_dir(&child).unwrap();
+    std::fs::write(&hidden, b"unlisted saved position").unwrap();
+    section1911_save_folder_order(&app, &folder, &["b.jpg", "hidden.txt", "child", "a.jpg"]);
+    app.load_folder(folder.clone());
+    settle(&mut app, &ctx);
+    assert!(app.folder_manual_order_applied());
+    let child_stamp = app.image_metas[app
+        .items
+        .iter()
+        .position(|item| item.name() == "child")
+        .unwrap()];
+    std::fs::write(child.join("active.part"), b"partial-download").unwrap();
+    // Cover both an ordinary visible removal and an inventory-only removal of
+    // a saved hidden child. Both preserve the displayed survivor row proof.
+    for removed in [folder.join("b.jpg"), hidden] {
+        let rows = Arc::clone(&app.folder_observation.as_ref().unwrap().rows);
+        std::fs::remove_file(&removed).unwrap();
+        delete_terminal(&mut app, vec![removed.clone()]);
+        let generation = app.items_generation;
+        assert!(Arc::ptr_eq(
+            &rows,
+            &app.folder_observation.as_ref().unwrap().rows
+        ));
+        assert_eq!(
+            app.folder_observation.as_ref().unwrap().projection_key,
+            app.current_folder_projection_key(&folder)
+        );
+        assert!(
+            app.external_rescan_pending
+                .as_ref()
+                .unwrap()
+                .proof
+                .as_ref()
+                .unwrap()
+                .baseline
+                .is_some()
+        );
+        settle(&mut app, &ctx);
+        assert_eq!(app.items_generation, generation);
+        let child_idx = app
+            .items
+            .iter()
+            .position(|item| item.name() == "child")
+            .unwrap();
+        assert_eq!(app.image_metas[child_idx], child_stamp);
+        let removed_key = crate::folder_order::folder_key(&removed);
+        assert!(!app.folder_order.inventory.contains(&removed_key));
+        assert!(
+            !app.folder_order
+                .record
+                .as_ref()
+                .unwrap()
+                .items
+                .contains(&removed_key)
+        );
+    }
+}
+
+#[test]
+fn section1911_delete_does_not_relabel_an_observation_from_a_previous_order_policy() {
+    let (mut app, folder, ctx) = fixture(&["a.jpg", "b.jpg", "c.jpg"]);
+    app.settings.auto_fullscreen_image_folders = false;
+    section1911_save_folder_order(&app, &folder, &["b.jpg", "c.jpg", "a.jpg"]);
+    app.load_folder(folder.clone());
+    settle(&mut app, &ctx);
+    let old_key = app.folder_observation.as_ref().unwrap().projection_key;
+    // The sort handler has changed policy, but its caller has not yet rebuilt
+    // the old rows. A deletion cannot authorize those rows as the new policy.
+    assert!(app.select_folder_sort(FolderSortChoice::Standard(
+        crate::settings::SortOrder::FileName
+    )));
+    let removed = folder.join("b.jpg");
+    std::fs::remove_file(&removed).unwrap();
+    delete_terminal(&mut app, vec![removed]);
+    assert_eq!(
+        app.folder_observation.as_ref().unwrap().projection_key,
+        old_key
+    );
+    assert_ne!(old_key, app.current_folder_projection_key(&folder));
+    assert!(
+        app.external_rescan_pending
+            .as_ref()
+            .unwrap()
+            .proof
+            .as_ref()
+            .unwrap()
+            .baseline
+            .is_none()
+    );
+    settle(&mut app, &ctx);
+}
+
+#[test]
+fn section1911_delete_does_not_relabel_manual_rows_when_remaining_images_lock_page_order() {
+    let (mut app, folder, ctx) = fixture(&["a.jpg", "b.jpg"]);
+    let child = folder.join("child");
+    std::fs::create_dir(&child).unwrap();
+    app.settings.auto_fullscreen_zip_pdf = true;
+    app.settings.auto_fullscreen_image_folders = true;
+    section1911_save_folder_order(&app, &folder, &["b.jpg", "child", "a.jpg"]);
+    app.load_folder(folder.clone());
+    settle(&mut app, &ctx);
+    assert!(app.folder_manual_order_applied());
+    let old_key = app.folder_observation.as_ref().unwrap().projection_key;
+    std::fs::remove_dir(&child).unwrap();
+    delete_terminal(&mut app, vec![child]);
+    assert!(!app.folder_manual_order_eligible());
+    assert_eq!(
+        app.folder_observation.as_ref().unwrap().projection_key,
+        old_key
+    );
+    assert_ne!(old_key, app.current_folder_projection_key(&folder));
+    assert!(
+        app.external_rescan_pending
+            .as_ref()
+            .unwrap()
+            .proof
+            .as_ref()
+            .unwrap()
+            .baseline
+            .is_none()
+    );
+    settle(&mut app, &ctx);
+    assert_eq!(
+        app.items
+            .iter()
+            .map(|item| item.name().into_owned())
+            .collect::<Vec<_>>(),
+        ["a.jpg", "b.jpg"]
+    );
+}
+
 #[test]
 fn section1375_same_second_file_overwrite_is_observed_by_actual_worker() {
     let (mut app, folder, ctx) = fixture(&["a.jpg", "b.jpg"]);

@@ -71,7 +71,7 @@ impl FolderOrderListingInput {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum FolderOrderMode {
     #[default]
     Normal,

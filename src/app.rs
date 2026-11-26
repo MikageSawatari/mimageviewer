@@ -27937,6 +27937,9 @@ impl App {
                 presentation.as_ref(),
             ),
             &self.folder_order,
+            self.folder_order.manual_active()
+                && !self.stack_mode_requested
+                && self.folder_manual_order_eligible(),
         )
     }
 
@@ -28322,6 +28325,9 @@ impl App {
         let projection_key = folder_manual_order::projection_key(
             folder_projection_key(&listing_settings, self.stack_mode_requested),
             &self.folder_order,
+            self.folder_order.manual_active()
+                && !self.stack_mode_requested
+                && self.folder_manual_order_eligible(),
         );
         listing_settings.sort_order =
             self.effective_listing_sort_order(listing_settings.sort_order);
@@ -33471,6 +33477,9 @@ impl App {
         self.stack_active_rule = None;
         self.stack_script_error = None;
         let items_len = items.len();
+        // The common installer retires the old stack presentation. The accepted
+        // request's stack policy still owns this new physical projection's key.
+        let requested_stack = self.stack_mode_requested;
         let mut hydration = self.install_loading_items_inner(
             path,
             items,
@@ -33492,7 +33501,14 @@ impl App {
             .order_revision
             .checked_add(1)
             .expect("folder order revision exhausted");
-        let projection_key = folder_manual_order::projection_key(projection_key, &folder_order);
+        let manual_applied = !requested_stack
+            && folder_order.applies_to_physical_listing(
+                &self.settings,
+                &audio_inventory_parent,
+                &self.items,
+            );
+        let projection_key =
+            folder_manual_order::projection_key(projection_key, &folder_order, manual_applied);
         self.folder_order = folder_order;
         self.notify_folder_order_read_failure();
         // The shared write predicate can now validate the adopted folder itself,
@@ -45426,7 +45442,23 @@ impl App {
                 &items,
             ),
         };
-        self.retire_folder_order_for_listing();
+        // A downstream physical Stack projection still belongs to the same
+        // scanned folder. It suppresses manual application without retiring its
+        // record/inventory owner. Other source/projection installs leave it.
+        let retained_physical_order = matches!(
+            &authority,
+            VisibleInstallAuthority::Projection {
+                recipe: book_materialization::ProjectionRecipe::OrdinaryList
+            }
+        ) && self.folder_order.folder_key.as_deref()
+            == Some(crate::folder_order::folder_key(&source_path).as_str())
+            && matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Folder
+            );
+        if !retained_physical_order {
+            self.retire_folder_order_for_listing();
+        }
         self.install_new_items_inner(items, image_metas, !has_prepared_aggregate);
         self.spread_presentation_source = spread_presentation_source;
         // Downstream Stack installs retain the physical scan record. Bind it only after
@@ -53470,6 +53502,23 @@ impl App {
         // items が途中で入れ替わっても (Ctrl+G 結果差し替え等) 現 items に残っている分だけ
         // 引き当てられる。items_generation の一致チェックは不要 (空振り最適化のためだけの
         // 早期 return を入れると、Ctrl+G 結果に削除済み path が含まれていたとき反映漏れになる)。
+        // Only a current observation can be advanced by this successful removal.
+        // A pending sort/mode change must still rebuild from its own new policy.
+        let retained_order_observation = self
+            .folder_observation
+            .as_ref()
+            .filter(|record| {
+                record.generation == self.items_generation
+                    && self.current_folder.as_ref() == Some(&record.source)
+                    && record.projection_key == self.current_folder_projection_key(&record.source)
+            })
+            .map(|record| {
+                (
+                    record.source.clone(),
+                    Arc::clone(&record.rows),
+                    self.folder_manual_order_applied(),
+                )
+            });
         self.folder_order.delete(
             &succeeded
                 .iter()
@@ -53497,6 +53546,24 @@ impl App {
             self.remove_items_batch(&idxs);
             if let Some(restart) = restart {
                 self.resume_initial_stack_after_deletion(restart);
+            }
+        }
+        // The removed-path proof and its surviving rows now describe the new
+        // record/inventory revision, including deletions of unlisted children.
+        // Do not relabel a replaced or retired observation from another install.
+        if let Some((source, rows, manual_applied)) = retained_order_observation {
+            let projection_key = self.current_folder_projection_key(&source);
+            // Removing the last non-image child can lock page order. Those old
+            // manual rows do not prove the newly selected fixed-order policy.
+            let same_order_policy = manual_applied == self.folder_manual_order_applied();
+            let generation = self.items_generation;
+            if let Some(record) = self.folder_observation.as_mut().filter(|record| {
+                same_order_policy
+                    && record.source == source
+                    && record.generation == generation
+                    && Arc::ptr_eq(&record.rows, &rows)
+            }) {
+                record.projection_key = projection_key;
             }
         }
         // Successful physical removals always request reconciliation, even with no visible row
