@@ -12,7 +12,7 @@ use mimageviewer::archive_converter::{
 #[test]
 fn locked_zip_publish_reports_plain_message_and_native_error_without_overwrite() {
     let dir = tempfile::tempdir().unwrap();
-    // This integration binary owns its logger and uses only disposable data.
+    // This test owns its logger; use nextest or filter to this module with cargo test.
     mimageviewer::data_dir::DATA_DIR
         .set(dir.path().join("data"))
         .unwrap();

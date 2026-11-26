@@ -3,17 +3,16 @@
 //! 全モデルがサンプル画像で正常に動作することを確認する。
 //!
 //! 実行方法:
-//!   cargo test --test test_ai_upscale -- --nocapture
+//!   cargo test -p mimageviewer --test integration test_ai_upscale:: -- --nocapture
 //!
 //! 環境変数 TEST_IMAGE_PATH でテスト用画像を指定できる:
-//!   TEST_IMAGE_PATH="D:\path\to\image.jpg" cargo test --test test_ai_upscale -- --nocapture
+//!   TEST_IMAGE_PATH="D:\path\to\image.jpg" cargo test -p mimageviewer --test integration test_ai_upscale:: -- --nocapture
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-#[path = "support/gpu_test_group.rs"]
-mod test_gpu_group;
+use crate::test_gpu_group;
 
 /// テスト用画像のパスを返す。
 /// 環境変数 TEST_IMAGE_PATH があればそれを使い、なければデフォルトのテスト画像を生成。

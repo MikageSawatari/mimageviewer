@@ -350,9 +350,9 @@ PrefixPreview / FullComposite / ShowSource × `ensure_final_composite_texture`
 `.github/workflows/` の test job に何も追加せず動く (= `cargo test` 全体に含まれる)。
 ローカルでは:
 ```bash
-cargo test --test local_adjust_core_parity  # L3 のみ
+cargo test -p mimageviewer --test integration local_adjust_core_parity::  # L3 のみ
 cargo test --lib local_adjust                # L1 + L2 のみ
-cargo test                                    # 全部
+.\scripts\test-full.ps1                       # 全部 (nextest、doctest は別段)
 ```
 
 ## 追加 / 改廃時のルール
