@@ -11,7 +11,7 @@ backlog §1.903 の記録。v5.7.0 のリリース時の依存物の確認 (リ�
 | --- | --- | --- |
 | 通常 crate | master `c77d48f46` の Cargo.lock | `cargo update` の範囲で 23 件 (下記) |
 | PDFium | `chromium/8165`, `160.0.8165.0` | `chromium/8179`, `160.0.8179.0` (2026-11-23 公開) |
-| mIV Sound の元 (EffeTune Mixwright) | v0.17.0 (mIV Sound 0.17.0-miv.1) | (作業中) |
+| mIV Sound の元 (EffeTune Mixwright) | v0.17.0 (mIV Sound 0.17.0-miv.1) | v0.19.0 (mIV Sound 0.19.0-miv.1、候補 `b903e76a…7334`、2026-11-26 承認) |
 
 手を入れている crate (`vendor/eframe`・`egui`・`egui-wgpu`・`egui-winit`・`epaint`・`libmimalloc-sys`・
 `tantivy`、`crates/unrar-patched`) は、2026-11-25 の確認でどれも最新。Rust 1.100.0・FFmpeg・LibRaw・
@@ -104,7 +104,23 @@ python scripts/generate-pdfium-license.py --check
 
 ## mIV Sound の元 (EffeTune Mixwright) 0.19.0
 
-(作業中)
+詳しい記録は [派生版計画 §21](effetune-fork-plan.md#21-0190-miv1-への更新-2026-11-26)。ここには要点だけを置く。
+
+- 上流 v0.17.0 → v0.19.0 (Mixwright 5 commit、EffeTune 2.17.0 → 2.19.0)。派生版 `G:\home\miv-sound` のブランチ `miv-0.19`
+  (merge `42c7d49`、修正 `346c8b0`・`801ca2a`、未 push)。submodule は effetune `0ffa5c7`、choc `8af031c`。
+- 利用者の決定 (2026-11-26、統括経由): 歌詞は派生版の方式を残す (上流の `EffeTune.NowPlayingLyrics` と ProcessContext の時計は派生版から外した。
+  mIV 本体と vst3-host は変えない)。Headphone EQ は AutoEQ の取得も含めて出す (CSP の connect-src に
+  `https://raw.githubusercontent.com/jaakkopasanen/AutoEq/` だけを足す)。Distortion Correction は追加の一覧から外す (保存済みは読める)。
+  Live Audio Send/Receive は従来どおり外す。0.19 → 0.17 へ戻したときの互換は保証しない。
+- 候補 `b903e76a…7334`、ctest 139 件すべて成功。独立レビューは 2 回目で ACCEPT。
+  サブ PC の実機確認 (サブ PC 担当の観測) は期待どおり (耳で聞く確認は未実施)。利用者の採用判断 (2026-11-26、統括経由) を受けて承認した。
+- mIV 側: `config/miv-sound.rs` を 0.19.0-miv.1 / v0.19.0 にし、説明書 (snapshot `third_party/effetune-docs/0ffa5c70`)・
+  privacy.html (日英、Headphone EQ の通信と保存)・マニュアル `effetune.html` を更新した。製品ページのカードは今回も成り立つので変えていない。
+- 承認 (`-Approve`) で `vendor/miv-sound` (0.19.0-miv.1)・`third_party/miv-sound/0.19.0-miv.1/` と
+  `C:\home\mimageviewer_vendor_backup\miv-sound-0.19.0-miv.1\` ができた。バックアップは vendor・third_party と内容が一致する (diff -r)。
+  **master へ取り込んだ後は、各作業ツリーの `vendor/miv-sound` も 0.19.0-miv.1 に入れ替える必要がある** (config と食い違うとビルドが止まる)。
+  バックアップの `artifact\` を実体コピーすればよい。
+- **公開前の VirusTotal (リリース手順 12.6) が要る**: `mIV Sound.vst3` (DLL と webview の資源) が変わる。vst3-host は変わらない。
 
 ## 検証
 
@@ -119,7 +135,8 @@ python scripts/generate-pdfium-license.py --check
   で、lease を返した直後の `poll_remote_session` の後も `AcquiringRemote` のままで `RemoteActive` にならなかった。
   同じソースで `still_window_mode_key_tests::remote_` の 14 件を単独で 3 回流すと 3 回とも全件成功した。master の直近の全件
   (統括、2026-11-26 00:18 開始、同じ 20,784 件) は全件成功している。負荷の高い全件の中でだけ出る時間依存の失敗と見ているが、
-  crate の更新と無関係だとは確かめていない。統括が master で流す全件で再び出るかを見る。
+  統括の判断: 既知の §1.847 (リモート取得のテストが混雑時に 1 回の poll で完了しない、テストの組み方の問題) と同じ群。
+  crate・PDFium を取り込んだ後の master の全件 (20,796 件) は全件成功し、この 2 件は出なかった (統括、2026-11-26)。
 - 独立レビュー (gpt-6.1-sol / xhigh、read-only): 1 回目 REJECT (P2: Windows 向けにはビルドされない pin-project 1.2.0・zcheapstr のソースが手元に無く未確認、
   P3: zlib-rs 0.6.9 の不正な zlib ヘッダでの assert は mIV の flate2 の使い方からは到達しない)。`cargo fetch` の後の 2 回目で ACCEPT。
   レビューが挙げた挙動の変化: ahash のハッシュ値が変わる (mIV は ahash の値を保存していない)、url がパスの `^` を `%5E` にする、
@@ -130,9 +147,19 @@ python scripts/generate-pdfium-license.py --check
 - `python scripts/generate-pdfium-license.py --check`: 成功。
 - `cargo nextest run -p mimageviewer --lib -E 'test(/pdf/) | test(/pdfium/) | test(/about/)'`: 609 件すべて成功 (About の `pdfium_notices_match_all_vendor_files_and_version` を含む)。
 
-## 未確認 (実機)
+### mIV Sound 0.19.0-miv.1 の承認 (254e895a4)
 
-mIV の自動テストは PDF の描画結果の画素を比べない。利用者 (サブ PC) の実機で次を見てもらう必要がある。
+- `effetune-distribution.ps1 -ValidateSource <vendor\miv-sound の絶対パス>`: 成功 (相対パスで渡すと .NET の現在フォルダ基準で別の作業ツリーを見るので注意)。
+- `test-effetune-distribution.ps1`・`test-miv-sound-candidate.ps1`: PASS。`test_gen_effetune_docs.py`: 44 件成功。`gen-effetune-docs.py --check`: 最新。
+- 本体 lib 全件 (`.\scripts\test-lib-full.ps1`、run-heavy `-FullTest`): **20,796 件すべて成功 / 106 skipped** (795.4 秒)。
+  `MIV_SOUND_CANDIDATE` なしでビルドした (承認後の vendor をそのまま使う形)。
 
-- PDF: サムネイル (表紙)、ページ送り・見開き・拡大、文字の多い PDF (縦書き・横書き)、図形・半透明・クリップの多い PDF、スキャン画像の PDF、
-  パスワード付き PDF。About の PDFium の版が `160.0.8179.0`。
+## 実機確認 (サブ PC)
+
+mIV の自動テストは PDF の描画結果の画素や音を比べないので、サブ PC で確認した (2026-11-26、サブ PC 担当の観測、
+`C:\home\mimageviewer-subpc\deps903\results\notes.md`)。
+
+- PDF (PDFium 8179): 合成データ 5 本 (§1.816 と同じ) のサムネイル、ページ送り・見開き (両方向)・拡大、スキャン画像の白地に黒い文字、
+  パスワード付き PDF、About の版 `160.0.8179.0`。すべて期待どおり。
+- mIV Sound: 版の表示、Headphone EQ (検索・取得・断り・ファイル読み込み・再起動後の保持)、歌詞と Counter、0.17 の保存データ。
+  期待どおり。**音を耳で聞く確認は未実施**。

@@ -27,7 +27,7 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 MANUAL = ROOT / "htdocs/mimageviewer/manual"
 RULES = ROOT / "docs/effetune-docs-overrides"
-DEFAULT_SOURCE = ROOT / "third_party/effetune-docs/5ffca1b3"
+DEFAULT_SOURCE = ROOT / "third_party/effetune-docs/0ffa5c70"
 UPSTREAM = "https://effetune.frieve.com"
 VERSION_PATTERN = r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?'
 REDIRECT_BEGIN = '  # BEGIN GENERATED EFFETUNE REDIRECTS'

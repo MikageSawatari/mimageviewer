@@ -65,7 +65,7 @@
   },
   "plugins/control.md": {
     "include": true,
-    "reason": "Section groups and controls bundled effects."
+    "reason": "Keep Section for bundled effects; exclude Live Audio Receive/Send because network output/reception is not shipped."
   },
   "plugins/delay.md": {
     "include": true,
@@ -77,7 +77,7 @@
   },
   "plugins/eq.md": {
     "include": true,
-    "reason": "Bundled equalizer/filter effects, including Tonal Balance EQ; native processing and stereo boundary retained."
+    "reason": "Bundled equalizer/filter effects, including Headphone EQ with AutoEQ downloads and Tonal Balance EQ; native processing and stereo boundary retained."
   },
   "plugins/lofi.md": {
     "include": true,
@@ -89,7 +89,7 @@
   },
   "plugins/others.md": {
     "include": true,
-    "reason": "Keep Oscillator and SoundFont Note Player (formerly SFZ Note Player). Exclude MIDI-file/live-MIDI SoundFont Player: mIV supplies audio but no MIDI note events; Mixwright Instrument is not registered.",
+    "reason": "Exclude Distortion Correction (measurement page unavailable). Keep Oscillator and SoundFont Note Player (formerly SFZ Note Player). Exclude MIDI-file/live-MIDI SoundFont Player: mIV supplies audio but no MIDI note events; Mixwright Instrument is not registered.",
     "title": "その他のオーディオツール",
     "sections": [
       "プラグイン一覧",

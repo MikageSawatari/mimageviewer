@@ -37,6 +37,7 @@
 <a href="eq-earphone-cable-sim.html" class="sub">Earphone Cable Sim</a>
 <a href="eq-group-delay-eq.html" class="sub">Group Delay EQ</a>
 <a href="eq-group-delay-peq.html" class="sub">Group Delay PEQ</a>
+<a href="eq-headphone-eq.html" class="sub">Headphone EQ</a>
 <a href="eq-hi-pass-filter.html" class="sub">Hi Pass Filter</a>
 <a href="eq-lo-pass-filter.html" class="sub">Lo Pass Filter</a>
 <a href="eq-loudness-equalizer.html" class="sub">Loudness Equalizer</a>
@@ -57,7 +58,7 @@
 <a href="license.html">MIT License</a>
   </nav></aside>
   <main class="content">
-    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/5ffca1b31e8a74ada7140aefd0c9c9fe4b7740da/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
+    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/0ffa5c709ed1f1c99e5c94149ccd45c15e501e9d/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
 <h1 id="tonal-balance-eq" class="page-title">Tonal Balance EQ</h1>
 
 <p><a href="eq.html">カテゴリの説明とプラグイン一覧</a></p>
@@ -69,7 +70,7 @@
 <li><p><strong>アルバム全体に一定の補正をかける</strong>: アルバムの開始時に <strong>Reset</strong> をクリックし、<strong>Averaging Time</strong> を <strong>∞</strong> にします。補正が再生全体を平均し、固定のカーブに落ち着きます。</p></li>
 <li><p><strong>ジャンル別の目標</strong>: 特定のスタイルに合わせるなら <strong>Classical</strong>、<strong>Electronic</strong>、<strong>Pop</strong>、<strong>Rock</strong> を、さまざまな音楽を聴くなら <strong>All</strong> を選びます。</p></li>
 <li><p><strong>補正を控えめにする</strong>: 大まかで穏やかな傾きにするには、<strong>Amount</strong> を下げる（例: 50%）、<strong>Range</strong> を小さくする（例: 3 dB）、または <strong>Smoothing</strong> を上げます（例: 1 oct）。</p></li>
-<li><p><strong>自分好みのハウスカーブ</strong>: グラフの下にある5つの <strong>Target Adjust</strong> バンドで、目標を好みに合わせて傾けたり形を変えたりします（例: 8 kHzに+1.5 dBのHigh shelf）。各録音は、このカスタム目標へ必要な分だけ補正されます。</p></li>
+<li><p><strong>自分好みのハウスカーブ</strong>: グラフの下にある5つの <strong>Target Adjust</strong> バンドで、目標を好みに合わせて傾けたり形を変えたりします（例: 8 kHzに+1.5 dBの<strong>HighShel</strong>バンド）。各録音は、このカスタム目標へ必要な分だけ補正されます。</p></li>
 <li><p><strong>固定の傾きの基準</strong>: <strong>Target: Tilt</strong> を選ぶと、<strong>Corner</strong> より下は平坦で、そこから一定の <strong>Slope</strong> で下がる目標になります（−5 dB/octが一般的な市販マスターに近く、−3 dB/octがピンクノイズに相当します）。</p></li></ul>
 <p>メイクアップゲインが保つのはピークレベルではなくラウドネスなので、ピークが上がることがあります。後段でクリップする場合は、このプラグインの後でレベルを下げるか、リミッターを追加してください。</p>
 <h2 id="パラメータ-16">パラメータ</h2>
@@ -83,7 +84,7 @@
 <li><p><strong>Averaging Time</strong>（0.1 s～∞、初期値 30 s）- 測定を積算する時間です。短い値（例: 0.5～1 s）は、暗いAメロと明るいサビのような曲中の変化に追従し、長い値は安定した補正になります（<strong>∞</strong> では最後の <strong>Reset</strong> 以降を継続して平均します）。</p></li>
 <li><p><strong>Low</strong>（20～200 Hz、初期値 20 Hz）/ <strong>High</strong>（2000～20000 Hz、初期値 16000 Hz）- 補正で形を変える範囲の下端と上端です（範囲外では補正値が一定に保たれます）。重低音に手を加えたくない場合は <strong>Low</strong> を上げ、最上部のオクターブに手を加えたくない場合は <strong>High</strong> を下げます。</p></li>
 <li><p><strong>Average SPL</strong>（60～96 dB、初期値 83 dB）- 推定リスニングレベルです。静かな帯域が、持ち上げてよいほど聞こえるかどうかの判定に使い、出力レベルは変えません。低い値ほど多くの微弱な帯域を聞こえないものとみなして持ち上げず、高い値ほど多くを聞こえるものとみなします。</p></li>
-<li><p><strong>Target Adjust</strong> - 目標カーブの形を変える、5つのパラメトリックバンドです（Peak / Low shelf / High shelf、20 Hz～20 kHz、±20 dB、Q 0.1～10、シェルフは2まで、初期値 Q 0.7）。正のゲインではその帯域が多め、負のゲインでは少なめの目標になります。</p></li></ul>
+<li><p><strong>Target Adjust</strong> - 目標カーブの形を変える、5つのパラメトリックバンドです（タイプは <strong>Peaking</strong> / <strong>LowShelv</strong> / <strong>HighShel</strong>、20 Hz～20 kHz、±20 dB、Q 0.1～10、シェルフは2まで、初期値 Q 0.7）。正のゲインではその帯域が多め、負のゲインでは少なめの目標になります。<strong>Peaking</strong> ではQを上げると狭い帯域、下げると広い帯域に作用し、シェルフではQが切り替わり付近の形を変えます。</p></li></ul>
 <p><strong>Target Adjust</strong> が変えるのは目標だけです。各録音は引き続き <strong>Amount</strong> と <strong>Range</strong> の範囲内で目標へ補正されるため、大きく調整した場合は <strong>Range</strong> を広げる必要があることがあります。全体のレベルは比較の前に揃えられるため、目標全体を同じ量だけ上げても何も変わりません。狭いピークやディップは平滑化されるので、狭い範囲の修正には5Band PEQを使ってください。</p>
 <h2 id="ビジュアル表示-16">ビジュアル表示</h2>
 <ul>
