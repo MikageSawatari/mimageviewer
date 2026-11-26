@@ -1361,10 +1361,6 @@ impl App {
         if self.main_folder_history_available() {
             self.cancel_unresolved_open_for_navigation(true);
         }
-        let top_level_origin = self.top_level_grid_view.take_return_origin();
-        let top_level_return = top_level_origin
-            .as_ref()
-            .map(|origin| origin.restore.clone());
         // filter suppress も解除 (= snapshot 内 folder enter で発動していた可能性がある)
         let _ = self.restore_rating_filter_suppression();
         // current_folder が snapshot origin と一致するか
@@ -1376,6 +1372,16 @@ impl App {
                     == crate::snapshot::snapshot_key_from_path(&snap.origin)
             })
             .unwrap_or(false);
+        let top_level_origin = if at_origin {
+            self.top_level_grid_view.take_return_origin()
+        } else {
+            // A physical child needs a worker Read before it can become a normal list.
+            // Keep the retained rows' surface and return owner until that adoption.
+            self.top_level_grid_view.return_origin().cloned()
+        };
+        let top_level_return = top_level_origin
+            .as_ref()
+            .map(|origin| origin.restore.clone());
         if let Some(super::top_level_grid_view::TopLevelGridRestore::SmartFolder(mut state)) =
             top_level_return.as_ref().cloned()
         {
@@ -1387,6 +1393,9 @@ impl App {
                 }
             });
             if at_origin || current_in_scope {
+                if !at_origin {
+                    let _ = self.top_level_grid_view.take_return_origin();
+                }
                 let route = if at_origin {
                     top_level_origin.as_ref().unwrap().route.clone()
                 } else {
@@ -1591,6 +1600,7 @@ impl App {
                     route: self.facet_navigation.route().clone(),
                 });
             } else {
+                let _ = self.top_level_grid_view.take_return_origin();
                 self.mark_color_filter_scope_dirty();
                 self.rebuild_visible_indices();
             }
@@ -3140,18 +3150,36 @@ mod tests {
             .unwrap()
             .unwrap();
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        app.finish_page_identity_preparation_for_test();
+        assert!(app.is_snapshot_active());
         app.snapshot_internal_nav = true;
         app.app.load_folder(child.clone());
         app.snapshot_internal_nav = false;
         app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.current_folder.as_deref(), Some(child.as_path()));
+        assert!(app.is_snapshot_active());
         assert!(matches!(
             app.folder_order.input,
             FolderOrderListingInput::NotApplicable
         ));
         let generation = app.items_generation;
+        let fixed_items = app.items.clone();
+        let fixed_order = app.folder_order.clone();
+        let fixed_surface_generation = app.top_level_grid_view.generation();
+        let fixed_return_origin = app.top_level_grid_view.return_origin().cloned();
         app.deactivate_snapshot();
         assert!(!app.is_snapshot_active());
         assert_eq!(app.items_generation, generation);
+        assert_eq!(app.items, fixed_items);
+        assert_eq!(app.folder_order, fixed_order);
+        assert_eq!(
+            app.top_level_grid_view.generation(),
+            fixed_surface_generation
+        );
+        assert_eq!(
+            app.top_level_grid_view.return_origin(),
+            fixed_return_origin.as_ref()
+        );
         assert!(matches!(
             app.top_level_grid_view.surface(),
             crate::app::top_level_grid_view::TopLevelGridSurface::Snapshot
@@ -3161,6 +3189,12 @@ mod tests {
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.current_folder.as_deref(), Some(child.as_path()));
         assert!(app.folder_order.input.is_read());
+        assert!(app.folder_order.order_revision > fixed_order.order_revision);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            crate::app::top_level_grid_view::TopLevelGridSurface::Folder
+        ));
+        assert!(app.top_level_grid_view.return_origin().is_none());
         assert_eq!(
             app.items
                 .iter()

@@ -5225,8 +5225,15 @@ mod folder_manual_order_tests {
                 .items
                 .iter()
                 .zip(&baseline.metas)
-                .map(|(item, meta)| (item.name().into_owned(), *meta))
+                .zip(&baseline.sort_metas)
+                .map(|((item, meta), sort_meta)| (item.name().into_owned(), (*meta, *sort_meta)))
                 .collect::<std::collections::HashMap<_, _>>();
+            // Display/cache stamps and typed sort metadata have separate contracts:
+            // real folders retain their display stamp, but never have a sortable size.
+            assert_eq!(
+                expected_meta["a-folder"],
+                (Some((0, 1)), ListingSortMetadata::new(0, None))
+            );
             let base_unknown = names(&baseline)
                 .into_iter()
                 .filter(|name| name.starts_with("unknown"))
@@ -5269,14 +5276,18 @@ mod folder_manual_order_tests {
                 settings.details_sort_key,
                 crate::settings::DetailsSortKey::Name
             );
-            for ((item, meta), sort_meta) in listing
-                .items
-                .iter()
-                .zip(&listing.metas)
-                .zip(&listing.sort_metas)
-            {
-                assert_eq!(*meta, expected_meta[item.name().as_ref()]);
-                assert_eq!(sort_meta.file_size, meta.map(|(_, size)| size));
+            for projected in [&baseline, &listing, &with_details_header] {
+                assert_eq!(projected.items.len(), expected_meta.len());
+                assert_eq!(projected.items.len(), projected.metas.len());
+                assert_eq!(projected.items.len(), projected.sort_metas.len());
+                for ((item, meta), sort_meta) in projected
+                    .items
+                    .iter()
+                    .zip(&projected.metas)
+                    .zip(&projected.sort_metas)
+                {
+                    assert_eq!((*meta, *sort_meta), expected_meta[item.name().as_ref()]);
+                }
             }
         }
     }

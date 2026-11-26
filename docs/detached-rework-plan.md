@@ -8286,3 +8286,6 @@ fork 先は空、元 context は cache と proof を保持する。detached の�
   読み取りや別 context の close で兄弟の手動記録を更新・無効化せず、fork は記録の写しを保持する。
 - 本項は設計担当から指定された実装範囲と実装上の判断理由の記録。独立実装レビューの受領・検収を表さない。
   コンパイル・テスト実行は利用者指定により行わず、設計担当の共有 runner へ引き継ぐ。
+- 2026-11-27 の関連テスト失敗対応で、固定内の通常物理 child を解除するときの surface 退役も成功採用へ揃えた。
+  `take_return_origin` による早期の Folder 化を避け、worker の Read 待機中は旧 items と Snapshot surface・戻り先の所有を保つ。
+  origin の復元と対象外 child の即時経路、detached の述語・viewport 配送・窓の寿命は変更しない。

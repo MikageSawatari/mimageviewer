@@ -384,24 +384,31 @@ Explorer からのドロップ (コピー) は今のまま。
 段 1 の共有 runner で失敗した `folder_order_save_and_reset_touch_direct_children_only_with_literal_wildcards` は、
 fixture のフォルダキー `c:/fXX` も `c:/fxx` に統一する。production の正規化済みキーの検査は維持する。
 
-同期 `load_folder` の production 呼出し元を着手時に列挙した。行番号は段 2 着手前のもの。
+同期 `load_folder` の production 呼出し元を着手時に列挙した。入口列の行番号は段 2 着手前のもの。
+再確認列は関連 815 件中 6 件失敗の報告を受けたソース照合（2026-11-27）。対象かどうかは移動元でなく移動先の一覧で決まる。
 テスト、コメント内の参照、`load_folder_with_scan` 等の内部実装呼出しはこの表と分けて確認する。
 
-| 呼出し元 | 入口 (着手前 file:line) | 対象と採用境界の確認 |
-| --- | --- | --- |
-| 再生の自動検証で親フォルダを開く | `app.rs:34375` (`poll_play_test`) | 物理一覧。非同期採用待ちの再要求と、採用後の動画選択を既存 open owner に揃える |
-| 一時ビューの戻り先 (mounted context) | `app.rs:35338` (`restore_view_return_origin`) | 通常物理フォルダは読取後の採用へ。context の既存復元所有権を維持する |
-| 検索から開いた本の前後送り | `app.rs:35874` (`favsearch_navigate_sibling`) | `Search(Favorite)` の所有する対象外一覧。nav_stack / address と load 後 items の同期契約を維持する |
-| 検索内の親へ戻る | `app.rs:35896` (`favsearch_back`) | 同じく検索所有で対象外。空スタックでは既存の検索結果一覧へ戻る |
-| 本棚を開く | `app.rs:56021` (`open_books_root`) | 本棚は手動順の対象外。同期契約を維持する |
-| 本の管理から開く | `app/location_jump.rs:30` (`open_book_manager_target`) | 本棚／管理本は対象外。それ以外の物理一覧は共通 open の読取後採用へ |
-| 展開走査の中止から元の場所へ戻る | `app/subfolder_expansion.rs:1801` (`toggle_subfolder_expansion_view`) | 展開一覧が表示中なら、その snapshot / surface の破棄を成功採用側へ移す |
-| サブフォルダ展開を終了 | `app/subfolder_expansion.rs:1986` (`exit_subfolder_expansion_view`) | 同上。read 前に元の表示状態を破棄しない |
-| スマートフォルダ中止の戻り先が再利用不能 | `app/smart_folder.rs:8299` (`restore_cancelled_smart_folder_prior`) | 物理戻り先があれば旧表示所有権の破棄を成功採用側へ移す |
-| 表示中スマートフォルダの定義削除 | `app/smart_folder.rs:8373` (`forget_smart_folder_definition`) | 同上。戻り先なしのドライブ一覧は既存の即時採用を維持する |
-| 固定 snapshot の変換書庫を一覧で開く | `app/snapshot_ops.rs:1926` | 固定範囲内の操作で対象外。`snapshot_internal_nav` 中の同期契約を維持する |
-| 固定 snapshot の読書開始 | `app/snapshot_ops.rs:2135` (`snapshot_load_and_open`) | load 直後の items と fullscreen 選択に依存する対象外操作。同期契約を維持する |
-| 固定 snapshot の別コンテナを一覧で開く | `app/snapshot_ops.rs:2870` | 同じく対象外。同期契約を維持する |
+| 呼出し元 | 入口 (着手前 file:line) | 対象と採用境界の確認 | 失敗報告後の再確認 |
+| --- | --- | --- | --- |
+| 再生の自動検証で親フォルダを開く | `app.rs:34375` (`poll_play_test`) | 物理一覧。非同期採用待ちの再要求と、採用後の動画選択を既存 open owner に揃える | 現 `app.rs:34577`。移動中は return し、移動先の採用後に動画を選ぶ。load 直後の items には依存しない |
+| 一時ビューの戻り先 (mounted context) | `app.rs:35338` (`restore_view_return_origin`) | 通常物理フォルダは読取後の採用へ。context の既存復元所有権を維持する | 現 `app.rs:35540`。物理先は対象、展開一覧の復元は別 dispatcher。load 直後は return し、後続の同期 items 操作なし |
+| 検索から開いた本の前後送り | `app.rs:35874` (`favsearch_navigate_sibling`) | `Search(Favorite)` の所有する対象外一覧。nav_stack / address と load 後 items の同期契約を維持する | 現 `app.rs:36076`。検索の所有を維持する surface 判定で手動 Read 対象外。同期契約のまま |
+| 検索内の親へ戻る | `app.rs:35896` (`favsearch_back`) | 同じく検索所有で対象外。空スタックでは既存の検索結果一覧へ戻る | 現 `app.rs:36098`。同じ検索 surface。空スタックは execute_favsearch へ渡す |
+| 本棚を開く | `app.rs:56021` (`open_books_root`) | 本棚は手動順の対象外。同期契約を維持する | 現 `app.rs:56239`。books root は非同期 Read 分岐より前の除外条件に含む |
+| 本の管理から開く | `app/location_jump.rs:30` (`open_book_manager_target`) | 本棚／管理本は対象外。それ以外の物理一覧は共通 open の読取後採用へ | 呼出位置は同じ。本棚／直接の管理本の除外を確認。通常物理先は対象で、load 後の同期 items 操作なし |
+| 展開走査の中止から元の場所へ戻る | `app/subfolder_expansion.rs:1801` (`toggle_subfolder_expansion_view`) | 展開一覧が表示中なら、その snapshot / surface の破棄を成功採用側へ移す | 現 `subfolder_expansion.rs:1802`。移動先が通常物理フォルダなら対象。即時終了と衝突する失敗 5 と同型のため、即時契約の変更は未実施・相談対象 |
+| サブフォルダ展開を終了 | `app/subfolder_expansion.rs:1986` (`exit_subfolder_expansion_view`) | 同上。read 前に元の表示状態を破棄しない | 現 `subfolder_expansion.rs:1993`。失敗 5 の空の通常物理フォルダは eligible。§4.3 の旧表示維持と既存の即時終了期待が衝突しており未修正 |
+| スマートフォルダ中止の戻り先が再利用不能 | `app/smart_folder.rs:8299` (`restore_cancelled_smart_folder_prior`) | 物理戻り先があれば旧表示所有権の破棄を成功採用側へ移す | 呼出位置は同じ。通常物理先への復帰なら対象で、上の即時性と同型。戻り先なしのドライブ一覧は即時のまま |
+| 表示中スマートフォルダの定義削除 | `app/smart_folder.rs:8373` (`forget_smart_folder_definition`) | 同上。戻り先なしのドライブ一覧は既存の即時採用を維持する | 呼出位置は同じ。通常物理先なら同型の相談対象。Smart の履歴・session を保つ子への移動とは別経路 |
+| 固定 snapshot の変換書庫を一覧で開く | `app/snapshot_ops.rs:1926` | 固定範囲内の操作で対象外。`snapshot_internal_nav` 中の同期契約を維持する | 現 `snapshot_ops.rs:1990`。呼出前後の internal nav と固定範囲を維持し、通常物理 Read 分岐へ入らない |
+| 固定 snapshot の読書開始 | `app/snapshot_ops.rs:2135` (`snapshot_load_and_open`) | load 直後の items と fullscreen 選択に依存する対象外操作。同期契約を維持する | 現 `snapshot_ops.rs:2199`。同じ internal nav 除外。固定内にいる間の契約は維持する |
+| 固定 snapshot の別コンテナを一覧で開く | `app/snapshot_ops.rs:2870` | 同じく対象外。同期契約を維持する | 現 `snapshot_ops.rs:2934`。同じ除外。固定解除後の通常物理先への再読取とは区別する |
+
+上表とは別に、失敗 6 の `load_folder_or_convert_archive`（`app.rs:30254`）も照合した。
+Smart root の履歴採用後、定義の範囲外にある新しい通常物理フォルダへ移るテストであり、Smart 所有の子への移動ではない。
+`duration_metadata.rs:73` の移動先 surface は Folder、空の一覧は `folder_order/listing.rs:356` の predicate で eligible になる。
+`app.rs:32845` の worker 読取分岐は Classifying を返すため、既存テストの即時 Loaded・履歴確定と衝突する。
+移動元を理由に対象外へ読み替えたり、読取前に採用済みと報告する変更はしない。失敗 5 と 6 の契約調整は設計担当へ戻す。
 
 - 段 2 の前提確認で、§4.1 の「Remote は別プロセスなので DB を直接読む」と実際の一覧生成の所有が一致しないことを発見。
   `web-remote-plan.md:86` は通常フォルダ一覧を IPC → 本体 worker と規定し、`remote_ipc/pipe.rs:42` が
@@ -449,3 +456,24 @@ fixture のフォルダキー `c:/fXX` も `c:/fxx` に統一する。production
   actor 未登録、未記録、破損 DB の原本保持を対象にした。protocol は 74 のまま変更しない。
 - 続行分も `cargo fmt`（引数なし）、UI glyph 検査、`git diff --check` を実行して正常終了した。
   コンパイル・テスト・検証用ビルド・コミットは実施せず、共有 runner での再確認へ引き継ぐ。
+
+段 2 関連テストの失敗対応（2026-11-27）:
+
+- 設計担当の共有 runner による修正前の結果は 815 件中 809 件成功・6 件失敗。以下の修正後のテストは未実行。
+- 新規の stale rescan / hidden inventory テストは、分類の完了を一覧の identity 準備完了と取り違えていた。
+  `poll_external_rescan` は準備中に応答の採用を保留する既存契約なので、fixture と refresh helper を既存の
+  `finish_page_identity_preparation_for_test` へ揃えた。応答の消費、古い revision の拒否、refresh 要求の保持、
+  Equal 応答の新 inventory の採用という assertions は維持・補強する。production の保留条件は変えない。
+- materializer の行をまたぐ順のテストは、表示用 metadata のサイズと整列用 metadata のサイズを同一視していた。
+  実フォルダの整列用サイズは既存契約で None。基準一覧の表示用と整列用を別々に控え、手動順・詳細ヘッダありの双方で
+  items と全 metadata の対応・列長を照合するテストへ直した。基準の投影は変えない。
+- 固定解除の child テストも、固定の identity 準備中に child load を要求して拒否され、origin 復元の分岐を通っていた。
+  固定の準備を待ち、解除前の child 採用を明示的に確認する。同時に `take_return_origin` が surface を Folder へ変えていた
+  production の境界を修正し、通常物理 child の Read 待機中は旧 Snapshot surface・items・手動状態・戻り先の所有を保持する。
+  成功採用だけが Folder へ切り替え、items generation を 1 回進める。origin 復元と対象外 child の即時契約は維持する。
+- 既存の失敗 5（展開ボタンの即時終了）と 6（Smart 履歴後の別通常フォルダへの即時 Loaded）は未修正。
+  どちらも移動先は eligible な物理一覧で、対象外の Smart / 展開一覧へ入る例ではない。§4.3 の Read 後 1 回採用と、
+  既存の即時終了・即時履歴確定を同時に満たせない。移動元で対象外にする分岐、先に surface だけを戻す処理、
+  未採用なのに Loaded と返す処理、既存テストの期待値変更は入れず、この部分は契約の判断待ちとして停止する。
+  同型の復帰経路の確認は上の同期呼出し元表へ記録した。段 2 の検収完了を意味しない。
+- 今回も `cargo fmt`（引数なし）と `git diff --check` は正常終了。コンパイル・自動テスト・検証用ビルド・コミットは実施しない。

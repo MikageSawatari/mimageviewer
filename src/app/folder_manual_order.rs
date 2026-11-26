@@ -317,6 +317,8 @@ mod tests {
             std::fs::write(folder.join(name), b"fixture").unwrap();
         }
         app.load_folder(folder.clone());
+        // Classification adopts rows before identity hydration releases refresh polling.
+        app.finish_page_identity_preparation_for_test();
         (app, folder)
     }
 
@@ -343,6 +345,7 @@ mod tests {
                     order,
                     *reload_owner
                 ));
+                app.finish_page_identity_preparation_for_test();
                 return;
             }
             assert!(
@@ -550,6 +553,7 @@ mod tests {
         let generation = app.items_generation;
         app.folder_order.enter_manual();
         app.poll_external_rescan(&ctx);
+        assert!(app.external_rescan_pending.is_none());
         assert_eq!(app.items_generation, generation);
         assert_eq!(app.folder_order.mode, FolderOrderMode::ManualUnrecorded);
         assert!(app.folder_refresh_pending.is_some());
@@ -657,11 +661,15 @@ mod tests {
             .rx
             .recv_timeout(Duration::from_secs(10))
             .unwrap();
-        assert!(matches!(&response, Some(ExternalRescanResult::Equal(..))));
+        let Some(ExternalRescanResult::Equal(_, _, _, _, _, inventory)) = &response else {
+            panic!("hidden-only changes must retain the displayed rows");
+        };
+        assert!(inventory.contains(&folder_key(&hidden)));
         let (tx, rx) = mpsc::channel();
         tx.send(response).unwrap();
         app.external_rescan_pending.as_mut().unwrap().rx = rx;
         app.poll_external_rescan(&ctx);
+        assert!(app.external_rescan_pending.is_none());
         assert_eq!(keys(&app), recorded);
         assert!(app.folder_order.inventory.contains(&folder_key(&hidden)));
     }
