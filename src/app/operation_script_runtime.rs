@@ -879,16 +879,25 @@ impl App {
             .into(),
         );
         if !viewer {
+            snapshot.grid_columns = Some(self.settings.grid_cols as i64);
+            snapshot.grid_details =
+                Some(self.settings.grid_view_mode == crate::settings::GridViewMode::Details);
             snapshot.grid_selected_count = Some(
                 self.selection_target_indices(super::ActionSurface::MainWindow)
                     .len() as i64,
             );
+        } else {
+            snapshot.view.depth = Some(self.fs_exclusive_view.is_depth());
+            snapshot.view.slideshow = Some(self.slideshow_playing);
         }
         if context == ScriptContext::FsVideo
             && let Some(super::FsCacheEntry::Video { player, .. }) =
                 idx.and_then(|idx| self.fs_cache.get(&idx))
         {
             snapshot.video.playing = Some(player.is_playing());
+            snapshot.video.muted = Some(player.is_muted());
+            snapshot.video.volume_db =
+                Some(crate::settings::video_volume_linear_to_db(player.volume()));
             snapshot.video.position_sec = Some(player.position());
             // A loading player has no duration yet; zero is a legitimate cached
             // duration only once metadata has arrived.

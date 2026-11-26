@@ -165,6 +165,10 @@ Load / Open / ResetはAppのloader所有の単一FIFOで直列化し、順序と
 手動のScriptSlot1〜20はGlobal / Press / 既定キーなし。操作カスタマイズ名は固定で、labelは環境設定と右クリックだけに表示する。
 mainの一覧／画像／動画・音声に限定し、編集・ページ一覧・モーダル・TextEdit/IME・Remote取得中は実行しない。
 イベント可は同期32（画像7・動画4・一覧21）とopen限定2。動画の再生/ループ/全シーク9操作はイベント不可。
+画像の `FsDepthParallax` / `FsSlideshow` も種別Aとして手動起動から使える (イベント不可)。
+状態api=1に `view.depth` / `view.slideshow` (viewer面)、`video.muted` / `video.volume_db`
+(再生器がある動画・音声)、`grid.columns` / `grid.details` (一覧面) を公開する。
+対象外の面と未取得値は `()`、音量は既存変換のdB値 (-80.0〜+18.0) を渡し、写しのためのI/Oは行わない。
 詳細な状態・許可表・上限は[確定設計](operation-script-plan.md)と[公開マニュアル](../htdocs/mimageviewer/manual/operation-script.html)。
 段5は実装済み。自動検証・独立実装レビュー・設計担当の検収・実機確認は未実施。AI(MCP)からこの本文を直接読み書きする機能は未実装。
 

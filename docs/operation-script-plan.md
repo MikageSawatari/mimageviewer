@@ -2363,3 +2363,43 @@ ClaudeCodeのfilterは`event_r13`、`event_safe_video_actions`、`event_execute`
   種類にし、同じ受け口で順に処理する。`Load` の「読み込み中のときだけ採用」の条件を AI の結果へ流用しない。detached の同意は維持
   (レビュー担当の言葉: 「§17.2 は条件評価時点を維持した構造的な共用化であり、症状パッチではないことへの同意を維持します。§17.5 は
   App の loader と agent 受付に閉じ、detached に触れないという判断も維持します。」)。
+
+### 17.10 前半の実装引継ぎ (2026-11-26、実装担当。自動検証・独立実装レビュー前)
+
+今回の範囲は§17.2・§17.3・§17.6の例と§17.7/17.8の対応する前半。
+§17.5のMCP tool、IPC版、FIFOの書き込み、AIテンプレートのMCP案内は未着手。
+既存の設計レビューの記録は設計への判断であり、今回の実装への判定ではない。
+
+- `contract.rs` のA/IMAGEへ2操作を追加し、イベント不可Aは17 (見開き6・動画9・今回2)、同期可32とOpenOnly2は維持。
+  `allowed-signatures.txt` はRhai組込関数と演算子の署名表で操作名の一覧ではないため、変更しない。
+  操作表の一致はcontractのinventoryと新しい画像専用Aの表テストで確かめる。
+- `ui_fullscreen.rs` のS consume・D consume/実行・360°判定は元の位置で純粋判定を呼び、VとSの実行も動かさない。
+  スクリプトは同じ判定を実行時に評価し、既存の2つのトグル本体を呼ぶ。判定不可、モデル準備モーダル後の
+  次の操作の拒否は、既存runtimeの残り破棄と通知を使う。新しい待機や非同期ownerは作らない。
+  動画・音声では許可表と既存media dispatcherも画像操作を拒否する。
+- snapshotの6状態はメモリ値のみ。viewerと一覧の面を明示して値/`()`を分け、音量は既存dB変換を使う。
+- マニュアルは雛形と別の17例を掲載し、当該ページのsidebarから例へリンクする。目次の説明にも利用例を明記。
+  `manual_examples_tests.rs` はHTML本文を直接取り出し、製品のcompile/evaluate/validateで全17例と分岐を確認する形。
+  本文をRust側に二重定義しない。見開き例はスロットだけで、openでもイベント不可を回帰する。
+  透過の有無は公開状態に無いので背景例はPNG対象とし、不透明画像と市松を選べない表示の制限を記載。
+  正の音量のキー幅は既存設定関数で1.5 dBのため、0 dB例は最大12操作。実音量step関数で期待列を作るテストを追加。
+- detachedの述語・viewport・寿命・context取り付け・bundleに変更は無い。今回の指示に従い
+  `detached-rework-plan.md` §11は変更しない (§17.2/17.8の予定記述より今回の明示範囲を優先)。
+
+追加テストの主な入口:
+
+- `src/app/operation_script_runtime/tests/script_363.rs`: 6状態の面ごとの値、音量既定0.0/最小-80.0/上限、
+  イベント返値の0 dispatch拒否、360°拒否のprefix保持、`gpu_tests`でキー/scriptの開始停止一致・同一起動の3D/slide・
+  同frame S+V、D+S+G、重複キー先勝ち、モデル無しモーダル後のsuffix破棄、動画/音楽抑止。
+- `src/operation_script/manual_examples_tests.rs`: `script_363_all_published_manual_examples_evaluate_with_real_engine_and_contract` /
+  `script_363_published_examples_cover_branches_unknowns_and_secondary_slots`。
+- `contract.rs`: `script_363_depth_and_slideshow_are_image_only_a_and_event_forbidden`と既存event inventoryを更新。
+  `snapshot.rs` の最大状態テストへ6状態を追加。
+
+ClaudeCodeのrun-heavy向けfilter: まず`script_363`、次に`operation_script` (変更moduleの既存engine/contract/snapshot/loader/
+runtime/eventsと画像キー共用回帰を含む)、既存`depth_slideshow`と`depth_actual`。
+HTMLの同梱ヘルプも変わるため、MCP crateの既存`help::tests` / `tests::help_transport_tests`も確認する。
+GPU fixtureを使う新規テストは`gpu_tests`内に置き、既存nextest group規則を再利用する。
+
+実装担当への明示指示によりcargo build/test/check・検証binary作成・アプリ起動・commitは未実施。
+Rustの実行結果や独立実装レビューの結果はまだ無い。軽量確認の結果は最終引継ぎに記す。

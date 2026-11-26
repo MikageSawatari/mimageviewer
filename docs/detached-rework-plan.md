@@ -1524,6 +1524,19 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   - 合意: 段 5 の実装の独立レビュー (GPT-6 Astra / medium、read-only、新しい会話、2 回目の 9e46c1127 で ACCEPT) で、レビュー担当の言葉 (1 回目):「段5はApp所有のloader内でファイル要求を直列化し、環境設定から接続する変更です。別ウィンドウの述語・viewport・寿命・context取り付け・bundleを変更せず、段1〜4の利用資格も維持しています。症状を隠す追加条件ではなく、既存の所有境界を保つ構造的な決定です。」設計担当 ClaudeCode も同意する。
 - 段 4 (イベント) の実装の後に独立レビューを受け、結果をここに足す。
 
+### 2026-11-26: 3D 写真・スライドショーのキーの受付条件を判定の関数にし、操作のスクリプトと共用する (§1.363 の v5.9.0 の追加)
+
+- 正本は [操作のスクリプトの設計](operation-script-plan.md) §17.2。`FsDepthParallax`・`FsSlideshow` をスクリプトの許可リスト (種別 A、イベント不可) に足すため、
+  `ui_fullscreen.rs` のキーの受付の条件を純粋な判定の関数 (`fullscreen_depth_input_allowed`・`fullscreen_slideshow_input_allowed`・`fullscreen_slideshow_view_allowed`) にした。
+  キーは consume・条件の評価・実行の位置を 1 つも動かさず、式を関数の呼び出しに置き換えただけ。スクリプトは共用の入口 (`apply_fullscreen_shared_key_action`) で同じ判定を評価し、
+  同じ本体 (`toggle_depth_parallax`・`toggle_fullscreen_slideshow`) を呼ぶ。スクリプトの実行は今までどおりメインの context だけ。
+- detached の述語・viewport の選択と配送・窓の寿命・context の取り付け・bundle は変えていない。guard・delay・retry・一括 reset・silent fallback は足していない。
+  同じ判定は別ウィンドウの viewer のキーからも、その viewer の値で評価される (今と同じ)。
+- 合意 (設計の段階): 設計担当 ClaudeCode と独立設計レビュー (GPT-6 Astra / medium) は、条件の評価の時点を保つ形なら症状パッチではなく構造的修正であることに合意。
+  レビュー担当の言葉:「§17.2 は、上記2の条件評価時点も保存する形なら、既存の context 所有を維持した実行入口の共用化であり、症状パッチではなく構造的な修正であることに明示的に同意します。」
+  実装の独立レビューの合意は、レビューの後に追記する。
+- 同じ追加の MCP tool `operation_script` (§17.5) は App の loader と agent の受付だけで、detached に触れない (同じレビューで同意)。
+
 ### 2026-11-23: ブラウザ閲覧の保存先のフォルダはページ構成の既定を単ページにする (§1.870、設計の段階。実装はこれから)
 
 - 正本は [browser-view-single-page-plan.md](browser-view-single-page-plan.md)。ブラウザから開いた画像が、保存先の月のフォルダの関係のない画像と見開きになる件。

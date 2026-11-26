@@ -31,6 +31,23 @@ pub(crate) struct FullscreenRatingEditOutcome {
     pub(crate) target: FullscreenRatingTarget,
 }
 
+// Keep consume, admission and execution at their original key-handler positions.
+// S is admitted before V executes; D executes before the following view checks.
+// Scripts evaluate these same predicates for each operation.
+fn fullscreen_depth_input_allowed(video: bool, music: bool) -> bool {
+    !video && !music
+}
+
+fn fullscreen_slideshow_input_allowed(music: bool) -> bool {
+    !music
+}
+
+fn fullscreen_slideshow_view_allowed(
+    exclusive: Option<crate::fs_exclusive_view::ExclusiveViewKind>,
+) -> bool {
+    exclusive != Some(crate::fs_exclusive_view::ExclusiveViewKind::Panorama)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SpreadPresentationPersistence {
     Saved,
@@ -36483,6 +36500,23 @@ impl App {
     ) -> bool {
         use KeyAction::*;
         match key_action {
+            FsDepthParallax => {
+                if !fullscreen_depth_input_allowed(
+                    matches!(self.items.get(fs_idx), Some(GridItem::Video(_))),
+                    self.fs_music_view_active(fs_idx),
+                ) {
+                    return false;
+                }
+                self.toggle_depth_parallax(ctx, fs_idx);
+            }
+            FsSlideshow => {
+                if !fullscreen_slideshow_input_allowed(self.fs_music_view_active(fs_idx))
+                    || !fullscreen_slideshow_view_allowed(self.fs_exclusive_view_active(fs_idx))
+                {
+                    return false;
+                }
+                self.toggle_fullscreen_slideshow(fs_idx);
+            }
             FsSpreadSingle | FsViewSpread | FsSpreadLtr | FsSpreadLtrCover | FsSpreadRtl
             | FsSpreadRtlCover => {
                 let (view, spread, number) = match key_action {
@@ -38253,8 +38287,8 @@ impl App {
             && self.keymap.consume_action(ctx, KeyAction::FsCompareCycle);
         // S: スライドショー 再生/停止 (旧 P キー、左手で押しやすいよう S に移行)。音声は
         // 画像スライドショーに参加しない。
-        let key_s =
-            !fs_music_view_active && self.keymap.consume_action(ctx, KeyAction::FsSlideshow);
+        let key_s = fullscreen_slideshow_input_allowed(fs_music_view_active)
+            && self.keymap.consume_action(ctx, KeyAction::FsSlideshow);
         let key_seek_strip_toggle = self.fs_context_menu_idx.is_none()
             && self.fullscreen_seek_overlay_allowed(fs_idx, current_item_is_video)
             && self
@@ -38310,8 +38344,7 @@ impl App {
         // - E / Ctrl+G / Ctrl+M / Ctrl+T は各編集モードの共通入口まで通し、
         //   そこで理由付き no-op にする。
         // - 抑止しない: V (= 360 を抜ける手段)、Esc / 矢印 / Wheel / F1-F5 / BS (= ナビ・レーティング)
-        if !is_video_fs
-            && !fs_music_view_active
+        if fullscreen_depth_input_allowed(is_video_fs, fs_music_view_active)
             && self.keymap.consume_action(ctx, KeyAction::FsDepthParallax)
         {
             self.toggle_depth_parallax(ctx, fs_idx);
@@ -38324,9 +38357,8 @@ impl App {
             .detached_viewer_image_edit_tools_disabled_reason()
             .is_some();
         let key_z = key_z_raw && !pano_active_now;
-        let key_s = key_s
-            && self.fs_exclusive_view_active(fs_idx)
-                != Some(crate::fs_exclusive_view::ExclusiveViewKind::Panorama);
+        let key_s =
+            key_s && fullscreen_slideshow_view_allowed(self.fs_exclusive_view_active(fs_idx));
         let key_e = key_e_raw;
         let key_m = key_m && !pano_active_now;
         // 透過部分の下地は3Dでも毎描画反映する。背景切替の抑止は360°固有。

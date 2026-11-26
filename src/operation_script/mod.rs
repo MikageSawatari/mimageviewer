@@ -6,6 +6,8 @@ mod contract;
 mod engine;
 mod file_worker;
 mod loader;
+#[cfg(test)]
+mod manual_examples_tests;
 mod snapshot;
 mod syntax;
 

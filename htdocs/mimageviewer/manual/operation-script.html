@@ -60,6 +60,7 @@
         <a href="remote.html">リモート閲覧</a>
         <a href="ai-integration.html">AI アプリとの連携</a>
         <a href="operation-script.html" class="active">操作のスクリプト</a>
+        <a href="#examples" class="sub">スクリプトの利用例</a>
         <a href="shortcuts.html">キーボードショートカット</a>
         <a href="gamepad.html">ゲームパッド操作</a>
         <a href="settings.html">設定リファレンス</a>
@@ -154,9 +155,13 @@ fn rate3_next(s) {
       <tr><td><code>page.is_first</code> / <code>page.is_last</code></td><td>真偽値 / ()</td><td>先頭・末尾か。見開き・分割では表示するページのまとまりで判断。未確定なら ()</td></tr>
       <tr><td><code>view.spread</code></td><td>文字列</td><td><code>single</code> / <code>ltr</code> / <code>ltr_cover</code> / <code>rtl</code> / <code>rtl_cover</code> / <code>vertical</code> / <code>split_ltr</code> / <code>split_rtl</code></td></tr>
       <tr><td><code>view.direction</code> / <code>view.background</code></td><td>文字列</td><td>読み方向 <code>ltr</code> / <code>rtl</code>、透過画像の背景 <code>black</code> / <code>white</code> / <code>checker</code></td></tr>
+      <tr><td><code>view.depth</code> / <code>view.slideshow</code></td><td>真偽値 / ()</td><td>3D 写真の表示中か・スライドショーが動いているか。画像・動画／音声の表示で渡し、一覧では ()。3D の奥行きの計算待ちも true、初回の準備の確認中は false</td></tr>
       <tr><td><code>video.playing</code></td><td>真偽値 / ()</td><td>動画・音声の再生中か</td></tr>
       <tr><td><code>video.position_sec</code> / <code>video.duration_sec</code></td><td>小数 / ()</td><td>動画・音声の現在位置・長さ（秒）</td></tr>
+      <tr><td><code>video.muted</code></td><td>真偽値 / ()</td><td>動画・音声のミュート中か。再生の準備前や、ほかの画面では ()</td></tr>
+      <tr><td><code>video.volume_db</code></td><td>小数 / ()</td><td>動画・音声の音量（dB）。-80.0（画面では -∞dB）〜+18.0、既定は 0.0。ミュート中も音量の値は残る。再生の準備前や、ほかの画面では ()</td></tr>
       <tr><td><code>grid.selected_count</code></td><td>整数 / ()</td><td>一覧の選択数。画像・動画表示では ()</td></tr>
+      <tr><td><code>grid.columns</code> / <code>grid.details</code></td><td>整数 / 真偽値 / ()</td><td>一覧の列数の設定・詳細表示か。詳細表示中も列数の設定を渡す。画像・動画表示では ()</td></tr>
     </tbody></table></div>
 
     <h2 id="operations">返せる操作と組み合わせの制約</h2>
@@ -171,7 +176,7 @@ fn rate3_next(s) {
     表に無い操作は使えません。全体を実行前に確かめ、操作名・画面・並びの制約が合わなければ、その回は何も実行せず通知します。
     実行の途中で対象が変わったり操作を受け付けられなくなった場合は、残りを実行せず通知します。先に行った変更は戻しません。</p>
     <div class="table-wrap"><table><thead><tr><th>種類</th><th>画面</th><th>操作名</th></tr></thead><tbody>
-      <tr><td>A</td><td>画像の全画面</td><td><code>FsSpreadSingle</code>、<code>FsViewSpread</code>、<code>FsSpreadLtr</code>、<code>FsSpreadLtrCover</code>、<code>FsSpreadRtl</code>、<code>FsSpreadRtlCover</code>、<code>FsReadingDirectionToggle</code>、<code>FsBgCycle</code>、<code>FsFitModeCycle</code>、<code>FsZoomIn</code>、<code>FsZoomOut</code>、<code>FsToggleMetadata</code>、<code>FsNavigatorToggle</code>、<code>FsPixelGrid</code>、<code>FsPageTurnAnimationToggle</code></td></tr>
+      <tr><td>A</td><td>画像の全画面</td><td><code>FsSpreadSingle</code>、<code>FsViewSpread</code>、<code>FsSpreadLtr</code>、<code>FsSpreadLtrCover</code>、<code>FsSpreadRtl</code>、<code>FsSpreadRtlCover</code>、<code>FsReadingDirectionToggle</code>、<code>FsBgCycle</code>、<code>FsFitModeCycle</code>、<code>FsZoomIn</code>、<code>FsZoomOut</code>、<code>FsToggleMetadata</code>、<code>FsNavigatorToggle</code>、<code>FsPixelGrid</code>、<code>FsPageTurnAnimationToggle</code>、<code>FsDepthParallax</code>、<code>FsSlideshow</code></td></tr>
       <tr><td>A</td><td>動画・音声の全画面</td><td><code>VideoPlayPause</code>、<code>VideoMute</code>、<code>VideoVolumeUp</code>、<code>VideoVolumeDown</code>、<code>VideoLoop</code>、<code>VideoSeekStart</code>、<code>VideoSeekBackSmall</code>、<code>VideoSeekForwardSmall</code>、<code>VideoSeekBackMedium</code>、<code>VideoSeekForwardMedium</code>、<code>VideoSeekBackLarge</code>、<code>VideoSeekForwardLarge</code>、<code>VideoSeekStripToggle</code></td></tr>
       <tr><td>A</td><td>一覧</td><td><code>GridColumnCount1..20</code>、<code>GridToggleDetailsView</code></td></tr>
       <tr><td>B</td><td>画像の全画面</td><td><code>FsPagePrev</code>、<code>FsPageNext</code>、<code>FsJumpFirst</code>、<code>FsJumpLast</code>、<code>FsFixedJumpPrev</code>、<code>FsFixedJumpNext</code></td></tr>
@@ -222,7 +227,8 @@ fn rate3_next(s) {
     横長分割と自由回転を組み合わせた表示でこの 2 操作を使うと、後で <code>page</code> が 1 回余分に発生することがあります。
     大きさが未取得の場合や検出できない期間があれば、その後の検出にまとまります。
     <code>page</code> だけの回に同じ 2 操作を返すと、並び全体を実行せず通知します。</p>
-    <p>見開きの形の 6 操作と、動画の再生／一時停止・ループ・先頭へ・前後すべてのシークは、イベントから使えません。
+    <p>見開きの形の 6 操作、3D 写真（<code>FsDepthParallax</code>）、スライドショー（<code>FsSlideshow</code>）と、動画の再生／一時停止・ループ・先頭へ・前後すべてのシークは、イベントから使えません。
+    3D 写真は準備の確認が開く場合があり、スライドショーは後からページを送るためです。
     動画のこれらの操作は再生や次のファイルへの移動につながり、自動操作が繰り返されるおそれがあるためです。
     移動・レーティング・タグ・保存・コピーもイベントからは使えません。必要な場合はスロットへ登録し、手動で呼び出してください。</p>
     <p>イベントの呼び出しは 1 秒に 10 回までです。超えた回は実行せず、後から実行し直しません。
@@ -252,7 +258,7 @@ fn rate3_next(s) {
 
     <h2 id="example">雛形の例</h2>
     <p>ファイルが無いときと「既定に戻す」で、次の内容が用意されます。</p>
-    <pre><code>// 番号・表示名・状態を受け取る関数を指定します。
+    <pre><code data-operation-template>// 番号・表示名・状態を受け取る関数を指定します。
 // 表示名は右クリックメニューと環境設定の「操作のスクリプト」に表示されます。
 fn slots() {
     [
@@ -282,6 +288,181 @@ fn on_event(s) {
     <p><code>\manga\</code> を含む本を開いたとき、右から左へ読む向きに揃えます。
     自分のフォルダ名に合わせて変えてください。スロットの例は画像表示で使います。</p>
 
+    <h2 id="examples">スクリプトの利用例</h2>
+    <p>各例は独立した本文です。使いたい例を選び、スロットの番号や名前を自分の割り当てに合わせてください。複数の例を合わせる場合は、<code>slots()</code> と <code>on_event(s)</code> をそれぞれ 1 つにまとめます。</p>
+    <h3 id="example-next-book">1. 最後のページなら次の本へ</h3>
+    <p>最後のページでは次の兄弟フォルダへ、それ以外は次のページへ進みます。</p>
+    <p>割り当て：スロット 1（画像表示）</p>
+    <pre><code data-operation-example="next-book">fn slots() { [#{slot:1, label:&quot;最後のページなら次の本へ&quot;, run:&quot;next_book&quot;}] }
+fn next_book(s) {
+    if s.context != &quot;fs_image&quot; || s.page.is_last == () { return []; }
+    if s.page.is_last { [&quot;FsSiblingNext&quot;] } else { [&quot;FsPageNext&quot;] }
+}</code></pre>
+    <h3 id="example-rate-next">2. ★3 を付けて次へ</h3>
+    <p>表示中の画像に ★3 を付けてから、次のページへ進みます。</p>
+    <p>割り当て：スロット 1（画像表示）</p>
+    <pre><code data-operation-example="rate-next">fn slots() { [#{slot:1, label:&quot;★3 を付けて次へ&quot;, run:&quot;rate_next&quot;}] }
+fn rate_next(s) {
+    if s.context != &quot;fs_image&quot; { return []; }
+    [&quot;RatingItem3&quot;, &quot;FsPageNext&quot;]
+}</code></pre>
+    <h3 id="example-named-spread">3. 名前で見開きの形を選び分ける</h3>
+    <p>本のパスに LTR・RTL があれば表紙を単独にする左綴じ・右綴じの見開き、それ以外は単ページを選びます。</p>
+    <p>割り当て：スロット 1（画像表示、手動で呼び出す）</p>
+    <pre><code data-operation-example="named-spread">fn slots() { [#{slot:1, label:&quot;名前で見開きの形を選び分ける&quot;, run:&quot;named_spread&quot;}] }
+fn named_spread(s) {
+    if s.context != &quot;fs_image&quot; || s.book.path == () { return []; }
+    if s.book.path.contains(&quot;LTR&quot;) { return [&quot;FsSpreadLtrCover&quot;]; }
+    if s.book.path.contains(&quot;RTL&quot;) { return [&quot;FsSpreadRtlCover&quot;]; }
+    [&quot;FsSpreadSingle&quot;]
+}</code></pre>
+    <h3 id="example-manga-direction">4. 本を開いたら読む向きを合わせる</h3>
+    <p>パスに manga を含む本を開いたとき、右から左へ読む向きにそろえます。</p>
+    <p>割り当て：on_event（open、画像表示）</p>
+    <pre><code data-operation-example="manga-direction">fn slots() { [] }
+fn on_event(s) {
+    if s.context != &quot;fs_image&quot; || !(&quot;open&quot; in s.events) || s.book.path == () { return []; }
+    if s.book.path.to_lower().contains(&quot;manga&quot;) &amp;&amp; s.view.direction != &quot;rtl&quot; {
+        return [&quot;FsReadingDirectionToggle&quot;];
+    }
+    []
+}</code></pre>
+    <h3 id="example-checker-background">5. 透過画像の背景を市松模様にそろえる</h3>
+    <p>PNG を開いたときやページを送ったとき、透過部分の背景を市松模様にそろえます。</p>
+    <p>割り当て：on_event（open / page、画像表示）</p>
+    <pre><code data-operation-example="checker-background">fn slots() { [] }
+fn on_event(s) {
+    if s.context != &quot;fs_image&quot; || s.item.ext != &quot;png&quot; { return []; }
+    if !(&quot;open&quot; in s.events) &amp;&amp; !(&quot;page&quot; in s.events) { return []; }
+    if s.view.background == &quot;black&quot; { return [&quot;FsBgCycle&quot;, &quot;FsBgCycle&quot;]; }
+    if s.view.background == &quot;white&quot; { return [&quot;FsBgCycle&quot;]; }
+    []
+}</code></pre>
+    <p>透過の有無は状態に含まれないため、この例は PNG を対象にしています。透過のない画像では背景の切り替えを受け付けず通知します。AI 高画質化など、市松模様を選べない表示では使わないでください。</p>
+    <h3 id="example-wide-fit">6. 横長の画像で合わせ方を切り替える</h3>
+    <p>横長の画像を開いたとき、画像の合わせ方を次の設定へ切り替えます。</p>
+    <p>割り当て：on_event（open、画像表示）</p>
+    <pre><code data-operation-example="wide-fit">fn slots() { [] }
+fn on_event(s) {
+    if s.context != &quot;fs_image&quot; || !(&quot;open&quot; in s.events) { return []; }
+    if s.item.width == () || s.item.height == () { return []; }
+    if s.item.width &gt; s.item.height { [&quot;FsFitModeCycle&quot;] } else { [] }
+}</code></pre>
+    <h3 id="example-video-remaining">7. 動画の残り時間で送り方を選ぶ</h3>
+    <p>動画・音声の残りが 10 秒未満なら次のファイルへ、それ以外は小さく先へシークします。</p>
+    <p>割り当て：スロット 1（動画・音声表示）</p>
+    <pre><code data-operation-example="video-remaining">fn slots() { [#{slot:1, label:&quot;動画の残り時間で送り方を選ぶ&quot;, run:&quot;video_next&quot;}] }
+fn video_next(s) {
+    if s.context != &quot;fs_video&quot; || s.video.duration_sec == () || s.video.position_sec == () { return []; }
+    if s.video.duration_sec - s.video.position_sec &lt; 10.0 {
+        [&quot;VideoNextFile&quot;]
+    } else { [&quot;VideoSeekForwardSmall&quot;] }
+}</code></pre>
+    <h3 id="example-volume-three">8. 音量を 3 段まとめて変える</h3>
+    <p>動画・音声の音量を 3 段まとめて上げる操作と下げる操作を用意します。</p>
+    <p>割り当て：スロット 1（上げる）・2（下げる）、動画・音声表示</p>
+    <pre><code data-operation-example="volume-three">fn slots() {
+    [#{slot:1, label:&quot;音量を3段上げる&quot;, run:&quot;volume_up&quot;},
+     #{slot:2, label:&quot;音量を3段下げる&quot;, run:&quot;volume_down&quot;}]
+}
+fn volume_up(s) {
+    if s.context != &quot;fs_video&quot; { return []; }
+    [&quot;VideoVolumeUp&quot;, &quot;VideoVolumeUp&quot;, &quot;VideoVolumeUp&quot;]
+}
+fn volume_down(s) {
+    if s.context != &quot;fs_video&quot; { return []; }
+    [&quot;VideoVolumeDown&quot;, &quot;VideoVolumeDown&quot;, &quot;VideoVolumeDown&quot;]
+}</code></pre>
+    <h3 id="example-fixed-columns">9. 一覧を 4 列・8 列にする</h3>
+    <p>一覧を 4 列または 8 列のサムネイル表示へ切り替え、すでに同じ表示なら何もしません。</p>
+    <p>割り当て：スロット 1（4 列）・2（8 列）、一覧</p>
+    <pre><code data-operation-example="fixed-columns">fn slots() {
+    [#{slot:1, label:&quot;4列にする&quot;, run:&quot;columns4&quot;},
+     #{slot:2, label:&quot;8列にする&quot;, run:&quot;columns8&quot;}]
+}
+fn columns4(s) {
+    if s.context != &quot;grid&quot; { return []; }
+    if s.grid.details || s.grid.columns != 4 { [&quot;GridColumnCount4&quot;] } else { [] }
+}
+fn columns8(s) {
+    if s.context != &quot;grid&quot; { return []; }
+    if s.grid.details || s.grid.columns != 8 { [&quot;GridColumnCount8&quot;] } else { [] }
+}</code></pre>
+    <h3 id="example-copy-next">10. パスをコピーして次へ</h3>
+    <p>表示中の画像のパスをコピーしてから、次のページへ進みます。</p>
+    <p>割り当て：スロット 1（画像表示）</p>
+    <pre><code data-operation-example="copy-next">fn slots() { [#{slot:1, label:&quot;パスをコピーして次へ&quot;, run:&quot;copy_next&quot;}] }
+fn copy_next(s) {
+    if s.context != &quot;fs_image&quot; { return []; }
+    [&quot;FsCopyPath&quot;, &quot;FsPageNext&quot;]
+}</code></pre>
+    <h3 id="example-rate-back">11. 本を評価して一覧へ戻る</h3>
+    <p>本に ★3 を付けて一覧へ戻り、本がないときは表示中の項目を評価します。</p>
+    <p>割り当て：スロット 1（画像表示、右クリックの「スクリプト」からも選択可）</p>
+    <pre><code data-operation-example="rate-back">fn slots() { [#{slot:1, label:&quot;本を評価して一覧へ戻る&quot;, run:&quot;rate_back&quot;}] }
+fn rate_back(s) {
+    if s.context != &quot;fs_image&quot; { return []; }
+    [&quot;RatingBookPreferred3&quot;, &quot;FsBackToList&quot;]
+}</code></pre>
+    <h3 id="example-unrated">12. 未評価なら ★3、評価済みなら次へ</h3>
+    <p>未評価の画像には ★3 を付け、評価済みなら次へ進み、評価が未取得なら何もしません。</p>
+    <p>割り当て：スロット 1（画像表示）</p>
+    <pre><code data-operation-example="unrated">fn slots() { [#{slot:1, label:&quot;未評価なら ★3、評価済みなら次へ&quot;, run:&quot;unrated&quot;}] }
+fn unrated(s) {
+    if s.context != &quot;fs_image&quot; || s.item.rating == () { return []; }
+    if s.item.rating == 0 { [&quot;RatingItem3&quot;] } else { [&quot;FsPageNext&quot;] }
+}</code></pre>
+    <h3 id="example-depth-slideshow">13. 3D 写真とスライドショーを一緒に始める・止める</h3>
+    <p>両方が動いていれば両方を止め、片方だけ動いているときは足りない方を始めます。</p>
+    <p>割り当て：スロット 1（画像表示）</p>
+    <pre><code data-operation-example="depth-slideshow">fn slots() { [#{slot:1, label:&quot;3D 写真とスライドショーを一緒に始める・止める&quot;, run:&quot;depth_slideshow&quot;}] }
+fn depth_slideshow(s) {
+    if s.context != &quot;fs_image&quot; || s.view.depth == () || s.view.slideshow == () { return []; }
+    if s.view.depth &amp;&amp; s.view.slideshow { return [&quot;FsSlideshow&quot;, &quot;FsDepthParallax&quot;]; }
+    let ops = [];
+    if !s.view.depth { ops += &quot;FsDepthParallax&quot;; }
+    if !s.view.slideshow { ops += &quot;FsSlideshow&quot;; }
+    ops
+}</code></pre>
+    <p>初回は 3D 写真の準備の確認が入るため、1 回の入力で両方が始まらないことがあります。準備が済んでから、もう一度呼び出してください。</p>
+    <h3 id="example-stop-rate">14. スライドショーを止めて ★ を付ける</h3>
+    <p>スライドショーが動いていれば止めてから、表示中の画像に ★3 を付けます。</p>
+    <p>割り当て：スロット 1（画像表示）</p>
+    <pre><code data-operation-example="stop-rate">fn slots() { [#{slot:1, label:&quot;スライドショーを止めて ★ を付ける&quot;, run:&quot;stop_rate&quot;}] }
+fn stop_rate(s) {
+    if s.context != &quot;fs_image&quot; || s.view.slideshow == () { return []; }
+    if s.view.slideshow { [&quot;FsSlideshow&quot;, &quot;RatingItem3&quot;] } else { [&quot;RatingItem3&quot;] }
+}</code></pre>
+    <h3 id="example-unmute-up">15. ミュートを解除して音量を上げる</h3>
+    <p>ミュート中なら解除してから、動画・音声の音量を 1 段上げます。</p>
+    <p>割り当て：スロット 1（動画・音声表示）</p>
+    <pre><code data-operation-example="unmute-up">fn slots() { [#{slot:1, label:&quot;ミュートを解除して音量を上げる&quot;, run:&quot;unmute_up&quot;}] }
+fn unmute_up(s) {
+    if s.context != &quot;fs_video&quot; || s.video.muted == () { return []; }
+    if s.video.muted { [&quot;VideoMute&quot;, &quot;VideoVolumeUp&quot;] } else { [&quot;VideoVolumeUp&quot;] }
+}</code></pre>
+    <h3 id="example-volume-zero">16. 0 dB を超えた音量を下げる</h3>
+    <p>0 dB より大きい音量を、1 回の入力で 0 dB 付近まで下げます。</p>
+    <p>割り当て：スロット 1（動画・音声表示）</p>
+    <pre><code data-operation-example="volume-zero">fn slots() { [#{slot:1, label:&quot;0 dB を超えた音量を下げる&quot;, run:&quot;volume_zero&quot;}] }
+fn volume_zero(s) {
+    if s.context != &quot;fs_video&quot; || s.video.volume_db == () { return []; }
+    let ops = [];
+    // 0 dB以上では1段が1.5 dB。最大でも12段です。
+    for step in 0..12 {
+        if s.video.volume_db - step * 1.5 &gt; 0.0 { ops += &quot;VideoVolumeDown&quot;; }
+    }
+    ops
+}</code></pre>
+    <h3 id="example-toggle-columns">17. 一覧の列数を 4 ⇔ 8 で切り替える</h3>
+    <p>4 列のサムネイル表示なら 8 列に、それ以外は 4 列のサムネイル表示にします。</p>
+    <p>割り当て：スロット 1（一覧）</p>
+    <pre><code data-operation-example="toggle-columns">fn slots() { [#{slot:1, label:&quot;一覧の列数を 4 ⇔ 8 で切り替える&quot;, run:&quot;toggle_columns&quot;}] }
+fn toggle_columns(s) {
+    if s.context != &quot;grid&quot; || s.grid.columns == () || s.grid.details == () { return []; }
+    if !s.grid.details &amp;&amp; s.grid.columns == 4 { [&quot;GridColumnCount8&quot;] } else { [&quot;GridColumnCount4&quot;] }
+}</code></pre>
+
     <h2 id="ai-template">AI に書いてもらうときのテンプレート</h2>
     <p>次の文章と、このページの状態・操作の表、必要なら現在の本文を AI に貼り付け、「やりたいこと」を書き足してください。
     パスなどを渡す場合は、AI アプリの提供元へ送られることを考慮してください。
@@ -301,7 +482,11 @@ fn on_event(s) {
   キャプチャ保存・コピーは手動起動だけで合計1つ。
 - fn on_event(s) は任意。s.events は view / open / page / select の配列。
   イベント可の32操作だけを使用。読む向きと合わせ方の2操作は open を含む回だけ。
-  動画の再生／一時停止・ループ・全シーク、移動、レーティング、タグ、保存、コピーはイベント不可。
+  3D 写真・スライドショー、動画の再生／一時停止・ループ・全シーク、
+  見開きの形、移動、レーティング、タグ、保存、コピーはイベント不可。
+- view.depth / view.slideshow は画像・動画／音声の表示でだけ使えます。
+  video.muted / video.volume_db は動画・音声だけ。音量は dB（-80.0〜+18.0）。
+  grid.columns / grid.details は一覧だけ。ほかの画面では () です。
 - 操作名・状態はマニュアルの表だけを使い、存在しないものを作らないでください。
 - 使える補助関数: 文字列 contains / starts_with / ends_with / to_lower / len、
   配列 contains / len、マップ contains、in。配列・整数範囲の for は可。

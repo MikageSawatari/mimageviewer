@@ -59,6 +59,8 @@ pub struct ViewSnapshot {
     pub spread: Option<String>,
     pub direction: Option<String>,
     pub background: Option<String>,
+    pub depth: Option<bool>,
+    pub slideshow: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -66,6 +68,8 @@ pub struct VideoSnapshot {
     pub playing: Option<bool>,
     pub position_sec: Option<f64>,
     pub duration_sec: Option<f64>,
+    pub muted: Option<bool>,
+    pub volume_db: Option<f64>,
 }
 
 /// すべて呼び出し側が保持済みの値。変換はI/OもAppへの参照も持たない。
@@ -80,6 +84,8 @@ pub struct StateSnapshot {
     pub view: ViewSnapshot,
     pub video: VideoSnapshot,
     pub grid_selected_count: Option<i64>,
+    pub grid_columns: Option<i64>,
+    pub grid_details: Option<bool>,
 }
 
 fn string(value: &Option<String>) -> Dynamic {
@@ -118,6 +124,8 @@ impl StateSnapshot {
             view: ViewSnapshot::default(),
             video: VideoSnapshot::default(),
             grid_selected_count: None,
+            grid_columns: None,
+            grid_details: None,
         }
     }
 
@@ -188,6 +196,8 @@ impl StateSnapshot {
                     ("spread", string(&self.view.spread)),
                     ("direction", string(&self.view.direction)),
                     ("background", string(&self.view.background)),
+                    ("depth", optional(self.view.depth)),
+                    ("slideshow", optional(self.view.slideshow)),
                 ]),
             ),
             (
@@ -196,11 +206,17 @@ impl StateSnapshot {
                     ("playing", optional(self.video.playing)),
                     ("position_sec", float(self.video.position_sec)),
                     ("duration_sec", float(self.video.duration_sec)),
+                    ("muted", optional(self.video.muted)),
+                    ("volume_db", float(self.video.volume_db)),
                 ]),
             ),
             (
                 "grid",
-                map([("selected_count", optional(self.grid_selected_count))]),
+                map([
+                    ("selected_count", optional(self.grid_selected_count)),
+                    ("columns", optional(self.grid_columns)),
+                    ("details", optional(self.grid_details)),
+                ]),
             ),
         ])
     }
@@ -228,9 +244,11 @@ mod tests {
                     s.item.width == 1200 && s.item.height == 1800 && s.item.rating == 3,
                     s.book.path == "C:/manga/book" && s.book.kind == "folder",
                     s.page.index == 1 && s.page.count == 2 && !s.page.is_first && s.page.is_last,
-                    s.view.spread == "single" && s.view.direction == "rtl" && s.view.background == "black",
-                    s.video.playing && s.video.position_sec == 1.5 && s.video.duration_sec == 60.0,
-                    s.grid.selected_count == 1,
+                    s.view.spread == "single" && s.view.direction == "rtl" && s.view.background == "black"
+                        && s.view.depth && !s.view.slideshow,
+                    s.video.playing && s.video.position_sec == 1.5 && s.video.duration_sec == 60.0
+                        && s.video.muted && s.video.volume_db == -3.0,
+                    s.grid.selected_count == 1 && s.grid.columns == 8 && s.grid.details,
                 ];
                 !(false in checks)
             }
@@ -269,13 +287,19 @@ mod tests {
                 spread: Some("single".into()),
                 direction: Some("rtl".into()),
                 background: Some("black".into()),
+                depth: Some(true),
+                slideshow: Some(false),
             };
             snapshot.video = VideoSnapshot {
                 playing: Some(true),
                 position_sec: Some(1.5),
                 duration_sec: Some(60.0),
+                muted: Some(true),
+                volume_db: Some(-3.0),
             };
             snapshot.grid_selected_count = Some(1);
+            snapshot.grid_columns = Some(8);
+            snapshot.grid_details = Some(true);
             snapshot.events = vec![ScriptEvent::Open; MAX_COLLECTION_SIZE + 1];
             snapshot
                 .events

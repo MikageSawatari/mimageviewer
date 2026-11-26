@@ -162,7 +162,7 @@ operations! {
         FsSpreadSingle, FsViewSpread, FsSpreadLtr, FsSpreadLtrCover,
         FsSpreadRtl, FsSpreadRtlCover, FsReadingDirectionToggle, FsBgCycle,
         FsFitModeCycle, FsZoomIn, FsZoomOut, FsToggleMetadata, FsNavigatorToggle,
-        FsPixelGrid, FsPageTurnAnimationToggle,
+        FsPixelGrid, FsPageTurnAnimationToggle, FsDepthParallax, FsSlideshow,
     ];
     A, VIDEO => [
         VideoPlayPause, VideoMute, VideoVolumeUp, VideoVolumeDown, VideoLoop,
@@ -620,6 +620,26 @@ mod tests {
     }
 
     #[test]
+    fn script_363_depth_and_slideshow_are_image_only_a_and_event_forbidden() {
+        for action in [KeyAction::FsDepthParallax, KeyAction::FsSlideshow] {
+            let operation = ALLOWED_OPERATIONS
+                .iter()
+                .find(|op| op.action == action)
+                .unwrap();
+            assert_eq!(operation.kind, OperationKind::A);
+            assert_eq!(operation.event_permission, EventPermission::Forbidden);
+            assert_eq!(operation.contexts, ScriptContexts::IMAGE);
+            assert!(
+                validate_output(output(&[action.ini_name()]), scope(ScriptContext::FsImage))
+                    .is_ok()
+            );
+            for context in [ScriptContext::Grid, ScriptContext::FsVideo] {
+                assert!(validate_output(output(&[action.ini_name()]), scope(context)).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn validation_rejects_events_without_audited_mark() {
         for name in [
             "FsSpreadLtr",
@@ -629,6 +649,8 @@ mod tests {
             "FsClose",
             "RatingItem3",
             "FsCapture",
+            "FsDepthParallax",
+            "FsSlideshow",
         ] {
             let mut context = scope(ScriptContext::FsImage);
             context.invocation = ScriptInvocation::Event(&[]);
@@ -707,6 +729,8 @@ mod tests {
                 KeyAction::FsSpreadLtrCover,
                 KeyAction::FsSpreadRtl,
                 KeyAction::FsSpreadRtlCover,
+                KeyAction::FsDepthParallax,
+                KeyAction::FsSlideshow,
                 KeyAction::VideoPlayPause,
                 KeyAction::VideoLoop,
                 KeyAction::VideoSeekStart,

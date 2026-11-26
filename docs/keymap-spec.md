@@ -80,6 +80,13 @@ Enterでは既定確定せず子で消費し、Escapeでは子だけを取り消
 環境設定の子モーダルの確定・取消のためkeymap対象外で、新しいKeyAction・既定キーは追加しない。
 全体の設計は [操作のスクリプト](operation-script-plan.md) を参照。
 
+`FsDepthParallax` と `FsSlideshow` は画像のスクリプトからも使える種別Aで、イベントからは不可。
+キーのconsume・判定・実行の位置は保持し、3Dの動画／音楽抑止、スライドショーの音楽抑止と
+360°抑止の純粋判定だけをスクリプトと共用する。本体は既存の `toggle_depth_parallax` /
+`toggle_fullscreen_slideshow`。Sのconsume→D実行→360°判定→V実行→S実行の順序を変えず、
+同frameのS＋V・D＋S、D後の表示抑止、重複割り当ての先勝ちも維持する。
+新しいKeyAction・キー・リングの割り当ては追加しない (§17.2)。
+
 ## 3D 写真
 
 `FsDepthParallax` は画像閲覧 (`FsImage`) の `Press` 操作、既定は

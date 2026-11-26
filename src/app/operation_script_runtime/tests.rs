@@ -5,6 +5,7 @@ use crate::operation_script::CompiledOperationScript;
 
 mod events;
 mod page_identity_perf;
+mod script_363;
 
 fn ready(body: &str) -> OperationScriptState {
     let source = format!(
