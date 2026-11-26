@@ -277,7 +277,7 @@ fn restore_candidates_with_maintenance(
         .collect::<Vec<_>>();
     let epub_store_count = crate::rename_key_migration::STORES
         .iter()
-        .filter(|store| store.unique && store.file != "content_identity.db")
+        .filter(|store| store.copies_with_content_identity && store.file != "content_identity.db")
         .count();
     let epub_total = epub_mappings
         .iter()
@@ -1665,7 +1665,9 @@ mod tests {
     fn create_all_unique_store_schemas(data_dir: &Path) {
         for descriptor in crate::rename_key_migration::STORES
             .iter()
-            .filter(|descriptor| descriptor.unique && descriptor.file != "content_identity.db")
+            .filter(|descriptor| {
+                descriptor.copies_with_content_identity && descriptor.file != "content_identity.db"
+            })
         {
             if descriptor.file == "book_composition.db" {
                 crate::book_composition::initialize_database_at(&data_dir.join(descriptor.file))
@@ -1735,6 +1737,7 @@ mod tests {
     /// Exercise the schema creation and additive migrations used by the application, rather
     /// than test-local CREATE TABLE statements. Every STORES file is opened at least once.
     fn create_production_store_schemas(data_dir: &Path) {
+        crate::folder_order::initialize_database_at(&data_dir.join("folder_order.db")).unwrap();
         // watched is the first settings.db entry in STORES. Exercise its real schema
         // initializer too; merely opening this file with rusqlite leaves an empty DB.
         if data_dir.join("settings.db").exists() {

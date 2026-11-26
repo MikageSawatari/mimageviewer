@@ -248,6 +248,7 @@ mod adjustment_parameter_edit;
 mod everything_ipc;
 mod everything_results;
 mod filename_stack_ui;
+pub(crate) mod folder_order;
 pub mod folder_pane;
 pub mod folder_rating_counter;
 pub mod folder_thumb_pins;
