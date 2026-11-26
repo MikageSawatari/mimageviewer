@@ -2703,6 +2703,8 @@ pub(crate) enum FullscreenPrimarySuppression {
     #[default]
     Idle,
     PointerStream(FullscreenPrimarySuppressionReason),
+    /// The stream has ended, but downstream canvases must still reject this pass.
+    ReleasedThisPass(FullscreenPrimarySuppressionReason),
     TouchStream,
 }
 
@@ -2724,6 +2726,7 @@ impl FullscreenPrimarySuppressionReason {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FullscreenPrimarySuppressionEvent {
+    #[cfg(test)]
     PointerStreamStarted(FullscreenPrimarySuppressionReason),
     PointerFrame {
         released: bool,
@@ -2737,7 +2740,7 @@ enum FullscreenPrimarySuppressionEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FullscreenPrimarySuppressionDecision {
+pub(crate) enum FullscreenPrimarySuppressionDecision {
     Preserve,
     Allow,
     Suppress(FullscreenPrimarySuppressionReason),
@@ -2767,16 +2770,29 @@ impl FullscreenPrimarySuppression {
         self != Self::Idle
     }
 
-    pub(crate) fn arm_pointer_stream(&mut self) {
-        let _ = self.apply(FullscreenPrimarySuppressionEvent::PointerStreamStarted(
-            FullscreenPrimarySuppressionReason::Other,
-        ));
+    #[cfg(test)]
+    fn pointer_stream_for_test(reason: FullscreenPrimarySuppressionReason) -> Self {
+        Self::PointerStream(reason)
     }
 
-    fn arm_focus_restore_pointer_stream(&mut self) -> FullscreenPrimarySuppressionDecision {
-        self.apply(FullscreenPrimarySuppressionEvent::PointerStreamStarted(
-            FullscreenPrimarySuppressionReason::FocusRestore,
-        ))
+    fn arm(
+        &mut self,
+        primary_down: bool,
+        reason: FullscreenPrimarySuppressionReason,
+    ) -> FullscreenPrimarySuppressionDecision {
+        let reason = match *self {
+            Self::Idle => reason,
+            Self::PointerStream(current) | Self::ReleasedThisPass(current) => {
+                current.combined_with(reason)
+            }
+            Self::TouchStream => FullscreenPrimarySuppressionReason::Other,
+        };
+        if primary_down {
+            *self = Self::PointerStream(reason);
+        } else if *self != Self::TouchStream {
+            *self = Self::ReleasedThisPass(reason);
+        }
+        FullscreenPrimarySuppressionDecision::Suppress(reason)
     }
 
     fn apply(
@@ -2784,18 +2800,15 @@ impl FullscreenPrimarySuppression {
         event: FullscreenPrimarySuppressionEvent,
     ) -> FullscreenPrimarySuppressionDecision {
         match event {
+            #[cfg(test)]
             FullscreenPrimarySuppressionEvent::PointerStreamStarted(reason) => {
-                let reason = match *self {
-                    Self::Idle => reason,
-                    Self::PointerStream(current) => current.combined_with(reason),
-                    Self::TouchStream => FullscreenPrimarySuppressionReason::Other,
-                };
-                *self = Self::PointerStream(reason);
-                FullscreenPrimarySuppressionDecision::Suppress(reason)
+                self.arm(true, reason)
             }
             FullscreenPrimarySuppressionEvent::PointerFrame { released } => {
                 let decision = match *self {
-                    Self::Idle => FullscreenPrimarySuppressionDecision::Allow,
+                    Self::Idle | Self::ReleasedThisPass(_) => {
+                        FullscreenPrimarySuppressionDecision::Allow
+                    }
                     Self::PointerStream(reason) => {
                         FullscreenPrimarySuppressionDecision::Suppress(reason)
                     }
@@ -2803,7 +2816,9 @@ impl FullscreenPrimarySuppression {
                         FullscreenPrimarySuppressionReason::Other,
                     ),
                 };
-                if released && matches!(self, Self::PointerStream(_)) {
+                if matches!(self, Self::ReleasedThisPass(_))
+                    || (released && matches!(self, Self::PointerStream(_)))
+                {
                     *self = Self::Idle;
                 }
                 decision
@@ -2814,6 +2829,8 @@ impl FullscreenPrimarySuppression {
                 completed,
                 cancelled,
             } => {
+                // ReleasedThisPass behaves like Idle: an ended mouse stream
+                // cannot promote an unrelated active touch to TouchStream.
                 // PointerStream is provisional until raw-touch correlation has
                 // identified the source. From that point the touch frame is
                 // authoritative for this pass: canvas gestures are allowed,
@@ -2845,6 +2862,20 @@ impl FullscreenPrimarySuppression {
                 decision
             }
         }
+    }
+}
+
+impl App {
+    /// Arm only from the final physical state of this viewport's current pass.
+    /// A completed click remains visible to downstream edit canvases this pass.
+    #[must_use]
+    pub(crate) fn arm_fs_primary_suppression(
+        &mut self,
+        ctx: &egui::Context,
+        reason: FullscreenPrimarySuppressionReason,
+    ) -> FullscreenPrimarySuppressionDecision {
+        self.fs_primary_suppression
+            .arm(ctx.input(|i| i.pointer.primary_down()), reason)
     }
 }
 
@@ -16000,7 +16031,8 @@ impl App {
         let drag = self.fs_middle_zoom_drag.take().unwrap();
         if drag.input == ZoomDragInput::Scrub {
             if ctx.input(|i| i.pointer.primary_down()) {
-                self.fs_primary_suppression.arm_pointer_stream();
+                let _ =
+                    self.arm_fs_primary_suppression(ctx, FullscreenPrimarySuppressionReason::Other);
             }
             return true;
         }
@@ -16031,7 +16063,8 @@ impl App {
             if drag.owner != owner || drag.surface != self.zoom_drag_surface() {
                 self.fs_middle_zoom_drag = None;
                 if input == ZoomDragInput::Scrub && down {
-                    self.fs_primary_suppression.arm_pointer_stream();
+                    let _ = self
+                        .arm_fs_primary_suppression(ctx, FullscreenPrimarySuppressionReason::Other);
                 }
                 return input == ZoomDragInput::Scrub;
             }
@@ -16146,7 +16179,8 @@ impl App {
                 // A concurrent middle drag keeps the zoom owner; the scrub chord
                 // still claims this primary press so tools cannot start drawing.
                 if !used && primary_pressed {
-                    self.fs_primary_suppression.arm_pointer_stream();
+                    let _ = self
+                        .arm_fs_primary_suppression(ctx, FullscreenPrimarySuppressionReason::Other);
                 }
                 ctx.set_cursor_icon(egui::CursorIcon::ZoomIn);
                 return true;
@@ -16159,7 +16193,8 @@ impl App {
                 // Ctrl added during an existing Space pan must not turn that
                 // same primary stream into a brush stroke or a new zoom.
                 if scrub_held && primary_down {
-                    self.fs_primary_suppression.arm_pointer_stream();
+                    let _ = self
+                        .arm_fs_primary_suppression(ctx, FullscreenPrimarySuppressionReason::Other);
                     return true;
                 }
             }
@@ -41262,10 +41297,11 @@ impl App {
                     );
                 }
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
-                primary_suppression = primary_suppression.overridden_by(
-                    self.fs_primary_suppression
-                        .arm_focus_restore_pointer_stream(),
-                );
+                primary_suppression =
+                    primary_suppression.overridden_by(self.arm_fs_primary_suppression(
+                        ctx,
+                        FullscreenPrimarySuppressionReason::FocusRestore,
+                    ));
                 let touch_scope = self.fullscreen_idx.map(|fs_idx| StillTouchChromeLatch {
                     fs_idx,
                     session_started_at: self.fullscreen_opened_at(),
@@ -41767,7 +41803,8 @@ impl App {
             );
             if used || (scrub_held && can_start && pressed) {
                 if pressed {
-                    self.fs_primary_suppression.arm_pointer_stream();
+                    let _ = self
+                        .arm_fs_primary_suppression(ctx, FullscreenPrimarySuppressionReason::Other);
                 }
                 ctx.set_cursor_icon(egui::CursorIcon::ZoomIn);
                 return FsWheelFrameResult::default();
@@ -81974,7 +82011,9 @@ mod tests {
         let drag_end = egui::pos2(400.0, 240.0);
 
         run_frame(&mut app, &ctx, screen, &state, Vec::new(), true);
-        app.fs_primary_suppression.arm_pointer_stream();
+        app.fs_primary_suppression = FullscreenPrimarySuppression::pointer_stream_for_test(
+            FullscreenPrimarySuppressionReason::Other,
+        );
         let nav = run_frame(
             &mut app,
             &ctx,
@@ -82016,7 +82055,9 @@ mod tests {
         );
 
         let tap = egui::pos2(600.0, 300.0);
-        app.fs_primary_suppression.arm_pointer_stream();
+        app.fs_primary_suppression = FullscreenPrimarySuppression::pointer_stream_for_test(
+            FullscreenPrimarySuppressionReason::Other,
+        );
         run_frame(
             &mut app,
             &ctx,
@@ -83480,7 +83521,9 @@ mod tests {
 
         let drag_start = tap;
         let touch_dragged = tap + egui::vec2(64.0, 24.0);
-        app.fs_primary_suppression.arm_pointer_stream();
+        app.fs_primary_suppression = FullscreenPrimarySuppression::pointer_stream_for_test(
+            FullscreenPrimarySuppressionReason::Other,
+        );
         run_frame(
             &mut app,
             &ctx,
@@ -83565,7 +83608,9 @@ mod tests {
         );
 
         app.fs_pan = egui::Vec2::ZERO;
-        app.fs_primary_suppression.arm_pointer_stream();
+        app.fs_primary_suppression = FullscreenPrimarySuppression::pointer_stream_for_test(
+            FullscreenPrimarySuppressionReason::Other,
+        );
         run_frame(
             &mut app,
             &ctx,

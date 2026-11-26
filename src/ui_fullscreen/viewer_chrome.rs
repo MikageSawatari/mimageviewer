@@ -28,29 +28,33 @@ impl App {
                 i.pointer.primary_released(),
             )
         });
+        // Retire the previous flow before arming any new press in this pass.
+        // A release followed by a press must not retire the new flow's owner.
+        let mut primary_suppression =
+            self.fs_primary_suppression
+                .apply(FullscreenPrimarySuppressionEvent::PointerFrame {
+                    released: primary_released,
+                });
         if self.cancel_mouse_right_drag_on_primary_press(
             crate::ring_shortcut::RightDragOwner::Root,
             primary_pressed && !front_primary_owned,
         ) {
-            self.fs_primary_suppression.arm_pointer_stream();
+            primary_suppression = primary_suppression.overridden_by(
+                self.arm_fs_primary_suppression(ctx, FullscreenPrimarySuppressionReason::Other),
+            );
         }
         if let Some(t) = self.fs_focus_regained_at {
             if t.elapsed() >= FOCUS_RESTORE_GRACE {
                 self.fs_focus_regained_at = None;
             } else if !self.fs_primary_suppression.is_active() && pointer_primary_down {
-                self.fs_primary_suppression
-                    .arm_focus_restore_pointer_stream();
+                primary_suppression =
+                    primary_suppression.overridden_by(self.arm_fs_primary_suppression(
+                        ctx,
+                        FullscreenPrimarySuppressionReason::FocusRestore,
+                    ));
                 self.fs_focus_regained_at = None;
             }
         }
-        // Snapshot before releasing persistent ownership. The terminal frame
-        // itself remains suppressed, while later early returns cannot strand
-        // the owner because the viewer calls this before key-driven surface changes.
-        let primary_suppression =
-            self.fs_primary_suppression
-                .apply(FullscreenPrimarySuppressionEvent::PointerFrame {
-                    released: primary_released,
-                });
         primary_suppression
     }
 
