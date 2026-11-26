@@ -83,6 +83,16 @@ struct Canvas {
 
 impl Canvas {
     fn new() -> Self {
+        let mut canvas = Self::without_pointer_pass();
+        canvas.plan(
+            vec![egui::Event::PointerMoved(canvas_pos())],
+            Options::default(),
+        );
+        canvas
+    }
+
+    /// Let a child viewport own the first pointer pass instead of priming ROOT.
+    fn without_pointer_pass() -> Self {
         let ctx = egui::Context::default();
         page_turn::install(&ctx);
         install_fs_navigator_input_tracking(&ctx);
@@ -91,16 +101,11 @@ impl Canvas {
         app.settings.fullscreen_navigator_visible = false;
         app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
         app.fs_focus_regained_at = None;
-        let mut canvas = Self {
+        Self {
             ctx,
             app,
             time: 0.0,
-        };
-        canvas.plan(
-            vec![egui::Event::PointerMoved(canvas_pos())],
-            Options::default(),
-        );
-        canvas
+        }
     }
 
     fn plan(&mut self, events: Vec<egui::Event>, options: Options) -> Outcome {

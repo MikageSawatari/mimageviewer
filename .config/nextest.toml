@@ -129,6 +129,8 @@ filter = '''
     | test(/^ui_fullscreen::depth_view_transform_tests::depth_transform_(pdf_first_single_draw_consumes_suppression_after_d_f12_and_z|pinch_starts_on_canvas_but_not_on_panel|ready_first_draw_commits_reading_start_and_bounds_like_2d|wheel_prediction_matches_2d_for_default_navigation_and_local_scroll)$/)
     | test(=ui_fullscreen::depth_view_transform_tests::depth_transform_drag_start_follows_press_origin_across_panel)
     | test(=ui_fullscreen::depth_view_transform_tests::depth_transform_middle_short_click_same_pass_uses_pressed_position)
+    | test(=ui_fullscreen::depth_view_transform_tests::depth_transform_907_middle_admission_uses_its_own_press_not_primary)
+    | test(=ui_fullscreen::depth_view_transform_tests::depth_transform_907_primary_semantic_origin_survives_release_after_crossing_panel)
     | test(=global_search_ui::everything::ui::tests::everything_search_bar_not_responding_narrow_dark)
     | test(/^gpu_lanczos::prewarm_tests::(prewarm_delivery_claim_cache_hit_and_output_lease_use_normal_ownership|prewarm_execution_rejects_changed_source_and_freed_backing_before_claim)$/)
     | test(/^gpu_lanczos::tests::(back_native_execution_rechecks_no_removal_before_backing_claim_or_mutation|ordinary_prepare_output_limit_fallback_captures_actual_managed_allocation)$/)

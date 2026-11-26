@@ -473,6 +473,11 @@ F2 と `advance_viewer_primary_pointer_frame` は F12 の別ウィンドウと�
   `scrub_907_tests.rs` の共有検査では実際の child viewport の入力で閉じる処理まで通し、兄弟を保つ。
 - Rust テスト・整形・ビルドは利用者指示により未実行。後続 runner の対象は
   `-E 'test(/close_mode_900/)'` と既存の `-E 'test(/double_click_close_tests/)'`。
+- 995eeba7c の runner 結果を受けたテスト修正: detached の固定具が `page_canvas()` で先に ROOT の
+  pointer owner を作っていたため、child viewport の入力は `capture_with_primary_chrome` の所有境界で
+  拒否され、2 回目のリセットも起きていなかった。最初の pointer pass を child viewport にする固定具へ直し、
+  各クリックで viewport、egui の回数 1・2・3・3、受け付け数 1・2・1・2、倍率 2・1・1・1、候補を確認する。
+  閉じる処理と兄弟 context の不変検査は維持する。製品コード・§14 の設計は変更しない。修正後の Rust 検証は未実行。
 
 ## 15. §1.907 修正: ドラッグ拡大の和音での速いクリックでページを送らない (この pass の押下位置)
 
@@ -624,3 +629,5 @@ guard・遅延・再試行・時間切れを足さない。ClaudeCode と Codex 
 - 利用者指示により Rust テスト・cargo fmt・ビルド・製品起動は未実行。後続 runner は
   `-E 'test(/907|suppression_906|depth_transform_middle_and_scrub|native_top_popups_close_on_outside|native_bottom_menus_close_on_outside/)'`。
   UI スナップショットの変更は見込まない。
+- 995eeba7c の runner で新規 Depth 2 件の GPU group 登録漏れが判明したため、`.config/nextest.toml` の
+  既存 gpu filter に完全名 2 件を追加した。group の並列数・timeout・retry は変えない。修正後の Rust 検証は未実行。

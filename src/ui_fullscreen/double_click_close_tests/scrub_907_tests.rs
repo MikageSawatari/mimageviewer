@@ -127,7 +127,9 @@ fn scrub_907_each_primary_flow_keeps_last_press_but_preserves_existing_suppressi
 fn close_mode_900_scrub_907_detached_actual_viewport_preserves_sibling() {
     let _input = crate::key_input::lock_test_input();
     for scrub in [false, true] {
-        let mut canvas = super::suppression_906_tests::page_canvas();
+        // page_canvas primes ROOT's pointer owner. This fixture starts in the
+        // detached viewport, so no other viewport may capture before it.
+        let mut canvas = Canvas::without_pointer_pass();
         canvas.app.settings.fullscreen_primary_click = if scrub {
             FullscreenPrimaryClickMode::PageTurn
         } else {
@@ -157,6 +159,8 @@ fn close_mode_900_scrub_907_detached_actual_viewport_preserves_sibling() {
             owner.fullscreen_viewport_id()
         });
         assert_ne!(viewport_a, egui::ViewportId::ROOT);
+        assert_eq!(canvas.app.fs_front_pointer.viewport, None);
+        let close_click_check = std::cell::Cell::new(None::<(u32, u32, f32)>);
         let run_detached = |app: &mut App, ui: &mut egui::Ui| {
             assert_eq!(ui.ctx().viewport_id(), viewport_a);
             app.with_window_context_for_test(a, |owner| {
@@ -164,6 +168,30 @@ fn close_mode_900_scrub_907_detached_actual_viewport_preserves_sibling() {
                 owner.keyboard_owner_for_pass(ui.ctx());
                 let (result, operation) =
                     super::super::wheel_frame_tests::actual_merge(owner, ui, false);
+                assert_eq!(owner.fs_front_pointer.viewport, Some(viewport_a));
+                if let Some((raw_count, accepted_count, zoom)) = close_click_check.get() {
+                    let raw: Vec<_> = ui.ctx().input(|input| {
+                        input
+                            .pointer
+                            .released_buttons_with_click_counts()
+                            .filter_map(|(button, click)| {
+                                (button == egui::PointerButton::Primary)
+                                    .then_some(click)
+                                    .flatten()
+                            })
+                            .map(|(_, count)| count)
+                            .collect()
+                    });
+                    assert_eq!(raw, [raw_count]);
+                    assert_eq!(
+                        owner.fs_front_pointer.clicks.current_accepted,
+                        accepted_count
+                    );
+                    assert!(owner.fs_front_pointer.clicks.previous_close_candidate);
+                    assert_eq!(owner.fs_zoom, zoom);
+                    assert_eq!(owner.fs_pan, egui::Vec2::ZERO);
+                    assert_eq!(owner.fs_free_rotation, 0.0);
+                }
                 let facts = (result.close, !result.page_nav.is_none());
                 if result.close {
                     owner.handle_fs_navigation_with_operation(
@@ -223,7 +251,13 @@ fn close_mode_900_scrub_907_detached_actual_viewport_preserves_sibling() {
             canvas
                 .app
                 .with_window_context_for_test(a, |owner| owner.fs_zoom = 2.0);
-            for closes in [false, false, false, true] {
+            for (raw, accepted, zoom, closes) in [
+                (1, 1, 2.0, false),
+                (2, 2, 1.0, false),
+                (3, 1, 1.0, false),
+                (3, 2, 1.0, true),
+            ] {
+                close_click_check.set(Some((raw, accepted, zoom)));
                 assert_eq!(
                     canvas.merge_using_on(
                         viewport_a,
