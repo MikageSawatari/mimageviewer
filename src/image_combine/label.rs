@@ -106,15 +106,15 @@ fn measure(
             bottom = bottom.max(y + (height.ceil() + 2.0 * pad) as f64);
         }
     }
-    bounds.width = (right - bounds.x).ceil();
-    bounds.height = (bottom - bounds.y).ceil();
+    bounds.max_x = bounds.x + (right - bounds.x).ceil();
+    bounds.max_y = bounds.y + (bottom - bounds.y).ceil();
     let padding = if o.style == BadgeStyle::Plain {
         0.0
     } else {
         size * 0.35
     };
-    let height = bounds.height + 2.0 * padding;
-    let width = (bounds.width + 2.0 * padding).max(if o.style == BadgeStyle::Pill {
+    let height = bounds.height() + 2.0 * padding;
+    let width = (bounds.width() + 2.0 * padding).max(if o.style == BadgeStyle::Pill {
         height
     } else {
         0.0
@@ -155,7 +155,7 @@ pub fn label_layout(
             LabelPlacement::Band => card.band.unwrap_or_default().inset(margin, 0.0),
             LabelPlacement::None => unreachable!(),
         };
-        let placed = (area.width > 0.0 && area.height > 0.0)
+        let placed = (area.width() > 0.0 && area.height() > 0.0)
             .then(|| fit_label(&text, area, labels, fonts))
             .flatten();
         if placed.is_none() {
@@ -175,17 +175,17 @@ fn fit_label(
     let initial = o.text_size_px as f64;
     let min_size = initial * 0.6;
     let fits = |size: f64, text: &str| -> Option<(Rect, f64, f64)> {
-        measure(text, size, o, fonts).filter(|&(_, w, h)| w <= area.width && h <= area.height)
+        measure(text, size, o, fonts).filter(|&(_, w, h)| w <= area.width() && h <= area.height())
     };
     let mut displayed = text.to_owned();
     let (size, measurement) = if let Some(m) = fits(initial, text) {
         (initial, m)
     } else {
         let minimum = measure(text, min_size, o, fonts)?;
-        if minimum.2 > area.height {
+        if minimum.2 > area.height() {
             return None;
         }
-        if minimum.1 <= area.width {
+        if minimum.1 <= area.width() {
             // Finite bisection of font measurement, not the closed-form image layout.
             // Always retain the measured fitting endpoint (raster metrics are stepped).
             let mut low = min_size;
@@ -229,16 +229,16 @@ fn fit_label(
         o.overlay_anchor.fractions()
     };
     let rect = Rect::new(
-        area.x + (area.width - w) * ax,
-        area.y + (area.height - h) * ay,
+        area.x + (area.width() - w) * ax,
+        area.y + (area.height() - h) * ay,
         w,
         h,
     );
     let text_rect = Rect::new(
-        rect.x + (w - bounds.width) * 0.5,
-        rect.y + (h - bounds.height) * 0.5,
-        bounds.width,
-        bounds.height,
+        rect.x + (w - bounds.width()) * 0.5,
+        rect.y + (h - bounds.height()) * 0.5,
+        bounds.width(),
+        bounds.height(),
     );
     Some(PlacedLabel {
         text: displayed,
@@ -261,8 +261,8 @@ pub(super) fn render_text(
         block,
     );
     let (w, h) = (
-        label.text_bounds.width as u32,
-        label.text_bounds.height as u32,
+        label.text_bounds.width() as u32,
+        label.text_bounds.height() as u32,
     );
     let overlay = comic_core::bake_overlay(&[object], w as usize, h as usize, fonts);
     RgbaImage::from_raw(w, h, overlay.pixels).expect("comic-core text raster dimensions")

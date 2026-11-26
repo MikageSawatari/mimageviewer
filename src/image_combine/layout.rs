@@ -7,39 +7,40 @@ pub const MAX_CANVAS_PIXELS: u64 = 150_000_000;
 pub struct Rect {
     pub x: f64,
     pub y: f64,
-    pub width: f64,
-    pub height: f64,
+    pub max_x: f64,
+    pub max_y: f64,
 }
 
 impl Rect {
     pub fn new(x: f64, y: f64, width: f64, height: f64) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
+        Self::from_edges(x, y, x + width, y + height)
+    }
+    /// Endpoints are canonical: reconstructing an edge as x + width can change
+    /// its last bit and put a shared half-pixel boundary on opposite sides.
+    pub fn from_edges(x: f64, y: f64, max_x: f64, max_y: f64) -> Self {
+        Self { x, y, max_x, max_y }
+    }
+    pub fn width(self) -> f64 {
+        self.max_x - self.x
+    }
+    pub fn height(self) -> f64 {
+        self.max_y - self.y
     }
     pub fn right(self) -> f64 {
-        self.x + self.width
+        self.max_x
     }
     pub fn bottom(self) -> f64 {
-        self.y + self.height
+        self.max_y
     }
     pub fn inset(self, x: f64, y: f64) -> Self {
-        Self::new(
-            self.x + x,
-            self.y + y,
-            self.width - 2.0 * x,
-            self.height - 2.0 * y,
-        )
+        Self::from_edges(self.x + x, self.y + y, self.max_x - x, self.max_y - y)
     }
     fn finite(self) -> bool {
         [
             self.x,
             self.y,
-            self.width,
-            self.height,
+            self.width(),
+            self.height(),
             self.right(),
             self.bottom(),
         ]
@@ -214,6 +215,51 @@ impl Affine {
             OutputSize::LongEdge(e) => {
                 ((e as f64 - self.b) / self.a).min((e as f64 - self.d) / self.c)
             }
+        }
+    }
+}
+
+/// Each end is computed once, then used both by its rectangle and the following
+/// gap/start. The last end is the shared enclosing edge, not an accumulated sum.
+fn partition(start: f64, end: f64, lengths: &[f64], gap: f64) -> Vec<(f64, f64)> {
+    let mut next = start;
+    lengths
+        .iter()
+        .enumerate()
+        .map(|(i, &length)| {
+            let start = next;
+            let finish = if i + 1 == lengths.len() {
+                end
+            } else {
+                start + length
+            };
+            next = finish + gap;
+            (start, finish)
+        })
+        .collect()
+}
+
+fn aligned_edges(start: f64, end: f64, length: f64, fraction: f64) -> (f64, f64) {
+    if fraction == 0.0 {
+        (start, start + length)
+    } else if fraction == 1.0 {
+        (end - length, end)
+    } else {
+        let start = start + (end - start - length) * fraction;
+        (start, start + length)
+    }
+}
+
+struct Cell {
+    image_area: Rect,
+    card_bottom: f64,
+}
+
+impl Cell {
+    fn new(left: f64, top: f64, right: f64, image_bottom: f64, card_bottom: f64) -> Self {
+        Self {
+            image_area: Rect::from_edges(left, top, right, image_bottom),
+            card_bottom,
         }
     }
 }
@@ -395,117 +441,151 @@ fn solve(
     let mut cells = Vec::with_capacity(n);
     match o.layout {
         CombineLayout::Row => {
-            let mut x = m;
-            let max_h = if matched {
-                s
-            } else {
-                heights.iter().copied().fold(0.0, f64::max) * s
-            };
-            for i in 0..n {
-                let iw = if matched {
-                    aspects[i] * s
-                } else {
-                    widths[i] * s
-                };
+            let lengths: Vec<_> = (0..n)
+                .map(|i| {
+                    if matched {
+                        aspects[i] * s
+                    } else {
+                        widths[i] * s
+                    }
+                })
+                .collect();
+            let max_height = heights.iter().copied().fold(0.0, f64::max);
+            let card_bottom = h - m;
+            let image_bottom = card_bottom - t;
+            for (i, (left, right)) in partition(m, w - m, &lengths, gx).into_iter().enumerate() {
                 let ih = if matched { s * k } else { heights[i] * s };
-                cells.push(Rect::new(
-                    x,
-                    m + (max_h * k - ih) * o.line_align.fraction(),
-                    iw,
-                    ih,
-                ));
-                x += iw + gx;
+                let (top, bottom) = if matched || heights[i] == max_height {
+                    (m, image_bottom)
+                } else {
+                    aligned_edges(m, image_bottom, ih, o.line_align.fraction())
+                };
+                let bottom_with_band = if bottom == image_bottom {
+                    card_bottom
+                } else {
+                    bottom + t
+                };
+                cells.push(Cell::new(left, top, right, bottom, bottom_with_band));
             }
         }
         CombineLayout::Column => {
-            let mut y = m;
-            let max_w = if matched {
-                s
-            } else {
-                widths.iter().copied().fold(0.0, f64::max) * s
-            };
-            for i in 0..n {
+            let lengths: Vec<_> = (0..n)
+                .map(|i| {
+                    if matched {
+                        s / aspects[i] + t
+                    } else {
+                        heights[i] * s + t
+                    }
+                })
+                .collect();
+            let max_width = widths.iter().copied().fold(0.0, f64::max);
+            for (i, (top, bottom)) in partition(m, h - m, &lengths, gy).into_iter().enumerate() {
                 let iw = if matched { s * k } else { widths[i] * s };
-                let ih = if matched {
-                    s / aspects[i]
+                let (left, right) = if matched || widths[i] == max_width {
+                    (m, w - m)
                 } else {
-                    heights[i] * s
+                    aligned_edges(m, w - m, iw, o.line_align.fraction())
                 };
-                cells.push(Rect::new(
-                    m + (max_w * k - iw) * o.line_align.fraction(),
-                    y,
-                    iw,
-                    ih,
-                ));
-                y += ih + t + gy;
+                cells.push(Cell::new(left, top, right, bottom - t, bottom));
             }
         }
         CombineLayout::Grid => {
+            let xs = partition(m, w - m, &vec![s; columns], gx);
+            let ys = partition(m, h - m, &vec![s / r + t; rows], gy);
             for i in 0..n {
-                cells.push(Rect::new(
-                    m + (i % columns) as f64 * (s + gx),
-                    m + (i / columns) as f64 * (s / r + t + gy),
-                    s,
-                    s / r,
-                ));
+                let (left, right) = xs[i % columns];
+                let (top, bottom) = ys[i / columns];
+                cells.push(Cell::new(left, top, right, bottom - t, bottom));
             }
         }
         CombineLayout::JustifiedRows | CombineLayout::JustifiedColumns => {
-            let mut index = 0;
-            let mut cross = m;
-            for (group, (&count, &(a, b))) in split.iter().zip(&group_terms).enumerate() {
+            let mut bases = Vec::with_capacity(split.len());
+            for (group, &(a, b)) in group_terms.iter().enumerate() {
                 let base = a * s + b;
                 if base <= 0.0 {
                     return Err(LayoutError::NonPositiveImageArea { group });
                 }
-                let mut along = m;
-                for _ in 0..count {
+                bases.push(base);
+            }
+            let cross_lengths: Vec<_> = bases
+                .iter()
+                .map(|base| if horizontal { base * k + t } else { base * k })
+                .collect();
+            let cross_spans = partition(
+                m,
+                if horizontal { h - m } else { w - m },
+                &cross_lengths,
+                if horizontal { gy } else { gx },
+            );
+            let mut index = 0;
+            for ((&count, &base), (cross_start, cross_end)) in
+                split.iter().zip(&bases).zip(cross_spans)
+            {
+                let lengths: Vec<_> = aspects[index..index + count as usize]
+                    .iter()
+                    .map(|aspect| {
+                        if horizontal {
+                            aspect * base
+                        } else {
+                            base / aspect + t
+                        }
+                    })
+                    .collect();
+                let spans = partition(
+                    m,
+                    if horizontal { w - m } else { h - m },
+                    &lengths,
+                    if horizontal { gx } else { gy },
+                );
+                for (start, end) in spans {
                     if horizontal {
-                        let iw = aspects[index] * base;
-                        cells.push(Rect::new(along, cross, iw, base * k));
-                        along += iw + gx;
+                        cells.push(Cell::new(start, cross_start, end, cross_end - t, cross_end));
                     } else {
-                        let ih = base / aspects[index];
-                        cells.push(Rect::new(cross, along, base * k, ih));
-                        along += ih + t + gy;
+                        cells.push(Cell::new(cross_start, start, cross_end, end - t, end));
                     }
                     index += 1;
                 }
-                cross += if horizontal {
-                    base * k + t + gy
-                } else {
-                    base * k + gx
-                };
             }
         }
     }
     let mut cards = Vec::with_capacity(n);
     let mut max_crop: f64 = 0.0;
     let mut upscaled = false;
-    for (index, cell) in cells.into_iter().enumerate() {
+    for (index, placement) in cells.into_iter().enumerate() {
+        let cell = placement.image_area;
         let size = dims[index];
         let full = Rect::new(0.0, 0.0, size.0 as f64, size.1 as f64);
         let (mut image, crop) = if o.layout == CombineLayout::Grid && o.cell_fit == CellFit::Fit {
-            let factor = (cell.width / full.width).min(cell.height / full.height);
+            let sx = cell.width() / full.width();
+            let sy = cell.height() / full.height();
+            let factor = sx.min(sy);
             let (ax, ay) = o.anchor.fractions();
-            let (iw, ih) = (full.width * factor, full.height * factor);
-            (
-                Rect::new(
-                    cell.x + (cell.width - iw) * ax,
-                    cell.y + (cell.height - ih) * ay,
-                    iw,
-                    ih,
-                ),
-                full,
-            )
+            let (iw, ih) = (full.width() * factor, full.height() * factor);
+            let (left, right) = if sx <= sy {
+                (cell.x, cell.right())
+            } else {
+                aligned_edges(cell.x, cell.right(), iw, ax)
+            };
+            let (top, bottom) = if sy <= sx {
+                (cell.y, cell.bottom())
+            } else {
+                aligned_edges(cell.y, cell.bottom(), ih, ay)
+            };
+            (Rect::from_edges(left, top, right, bottom), full)
         } else {
             (cell, fill_crop(full, cell, o.anchor))
         };
-        let mut card = Rect::new(cell.x, cell.y, cell.width, cell.height + t);
-        let mut band = (t > 0.0).then(|| Rect::new(cell.x, cell.bottom(), cell.width, t));
+        let mut card = Rect::from_edges(cell.x, cell.y, cell.right(), placement.card_bottom);
+        let mut band = (t > 0.0)
+            .then(|| Rect::from_edges(cell.x, cell.bottom(), cell.right(), placement.card_bottom));
         if o.direction == CombineDirection::RightToLeft && o.layout != CombineLayout::Column {
             let mirror = |rect: &mut Rect| {
-                rect.x = canvas_size.0 as f64 - rect.right();
+                *rect = Rect::from_edges(
+                    canvas_size.0 as f64 - rect.right(),
+                    rect.y,
+                    canvas_size.0 as f64 - rect.x,
+                    rect.bottom(),
+                );
             };
             mirror(&mut card);
             mirror(&mut image);
@@ -516,13 +596,13 @@ fn solve(
         if ![cell, image, crop, card].iter().all(|r| r.finite()) {
             return Err(LayoutError::NonFinite);
         }
-        if image.width < 1.0 - 1e-9 || image.height < 1.0 - 1e-9 {
+        if image.width() < 1.0 - 1e-9 || image.height() < 1.0 - 1e-9 {
             return Err(LayoutError::ImageTooSmall { index });
         }
         max_crop = max_crop
-            .max(1.0 - crop.width / full.width)
-            .max(1.0 - crop.height / full.height);
-        upscaled |= image.width > crop.width + 1e-9 || image.height > crop.height + 1e-9;
+            .max(1.0 - crop.width() / full.width())
+            .max(1.0 - crop.height() / full.height());
+        upscaled |= image.width() > crop.width() + 1e-9 || image.height() > crop.height() + 1e-9;
         cards.push(CardLayout {
             card,
             image,
@@ -582,8 +662,13 @@ fn checked_canvas(w: f64, h: f64, format: CombineFormat) -> Result<(u32, u32), L
 }
 
 fn fill_crop(source: Rect, target: Rect, anchor: Anchor9) -> Rect {
-    let factor = (target.width / source.width).max(target.height / source.height);
-    let (cw, ch) = (target.width / factor, target.height / factor);
+    let factor = (target.width() / source.width()).max(target.height() / source.height());
+    let (cw, ch) = (target.width() / factor, target.height() / factor);
     let (ax, ay) = anchor.fractions();
-    Rect::new((source.width - cw) * ax, (source.height - ch) * ay, cw, ch)
+    Rect::new(
+        (source.width() - cw) * ax,
+        (source.height() - ch) * ay,
+        cw,
+        ch,
+    )
 }

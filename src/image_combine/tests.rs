@@ -182,13 +182,13 @@ fn five_layouts_directions_gaps_margins_and_bands_follow_affine_formulas() {
                     };
                     close(card.card.x, x as f64);
                     close(card.card.y, y as f64);
-                    close(card.image.width, 100.0);
-                    close(card.image.height, 100.0);
-                    close(card.card.height, (100 + t) as f64);
+                    close(card.image.width(), 100.0);
+                    close(card.image.height(), 100.0);
+                    close(card.card.height(), (100 + t) as f64);
                     assert_eq!(card.band.is_some(), t > 0);
                     if let Some(band) = card.band {
                         close(band.y, card.image.bottom());
-                        close(band.height, t as f64);
+                        close(band.height(), t as f64);
                     }
                 }
             }
@@ -213,8 +213,8 @@ fn band_column_and_unequal_justified_columns_keep_bands_below_images() {
     let l = layout(&o, &[(100, 100); 3], Some(20)).unwrap();
     // Inner height 390: first width 370, second (390-10-40)/2 = 170.
     assert_eq!(l.canvas_size, (558, 400));
-    close(l.cards[0].image.width, 370.0);
-    close(l.cards[1].image.width, 170.0);
+    close(l.cards[0].image.width(), 370.0);
+    close(l.cards[1].image.width(), 170.0);
     close(l.cards[1].image.x, 383.0);
     close(l.cards[2].image.y, 205.0);
     close(l.cards[0].band.unwrap().bottom(), 395.0);
@@ -271,7 +271,7 @@ fn output_sizes_and_fixed_ratio_both_hold_for_all_layouts() {
                 }
                 for card in l.cards {
                     if let Some(band) = card.band {
-                        close(band.height, 20.0);
+                        close(band.height(), 20.0);
                     }
                 }
             }
@@ -339,12 +339,12 @@ fn fixed_ratio_crops_both_axes_with_all_nine_anchors() {
                 let l = calculate(&o, &[(100, 100)]);
                 let crop = l.cards[0].source_crop;
                 if ratio == (2, 1) {
-                    close(crop.width, 100.0);
-                    close(crop.height, 50.0);
+                    close(crop.width(), 100.0);
+                    close(crop.height(), 50.0);
                     close(crop.y, 50.0 * ay);
                 } else {
-                    close(crop.width, 50.0);
-                    close(crop.height, 100.0);
+                    close(crop.width(), 50.0);
+                    close(crop.height(), 100.0);
                     close(crop.x, 50.0 * ax);
                 }
                 close(l.max_crop_percent, 50.0);
@@ -383,6 +383,35 @@ fn automatic_fixed_ratio_solves_each_candidate_and_skips_invalid_two_two() {
         layout(&o, &[(100, 100); 4], Some(180)),
         Err(LayoutError::NonPositiveThickness)
     );
+}
+
+#[test]
+fn automatic_fixed_ratio_uses_log_thickness_instead_of_natural_ratio_with_bands() {
+    let mut o = options(CombineLayout::JustifiedRows);
+    o.canvas_ratio = Some((5, 4));
+    let dims = [(100, 100); 3];
+    let automatic = layout(&o, &dims, Some(13)).unwrap();
+    assert_eq!(automatic.split, vec![3]);
+    close(automatic.thickness, 2.27);
+
+    let mut fixed = o.clone();
+    fixed.split = Split::Counts(vec![1, 2]);
+    let two_rows = layout(&fixed, &dims, Some(13)).unwrap();
+    close(two_rows.thickness, 0.4033333333333333);
+    assert!(automatic.thickness.ln().abs() < two_rows.thickness.ln().abs());
+
+    // Both candidates are valid, but scoring the natural ratio would choose
+    // the other split. Keep unrounded dimensions, just as the selector does.
+    fixed.canvas_ratio = None;
+    let natural_two = layout(&fixed, &dims, Some(13)).unwrap();
+    fixed.split = Split::Counts(vec![3]);
+    let natural_one = layout(&fixed, &dims, Some(13)).unwrap();
+    let score = |l: &Layout| {
+        (l.s / l.cards.last().unwrap().card.bottom() / 1.25)
+            .ln()
+            .abs()
+    };
+    assert!(score(&natural_two) < score(&natural_one));
 }
 
 #[test]
@@ -433,8 +462,8 @@ fn rtl_mirrors_every_destination_rect_and_grid_empty_cells_move_left() {
                     },
                 );
                 close(a.y, b.y);
-                close(a.width, b.width);
-                close(a.height, b.height);
+                close(a.width(), b.width());
+                close(a.height(), b.height());
             }
             assert_eq!(a.source_crop, b.source_crop);
         }
@@ -518,7 +547,7 @@ fn fixed_pixel_gaps_bands_margin_and_border_do_not_scale_with_output_size() {
         let l = layout(&o, &[(100, 100); 2], Some(30)).unwrap();
         close(l.cards[1].card.x - l.cards[0].card.right(), 11.0);
         close(l.cards[0].card.x, 7.0);
-        close(l.cards[0].band.unwrap().height, 30.0);
+        close(l.cards[0].band.unwrap().height(), 30.0);
         let mut canvas = create_canvas(&l, &o, 1.0).unwrap();
         draw_card(
             &mut canvas,
@@ -713,10 +742,10 @@ fn border_fully_covers_interior_ring_on_all_edges_and_arcs() {
     // Independent piecewise geometry: corner-circle distance in a corner's
     // quadrant, otherwise distance to the nearest straight rectangle edge.
     fn signed_distance(rect: Rect, radius: f64, x: f64, y: f64) -> f64 {
-        if rect.width <= 0.0 || rect.height <= 0.0 {
+        if rect.width() <= 0.0 || rect.height() <= 0.0 {
             return f64::INFINITY;
         }
-        let radius = radius.min(rect.width.min(rect.height) * 0.5);
+        let radius = radius.min(rect.width().min(rect.height()) * 0.5);
         let corner_x = if x < rect.x + radius {
             Some(rect.x + radius)
         } else if x > rect.right() - radius {
@@ -765,8 +794,9 @@ fn border_fully_covers_interior_ring_on_all_edges_and_arcs() {
             let mut image = create_canvas(&l, &o, scale).unwrap();
             draw_card(&mut image, card, &source, &o, scale).unwrap();
             let outer = render::scaled_rect(card.card, scale);
-            let radius =
-                (o.corner_radius as f64).min(card.card.width.min(card.card.height) * 0.5) * scale;
+            let radius = (o.corner_radius as f64)
+                .min(card.card.width().min(card.card.height()) * 0.5)
+                * scale;
             let border = o.border.width_px as f64 * scale;
             let inner = outer.inset(border, border);
             let mut checked = 0;
@@ -822,10 +852,10 @@ fn label_boxes_pills_band_alignment_and_descenders_fit_decorated_bounds() {
             match align {
                 HAlign::Left => close(label.rect.x, 16.0),
                 HAlign::Right => close(label.rect.right(), 584.0),
-                HAlign::Center => close(label.rect.x + label.rect.width / 2.0, 300.0),
+                HAlign::Center => close(label.rect.x + label.rect.width() / 2.0, 300.0),
             }
             if style == BadgeStyle::Pill {
-                assert!(label.rect.width >= label.rect.height);
+                assert!(label.rect.width() >= label.rect.height());
             }
             let raster = label::render_text(label, &o.labels, &fonts);
             assert!(raster.pixels().any(|p| p[3] != 0));
@@ -833,7 +863,7 @@ fn label_boxes_pills_band_alignment_and_descenders_fit_decorated_bounds() {
                 render_all(&l, &[RgbaImage::new(600, 100)], &o, &labels, 1.0, &fonts).unwrap();
             assert_eq!(output.dimensions(), l.canvas_size);
             if style != BadgeStyle::Plain {
-                let x = (label.rect.x + label.rect.width / 2.0).round() as u32;
+                let x = (label.rect.x + label.rect.width() / 2.0).round() as u32;
                 let y = label.rect.y.round() as u32 + 2;
                 assert!(
                     output.get_pixel(x, y)[0] < 200,
@@ -856,8 +886,8 @@ fn label_overlay_nine_anchors_measure_margin_from_inside_border() {
         let labels = label_layout(&l, &[spec(None)], &o, &fonts);
         let label = labels.labels[0].as_ref().unwrap();
         let (ax, ay) = anchor.fractions();
-        close(label.rect.x, 24.0 + (452.0 - label.rect.width) * ax);
-        close(label.rect.y, 24.0 + (352.0 - label.rect.height) * ay);
+        close(label.rect.x, 24.0 + (452.0 - label.rect.width()) * ax);
+        close(label.rect.y, 24.0 + (352.0 - label.rect.height()) * ay);
     }
 }
 
@@ -872,7 +902,7 @@ fn label_shrinks_then_ellipsizes_and_counts_only_nonempty_unplaceable_labels() {
     let original = label_layout(&wide, &[spec(Some("商品ABC"))], &o, &fonts).labels[0]
         .clone()
         .unwrap();
-    let width = (original.rect.width * 0.8).floor() as u32;
+    let width = (original.rect.width() * 0.8).floor() as u32;
     let l = calculate(&o, &[(width, 800)]);
     let labels = label_layout(&l, &[spec(Some("商品ABC"))], &o, &fonts);
     let label = labels.labels[0].as_ref().unwrap();
@@ -883,7 +913,7 @@ fn label_shrinks_then_ellipsizes_and_counts_only_nonempty_unplaceable_labels() {
     let label = labels.labels[0].as_ref().unwrap();
     close(label.text_size_px, 60.0);
     assert!(label.text.ends_with('…'));
-    assert!(label.rect.width <= width as f64);
+    assert!(label.rect.width() <= width as f64);
     let tiny = calculate(&o, &[(10, 10); 3]);
     let labels = label_layout(
         &tiny,
@@ -1018,8 +1048,8 @@ fn preview_and_output_use_identical_edge_rounding_and_label_decisions() {
     for (i, card) in l.cards.iter().enumerate() {
         let target = render::scaled_rect(card.image, scale);
         let (cx, cy) = (
-            (target.x + target.width / 2.0) as u32,
-            (target.y + target.height / 2.0) as u32,
+            (target.x + target.width() / 2.0) as u32,
+            (target.y + target.height() / 2.0) as u32,
         );
         assert_eq!(*preview.get_pixel(cx, cy), Rgba(colors[i]));
         assert_eq!(preview.get_pixel(cx, cy), reduced.get_pixel(cx, cy));
@@ -1208,8 +1238,8 @@ fn fractional_crop_is_preserved_when_using_small_preview_sources() {
         .crop(
             crop.x * 13.0 / 100.0,
             crop.y * 17.0 / 100.0,
-            crop.width * 13.0 / 100.0,
-            crop.height * 17.0 / 100.0,
+            crop.width() * 13.0 / 100.0,
+            crop.height() * 17.0 / 100.0,
         );
     fast_image_resize::Resizer::new()
         .resize(&source, &mut expected, &opts)
@@ -1221,4 +1251,277 @@ fn fractional_crop_is_preserved_when_using_small_preview_sources() {
             .zip(expected.as_raw())
             .all(|(&a, &b)| a.abs_diff(b) <= 1)
     );
+}
+
+#[test]
+fn fractional_grid_width_4093_has_no_background_seam() {
+    let mut o = options(CombineLayout::Grid);
+    o.grid_columns = Some(12);
+    o.cell_fit = CellFit::Fill;
+    o.output_size = OutputSize::Width(4093);
+    o.background = Background::Transparent;
+    let sources = vec![RgbaImage::from_pixel(1, 1, Rgba([17, 93, 211, 255])); 12];
+    for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
+        o.direction = direction;
+        let l = calculate(&o, &[(100, 100); 12]);
+        close(l.cards[0].card.width(), 4093.0 / 12.0);
+        for pair in l.cards.windows(2) {
+            if direction == CombineDirection::LeftToRight {
+                assert_eq!(pair[0].card.right(), pair[1].card.x);
+            } else {
+                assert_eq!(pair[0].card.x, pair[1].card.right());
+            }
+        }
+        for scale in [1.0, 0.37] {
+            let image = render_all(
+                &l,
+                &sources,
+                &o,
+                &no_labels(12),
+                scale,
+                &comic_core::FontSet::default(),
+            )
+            .unwrap();
+            for (x, y, pixel) in image.enumerate_pixels() {
+                assert_eq!(
+                    *pixel,
+                    Rgba([17, 93, 211, 255]),
+                    "{direction:?}, scale {scale}, ({x},{y})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn justified_rows_fractional_widths_have_no_background_seam() {
+    let mut o = options(CombineLayout::JustifiedRows);
+    o.split = Split::Counts(vec![12]);
+    o.output_size = OutputSize::Width(4093);
+    o.background = Background::Transparent;
+    let sources = vec![RgbaImage::from_pixel(1, 1, Rgba([41, 123, 209, 255])); 12];
+    for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
+        o.direction = direction;
+        let l = calculate(&o, &[(100, 100); 12]);
+        assert!(l.cards.iter().any(|card| card.card.width().fract() != 0.0));
+        for scale in [1.0, 0.37] {
+            let image = render_all(
+                &l,
+                &sources,
+                &o,
+                &no_labels(12),
+                scale,
+                &comic_core::FontSet::default(),
+            )
+            .unwrap();
+            for (x, y, pixel) in image.enumerate_pixels() {
+                assert_eq!(
+                    *pixel,
+                    Rgba([41, 123, 209, 255]),
+                    "{direction:?}, scale {scale}, ({x},{y})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn all_layouts_share_card_image_band_and_gap_endpoints() {
+    for kind in [
+        CombineLayout::Row,
+        CombineLayout::Column,
+        CombineLayout::Grid,
+        CombineLayout::JustifiedRows,
+        CombineLayout::JustifiedColumns,
+    ] {
+        let vertical = matches!(
+            kind,
+            CombineLayout::Column | CombineLayout::JustifiedColumns
+        );
+        let mut o = options(kind);
+        o.grid_columns = Some(4);
+        o.cell_fit = CellFit::Fill;
+        o.split = Split::Counts(vec![3, 4, 5]);
+        o.output_size = if vertical {
+            OutputSize::Height(509)
+        } else {
+            OutputSize::Width(509)
+        };
+        o.background = Background::Transparent;
+        o.labels.band_color = BandColor::Color([11, 59, 173]);
+        let sources = vec![RgbaImage::from_pixel(1, 1, Rgba([211, 73, 31, 255])); 12];
+        for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
+            o.direction = direction;
+            for band_height in [0, 13] {
+                for gap in [0, 7] {
+                    o.gap_x = gap;
+                    o.gap_y = gap;
+                    let l = layout(&o, &[(100, 100); 12], Some(band_height)).unwrap();
+                    for scale in [1.0, 0.5, 0.37] {
+                        for card in &l.cards {
+                            let outer = render::scaled_rect(card.card, scale);
+                            let image = render::scaled_rect(card.image, scale);
+                            assert_eq!(
+                                (outer.x, outer.right(), outer.y),
+                                (image.x, image.right(), image.y)
+                            );
+                            if let Some(band) = card.band {
+                                let band = render::scaled_rect(band, scale);
+                                assert_eq!(image.bottom(), band.y);
+                                assert_eq!(
+                                    (outer.x, outer.right(), outer.bottom()),
+                                    (band.x, band.right(), band.bottom())
+                                );
+                            } else {
+                                assert_eq!(outer, image);
+                            }
+                        }
+                        // Within each logical row/column, gaps are rectangles
+                        // defined by those same card endpoints, including RTL.
+                        let mut index = 0;
+                        for &count in &l.split {
+                            for pair in l.cards[index..index + count as usize].windows(2) {
+                                let (a, b) =
+                                    if !vertical && direction == CombineDirection::RightToLeft {
+                                        (&pair[1], &pair[0])
+                                    } else {
+                                        (&pair[0], &pair[1])
+                                    };
+                                let gap_rect = if vertical {
+                                    Rect::from_edges(
+                                        a.card.x,
+                                        a.card.bottom(),
+                                        a.card.right(),
+                                        b.card.y,
+                                    )
+                                } else {
+                                    Rect::from_edges(
+                                        a.card.right(),
+                                        a.card.y,
+                                        b.card.x,
+                                        a.card.bottom(),
+                                    )
+                                };
+                                let gap_rect = render::scaled_rect(gap_rect, scale);
+                                let a = render::scaled_rect(a.card, scale);
+                                let b = render::scaled_rect(b.card, scale);
+                                if vertical {
+                                    assert_eq!(a.bottom(), gap_rect.y);
+                                    assert_eq!(gap_rect.bottom(), b.y);
+                                    if gap == 0 {
+                                        assert_eq!(a.bottom(), b.y);
+                                    }
+                                } else {
+                                    assert_eq!(a.right(), gap_rect.x);
+                                    assert_eq!(gap_rect.right(), b.x);
+                                    if gap == 0 {
+                                        assert_eq!(a.right(), b.x);
+                                    }
+                                }
+                            }
+                            index += count as usize;
+                        }
+                        if gap == 0 {
+                            let image = render_all(
+                                &l,
+                                &sources,
+                                &o,
+                                &no_labels(12),
+                                scale,
+                                &comic_core::FontSet::default(),
+                            )
+                            .unwrap();
+                            // Test internal joins. The rounded canvas extent and
+                            // scaled unrounded outer edge may differ by one pixel.
+                            for (x, y, pixel) in image.enumerate_pixels() {
+                                if x > 0 && y > 0 && x + 1 < image.width() && y + 1 < image.height()
+                                {
+                                    assert_eq!(
+                                        pixel[3], 255,
+                                        "{kind:?} {direction:?}, band {band_height}, scale {scale}, ({x},{y})"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn thin_border_scan_visits_perimeter_instead_of_canvas_area() {
+    let mut visited = 0_u64;
+    render::for_each_border_span(
+        Rect::new(0.0, 0.0, 15000.0, 10000.0),
+        0.0,
+        1.0,
+        (15000, 10000),
+        |left, right, _| {
+            visited += (right - left) as u64;
+        },
+    );
+    assert_eq!(visited, 2 * 15000 + 2 * (10000 - 2));
+    let mut rounded_visited = 0_u64;
+    render::for_each_border_span(
+        Rect::new(0.0, 0.0, 15000.0, 10000.0),
+        20.0,
+        1.0,
+        (15000, 10000),
+        |left, right, _| {
+            rounded_visited += (right - left) as u64;
+        },
+    );
+    assert!(rounded_visited <= visited + 4 * 20 * 20);
+}
+
+#[test]
+fn restricted_border_scan_matches_full_scan_including_fractional_arcs_and_clipping() {
+    let color = Rgba([233, 41, 79, 255]);
+    for rect in [
+        Rect::new(3.0, 5.0, 96.0, 80.0),
+        Rect::new(-7.0, -3.0, 60.0, 40.0),
+        Rect::new(10.0, 8.0, 1.0, 3.0),
+    ] {
+        for radius in [0.0, 0.37, 7.4, 20.0, 500.0] {
+            for border in [0.0, 0.37, 1.0, 1.48, 4.0, 30.0, 100.0] {
+                let mut expected = RgbaImage::from_fn(110, 95, |x, y| {
+                    Rgba([(x * 2) as u8, (y * 2) as u8, 131, 173])
+                });
+                let mut actual = expected.clone();
+                let inner = rect.inset(border, border);
+                if border > 0.0 {
+                    for (x, y, pixel) in expected.enumerate_pixels_mut() {
+                        let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
+                        // The original full scan was confined to the outer box.
+                        if cx < rect.x || cx >= rect.right() || cy < rect.y || cy >= rect.bottom() {
+                            continue;
+                        }
+                        let coverage = (render::rounded_coverage(rect, radius, cx, cy)
+                            - render::rounded_coverage(inner, (radius - border).max(0.0), cx, cy))
+                        .max(0.0);
+                        render::composite(pixel, color, coverage);
+                    }
+                }
+                render::paint_border(&mut actual, rect, radius, border, color);
+                for ((x, y, actual), expected) in actual.enumerate_pixels().zip(expected.pixels()) {
+                    assert_eq!(
+                        actual, expected,
+                        "{rect:?}, radius {radius}, border {border}, ({x},{y})"
+                    );
+                }
+                let mut visits = vec![0; 110 * 95];
+                render::for_each_border_span(rect, radius, border, (110, 95), |left, right, y| {
+                    for x in left..right {
+                        visits[y as usize * 110 + x as usize] += 1;
+                    }
+                });
+                assert!(
+                    visits.iter().all(|&count| count <= 1),
+                    "no pixel may be blended twice"
+                );
+            }
+        }
+    }
 }

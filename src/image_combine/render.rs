@@ -38,11 +38,11 @@ fn check_scale(scale: f64) -> Result<(), RenderError> {
 /// Round edges, not widths: adjoining edges retain the same pixel boundary.
 pub fn scaled_rect(rect: Rect, scale: f64) -> Rect {
     let (x, y) = ((rect.x * scale).round(), (rect.y * scale).round());
-    Rect::new(
+    Rect::from_edges(
         x,
         y,
-        (rect.right() * scale).round() - x,
-        (rect.bottom() * scale).round() - y,
+        (rect.right() * scale).round(),
+        (rect.bottom() * scale).round(),
     )
 }
 
@@ -93,13 +93,19 @@ pub fn create_canvas(
 /// Signed-distance coverage of a rounded rectangle at the pixel center. All
 /// rounded cards, inner borders and badges share this one antialiasing rule.
 pub fn rounded_coverage(rect: Rect, radius: f64, x: f64, y: f64) -> f64 {
-    if rect.width <= 0.0 || rect.height <= 0.0 {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
         return 0.0;
     }
-    let radius = radius.max(0.0).min(rect.width.min(rect.height) * 0.5);
-    let qx = (x - (rect.x + rect.width * 0.5)).abs() - (rect.width * 0.5 - radius);
-    let qy = (y - (rect.y + rect.height * 0.5)).abs() - (rect.height * 0.5 - radius);
-    let distance = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
+    let radius = radius.max(0.0).min(rect.width().min(rect.height()) * 0.5);
+    let qx = (x - (rect.x + rect.width() * 0.5)).abs() - (rect.width() * 0.5 - radius);
+    let qy = (y - (rect.y + rect.height() * 0.5)).abs() - (rect.height() * 0.5 - radius);
+    // Only the corner quadrants need a circular distance. On a straight side
+    // (including radius zero), the same signed-distance formula reduces to max.
+    let distance = if qx > 0.0 && qy > 0.0 {
+        qx.hypot(qy) - radius
+    } else {
+        qx.max(qy) - radius
+    };
     (0.5 - distance).clamp(0.0, 1.0)
 }
 
@@ -129,6 +135,72 @@ fn paint(canvas: &mut RgbaImage, rect: Rect, mut sample: impl FnMut(f64, f64) ->
             composite(canvas.get_pixel_mut(x, y), src, coverage);
         }
     }
+}
+
+/// Non-overlapping scanline spans covering only the border bands and corner
+/// squares. Bounds are scaled/rounded already; ceil includes the AA fringe for
+/// fractional preview widths. Clip only after deriving spans from the card.
+pub(super) fn for_each_border_span(
+    outer: Rect,
+    radius: f64,
+    border: f64,
+    canvas_size: (u32, u32),
+    mut visit: impl FnMut(u32, u32, u32),
+) {
+    if border <= 0.0 || outer.width() <= 0.0 || outer.height() <= 0.0 {
+        return;
+    }
+    let radius = radius.max(0.0).min(outer.width().min(outer.height()) * 0.5);
+    let (left, right, top, bottom) = (
+        outer.x as i64,
+        outer.right() as i64,
+        outer.y as i64,
+        outer.bottom() as i64,
+    );
+    let band = border.ceil() as i64;
+    let corner = radius.max(border).ceil() as i64;
+    let mut emit = |x0: i64, x1: i64, y: i64| {
+        let x0 = x0.clamp(0, canvas_size.0 as i64) as u32;
+        let x1 = x1.clamp(0, canvas_size.0 as i64) as u32;
+        if x0 < x1 {
+            visit(x0, x1, y as u32);
+        }
+    };
+    for y in top.max(0)..bottom.min(canvas_size.1 as i64) {
+        let edge_distance = (y - top).min(bottom - 1 - y);
+        if edge_distance < band {
+            emit(left, right, y);
+        } else {
+            let extent = if edge_distance < corner { corner } else { band };
+            let left_end = (left + extent).min(right);
+            let right_start = (right - extent).max(left_end);
+            emit(left, left_end, y);
+            emit(right_start, right, y);
+        }
+    }
+}
+
+pub(super) fn paint_border(
+    canvas: &mut RgbaImage,
+    outer: Rect,
+    radius: f64,
+    border: f64,
+    color: Rgba<u8>,
+) {
+    let inner = outer.inset(border, border);
+    let canvas_size = canvas.dimensions();
+    for_each_border_span(outer, radius, border, canvas_size, |left, right, y| {
+        paint(
+            canvas,
+            Rect::from_edges(left as f64, y as f64, right as f64, (y + 1) as f64),
+            |x, y| {
+                let ring = (rounded_coverage(outer, radius, x, y)
+                    - rounded_coverage(inner, (radius - border).max(0.0), x, y))
+                .max(0.0);
+                (color, ring)
+            },
+        );
+    });
 }
 
 /// Keep fractional source coordinates, including for downscaled previews. FIR's
@@ -187,7 +259,8 @@ pub fn draw_card(
     check_scale(scale)?;
     let o = options.normalized();
     let outer = scaled_rect(card.card, scale);
-    let radius = (o.corner_radius as f64).min(card.card.width.min(card.card.height) * 0.5) * scale;
+    let radius =
+        (o.corner_radius as f64).min(card.card.width().min(card.card.height()) * 0.5) * scale;
     if let Some(band) = card.band {
         let band = scaled_rect(band, scale);
         let fill = match o.labels.band_color {
@@ -199,8 +272,8 @@ pub fn draw_card(
         });
     }
     let target = scaled_rect(card.image, scale);
-    if target.width > 0.0 && target.height > 0.0 {
-        let resized = resize_source(source, card, target.width as u32, target.height as u32)?;
+    if target.width() > 0.0 && target.height() > 0.0 {
+        let resized = resize_source(source, card, target.width() as u32, target.height() as u32)?;
         paint(canvas, target, |x, y| {
             (
                 *resized.get_pixel((x - target.x) as u32, (y - target.y) as u32),
@@ -210,14 +283,7 @@ pub fn draw_card(
     }
     let border = o.border.width_px as f64 * scale;
     if border > 0.0 {
-        let inner = outer.inset(border, border);
-        let color = rgba(o.border.color, 255);
-        paint(canvas, outer, |x, y| {
-            let ring = (rounded_coverage(outer, radius, x, y)
-                - rounded_coverage(inner, (radius - border).max(0.0), x, y))
-            .max(0.0);
-            (color, ring)
-        });
+        paint_border(canvas, outer, radius, border, rgba(o.border.color, 255));
     }
     Ok(())
 }
@@ -237,7 +303,7 @@ pub fn draw_label(
     }
     let card_rect = scaled_rect(card.card, scale);
     let card_radius =
-        (o.corner_radius as f64).min(card.card.width.min(card.card.height) * 0.5) * scale;
+        (o.corner_radius as f64).min(card.card.width().min(card.card.height()) * 0.5) * scale;
     let band = card.band.map(|band| scaled_rect(band, scale));
     let clip = |x: f64, y: f64| {
         let card = rounded_coverage(card_rect, card_radius, x, y);
@@ -250,7 +316,7 @@ pub fn draw_label(
     if o.labels.style != BadgeStyle::Plain {
         let rect = scaled_rect(label.rect, scale);
         let radius = if o.labels.style == BadgeStyle::Pill {
-            rect.height * 0.5
+            rect.height() * 0.5
         } else {
             label.text_size_px * 0.3 * scale
         };
@@ -263,15 +329,15 @@ pub fn draw_label(
         });
     }
     let target = scaled_rect(label.text_rect, scale);
-    if target.width > 0.0 && target.height > 0.0 {
+    if target.width() > 0.0 && target.height() > 0.0 {
         let original = render_text(label, &o.labels, fonts);
-        let text = if original.dimensions() == (target.width as u32, target.height as u32) {
+        let text = if original.dimensions() == (target.width() as u32, target.height() as u32) {
             original
         } else {
             crate::fast_resize::resize_rgba8_exact(
                 &original,
-                target.width as u32,
-                target.height as u32,
+                target.width() as u32,
+                target.height() as u32,
                 crate::fast_resize::Quality::Lanczos3,
             )
         };
