@@ -2134,10 +2134,12 @@ pub(crate) struct DetachedToggleRowState {
 #[cfg(windows)]
 const DETACHED_TOGGLE_DISABLED_REASON: &str = "毎回新しいウィンドウで開く設定ではF12切替は無効です";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum VisibleSelectionPolicy {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VisibleSelectionPolicy {
     General,
     RatingMembership,
+    /// 同じ一覧の再適用では未選択も維持し、先頭への移動・reveal を発行しない。
+    RetainCurrentCursor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8045,6 +8047,15 @@ struct LocalSearchListIdentity {
 enum LocalSearchCursorPolicy {
     Reset,
     Retain,
+}
+
+impl LocalSearchCursorPolicy {
+    fn visible_selection(self) -> VisibleSelectionPolicy {
+        match self {
+            Self::Reset => VisibleSelectionPolicy::General,
+            Self::Retain => VisibleSelectionPolicy::RetainCurrentCursor,
+        }
+    }
 }
 
 struct LocalSearchRequest {
@@ -17735,8 +17746,8 @@ pub struct App {
     /// 色フィルタの一時状態。Settings へ保存しないオンデマンド絞り込み。
     pub(crate) color_filter: crate::color_search::ColorFilterState,
     /// `egui::Context` を持たない軽量 items 差し替え経路で、次フレームに色スキャンを
-    /// 起動するための one-shot フラグ。
-    pub(crate) color_filter_scope_refresh_pending: bool,
+    /// 起動し、その可視集合の公開まで選択方針を運ぶ one-shot 要求。
+    pub(crate) color_filter_scope_refresh_pending: Option<VisibleSelectionPolicy>,
 
     // ── スクロール体感ロギング (--log 時) ──────────────────────────
     /// 直近のフレームで計算した可視範囲 (raw idx)。
@@ -21560,7 +21571,7 @@ impl App {
             facet_name_cache_failed_generation: None,
             facet_tag_search_query: String::new(),
             color_filter: crate::color_search::ColorFilterState::default(),
-            color_filter_scope_refresh_pending: false,
+            color_filter_scope_refresh_pending: None,
             last_vis_range: (0, 0),
             vis_settle_at: None,
             vis_first_logged: false,
@@ -42076,7 +42087,7 @@ impl App {
             self.color_filter.applied_scope_signature = None;
             self.color_filter.confirmation = None;
             self.color_filter.confirmed_large_scan_scope = None;
-            self.color_filter_scope_refresh_pending = true;
+            self.color_filter_scope_refresh_pending = Some(VisibleSelectionPolicy::General);
         }
         // ZIP 内の階層ごとに Shift+F のコンテナ★キーが変わるため、アドレスバー★の
         // メモ化値も階層切替ごとに捨てる。
@@ -45149,7 +45160,9 @@ impl App {
                 MainListFilterPolicy::Clear => self.clear_color_filter_for_new_items(),
                 MainListFilterPolicy::RetainCurrentPhysicalFolder => {
                     self.color_filter.cancel_pending();
-                    self.mark_color_filter_scope_dirty();
+                    self.mark_color_filter_scope_dirty_with_selection(
+                        VisibleSelectionPolicy::RetainCurrentCursor,
+                    );
                 }
             }
         }
@@ -77313,6 +77326,13 @@ impl App {
     /// ページ単位 (Image / ZipImage / PdfPage) + コンテナ (Folder / ZipFile / PdfFile) の両方。
     /// 動画 / セパレータ / ConvertibleArchive などは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
+        self.rebuild_visible_indices_with_selection(VisibleSelectionPolicy::General);
+    }
+
+    pub(crate) fn rebuild_visible_indices_with_selection(
+        &mut self,
+        policy: VisibleSelectionPolicy,
+    ) {
         let reader_open = self
             .sidecar_restore_rating_deferred_target()
             .or(self.fullscreen_idx)
@@ -77328,7 +77348,7 @@ impl App {
             if reader_open {
                 VisibleSelectionPolicy::RatingMembership
             } else {
-                VisibleSelectionPolicy::General
+                policy
             },
         );
         if reader_open {
@@ -77336,6 +77356,22 @@ impl App {
                 old,
                 crate::rating_membership::RatingAdoptionIntent::Reconcile,
             );
+        }
+    }
+
+    fn finish_visible_selection(&mut self, policy: VisibleSelectionPolicy) {
+        match policy {
+            VisibleSelectionPolicy::General => self.ensure_selected_visible_or_first(),
+            VisibleSelectionPolicy::RetainCurrentCursor => {
+                if self
+                    .selected
+                    .is_some_and(|index| self.visible_indices.binary_search(&index).is_err())
+                {
+                    self.move_grid_cursor(None, GridCursorIntent::Automatic);
+                }
+            }
+            // Its caller owns the reader/rating reconciliation after visibility publication.
+            VisibleSelectionPolicy::RatingMembership => {}
         }
     }
 
@@ -77381,9 +77417,7 @@ impl App {
             self.details_order.clear();
             self.close_page_overview_if_reader_order_changed();
             self.viewer_navigation_caches.invalidate();
-            if selection_policy == VisibleSelectionPolicy::General {
-                self.ensure_selected_visible_or_first();
-            }
+            self.finish_visible_selection(selection_policy);
             return;
         }
         if self.navigation_scope.is_detached_physical() {
@@ -77414,9 +77448,7 @@ impl App {
                 let vi = &self.visible_indices;
                 self.checked.retain(|idx| vi.binary_search(idx).is_ok());
             }
-            if selection_policy == VisibleSelectionPolicy::General {
-                self.ensure_selected_visible_or_first();
-            }
+            self.finish_visible_selection(selection_policy);
             return;
         }
         self.ensure_bookmark_presence_loaded();
@@ -77682,9 +77714,7 @@ impl App {
             let vi = &self.visible_indices;
             self.checked.retain(|idx| vi.binary_search(idx).is_ok());
         }
-        if selection_policy == VisibleSelectionPolicy::General {
-            self.ensure_selected_visible_or_first();
-        }
+        self.finish_visible_selection(selection_policy);
     }
 
     pub(crate) fn facet_candidate_indices(&mut self, ignore: FacetField) -> Vec<usize> {
@@ -79422,7 +79452,10 @@ impl App {
     ) {
         self.start_submitted_local_search_with_cursor(submitted, cursor_policy);
         if self.search_pending.is_none() {
-            self.refresh_color_filter_for_scope_change(ctx);
+            self.refresh_color_filter_for_scope_change_with_selection(
+                ctx,
+                cursor_policy.visible_selection(),
+            );
         }
     }
 
@@ -79446,7 +79479,7 @@ impl App {
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_tag_bridge.clear();
-            self.rebuild_visible_indices();
+            self.rebuild_visible_indices_with_selection(cursor_policy.visible_selection());
             return;
         }
         self.search_filter_origin_folder = self.effective_folder();
@@ -79617,20 +79650,15 @@ impl App {
                     submitted: pending.request.submitted.clone(),
                 });
                 self.search_filter_origin_folder = self.effective_folder();
-                let selected = self.selected;
-                self.rebuild_visible_indices();
+                let selection_policy = cursor_policy.visible_selection();
+                self.rebuild_visible_indices_with_selection(selection_policy);
                 if cursor_policy == LocalSearchCursorPolicy::Reset {
                     self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
                     self.grid_scroll.set_position(0.0);
                     self.grid_scroll.clear_edge();
-                } else {
-                    self.move_grid_cursor(
-                        selected.filter(|index| self.visible_indices.binary_search(index).is_ok()),
-                        crate::app::GridCursorIntent::Automatic,
-                    );
                 }
                 self.search_pending = None;
-                self.refresh_color_filter_for_scope_change(ctx);
+                self.refresh_color_filter_for_scope_change_with_selection(ctx, selection_policy);
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {

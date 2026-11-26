@@ -1,7 +1,7 @@
 //! Handler-level coverage: drive egui's real pointer responses through the grid dispatcher.
 
 use super::*;
-use crate::app::{AppTestEnvForTest, GridScrollGeometry, setup_app_for_test};
+use crate::app::{AppTestEnvForTest, GridCursorIntent, GridScrollGeometry, setup_app_for_test};
 use crate::folder_order::{FolderOrderMode, FolderOrderRecord, physical_item_key};
 use crate::settings::{GridClickSelectionMode, GridViewMode, SortOrder};
 use egui_kittest::Harness;
@@ -205,6 +205,40 @@ fn folder_order_drag_handler_manual_thumbnail_starts_without_native_payload() {
         FolderOrderMode::ManualUnrecorded
     );
     assert!(read_record(&h).is_none());
+}
+
+#[test]
+fn folder_order_drag_handler_press_drag_and_drop_preserve_absent_cursor() {
+    let mut state = fixture();
+    state
+        .app
+        .move_grid_cursor(None, GridCursorIntent::Automatic);
+    let mut h = harness(state);
+    let before = keys(&h);
+    let generation = h.state().app.items_generation;
+    assert_eq!(h.state().app.selected, None);
+    let source = rect(&h, 0).center();
+    button(&mut h, source, egui::PointerButton::Primary, true);
+    assert_eq!(h.state().app.selected, None, "a press is not a click");
+    assert!(h.state().app.pending_native_drag.is_none());
+    h.hover_at(source + egui::vec2(20.0, 0.0));
+    h.step();
+    assert!(h.state().active);
+    assert_eq!(h.state().app.selected, None);
+    assert!(h.state().app.pending_native_drag.is_none());
+    let target = rect(&h, 5).right_center() - egui::vec2(8.0, 0.0);
+    drop_at(&mut h, target);
+    assert!(!h.state().active);
+    assert_eq!(h.state().app.selected, None);
+    assert!(h.state().app.checked.is_empty());
+    assert!(h.state().app.pending_native_drag.is_none());
+    assert_eq!(
+        read_record(&h).unwrap().items,
+        [1, 2, 3, 4, 5, 0].map(|index| before[index].clone())
+    );
+    // The actual pointer route commits while the refresh still owns adoption.
+    assert_eq!(keys(&h), before);
+    assert_eq!(h.state().app.items_generation, generation);
 }
 
 #[test]

@@ -3150,7 +3150,9 @@ mod tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 app.poll_color_scan(ctx);
-                if app.color_filter.pending.is_none() && !app.color_filter_scope_refresh_pending {
+                if app.color_filter.pending.is_none()
+                    && app.color_filter_scope_refresh_pending.is_none()
+                {
                     assert!(app.color_filter.applied_scope_signature.is_some());
                     return;
                 }

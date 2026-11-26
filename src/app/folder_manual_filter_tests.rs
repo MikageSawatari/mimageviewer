@@ -67,7 +67,7 @@ fn finish_filters(app: &mut App) {
         if !app.sidecar_restore_active()
             && app.search_pending.is_none()
             && app.color_filter.pending.is_none()
-            && !app.color_filter_scope_refresh_pending
+            && app.color_filter_scope_refresh_pending.is_none()
         {
             return;
         }
@@ -80,6 +80,11 @@ fn finish_filters(app: &mut App) {
 }
 
 fn finish_refresh(app: &mut App) {
+    finish_refresh_adoption(app, |_| {});
+    finish_filters(app);
+}
+
+fn finish_refresh_adoption(app: &mut App, before_adopt: impl FnOnce(&mut App)) {
     let ctx = egui::Context::default();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -92,6 +97,7 @@ fn finish_refresh(app: &mut App) {
             else {
                 panic!("unexpected folder open purpose");
             };
+            before_adopt(app);
             assert!(app.apply_current_view_order_refresh(
                 ready.path,
                 ready.scan.unwrap(),
@@ -99,7 +105,6 @@ fn finish_refresh(app: &mut App) {
                 *reload_owner
             ));
             app.finish_page_identity_preparation_for_test();
-            finish_filters(app);
             return;
         }
         assert!(
@@ -301,4 +306,77 @@ fn folder_manual_reorder_ctrl_f_replay_preserves_absent_cursor() {
     assert_eq!(keys(&app), vec![d.clone(), a.clone(), c, b.clone()]);
     assert_eq!(visible_keys(&app), vec![d, a, b]);
     assert_eq!(app.selected, None);
+}
+
+fn intersected_reorder_preserves_absent_cursor(missing_palettes: bool) {
+    let (mut app, folder) = fixture(true);
+    // Warm every item before narrowing the candidate scope with Ctrl+F, so the
+    // reuse case cannot start a worker for an item excluded by the old query.
+    apply_filters(&mut app, true, false);
+    apply_filters(&mut app, true, true);
+    let [a, b, c, d] = NAMES.map(|name| folder_key(&folder.join(name)));
+    let initial = vec![a.clone(), b.clone(), c.clone(), d.clone()];
+    let reordered = vec![d.clone(), a.clone()];
+    let expected = vec![d.clone(), b, c, a.clone()];
+    assert_eq!(keys(&app), initial);
+    assert_eq!(visible_keys(&app), vec![a, d]);
+    assert_eq!(app.color_filter.palettes.map.len(), NAMES.len());
+    let scan_id = app.color_filter.palettes.active_scan_id;
+    let generation = app.items_generation;
+    app.move_grid_cursor(None, GridCursorIntent::Automatic);
+    assert_eq!(app.selected, None);
+    app.commit_folder_manual_reorder(&reordered);
+    assert_eq!(app.selected, None);
+    assert_eq!(keys(&app), initial);
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(read_record(&app, &folder).unwrap().items, expected);
+    finish_refresh_adoption(&mut app, |app| {
+        if missing_palettes {
+            // Evict at the refresh's adoption boundary, before either filter
+            // can replay, to exercise a real color worker and its publication.
+            app.color_filter.palettes.map.clear();
+        }
+    });
+    assert_eq!(app.selected, None);
+    finish_filters(&mut app);
+    assert!(app.items_generation > generation);
+    assert_eq!(app.folder_order.mode, FolderOrderMode::ManualRecorded);
+    assert_eq!(keys(&app), expected);
+    assert_eq!(visible_keys(&app), reordered);
+    assert_eq!(app.selected, None);
+    assert!(app.checked.is_empty());
+    assert!(app.pending_native_drag.is_none());
+    assert!(app.color_filter.enabled);
+    assert!(app.color_filter.applied_scope_signature.is_some());
+    assert_eq!(app.color_filter.query_rgb, [255, 0, 0]);
+    assert_eq!(
+        app.color_filter.tolerance,
+        crate::color_search::MIN_TOLERANCE
+    );
+    assert_eq!(app.search_filter.as_ref().unwrap().submitted.query, "keep");
+    assert_eq!(app.search_query, "unsubmitted replacement");
+    assert!(app.show_search_bar);
+    assert_eq!(read_record(&app, &folder).unwrap().items, expected);
+    if missing_palettes {
+        assert!(
+            app.color_filter.palettes.active_scan_id > scan_id,
+            "missing palettes must be published by a new color worker"
+        );
+        assert!(!app.color_filter.palettes.map.is_empty());
+    } else {
+        assert_eq!(
+            app.color_filter.palettes.active_scan_id, scan_id,
+            "fresh palettes must exercise the synchronous reuse path"
+        );
+    }
+}
+
+#[test]
+fn folder_manual_reorder_color_and_ctrl_f_palette_reuse_preserves_absent_cursor() {
+    intersected_reorder_preserves_absent_cursor(false);
+}
+
+#[test]
+fn folder_manual_reorder_color_and_ctrl_f_worker_publication_preserves_absent_cursor() {
+    intersected_reorder_preserves_absent_cursor(true);
 }
