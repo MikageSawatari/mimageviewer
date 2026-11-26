@@ -217,3 +217,47 @@ pub enum MetadataProfile {
 - 2 回目 (b4b30e865): REVISE。1 回目の 4 件は解消。P2 上限を超えた Raw APP1 の XMP を EXIF 扱いにする。→ 44dcac70f で対応
   (分類だけに先頭 1 KiB を raw deflate で展開する。zlib のままだと小さい流れでは checksum の誤りで先頭も得られない)。
 - 3 回目 (44dcac70f): ACCEPT、指摘なし。
+
+## 9. §1.902: 1 枚の書き出しでも RGB の色のプロファイル (ICC) を残す
+
+- 状態: 設計 (2026-11-26、ブランチ small-fixes-590)。v5.9.0 の小さな修正としてまとめて扱う。
+- 報告: [backlog §1.902](next-release-backlog.md)。観測はサブ PC 担当 (2026-11-26): APP2 に ICC を持つ JPEG を
+  Ctrl+E で書き出すと、出力に ICC が無い。コードでは v5.7.0 から同じ (§3.3 の「JPEG に ICC を足さない」)。
+
+### 9.1 原因と判断
+
+- §1.888 では、統括の指示 (リリース済みの挙動なので「メタデータを保持」の他の中身を変えない) により、1 枚の書き出しの
+  転記対象を変えなかった (§1・§3.3)。そのため、JPEG の APP2・PNG の `iCCP` は転記せず、WebP の `ICCP` だけは色空間を問わず
+  残すという、形式ごとにばらばらの扱いが残った。一括 (§1.362) は 3 形式とも RGB の ICC だけを残す。
+- mIV のデコードは ICC で色を変換しない ([一括エクスポートの設計](batch-export-plan.md) §1)。書き出す画素は元の色空間の
+  値のままなので、元の ICC を付けるのが正しい。付けないと、色を管理するソフトでは sRGB として表示され、
+  Adobe RGB などの元画像と色が変わる (付ければ元画像と同じに見える)。mIV 自身の表示は変わらない。
+- 利用者の「メタデータを保持」の操作は増えない・減らない (既定値・文言・保存形式は変えない)。今の使い方が不便になる
+  変更ではないので、相談なしで直す (CLAUDE.md の相談の条件に当たらない)。
+
+### 9.2 直し方
+
+- **ICC の規則を一括と 1 枚で同じにする**: 3 形式とも、ICC ヘッダの色空間が `RGB ` のものだけ転記する
+  (一括の §3.6 の規則、`rgb_icc`・`jpeg_rgb_icc_segments` をそのまま使う)。`MetadataProfile` で ICC の扱いを分けない。
+  - JPEG: 1 枚でも APP2 の RGB の ICC (複数セグメントを順に、欠け・重複は付けない) を足す。
+  - PNG: 1 枚でも `iCCP` の RGB のものを足す (今の 1 枚はテキストチャンクだけを抜き出している。`eXIf` は今回も足さない)。
+  - WebP: 1 枚でも `RGB ` 以外の `ICCP` を付けない (今は色空間を問わず残す。出力は常に RGB なので、GRAY・CMYK の
+    ICC は出力に合わない。WebP にこれらが入っている例は少ないが、規則を 1 つにする)。
+- `MetadataProfile` が分けるのは、EXIF の向きの扱い・読めない EXIF の扱い・PNG の `eXIf` の転記だけになる。
+  モジュールの説明 (`save_with_metadata.rs` 冒頭・`MetadataProfile` の doc) を合わせて直す。
+
+### 9.3 テスト
+
+- 1 枚 (Single) で、3 形式 × 色空間 (`RGB ` / `GRAY` / `CMYK`) → RGB だけ ICC が残る (一括の
+  `batch_icc_accepts_rgb_and_drops_gray_cmyk_in_all_formats` を両方の profile で回す形にする)。JPEG と PNG の RGB は
+  **旧コードで落ちる**。
+- `single_page_metadata_bytes_match_legacy_except_ifd1` の比較の基準 (旧の転記) に、ICC の違いを足す (旧の基準のまま
+  比べると落ちるのは期待どおり)。ICC 以外のバイトが今と同じであることは保つ。
+- 書き出しの統合テスト (`export_integration` など、実際の Ctrl+E の worker を通す) で、ICC 付きの JPEG を書き出すと
+  APP2 が残る。
+
+### 9.4 文書
+
+- 本書 §2・§3.3 の表と文 (1 枚の転記対象)、[一括エクスポートの設計](batch-export-plan.md) §3.6 の「単ページとの共通処理」、
+  マニュアル `manual/export.html` の「メタデータ保持」の行 (RGB の色プロファイルも引き継ぐ)。更新履歴は公開時。
+- まれな失敗: 対象外 (転記の規則だけで、失敗の扱いは今と同じ)。

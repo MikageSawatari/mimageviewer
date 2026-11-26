@@ -404,3 +404,130 @@ F2 と `advance_viewer_primary_pointer_frame` は F12 の別ウィンドウと�
 - 検証 (ClaudeCode が run-heavy で実行、be712caf9): `cargo fmt --check` 成功。関連 nextest 418 件 (suppression_906・close_mode・double_click_close・primary_suppression・erase_preview_canvas・focus_restore・scrub・drag_zoom・depth ほか) と周辺 2573 件 (ui_fullscreen:: ほか) が成功。変異確認: `arm` を「離し済みでも `PointerStream` を残す」に戻すと 15 件、advance の順序を旧に戻すと 2 件 (離し→押し、右ドラッグ) が落ちる。本体 lib 全件は統括の master 取り込み後。実機は未確認。
 - 実装の独立レビュー r1 (実装者とは別の GPT-6.1 Sol / xhigh、read-only、`8a6c2f541..d3c2c7bbe`): REVISE。P2: 実装中に足した viewer の scrub 開始位置の変更 (この pass の press イベントから取る) が、Depth パネル除外 (`press_origin` のまま) と食い違う。P3: その範囲が detached の §11 に未記録。ClaudeCode の判断で開始位置の変更を範囲から外して戻し (be712caf9)、§13.1 の表と §13.5・§13.9 を直した。
 - 実装の独立レビュー r2 (同じレビュー担当、`d3c2c7bbe..be712caf9`): **ACCEPT**、指摘なし。範囲から外す判断に同意。detached: 最終版全体が「症状パッチではなく構造的修正」であることに合意。
+
+## 14. §1.900 修正: 表示を戻したダブルクリックの直後のダブルクリックで閉じる
+
+- 状態: 設計 (2026-11-26、ブランチ small-fixes-590)。v5.9.0 の小さな修正としてまとめて扱う。
+- 報告: [backlog §1.900](next-release-backlog.md) (§12.7 で見つけた件、コード読み・headless の試験。実機での観測はない)。
+
+### 14.1 原因 (コード)
+
+- egui のクリック回数 (`PointerState::click_count`、`vendor/egui/src/input_state/mod.rs`) は 1・2・3 で、3 で頭打ちになる。
+  前のクリックから `max_double_click_delay` 以内なら、4 回目以降も 3 のまま続く。
+- 閉じるモードの数え方 (`FsFrontPointerOwnership::accept_close_mode_clicks`) は、離しごとの実効回数を
+  `raw_count.min(受け付け数)` とし、受け付け数は `raw_count == 1` のときだけ 1 に戻る。
+- 動かした表示でダブルクリック (1・2) → `ResetTransform`。間を置かずにもう一度ダブルクリックすると、
+  egui の回数は 3・3 で、実効回数も 3・3 になり、2 にならない。表示はもう動いていないので閉じる条件
+  (§4.2) を満たすのに、`CloseViewer` が出ない。間を置けば egui が 1 から数え直すので閉じる。
+- 守るべき性質 (§4.2): 「拡大して見ていたページは、ダブルクリック 1 回目で元に戻り、もう 1 回で閉じる」。
+  2 回のダブルクリックを素早く続けても成り立つ必要がある。
+
+### 14.2 直し方
+
+- 閉じるモードの数え方で、**実効回数が 2 になった離しで列を区切る**。その離しの処理の後で、受け付け数を 0、
+  候補のビットを偽にする。次の離しは egui の回数によらず 1 回目に数える (受け付け数 0 → 1、
+  `raw_count.min(1)` = 1)。その次が 2 回目になり、候補なら閉じる。
+- `ResetTransform` になったかどうかで分けない。閉じるモードでは 2 回目の離しが列の用途 (戻す・閉じる・
+  何もしない) を決めるので、3 回目以降を同じ列の続きとして数える意味がない。条件を 1 つにして、
+  動かした表示の判定 (`can_reset`) を数え方へ持ち込まない。
+- 帰結: 3 回の速いクリックは 1・2・1 (今は 1・2・3)。動かした表示で 4 回なら 1・2 (戻す)・1・2 (閉じる)。
+  動かしていない表示では 2 回目で閉じるので、3 回目以降は起きない。今の 3 回目は何もしないので、
+  3 回の速いクリックの見える結果は変わらない。
+- 同じ pass に複数の離しが入っても、離しごとにイベント順で畳むので同じ規則になる (今の畳み込みのまま)。
+- 従来モード (`accept_backing_click` / `backing_double_clicked`) は変えない。従来モードでは、動かしていない表示の
+  ダブルクリックに用途がなく、この件は起きない。ナビゲーターのクリック (`accept_navigator_click`) も変えない。
+- 変えないもの: F2 の中も同じ畳み込みの関数を通る (§12.2 の 3) ので、別の処理は足さない。フォーカス復帰の
+  離しの扱い (§12)、候補の判定、`ResetTransform` の優先順位。
+
+### 14.3 採らなかった案
+
+- `ResetTransform` を適用したときだけ区切る: 数え方 (`accept_close_mode_clicks`) が、後で決まる作用
+  (`plan_fs_canvas_click`) を知る必要があり、順序の依存が増える。帰結も 14.2 と変わらない。
+- 独自のタイマーで数える: egui に時間・距離の判定を任せる今の方針 (§4.3) に反する。
+
+### 14.4 テスト (handler-level、旧コードで落ちるもの)
+
+- 閉じるモード、動かした表示 (拡大): ダブルクリック → 戻る・閉じない。`max_double_click_delay` 以内に続けて
+  ダブルクリック → 閉じる (**旧コードで落ちる**)。
+- 動かした表示で 3 回の速いクリック → 戻るだけで閉じない。
+- 動かしていない表示でダブルクリック → 閉じる (回帰の確認)。
+- 同じ pass に 4 回の離し (動かした表示、重いフレームで詰まったとき): 畳み込みで 2 回目と 4 回目が実効回数 2 になるが、
+  作用の判定は今の優先順位 (`can_reset` なら `ResetTransform` が先) のままで、そのフレームは戻すだけ。この結果を固定する。
+- 従来モード: 3 回の速いクリックの結果が今と同じ。
+- F12 の別ウィンドウの viewer context で、上の 1 つ目と同じ操作 → その窓だけが閉じ、兄弟の context を変えない。
+
+## 15. §1.907 修正: ドラッグ拡大の和音での速いクリックでページを送らない (この pass の押下位置)
+
+- 状態: 設計 (2026-11-26、ブランチ small-fixes-590)。v5.7.0 からの挙動。
+- 報告: [backlog §1.907](next-release-backlog.md) (§13.9 の別件。コード読み、実機での観測はない)。
+
+### 15.1 原因 (コード)
+
+- egui の `PointerState::press_origin` は、押したときに位置を持ち、離したとき (`PointerButton { pressed: false }` と
+  位置なしの `PointerButtonReleased`) に消える。押す・離すが同じ pass に入ると、pass の終わりには `None` になる。
+- viewer のドラッグ拡大の和音 (`KeyAction::FsScrubZoomHold`、既定 Ctrl+Space) の開始条件 `can_start` は
+  `press_origin` が全体の矩形の中にあることを求める (`ui_fullscreen.rs` の `if scrub_active || (scrub_canvas && scrub_held)`)。
+  同じ pass の押す・離すでは成り立たず、拡大を始めず、止めも立てずに、後段のクリックの処理へ進んで
+  ページを送る。押す・離すが別の pass なら、押した pass で拡大を始めて止めを立て、クリックにならない。
+  同じ操作 (和音を押したまま、動かさずにクリック) の結果が、押す・離すの間隔で変わる。
+- 同じ値の Depth パネルの除外: `press_in_depth_panel` (同じ関数、和音と中ボタンの外側の振り分けで共有) と
+  `FsWheelFrameSemanticInput::primary_press_origin` (左ドラッグの開始の `can_start_drag`) も `press_origin` を読む。
+  §1.906 の実装中に和音の開始位置だけを「この pass の押下イベント」に変え、Depth の除外が `press_origin` のまま
+  食い違った (§13.9・§13.10 の r1 P2)。開始と除外は同じ値で決める必要がある。
+- 同じ形の箇所 (押した pass の判定に `press_origin` を使う、`src` 全体を確認):
+  - `src/video/native_presenter/overlay_draw.rs` の 2 か所と `render_core.rs` の 2 か所: popup の外側の押下で閉じる
+    (`press_origin` + `any_pressed`)。同じ pass の押す・離すでは閉じない。
+  - 編集面 (`ui_analysis_panel.rs` 2 か所、`ui_crop.rs`、`ui_sns_split.rs`): 押した pass にドラッグを始める。
+    同じ pass の押す・離すでは何も始めない。別の pass でも動かさずに離せば変化なしで終わる見込みなので、
+    今回は変えない (実装担当が見える結果の違いがないかを確かめ、違えば報告する)。
+  - `ui_main.rs` の 2 か所は `drag_started` の後に読むだけ (押下中) で、`unwrap_or` もあるので対象外。
+
+### 15.2 直し方
+
+- **押下位置の入口を 1 つにする**: egui の入力から「この pass の左ボタンの押下位置」を返す関数を 1 つ置く
+  (例 `primary_press_origin(&egui::InputState) -> Option<egui::Pos2>`)。
+  - この pass の `pointer.button_events()` (vendor の egui の順序付きの押下・離し、位置付き) に左ボタンの押下があれば、
+    **その最後の押下の位置**。その流れがこの pass で離されていても返す。
+  - 無ければ `pointer.press_origin()` (前の pass で押してまだ離していない流れ)。
+  - 「どのボタンの押下か」を区別したい箇所 (popup の外側の押下) には、ボタンを問わない版を同じ場所に置く
+    (この pass の最後の押下、無ければ `press_origin`)。
+- viewer の 3 か所 (和音の `can_start`、`press_in_depth_panel`、`FsWheelFrameSemanticInput::primary_press_origin`)
+  を左ボタン版へ、native presenter の popup の 4 か所をボタンを問わない版へ替える。`press_origin()` を直接読む箇所は
+  上の対象外の箇所だけにする。
+- 和音で同じ pass に押す・離すが入ったとき: `handle_drag_zoom` は `pressed` で始め、同じ呼び出しで `released` により
+  終える (動かしていないので倍率は変わらない)。`used` が真になり、`arm_fs_primary_suppression` (§13 の単一の入口、
+  離し済みなので `ReleasedThisPass(Other)`) で止め、早期 return する。押す・離すが別の pass のときと同じ結果
+  (送らない・次のクリックは止めない)。
+- 位置の意味は今と同じ (押した位置)。押下中の流れでは今と同じ値を返すので、別の pass の操作の結果は変わらない。
+
+### 15.3 採らなかった案
+
+- vendor の egui の `press_origin` を離しで消さないようにする: egui の多くの部品が「押下中なら `Some`」の意味で使っており、
+  影響が広い。mIV 側の入口 1 つで足りる。
+- 和音の開始だけを直す: Depth の除外と食い違う (§13.10 r1 P2)。
+
+### 15.4 テスト (handler-level、旧コードで落ちるもの)
+
+- viewer、和音を押したまま、押す・離すが同じ pass のクリック → ページを送らない (**旧コードで落ちる**)。拡大の倍率は
+  変わらない。次の pass の普通のクリック (和音なし) で送る (止めが残らない)。
+- 同じ操作の押す・離すが別の pass → 今と同じ (送らない) (対照)。
+- Depth パネルの上で、和音を押したまま押す・離すが同じ pass → 拡大を始めない (パネルの除外)。パネルの外では始める。
+  開始と除外が同じ位置で決まることを、パネルの境目をまたぐ押下と離し (押下は内、離しは外、またはその逆) で確かめる。
+- 左ドラッグの開始の Depth 除外 (`can_start_drag`): 押下がパネルの中、同じ pass で閾値を超えて外へ動いた → ドラッグを始めない
+  (今の別 pass の結果と同じ)。
+- native presenter の popup: 外側の押す・離すが同じ pass → 閉じる (**旧コードで落ちる**、関数の単位でよい)。
+- 押下位置の関数の単体: この pass の押下あり (離しあり・なし)、押下なしで押下中、押下も押下中もなし、同じ pass の押す・離す・押す
+  (最後の押下)、ほかのボタンの押下 (左ボタン版は無視、ボタンを問わない版は返す)、位置なしの離し。
+- F12 の別ウィンドウの viewer context で、和音の同じ pass のクリック → 送らない。兄弟の context を変えない。
+
+### 15.5 detached の決まり (§14 と共通)
+
+§14 の数え方 (`accept_close_mode_clicks`) と §15 の viewer の入力 (`handle_fs_wheel_and_click_frame`) は F12 の別ウィンドウと
+共有する。detached の述語・viewport の経路・窓の所有・open / close の初期化は変えない。§14 は「列の区切りを egui の頭打ちの
+回数に任せていた」数え方の前提、§15 は「離しで消える値を押した pass の判定に使っていた」入力の境界を直す構造的修正で、
+guard・遅延・再試行・時間切れを足さない。ClaudeCode と Codex の双方の合意を取り、[detached-rework-plan.md](detached-rework-plan.md)
+§11 に記録する。
+
+### 15.6 まれな失敗
+
+対象外 (§14・§15 とも入力の状態だけで、保存や外部の失敗は関わらない)。
