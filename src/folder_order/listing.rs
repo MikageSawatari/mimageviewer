@@ -689,8 +689,10 @@ mod tests {
             .unwrap();
         service.shutdown();
         assert!(handle.read(root).is_err());
-        let record = read_remote_at(&database, root).unwrap().unwrap();
+        let persisted = FolderOrderDb::open_at(&database).unwrap();
+        let record = persisted.read(&folder_key(root)).unwrap().unwrap();
         assert_eq!(record.items, keys(&["b.jpg", "a.jpg"]));
+        drop(persisted);
         // The joined actor released its connection before the fixture directory.
         std::fs::remove_file(database).unwrap();
     }

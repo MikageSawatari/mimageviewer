@@ -1,6 +1,6 @@
 //! Physical-folder manual order. The process owns one FIFO actor; listing workers
 //! request reads through its handle and the UI only submits/polls messages.
-//! Remote may use the explicitly read-only reader. Reading never records an order.
+//! Remote and Agent IPC workers share the App's actor. Reading never records an order.
 
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -533,20 +533,6 @@ impl FolderOrderDb {
     fn rename(&mut self, rename: &FolderOrderRename) -> OrderResult<()> {
         self.rename_mappings(std::slice::from_ref(rename))
     }
-}
-
-/// Separate-process reader only. Never creates, migrates or writes a database.
-pub(crate) fn read_remote_at(path: &Path, folder: &Path) -> OrderResult<Option<FolderOrderRecord>> {
-    let conn = Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    conn.busy_timeout(Duration::from_millis(750))?;
-    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version != 1 {
-        return Err(FolderOrderError::new("unsupported folder order schema"));
-    }
-    FolderOrderDb { conn }.read(&folder_key(folder))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1986,21 +1972,15 @@ mod tests {
     }
 
     #[test]
-    fn folder_order_remote_reader_never_creates_or_writes() {
-        let mut actor = ActorTest::new(vec![]);
-        let absent = actor.temp.path().join("missing.db");
-        assert!(read_remote_at(&absent, Path::new("c:/f")).is_err());
-        assert!(!absent.exists());
+    fn folder_order_actor_read_normalizes_folder_identity_without_recording() {
+        let actor = ActorTest::new(vec![]);
+        assert_eq!(actor.read("C:/F/"), Ok(None));
         actor
             .handle()
             .save(Path::new("c:/f"), save_data(1, &["c:/f/a"]))
             .unwrap();
-        assert!(actor.completion().result.is_ok());
-        actor.close();
-        assert_eq!(
-            read_remote_at(&actor.temp.path().join(DB_NAME), Path::new("C:/F/")).unwrap(),
-            Some(record(1, &["c:/f/a"]))
-        );
+        assert_eq!(actor.read("C:/F/").unwrap(), Some(record(1, &["c:/f/a"])));
+        assert_eq!(actor.read("c:/f").unwrap(), Some(record(1, &["c:/f/a"])));
     }
 
     #[test]

@@ -406,7 +406,7 @@ fixture のフォルダキー `c:/fXX` も `c:/fxx` に統一する。production
 - 段 2 の前提確認で、§4.1 の「Remote は別プロセスなので DB を直接読む」と実際の一覧生成の所有が一致しないことを発見。
   `web-remote-plan.md:86` は通常フォルダ一覧を IPC → 本体 worker と規定し、`remote_ipc/pipe.rs:42` が
   本体側の `ContainerEngine` を使用する。この worker で `read_remote_at` を呼ぶと本体 actor 単一 opener の原則と両立しない。
-  この経路については actor 経由への修正か read-only 接続の明示例外かを設計担当へ照会し、回答までは確定を止める。
+  設計担当の回答により actor 経由へ修正すると決定した（2026-11-27、段 2 続行）。§4.1 / §4.3 も同じ境界へ訂正済み。
 - 手動入力は `FolderOrderListingInput::NotApplicable | Read { result, stack_active }` とした。
   `Read(Err)` に相当する入力は読取失敗の事実を保持し、原本を残して基準順を表示する。`NotApplicable` や未記録への読み替えはしない。
   stack は同じ Read の適用抑止情報で、active や記録を消さない。`ListingOrderRequest` は変更しない。
@@ -432,4 +432,20 @@ fixture のフォルダキー `c:/fXX` も `c:/fxx` に統一する。production
   本棚 root / 直接の管理本 / 仮想経路 / 固定 snapshot / 検索所有の一覧は対象外のままにした。
 - `cargo fmt`（引数なし）と UI glyph 検査を実行した。コンパイル・cargo check・build・test・nextest・実機起動は
   利用者の PC 負荷指定により未実行。独立実装レビューは今回受領しておらず、設計担当が全段の後に依頼する。
-  コミットは行っていない。Remote 読取所有方式の照会は未解決のため、段 2 全体の完了とはしない。
+  実装担当はコミットを行っていない。段 2 の初回差分は設計担当が `9ccc99e91`（WIP）として記録し、続行分を同じ作業ツリーへ残す。
+
+段 2 続行（2026-11-27）:
+
+- `ContainerEngine` は production 起動時に `Arc<SharedReaders>` を受け取り、各読取時に登録済みの actor handle を取得する。
+  engine 作成後の App による handle 登録も反映し、通常フォルダ一覧に第 2 の DB reader を作らない。
+  不要になった `read_remote_at` と直接読取 helper は削除する。読取失敗は共通の `Read(Err)` と基準順表示に揃える。
+- 共有 runner で報告された lib test target の7件の名前解決エラーは、`phase_c_support` の
+  `PathBuf` / `ScannedDir` / `OpenRequestOwner` / `StartupListIntent` の明示 import を補った。
+  前回変更した他の test module も import・型・追加 field・共有 API の引数をソースで照合し、
+  shutdown 回帰に残った削除 API の参照を test-private な DB 確認へ置き換えた。
+  この確認はコンパイル・テスト実行・独立レビューの代わりではない。
+- Remote 回帰は実 actor を登録する形へ更新した。Save の直後の読取（完了待ちなし）、
+  engine 作成後の handle 登録、終了した actor と保存済み DB の組で直接 DB を開き直さないこと、
+  actor 未登録、未記録、破損 DB の原本保持を対象にした。protocol は 74 のまま変更しない。
+- 続行分も `cargo fmt`（引数なし）、UI glyph 検査、`git diff --check` を実行して正常終了した。
+  コンパイル・テスト・検証用ビルド・コミットは実施せず、共有 runner での再確認へ引き継ぐ。

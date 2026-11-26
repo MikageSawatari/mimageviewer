@@ -15460,7 +15460,11 @@ fn clamp_color_image_for_gpu_preserves_premultiplied_alpha() {
 /// 使用者が単一の Mutex で直列化される。
 #[cfg(test)]
 pub(crate) mod phase_c_support {
-    use super::{AiRuntimeFixture, AiRuntimeFixtureCleanup, App, AppDataDirFixture, AppTestConfig};
+    use super::{
+        AiRuntimeFixture, AiRuntimeFixtureCleanup, App, AppDataDirFixture, AppTestConfig,
+        OpenRequestOwner, ScannedDir, StartupListIntent,
+    };
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Prove that the last admitted position write has committed before a test
