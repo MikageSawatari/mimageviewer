@@ -23,6 +23,72 @@
   <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
   <!-- meta:end -->
   <link rel="stylesheet" href="style.css">
+  <style>
+    /* 更新履歴ページ: メジャー版ごとのタブ */
+    .ver-tabs {
+      position: sticky;
+      top: 52px;
+      z-index: 100;
+      display: flex;
+      gap: 0.4rem;
+      overflow-x: auto;
+      scrollbar-width: none;
+      margin: 0 0 1.75rem;
+      padding: 0.65rem 0;
+      background: rgba(255, 255, 255, 0.94);
+      -webkit-backdrop-filter: blur(6px);
+      backdrop-filter: blur(6px);
+      border-bottom: 1px solid var(--border);
+    }
+    .ver-tabs[hidden] { display: none; }
+    .ver-tabs::-webkit-scrollbar { display: none; }
+    .ver-tab {
+      flex: 0 0 auto;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-width: 4.1rem;
+      padding: 0.4rem 0.85rem 0.35rem;
+      font: inherit;
+      line-height: 1.25;
+      color: var(--text-sub);
+      background: #fff;
+      border: 1px solid #eadde4;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s, border-color 0.15s, box-shadow 0.15s;
+    }
+    .ver-tab-name { font-size: 0.95rem; font-weight: 700; letter-spacing: 0.02em; }
+    .ver-tab-count { font-size: 0.68rem; color: #a3a3ad; }
+    .ver-tab:hover {
+      color: var(--pink);
+      background: var(--pink-bg);
+      border-color: var(--pink-pale);
+    }
+    .ver-tab[aria-selected="true"] {
+      color: #fff;
+      background: linear-gradient(135deg, var(--pink-light), var(--pink));
+      border-color: transparent;
+      box-shadow: 0 3px 10px rgba(214, 51, 132, 0.28);
+    }
+    .ver-tab[aria-selected="true"] .ver-tab-count { color: rgba(255, 255, 255, 0.85); }
+    .ver-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .ver-group[hidden] { display: none; }
+    /* 各グループの最初の見出しは上の余白が 0 なので、続けて並べるときだけ間を空ける */
+    .ver-group + .ver-group { margin-top: 2.5rem; }
+    .ver-tabs-on:not(.ver-show-all) .ver-group { margin-top: 0; }
+    /* 見出しへ移ったとき、固定のヘッダ (とタブ。高さはスクリプトが入れる) に隠れないようにする */
+    .ver-group, .ver-group h2 { scroll-margin-top: 64px; }
+    .ver-tabs-on .ver-group, .ver-tabs-on .ver-group h2 {
+      scroll-margin-top: calc(52px + var(--ver-tabs-h, 64px) + 12px);
+    }
+    @media (max-width: 768px) {
+      .ver-tabs { gap: 0.3rem; }
+      .ver-tab { flex: 1 1 0; min-width: 0; padding: 0.35rem 0.2rem 0.3rem; }
+      .ver-tab-name { font-size: 0.85rem; }
+      .ver-tab-count { display: none; }
+    }
+  </style>
 </head>
 <body>
 
@@ -87,13 +153,13 @@
     <p class="page-desc">mImageViewer のバージョンごとの変更点をまとめています。最新版は<a href="../index.html#download">ダウンロードページ</a>から入手できます。</p>
 
     <div class="ver-tabs" role="tablist" aria-label="メジャー版" hidden>
-      <button type="button" role="tab" class="ver-tab" id="tab-v5" aria-controls="v5" data-major="v5">v5</button>
-      <button type="button" role="tab" class="ver-tab" id="tab-v4" aria-controls="v4" data-major="v4">v4</button>
-      <button type="button" role="tab" class="ver-tab" id="tab-v3" aria-controls="v3" data-major="v3">v3</button>
-      <button type="button" role="tab" class="ver-tab" id="tab-v2" aria-controls="v2" data-major="v2">v2</button>
-      <button type="button" role="tab" class="ver-tab" id="tab-v1" aria-controls="v1" data-major="v1">v1</button>
-      <button type="button" role="tab" class="ver-tab" id="tab-v0" aria-controls="v0" data-major="v0">v0</button>
-      <button type="button" role="tab" class="ver-tab" id="tab-all" data-major="all">すべて</button>
+      <button type="button" role="tab" class="ver-tab" id="tab-v5" aria-controls="v5" data-major="v5"><span class="ver-tab-name">v5</span><span class="ver-tab-count">11 版</span></button>
+      <button type="button" role="tab" class="ver-tab" id="tab-v4" aria-controls="v4" data-major="v4"><span class="ver-tab-name">v4</span><span class="ver-tab-count">18 版</span></button>
+      <button type="button" role="tab" class="ver-tab" id="tab-v3" aria-controls="v3" data-major="v3"><span class="ver-tab-name">v3</span><span class="ver-tab-count">16 版</span></button>
+      <button type="button" role="tab" class="ver-tab" id="tab-v2" aria-controls="v2" data-major="v2"><span class="ver-tab-name">v2</span><span class="ver-tab-count">16 版</span></button>
+      <button type="button" role="tab" class="ver-tab" id="tab-v1" aria-controls="v1" data-major="v1"><span class="ver-tab-name">v1</span><span class="ver-tab-count">11 版</span></button>
+      <button type="button" role="tab" class="ver-tab" id="tab-v0" aria-controls="v0" data-major="v0"><span class="ver-tab-name">v0</span><span class="ver-tab-count">12 版</span></button>
+      <button type="button" role="tab" class="ver-tab" id="tab-all" data-major="all"><span class="ver-tab-name">すべて</span><span class="ver-tab-count">84 版</span></button>
     </div>
 
     <section class="ver-group" id="v5">
@@ -1701,6 +1767,7 @@
   select(majorFor(id) || groups[0].id);
   tabs.hidden = false;
   content.classList.add("ver-tabs-on");
+  content.style.setProperty("--ver-tabs-h", tabs.offsetHeight + "px");
   if (majorFor(id)) jumpTo(id);
 })();
 </script>

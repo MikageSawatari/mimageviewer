@@ -166,52 +166,6 @@ h2:first-of-type { margin-top: 0; }
   letter-spacing: 0.02em;
 }
 
-/* 更新履歴ページ: メジャー版ごとのタブ。タブはスクリプトが出す (JavaScript が
-   無いときはタブを出さず、すべての版を並べる)。 */
-.ver-tabs {
-  position: sticky;
-  top: 52px;
-  z-index: 100;
-  display: flex;
-  gap: 0.25rem;
-  overflow-x: auto;
-  background: #fff;
-  border-bottom: 2px solid var(--pink-pale);
-  margin: 0 0 1.75rem;
-  padding-top: 0.5rem;
-  scrollbar-width: none;
-}
-.ver-tabs[hidden] { display: none; }
-.ver-tab {
-  font: inherit;
-  font-size: 0.875rem;
-  font-weight: 600;
-  color: var(--text-sub);
-  background: none;
-  border: none;
-  border-bottom: 3px solid transparent;
-  border-radius: 6px 6px 0 0;
-  margin-bottom: -2px;
-  padding: 0.35rem 0.95rem;
-  white-space: nowrap;
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
-}
-.ver-tab:hover { color: var(--pink); background: var(--pink-bg); }
-.ver-tab[aria-selected="true"] {
-  color: var(--pink);
-  background: var(--pink-bg);
-  border-bottom-color: var(--pink);
-}
-.ver-tab:focus-visible { outline: 2px solid var(--pink); outline-offset: -2px; }
-.ver-group[hidden] { display: none; }
-/* 各グループの最初の見出しは上の余白が 0 なので、続けて並べるときだけ間を空ける */
-.ver-group + .ver-group { margin-top: 2.5rem; }
-.ver-tabs-on:not(.ver-show-all) .ver-group { margin-top: 0; }
-/* 見出しへ移ったとき、固定のヘッダ (とタブ) に隠れないようにする */
-.ver-group, .ver-group h2 { scroll-margin-top: 64px; }
-.ver-tabs-on .ver-group, .ver-tabs-on .ver-group h2 { scroll-margin-top: 112px; }
-
 h3 {
   font-size: 1rem;
   font-weight: 700;
@@ -505,5 +459,4 @@ footer a { color: #aaa; }
   .layout { flex-direction: column; }
   .sidebar { width: 100%; height: auto; position: static; border-right: none; border-bottom: 1px solid var(--border); padding: 1rem 0; }
   .content { padding: 1.5rem 1.25rem 3rem; }
-  .ver-tab { padding: 0.35rem 0.6rem; }
 }

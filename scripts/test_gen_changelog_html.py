@@ -105,7 +105,7 @@ class RealChangelogTest(unittest.TestCase):
         # keeps ?version= that the app adds when it opens this page.
         self.assertIn('history.replaceState(null, "", "#" + major)', gen.TAB_SCRIPT)
         self.assertNotIn("location.search", gen.TAB_SCRIPT)
-        page = gen.PAGE_TEMPLATE.format(sidebar="", content="", script=gen.TAB_SCRIPT)
+        page = gen.PAGE_TEMPLATE.format(sidebar="", content="", style=gen.TAB_STYLE, script=gen.TAB_SCRIPT)
         self.assertLess(page.index("</main>"), page.index("<script>"))
 
 
