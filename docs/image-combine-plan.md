@@ -1,6 +1,6 @@
 # 画像の結合 設計 (§1.904)
 
-- 状態: **設計中 (2026-11-26、担当 combine-904)。実装前。独立設計レビュー 3 回目 REVISE → 対応済み、4 回目待ち (§17)**。収録版は「でき次第、その次のリリース」(利用者 2026-11-26)。
+- 状態: **設計済み (2026-11-26、担当 combine-904)。実装前。独立設計レビュー 4 回目で ACCEPT (Codex gpt-6.1-sol / xhigh、§17)**。収録版は「でき次第、その次のリリース」(利用者 2026-11-26)。
 - 他ソフトの分析: [image-combine-competitor-analysis.md](image-combine-competitor-analysis.md) (2026-11-26、約 20 製品、出典 URL 付き)。
 - 関連: [batch-export-plan.md](batch-export-plan.md) (読み込み・編集の合成・保存・上書き・プリセットの部品)、
   [virtual-folders.md](virtual-folders.md) (ZIP・PDF の中の画像)、[ui-responsiveness.md §4](ui-responsiveness.md)、
@@ -767,6 +767,11 @@ resolver の規則、帯付きの式、矩形の検査、形式の固定、索�
 | 指摘 | 対応 |
 | --- | --- |
 | P2 終わりの通知の無い切断で `Writing` が残る | `export_pending` を手放すすべての分岐 (中断の切断を含む) から結合の終わりの処理を 1 回呼ぶ (§8.2) |
+
+### 4 回目 (2026-11-26、対象 3d251d3ff): ACCEPT
+
+指摘なし。`poll_export_pending` (取消・正常終了・終わりの通知の無い切断) と `draw_export_progress_dialog`
+(終了後の「閉じる」・×) の解放の経路を照合し、§8.2 が覆うことが確認された。
 
 ## 18. 未確認・実装時に確かめること
 
