@@ -2768,6 +2768,16 @@ fn draw_mouse_gesture_guide_row(
 pub(crate) struct MouseButtonDispatchResult {
     pub(crate) navigation: Option<AddressBarNav>,
     pub(crate) dispatched_action: Option<RingActionId>,
+    /// Draw-owned fullscreen input returns the request to its key/render owner.
+    pub(crate) script_slot: Option<u8>,
+}
+
+/// Whether the caller can finish a fullscreen key result before drawing starts.
+/// Draw-owned requests are connected separately in stage 2b.
+#[derive(Clone, Copy)]
+enum RingScriptPhase {
+    DrawOwned,
+    BeforeRender,
 }
 
 impl App {
@@ -3868,6 +3878,50 @@ impl App {
         ctx: &egui::Context,
         command: RightDragCommand,
     ) -> Option<AddressBarNav> {
+        self.execute_right_drag_command_in_phase(
+            ctx,
+            command,
+            RingScriptPhase::DrawOwned,
+            &mut None,
+        )
+    }
+
+    /// The render owner executes viewer scripts only after its final UI has closed.
+    pub(crate) fn execute_right_drag_command_for_fullscreen_render(
+        &mut self,
+        ctx: &egui::Context,
+        command: RightDragCommand,
+    ) -> (Option<AddressBarNav>, Option<u8>) {
+        let mut slot = None;
+        let nav = self.execute_right_drag_command_in_phase(
+            ctx,
+            command,
+            RingScriptPhase::DrawOwned,
+            &mut slot,
+        );
+        (nav, slot)
+    }
+
+    pub(crate) fn execute_right_drag_command_before_fullscreen_render(
+        &mut self,
+        ctx: &egui::Context,
+        command: RightDragCommand,
+    ) -> Option<AddressBarNav> {
+        self.execute_right_drag_command_in_phase(
+            ctx,
+            command,
+            RingScriptPhase::BeforeRender,
+            &mut None,
+        )
+    }
+
+    fn execute_right_drag_command_in_phase(
+        &mut self,
+        ctx: &egui::Context,
+        command: RightDragCommand,
+        phase: RingScriptPhase,
+        script_slot: &mut Option<u8>,
+    ) -> Option<AddressBarNav> {
         match command {
             RightDragCommand::RingShortcut {
                 context,
@@ -3886,7 +3940,14 @@ impl App {
                     self.show_feedback_toast(format!("[{}: なし]", direction.label()));
                     return None;
                 }
-                self.apply_ring_action(ctx, context, action, source)
+                self.apply_right_drag_action_in_phase(
+                    ctx,
+                    context,
+                    action,
+                    source,
+                    phase,
+                    script_slot,
+                )
             }
             RightDragCommand::MouseGesture {
                 context,
@@ -3914,7 +3975,14 @@ impl App {
                         self.ring_runtime_label(action_context, &action)
                     ));
                 }
-                self.apply_ring_action(ctx, action_context, action, "mouse-gesture")
+                self.apply_right_drag_action_in_phase(
+                    ctx,
+                    action_context,
+                    action,
+                    "mouse-gesture",
+                    phase,
+                    script_slot,
+                )
             }
             RightDragCommand::ViewerShortRightClick { context, pos } => {
                 if self.page_overview.session().is_some() {
@@ -7925,7 +7993,8 @@ impl App {
         direction: RingDirection,
     ) -> Option<AddressBarNav> {
         let context = self.current_ring_shortcut_context();
-        self.trigger_ring_shortcut_action(ctx, context, direction, "gamepad-ring")
+        let command = self.right_drag_ring_command(context, direction, "gamepad-ring");
+        self.execute_right_drag_command_before_fullscreen_render(ctx, command)
     }
 
     #[cfg(test)]
@@ -7981,7 +8050,18 @@ impl App {
         surface: crate::app::ActionSurface,
         source: &'static str,
     ) -> Option<AddressBarNav> {
-        self.apply_mouse_button(
+        self.apply_mouse_back_forward_button_with_repeat(ctx, forward, surface, source, false)
+    }
+
+    pub(crate) fn apply_mouse_back_forward_button_with_repeat(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+        surface: crate::app::ActionSurface,
+        source: &'static str,
+        repeat: bool,
+    ) -> Option<AddressBarNav> {
+        self.dispatch_mouse_button_with_repeat(
             ctx,
             if forward {
                 MouseButtonSlot::Forward
@@ -7990,7 +8070,9 @@ impl App {
             },
             surface,
             source,
+            repeat,
         )
+        .navigation
     }
 
     pub(crate) fn update_mouse_middle_short_click(
@@ -8090,6 +8172,19 @@ impl App {
         surface: crate::app::ActionSurface,
         source: &'static str,
     ) -> MouseButtonDispatchResult {
+        self.dispatch_mouse_button_with_repeat(ctx, slot, surface, source, false)
+    }
+
+    /// Browser-key repeats keep their normal assignment behavior, but may not
+    /// start a script. Resolve the assignment before applying that distinction.
+    pub(crate) fn dispatch_mouse_button_with_repeat(
+        &mut self,
+        ctx: &egui::Context,
+        slot: MouseButtonSlot,
+        surface: crate::app::ActionSurface,
+        source: &'static str,
+        repeat: bool,
+    ) -> MouseButtonDispatchResult {
         self.note_input_surface(surface);
         let context = self.ring_shortcut_context_for_surface(surface);
         let action = self
@@ -8097,6 +8192,9 @@ impl App {
             .ring_shortcuts
             .mouse_button_profile(context)
             .action(slot);
+        if repeat && action.script_slot_key_action().is_some() {
+            return MouseButtonDispatchResult::default();
+        }
         if !action.is_valid_for_mouse_button_context(context) {
             crate::logger::log(format!(
                 "[input-nav] source={source} ignored invalid mouse button action={} context={context:?}",
@@ -8123,9 +8221,15 @@ impl App {
             action.as_str()
         ));
         let dispatched_action = action.clone();
+        let script_slot = (context != RingShortcutContext::Grid
+            && !self.operation_script_uses_native_video())
+        .then(|| action.script_slot_key_action())
+        .flatten()
+        .and_then(super::operation_script_runtime::script_slot_number);
         MouseButtonDispatchResult {
             navigation: self.apply_ring_action(ctx, context, action, source),
             dispatched_action: Some(dispatched_action),
+            script_slot,
         }
     }
 
@@ -8243,9 +8347,13 @@ impl App {
         }
     }
 
-    pub(crate) fn apply_pinned_tag_key_action(&mut self, action: KeyAction, source: &'static str) {
+    pub(crate) fn apply_pinned_tag_key_action(
+        &mut self,
+        action: KeyAction,
+        source: &'static str,
+    ) -> bool {
         let Some(slot) = action.pinned_tag_slot_number() else {
-            return;
+            return false;
         };
         let Some(name) = self
             .settings
@@ -8256,7 +8364,7 @@ impl App {
             .map(|tag| tag.name.clone())
         else {
             self.show_feedback_warning(format!("ピン留めタグ {slot} は未登録です"));
-            return;
+            return false;
         };
         self.bump_input_seq(source, Some(&format!("pinned_tag_slot={slot}")));
         // ピン留めタグ KeyAction は Grid コンテキスト専用 (keymap テストで固定) なので
@@ -8271,9 +8379,10 @@ impl App {
             .is_empty()
         {
             self.show_feedback_warning("[タグ対象なし]".to_string());
-            return;
+            return false;
         }
         self.request_tag_toggle_for_selection(&name, crate::app::ActionSurface::MainWindow);
+        true
     }
 
     pub(crate) fn apply_history_clear_key_action(
@@ -8462,6 +8571,31 @@ impl App {
         action: RingActionId,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        self.apply_ring_action_in_phase(ctx, context, action, source, RingScriptPhase::DrawOwned)
+    }
+
+    pub(crate) fn apply_ring_action_before_fullscreen_render(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        action: RingActionId,
+        source: &'static str,
+    ) -> Option<AddressBarNav> {
+        self.apply_ring_action_in_phase(ctx, context, action, source, RingScriptPhase::BeforeRender)
+    }
+
+    fn apply_ring_action_in_phase(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        action: RingActionId,
+        source: &'static str,
+        phase: RingScriptPhase,
+    ) -> Option<AddressBarNav> {
+        if let Some(key) = action.script_slot_key_action() {
+            let slot = super::operation_script_runtime::script_slot_number(key)?;
+            return self.apply_ring_script_slot(ctx, context, slot, phase);
+        }
         // These alternate input routes share Depth's fullscreen restrictions.
         // Panorama keeps its released ring behavior; its key restrictions remain separate.
         if context == RingShortcutContext::ImageFullscreen
@@ -8549,6 +8683,27 @@ impl App {
 
         match action {
             RingActionId::None | RingActionId::Unknown(_) => None,
+            // Script slots are routed above, before ordinary ring action dispatch.
+            RingActionId::ScriptSlot1
+            | RingActionId::ScriptSlot2
+            | RingActionId::ScriptSlot3
+            | RingActionId::ScriptSlot4
+            | RingActionId::ScriptSlot5
+            | RingActionId::ScriptSlot6
+            | RingActionId::ScriptSlot7
+            | RingActionId::ScriptSlot8
+            | RingActionId::ScriptSlot9
+            | RingActionId::ScriptSlot10
+            | RingActionId::ScriptSlot11
+            | RingActionId::ScriptSlot12
+            | RingActionId::ScriptSlot13
+            | RingActionId::ScriptSlot14
+            | RingActionId::ScriptSlot15
+            | RingActionId::ScriptSlot16
+            | RingActionId::ScriptSlot17
+            | RingActionId::ScriptSlot18
+            | RingActionId::ScriptSlot19
+            | RingActionId::ScriptSlot20 => None,
             action @ (RingActionId::CopyFiles
             | RingActionId::ImageCopyPath
             | RingActionId::ImageCopyFileName
@@ -9076,6 +9231,74 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    fn apply_ring_script_slot(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        slot: u8,
+        phase: RingScriptPhase,
+    ) -> Option<AddressBarNav> {
+        use super::operation_script_runtime::{ScriptInputSurface, ScriptRunResult};
+        match context {
+            RingShortcutContext::Grid => {
+                match self.run_script_slot(ctx, slot, ScriptInputSurface::Grid, false) {
+                    ScriptRunResult::Grid { nav, .. } => nav,
+                    _ => None,
+                }
+            }
+            RingShortcutContext::ImageFullscreen => {
+                if matches!(phase, RingScriptPhase::DrawOwned) {
+                    // Stage 2b returns the request to the draw owner. Never run
+                    // through the pre-render finisher from inside its render pass.
+                    return None;
+                }
+                let fs_idx = self.fullscreen_idx?;
+                let mut action = crate::ui_fullscreen::FsKeyAction::default();
+                self.run_fullscreen_script_slot_for_action(ctx, slot, &mut action, &mut None);
+                self.finish_fullscreen_key_action(ctx, fs_idx, action);
+                None
+            }
+            RingShortcutContext::VideoFullscreen => {
+                if self.operation_script_uses_native_video() {
+                    // Native operations finish here, including their ordinary
+                    // navigation/close handling. Do not also return a draw request.
+                    self.run_script_slot(ctx, slot, ScriptInputSurface::Viewer, false);
+                    return None;
+                }
+                if matches!(phase, RingScriptPhase::DrawOwned) {
+                    return None;
+                }
+                let fs_idx = self.fullscreen_idx?;
+                let mut action = crate::ui_fullscreen::FsKeyAction::default();
+                self.run_fullscreen_script_slot_for_action(ctx, slot, &mut action, &mut None);
+                self.finish_fullscreen_key_action(ctx, fs_idx, action);
+                None
+            }
+        }
+    }
+
+    fn apply_right_drag_action_in_phase(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        action: RingActionId,
+        source: &'static str,
+        phase: RingScriptPhase,
+        script_slot: &mut Option<u8>,
+    ) -> Option<AddressBarNav> {
+        if matches!(phase, RingScriptPhase::DrawOwned)
+            && context != RingShortcutContext::Grid
+            && !self.operation_script_uses_native_video()
+            && let Some(slot) = action
+                .script_slot_key_action()
+                .and_then(super::operation_script_runtime::script_slot_number)
+        {
+            *script_slot = Some(slot);
+            return None;
+        }
+        self.apply_ring_action_in_phase(ctx, context, action, source, phase)
     }
 
     fn apply_ring_grid_column_count(&mut self, cols: usize) {
@@ -15179,3 +15402,325 @@ mod physical_boundary_tests {
 #[cfg(test)]
 #[path = "spread_step_input_tests.rs"]
 mod spread_step_input_tests;
+
+#[cfg(test)]
+mod script_slot_assignment_stage_tests {
+    use super::*;
+
+    fn install_script(app: &mut App, operation: &str) {
+        app.settings.operation_script_enabled = true;
+        app.operation_script.state = crate::operation_script::OperationScriptState::Ready(Box::new(
+            crate::operation_script::CompiledOperationScript::compile(&format!(
+                "fn slots() {{ [#{{slot:1,label:\"test\",run:\"run\"}}] }} fn run(s) {{ [\"{operation}\"] }}"
+            )).unwrap(),
+        ));
+    }
+
+    #[cfg(windows)]
+    fn media_script_app(music: bool) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        let path = std::path::PathBuf::from(if music {
+            r"C:\script-ring\audio.mp3"
+        } else {
+            r"C:\script-ring\video.mp4"
+        });
+        app.items = vec![if music {
+            crate::grid_item::GridItem::Audio(path.clone())
+        } else {
+            crate::grid_item::GridItem::Video(path.clone())
+        }];
+        app.visible_indices = vec![0];
+        app.current_folder = Some(r"C:\script-ring".into());
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        app.video_session_muted = false;
+        app.fs_cache.insert(
+            0,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path),
+                ),
+                load_seq: 0,
+            },
+        );
+        install_script(&mut app, "VideoMute");
+        app
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn script_native_media_mouse_runs_once_and_returns_no_draw_request() {
+        let ctx = egui::Context::default();
+        for slot in [
+            MouseButtonSlot::Back,
+            MouseButtonSlot::Forward,
+            MouseButtonSlot::Middle,
+        ] {
+            let mut app = media_script_app(false);
+            let profile = &mut app.settings.ring_shortcuts.mouse_buttons_video;
+            match slot {
+                MouseButtonSlot::Back => profile.back = RingActionId::ScriptSlot1,
+                MouseButtonSlot::Forward => profile.forward = RingActionId::ScriptSlot1,
+                MouseButtonSlot::Middle => profile.middle = RingActionId::ScriptSlot1,
+            }
+            for repeat in [false, true] {
+                let result = app.dispatch_mouse_button_with_repeat(
+                    &ctx,
+                    slot,
+                    crate::app::ActionSurface::Viewer,
+                    "script-native-mouse-test",
+                    repeat,
+                );
+                assert!(result.navigation.is_none());
+                assert!(result.script_slot.is_none());
+                assert_eq!(
+                    result.dispatched_action,
+                    (!repeat).then_some(RingActionId::ScriptSlot1)
+                );
+                assert!(
+                    app.video_session_muted,
+                    "initial runs once, repeat does not toggle again"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn script_media_ring_native_completes_and_music_keeps_draw_ownership() {
+        let ctx = egui::Context::default();
+        for music in [false, true] {
+            for gesture in [false, true] {
+                let mut app = media_script_app(music);
+                let command = if gesture {
+                    RightDragCommand::MouseGesture {
+                        context: RightDragContext::VideoFullscreen,
+                        action: RingActionId::ScriptSlot1,
+                        pattern_label: "→".into(),
+                        show_result_toast: false,
+                    }
+                } else {
+                    RightDragCommand::RingShortcut {
+                        context: RingShortcutContext::VideoFullscreen,
+                        action: RingActionId::ScriptSlot1,
+                        direction: RingDirection::Up,
+                        source: "script-media-ring-test",
+                    }
+                };
+                let (nav, slot) =
+                    app.execute_right_drag_command_for_fullscreen_render(&ctx, command);
+                assert!(nav.is_none());
+                assert_eq!(slot, music.then_some(1));
+                assert_eq!(app.video_session_muted, !music);
+                if music {
+                    app.apply_ring_action_before_fullscreen_render(
+                        &ctx,
+                        RingShortcutContext::VideoFullscreen,
+                        RingActionId::ScriptSlot1,
+                        "script-music-pre-render-test",
+                    );
+                    assert!(app.video_session_muted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn browser_mouse_grid_script_assignment_rejects_only_repeat_press() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..3)
+            .map(|i| crate::grid_item::GridItem::Image(format!("C:/browser-repeat/{i}.png").into()))
+            .collect();
+        app.visible_indices = vec![0, 1, 2];
+        app.current_folder = Some("C:/browser-repeat".into());
+        install_script(&mut app, "GridMoveLast");
+        app.settings.ring_shortcuts.mouse_buttons_grid.back = RingActionId::ScriptSlot1;
+        app.settings.ring_shortcuts.mouse_buttons_grid.forward = RingActionId::ScriptSlot1;
+
+        for slot in [MouseButtonSlot::Back, MouseButtonSlot::Forward] {
+            for repeat in [true, false, true] {
+                app.selected = Some(1);
+                let result = app.dispatch_mouse_button_with_repeat(
+                    &ctx,
+                    slot,
+                    crate::app::ActionSurface::MainWindow,
+                    "browser-grid-script-repeat-test",
+                    repeat,
+                );
+                assert!(result.navigation.is_none());
+                assert_eq!(
+                    result.dispatched_action,
+                    (!repeat).then_some(RingActionId::ScriptSlot1)
+                );
+                assert_eq!(app.selected, Some(if repeat { 1 } else { 2 }));
+            }
+        }
+        app.selected = Some(1);
+        app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::ScriptSlot1,
+            "browser-grid-script-ring-test",
+        );
+        assert_eq!(app.selected, Some(2), "ring input remains an initial press");
+    }
+
+    #[test]
+    fn browser_mouse_grid_normal_assignment_keeps_repeat_navigation() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.ring_shortcuts.mouse_buttons_grid.back = RingActionId::OpenLocationDriveList;
+        app.settings.ring_shortcuts.mouse_buttons_grid.forward =
+            RingActionId::OpenLocationDriveList;
+        for forward in [false, true] {
+            for repeat in [false, true] {
+                let nav = app.apply_mouse_back_forward_button_with_repeat(
+                    &ctx,
+                    forward,
+                    crate::app::ActionSurface::MainWindow,
+                    "browser-grid-normal-repeat-test",
+                    repeat,
+                );
+                assert!(matches!(
+                    nav,
+                    Some(AddressBarNav::LocationJump(
+                        crate::ui_main::LocationJumpTarget::DriveList
+                    ))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn browser_mouse_fullscreen_script_repeat_does_not_return_a_request() {
+        let ctx = egui::Context::default();
+        let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+            &ctx,
+            crate::settings::SpreadMode::Single,
+        );
+        install_script(&mut app, "FsClose");
+        app.settings.ring_shortcuts.mouse_buttons_image.back = RingActionId::ScriptSlot1;
+        app.settings.ring_shortcuts.mouse_buttons_image.forward = RingActionId::ScriptSlot1;
+        for slot in [MouseButtonSlot::Back, MouseButtonSlot::Forward] {
+            for repeat in [true, false] {
+                let result = app.dispatch_mouse_button_with_repeat(
+                    &ctx,
+                    slot,
+                    crate::app::ActionSurface::Viewer,
+                    "browser-image-script-repeat-test",
+                    repeat,
+                );
+                assert_eq!(result.script_slot, (!repeat).then_some(1));
+                assert_eq!(
+                    result.dispatched_action,
+                    (!repeat).then_some(RingActionId::ScriptSlot1)
+                );
+                assert_eq!(app.fullscreen_idx, Some(0));
+            }
+        }
+    }
+
+    #[test]
+    fn script_image_ring_draw_owned_path_does_not_execute_but_pre_render_finishes_close() {
+        let ctx = egui::Context::default();
+        let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+            &ctx,
+            crate::settings::SpreadMode::Single,
+        );
+        install_script(&mut app, "FsClose");
+        let original = app.fullscreen_idx;
+        assert!(original.is_some());
+        assert!(
+            app.apply_ring_action(
+                &ctx,
+                RingShortcutContext::ImageFullscreen,
+                RingActionId::ScriptSlot1,
+                "script-draw-owned-test"
+            )
+            .is_none()
+        );
+        assert_eq!(
+            app.fullscreen_idx, original,
+            "stage 2b must own the draw request"
+        );
+        assert!(
+            app.apply_ring_action_before_fullscreen_render(
+                &ctx,
+                RingShortcutContext::ImageFullscreen,
+                RingActionId::ScriptSlot1,
+                "script-before-render-test"
+            )
+            .is_none()
+        );
+        assert_eq!(app.fullscreen_idx, None);
+    }
+
+    #[test]
+    fn script_image_gamepad_ring_uses_the_pre_render_finisher() {
+        let ctx = egui::Context::default();
+        let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+            &ctx,
+            crate::settings::SpreadMode::Single,
+        );
+        install_script(&mut app, "FsClose");
+        app.note_input_surface(crate::app::ActionSurface::Viewer);
+        app.settings
+            .ring_shortcuts
+            .profile_mut(RingShortcutContext::ImageFullscreen)
+            .slots[RingDirection::Up.slot_index()] = RingActionId::ScriptSlot1;
+        assert!(
+            app.trigger_gamepad_ring_action_for_test(&ctx, RingDirection::Up)
+                .is_none()
+        );
+        assert_eq!(app.fullscreen_idx, None);
+    }
+
+    #[test]
+    fn script_image_mouse_dispatch_returns_slot_without_running_it() {
+        let ctx = egui::Context::default();
+        let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+            &ctx,
+            crate::settings::SpreadMode::Single,
+        );
+        install_script(&mut app, "FsClose");
+        app.settings
+            .ring_shortcuts
+            .mouse_button_profile_mut(RingShortcutContext::ImageFullscreen)
+            .back = RingActionId::ScriptSlot1;
+        let result = app.dispatch_mouse_button(
+            &ctx,
+            MouseButtonSlot::Back,
+            crate::app::ActionSurface::Viewer,
+            "script-image-mouse-request-test",
+        );
+        assert!(result.navigation.is_none());
+        assert_eq!(result.script_slot, Some(1));
+        assert_eq!(result.dispatched_action, Some(RingActionId::ScriptSlot1));
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+
+    #[test]
+    fn script_slot_ring_actions_are_noops_while_scripts_are_disabled() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let settings = serde_json::to_value(&app.settings).unwrap();
+        let selected = app.selected;
+        let fullscreen_idx = app.fullscreen_idx;
+        for &context in RingShortcutContext::all() {
+            let actions = RingActionId::available_for_context(context)
+                .into_iter()
+                .filter(|action| action.script_slot_key_action().is_some());
+            for action in actions {
+                assert!(
+                    app.apply_ring_action(&ctx, context, action, "script-slot-assignment-test")
+                        .is_none()
+                );
+                assert_eq!(app.selected, selected);
+                assert_eq!(app.fullscreen_idx, fullscreen_idx);
+                assert!(app.saved_group_open_request_id_for_test().is_none());
+                assert_eq!(serde_json::to_value(&app.settings).unwrap(), settings);
+            }
+        }
+    }
+}

@@ -230,7 +230,7 @@ fn replace_script(path: &Path, source: &str) -> Result<(), String> {
 /// POSIX replacement leaves sharing readers on the old contents. The ordinary
 /// MoveFileExW helper cannot replace such an open target, even on NTFS.
 #[cfg(windows)]
-fn rename_script_temporary(
+pub(crate) fn rename_script_temporary(
     temporary: &File,
     _temporary_path: &Path,
     destination: &Path,
@@ -309,7 +309,7 @@ fn rename_script_temporary(
 }
 
 #[cfg(not(windows))]
-fn rename_script_temporary(
+pub(crate) fn rename_script_temporary(
     _temporary: &File,
     temporary_path: &Path,
     destination: &Path,

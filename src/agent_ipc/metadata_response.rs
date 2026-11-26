@@ -22,7 +22,10 @@ pub(super) fn respond(
     let worker_dispatch = dispatch.clone();
     let controller = connection.handlers.open.clone();
     let changes = connection.handlers.changes.clone();
-    let script_read = matches!(&command, Command::StackScript { source: None, .. });
+    let script_read = matches!(
+        &command,
+        Command::StackScript { source: None, .. } | Command::OperationScript { source: None, .. }
+    );
     let worker_ctx = ctx.clone();
     let client_name = client
         .as_ref()
@@ -33,6 +36,19 @@ pub(super) fn respond(
         .name("agent-metadata-worker".into())
         .spawn(move || {
             let result = match command {
+                Command::OperationScript {
+                    source,
+                    part,
+                    expected_sha256,
+                } => controller.execute_operation_script(
+                    source,
+                    part,
+                    expected_sha256,
+                    &worker_ctx,
+                    client_name,
+                    worker_dispatch,
+                    &changes,
+                ),
                 Command::StackScript {
                     source,
                     part,
@@ -110,7 +126,8 @@ pub(super) fn respond(
             | open::UiOpenOutcome::Settings(_)
             | open::UiOpenOutcome::Operations(_),
         )
-        | Ok(open::UiOpenOutcome::StackScriptAdmitted { .. }) => {
+        | Ok(open::UiOpenOutcome::StackScriptAdmitted { .. })
+        | Ok(open::UiOpenOutcome::OperationScriptAdmitted { .. }) => {
             (Err(failed()), ReplyPolicy::Rejected)
         }
     };

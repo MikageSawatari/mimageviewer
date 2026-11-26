@@ -8,6 +8,7 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [operation-script-plan.md](operation-script-plan.md) | §1.363 操作のスクリプト。段1〜5実装（段5は実装済み、自動検証・独立実装レビュー・設計担当の検収・実機は未確認）。環境設定の下書きと初回確認、単一FIFOのLoad/Open/Reset、状態表示と公開マニュアル。イベント可は同期32＋open限定2、動画の再生・ループ・全シーク9操作は不可。段4は関連253テスト成功・独立レビューACCEPT、費用の実測と実機は未実施。段5の確定設計は§4.1.1、段4の詳細は§16 |
 | [drive-tabs-793-plan.md](drive-tabs-793-plan.md) | §1.793 ツールバーのドライブ欄 (ドライブ別の最後の場所を常設ボタンから開く)。A/B の記録から導くドライブの集合、キー操作と共有するドライブ移動の worker 解決、置き場所・右クリック・利用者判断。設計段階、未実装 |
 | [folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) | §1.464 ツリー行への D&D と右クリック貼り付け、§1.821 一覧ドロップ。表示済み pass の形・ROOT OLE target・既定操作のボリューム確認・共有受付と転送 owner。generic Shell image と target description を使用。実装記録と未実施の検証は §14〜15 |
 | [grid-folder-drop-and-handle-release-plan.md](grid-folder-drop-and-handle-release-plan.md) | §1.858 B・2 / §1.860 (v5.7.0 予定、設計中)。移動・名前の変更・削除の前に mIV が持つ ZIP / PDF の handle を手放す「変更の囲い」、一覧の実フォルダのセルへのドロップ、外部からのドラッグ中の落とし先の強調と説明のバッジ |

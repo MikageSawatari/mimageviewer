@@ -1,5 +1,39 @@
 # 非同期・並列アーキテクチャ
 
+## 操作スクリプトのファイル処理（§1.363 段1〜5・§17）
+
+App共通の `OperationScriptLoader` が単一FIFO worker・要求sender・結果receiverを所有し、viewer bundleへ入れない。
+最初の要求で起動し、Load（generation付き）/ Open / Reset / AI読み取り / AI書き込みを受け付け順に処理する。読み込みも同じ列へ入れるため、
+Reset直後のReloadは置換後の本文を読む。旧来の読み込みごとのthreadと雛形作成専用の経路は使わない。
+Loadは無ければcreate_newで雛形作成 → 読む → compile → slots()評価、Openは同じ欠落時作成 → Shellのエディタ起動。
+Load / Openは既存の本文も空ファイルも上書きしない。Resetは確認後に既定本文を書き、同じフォルダの一時ファイルから置換して元本文の先行削除を避ける。
+ファイル監視・Reset完了後の自動reload・完了待ち・再試行状態は設けない。UIは要求を投入するだけ。
+
+§17.5の `operation_script` は設定許可と既存の受付条件をUIで検査し、その場で同じFIFOへ投入する。
+senderはApp/loaderだけが持ち、agent workerは仕事に入れた返信先を待つ。AI読み取りはNotFoundだけ雛形を返し、作成しない。
+AI書き込みは同じ仕事の中で現在の本文のSHA-256照合 → compile / slots()評価 → Reset共用の置換を行う。
+受付はloaderの状態・generationを変えず、OFF以外の現generationだけを捕捉する。
+成功時だけコンパイル済みの本文を別種の結果AiWriteとしてLoadと同じreceiverへ返す。agentへの返信は別に返す。
+AiWriteは現generationかつReady / Failedで採用する。Loading中の受付なら先行Loadの結果が先に届く。
+拒否・失敗はloaderへ結果を返さず、稼働中の本文と状態を保つ。後のReload / OFF / 再ONがgenerationを進めたら採用しない。
+OFF中の書き込みは採用せず、有効化時のLoadが保存本文を読む。書き込み後にLoadを追加投入する経路は作らない。
+AI書き込みの後のResetも自動reloadしないため、稼働本文はAIの本文、ファイルは既定本文になり得る。
+応答のenabled・読み込み状態は受付時点の写しであり、その応答のSHA-256の本文を採用した証明ではない。
+
+ROOTのpollはDisabled / Loading / Ready / Failedに関係なく毎frame受け口をdrainする。
+Load結果は現在のLoadingのgenerationと一致する時だけ採用する。古い結果を捨てた後もdrainを続けて最新結果を採る。
+採用するLoad結果が失敗なら、その受信時に一度だけOpen/Resetと同じ経路でログと通知を出す。通知済みの状態は持たず、古い世代やOFF後の結果は通知しない。
+OFFでは世代を進めてLoad採用資格を失わせるが、workerとreceiverは保持する。
+Open / Resetの失敗はOFFや読み込み中でもログと通知にする。まれな失敗は復旧状態を増やさず通知で終える。
+初回の有効化・起動時・Reloadとも、ファイル欠落は雛形を作って読む。雛形のon_eventも実行対象となる。
+
+loaderをdropするとsenderが閉じる。workerは受理済み要求を処理してから終わるが、UIはjoinしない。
+プロセス終了時に未処理の要求が終わることは保証しない。テストは注入したworkerの停止を解除し、終了を確認してから隔離先を片付ける。
+テスト用loaderは使い捨ての保存先と差し替えのeditor起動を受け取り、製品の保存先・実エディタを使わない。
+状態の写し・イベント基準は在メモリのみ。イベントの共用実行が既存のsettings/spread_db同期保存を呼ぶ点は、利用者の例外決定を保つ。
+費用とイベント基準は[UI応答性](ui-responsiveness.md)、[設計§4.1.1](operation-script-plan.md)を参照。
+段5は実装済み。自動検証・独立実装レビュー・設計担当の検収・実機確認は未実施。
+
 ## 起動 resolver の走査と外部 Shell 起動（§1.853・§1.861、実装・検証待ち）
 
 `startup-open-resolve` は既存 pending 一つで、明示の起動入力と既定の場所の typed input を扱う。

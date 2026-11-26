@@ -19,6 +19,42 @@ fn manual_root() -> std::path::PathBuf {
 }
 
 #[test]
+fn operation_script_help_is_searchable_and_retrievable_offline() {
+    let found = call(
+        "search_help",
+        json!({"query":"操作のスクリプト","limit":30}),
+    )
+    .unwrap();
+    assert_eq!(found["isError"], false);
+    let hit = found["structuredContent"]["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|hit| {
+            hit["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("operation-script.html#"))
+        })
+        .expect("operation-script manual is discoverable from the tool description");
+    let section = call("get_help", json!({"id":hit["id"]})).unwrap();
+    assert_eq!(section["isError"], false);
+    assert!(
+        !section["structuredContent"]["text"]
+            .as_str()
+            .unwrap()
+            .is_empty()
+    );
+    let page = call("get_help", json!({"id":"operation-script.html"})).unwrap();
+    assert_eq!(page["isError"], false);
+    assert!(
+        !page["structuredContent"]["sections"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn help_generation_is_deterministic_and_ids_are_unique() {
     let first = help_build::load_manual(&manual_root()).unwrap();
     let second = help_build::load_manual(&manual_root()).unwrap();

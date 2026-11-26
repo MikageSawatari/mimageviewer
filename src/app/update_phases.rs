@@ -361,7 +361,30 @@ impl App {
         self.flush_periodic_sidecars();
     }
 
+    /// 設定の確定を次のROOTフレームで照合し、ファイルworkerの結果を常に読み切る。
+    /// 環境設定の下書きには触れず、ここでは投入と非blocking受信だけを行う。
+    pub(crate) fn service_operation_script_files(&mut self, ctx: &egui::Context) {
+        // 起動後最初のROOT passと設定ON/OFFを同じ状態遷移に通す。
+        // 設定OFFの間も開く・既定に戻すの失敗を受け取る。
+        let script_disabled = matches!(
+            self.operation_script.state,
+            crate::operation_script::OperationScriptState::Disabled
+        );
+        if self.settings.operation_script_enabled == script_disabled {
+            self.operation_script.sync_enabled(
+                self.settings.operation_script_enabled,
+                &crate::data_dir::get(),
+                ctx,
+            );
+        }
+        for error in self.operation_script.poll() {
+            crate::logger::log(format!("operation script: {error}"));
+            self.show_feedback_error(error);
+        }
+    }
+
     pub(super) fn service_startup_notifications(&mut self, ctx: &egui::Context) {
+        self.service_operation_script_files(ctx);
         self.poll_indexer_notifications(
             ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
         );
@@ -900,14 +923,20 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         main_viewer_blocked: bool,
-    ) {
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        if !main_viewer_blocked {
+            self.detect_operation_script_events(
+                ctx,
+                super::operation_script_runtime::ScriptInputSurface::Grid,
+            );
+        }
         // Only menu/dialog ownership blocks this entire phase. Text-input
         // shortcuts retain the per-branch admission and keymap behavior below.
         if matches!(
             self.keyboard_owner_for_pass(ctx),
             crate::keyboard_input::KeyboardOwner::Modal
         ) {
-            return;
+            return None;
         }
         // ── F12: 画像・動画ビューア別ウィンドウモード ───────────────
         if !self.address_has_focus
@@ -933,6 +962,33 @@ impl App {
                 .consume_action_no_repeat(ctx, KeyAction::ToggleAlwaysOnTop)
         {
             self.toggle_always_on_top(ctx, ActionSurface::MainWindow);
+        }
+
+        if !self.address_has_focus
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+            && !self.global_search.has_focus
+            && !self.tag_view.has_focus
+            && !main_viewer_blocked
+            && !self.any_dialog_open()
+        {
+            for (index, action) in super::operation_script_runtime::SCRIPT_SLOT_ACTIONS
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                if self.keymap.consume_action_no_repeat(ctx, action) {
+                    return match self.run_script_slot(
+                        ctx,
+                        index as u8 + 1,
+                        super::operation_script_runtime::ScriptInputSurface::Grid,
+                        false,
+                    ) {
+                        super::operation_script_runtime::ScriptRunResult::Grid { nav, .. } => nav,
+                        _ => None,
+                    };
+                }
+            }
         }
 
         if !self.address_has_focus
@@ -1154,7 +1210,7 @@ impl App {
                 .keymap
                 .pressed_action(ctx, KeyAction::GridToggleDetailsView)
             {
-                self.toggle_grid_details_view();
+                self.execute_grid_view_key_action(KeyAction::GridToggleDetailsView);
             }
             let selected_cols = [
                 (KeyAction::GridColumnCount1, 1),
@@ -1180,15 +1236,12 @@ impl App {
             ]
             .into_iter()
             .find(|(action, _)| self.keymap.pressed_action(ctx, *action))
-            .map(|(_, cols)| cols);
-            if let Some(cols) = selected_cols {
-                self.set_grid_view_mode(crate::settings::GridViewMode::Thumbnail);
-                if cols != self.settings.grid_cols {
-                    self.settings.grid_cols = cols;
-                    self.settings.save();
-                }
+            .map(|(action, _)| action);
+            if let Some(action) = selected_cols {
+                self.execute_grid_view_key_action(action);
             }
         }
+        None
     }
 
     pub(super) fn post_render_main_navigation(
@@ -1506,12 +1559,15 @@ impl App {
                     crate::ui_dialogs::context_menu::ContextMenuAction::JumpToFolder(request) => {
                         self.begin_context_jump_to_folder(request)
                     }
-                    crate::ui_dialogs::context_menu::ContextMenuAction::OpenGridContainer {
-                        idx,
-                        mode,
-                    } => self
-                        .open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
-                        .and_then(|nav| match nav {
+                    action => {
+                        let nav = match action {
+                            crate::ui_dialogs::context_menu::ContextMenuAction::ScriptNavigation(nav) => Some(nav),
+                            crate::ui_dialogs::context_menu::ContextMenuAction::OpenGridContainer { idx, mode } => {
+                                self.open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
+                            }
+                            crate::ui_dialogs::context_menu::ContextMenuAction::JumpToFolder(_) => unreachable!(),
+                        };
+                        nav.and_then(|nav| match nav {
                             crate::ui_main::AddressBarNav::WorkerFavorite(path) => {
                                 navigate_scan_route = DirectoryScanRoute::Worker;
                                 self.dispatch_favorite_navigation(path)
@@ -1615,10 +1671,18 @@ impl App {
                                 self.dispatch_drive_jump_input(input);
                                 None
                             }
-                            crate::ui_main::AddressBarNav::HistoryBack
-                            | crate::ui_main::AddressBarNav::HistoryForward
-                            | crate::ui_main::AddressBarNav::SavedGroupReady(_) => None,
-                        }),
+                            crate::ui_main::AddressBarNav::HistoryBack => self
+                                .dispatch_main_folder_history_input(FolderHistoryDirection::Back),
+                            crate::ui_main::AddressBarNav::HistoryForward => self
+                                .dispatch_main_folder_history_input(
+                                    FolderHistoryDirection::Forward,
+                                ),
+                            crate::ui_main::AddressBarNav::SavedGroupReady(id) => {
+                                self.adopt_saved_group_ready(id);
+                                None
+                            }
+                        })
+                    }
                 }
             } else if let Some(activation) = folder_pane_nav {
                 // フォルダツリーペインのクリック/Enter ナビは worker で scan_directory を
@@ -2514,6 +2578,227 @@ impl App {
         self.spread_shift
             .confirm_retained_readoption_modal_paint(ctx);
         self.poll_sidecar_restore(ctx);
+    }
+}
+
+#[cfg(test)]
+mod operation_script_file_service_tests {
+    use crate::operation_script::{OperationScriptLoader, OperationScriptState};
+
+    fn app_for_load_notification_test(source: &str) -> crate::app::AppTestEnvForTest {
+        // This fixture owns data-dir/DB isolation; never acquire its lock again.
+        let mut app = crate::app::setup_app_for_test();
+        let path = crate::operation_script::script_path(app.tmp.path());
+        std::fs::write(&path, source).unwrap();
+        app.settings.operation_script_enabled = true;
+        app.operation_script = OperationScriptLoader::with_file_worker(path, |_| Ok(()), || {});
+        app
+    }
+
+    #[test]
+    fn operation_script_current_load_failure_is_notified_once_as_error() {
+        let mut app = app_for_load_notification_test("fn slots( {");
+        let data_dir = app.tmp.path().to_path_buf();
+        let ctx = egui::Context::default();
+        app.operation_script.reload(&data_dir, &ctx);
+        // Complete all work before assertions or the isolated profile is dropped.
+        app.operation_script.shutdown_file_worker_for_test();
+        app.feedback_toasts_for_test.clear();
+        app.service_operation_script_files(&ctx);
+        let OperationScriptState::Failed(reason) = &app.operation_script.state else {
+            panic!("current failed load must be adopted");
+        };
+        assert!(reason.contains("コンパイル"));
+        assert_eq!(app.feedback_toasts_for_test.len(), 1);
+        assert_eq!(
+            app.feedback_toasts_for_test[0].0,
+            format!("スクリプトを読み込めません: {reason}")
+        );
+        assert_eq!(
+            app.feedback_toasts_for_test[0].1,
+            crate::feedback::FeedbackKind::Error
+        );
+        app.service_operation_script_files(&ctx);
+        app.service_operation_script_files(&ctx);
+        assert_eq!(app.feedback_toasts_for_test.len(), 1);
+    }
+
+    #[test]
+    fn operation_script_stale_load_failure_is_not_notified_before_latest_success() {
+        let mut app = app_for_load_notification_test("fn slots( {");
+        let data_dir = app.tmp.path().to_path_buf();
+        let path = crate::operation_script::script_path(&data_dir);
+        let replacement_path = path.clone();
+        let requests = std::cell::Cell::new(0);
+        app.operation_script = OperationScriptLoader::with_file_worker(
+            path,
+            |_| Ok(()),
+            move || {
+                let request = requests.get();
+                requests.set(request + 1);
+                if request == 1 {
+                    // Same FIFO: only the second load sees valid source. The first
+                    // failed result stays queued until both generations are complete.
+                    std::fs::write(&replacement_path, "fn slots() { [] }").unwrap();
+                }
+            },
+        );
+        let ctx = egui::Context::default();
+        app.operation_script.reload(&data_dir, &ctx);
+        app.operation_script.reload(&data_dir, &ctx);
+        app.operation_script.shutdown_file_worker_for_test();
+        app.feedback_toasts_for_test.clear();
+        app.service_operation_script_files(&ctx);
+        assert!(matches!(
+            app.operation_script.state,
+            OperationScriptState::Ready(_)
+        ));
+        assert!(app.feedback_toasts_for_test.is_empty());
+        app.service_operation_script_files(&ctx);
+        assert!(app.feedback_toasts_for_test.is_empty());
+    }
+
+    #[test]
+    fn operation_script_load_failure_received_after_off_is_not_notified() {
+        let mut app = app_for_load_notification_test("fn slots( {");
+        let data_dir = app.tmp.path().to_path_buf();
+        let ctx = egui::Context::default();
+        app.operation_script.reload(&data_dir, &ctx);
+        app.operation_script.shutdown_file_worker_for_test();
+        app.settings.operation_script_enabled = false;
+        app.feedback_toasts_for_test.clear();
+        // The production service invalidates the load before draining its result.
+        app.service_operation_script_files(&ctx);
+        assert!(matches!(
+            app.operation_script.state,
+            OperationScriptState::Disabled
+        ));
+        assert!(app.feedback_toasts_for_test.is_empty());
+        app.service_operation_script_files(&ctx);
+        assert!(app.feedback_toasts_for_test.is_empty());
+    }
+
+    #[test]
+    fn operation_script_successful_load_is_not_notified() {
+        let mut app = app_for_load_notification_test("fn slots() { [] }");
+        let data_dir = app.tmp.path().to_path_buf();
+        let ctx = egui::Context::default();
+        app.operation_script.reload(&data_dir, &ctx);
+        app.operation_script.shutdown_file_worker_for_test();
+        app.feedback_toasts_for_test.clear();
+        app.service_operation_script_files(&ctx);
+        assert!(matches!(
+            app.operation_script.state,
+            OperationScriptState::Ready(_)
+        ));
+        assert!(app.feedback_toasts_for_test.is_empty());
+        app.service_operation_script_files(&ctx);
+        assert!(app.feedback_toasts_for_test.is_empty());
+    }
+
+    #[test]
+    fn operation_script_file_failures_are_notified_while_disabled_and_drained_once() {
+        // setup_app_for_test owns the single data-dir/DB isolation lock. The
+        // injected instance cannot launch an editor or reach a normal profile.
+        let mut app = crate::app::setup_app_for_test();
+        assert!(!app.settings.operation_script_enabled);
+        let data_dir = app.tmp.path().to_path_buf();
+        let path = data_dir.join("operation-script-is-a-directory");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep.txt"), "preserve directory contents").unwrap();
+        app.operation_script = OperationScriptLoader::with_file_worker(
+            path,
+            |_| Err("test editor refused open".into()),
+            || {},
+        );
+        let ctx = egui::Context::default();
+        app.operation_script
+            .enqueue_open_user_script(&data_dir, &ctx);
+        app.operation_script
+            .enqueue_reset_user_script(&data_dir, &ctx);
+        // Release the sender and join before either isolation or data is
+        // cleaned up. The receiver retains both completed failure results.
+        app.operation_script.shutdown_file_worker_for_test();
+        app.feedback_toasts_for_test.clear();
+        app.service_operation_script_files(&ctx);
+        assert!(matches!(
+            app.operation_script.state,
+            OperationScriptState::Disabled
+        ));
+        assert_eq!(app.feedback_toasts_for_test.len(), 2);
+        assert!(
+            app.feedback_toasts_for_test
+                .iter()
+                .any(|(message, _)| { message.contains("スクリプトを開けません") })
+        );
+        assert!(app.feedback_toasts_for_test.iter().any(|(message, _)| {
+            message.contains("スクリプトを既定に戻せません")
+        }));
+        assert!(
+            app.feedback_toasts_for_test
+                .iter()
+                .all(|(_, kind)| { *kind == crate::feedback::FeedbackKind::Error })
+        );
+        app.service_operation_script_files(&ctx);
+        assert_eq!(app.feedback_toasts_for_test.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod operation_script_grid_key_tests {
+    use super::*;
+
+    #[test]
+    fn grid_script_shortcut_uses_global_assignment_and_ignores_repeat_and_blocked_viewer() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.operation_script_enabled = true;
+        app.keymap = crate::keymap::Keymap::from_ini_str("[Global]\nScriptSlot1 = F13\n");
+        app.operation_script.state = crate::operation_script::OperationScriptState::Ready(Box::new(
+            crate::operation_script::CompiledOperationScript::compile(
+                r#"fn slots() { [#{slot:1,label:"キー",run:"entry"}] }
+                   fn entry(s) { if s.context == "grid" { #{run:[],notice:"一覧キーから実行"} } else { [] } }"#,
+            )
+            .unwrap(),
+        ));
+        let ctx = egui::Context::default();
+        for (repeat, blocked, expected) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            app.fs_feedback_toast = None;
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::F13,
+                    physical_key: Some(egui::Key::F13),
+                    pressed: true,
+                    repeat,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            app.input_update_begin(&ctx);
+            assert!(app.input_main_grid_shortcuts(&ctx, blocked).is_none());
+            assert_eq!(
+                app.fs_feedback_toast.is_some(),
+                expected,
+                "repeat={repeat} blocked={blocked}"
+            );
+            if expected {
+                assert!(
+                    app.fs_feedback_toast
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .contains("一覧キーから実行")
+                );
+            }
+            let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
+        }
     }
 }
 

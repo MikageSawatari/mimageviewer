@@ -1520,25 +1520,37 @@ impl App {
         ctx: &egui::Context,
         index: usize,
     ) -> Option<crate::ui_main::AddressBarNav> {
-        let (path, folder) = match self.items.get(index)? {
-            GridItem::Folder(path) => (path.clone(), true),
-            GridItem::ZipFile(path) | GridItem::PdfFile(path) => (path.clone(), false),
-            _ => return None,
+        self.accept_grid_container_open_with_admission(ctx, index).0
+    }
+
+    pub(crate) fn accept_grid_container_open_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        index: usize,
+    ) -> (
+        Option<crate::ui_main::AddressBarNav>,
+        super::ActionAdmission,
+    ) {
+        let (path, folder) = match self.items.get(index) {
+            Some(GridItem::Folder(path)) => (path.clone(), true),
+            Some(GridItem::ZipFile(path) | GridItem::PdfFile(path)) => (path.clone(), false),
+            _ => return (None, super::ActionAdmission::Rejected),
         };
         #[cfg(test)]
         GRID_CONTAINER_OPEN_ACCEPT_COUNT.with(|count| count.set(count.get() + 1));
         let auto_fullscreen = self.should_auto_fullscreen_grid_container(index);
         #[cfg(windows)]
         if auto_fullscreen && !self.park_active_detached_context_for_new_grid_open(ctx, index) {
-            return None;
+            return (None, super::ActionAdmission::Rejected);
         }
-        if self.begin_smart_grid_container_navigation(
+        let route = self.begin_smart_grid_container_navigation_with_admission(
             index,
             path.clone(),
             auto_fullscreen,
             super::StartupListIntent::container_open(auto_fullscreen),
-        ) {
-            return None;
+        );
+        if route.handled {
+            return (None, route.admission);
         }
         if folder {
             self.note_reading_history_open(index);
@@ -1547,7 +1559,10 @@ impl App {
                 self.pending_auto_fs_open = true;
             }
         }
-        Some(self.grid_physical_navigation(index, path, auto_fullscreen))
+        (
+            Some(self.grid_physical_navigation(index, path, auto_fullscreen)),
+            super::ActionAdmission::Accepted,
+        )
     }
 
     #[cfg(test)]

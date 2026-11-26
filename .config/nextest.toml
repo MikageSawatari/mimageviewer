@@ -77,6 +77,7 @@ filter = '''
     | test(/^panorama_wgpu::gpu_tests::/)
     | test(/^ui_adjustment_panel::creative_lut_ui_tests::/)
     | test(/^ui_dialogs::preferences::pages::plain_folder_spread_tests::/)
+    | test(/^ui_dialogs::preferences::operation_script::tests::operation_script_preferences_snapshot_(light|dark)$/)
     | test(/^ui_dialogs::preferences::pages::fullscreen_in_page_scroll_setting_tests::fullscreen_in_page_scroll_settings_snapshot_/)
     | test(/^ui_dialogs::preferences::pages::fullscreen_in_page_scroll_setting_tests::fullscreen_(scroll_then_turn_settings_snapshot_light|wheel_zoom_settings_snapshot_dark)$/)
     | test(/^ui_fullscreen::canonical_demand::draw_key_tests::/)

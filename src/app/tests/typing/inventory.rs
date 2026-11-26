@@ -130,6 +130,12 @@ const EXEMPTIONS: &[Entry] = &[
         "ドロップと入力所有の境界を検査する fixture",
     ),
     exempt(
+        "src/app/operation_script_runtime/tests.rs",
+        "show_singleline(ui, &mut text, Some(&mut focus)",
+        1,
+        "文字入力中に操作スクリプトを起動しない入力所有を検査する fixture",
+    ),
+    exempt(
         "src/app/pinned_search/history_tests.rs",
         "app.search_draft_mut(field.kind())",
         1,
@@ -392,6 +398,18 @@ const EXEMPTIONS: &[Entry] = &[
         "add_singleline(ui, &mut text,",
         2,
         "ページ内スクロールの入力所有 fixture",
+    ),
+    exempt(
+        "src/ui_fullscreen/operation_script_event_tests.rs",
+        "show_singleline(ui, &mut text, Some(&mut focus)",
+        1,
+        "文字入力中に操作スクリプトのイベントを検出しない入力所有を検査する fixture",
+    ),
+    exempt(
+        "src/ui_fullscreen/operation_script_owner_tests.rs",
+        "show_singleline(ui, &mut text, Some(&mut focus)",
+        2,
+        "文字入力中に全画面の操作スクリプトを起動しない入力所有を検査する fixture",
     ),
     exempt(
         "src/ui_metadata_panel/exif_copy_tests.rs",

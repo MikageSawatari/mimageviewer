@@ -1,5 +1,50 @@
 # アーキテクチャ概観
 
+## 操作のスクリプト（§1.363 段1〜5・§17）
+
+`operation_script` がサンドボックス、状態の写し、スロット・戻り値の解釈、操作の許可表と並びの検査を持つ。
+§17.2/17.3では画像の3D・スライドショーを手動の種別Aへ追加し、キーの各処理位置に残す純粋判定と
+既存トグル本体を共有する。新しい非同期ownerは作らない。6つの状態追加は入力面と再生器に応じたメモリ値だけ。
+App共通の `OperationScriptLoader` は、無効／読み込み中／使える／失敗を一つの値で保持し、viewer contextのbundleには含めない。
+段5と§17.5ではloader所有の遅延起動する単一FIFO workerへ、Load / Open / Reset / AI読み取り / AI書き込みを受け付け順に投入する。
+Loadは欠落時の雛形作成・本文読み込み・コンパイル・`slots()` 評価、Openは欠落時の作成とエディタ起動、
+Resetは既定本文への安全な置き換えを担う。Resetの後に投入したLoadが古い本文を読む競合を除く。
+ROOTは読み込み状態に関係なく受け口を毎フレームdrainする。通常のLoadは現在のLoading世代だけ採用する。
+AI書き込みは受付時に状態・世代を変えず、OFF以外では現世代を捕捉する。照合・コンパイル・slots評価・置き換えが
+成功した本文だけを別の結果種別AiWriteで同じ受け口へ返し、現世代かつReady / Failedなら採用する。
+Loading中の受付は先行Load結果の後に届く。拒否・失敗はloaderへ結果を送らず、状態も採用本文も変えない。
+後のReload / OFF / 再ONは世代を進め、古いAiWriteの採用を失効させる。OFF中は保存だけで有効化時のLoadが読む。
+OFFは世代を進め、workerと受け口を保持する。Open/Reset失敗は全状態でログと通知にする。
+UIはI/O・完了待ち・終了joinをせず、loader破棄で送り口を閉じる。受理済み要求は処理後に終わるが、プロセス終了時の完了は保証しない。
+コンパイル済みの値はヒープに保持し、`rhai/sync` によりASTをworkerから渡す。
+環境設定のOperationScriptページは、下書きの有効化と初回確認をOKで一緒に確定する唯一の書き手。
+ファイルボタンは即時投入し、再読み込みだけは確定済みenabledで可否を決める。状態はメモリからページへ写し、
+スロットの番号・label・関数名とon_eventの有無を示す。labelはここ及び右クリックのみで、操作カスタマイズ名は固定。
+設定転送・AI設定変更はこの2設定を対象外とする。
+段2aでは `app::operation_script_runtime` が入力面に基づく利用資格・在メモリの状態の写し・同期実行を所有し、
+`operation_script_grid` と画像の全画面の共用実行関数へ検査済みの操作を順に渡す。
+対象の型付き識別・チェック集合は呼出し内のローカル値として比較し、後処理の要る結果を既存の呼出し元へ返す。
+一覧の全入口と全画面の描画前の入口を接続している。段2bの描画内入口は、スロットと受信時の識別を
+所有passローカルの `FsScriptFrame` へ返し、メニューと表示設定の適用後に所有viewportのctxで実行する。
+結果は `FsKeyAction::merge_script_action` で既存の移動要求へ合流し、既存dispatcherで1回処理する。
+Closedは既に終了した結果としてdispatcherを通さず、Rebasedは番号だけ取り直す。
+保留wheelの適用順は維持し、保留と同じフレームのスクリプト要求・適用内のスクリプトは通知して拒否する。
+段3では `execute_video_key_action` が解決済みKeyActionの動画・音声操作を共有する。
+nativeは実行完了の受付可否だけを返し、eguiの動画・音楽は既存の `FsKeyAction` を返す。
+nativeのキー・Browserキー・マウス・リングはその場で実行し、音楽表示は描画の所有passの経路を保つ。
+native overlayの文字入力は保持済みの入力snapshotで判断し、動画の状態欄はplayerの保持値だけを読む。
+通常native動画の右クリックメニューの実行は設計担当の判断で段3から外し、共通モデルと選択後のスロット返却を保持する。
+ROOTにフォーカスがある全画面のキーは既存のROOT側予備経路で実行する。共有Contextの転送分岐は変更しない。
+段4では `operation_script_runtime::events` がmain専用のbaseline・ROOT frame番号・rolling実行上限をbundle外で所有する。
+一覧ROOT、egui viewerの所有pass、native ROOTでキーより前に1frame1回検出し、利用資格を満たす時だけ評価する。
+入れ物は表示項目のtyped identityから導出し、pageは段2bと共用するscalarとstrong composition Arcを比較する。
+段2bの要求照合はreader orderを含む従来のO(N)を保つ。イベントは全件検査済みAだけをslotと同じ実行関数へ渡し、
+同frameの再snapshotを基準にする。r12の方向/合わせ方は検出側のopenを含む回だけ許し、イベント集合を並び全体の事前検査へ渡す。
+段4は47fdcb264で関連253テスト成功（設計担当が実行）、独立実装レビュー3回目でACCEPT。既存release識別計測も実施済み。段5は実装済み。自動検証・独立実装レビュー・設計担当の検収と、event_execute費用の実測・実機は未確認。
+r13は再生/ループ/全シーク9操作をイベント不可にし、共用実行の同期保存は利用者の例外決定で保つ。
+`script/event_execute`が評価・検査・全操作と同frame取り直しの費用を記録する。後方3種の追加除外と残る動画4操作の監査は計画§16に記す。
+詳細は [設計](operation-script-plan.md)。
+
 ## ブラウザ閲覧の保存先のページ構成（§1.870）
 
 `browser_view_policy` は保存先の根と実フォルダの走査元情報だけで対象を判定する。
@@ -37,11 +82,14 @@ Web の AI は同じ worker で案内の文をコピーし、共通の App 受�
 操作の要求内では override 名を一度ずつ解釈する索引を作り、実効キー・変更前後の値・置換位置に共有する。
 `agent/get_operations`・`agent/set_operations` は許可検査から応答までの `duration_ms`、`agent/set_operations_commit` は既存確定経路の時間を記録する。
 `agent-ipc::bound_page_rows` は設定と操作の単行・ページ合計予算を共通化し、所属を保ったまま大きい行を省く。
-IPC 版は 7。スタック用スクリプトの本文は、同じ設定許可の `stack_script` で読み書きする。
+IPC 版は 8（`operation_script` を追加、版7の凍結fixtureを保持）。スタック用スクリプトの本文は、同じ設定許可の `stack_script` で読み書きする。
 本文の取得・検査は agent worker、AI の照合付き書き込みと環境設定の「既定に戻す」「スクリプトを開く」は
 `filename_stack_script` の単一 FIFO worker に集約する。ボタンは enqueue だけで、UI は I/O・完了待ち・監視を行わない。
 書き込みは本文全体の SHA-256 を照合し、変更行とログには本文を出さず行数だけを残す。
 表示中のスタックは再構成せず、開き直し・フォルダ再読込時に新しい本文を使う。
+操作スクリプトは同じ設定許可の `operation_script` で本文を読み書きするが、有効化と初回確認は利用者だけが行う。
+UIで受付とFIFO投入を一緒に行い、loader所有の列と結果採用規約を使う（上の操作スクリプト節）。
+応答のenabled・読み込み状態は受付時点の写しで、返したSHA-256の本文の採用結果ではない。
 詳細は[設計と区切りごとの検証記録](mcp-guide-settings-plan.md)を参照。
 
 ## 3Dスライドショーの準備と提示（§1.771）

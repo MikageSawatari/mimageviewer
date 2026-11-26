@@ -140,6 +140,7 @@ pub(crate) fn draw_fullscreen_specified_scale_max_controls(
 
 mod folder_background;
 mod name_colors;
+mod operation_script;
 
 mod browser_integration;
 #[cfg(test)]
@@ -513,6 +514,7 @@ pub(crate) enum PreferencesPage {
     Vst3,
     /// 編集用追加パック (オノマトペ向けフォント + 被写体分離モデル) の管理
     EditingAddon,
+    OperationScript,
     /// 開発者 / 診断 (ログ zip 書き出し・性能ログ)
     Developer,
 }
@@ -712,6 +714,7 @@ impl PreferencesPage {
         Self::Video,
         Self::Vst3,
         Self::EditingAddon,
+        Self::OperationScript,
         Self::Developer,
     ];
 
@@ -754,6 +757,7 @@ impl PreferencesPage {
             Self::Video => "動画",
             Self::Vst3 => "VST3 プラグイン",
             Self::EditingAddon => "編集用追加ファイル",
+            Self::OperationScript => "操作のスクリプト",
             Self::Developer => "開発者",
         }
     }
@@ -1020,6 +1024,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::AiCaption,
             PreferencesPage::DepthAddon,
             PreferencesPage::EditingAddon,
+            PreferencesPage::OperationScript,
             PreferencesPage::Developer,
         ],
     },
@@ -1254,6 +1259,10 @@ pub(crate) struct PreferencesState {
     transfer_feedback: Option<PreferencesTransferFeedback>,
     /// Only UI OK asks about themes newly painted by this immutable draft.
     folder_background_confirmation: Option<Vec<bool>>,
+    operation_script_confirmation: Option<operation_script::Confirmation>,
+    pub operation_script_view: operation_script::OperationScriptView,
+    pub operation_script_committed_enabled: bool,
+    pub operation_script_actions: operation_script::Actions,
     /// 保存済み位置と音声トラック選択を明示的にクリアした編集意図。
     video_media_memory_clear_requested: bool,
     /// この編集ダイアログを開いた時点の通常ホイール割り当て。
@@ -1855,6 +1864,10 @@ impl PreferencesState {
             settings: s.preferences_snapshot(),
             transfer_feedback: None,
             folder_background_confirmation: None,
+            operation_script_confirmation: None,
+            operation_script_view: Default::default(),
+            operation_script_committed_enabled: false,
+            operation_script_actions: Default::default(),
             video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
             selected: PreferencesPage::General,
@@ -3548,6 +3561,9 @@ impl App {
         let clipboard_capture_startup_failed = self.clipboard_capture_startup_failed();
         if let Some(state) = self.pref_state.as_mut() {
             state.diag_export_view = self.diagnostics_export.view();
+            state.operation_script_view =
+                operation_script::OperationScriptView::from_loader(&self.operation_script.state);
+            state.operation_script_committed_enabled = self.settings.operation_script_enabled;
             state.clipboard_capture_startup_failed = clipboard_capture_startup_failed;
             state.clipboard_capture_default_output_dir =
                 crate::clipboard_capture::default_destination();
@@ -3606,10 +3622,15 @@ impl App {
             .as_ref()
             .is_some_and(|state| state.folder_background_confirmation.is_some());
         let collection_reorder_open = self.collection_reorder_open();
+        let operation_script_confirm_open = self
+            .pref_state
+            .as_ref()
+            .is_some_and(|state| state.operation_script_confirmation.is_some());
         if transfer_dialog_open
             || registration_dialog_open
             || vlm_dialog_open
             || folder_background_confirm_open
+            || operation_script_confirm_open
         {
             // Popups use independent UI layers and do not inherit a disabled
             // parent. Remove that combination while the transfer modal is shown.
@@ -3620,11 +3641,13 @@ impl App {
         let safe_rect = ctx.content_rect().shrink2(egui::vec2(24.0, 32.0));
         let safe_size = safe_rect.size().max(egui::Vec2::ZERO);
         let enter_pressed = !transfer_dialog_open
+            && !operation_script_confirm_open
             && !folder_background_confirm_open
             && !registration_dialog_open
             && !vlm_dialog_open
             && self.dialog_enter_pressed(ctx);
         let escape_pressed = !transfer_dialog_open
+            && !operation_script_confirm_open
             && !folder_background_confirm_open
             && !registration_dialog_open
             && !vlm_dialog_open
@@ -3636,6 +3659,7 @@ impl App {
             .drag_area(egui::WindowDrag::Anywhere)
             .enabled(
                 !transfer_dialog_open
+                    && !operation_script_confirm_open
                     && !registration_dialog_open
                     && !vlm_dialog_open
                     && !folder_background_confirm_open,
@@ -3936,6 +3960,56 @@ impl App {
             open = true;
         }
         self.submit_browser_integration_preferences(ctx);
+        // The child owns the opening AND closing frame. Parent key decisions
+        // were captured before the checkbox/button could create this modal.
+        let script_confirmation = self
+            .pref_state
+            .as_ref()
+            .and_then(|state| state.operation_script_confirmation);
+        if operation_script_confirm_open || script_confirmation.is_some() {
+            apply = false;
+            cancel = false;
+            open = true;
+        }
+        if let Some(confirmation) = script_confirmation {
+            let enter = self.dialog_enter_pressed(ctx);
+            // The initiating frame's Escape belongs to the parent input that
+            // opened this child. Only an already-open child may cancel on it.
+            let escape = operation_script_confirm_open && self.dialog_escape_pressed(ctx);
+            if let Some(accepted) =
+                operation_script::draw_confirmation(ctx, confirmation, enter, escape)
+            {
+                let state = self.pref_state.as_mut().unwrap();
+                state.operation_script_confirmation = None;
+                if accepted {
+                    match confirmation {
+                        operation_script::Confirmation::Enable => {
+                            state.settings.operation_script_enabled = true;
+                            state.settings.operation_script_notice_confirmed = true;
+                        }
+                        operation_script::Confirmation::Reset => {
+                            state.operation_script_actions.reset = true;
+                        }
+                    }
+                }
+            }
+        }
+        let script_actions = self
+            .pref_state
+            .as_mut()
+            .map(|state| std::mem::take(&mut state.operation_script_actions))
+            .unwrap_or_default();
+        if script_actions.open {
+            self.operation_script
+                .enqueue_open_user_script(&crate::data_dir::get(), ctx);
+        }
+        if script_actions.reset {
+            self.operation_script
+                .enqueue_reset_user_script(&crate::data_dir::get(), ctx);
+        }
+        if script_actions.reload && self.settings.operation_script_enabled {
+            self.operation_script.reload(&crate::data_dir::get(), ctx);
+        }
         if apply {
             let state = self.pref_state.as_mut().unwrap();
             let themes = crate::folder_cell_background::newly_painted_low_contrast(
@@ -4747,6 +4821,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::Video => page_video(ui, state),
         PreferencesPage::Vst3 => page_vst3(ui, state),
         PreferencesPage::EditingAddon => page_editing_addon(ui, state),
+        PreferencesPage::OperationScript => operation_script::page(ui, state),
         PreferencesPage::Developer => page_developer(ui, state),
     }
 }
@@ -10079,7 +10154,7 @@ mod tests {
         egui::Id::unique(title.text())
     }
 
-    fn preferences_view_harness(
+    pub(super) fn preferences_view_harness(
         page: PreferencesPage,
     ) -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
         preferences_view_harness_with_combo_reference(page, false)

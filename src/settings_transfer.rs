@@ -650,6 +650,8 @@ preferences_policy! {
         subfolder_expansion_filter_size_preset => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         stack_separator => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         stack_script_enabled => @prefs("分類ルールをスクリプト (カスタム) で行う", "folder/stack-script", |_, _| true, plain, plain) "移行先のローカルスクリプト実行方針を保持";
+        operation_script_enabled => "環境設定だけが確定するローカルスクリプトの実行許可。転送やAIによる設定変更では変更しない";
+        operation_script_notice_confirmed => "環境設定のOKで確定する第三者スクリプトの端末内の確認記録。別端末へ転送しない";
         thumb_px => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         text_preview_scale => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         text_smart_snap_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -2724,7 +2726,12 @@ mod tests {
                 .any(|(field, reason)| *field == "export_batch_presets" && reason.is_some())
         );
         assert!(!wire.contains(&"export_batch_presets"));
-        for key in ["agent_show_current_view", "agent_allow_settings"] {
+        for key in [
+            "agent_show_current_view",
+            "agent_allow_settings",
+            "operation_script_enabled",
+            "operation_script_notice_confirmed",
+        ] {
             assert!(
                 entries
                     .iter()

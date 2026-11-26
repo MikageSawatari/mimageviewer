@@ -27,6 +27,7 @@ use rhai::{
 use crate::filename_stack::StackMember;
 
 mod writer;
+pub(crate) use writer::rename_script_temporary;
 pub use writer::{
     ScriptDocument, ScriptWriteOutcome, enqueue_open_user_script, enqueue_reset_user_script,
     read_script_document, write_script,

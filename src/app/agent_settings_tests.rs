@@ -465,6 +465,8 @@ fn agent_settings_invalid_and_excluded_keys_refuse_the_whole_request() {
     for (key, value) in [
         ("agent_level", json!("Organize")),
         ("agent_allow_settings", json!(true)),
+        ("operation_script_enabled", json!(true)),
+        ("operation_script_notice_confirmed", json!(true)),
         ("remote_service_enabled", json!(true)),
         ("keymap", json!({})),
         ("not_a_setting", json!(true)),

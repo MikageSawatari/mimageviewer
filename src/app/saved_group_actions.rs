@@ -138,7 +138,7 @@ fn saved_group_source_unavailable_message(projected_main_context: bool) -> &'sta
     if projected_main_context {
         "メインの表示状態を確認できません"
     } else {
-        "この操作はメインウィンドウでのみ使用できます"
+        super::operation_script_runtime::MAIN_WINDOW_ONLY_NOTICE
     }
 }
 
@@ -490,22 +490,33 @@ impl App {
         ctx: &egui::Context,
         action: KeyAction,
     ) -> Option<AddressBarNav> {
+        self.try_apply_saved_group_key_action(ctx, action)
+            .ok()
+            .flatten()
+    }
+
+    /// Shared admission result; None can also mean an accepted asynchronous open.
+    pub(crate) fn try_apply_saved_group_key_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: KeyAction,
+    ) -> Result<Option<AddressBarNav>, ()> {
         match action {
             KeyAction::GridManageFavorites => {
                 self.show_favorites_editor = true;
-                return None;
+                return Ok(None);
             }
             KeyAction::GridManageBooks => {
                 self.open_book_manager_from_action();
-                return None;
+                return Ok(None);
             }
             KeyAction::GridManageCollections => {
                 self.open_collection_manager(None);
-                return None;
+                return Ok(None);
             }
             _ => {}
         }
-        let source = self.saved_group_open_source_if_allowed(action)?;
+        let source = self.saved_group_open_source_if_allowed(action).ok_or(())?;
         let source = if self.global_search.active || self.favsearch.active || self.tag_view.active {
             // Search departure owns the existing switch epoch as well as the
             // surface lease. Re-selecting the same query/location must retire an
@@ -566,14 +577,14 @@ impl App {
                     None
                 } else {
                     self.show_feedback_warning("本棚の更新処理が進行中です".into());
-                    return None;
+                    return Err(());
                 }
             } else if let Some(rows) = self.book_shelf.snapshot.as_ref() {
                 match book_action_target(rows, action, transition.current_book.as_ref()) {
                     Ok(path) => Some(path),
                     Err(message) => {
                         self.show_feedback_warning(message);
-                        return None;
+                        return Err(());
                     }
                 }
             } else {
@@ -585,18 +596,18 @@ impl App {
                     None
                 } else {
                     self.show_feedback_warning("本棚一覧を読み込めませんでした".into());
-                    return None;
+                    return Err(());
                 }
             };
             if let Some(path) = target
                 && let Err(message) = self.start_saved_book_scan(&mut transition, path)
             {
                 self.show_feedback_warning(message);
-                return None;
+                return Err(());
             }
             self.saved_group_open = Some(transition);
             ctx.request_repaint();
-            return None;
+            return Ok(None);
         }
         if action == KeyAction::GridOpenCollectionTarget
             || action == KeyAction::GridCollectionPrev
@@ -636,15 +647,15 @@ impl App {
                             // ready candidate. Returning it as a new external nav
                             // would cancel its own request before dispatch.
                             ctx.request_repaint();
-                            return None;
+                            return Ok(None);
                         }
                         lease.finish(Instant::now(), "adopted");
-                        return Some(AddressBarNav::CollectionOpen(id));
+                        return Ok(Some(AddressBarNav::CollectionOpen(id)));
                     }
                     Err(message) => self.show_feedback_warning(message),
                 }
                 lease.finish(Instant::now(), "rejected");
-                return None;
+                return Err(());
             }
             let id = self.next_saved_group_open_id();
             let lease = crate::collection_store::CollectionReadLease::new(
@@ -670,7 +681,7 @@ impl App {
             });
             ctx.request_repaint();
         }
-        None
+        Ok(None)
     }
 
     pub(crate) fn poll_saved_group_open(&mut self, ctx: &egui::Context) {

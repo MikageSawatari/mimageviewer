@@ -318,6 +318,14 @@ impl App {
     // The pending request retains its old presentation until atomic adoption.
     // Keep that large origin on the heap, without a second state or owner.
     fn retained_composed_projection(&self) -> Option<&AcceptedCompositionProjection> {
+        self.retained_composed_projection_input().map(Arc::as_ref)
+    }
+
+    /// Borrow the same accepted input allocation, including the retained refresh origin.
+    /// Readers that keep a semantic input snapshot can share it without copying its maps.
+    pub(crate) fn retained_composed_projection_input(
+        &self,
+    ) -> Option<&Arc<AcceptedCompositionProjection>> {
         match &self.book_composition {
             ViewerBookComposition::Accepted {
                 layout: CompositionProjectionOutcome::Composed(projection),
