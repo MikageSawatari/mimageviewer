@@ -5629,7 +5629,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 app.accept_grid_container_open(&egui::Context::default(), 0),
-                Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == branch
+                Some(crate::ui_main::AddressBarNav::GridFolder(intent)) if intent.path == branch
             ),
             "retained rows remain physically openable after the search ends"
         );

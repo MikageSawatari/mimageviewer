@@ -8489,12 +8489,21 @@ mod tests {
         wait_for_grid(&mut app, snapshot.collection_id());
         let before = app.folder_nav_history_snapshot();
 
-        assert!(!app.load_folder_with_scan_owned(
-            temp.path().join("missing-folder"),
-            None,
-            super::super::OpenRequestOwner::Navigation,
-            crate::app::StartupListIntent::ExplicitList,
+        // §6.3(1): main accepts the request before its worker can discover a missing path.
+        // The bool wrapper also accepts Classifying; failure is a completion outcome.
+        assert!(matches!(
+            app.load_folder_with_scan_owned_outcome(
+                temp.path().join("missing-folder"),
+                None,
+                super::super::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
+            ),
+            crate::app::FolderOpenOutcome::Classifying
         ));
+        app.finish_direct_navigation_scan_for_test();
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text.contains("フォルダを読み取れませんでした")
+        }));
         assert!(matches!(
             app.top_level_grid_view.surface(),
             TopLevelGridSurface::Collection(identity)
@@ -11945,12 +11954,21 @@ mod tests {
         let held_address = app.address.clone();
         let held_source = app.items[0].drag_source_path().unwrap().to_path_buf();
 
-        assert!(!app.load_folder_with_scan_owned(
-            temp.path().join("missing"),
-            None,
-            crate::app::OpenRequestOwner::Navigation,
-            crate::app::StartupListIntent::ExplicitList,
+        // §6.3(1): admission succeeds without synchronous I/O; the missing path
+        // fails only when the worker completes, leaving the installed root intact.
+        assert!(matches!(
+            app.load_folder_with_scan_owned_outcome(
+                temp.path().join("missing"),
+                None,
+                crate::app::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
+            ),
+            crate::app::FolderOpenOutcome::Classifying
         ));
+        app.finish_direct_navigation_scan_for_test();
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text.contains("フォルダを読み取れませんでした")
+        }));
         assert!(matches!(
             app.top_level_grid_view.surface(),
             TopLevelGridSurface::Collection(identity)

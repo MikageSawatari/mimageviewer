@@ -41,11 +41,18 @@ fn prepare_pdf_return(app: &mut App, root: &Path) {
 }
 
 fn close_to_parent(app: &mut App, root: &Path) {
+    let source = app.current_folder.clone();
     let nav = app
         .take_pending_return_to_parent_nav()
         .expect("accepted PDF return");
     assert!(matches!(&nav, crate::ui_main::AddressBarNav::Direct(path, _) if path == root));
     assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    // The immediate handler now admits the parent scan. The same UI completion
+    // seam must adopt it while the named mutex is still held by the fixture.
+    assert!(app.direct_navigation_scan_pending());
+    assert_eq!(app.current_folder, source);
+    assert_eq!(app.fullscreen_idx, Some(0));
+    app.finish_direct_navigation_scan_for_test();
     assert_eq!(app.current_folder.as_deref(), Some(root));
     assert!(app.fullscreen_idx.is_none());
 }
@@ -80,7 +87,8 @@ fn close_nav_801_inference_sessions_held_does_not_block_pdf_return_handler() {
     assert!(!events.contains(&TestEvent::Attempt(WaitSite::AiSessions)));
     assert!(events.contains(&TestEvent::Stage(Stage::PathIsFile, Outcome::Complete)));
     assert!(events.contains(&TestEvent::Stage(Stage::ScanDirectory, Outcome::Complete)));
-    assert!(events.contains(&TestEvent::Stage(Stage::DirectOpen, Outcome::Loaded)));
+    assert!(events.contains(&TestEvent::Stage(Stage::DirectOpen, Outcome::Classifying)));
+    assert!(events.contains(&TestEvent::Stage(Stage::LoadClaimed, Outcome::Loaded)));
 }
 
 #[test]

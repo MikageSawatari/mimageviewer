@@ -10921,7 +10921,7 @@ mod tests {
         assert!(smart_epub_waiting(&app));
         assert_eq!(app.current_folder, before);
         app.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Abort);
-        app.load_folder(next.clone());
+        app.load_folder_and_finish_for_test(next.clone());
         assert_eq!(app.current_folder.as_deref(), Some(next.as_path()));
     }
 

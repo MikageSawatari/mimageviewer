@@ -333,6 +333,7 @@ mod tests {
                 ));
                 assert_eq!(before, preview_state(&app));
                 assert!(parent_input(&mut app, input).is_none());
+                app.finish_direct_navigation_scan_for_test();
                 app.finish_page_identity_preparation_for_test();
                 assert_eq!(app.current_folder.as_ref(), Some(&root), "{mode:?}/{input}");
                 assert_eq!(app.tag_view.nav_stack, vec![root]);

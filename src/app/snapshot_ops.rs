@@ -5427,7 +5427,7 @@ mod tests {
         app.settings.browser_view_output_dir = Some(folder.clone());
         app.settings.default_spread_mode = SpreadMode::RtlCover;
         app.settings.apply_default_spread_to_plain_folders = true;
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.finish_page_identity_preparation_for_test();
         let source = app.spread_presentation_source.clone();
         assert_eq!(

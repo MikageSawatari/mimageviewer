@@ -1267,6 +1267,7 @@ fn mixed_path_history_replay_accepts_old_spelling_and_restores_the_same_folder()
             StartupListIntent::ExplicitList,
         ))
     );
+    app.finish_direct_navigation_scan_for_test();
     app.finish_page_identity_preparation_for_test();
     let old = PathBuf::from(origin.to_str().unwrap().replace('\\', "/").to_lowercase());
     let mut snapshot = app.folder_nav_history_snapshot();
@@ -1357,6 +1358,7 @@ mod file_organize_tests {
                 crate::app::StartupListIntent::ExplicitList,
             ))
         );
+        app.finish_direct_navigation_scan_for_test();
         assert_eq!(app.current_folder.as_ref(), Some(&destination));
         assert!(app.top_level_grid_view.open_path_classification().is_none());
         let after = app.folder_nav_history_snapshot();
@@ -3775,6 +3777,10 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         size_of::<usize>()
     );
     assert!(size_of::<PdfPasswordRequestOwner>() < 32);
+    assert!(
+        size_of::<crate::ui_fullscreen::FsCloseReturnPresentation>() <= 2 * size_of::<usize>(),
+        "close-return rendering payload must stay off the App stack"
+    );
     assert!(size_of::<PdfEnumeratePending>() < 1_200);
     assert!(size_of::<top_level_grid_view::TopLevelGridView>() < 3_200);
     // Keep the rare organize request payload on the heap instead of storing it
@@ -22416,7 +22422,8 @@ mod phase_c_folder_nav_history_tests {
                     std::fs::write(target.join(name), []).unwrap();
                     std::fs::write(origin.join(name), []).unwrap();
                 }
-                app.load_folder_and_finish_for_test(origin.clone());
+                app.load_folder(origin.clone());
+                app.finish_direct_navigation_scan_before_hydration_for_test();
                 assert_eq!(
                     app.modal_dialog_block_reason(),
                     Some("sidecar_restore"),
@@ -34064,6 +34071,7 @@ mod phase_c_drill_nav_tests {
 
         app.activate_subfolder_expansion_button();
 
+        app.finish_direct_navigation_scan_for_test();
         assert!(!app.items_are_subfolder_expansion_view);
         assert!(!app.show_subfolder_expansion_dialog);
     }
@@ -44272,6 +44280,7 @@ mod favorite_adjustment_defaults_tests {
             .take_pending_return_to_parent_nav()
             .expect("parent return request should become navigation");
         assert!(app.apply_fullscreen_close_nav_immediate(nav));
+        app.finish_direct_navigation_scan_for_test();
         app.finish_page_identity_preparation_for_test();
 
         assert_eq!(app.current_folder.as_deref(), Some(parent.as_path()));
@@ -44326,6 +44335,7 @@ mod favorite_adjustment_defaults_tests {
             app.apply_fullscreen_close_nav_immediate(nav),
             "embedded early-return path must apply the parent nav before returning"
         );
+        app.finish_direct_navigation_scan_for_test();
         assert_eq!(
             app.current_folder.as_deref(),
             Some(tmp.path()),

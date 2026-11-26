@@ -896,6 +896,7 @@ fn list_order_everything_parent_uses_the_moved_row_and_nested_book_returns_to_it
         app.close_fullscreen();
         assert!(app.handle_grid_parent_folder_action().is_none());
         if matches!(landing, Landing::FolderInnerZip) {
+            app.finish_direct_navigation_scan_for_test();
             app.finish_page_identity_preparation_for_test();
             assert_eq!(app.effective_folder().as_ref(), Some(&fixture.row));
             assert_child(&app, &fixture.row);

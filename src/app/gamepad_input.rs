@@ -11883,8 +11883,8 @@ mod tests {
         let nav = app.handle_gamepad_grid_accept(&egui::Context::default());
         assert!(matches!(
             nav,
-            Some(crate::ui_main::AddressBarNav::Direct(path, _))
-                if path == folder.join("folder-book")
+            Some(crate::ui_main::AddressBarNav::GridFolder(intent))
+                if intent.path == folder.join("folder-book")
         ));
         assert_eq!(app.current_folder.as_ref(), Some(&folder));
         assert_list_order_gamepad_replaced_stale_snapshot(&app, &stale);

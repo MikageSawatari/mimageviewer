@@ -1636,6 +1636,97 @@ cargo nextest run -p mimageviewer --lib -E $scan853R1Filter
 cargo nextest run -p mimageviewer --lib --features test-script -E $scan853R1Filter
 ```
 
+#### テスト実行後の修正 (r2)
+
+2026-11-27。設計担当が `d2768a9bb` で `scripts/test-lib-full.ps1` を実行した結果、
+既定構成は 20,862 件中 20,829 成功・33 失敗、`--features test-script` は 21,024 件中
+20,989 成功・同じ 33 件＋2 件の計 35 失敗（両構成とも ignored 106 件）だった。
+提供された `full-fails.txt`・`full-panics.txt`、各 run の実ログ（`stdout.log` は空で、診断は
+`stderr.log`）を読み、下表の入力・採用・復元の境界をコードで照合した。
+実装担当自身はコンパイル・cargo・nextest・ビルド・製品起動・コミットを行っていない。
+
+| ファイル・失敗テスト（module 接頭辞省略） | 根因と修正 |
+| --- | --- |
+| `browser818_presentation_tests.rs` / `browser818_presentation_activation_restore_materialized_keeps_request_seed` | 未走査の模擬 resolver 応答から Directory worker が始まるため、sidecar はまだ始まっていなかった。走査採用だけを完了し、新しい復元 owner を残して従来の seed を検査 |
+| `app.rs` / `saved_reveal_preserves_a_staged_classification_without_reserving_navigation` | 初期 source の読込が未採用のまま次の分類へ進んでいた。source のみ完了 helper へ変更し、後続 candidate の pending／request ID は維持 |
+| `collection_grid.rs` / `failed_independent_folder_load_keeps_collection_surface_and_history_unchanged` | main 未走査要求の受付を同期 I/O の失敗と誤認。§6.3(1) の `Classifying` 受付→worker 失敗通知→元 surface／履歴不変を検査 |
+| 同 / `failed_independent_scan_keeps_collection_root_surface_and_items_atomic` | 同じ受付／完了の混同。worker の失敗を待ち、元 root・items・世代・アドレス等の atomic な保持の期待を維持 |
+| `app.rs` / `disabling_memory_rebuilds_actual_items_with_common_view_order` | 最初の favorite の採用前に実 items の順序を検査していた。初期読込を完了 helper へ変更。無効化／再有効化後の実 rebuild・順序の検査は維持 |
+| 同 / `moving_between_favorites_and_common_context_keeps_actual_order_in_sync` | 各移動の採用前に favorite の sort を検査していた。3 回の読込を完了 helper へ変更し、各実順序の期待を維持 |
+| 同 / `reset_projects_layout_fields_and_leaves_the_common_quality_alone` | 初期 favorite 未採用で Details が適用されていなかった。初期読込だけ完了を待ち、reset 後の layout・quality・世代の期待は維持 |
+| 同 / `reset_rebuilds_actual_items_with_common_view_order` | 初期 favorite の走査待ちで rows が未採用。初期読込を完了 helper へ変更し、reset による実 rows の再構築は従来どおり検査 |
+| `gamepad_input.rs` / `list_order_gamepad_folder_accept_replaces_stale_snapshot_before_navigation` | Folder の carrier を旧 `Direct` として検査していた。同じ path を持つ `GridFolder` を検査し、凍結順の置換と採用前の source の期待は維持 |
+| `grid_parent.rs` / `section1473_router_tag_children_use_owner_and_zip_moves_only_one_level` | tag の Folder Back の採用待ち不足。実 post-render を通す完了 helper を追加し、戻り先と stack の期待を維持 |
+| `list_order_everything_tests.rs` / `list_order_everything_parent_uses_the_moved_row_and_nested_book_returns_to_its_folder_first` | inner ZIP→実フォルダの Back が未採用。完了 helper を追加し、元 row／drill の親／次の帰路の期待を維持 |
+| `menubar_search_jump_tests.rs` / `menubar_plain_books_root_opens_during_render_without_deferred_candidate` | render 中の受付を同期採用として検査していた。render 中に scan が始まることと、同じ完了経路での採用を検査。最終行き先は維持。実態に合わせ `menubar_plain_books_root_starts_during_render_and_adopts_without_deferred_candidate` へ改名 |
+| `multiwindow_scenario_tests.rs` / `multiwindow_scenario_a_folder_sidecar_restore_reaches_paint` | main 以外の同期 load に完了 helper を付け、検査対象の復元まで消費していた。元の `load_folder` に戻し、実 restore→paint の検査を維持 |
+| `release_checks.rs` / `release_pin_refresh_must_finish_before_a_following_open`（test-script のみ） | pin dirty の消費が D5 の Physical preflight になり、まだ復元が始まっていなかった。preflight のみ採用し、新 sidecar を残して後続 open の拒否を検査。許可後の open は完了を待つ |
+| `smart_folder.rs` / `epub_smart_modal_blocks_superseding_open_until_cancel` | modal 取消後の next folder の採用待ち不足。読込の完了を待ち、modal 中の拒否と取消後の行き先の期待は維持 |
+| `snapshot_ops.rs` / `browser870_snapshot_child_pdf_round_trip_restores_directory_source` | snapshot が初期 Directory の採用前の Other source を捕捉していた。初期読込を完了 helper へ変更し、元 Directory source／ページ構成の復元は維持 |
+| `startup_ops.rs` / `browser818_open_owner_initial_activation_and_agent_keep_intent_through_restore` | 手動 reply が path 解決だけで、実 worker が付ける Directory scan を欠いていた。実 worker と同じ走査処理で reply を構築し、復元開始時点の request seed を維持 |
+| 同 / `direct_media_activation_can_supersede_other_folder_and_fixed_snapshot_keeps_lock` | 同じ模擬 reply の欠落で余分な走査待ちになり、Loaded 後の明示 media 継続へ届かなかった。worker 相当の reply に補正し、置換／固定の期待は維持 |
+| 同 / `excluded_external_media_startup_and_activation_keep_projected_parent_and_siblings` | 同じ欠落で明示 media の一時的な表示継続が未実行。worker 相当の reply に補正し、除外対象の直接閲覧と兄弟順の期待は維持 |
+| 同 / `section1419_activation_and_bookmark_retire_earlier_main_requests` | B の模擬 reply が新しい走査を発行し、それを A の遅延完了として検査していた。B に実 worker の走査結果を付ける。A の退役と最終 owner の期待は維持 |
+| 同 / `section1419_snapshot_bookmark_classification_continuation_is_held_until_admission` | B と再開 A の模擬 resolver 完了が同じ走査結果を欠いていた。main のみ実 worker 相当にし、detached の非走査／保留と採用順の期待は維持 |
+| `tests/close_nav_801.rs` / `close_nav_801_ai_queue_held_does_not_block_pdf_return_handler` | C5 の親 scan 採用前に親を検査していた。完了を待ち、mutex 保持中に handler／採用が完了する検査と最終親を維持 |
+| 同 / `close_nav_801_inference_sessions_held_does_not_block_pdf_return_handler` | 同じ待ち不足。実完了 seam を通し、AI sessions の lock を取らない検査を維持。同期 Loaded を表していた受付の診断期待だけ Classifying に変更 |
+| 同 / `close_nav_801_remote_state_held_blocks_pdf_return_handler_at_named_lock` | 同じ親 scan 採用待ち不足。完了を待ち、既存 Remote lock の観測と最終親を維持 |
+| `tests.rs` / `direct_page_parent_return_preserves_parent_scroll_history` | C5 の親 scan 未採用。完了 helper を追加し、親・選択・scroll 240・reveal の期待は維持 |
+| 同 / `embedded_container_close_request_allows_parent_return_to_be_consumed` | 同じ未採用。既存 dispatcher 後に完了を待ち、親と fullscreen 終了／要求の消費の期待は維持 |
+| 同 / `file_organize_destinations_direct_handler_adopts_folder_and_history` | Direct 受付直後の同期採用を仮定。完了 helper を追加し、行き先と history の最終期待を維持 |
+| 同 / `history_transition_storage_keeps_app_stack_footprint_bounded` | 製品側の storage 退行。CloseReturn の描画 payload が navigation／owner に inline で伝播し App が 114,448 bytes になっていた。描画 payload を request ID と同じ所有者内の Box に移す。110,000 の上限を維持し、presentation 自体のサイズ上限も追加 |
+| 同 / `mixed_path_history_replay_accepts_old_spelling_and_restores_the_same_folder` | Direct の採用前で back stack が空だった。完了を待ってから旧 spelling を設定し、正規化された復元先／stack の期待は維持 |
+| 同 / `subfolder_expansion_button_exits_immediately_when_view_is_on` | D3 の終了を同期採用として検査。完了を待ち、合成一覧の終了／dialog の最終期待は維持 |
+| 同 / `section1705_local_filter_and_empty_bar_allow_history_keys_and_dispatch` | 完了 helper が検査対象の初期 sidecar まで消費していた。走査採用だけを待ち、実 modal→復元終了→history dispatch の期待を維持 |
+| `tests/scroll_661.rs` / `row_anchor_resume_keeps_middle_selected_row_in_both_renderers` | resume の helper が sidecar を先に完了していた。走査採用だけを待ち、実 hydration の選択優先処理と両 renderer の row anchor の期待を維持 |
+| `global_search_ui.rs` / `caption_drill_branch_identity_lives_with_installed_rows` | Folder の carrier が旧 Direct という前提。同じ branch path の GridFolder を検査し、検索終了後も行が開ける契約を維持 |
+| `test_script.rs` / `rating_folder_back_key_pointer_reveals_and_double_clicks_actual_large_grid_without_focus`（test-script のみ） | 同じ carrier の前提。選択済み key と同じ path の GridFolder を検査し、実 grid の選択／描画／pointer の期待は維持 |
+| `ui_main.rs` / `section1804_stack_pending_background_click_keeps_explicit_deselection` | 初期 folder の未採用で stack script の開始に届かなかった。走査採用後に既存の復元を完了し、pending 中の明示 deselection の期待は維持 |
+
+共通 helper `finish_direct_navigation_scan_before_hydration_for_test` は既存の post-render／fullscreen seam で
+走査採用までを待ち、採用が始めた sidecar は消費しない。既存の full helper はこれに復元待ちを加える。
+startup の新しい reply fixture は実 worker の `scan_startup_resolved_target` を呼び、main 以外は走査しない。
+意図して scan の無い応答を扱う既存 §1.285 テストは維持する。
+
+missing path の即時 bool を戻すための同期 metadata/read_dir は追加しない。§6.3(1) は未走査 main で
+`Classifying` を返す設計で、bool wrapper も元から Loaded／Classifying を受付成功とする。
+`saved_group_actions`・`collection_navigation`・`book_append_refresh` の成功後処理は走査済みの引数、
+変換書庫の成功後処理は別の ZIP/cache 経路と行き先照合、snapshot の実フォルダ fullscreen は上流の
+Required worker に属することを点検した。main 未走査の true を同期 install 成功として後処理する
+製品 caller は見つからなかった。wrapper に「受付結果であり採用完了を保証しない」と明記した。
+
+既存の最終一覧・選択・履歴・表示の期待値と App サイズ上限は変更していない。
+変更した中間期待は、未走査 main の即時失敗→非同期失敗、Folder の Direct→GridFolder carrier、
+同期受付の Loaded 診断→Classifying、および上表の採用／復元待ちである。
+
+利用者から指定された P3 の補強（§6.12 d5／d6）も追加した:
+
+- `src/app/native_video.rs` / `native_unblocked_home_end_and_hud_choose_real_targets_from_middle_item`:
+  3 項目の中央から Home／End と HUD 前後を実 handler に渡し、要求する移動と採用先・選択を検査する。
+  端の項目は実在の画像にし、decoder／native presenter／HWND を起動せずに通常の着地まで進める。
+- `src/ui_fullscreen/close_return_tests.rs` /
+  `close_return_wait_renders_live_zoom_pan_and_rotation_while_rejecting_page_targets`:
+  CloseReturn 中に通常 fullscreen を headless 描画し、現在ページの texture mesh の頂点と paint transform の一致、
+  zoom・pan・rotation を順に変えた実描画の変化を検査する。待ちの lock が残り、ページ送り／jump は拒否されることも検査する。
+- 同ファイルの既存 `close_return_captures_visible_previous_before_true_close_cleanup` は、捕捉を clone して元を drop した後も
+  同じ request ID と描画資源で sequence を始められる検査を追加し、Box 化後の所有を補強した。
+
+新しい返却事項はない。既存のお気に入り検索の重複 stack の判断待ちは、従来結果を維持したまま継続する。
+修正後のコンパイル・両構成のテスト成功、および App の実サイズは runner での再確認が必要。
+変更した Rust 22 ファイルは単体ごとの `rustfmt --edition 2024 --check --config skip_children=true` に成功し、
+`git diff --check` も成功した。これらはコンパイル・テストの成功証拠ではない。
+
+設計担当へ渡す r2 focused filter（実装担当では未実行）:
+
+```powershell
+$scan853R2Filter = 'test(browser818_) | test(saved_reveal_preserves_a_staged_classification_without_reserving_navigation) | test(failed_independent_) | test(favorite_view_state_tests) | test(list_order_gamepad_) | test(section1473_router_tag_children_) | test(list_order_everything_parent_) | test(menubar_plain_books_root_) | test(multiwindow_scenario_a_) | test(release_pin_refresh_) | test(epub_smart_modal_) | test(browser870_snapshot_child_) | test(direct_media_activation_) | test(excluded_external_media_) | test(section1419_) | test(close_nav_801_) | test(favorite_adjustment_defaults_tests) | test(file_organize_destinations_) | test(history_transition_storage_) | test(mixed_path_history_) | test(subfolder_expansion_button_exits_) | test(section1705_local_filter_) | test(row_anchor_resume_) | test(caption_drill_branch_) | test(rating_folder_back_key_pointer_) | test(section1804_stack_pending_) | test(native_) | test(close_return_)'
+cargo nextest run -p mimageviewer --lib -E $scan853R2Filter
+cargo nextest run -p mimageviewer --lib --features test-script -E $scan853R2Filter
+# focused と従前の関連 gate の後、同じ source で全件を両構成とも確認する。
+.\scripts\test-lib-full.ps1
+.\scripts\test-lib-full.ps1 -Features test-script
+```
+
 <!-- scan853-test-inventory -->
 
 #### `src/app/native_video.rs`
@@ -1643,6 +1734,7 @@ cargo nextest run -p mimageviewer --lib --features test-script -E $scan853R1Filt
 ```text
 native_home_end_and_hud_targeting_share_folder_wait_admission
 native_wait_gate_keeps_unblocked_inputs_and_swap_delta_coalescing
+native_unblocked_home_end_and_hud_choose_real_targets_from_middle_item
 ```
 
 #### `src/app/book_composition_permission_tests.rs`
@@ -2492,6 +2584,7 @@ preferences_transfer_busy_background_menu_and_toolbar_pointer_handlers
 close_return_captures_visible_previous_before_true_close_cleanup
 close_return_does_not_change_ctrl_folder_navigation_draw_policy
 close_return_live_render_keeps_fallback_and_input_lock_until_terminal
+close_return_wait_renders_live_zoom_pan_and_rotation_while_rejecting_page_targets
 close_return_page_and_jump_handlers_discard_new_targets_without_replay
 close_return_terminal_only_releases_its_own_request_and_exit_resets_panel
 close_return_waits_for_every_page_in_current_spread

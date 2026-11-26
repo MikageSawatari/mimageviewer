@@ -2615,7 +2615,9 @@ fn run_scenario_a(book: ScenarioABook) {
     });
     app.with_active_viewer_context(|active| {
         active.pending_auto_fs_open = true;
-        active.load_folder_and_finish_for_test(source.clone());
+        // Non-main opens still scan synchronously. Leave their real restore
+        // outstanding so the scenario can hold and release its checking owner.
+        active.load_folder(source.clone());
     })
     .expect("detached owner mounts for real book open");
     if matches!(book, ScenarioABook::Zip) {

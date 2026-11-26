@@ -949,6 +949,9 @@ fn browser818_presentation_activation_restore_materialized_keeps_request_seed() 
     });
     assert!(!root_focused(&output));
     output.drop_without_applying_deltas();
+    // This controlled resolver reply has no pre-scan. Adopt its real main scan
+    // without completing the restore whose request ownership is checked below.
+    app.finish_direct_navigation_scan_before_hydration_for_test();
     assert!(app.sidecar_restore_active());
     assert_eq!(
         app.sidecar_restore

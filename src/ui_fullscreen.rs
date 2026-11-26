@@ -4771,6 +4771,13 @@ enum FsNavHoldoverDecision {
 #[derive(Clone)]
 pub(crate) struct FsCloseReturnPresentation {
     pub(crate) request_id: u64,
+    // Close is cold; keep its captured geometry/resources out of every inline
+    // MainListNavigation and the App's pending-return enum storage.
+    drawing: Box<FsCloseReturnDrawing>,
+}
+
+#[derive(Clone)]
+struct FsCloseReturnDrawing {
     previous: Option<FsDisplayUnitHoldover>,
     chrome: FsNavigationChromeContinuation,
 }
@@ -4781,9 +4788,9 @@ impl std::fmt::Debug for FsCloseReturnPresentation {
             .field("request_id", &self.request_id)
             .field(
                 "pages",
-                &self.previous.as_ref().map(|unit| unit.pages.len()),
+                &self.drawing.previous.as_ref().map(|unit| unit.pages.len()),
             )
-            .field("chrome", &self.chrome)
+            .field("chrome", &self.drawing.chrome)
             .finish()
     }
 }
@@ -14165,8 +14172,7 @@ impl App {
         Some(FsCloseReturnPresentation {
             request_id: NEXT_CLOSE_RETURN_PRESENTATION_ID
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            previous,
-            chrome,
+            drawing: Box::new(FsCloseReturnDrawing { previous, chrome }),
         })
     }
 
@@ -14176,8 +14182,8 @@ impl App {
         presentation: &FsCloseReturnPresentation,
     ) {
         self.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
-            previous: presentation.previous.clone(),
-            chrome: presentation.chrome,
+            previous: presentation.drawing.previous.clone(),
+            chrome: presentation.drawing.chrome,
             purpose: FsNavigationPurpose::CloseReturn {
                 request_id: presentation.request_id,
             },

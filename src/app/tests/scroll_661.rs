@@ -567,7 +567,7 @@ fn row_anchor_after_list_adoption(route: &str) {
                         OpenRequestOwner::Navigation,
                         resume
                     ));
-                    env.finish_direct_navigation_scan_for_test();
+                    env.finish_direct_navigation_scan_before_hydration_for_test();
                 }
                 _ => unreachable!(),
             }

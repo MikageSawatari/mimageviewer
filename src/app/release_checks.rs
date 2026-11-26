@@ -445,6 +445,27 @@ mod tests {
         assert!(!app.release_check_interaction_ready());
         app.consume_folder_thumb_pin_dirty();
         assert!(app.folder_thumb_pin_dirty.is_empty());
+        assert!(!app.release_check_interaction_ready());
+        // A real-directory refresh now uses staged preflight even without an
+        // mtime. Adopt it without polling the newly started sidecar restore.
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        assert!(matches!(
+            app.top_level_grid_view.history_navigation_transition(),
+            Some(super::super::HistoryNavigationTransition::Physical(_))
+        ));
+        while app
+            .top_level_grid_view
+            .history_navigation_transition()
+            .is_some()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pin refresh preflight did not finish"
+            );
+            app.poll_collection_history_transition(&ctx);
+            std::thread::yield_now();
+        }
         // Reproduce the actual failure: the pin consumer starts sidecar
         // restoration, then the normal physical open refuses visible adoption.
         assert!(app.sidecar_restore_active());
@@ -456,7 +477,6 @@ mod tests {
             super::super::StartupListIntent::ExplicitList,
         ));
         assert_eq!(app.current_folder.as_ref(), Some(&child));
-        let ctx = egui::Context::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.sidecar_restore_active() {
             assert!(
@@ -474,6 +494,7 @@ mod tests {
             super::super::OpenRequestOwner::Navigation,
             super::super::StartupListIntent::ExplicitList,
         ));
+        app.finish_direct_navigation_scan_for_test();
         assert_eq!(app.current_folder.as_ref(), Some(&parent));
     }
 

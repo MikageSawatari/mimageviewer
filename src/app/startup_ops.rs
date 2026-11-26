@@ -3400,6 +3400,34 @@ mod startup_default_tests;
 mod tests {
     use super::*;
 
+    // A controlled resolver completion must include the same directory scan as
+    // the real resolver worker. Resolving the path alone leaves a second async
+    // open and skips the resolver's Loaded-only explicit-file continuation.
+    fn resolved_startup_result_for_test(
+        app: &App,
+        requested: PathBuf,
+        source: StartupOpenPathSource,
+        scan_main: bool,
+        ctx: &egui::Context,
+    ) -> StartupOpenPathResolveResult {
+        let mut result = resolve_startup_open_path(requested, source, None, true);
+        let resolve_ms = result.elapsed_ms;
+        scan_startup_resolved_target(
+            &mut result,
+            app.folder_scan_policy(),
+            scan_main,
+            &AtomicBool::new(false),
+            &StartupScanPhase::new(),
+            ctx,
+            None,
+            None,
+            "controlled-test",
+            app.input_seq,
+            resolve_ms,
+        );
+        result
+    }
+
     #[test]
     #[cfg(windows)]
     fn browser818_open_owner_initial_activation_and_agent_keep_intent_through_restore() {
@@ -3472,6 +3500,13 @@ mod tests {
                     }
                     _ => unreachable!(),
                 }
+                let result = resolved_startup_result_for_test(
+                    &app,
+                    requested.clone(),
+                    source,
+                    true,
+                    &egui::Context::default(),
+                );
                 let pending = app.startup_open_path_resolve_pending.as_mut().unwrap();
                 assert_eq!(
                     pending.owner.viewer_open_adoption().request(),
@@ -3481,13 +3516,7 @@ mod tests {
                 // The original worker's dropped receiver cannot affect the accepted owner.
                 let (tx, rx) = mpsc::channel();
                 pending.rx = rx;
-                tx.send(resolve_startup_open_path(
-                    requested.clone(),
-                    source,
-                    None,
-                    true,
-                ))
-                .unwrap();
+                tx.send(result).unwrap();
                 app.poll_startup_open_path_resolve(&egui::Context::default());
                 assert!(app.startup_open_path_resolve_pending.is_none());
                 assert!(
@@ -3640,16 +3669,18 @@ mod tests {
     fn section1419_complete_resolver(app: &mut App, ctx: &egui::Context) {
         let pending = app
             .startup_open_path_resolve_pending
-            .as_mut()
+            .as_ref()
             .expect("B resolver");
         let path = pending.requested.to_path_buf();
         let source = pending.owner.source();
+        let scan_main = unresolved_open_owner_is_main(&pending.owner);
+        let result = resolved_startup_result_for_test(app, path, source, scan_main, ctx);
+        let pending = app.startup_open_path_resolve_pending.as_mut().unwrap();
         pending.cancel.store(true, Ordering::Relaxed);
         pending.cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         pending.rx = rx;
-        tx.send(resolve_startup_open_path(path, source, None, true))
-            .unwrap();
+        tx.send(result).unwrap();
         app.poll_startup_open_path_resolve(ctx);
         app.finish_history_restore_preparation_for_test();
         app.finish_page_identity_preparation_for_test();
@@ -4371,11 +4402,12 @@ mod tests {
                     }
                     _ => None,
                 };
-                b_tx.send(resolve_startup_open_path(
+                b_tx.send(resolved_startup_result_for_test(
+                    &app,
                     destination.clone(),
                     StartupOpenPathSource::Activation,
-                    None,
                     true,
+                    &ctx,
                 ))
                 .unwrap();
                 app.poll_startup_open_path_resolve(&ctx);
@@ -5288,9 +5320,10 @@ mod tests {
                 .file_type_visibility
                 .excluded_extensions
                 .insert("png".into());
-            let result = resolve_startup_open_path(requested.clone(), source, None, true);
-            assert!(result.direct_media.is_some());
             let ctx = egui::Context::default();
+            let result =
+                resolved_startup_result_for_test(&app, requested.clone(), source, true, &ctx);
+            assert!(result.direct_media.is_some());
             let owner = match source {
                 StartupOpenPathSource::InitialStartup => {
                     StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences())
@@ -5545,11 +5578,12 @@ mod tests {
             image::RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30]))
                 .save(parent.join("1.jpg"))
                 .unwrap();
-            let result = resolve_startup_open_path(
+            let result = resolved_startup_result_for_test(
+                &app,
                 target.clone(),
                 StartupOpenPathSource::Activation,
-                None,
                 true,
+                &ctx,
             );
             app.finish_startup_open_path_resolve(
                 StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),

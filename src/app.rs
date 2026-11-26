@@ -152,7 +152,7 @@ mod clipboard_capture_admission_tests {
         let candidate = app.tmp.path().join("candidate.epub");
         std::fs::create_dir(&source).unwrap();
         std::fs::create_dir(&candidate).unwrap();
-        app.load_folder(source.clone());
+        app.load_folder_and_finish_for_test(source.clone());
         assert_eq!(
             app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                 candidate,
@@ -31877,6 +31877,8 @@ impl App {
         );
     }
 
+    /// Returns whether the load was accepted, including an asynchronous scan.
+    /// A true result does not guarantee that the destination has been adopted.
     pub(crate) fn load_folder_with_scan_owned(
         &mut self,
         path: PathBuf,
@@ -109731,7 +109733,7 @@ mod favorite_view_state_tests {
         app.settings.favorites.push(favorite);
         app.favorite_view_states.insert(id, favorite_state);
 
-        app.load_folder(folder);
+        app.load_folder_and_finish_for_test(folder);
         app.finish_page_identity_preparation_for_test();
         assert!(matches!(app.items.first(), Some(GridItem::Image(_))));
         assert_eq!(image_names(&app), ["b.jpg", "a.jpg"]);
@@ -109761,7 +109763,7 @@ mod favorite_view_state_tests {
         app.settings.favorites.push(favorite);
         app.favorite_view_states.insert(id, favorite_state);
 
-        app.load_folder(folder);
+        app.load_folder_and_finish_for_test(folder);
         app.finish_page_identity_preparation_for_test();
         assert_eq!(image_names(&app), ["b.jpg", "a.jpg"]);
 
@@ -109804,17 +109806,17 @@ mod favorite_view_state_tests {
         app.favorite_view_states.insert(favorite_b.id, state_b);
         app.settings.favorites.extend([favorite_a, favorite_b]);
 
-        app.load_folder(favorite_a_path);
+        app.load_folder_and_finish_for_test(favorite_a_path);
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
         assert_eq!(image_names(&app), ["b.jpg", "a.jpg"]);
 
-        app.load_folder(favorite_b_path);
+        app.load_folder_and_finish_for_test(favorite_b_path);
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.settings.sort_order, SortOrder::DateAsc);
         assert_eq!(image_names(&app), ["a.jpg", "b.jpg"]);
 
-        app.load_folder(common_path);
+        app.load_folder_and_finish_for_test(common_path);
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.settings.sort_order, SortOrder::FileName);
         assert_common_actual_order(&app);
@@ -109849,7 +109851,7 @@ mod favorite_view_state_tests {
         app.settings.favorites.push(favorite);
         app.favorite_view_states.insert(id, favorite_state);
 
-        app.load_folder(folder);
+        app.load_folder_and_finish_for_test(folder);
         assert_eq!(app.settings.grid_view_mode, GridViewMode::Details);
         assert_eq!(app.settings.grid_cols, 7, "列数はお気に入りの値になる");
         assert_eq!(app.settings.thumb_px, 512, "画質は共通のまま");

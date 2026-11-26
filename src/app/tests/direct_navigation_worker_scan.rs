@@ -5,6 +5,15 @@ use super::*;
 impl App {
     /// Settle only this new worker route. Tests keep their original post-adoption assertions.
     pub(crate) fn finish_direct_navigation_scan_for_test(&mut self) {
+        if self.direct_navigation_scan_pending() {
+            self.finish_direct_navigation_scan_before_hydration_for_test();
+            self.finish_page_identity_preparation_for_test();
+        }
+    }
+
+    /// Adopt the scan through the real frame seam, leaving the newly started
+    /// hydration owner intact for tests of admission and first-display ordering.
+    pub(crate) fn finish_direct_navigation_scan_before_hydration_for_test(&mut self) {
         let ctx = egui::Context::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while self.direct_navigation_scan_pending() {
@@ -25,7 +34,6 @@ impl App {
             #[cfg(not(windows))]
             self.post_render_main_navigation(&ctx, update_phases::MainFrameNavigation::default());
             if !self.direct_navigation_scan_pending() {
-                self.finish_page_identity_preparation_for_test();
                 return;
             }
             assert!(

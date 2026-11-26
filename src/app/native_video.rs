@@ -16998,6 +16998,82 @@ mod close_return_target_admission_tests {
         assert_eq!(app.native_video_deferred_nav_delta, Some(-1));
         assert_eq!(app.fullscreen_idx, Some(0));
     }
+
+    #[test]
+    fn native_unblocked_home_end_and_hud_choose_real_targets_from_middle_item() {
+        for (input, expected) in [("home", 0), ("end", 2), ("hud-prev", 0), ("hud-next", 2)] {
+            let ctx = egui::Context::default();
+            let mut app = crate::app::setup_app_for_test();
+            let first = app.tmp.path().join("first.png");
+            let last = app.tmp.path().join("last.png");
+            for path in [&first, &last] {
+                image::RgbImage::new(4, 8).save(path).unwrap();
+            }
+            // Image targets exercise the real selection/open handoff without a
+            // decoder, native presenter, HWND, or desktop input in this test.
+            app.items = vec![
+                GridItem::Image(first),
+                GridItem::Video(app.tmp.path().join("middle.mp4")),
+                GridItem::Image(last),
+            ];
+            app.visible_indices = vec![0, 1, 2];
+            app.image_metas = vec![None; 3];
+            app.thumbnails = vec![ThumbnailState::Pending; 3];
+            app.fullscreen_idx = Some(1);
+            app.selected = Some(1);
+            app.settings.detached_viewer_enabled = false;
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.viewer_presentation = ViewerPresentation::MainWindow;
+            assert!(!app.fs_nav_is_locked());
+            assert!(!app.fs_navigation_sequence_blocks_new_target());
+            if input == "home" || input == "end" {
+                let virtual_key = if input == "home" { 0x24 } else { 0x23 };
+                let action = if input == "home" {
+                    KeyAction::FsJumpFirst
+                } else {
+                    KeyAction::FsJumpLast
+                };
+                assert!(
+                    matches!(app.dispatch_native_video_key_event(&ctx, 1, key(virtual_key)),
+                    NativeVideoKeyOutcome::Action(actual) if actual == action)
+                );
+            } else {
+                let delta = if input == "hud-prev" { -1 } else { 1 };
+                app.handle_native_video_output_event(
+                    &ctx,
+                    1,
+                    0,
+                    crate::video::NativeVideoOutputEvent::NavigateItem {
+                        delta,
+                        via_wheel: false,
+                    },
+                );
+                // The resolver may finish in this same event. If still queued,
+                // verify the requested target direction before its adoption.
+                if let Some(request) = app.media_navigation_pending.as_ref() {
+                    assert!(matches!(&request.action,
+                        MediaNavigationAction::Manual { fs_idx: 1, delta: requested, landing: ManualMediaNavigationLanding::NativeVideo }
+                            if *requested == delta));
+                }
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while app.media_navigation_pending.is_some() {
+                    app.poll_media_navigation_pending(&ctx);
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "{input} target did not settle"
+                    );
+                    std::thread::yield_now();
+                }
+            }
+            assert_eq!(
+                app.fullscreen_idx,
+                Some(expected),
+                "{input} requested target"
+            );
+            assert_eq!(app.selected, Some(expected), "{input} mirrored selection");
+            assert!(app.native_video_deferred_nav_delta.is_none());
+        }
+    }
 }
 
 #[cfg(all(test, windows))]

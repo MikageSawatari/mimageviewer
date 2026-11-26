@@ -35432,6 +35432,7 @@ mod grid_reclick_open_tests {
                         OpenRequestOwner::Navigation,
                         StartupListIntent::ExplicitList,
                     ));
+                    app.finish_direct_navigation_scan_before_hydration_for_test();
                     app.finish_page_identity_preparation_for_test();
                     if !stacked {
                         app.move_grid_cursor(Some(3), crate::app::GridCursorIntent::Automatic);
