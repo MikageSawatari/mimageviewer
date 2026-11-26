@@ -5,6 +5,17 @@ use crate::folder_order::{
     FolderOrderWriteIntent,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FolderSortChoice {
+    Standard(crate::settings::SortOrder),
+    Manual,
+}
+
+pub(crate) struct FolderOrderResetConfirmation {
+    context: ViewerContextId,
+    folder_key: String,
+}
+
 pub(super) fn start_service() -> Option<FolderOrderService> {
     match FolderOrderService::start() {
         Ok(service) => Some(service),
@@ -44,6 +55,66 @@ fn completion_matches(
 }
 
 impl App {
+    /// Every sort control uses this mode owner. Standard callers retain their
+    /// existing settings-save/refresh tail; entering Manual owns its refresh here.
+    pub(crate) fn select_folder_sort(&mut self, choice: FolderSortChoice) -> bool {
+        match choice {
+            FolderSortChoice::Manual => {
+                if self
+                    .listing_sort_capabilities()
+                    .manual_order_disabled_reason
+                    .is_some()
+                {
+                    return false;
+                }
+                let revision = self.folder_order.order_revision;
+                self.enter_folder_manual_order();
+                self.folder_order.order_revision != revision
+            }
+            FolderSortChoice::Standard(order) => {
+                let revision = self.folder_order.order_revision;
+                self.leave_folder_manual_order();
+                let changed = self.settings.sort_order != order
+                    || self.folder_order.order_revision != revision;
+                self.settings.sort_order = order;
+                changed
+            }
+        }
+    }
+
+    pub(crate) fn folder_order_reset_available(&self) -> bool {
+        self.listing_sort_capabilities()
+            .manual_order_disabled_reason
+            .is_none()
+            && self.folder_order.record.is_some()
+    }
+
+    pub(crate) fn request_folder_order_reset_confirmation(&mut self) {
+        if self.folder_order_reset_available() {
+            self.folder_order_reset_confirmation = Some(FolderOrderResetConfirmation {
+                context: self.projected_viewer_context_id(),
+                folder_key: self.folder_order.folder_key.clone().unwrap(),
+            });
+        }
+    }
+
+    pub(crate) fn folder_order_reset_dialog_visible(&self) -> bool {
+        self.folder_order_reset_confirmation.is_some()
+    }
+
+    pub(crate) fn resolve_folder_order_reset_confirmation(&mut self, confirmed: bool) {
+        let Some(target) = self.folder_order_reset_confirmation.take() else {
+            return;
+        };
+        if confirmed
+            && target.context == self.projected_viewer_context_id()
+            && self.folder_order.folder_key.as_ref() == Some(&target.folder_key)
+            && self.folder_order_reset_available()
+        {
+            self.reset_folder_manual_order();
+        }
+    }
+
     pub(super) fn retire_folder_order_for_listing(&mut self) {
         // Retiring an already out-of-scope owner has no transition to publish.
         if matches!(
@@ -159,9 +230,8 @@ impl App {
         }
         let stack_was_active = self.stack_mode_requested;
         if stack_was_active {
-            self.stack_mode_requested = false;
+            self.prepare_stack_mode_for_reload(false);
             self.cancel_stack_script_pending();
-            self.stack_selection_target = None;
         }
         let revision = self.folder_order.order_revision;
         let intent = self.folder_order.enter_manual();
@@ -194,7 +264,9 @@ impl App {
         let intent = self.folder_order.reset();
         self.submit_folder_order_intent(intent);
         if self.folder_order.order_revision != revision {
-            self.stack_mode_requested = false;
+            if self.stack_mode_requested {
+                self.prepare_stack_mode_for_reload(false);
+            }
             self.cancel_stack_script_pending();
             self.stack_selection_target = None;
             self.apply_sort_change_reload();
@@ -361,6 +433,167 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    fn recorded_fixture() -> (AppTestEnvForTest, PathBuf) {
+        let (mut app, folder) = fixture();
+        app.select_folder_sort(FolderSortChoice::Manual);
+        finish_refresh(&mut app);
+        let mut order = keys(&app);
+        order.reverse();
+        app.commit_folder_manual_reorder(&order);
+        finish_refresh(&mut app);
+        assert!(read_record(&app, &folder).is_some());
+        (app, folder)
+    }
+
+    #[test]
+    fn folder_manual_choice_is_enter_only_and_preserves_details_header() {
+        let (mut app, folder) = fixture();
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+        assert!(app.select_folder_sort(FolderSortChoice::Manual));
+        finish_refresh(&mut app);
+        let revision = app.folder_order.order_revision;
+        assert!(!app.select_folder_sort(FolderSortChoice::Manual));
+        assert_eq!(app.folder_order.order_revision, revision);
+        assert_eq!(
+            app.settings.details_sort_key,
+            crate::settings::DetailsSortKey::Name
+        );
+        assert!(read_record(&app, &folder).is_none());
+    }
+
+    #[test]
+    fn folder_manual_assigned_grid_key_enters_once_through_common_handler() {
+        let (mut app, folder) = fixture();
+        app.keymap =
+            crate::keymap::Keymap::from_ini_str("[Grid]\nGridEnterFolderManualOrder = F19\n");
+        let ctx = egui::Context::default();
+        let mut revision = app.folder_order.order_revision;
+        for (pressed, changes) in [(true, true), (false, false), (true, false)] {
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::F19,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            let _ = app.handle_keyboard(&ctx);
+            ctx.end_pass().drop_without_applying_deltas();
+            if changes {
+                assert!(app.folder_order.order_revision > revision);
+                finish_refresh(&mut app);
+                revision = app.folder_order.order_revision;
+            } else {
+                assert_eq!(app.folder_order.order_revision, revision);
+            }
+            assert_eq!(app.folder_order.mode, FolderOrderMode::ManualUnrecorded);
+        }
+        assert!(read_record(&app, &folder).is_none());
+    }
+
+    #[test]
+    fn folder_manual_standard_choice_deactivates_record_even_when_base_value_matches() {
+        let (mut app, folder) = recorded_fixture();
+        let base = app.settings.sort_order;
+        let revision = app.folder_order.order_revision;
+        assert!(app.select_folder_sort(FolderSortChoice::Standard(base)));
+        assert_eq!(app.folder_order.mode, FolderOrderMode::Normal);
+        assert!(app.folder_order.order_revision > revision);
+        assert!(!read_record(&app, &folder).unwrap().active);
+        assert_eq!(app.settings.sort_order, base);
+    }
+
+    #[test]
+    fn folder_manual_stack_toggle_and_manual_entry_keep_active_record_without_stack_writes() {
+        let (mut app, folder) = recorded_fixture();
+        let record = read_record(&app, &folder);
+        app.toggle_stack_mode();
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert!(app.stack_mode_requested);
+        assert!(!app.folder_manual_order_applied());
+        assert_eq!(read_record(&app, &folder), record);
+        assert!(app.select_folder_sort(FolderSortChoice::Manual));
+        assert!(!app.stack_mode_requested);
+        finish_refresh(&mut app);
+        assert!(app.folder_manual_order_applied());
+        assert_eq!(read_record(&app, &folder), record);
+    }
+
+    #[test]
+    fn folder_manual_reset_confirmation_cancel_escape_and_enter_preserve_or_reset_record() {
+        let (mut app, folder) = recorded_fixture();
+        let record = read_record(&app, &folder);
+        app.request_folder_order_reset_confirmation();
+        assert!(app.common_modal_dialog_open());
+        assert_eq!(
+            app.modal_dialog_block_reason_filtered(false, false),
+            Some("folder_order_reset")
+        );
+        app.resolve_folder_order_reset_confirmation(false);
+        assert!(!app.folder_order_reset_dialog_visible());
+        assert_eq!(read_record(&app, &folder), record);
+        let ctx = egui::Context::default();
+        for key in [egui::Key::Escape, egui::Key::Enter] {
+            app.request_folder_order_reset_confirmation();
+            ctx.begin_pass(egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            });
+            app.show_folder_order_reset_confirm_dialog(&ctx);
+            ctx.end_pass().drop_without_applying_deltas();
+            assert!(!app.folder_order_reset_dialog_visible());
+            if key == egui::Key::Escape {
+                assert_eq!(read_record(&app, &folder), record);
+            } else {
+                assert!(read_record(&app, &folder).is_none());
+                assert_eq!(app.folder_order.mode, FolderOrderMode::ManualUnrecorded);
+                finish_refresh(&mut app);
+            }
+        }
+    }
+
+    #[test]
+    fn folder_manual_reset_confirmation_does_not_reset_a_different_folder_owner() {
+        let (mut app, folder) = recorded_fixture();
+        let record = read_record(&app, &folder);
+        app.request_folder_order_reset_confirmation();
+        app.folder_order.folder_key = Some(folder_key(&folder.join("other")));
+        app.resolve_folder_order_reset_confirmation(true);
+        assert!(!app.folder_order_reset_dialog_visible());
+        assert_eq!(read_record(&app, &folder), record);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn folder_manual_reset_confirmation_does_not_reset_same_folder_sibling() {
+        let (mut app, folder) = recorded_fixture();
+        let record = read_record(&app, &folder);
+        let original = app.folder_order.clone();
+        app.request_folder_order_reset_confirmation();
+        let sibling_state = original.clone();
+        let sibling_folder = folder.clone();
+        let sibling = app.build_window_context_for_test(91913, |owner| {
+            owner.folder_order = sibling_state;
+            owner.current_folder = Some(sibling_folder);
+        });
+        app.with_viewer_context(sibling, |owner| {
+            owner.resolve_folder_order_reset_confirmation(true);
+            assert_eq!(owner.folder_order, original);
+        })
+        .unwrap();
+        assert_eq!(app.folder_order, original);
+        assert_eq!(read_record(&app, &folder), record);
     }
 
     #[test]

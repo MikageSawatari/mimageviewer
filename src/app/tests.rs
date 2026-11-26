@@ -110278,7 +110278,8 @@ mod ring_picker_owner_tests {
 
         let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
         picker.dirty_rows.push(RingPickerRowId::GridSortOrder);
-        picker.sort_order = crate::settings::SortOrder::DateDesc;
+        picker.grid_sort_choice =
+            crate::app::FolderSortChoice::Standard(crate::settings::SortOrder::DateDesc);
         app.ring_picker = Some(picker);
         // 組み直しが所有窓へ届いたかを見るため、いったん空にする。
         app.items.clear();

@@ -661,6 +661,7 @@ use book_preferred_rating::{ContainerRatingTarget, ContainerRatingToast};
 #[cfg(test)]
 mod book_preferred_rating_tests;
 mod folder_manual_order;
+pub(crate) use folder_manual_order::FolderSortChoice;
 mod folder_pane_reclick;
 pub(crate) mod folder_scan;
 #[cfg(test)]
@@ -16639,6 +16640,8 @@ pub struct App {
     pub(crate) list_order: Option<Arc<ListOrderSnapshot>>,
     pub(crate) folder_order: crate::folder_order::FolderOrderState,
     pub(crate) folder_order_service: Option<crate::folder_order::FolderOrderService>,
+    pub(crate) folder_order_reset_confirmation:
+        Option<folder_manual_order::FolderOrderResetConfirmation>,
     /// 実フォルダ open の worker scan 待ち ([`FolderPaneOpenPending`])。
     /// folder pane と detached image open のどちらも bundle ownership で保持する。
     folder_pane_open_pending: Option<FolderPaneOpenPending>,
@@ -21105,6 +21108,7 @@ impl App {
             list_order: None,
             folder_order: Default::default(),
             folder_order_service: folder_manual_order::start_service(),
+            folder_order_reset_confirmation: None,
             folder_pane_open_pending: None,
             drive_jump_pending: None,
             #[cfg(test)]
@@ -24422,6 +24426,7 @@ impl App {
             self.edit_bundle_apply_pending.is_some() => "edit_bundle_apply_pending",
             self.edit_bundle_bulk_pending.is_some() => "edit_bundle_bulk_pending",
             self.show_rotation_reset_confirm => "rotation_reset_confirm",
+            self.folder_order_reset_dialog_visible() => "folder_order_reset",
             self.reading_history_clear_dialog_visible() => "reading_history_clear_confirm",
             self.pdf_password_dialog_path().is_some() => "pdf_password",
             self.show_about_dialog => "about",
@@ -60440,6 +60445,17 @@ impl App {
             self.toggle_stack_mode();
             return None;
         }
+        if !matches!(
+            block,
+            crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan
+                | crate::filename_stack_ui::GridItemInputBlock::ViewOrderRefreshScan
+        ) && self
+            .keymap
+            .consume_action_no_repeat(ctx, KeyAction::GridEnterFolderManualOrder)
+        {
+            self.select_folder_sort(FolderSortChoice::Manual);
+            return None;
+        }
         if !self.ime_input_active(ctx) && self.consume_context_shortcuts_help_key(ctx) {
             self.show_context_shortcuts_help = true;
             return None;
@@ -60775,6 +60791,14 @@ impl App {
             .consume_action(ctx, KeyAction::GridToggleStackMode)
         {
             self.toggle_stack_mode();
+            return None;
+        }
+
+        if self
+            .keymap
+            .consume_action_no_repeat(ctx, KeyAction::GridEnterFolderManualOrder)
+        {
+            self.select_folder_sort(FolderSortChoice::Manual);
             return None;
         }
 
@@ -104236,6 +104260,7 @@ impl App {
         self.show_stats_dialog_window(ctx);
         self.show_omitted_entries_dialog(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
+        self.show_folder_order_reset_confirm_dialog(ctx);
         self.show_reading_history_clear_confirm_dialog(ctx);
         self.show_cover_crop_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);

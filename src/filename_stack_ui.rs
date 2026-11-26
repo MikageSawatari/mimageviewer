@@ -2054,6 +2054,14 @@ impl crate::app::App {
         if self.current_folder.is_none() {
             return;
         }
+        self.prepare_stack_mode_for_reload(!self.stack_mode_requested);
+        self.reload_current_folder_preserving_override();
+        self.show_stack_toggle_feedback();
+    }
+
+    /// Shared by the stack toggle and manual-order entry. The caller owns the
+    /// reload, so a sort transition does not start a second listing replacement.
+    pub(crate) fn prepare_stack_mode_for_reload(&mut self, requested: bool) {
         // トグル前のカーソル画像 (代表パス) を捕まえ、トグル後も同じ被写体に留まるようにする。
         let target = self.current_selected_representative_path();
         // 通常フォルダでの選択は名前ベースの select_after_load で復元する (ON 時の計算中の
@@ -2066,13 +2074,15 @@ impl crate::app::App {
         {
             self.select_after_load = Some(name.to_string().into());
         }
-        self.stack_mode_requested = !self.stack_mode_requested;
+        self.stack_mode_requested = requested;
         self.stack_selection_target = if self.stack_mode_requested {
             target.map(StackSelectionTarget::MemberPath)
         } else {
             None
         };
-        self.reload_current_folder_preserving_override();
+    }
+
+    fn show_stack_toggle_feedback(&mut self) {
         // スクリプトをワーカーで計算中 (async) のときは、ここではトーストしない。完了時に
         // poll_stack_script が採用ルール / 失敗 / 非該当のトーストを出す。
         if self.stack_mode_requested && self.stack_script_pending.is_none() {

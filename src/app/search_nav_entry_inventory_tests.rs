@@ -263,6 +263,7 @@ fn key_entry(action: KeyAction) -> Entry {
         | GridToggleMaximize
         | GridToggleFolderTreePane
         | GridToggleStackMode
+        | GridEnterFolderManualOrder
         | GridConvertEpubToPdf
         | GridTagApply
         | GridRotateCw

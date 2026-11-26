@@ -3339,7 +3339,7 @@ pub struct RingPickerContainerTarget {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RingPickerOriginalState {
     pub grid_cols: usize,
-    pub sort_order: crate::settings::SortOrder,
+    pub(crate) grid_sort_choice: crate::app::FolderSortChoice,
     pub thumb_aspect_auto: bool,
     pub thumb_aspect: crate::settings::ThumbAspect,
     pub item_rating_records: Vec<RingPickerRatingTarget>,
@@ -3387,7 +3387,7 @@ pub struct RingPickerState {
     pub x_close_armed: bool,
     pub drill: Option<PickerListState>,
     pub grid_cols: usize,
-    pub sort_order: crate::settings::SortOrder,
+    pub(crate) grid_sort_choice: crate::app::FolderSortChoice,
     pub thumb_aspect_auto: bool,
     pub thumb_aspect: crate::settings::ThumbAspect,
     pub item_rating: u8,

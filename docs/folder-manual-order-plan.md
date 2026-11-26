@@ -551,3 +551,42 @@ Smart root の履歴採用後、定義の範囲外にある新しい通常物理
 - EPUB・7z 名のディレクトリ × 3 種の fixture load 入口で、準備済みの未記録索引でも分類状態が残り、
   Remote 取得で cancel され、後から結果を poll しても移動先を開かないことを検証するテストを追加した。
 - `cargo fmt`（引数なし）と `git diff --check` を実施し、コンパイル・テスト・コミットは利用者指定により実施しない。
+
+### 実装記録 (段 3)
+
+- 段 2 は `4657a489f` までの関連 1143 件が成功したとの設計担当の報告を引き継いだ。
+  段 3 のコンパイル・テスト実行結果を表すものではない。
+- UI の選択は `FolderSortChoice::Standard(SortOrder) | Manual` で共通の `select_folder_sort` へ渡す。
+  Standard は手動の解除と既存設定値の変更までを担当し、保存と再表示は各入口の既存の末尾で一度だけ行う。
+  Manual は段 2 の遷移と再表示を自身で担当する。再選択は何もせず、スタック中の選択だけは OFF にして手動へ戻す。
+  `SortOrder` の保存形式には手動を追加しない。同値の Standard 選択も、手動がスタックで隠れている場合を含め通常へ戻す。
+- メニューと toolbar / facet の両 dropdown へ「手動順 (このフォルダ)」と「手動順をリセット…」を追加した。
+  手動が適用されている間は通常順の選択表示を外す。`listing_sort_capabilities` の手動用の無効理由は、
+  段 2 の物理一覧の対象判定から導き、詳細ヘッダの表示上の並べ替えとは独立させた。手動を選んでもヘッダ設定は変えない。
+- **ツールバーの手動個別ボタンは未追加**。`settings.rs:6295` の `toolbar_sort_items: Vec<SortOrder>` と
+  ツールバーの「出すソート」の編集が、個別ボタンの集合を所有している。手動をその集合で設定できるようにするには
+  新しい設定表現が必要なため、利用者の段 3 指示に従ってこの部分を停止した。無条件の追加や新設定は行わない。
+  既存の設定済み Standard ボタンは共通 handler へ接続し、手動から同値を選んだ場合も解除する。
+- リセット確認は要求元の context ID と folder key を保持し、その対象の記録だけを破棄する。
+  `common_modal_dialog_open` へ表示 helper を登録した。Window は `default_pos`、通常の OS テーマ、意味色の警告、
+  IME 対応の Enter / Escape helper と非 repeat Enter を使う。Cancel・Escape・× は記録を変えない。
+  純描画 helper の小画面テストは 1093×614 相当の 100% / 200%、Light / Dark で操作行の矩形と実クリックを検証する。
+  同じフォルダを開いた兄弟 context に確認操作を渡しても記録を破棄しない回帰を追加した。
+- スタックの既存 toggle の「次の再表示に向けた状態と選択ヒントの変更」を helper として共有した。
+  手動への切り替え・リセットも同じ helper を通し、再表示自体は sort refresh 一回に揃える。
+  スタック ON/OFF は記録と active を保持し、DB へ書かない。既存のスタックの入力受付・通知は維持する。
+- ゲームパッドの picker は一つの `grid_sort_choice` を持ち、通常順と手動を同じ選択列で循環する。
+  collection の所有先と既存のロックは維持する。preview は共通 handler を使い、確定時は既に適用した手動を再実行しない。
+  preview を閉じても既に適用した変更を保持する既存契約も維持する。
+- `GridEnterFolderManualOrder` を Grid / Press / 既定なしで追加し、KeyAction の列挙・INI 名・説明・context・trigger・
+  default・ALL_ACTIONS と実際の入力 helper を接続した。既定 INI と keymap 仕様も同期した。操作は enter-only。
+  スタック等の入力保留中は既存の受付条件に従う。
+- Remote の手動 shape は段 2 の `FolderOrderState::applies_to_physical_listing` が決めており、PC の適用表示も同じ helper を使う。
+  `selected: manual`・単一 option・locked reason と SetSortOrder の拒否は変更しない。protocol は 74 のまま。
+- 既存の `facet_sort_dark` / `facet_sort_narrow_dark` / `facet_sort_edges_dark` / `facet_sort_edges_narrow_dark` は
+  閉じた combo の純描画 fixture で、`tag_sort_choices_dark` も専用のタグ選択のみ。今回の追加行を開く既存 PNG は無いため、
+  更新対象の既存 baseline は無い。PNG の生成・更新は行わず、実入力と geometry の回帰を追加した。
+- 追加テストは 19 件。既存の INI / settings 往復テストは手動順の操作も含め、
+  `unassigned_grid_actions_roundtrip_ini_and_settings` へ改名した。
+  `cargo fmt`（引数なし）、`python scripts/check_ui_glyphs.py`、`git diff --check` は正常終了。
+  コンパイル・テスト・検証用ビルド・コミットは利用者指定により実施せず、設計担当の共有 runner へ引き継ぐ。

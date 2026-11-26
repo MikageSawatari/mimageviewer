@@ -110,8 +110,8 @@ fn sort_hold_838_picker_descending_replaces_ascending_request_and_order() {
     // DurationDesc immediately follows DurationAsc in the released picker.
     h.pad(&[PadEvent::ButtonPressed(PadButton::DPadRight)]);
     assert_eq!(
-        h.env.ring_picker.as_ref().unwrap().sort_order,
-        SortOrder::DurationDesc
+        h.env.ring_picker.as_ref().unwrap().grid_sort_choice,
+        crate::app::FolderSortChoice::Standard(SortOrder::DurationDesc)
     );
     assert_eq!(h.env.settings.sort_order, SortOrder::DurationDesc);
     let b = HeldScan::capture(&mut h.env);
