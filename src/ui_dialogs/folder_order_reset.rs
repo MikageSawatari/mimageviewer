@@ -116,8 +116,9 @@ mod tests {
                         crate::ui_fonts::configure_fonts(ctx);
                     })
                     .with_size(egui::vec2(1093.0, 614.0) / scale)
-                    .build(move |ctx| {
-                        let output = draw_reset_confirmation(ctx, false, false);
+                    .build_ui(move |ui| {
+                        let ctx = ui.ctx().clone();
+                        let output = draw_reset_confirmation(&ctx, false, false);
                         if output.geometry.is_some() {
                             observed_geometry.set(output.geometry);
                         }
