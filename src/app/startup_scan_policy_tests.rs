@@ -241,8 +241,9 @@ fn check_policy_refresh(change: Change) {
     );
     #[cfg(feature = "test-script")]
     assert_eq!(
-        app.test_script_folder_load_requests, loads,
-        "scan continuation must not admit another load"
+        app.test_script_folder_load_requests,
+        loads + 1,
+        "the rescan is not counted; only the single adoption load of this startup request is"
     );
 }
 
