@@ -34,11 +34,11 @@ fn mask_detect_foreground_handoff_preserves_new_editor(close: bool) {
         app.with_viewer_context_state(owner, |app| {
             let request = app.capture_mask_detect_request(tool).unwrap();
             assert_eq!(request.context, owner);
-            app.mask_detect_pending = Some(MaskDetectPending {
+            app.mask_detect_pending = Some(Box::new(MaskDetectPending {
                 request,
                 cancel: Arc::clone(&old_cancel),
                 rx: old_rx,
-            });
+            }));
         })
         .unwrap();
         assert_eq!(app.projected_viewer_context_id(), main);
@@ -109,11 +109,11 @@ fn mask_detect_foreground_handoff_preserves_new_editor(close: bool) {
         let source = Arc::clone(&new_request.source);
         let new_cancel = Arc::new(AtomicBool::new(false));
         let (_new_tx, new_rx) = mpsc::channel();
-        app.mask_detect_pending = Some(MaskDetectPending {
+        app.mask_detect_pending = Some(Box::new(MaskDetectPending {
             request: new_request,
             cancel: Arc::clone(&new_cancel),
             rx: new_rx,
-        });
+        }));
         let basis = crate::material_display_basis::MaterialDisplayBasis::from_sampler(
             [8, 8],
             crate::source_coverage::SourceCoverage::FullSource,

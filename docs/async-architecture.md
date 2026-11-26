@@ -3,6 +3,7 @@
 ## 顔の自動検出（§1.914 段 1b、実装、cargo検証待ち）
 
 3 ツール共通の `MaskDetectPending` は viewer context ごとに 1 つで、開始時の対象を固定した要求・取消フラグ・受信口を所有する。
+App と bundle は `Option<Box<MaskDetectPending>>` で保持し、捕捉した文書を含む要求を inline で常駐させない。
 `launch_mask_detect_worker` は本番とテストの推論注入で共有する。1 回ごとの worker が `local_ai_activity_lease()` を
 ランタイム待ちから thread 終了まで保持し、YuNet の各段の区切りで取消を調べる。
 UI は `try_recv` で受け取り、context・page key・items 世代・ソースの Arc・ツールの編集対象が開始時と同じ場合だけ反映する。

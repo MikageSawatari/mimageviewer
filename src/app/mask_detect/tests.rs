@@ -114,11 +114,11 @@ pub(super) fn mask_detect_queue(
     let (tx, rx) = mpsc::channel();
     assert!(tx.send(Ok(output)).is_ok());
     let cancel = Arc::new(AtomicBool::new(false));
-    app.mask_detect_pending = Some(MaskDetectPending {
+    app.mask_detect_pending = Some(Box::new(MaskDetectPending {
         request,
         cancel: Arc::clone(&cancel),
         rx,
-    });
+    }));
     cancel
 }
 
@@ -587,10 +587,12 @@ fn mask_detect_dialog_actions_fit_small_screen_at_100_and_200_percent() {
                 .drop_without_applying_deltas();
             }
             let window = ctx
-                .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("mask_detect_window")))
+                .data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("mask_detect_window")))
                 .expect("dialog was drawn");
             let actions = ctx
-                .data(|data| data.get_temp::<Vec<egui::Rect>>(egui::Id::new("mask_detect_actions")))
+                .data(|data| {
+                    data.get_temp::<Vec<egui::Rect>>(egui::Id::unique("mask_detect_actions"))
+                })
                 .expect("action row was drawn");
             assert_eq!(actions.len(), 2);
             assert!(

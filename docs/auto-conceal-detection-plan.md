@@ -329,6 +329,7 @@ impl Drop for MaskDetectPending { fn drop(&mut self) { self.cancel.store(true, R
 ```
 
 - 待ちは **viewer context の bundle に 1 つだけ** (既存の `local_adjust_segmentation_pending` と同じ扱い)。
+  App / bundle のフィールドは `Option<Box<MaskDetectPending>>` とし、捕捉した文書を含む payload を heap に置く。
   消しゴム・隠蔽加工の編集中の mask / shapes / Undo は、既存の foreground 共通 draft のままである。
   service の一時 mount はその draft を交換しない。実際の foreground 引き渡しでは旧 owner 上で
   検出を取消・モードを reset してから新しい editor を開始する。この取消境界も検査する
@@ -909,3 +910,19 @@ mask_detect_parked_empty_receiver_keeps_root_poll_awake_until_result
   コンパイル・テストの実行は設計担当へ引き継ぐ。
 - `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。cargo の build / test / check / clippy、
   git add / commit は実行していない。再検証は `test(/mask_detect|^ai::detect::/)` で追加テストを含めて実行できる。
+
+## 22. lib 全件テストの失敗と非推奨 Id の修正 (対象 8144ef46b、修正後の実行検証待ち)
+
+- 設計担当による本体 lib 全件（21,036 件）の実行で、設定分類の件数と App のサイズ上限の 2 件が失敗したとの報告を受けた。
+  今回の実装担当は cargo の build / test / check / clippy を実行しない。
+- `mask_detect` は形・余白・閾値をまとめた Settings の 1 フィールドで、分類表には既に「環境設定外のツール設定」として
+  除外登録されていた。隠蔽加工と同じ除外を維持し、固定件数を総数 525 / 対象 174 / 除外 351 に更新する。
+  `mask_detect_tool_settings_are_excluded_from_preferences_transfer` を追加し、書き出しに含めず、読み込みで手元の 3 設定を
+  上書きしないことを検査する。
+- 大きな待ち状態は App と bundle の両方で `Option<Box<MaskDetectPending>>` に変更し、本番の生成と結果注入 fixture を揃える。
+  `local_adjust_segmentation_pending` は既存の inline 保持のまま。履歴遷移・PDF 採用などの Box 化の先例に合わせ、今回追加した待ちだけを対象にする。
+  取消・結果の照合・context の移譲は同じ pending を使う。`history_transition_storage_keeps_app_stack_footprint_bounded` の
+  110,000 バイトの上限は維持し、待ちフィールド自体が pointer 1 個分であることの検査を追加する。
+- Window と共有テストデータのキーはグローバルな Id なので `Id::unique` に揃え、テストの読み取りも同じ呼び出しにする。
+  ローカルな ScrollArea の `id_salt` は既存の書き方を維持する。`Id::new` は `Id::unique` への互換呼び出しだったので hash は変わらない。
+- `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。コンパイル・テストの再実行は設計担当へ引き継ぎ、git add / commit は実行していない。

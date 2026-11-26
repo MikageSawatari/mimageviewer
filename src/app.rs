@@ -18959,7 +18959,8 @@ pub struct App {
     pub(crate) local_adjust_lut_pending: Option<LocalAdjustLutLoadPending>,
     /// 補正レイヤーの被写体/領域マスク生成 worker。
     pub(crate) local_adjust_segmentation_pending: Option<LocalAdjustSegmentationPending>,
-    pub(crate) mask_detect_pending: Option<MaskDetectPending>,
+    /// Rare, captured detection state lives on the heap, including its document claim.
+    pub(crate) mask_detect_pending: Option<Box<MaskDetectPending>>,
     pub(crate) mask_detect_dialog: Option<MaskDetectTool>,
     pub(crate) erase_session: u64,
     pub(crate) conceal_session: u64,

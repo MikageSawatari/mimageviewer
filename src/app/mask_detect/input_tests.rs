@@ -156,7 +156,7 @@ fn mask_detect_modal_blocks_tool_keys_raw_canvas_and_both_local_panels() {
             };
             for id in panel_ids {
                 assert_eq!(
-                    ctx.data(|d| d.get_temp::<bool>(egui::Id::new(id))),
+                    ctx.data(|d| d.get_temp::<bool>(egui::Id::unique(id))),
                     Some(false),
                     "panel {id} must be disabled"
                 );
@@ -226,8 +226,10 @@ fn mask_detect_eye_preview_rejects_start_but_keeps_existing_hold_until_release()
             let eye = if tool == MaskDetectTool::Conceal {
                 app.conceal_preview_button_rect.unwrap()
             } else {
-                ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::new("mask_detect_erase_eye_rect")))
-                    .unwrap()
+                ctx.data(|d| {
+                    d.get_temp::<egui::Rect>(egui::Id::unique("mask_detect_erase_eye_rect"))
+                })
+                .unwrap()
             };
             let pointer = |pressed| {
                 vec![
@@ -610,7 +612,7 @@ fn mask_detect_expanded_dialog_keeps_actions_outside_scroll_at_small_screen() {
             frame(&mut app, Vec::new());
         }
         let header = ctx
-            .data(|d| d.get_temp::<egui::Rect>(egui::Id::new("mask_detect_details")))
+            .data(|d| d.get_temp::<egui::Rect>(egui::Id::unique("mask_detect_details")))
             .unwrap();
         for pressed in [true, false] {
             frame(
@@ -630,18 +632,18 @@ fn mask_detect_expanded_dialog_keeps_actions_outside_scroll_at_small_screen() {
             frame(&mut app, Vec::new());
         }
         assert_eq!(
-            ctx.data(|d| d.get_temp::<bool>(egui::Id::new("mask_detect_details_open"))),
+            ctx.data(|d| d.get_temp::<bool>(egui::Id::unique("mask_detect_details_open"))),
             Some(true)
         );
         let body = ctx
-            .data(|d| d.get_temp::<ScrollLayout>(egui::Id::new("mask_detect_body_layout")))
+            .data(|d| d.get_temp::<ScrollLayout>(egui::Id::unique("mask_detect_body_layout")))
             .unwrap();
         body.assert_height(HeightExpectation::Fits, screen, scale);
         let actions = ctx
-            .data(|d| d.get_temp::<Vec<egui::Rect>>(egui::Id::new("mask_detect_actions")))
+            .data(|d| d.get_temp::<Vec<egui::Rect>>(egui::Id::unique("mask_detect_actions")))
             .unwrap();
         let window = ctx
-            .data(|d| d.get_temp::<egui::Rect>(egui::Id::new("mask_detect_window")))
+            .data(|d| d.get_temp::<egui::Rect>(egui::Id::unique("mask_detect_window")))
             .unwrap();
         for action in actions {
             assert!(
@@ -774,11 +776,11 @@ fn mask_detect_parked_empty_receiver_keeps_root_poll_awake_until_result() {
         .unwrap();
     let owner_key = request.page_key.clone();
     let (tx, rx) = mpsc::channel();
-    app.mask_detect_pending = Some(MaskDetectPending {
+    app.mask_detect_pending = Some(Box::new(MaskDetectPending {
         request,
         cancel: Arc::new(AtomicBool::new(false)),
         rx,
-    });
+    }));
     let owner = app.stash_mounted_and_start_fresh("mask_detect_wait_test");
     let sibling = app.projected_viewer_context_id();
     let ctx = egui::Context::default();

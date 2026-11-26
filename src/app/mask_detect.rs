@@ -367,11 +367,11 @@ impl App {
         match spawn {
             Ok(_) => {
                 self.mask_detect_dialog = None;
-                self.mask_detect_pending = Some(MaskDetectPending {
+                self.mask_detect_pending = Some(Box::new(MaskDetectPending {
                     request,
                     cancel,
                     rx,
-                });
+                }));
             }
             Err(error) => {
                 self.show_feedback_error(format!("顔の検出を開始できませんでした: {error}"))
@@ -535,7 +535,7 @@ impl App {
     pub(crate) fn show_mask_detect_dialog(&mut self, ctx: &egui::Context) {
         if self.mask_detect_pending.is_some() {
             egui::Window::new("顔を検出中")
-                .id(egui::Id::new("mask_detect_progress"))
+                .id(egui::Id::unique("mask_detect_progress"))
                 .order(egui::Order::Foreground)
                 .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
                 .collapsible(false)
@@ -555,7 +555,7 @@ impl App {
         let mut detect = false;
         let mut close = self.dialog_escape_pressed(ctx);
         let _window = egui::Window::new("自動検出")
-            .id(egui::Id::new("mask_detect_settings"))
+            .id(egui::Id::unique("mask_detect_settings"))
             .open(&mut open)
             .order(egui::Order::Foreground)
             .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
@@ -612,11 +612,11 @@ impl App {
                         #[cfg(test)]
                         ctx.data_mut(|data| {
                             data.insert_temp(
-                                egui::Id::new("mask_detect_details"),
+                                egui::Id::unique("mask_detect_details"),
                                 _details.header_response.rect,
                             );
                             data.insert_temp(
-                                egui::Id::new("mask_detect_details_open"),
+                                egui::Id::unique("mask_detect_details_open"),
                                 _details.body_response.is_some(),
                             );
                         });
@@ -629,7 +629,7 @@ impl App {
                     // show_viewport_dyn. The parent is advanced by end() using the
                     // final allocation. In a vertical-only area this is its bottom.
                     layout.inner.max.y = ui.min_rect().bottom();
-                    data.insert_temp(egui::Id::new("mask_detect_body_layout"), layout)
+                    data.insert_temp(egui::Id::unique("mask_detect_body_layout"), layout)
                 });
                 ui.add(egui::Separator::default().spacing(spacing));
                 let enabled = self.mask_detect_can_start(tool);
@@ -641,7 +641,7 @@ impl App {
                     #[cfg(test)]
                     ctx.data_mut(|data| {
                         data.insert_temp(
-                            egui::Id::new("mask_detect_actions"),
+                            egui::Id::unique("mask_detect_actions"),
                             vec![start.rect, dismiss.rect],
                         )
                     });
@@ -650,7 +650,7 @@ impl App {
         #[cfg(test)]
         if let Some(window) = _window {
             ctx.data_mut(|data| {
-                data.insert_temp(egui::Id::new("mask_detect_window"), window.response.rect)
+                data.insert_temp(egui::Id::unique("mask_detect_window"), window.response.rect)
             });
         }
         if !open || close {

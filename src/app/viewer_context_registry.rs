@@ -2304,7 +2304,7 @@ pub(in crate::app) struct ViewerContextBundle {
     local_adjust_effect_picker_dialog_open: bool,
     local_adjust_lut_pending: Option<LocalAdjustLutLoadPending>,
     local_adjust_segmentation_pending: Option<LocalAdjustSegmentationPending>,
-    mask_detect_pending: Option<MaskDetectPending>,
+    mask_detect_pending: Option<Box<MaskDetectPending>>,
     mask_detect_dialog: Option<MaskDetectTool>,
     erase_session: u64,
     conceal_session: u64,
