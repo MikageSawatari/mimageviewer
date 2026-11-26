@@ -14,6 +14,7 @@ pub mod asr_worker;
 pub(crate) mod caption_job_worker;
 pub mod classify;
 pub mod denoise;
+pub mod detect;
 pub(crate) mod diagnostic_observation;
 pub(crate) mod failure;
 pub mod final_pipeline;

@@ -779,6 +779,14 @@ fn check_vendor_files() {
             "vendor/models/migan.onnx",
             "インストール済み環境の %APPDATA%\\mimageviewer\\models\\ からコピー",
         ),
+        (
+            "vendor/models/face_detection_yunet_2026may.onnx",
+            "bash scripts/bootstrap-vendor.sh で取得 (SHA-256 検証付き)",
+        ),
+        (
+            "YUNET-LICENSE.txt",
+            "リポジトリの YuNet MIT ライセンス本文を復元",
+        ),
     ];
 
     // VST3 host bridge プロセスは **通常ビルド (インストーラ / 単体 exe) のみ**

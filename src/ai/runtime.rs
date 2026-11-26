@@ -18,11 +18,12 @@
 //! `%APPDATA%/mimageviewer/tensorrt/` にダウンロードする必要がある
 //! (`tensorrt_pack` モジュール参照)。pack 不在/破損時は DirectML に自動フォールバック。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::SystemTime;
 
 use ort::session::Session;
 
@@ -518,6 +519,56 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<&'static InitializedOr
     }
 }
 
+/// Canonical file identity, read only on workers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalModelKey {
+    path: PathBuf,
+    size: u64,
+    modified: SystemTime,
+}
+
+impl ExternalModelKey {
+    fn read(path: &Path) -> Result<Self, AiError> {
+        let path = std::fs::canonicalize(path)?;
+        let metadata = std::fs::metadata(&path)?;
+        Ok(Self {
+            path,
+            size: metadata.len(),
+            modified: metadata.modified()?,
+        })
+    }
+}
+
+/// FIFO by load time, capped at two even during construction.
+/// Cache hits do not change load order. Eviction drops the oldest session.
+struct ExternalModelCache<T> {
+    entries: VecDeque<(ExternalModelKey, T)>,
+}
+
+impl<T> ExternalModelCache<T> {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn get_or_load<E>(
+        &mut self,
+        key: ExternalModelKey,
+        load: impl FnOnce() -> Result<T, E>,
+    ) -> Result<&mut T, E> {
+        if let Some(index) = self.entries.iter().position(|(cached, _)| cached == &key) {
+            return Ok(&mut self.entries[index].1);
+        }
+        if self.entries.len() == 2 {
+            self.entries.pop_front();
+        }
+        let value = load()?;
+        self.entries.push_back((key, value));
+        Ok(&mut self.entries.back_mut().unwrap().1)
+    }
+}
+
 /// ONNX Runtime ラッパー。
 /// アプリ全体で 1 つだけ作成し、`Arc<AiRuntime>` で共有する。
 ///
@@ -534,6 +585,7 @@ pub struct AiRuntime {
     /// ModelKind → Session のキャッシュ (DirectML ローカルセッション)。
     /// Session::run() は &mut self なので Mutex が必要。
     sessions: Mutex<HashMap<ModelKind, Session>>,
+    external_sessions: Mutex<ExternalModelCache<Session>>,
     /// 現プロセスで実際にロードされたバックエンド情報。
     backend: ActiveBackend,
     /// GUI process で共有する TensorRT child-process lifecycle。pool、retry、notice、
@@ -547,6 +599,7 @@ impl AiRuntime {
     pub(crate) fn empty_for_test() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            external_sessions: Mutex::new(ExternalModelCache::new()),
             backend: ActiveBackend {
                 requested: AiBackend::DirectMl,
                 effective: AiBackend::DirectMl,
@@ -601,6 +654,7 @@ impl AiRuntime {
         let active = ensure_ort_initialized(backend)?;
         Ok(AiRuntime {
             sessions: Mutex::new(HashMap::new()),
+            external_sessions: Mutex::new(ExternalModelCache::new()),
             backend: active.backend.clone(),
             trt_worker_lifecycle,
         })
@@ -691,30 +745,67 @@ impl AiRuntime {
             backend_label
         ));
 
-        // constructor が確定した同じ環境を使う。後着の呼び出しは cached 参照取得だけ。
-        let initialized = ensure_ort_initialized(self.backend.effective)?;
-        let mut builder = Session::builder(&initialized.environment)
-            .map_err(|e| AiError::ort_status(&e, format!("Session::builder: {e}")))?;
-
-        builder = builder
-            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
-            .map_err(|e| AiError::ort_status(&e, format!("optimization_level: {e}")))?;
-
-        builder = builder
-            .with_intra_threads(4)
-            .map_err(|e| AiError::ort_status(&e, format!("intra_threads: {e}")))?;
-
-        if !force_cpu {
-            builder = self.register_eps(builder, kind);
-        }
-
-        let session = builder.commit_from_file(model_path).map_err(|e| {
-            AiError::ort_status(&e, format!("Failed to load {}: {e}", model_path.display()))
-        })?;
+        let session = self.create_session(model_path, force_cpu, Some(kind))?;
 
         crate::logger::log(format!("[AI] Model {:?} loaded successfully", kind));
         sessions.insert(kind, session);
         Ok(())
+    }
+
+    /// Share optimization, provider registration and loading with fixed models.
+    /// External models (kind = None) never register TensorRT.
+    fn create_session(
+        &self,
+        model_path: &Path,
+        force_cpu: bool,
+        kind: Option<ModelKind>,
+    ) -> Result<Session, AiError> {
+        let initialized = ensure_ort_initialized(self.backend.effective)?;
+        let mut builder = Session::builder(&initialized.environment)
+            .map_err(|e| AiError::ort_status(&e, format!("Session::builder: {e}")))?;
+        builder = builder
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+            .map_err(|e| AiError::ort_status(&e, format!("optimization_level: {e}")))?;
+        builder = builder
+            .with_intra_threads(4)
+            .map_err(|e| AiError::ort_status(&e, format!("intra_threads: {e}")))?;
+        if !force_cpu {
+            builder = match kind {
+                Some(kind) => self.register_eps(builder, kind),
+                None => match self.backend.effective {
+                    AiBackend::DirectMl | AiBackend::TensorRt => self.register_directml_ep(builder),
+                    AiBackend::Cpu => builder,
+                },
+            };
+        }
+        builder.commit_from_file(model_path).map_err(|e| {
+            AiError::ort_status(&e, format!("Failed to load {}: {e}", model_path.display()))
+        })
+    }
+
+    /// Load/cache an external model and run under its independent session lock.
+    /// Canonicalization, file size/mtime queries and loading perform synchronous I/O.
+    /// Worker-only API: never call this from the UI thread.
+    pub fn with_external_session<F, R>(&self, path: &Path, f: F) -> Result<R, AiError>
+    where
+        F: FnOnce(&mut Session) -> Result<R, AiError>,
+    {
+        let key = ExternalModelKey::read(path)?;
+        let mut sessions = self.external_sessions.lock().unwrap();
+        let model_path = key.path.clone();
+        let session = sessions.get_or_load(key, || {
+            let backend = match self.backend.effective {
+                AiBackend::DirectMl | AiBackend::TensorRt => "DirectML",
+                AiBackend::Cpu => "CPU",
+            };
+            crate::logger::log(format!(
+                "[AI] Loading external model from {} ({})",
+                model_path.display(),
+                backend
+            ));
+            self.create_session(&model_path, false, None)
+        })?;
+        f(session)
     }
 
     /// 現在のバックエンドに応じて EP を登録する。失敗時は CPU フォールバック。
@@ -888,6 +979,107 @@ mod tests {
 
     fn fake_runtime() -> AiRuntime {
         AiRuntime::empty_for_test()
+    }
+
+    fn external_model_key(path: &str, size: u64, seconds: u64) -> ExternalModelKey {
+        ExternalModelKey {
+            path: PathBuf::from(path),
+            size,
+            modified: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+        }
+    }
+
+    #[test]
+    fn external_model_key_includes_path_size_and_modification_time() {
+        let original = external_model_key("a.onnx", 10, 1);
+        assert_ne!(original, external_model_key("b.onnx", 10, 1));
+        assert_ne!(original, external_model_key("a.onnx", 11, 1));
+        assert_ne!(original, external_model_key("a.onnx", 10, 2));
+        let mut cache = ExternalModelCache::new();
+        for (index, key) in [
+            original.clone(),
+            external_model_key("b.onnx", 10, 1),
+            external_model_key("a.onnx", 11, 1),
+            external_model_key("a.onnx", 11, 2),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                *cache
+                    .get_or_load(key.clone(), || Ok::<_, ()>(index))
+                    .unwrap(),
+                index
+            );
+            assert_eq!(
+                *cache
+                    .get_or_load(key, || -> Result<usize, ()> {
+                        panic!("same identity must hit cache")
+                    })
+                    .unwrap(),
+                index
+            );
+        }
+    }
+
+    #[test]
+    fn external_model_key_reads_canonical_path_size_and_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("fixture.onnx");
+        std::fs::write(&model, b"fixture").unwrap();
+        let key = ExternalModelKey::read(&temp.path().join(".").join("fixture.onnx")).unwrap();
+        assert_eq!(key.path, std::fs::canonicalize(&model).unwrap());
+        assert_eq!(key.size, 7);
+        assert_eq!(
+            key.modified,
+            std::fs::metadata(&model).unwrap().modified().unwrap()
+        );
+        std::fs::write(&model, b"different size").unwrap();
+        assert_ne!(key, ExternalModelKey::read(&model).unwrap());
+    }
+
+    #[test]
+    fn external_model_cache_drops_oldest_before_loading_third() {
+        struct Probe(usize, Arc<Mutex<Vec<usize>>>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.1.lock().unwrap().push(self.0);
+            }
+        }
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut cache = ExternalModelCache::new();
+        for index in 0..2 {
+            cache
+                .get_or_load(external_model_key(&format!("{index}.onnx"), 1, 1), || {
+                    Ok::<_, ()>(Probe(index, dropped.clone()))
+                })
+                .unwrap();
+        }
+        // A hit on the oldest must not convert FIFO to LRU.
+        let hit = cache
+            .get_or_load(
+                external_model_key("0.onnx", 1, 1),
+                || -> Result<Probe, ()> { panic!("cache hit") },
+            )
+            .unwrap();
+        assert_eq!(hit.0, 0);
+        cache
+            .get_or_load(external_model_key("2.onnx", 1, 1), || {
+                assert_eq!(*dropped.lock().unwrap(), vec![0]);
+                Ok::<_, ()>(Probe(2, dropped.clone()))
+            })
+            .unwrap();
+        assert_eq!(cache.entries.len(), 2);
+        drop(cache);
+        assert_eq!(*dropped.lock().unwrap(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn external_model_table_lock_is_independent_of_upscale_sessions() {
+        let runtime = fake_runtime();
+        runtime.hold_sessions_for_test(|| {
+            assert!(runtime.external_sessions.try_lock().is_ok());
+        });
     }
 
     fn wait_activity(publisher: &CheckpointPublisher, expected: u64) {

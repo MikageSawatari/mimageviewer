@@ -113,6 +113,18 @@ if [[ ${#missing_models[@]} -gt 0 ]]; then
     echo "    (= mIV を一度インストール / 起動して APPDATA に展開させた後に再実行する)"
 fi
 
+# YuNet is fetched directly (not from the installed profile). Verify even reused files.
+YUNET_MODEL="vendor/models/face_detection_yunet_2026may.onnx"
+YUNET_SHA256="ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0"
+if [[ $FORCE -eq 1 || ! -f "$YUNET_MODEL" ]]; then
+    curl -fsSL "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2026may.onnx" -o "$YUNET_MODEL.tmp"
+    echo "$YUNET_SHA256  $YUNET_MODEL.tmp" | sha256sum --check -
+    mv "$YUNET_MODEL.tmp" "$YUNET_MODEL"
+else
+    echo "$YUNET_SHA256  $YUNET_MODEL" | sha256sum --check -
+fi
+cp YUNET-LICENSE.txt vendor/models/face_detection_yunet_LICENSE.txt
+
 echo "============================================================"
 echo "[VLM worker backup]"
 if [[ -e "vendor/vlm-worker/mimageviewer-vlm.exe" ]]; then

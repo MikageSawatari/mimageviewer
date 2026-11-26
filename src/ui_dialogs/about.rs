@@ -15,6 +15,7 @@ const RUST_DEFLATE_NOTICES: &str = include_str!("../../RUST-DEFLATE-NOTICES.txt"
 const EVERYTHING_IPC_NOTICE: &str = include_str!("../../EVERYTHING-IPC-NOTICE.txt");
 const LIBJPEG_TURBO_LICENSE: &str = include_str!("../../LIBJPEG-TURBO-LICENSE.txt");
 const VLM_WORKER_LICENSE: &str = include_str!("../../VLM-WORKER-LICENSE.txt");
+const YUNET_LICENSE: &str = include_str!("../../YUNET-LICENSE.txt");
 // HarmNet の推論と重みは core に埋め込むため、portable を含む全構成で表示する。
 const HARMNET_NOTICE: (&str, &str, &str) = (
     "EffeTune Note Spectrogram (HarmNet L)",
@@ -275,6 +276,10 @@ impl App {
                         ui.label("MIT");
                         ui.end_row();
 
+                        ui.label("YuNet face detector");
+                        ui.label("MIT License, Copyright (c) 2020 Shiqi Yu");
+                        ui.end_row();
+
                         ui.label("1xDeJPG_realplksr_otf");
                         ui.label("CC-BY-4.0 — Phhofm");
                         ui.end_row();
@@ -344,6 +349,12 @@ impl App {
                     &format!("{} — MIT License 全文", HARMNET_NOTICE.0),
                     "about_harmnet_license",
                     HARMNET_NOTICE.2,
+                );
+                draw_license_text(
+                    ui,
+                    "YuNet face detector — MIT License 全文",
+                    "about_yunet_license",
+                    YUNET_LICENSE,
                 );
 
                 ui.add_space(6.0);
@@ -503,6 +514,22 @@ mod tests {
         IJG_ATTRIBUTION, LIBAVIF_LICENSE, LIBJPEG_TURBO_LICENSE, LIBRAW_LICENSE, LIBYUV_LICENSE,
         PDFIUM_LICENSE, ZLIB_LICENSE,
     };
+
+    #[test]
+    fn detect_yunet_license_matches_bundled_notice() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            super::YUNET_LICENSE,
+            std::fs::read_to_string(root.join("YUNET-LICENSE.txt")).unwrap()
+        );
+        assert_eq!(
+            super::YUNET_LICENSE,
+            std::fs::read_to_string(root.join("vendor/models/face_detection_yunet_LICENSE.txt"))
+                .unwrap()
+        );
+        assert!(super::YUNET_LICENSE.contains("MIT License"));
+        assert!(super::YUNET_LICENSE.contains("Copyright (c) 2020 Shiqi Yu"));
+    }
 
     #[test]
     fn embedded_raw_notices_equal_tracked_files_with_bsd_and_ijg_attribution() {

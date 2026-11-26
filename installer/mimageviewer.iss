@@ -71,6 +71,7 @@ Source: "..\vendor\ffmpeg\LICENSE.txt"; DestDir: "{app}"; DestName: "FFmpeg-LICE
 Source: "..\UNRAR-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 ; PDF, RAW, AVIF and JPEG components: full upstream licenses and attributions.
 Source: "..\LIBRAW-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\YUNET-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\PDFIUM-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LIBAVIF-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\DAV1D-LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion

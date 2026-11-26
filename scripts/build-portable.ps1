@@ -530,6 +530,7 @@ $copies = @(
     @{ src = 'vendor\ffmpeg\LICENSE.txt';            dst = 'LICENSE-ffmpeg.txt' }
     @{ src = 'UNRAR-LICENSE.txt';                     dst = 'UNRAR-LICENSE.txt' }
     @{ src = 'LIBRAW-LICENSE.txt';                    dst = 'LIBRAW-LICENSE.txt' }
+    @{ src = 'YUNET-LICENSE.txt'; dst = 'YUNET-LICENSE.txt' }
     @{ src = 'PDFIUM-LICENSE.txt'; dst = 'PDFIUM-LICENSE.txt' }
     @{ src = 'LIBAVIF-LICENSE.txt'; dst = 'LIBAVIF-LICENSE.txt' }
     @{ src = 'DAV1D-LICENSE.txt'; dst = 'DAV1D-LICENSE.txt' }
@@ -555,7 +556,8 @@ $models = @(
     'realcugan_4x_conservative.onnx',
     '4x_NMKD-Siax_200k.onnx',
     'dejpg_realplksr_otf.onnx',
-    'migan.onnx'
+    'migan.onnx',
+    'face_detection_yunet_2026may.onnx'
 )
 foreach ($m in $models) {
     $copies += @{ src = "vendor\models\$m"; dst = "models\$m" }

@@ -721,3 +721,26 @@ Ultralytics の汎用モデルと ultralytics 本体 (AGPL-3.0) は、この作�
 - 大きな画像で結果を足す 1 回の時間 (Undo の複製と表示用テクスチャ) は、段 1 の perf ログで測る (§11)。
 - YuNet の ONNX は段 1 で `vendor/models/` に置き、バックアップへもコピーする (取得物の sha256
   `ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0`、opencv_zoo の LFS の値と一致)。
+
+## 18. 段 1a の実装引き継ぎ (2026-11-27)
+
+- 範囲は同梱物・外部セッション・YuNet の純粋な検出層まで。UI・worker の起動と待ち・マスクへの
+  変換と書き込みは段 1b、Ultralytics の読み取りは段 2 のまま。
+- `model_manager` は `EmbeddedAsset::Model(ModelKind)` と `FaceDetectorYuNet` を分離し、
+  `face_detector_yunet_path()` を追加した。既存の展開先と portable の loose モデル解決は共通のまま。
+  `build.rs`・portable 同梱一覧・bootstrap に YuNet を追加した。MIT 本文は追跡する
+  `YUNET-LICENSE.txt` にも置き、ソフトウェア情報・インストーラ・portable で全文を供給する。
+- 外部セッションは `AiRuntime` の独立 Mutex が所有する。正規化したパス・サイズ・更新時刻を鍵にし、
+  読み込み順 FIFO で最大 2 件。参照では順序を変えず、3 件目の構築前に最古のセッションを閉じる。
+  最適化・EP 登録・ロードを既存モデルと共有し、外部モデルには TensorRT を登録しない。
+  EP 登録失敗時の扱いは実装依頼に従い既存 helper を維持し、外部モデル専用の CPU 再試行は追加していない。
+- `ai::detect` の結果は `Detection { class_idx, score, rect }` (元の画像の px) とした。
+  §5.3 の形・余白付き `DetectedBox` は段 1b で変換する。縮小には image crate の面積平均に近い
+  `imageops::thumbnail` を使い、丸め後の各軸の倍率で座標を戻す。YuNet の 12 出力は名前と形を検証する。
+  キャンセル・型付きエラー・各段の前処理／推論／後処理と全体の perf event を備える。
+- 合成出力・段寸法・BGR/ゼロ埋め・復元/切り詰め/NMS・同梱パス・外部キャッシュ/破棄・独立ロック・
+  MIT 本文のテストを追加した。実装担当は負荷の指定により cargo のビルド／テスト／check／clippy を
+  実行しない。設計担当の実行フィルター:
+  `cargo nextest run -p mimageviewer --lib -E 'test(/detect|external_model|embedded_asset/)'`。
+- この作業では他の worktree とツリー外のバックアップ先を変更しない。モデルの外部バックアップへの
+  コピーは設計担当へ引き継ぐ。モデル実体は指定の 229,738 バイトと上記 SHA-256 に一致した。

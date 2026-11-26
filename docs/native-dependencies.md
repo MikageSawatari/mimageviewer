@@ -30,6 +30,9 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
    build.rs が exe へ `include_bytes!` で同梱。未配置でもビルドは通るがスタンプは無効)
 8. `vendor/models/*.onnx` を `%APPDATA%/mimageviewer/models/` から自動 copy
    (= 一度 mIV をインストール / 起動して APPDATA に展開させた後でないと取れない)
+   ただし YuNet (`face_detection_yunet_2026may.onnx`) は OpenCV Zoo から直接取得し、
+   固定 SHA-256 を検証する。既存ファイルを使うときも検証する。MIT 本文の正本は
+   追跡対象の `YUNET-LICENSE.txt` で、bootstrap が `vendor/models/` にもコピーする。
 9. VLM worker が無ければ `C:\home\mimageviewer_vendor_backup\vlm-worker\mimageviewer-vlm.exe` を
    一時候補へ実ファイルでコピーし、現ソースの identity と一致してから `vendor/vlm-worker/` へ公開する。
    バックアップの欠落・不一致では配置せず、固定版ソースのセットアップ手順を案内する。
@@ -71,6 +74,7 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 - **`vendor/models/*.onnx`** — DL スクリプトが**存在しない**。`%APPDATA%\mimageviewer\
   models\` (インストール済み環境が展開した物) からコピーするしかない。動く mIV
   インストールも APPDATA も両方失うと**永久に取得不可**。
+  YuNet だけは例外で、`bootstrap-vendor.sh` の固定ハッシュ検証付き取得で復旧できる。
 - **`vendor/vst3-host/mimageviewer-vst3-host.exe`** — 再ビルドには VST3 SDK
   (~490 MB) + cmake が要る。古い exe の流用は上記の通り不可。
 - **`vendor/vlm-worker/mimageviewer-vlm.exe`** — 現ソースと一致する exe は CMake / Vulkan SDK

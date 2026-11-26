@@ -252,6 +252,8 @@ https://mikage.to/mimageviewer/privacy.html
     ライセンス全文と著作権表記: PDFIUM-LICENSE.txt (内部部品を含む)
     This software is based in part on the work of the FreeType Team.
   - ONNX Runtime (MIT): Microsoft
+  - YuNet face detector — MIT License, Copyright (c) 2020 Shiqi Yu
+    ライセンス全文と著作権表記: YUNET-LICENSE.txt
   - DirectML (Microsoft 独自ライセンス): Microsoft
   - LibRaw (CDDL-1.0): LibRaw LLC
     ライセンス全文と著作権表記: LIBRAW-LICENSE.txt

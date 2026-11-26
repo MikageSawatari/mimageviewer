@@ -85,6 +85,7 @@ Windows 向け 高速サムネイル画像ビューワー（ポータブル版�
   UNRAR-LICENSE.txt               UnRAR のライセンス本文
   LIBRAW-LICENSE.txt              RAW 表示・現像のライセンス本文
   PDFIUM-LICENSE.txt              PDF 表示と内部部品のライセンス全文と著作権表記
+  YUNET-LICENSE.txt               YuNet 顔検出器の MIT ライセンス本文と著作権表記
   LIBAVIF-LICENSE.txt             AVIF 表示のライセンス本文
   DAV1D-LICENSE.txt               AVIF 表示のライセンス本文
   LIBYUV-LICENSE.txt              AVIF 表示のライセンス本文
@@ -165,6 +166,8 @@ HEIC / JPEG XL 表示は Windows Imaging Component（WIC）を
     ライセンス全文と著作権表記: PDFIUM-LICENSE.txt (内部部品を含む)
     This software is based in part on the work of the FreeType Team.
   - ONNX Runtime (MIT): Microsoft
+  - YuNet face detector — MIT License, Copyright (c) 2020 Shiqi Yu
+    ライセンス全文と著作権表記: YUNET-LICENSE.txt
   - DirectML (Microsoft 独自ライセンス): Microsoft
   - LibRaw (CDDL-1.0): LibRaw LLC
     ライセンス全文と著作権表記: LIBRAW-LICENSE.txt
