@@ -237,6 +237,7 @@ pub mod filename_stack;
 pub mod filename_stack_script;
 mod final_composite;
 pub mod folder_cell_background;
+pub mod image_combine;
 mod image_folder_zip;
 mod image_folder_zip_job;
 mod image_folder_zip_metadata;
