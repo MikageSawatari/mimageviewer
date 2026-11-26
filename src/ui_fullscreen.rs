@@ -64,6 +64,8 @@ mod overlay_navigation_tests;
 #[cfg(test)]
 mod overview_page_turn_tests;
 mod page_turn;
+#[cfg(all(test, windows))]
+mod plane_view_tests;
 #[cfg(test)]
 mod prefetch_revision_tests;
 #[cfg(test)]
@@ -11006,6 +11008,7 @@ fn resolve_fs_geometry_in_layout_rect(
     }
     let texture_rect = fs_texture_content_rect(page_rect, input.texture_size, input.rotation);
     DisplayedImageGeometry::from_resolved_rect(input, texture_rect)
+        .map(|geometry| geometry.with_placement_frame(page_rect))
 }
 
 fn resolve_fs_transform_in_layout_rect(
@@ -11978,6 +11981,7 @@ impl FsContinuousReadingUnavailableFeature {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FsNavNoOpReason {
+    PlaneEntry(crate::plane_view::PlaneViewEntryBlock),
     LocalFilterActive,
     SearchResultList,
     SearchSiblingUnsupported,
@@ -15377,7 +15381,7 @@ impl App {
     /// Depth displays fit while retaining that zoom for its eventual return to 2D.
     /// Other excluded contexts (including Panorama) keep their existing reset behavior.
     fn fs_zoom_reset_for_blocked_context(&mut self) {
-        if self.fs_exclusive_view.is_depth() {
+        if self.fs_exclusive_view.is_depth() || self.fs_exclusive_view.is_plane_view() {
             self.fs_zoom_reset_transient();
         } else {
             self.fs_zoom_reset();
@@ -15771,7 +15775,7 @@ impl App {
     ///
     /// 判定はここ 1 か所に集める。新しい入力を足すときは必ずこれを通すこと。
     pub(crate) fn fs_zoom_owner(&self) -> FsZoomOwner {
-        if self.fs_exclusive_view.is_depth() {
+        if self.fs_exclusive_view.is_depth() || self.fs_exclusive_view.is_plane_view() {
             return FsZoomOwner::Image;
         }
         if self.fs_zoom_mode_engaged() {
@@ -16138,7 +16142,7 @@ impl App {
         let scrub_active = self.fs_middle_zoom_drag.as_ref().is_some_and(|drag| {
             drag.input == ZoomDragInput::Scrub && drag.surface == ZoomDragSurface::Overlay
         });
-        if scrub_active || (scrub_held && self.fs_pan_drag_start.is_none()) {
+        if scrub_active || (scrub_held && self.fs_canvas_drag.pan_start().is_none()) {
             let used = self.handle_drag_zoom(
                 ctx,
                 ZoomDragInput::Scrub,
@@ -16163,10 +16167,10 @@ impl App {
                 return true;
             }
         }
-        let active = self.fs_pan_drag_start.is_some();
+        let active = self.fs_canvas_drag.pan_start().is_some();
         if !space_held {
             if active {
-                self.fs_pan_drag_start = None;
+                self.fs_canvas_drag.set_pan_start(None);
                 // Ctrl added during an existing Space pan must not turn that
                 // same primary stream into a brush stroke or a new zoom.
                 if scrub_held && primary_down {
@@ -16183,15 +16187,16 @@ impl App {
 
         if primary_pressed && !active {
             if let Some(pos) = pointer_pos {
-                self.fs_pan_drag_start = Some((pos, self.fs_pan));
+                self.fs_canvas_drag.set_pan_start(Some((pos, self.fs_pan)));
             }
         } else if primary_down
-            && let (Some((start_pos, start_pan)), Some(pos)) = (self.fs_pan_drag_start, pointer_pos)
+            && let (Some((start_pos, start_pan)), Some(pos)) =
+                (self.fs_canvas_drag.pan_start(), pointer_pos)
         {
             self.set_fs_pan_from_input(self.fs_zoom, start_pan + (pos - start_pos));
         }
         if primary_released {
-            self.fs_pan_drag_start = None;
+            self.fs_canvas_drag.set_pan_start(None);
         }
         ctx.set_cursor_icon(if primary_down {
             egui::CursorIcon::Grabbing
@@ -20311,6 +20316,11 @@ struct FsWheelFrameResult {
     deferred: Option<FsWheelFrameProposal>,
 }
 
+struct FsSinglePageDraw {
+    transform: DisplayedImageTransform,
+    pdf_demand_rect: egui::Rect,
+}
+
 struct FsWheelFrameProposal {
     context: egui::Context,
     viewport: egui::ViewportId,
@@ -20320,6 +20330,7 @@ struct FsWheelFrameProposal {
     wheel_input: FsWheelFrameInput,
     page_nav: FsPageNavRequest,
     canvas_click: FsCanvasClickAction,
+    click_anchor: Option<crate::plane_view::PlaneViewAnchor>,
     secondary_action: FsSecondaryAction,
     side_panel_click_chrome: FullscreenSidePanelClickChrome,
     full_rect: egui::Rect,
@@ -20357,11 +20368,16 @@ struct FsWheelFrameSemanticInput {
     total_drag_delta: Option<egui::Vec2>,
     drag_delta: egui::Vec2,
     double_clicked: bool,
+    plane_lens_owned: bool,
     music_context_allowed: bool,
 }
 
 impl FsWheelFrameSemanticInput {
     fn capture(app: &App, ctx: &egui::Context, response: &egui::Response) -> Self {
+        let lens_frame_key =
+            egui::Id::unique(("plane_lens_used", app.edit_request_owner_context()));
+        let frame_nr = ctx.cumulative_frame_nr();
+        let lens_used = ctx.data(|data| data.get_temp::<u64>(lens_frame_key)) == Some(frame_nr);
         Self {
             pointer_pos: ctx.input(|input| input.pointer.hover_pos()),
             primary_press_origin: ctx.input(|input| {
@@ -20376,6 +20392,7 @@ impl FsWheelFrameSemanticInput {
             total_drag_delta: fullscreen_drag_pan_proposal(response, egui::Vec2::ZERO),
             drag_delta: response.drag_delta(),
             double_clicked: app.fs_front_pointer.backing_double_clicked(response),
+            plane_lens_owned: app.fs_canvas_drag.is_lens() || lens_used,
             music_context_allowed: app.music_timeline_ctrl_wheel_context_allowed(ctx),
         }
     }
@@ -20396,6 +20413,7 @@ enum FsWheelInPageClass {
     InPageScroll(egui::Vec2),
     ScrollThenPageTurn(egui::Vec2),
     SettingZoom,
+    PlaneView,
     Legacy,
 }
 
@@ -26176,7 +26194,7 @@ impl App {
                 Some(GridItem::Video(_) | GridItem::Audio(_))
             ),
             self.panorama_state().is_some(),
-            self.fs_exclusive_view_active(idx).is_some(),
+            self.fs_exclusive_view_active(idx).is_some() && !self.fs_exclusive_view.is_plane_view(),
         );
         let (rotation, seek, any_popup) = if viewport == ctx.viewport_id() {
             (
@@ -26257,7 +26275,8 @@ impl App {
                 export_crop_active: self.export_crop_mode,
                 view_trim_active: self.view_trim_mode,
                 analysis_active: self.analysis_mode,
-                panorama_active: self.fs_exclusive_view_active(fs_idx).is_some(),
+                panorama_active: self.fs_exclusive_view_active(fs_idx).is_some()
+                    && !self.fs_exclusive_view.is_plane_view(),
                 compare_wipe_active: matches!(
                     self.compare_view_mode,
                     crate::app::CompareViewMode::Wipe { .. }
@@ -28529,6 +28548,7 @@ impl App {
             Self::thread_cycles_now,
         );
         self.depth_view_may_continue(self.fullscreen_idx.unwrap_or(usize::MAX));
+        self.plane_view_may_continue(self.fullscreen_idx.unwrap_or(usize::MAX));
         let Some(fs_idx) = self.fullscreen_idx else {
             // in-window 静止画モードで PDF/ZIP enumerate defer 中:
             // grid (= 白 CentralPanel) が露出するのを防ぐため、メインウィンドウに
@@ -29240,7 +29260,7 @@ impl App {
                         // paint cannot cover this early presentation.
                         let root_overflow_frame = if self.fs_overflow_panel_state == FsOverflowPanelState::Root
                             && !state.is_video && !self.fs_music_view_active(fs_idx)
-                            && !self.fs_exclusive_view_active(fs_idx).is_some()
+                            && (self.fs_exclusive_view_active(fs_idx).is_none() || self.fs_exclusive_view.is_plane_view())
                             && self.fullscreen_top_bar_chrome_allowed(fs_idx)
                         {
                             if let Some(wheel) = hud_popup_wheel.as_mut() {
@@ -29627,7 +29647,7 @@ impl App {
                         );
                         // 360 度パノラマビューモード中は分析 / 補正 / 比較を抑止する
                         // (= 上バーの 360 / × / window のみ、機能制限モード)。
-                        let panorama_mode_active_now = self.fs_exclusive_view_active(fs_idx).is_some();
+                        let panorama_mode_active_now = self.fs_exclusive_view_active(fs_idx).is_some() && !self.fs_exclusive_view.is_plane_view();
                         // 画像領域を狭めた側と同じ答えを描画側にも渡す (§1.158)。
                         let info_panel_lock_effective =
                             self.still_info_panel_lock_effective_for_idx(fs_idx, state.is_video);
@@ -29688,6 +29708,7 @@ impl App {
                         let media_t0 = std::time::Instant::now();
                         self.fullscreen_page_layout.clear();
                         let mut single_transform: Option<DisplayedImageTransform> = None;
+                        let mut single_pdf_demand_rect = None;
                         let mut flat_crop = page_turn::FlatCrop::None;
                         let mut primary_draw = CompareFramePrimaryDraw::OrdinaryOnly;
                         let mut navigator_texture_sources = if spread_pair == SpreadPair::Single {
@@ -29963,7 +29984,8 @@ impl App {
                                                                 )
                                                             });
                                                 }
-                                                single_transform = painted;
+                                                single_pdf_demand_rect = painted.as_ref().map(|draw| (paint_idx,draw.pdf_demand_rect));
+                                                single_transform = painted.map(|draw| draw.transform);
                                             }
                                         }
                                     } // else (= !panorama_painted) ブロック終端
@@ -30675,7 +30697,7 @@ impl App {
                                 self.panorama_state().is_some() && panorama_trigger.is_some();
                             // panorama_mode_active=true なら他のボタン (info / analysis /
                             // spread / 補正 / rotate / capture / VST / play / tile) は全て隠す。
-                            let panorama_mode_active = self.fs_exclusive_view_active(fs_idx).is_some();
+                            let panorama_mode_active = self.fs_exclusive_view_active(fs_idx).is_some() && !self.fs_exclusive_view.is_plane_view();
                             let mut panorama_pressed = false;
                             // 投影方式は 360 セッションの state。OFF 中はボタン自体を
                             // 出さないので、値は既定でよい。
@@ -30697,7 +30719,7 @@ impl App {
                             }
                             let view_trim_active =
                                 self.view_trim_active_for_display(fs_idx, spread_pair);
-                            self.reconcile_specified_pdf_demand(ctx);
+                            self.reconcile_specified_pdf_demand_with_single(ctx, single_pdf_demand_rect);
                             let mut fit_mode_choice: Option<FullscreenFitMode> = None;
                             let mut specified_scale_edit = self.settings.fullscreen_specified_scale;
                             let mut specified_scale_max_edit = self.settings.fullscreen_specified_scale_max_tenths;
@@ -30776,6 +30798,7 @@ impl App {
                             let depth_active = self.fs_exclusive_view.is_depth();
                             let depth_allowed = self.depth_entry_allowed(fs_idx).is_ok();
                             let mut depth_pressed = false;
+                            let mut view_trim_mode_edit = self.view_trim_mode;
                             Self::draw_fs_hover_bar(
                                 ui,
                                 ctx,
@@ -30825,7 +30848,7 @@ impl App {
                                 &mut fit_mode_choice,
                                 &mut fit_no_upscale_choice,
                                 &mut fit_no_downscale_choice,
-                                &mut self.view_trim_mode,
+                                &mut view_trim_mode_edit,
                                 view_trim_active,
                                 is_video_mode,
                                 video_meta,
@@ -30850,6 +30873,11 @@ impl App {
                                 frame_close_response.take(),
                             Some((depth_active, depth_allowed, &mut depth_pressed)),
 );
+                            if view_trim_mode_edit != self.view_trim_mode {
+                                if view_trim_mode_edit && self.fs_exclusive_view.is_plane_view() {
+                                    self.show_feedback_toast("魚眼を終了してから表示トリムを編集してください".into());
+                                } else { self.view_trim_mode = view_trim_mode_edit; }
+                            }
                             if top_bar_lock_pressed {
                                 self.settings.fullscreen_top_bar_locked =
                                     !self.settings.fullscreen_top_bar_locked;
@@ -33320,6 +33348,13 @@ impl App {
 
     /// Stable source provenance, independent of the texture currently sampled.
     fn reconcile_specified_pdf_demand(&mut self, ctx: &egui::Context) {
+        self.reconcile_specified_pdf_demand_with_single(ctx, None);
+    }
+    fn reconcile_specified_pdf_demand_with_single(
+        &mut self,
+        ctx: &egui::Context,
+        single: Option<(usize, egui::Rect)>,
+    ) {
         if self.fs_exclusive_view.is_depth() {
             self.fs_pdf_rerender_demand.suppress_for_depth();
             return;
@@ -33330,21 +33365,28 @@ impl App {
         {
             return;
         }
-        self.reconcile_pdf_layout_demand(ctx, false);
+        self.reconcile_pdf_layout_demand(ctx, false, single);
     }
 
     fn reconcile_continuous_pdf_demand(&mut self, ctx: &egui::Context) {
-        self.reconcile_pdf_layout_demand(ctx, true);
+        self.reconcile_pdf_layout_demand(ctx, true, None);
     }
 
-    fn reconcile_pdf_layout_demand(&mut self, ctx: &egui::Context, continuous: bool) {
+    fn reconcile_pdf_layout_demand(
+        &mut self,
+        ctx: &egui::Context,
+        continuous: bool,
+        single: Option<(usize, egui::Rect)>,
+    ) {
         let mut demands = HashMap::<usize, f32>::new();
         for page in self.fullscreen_page_layout.displayed_pages() {
             let idx = page.transform.page_idx;
             if !matches!(self.items.get(idx), Some(GridItem::PdfPage { .. })) {
                 continue;
             }
-            let rect = page.transform.layout_full_image_rect;
+            let rect = single
+                .filter(|(page_idx, _)| *page_idx == idx)
+                .map_or(page.transform.layout_full_image_rect, |(_, rect)| rect);
             let required = rect.width().max(rect.height()) * ctx.pixels_per_point();
             demands
                 .entry(idx)
@@ -33435,8 +33477,16 @@ impl App {
         resource: &FullscreenPaintPayload,
         view: crate::material_display_basis::MaterialDisplayView,
     ) -> Result<FullscreenFitInput, crate::material_display_basis::MaterialBasisUnavailable> {
+        self.fs_basis_fit_input(mode, resource.display_basis(), view)
+    }
+
+    fn fs_basis_fit_input(
+        &self,
+        mode: FullscreenFitMode,
+        accepted: crate::material_display_basis::MaterialDisplayBasis,
+        view: crate::material_display_basis::MaterialDisplayView,
+    ) -> Result<FullscreenFitInput, crate::material_display_basis::MaterialBasisUnavailable> {
         use crate::material_display_basis::MaterialLegacyBasis;
-        let accepted = resource.display_basis();
         if mode == FullscreenFitMode::SpecifiedScale {
             return Ok(FullscreenFitInput::from_mode(
                 mode,
@@ -37277,6 +37327,36 @@ impl App {
         {
             self.toggle_depth_parallax(ctx, fs_idx);
         }
+        for (action, notches) in [(KeyAction::FsFisheyeIn, 1.), (KeyAction::FsFisheyeOut, -1.)] {
+            if !is_video_fs && !fs_music_view_active && self.keymap.consume_action(ctx, action) {
+                let full_rect = ctx.content_rect();
+                let seek_geometry = self.still_seek_geometry_for_idx(full_rect, fs_idx, false);
+                let canvas = self.fullscreen_media_rect_with_geometry(
+                    full_rect,
+                    fs_idx,
+                    false,
+                    seek_geometry,
+                );
+                if let Some(input) = self.plane_view_wheel_input(
+                    canvas,
+                    None,
+                    notches,
+                    self.fs_zoom,
+                    self.fs_pan,
+                    self.plane_view_pose(),
+                ) {
+                    let mut outcome = crate::plane_view::plane_view_wheel_transition(input);
+                    outcome.pan = clamp_fullscreen_pan_from_layout(
+                        &self.fullscreen_page_layout,
+                        outcome.zoom,
+                        outcome.pan,
+                    );
+                    self.clear_fs_initial_placement_request();
+                    self.apply_plane_view_outcome(ctx, outcome);
+                    self.maybe_rerender_pdf(self.fs_zoom);
+                }
+            }
+        }
         let pano_active_now = self.fs_exclusive_view_active(fs_idx).is_some();
         // 描画・PageUp/Down・通常ナビと同じ正本を使う。reading_flow だけでは、比較等で
         // 実際には単ページ描画へフォールバック中なのに連結表示扱いする食い違いが起きる。
@@ -37293,7 +37373,10 @@ impl App {
         // 透過部分の下地は3Dでも毎描画反映する。背景切替の抑止は360°固有。
         let key_b_bg = key_b_bg && !self.is_panorama_mode_active(fs_idx);
         let key_g = key_g && !pano_active_now;
-        let key_i = key_i && (!pano_active_now || self.fs_exclusive_view.is_depth());
+        let key_i = key_i
+            && (!pano_active_now
+                || self.fs_exclusive_view.is_depth()
+                || self.fs_exclusive_view.is_plane_view());
         let key_compare_x = key_compare_x && !pano_active_now;
         let key_compare_alt_c = key_compare_alt_c && !pano_active_now;
         let key_compare_shift_c = key_compare_shift_c && !pano_active_now;
@@ -38796,7 +38879,7 @@ impl App {
         fs_idx: usize,
         captured_display_unit: bool,
     ) -> bool {
-        if self.fs_exclusive_view.is_depth() {
+        if self.fs_exclusive_view.is_depth() || self.fs_exclusive_view.is_plane_view() {
             return false;
         }
         let focused = ctx.input(|input| input.viewport().focused.unwrap_or(true));
@@ -41171,8 +41254,9 @@ impl App {
             crate::app::CompareViewMode::Wipe { .. }
         );
         let panel_fs_idx = self.fullscreen_idx;
-        let panorama_active =
-            panel_fs_idx.is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some());
+        let panorama_active = panel_fs_idx
+            .is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some())
+            && !self.fs_exclusive_view.is_plane_view();
         let music_view_active = panel_fs_idx.is_some_and(|idx| self.fs_music_view_active(idx));
         let side_panel_chrome_enabled =
             still_side_panel_chrome_enabled(StillSidePanelChromeInputs {
@@ -41381,6 +41465,7 @@ impl App {
                         self.fs_pan,
                         Some(&overflow_pointer_input),
                         primary_suppression,
+                        self.fs_exclusive_view.is_plane_view(),
                     );
                     let close = self.apply_fs_canvas_click(
                         canvas_click,
@@ -41519,6 +41604,9 @@ impl App {
                         .unwrap_or(false)
                 });
 
+        if !ctx.input(|i| i.viewport().focused.unwrap_or(true)) || modal_input_blocked {
+            self.fs_canvas_drag.retire_lens();
+        }
         // Depth controls admit drags by their press, not by the hover position
         // after later moves in the same pass. Each button owns its admission
         // position; a primary press must not reject a later middle press.
@@ -41701,6 +41789,37 @@ impl App {
                     touch_chrome_latched,
                 })
         });
+        let lens_press_in_chrome = ctx
+            .input(|input| {
+                crate::ui_helpers::button_press_origin(input, egui::PointerButton::Primary)
+            })
+            .is_some_and(|pos| {
+                self.fs_side_panel_click_chrome(
+                    ctx,
+                    full_rect,
+                    seek_geometry,
+                    state.is_video,
+                    side_panel_chrome_enabled,
+                    None,
+                )
+                .contains_pointer(pos)
+                    || (top_bar_visible && fullscreen_top_bar_rect(full_rect).contains(pos))
+            });
+        let primary_lens_owned = self.handle_plane_lens_drag(
+            ctx,
+            default_image_rect,
+            !lens_press_in_chrome
+                && !self.spread_popup_open
+                && !self.fit_popup_open
+                && !self.panorama_projection_popup_open
+                && !fs_rotation_popup_open(ctx)
+                && !fs_still_seek_strip_popup_open(ctx)
+                && !self.fs_overflow_panel_state.is_open()
+                && self.fs_context_menu_idx.is_none()
+                && !modal_input_blocked
+                && !overflow_pointer_input.primary_owned
+                && !primary_suppression.suppresses_current_frame(),
+        );
         // 編集モード限定の固定入力。既存の panel 判定と top bar の表示矩形をそのまま使い、
         // キャンバス上の筆系ツールだけで「判定 → 半径へ適用 → wheel 消費」を完結させる。
         // 筆以外、各パネル上、popup / modal 中は input に触れず、下流の従来経路へ残す。
@@ -41803,8 +41922,9 @@ impl App {
                     })
                     && !overflow_pointer_input.primary_owned
                     && !primary_suppression.suppresses_current_frame()
-                    && self.fs_pan_drag_start.is_none()
-                    && self.fs_rotation_drag_start.is_none();
+                    && !primary_lens_owned
+                    && self.fs_canvas_drag.pan_start().is_none()
+                    && self.fs_canvas_drag.rotation_start().is_none();
                 let used = self.handle_drag_zoom(
                     ctx,
                     ZoomDragInput::Scrub,
@@ -41908,9 +42028,13 @@ impl App {
             crate::touch_input::TapZoneGeometry {
                 surface: full_rect,
                 excluded: touch_excluded,
-                behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
-                    accepts_pinch: true,
-                    tap_zones: touch_tap_zones_enabled,
+                behavior: if self.fs_exclusive_view.is_plane_view() && touch_tap_zones_enabled {
+                    crate::touch_input::TouchSurfaceBehavior::TransformedViewer
+                } else {
+                    crate::touch_input::TouchSurfaceBehavior::Viewer {
+                        accepts_pinch: true,
+                        tap_zones: touch_tap_zones_enabled,
+                    }
                 },
             },
             ctx.cumulative_frame_nr(),
@@ -42080,8 +42204,7 @@ impl App {
             self.cancel_mouse_ring_flick();
             self.cancel_mouse_gesture();
             self.fs_secondary_press.cancel();
-            self.fs_pan_drag_start = None;
-            self.fs_rotation_drag_start = None;
+            self.fs_canvas_drag = crate::plane_view::FsCanvasDrag::default();
             return FsWheelFrameResult::default();
         }
 
@@ -42326,25 +42449,33 @@ impl App {
                     ));
                 }
             }
-            let class = self.fs_wheel_segment_in_page_scroll(wheel, cursor_in_seek_panel);
+            let class = if self.plane_wheel_route(wheel.modifiers) {
+                FsWheelInPageClass::PlaneView
+            } else {
+                self.fs_wheel_segment_in_page_scroll(wheel, cursor_in_seek_panel)
+            };
             if wheel_y.abs() > 0.5 && suppress_egui_wheel {
                 // F12 detached 動画では native presenter child HWND がホイールを
                 // `NavigateItem` / tile 列変更に変換する。親の egui detached viewport にも
                 // 同じ wheel が届く環境があるため、ここでは消費だけして二重ナビを防ぐ。
                 crate::wheel_input::consume_wheel_segment(ctx, segment);
-            } else if handle_wheel_here && {
-                match class {
-                    FsWheelInPageClass::InPageScroll(delta) => {
-                        delta.is_finite() && delta != egui::Vec2::ZERO
-                    }
-                    FsWheelInPageClass::ScrollThenPageTurn(delta) => {
-                        delta.is_finite() && delta.y != 0.0
-                    }
-                    FsWheelInPageClass::SettingZoom | FsWheelInPageClass::Legacy => {
-                        wheel_y.abs() > 0.5
+            } else if handle_wheel_here
+                && !(class == FsWheelInPageClass::PlaneView && cursor_in_panel_for_wheel)
+                && {
+                    match class {
+                        FsWheelInPageClass::InPageScroll(delta) => {
+                            delta.is_finite() && delta != egui::Vec2::ZERO
+                        }
+                        FsWheelInPageClass::ScrollThenPageTurn(delta) => {
+                            delta.is_finite() && delta.y != 0.0
+                        }
+                        FsWheelInPageClass::PlaneView => segment.vertical_before_axis_mapping != 0.,
+                        FsWheelInPageClass::SettingZoom | FsWheelInPageClass::Legacy => {
+                            wheel_y.abs() > 0.5
+                        }
                     }
                 }
-            } {
+            {
                 let scroll_origin = if matches!(
                     class,
                     FsWheelInPageClass::InPageScroll(_) | FsWheelInPageClass::ScrollThenPageTurn(_)
@@ -42384,7 +42515,7 @@ impl App {
         );
         // Preserve the released wheel-before-click classification without mutating
         // a page which an intermediate navigation has already left.
-        let (click_zoom, click_pan, wheel_navigation_produced) =
+        let (click_zoom, click_pan, wheel_navigation_produced, click_plane_active) =
             self.predict_fs_wheel_frame(ctx, default_image_rect, &accepted_wheel);
         let canvas_click = self.plan_fs_canvas_click(
             ctx,
@@ -42401,6 +42532,7 @@ impl App {
             click_pan,
             Some(&overflow_pointer_input),
             close_mode_primary_suppression,
+            click_plane_active,
         );
         // Input planning precedes source update and paint in both presentations.
         // The proposal may be applied after paint when wheel navigation is mixed.
@@ -42432,6 +42564,7 @@ impl App {
             wheel_input: FsWheelFrameInput::Unconsumed(accepted_wheel),
             page_nav,
             canvas_click,
+            click_anchor: self.fullscreen_idx.map(|idx| self.plane_view_anchor(idx)),
             secondary_action,
             side_panel_click_chrome,
             full_rect,
@@ -42462,6 +42595,27 @@ impl App {
                 navigation_operation,
             )
         }
+    }
+
+    fn plane_wheel_action_matches_page(&self, action: &FsWheelAction) -> bool {
+        action.page_owner
+            == (
+                self.items_generation,
+                self.fullscreen_idx,
+                self.fullscreen_page_slice,
+            )
+    }
+
+    fn plane_wheel_route(&self, modifiers: egui::Modifiers) -> bool {
+        modifiers.ctrl
+            && modifiers.shift
+            && !modifiers.alt
+            && !self.fs_zoom_mode_effective()
+            && !self.analysis_mode
+            && !self.is_overlay_edit_mode_active()
+            && !self
+                .fullscreen_idx
+                .is_some_and(|idx| self.is_panorama_mode_active(idx))
     }
 
     fn fs_wheel_action_requests_navigation(&self, action: &FsWheelAction) -> bool {
@@ -42545,6 +42699,7 @@ impl App {
                         FsWheelInPageClass::ScrollThenPageTurn(_) => {
                             FsWheelInPageClass::ScrollThenPageTurn(segment.input.delta)
                         }
+                        FsWheelInPageClass::PlaneView => FsWheelInPageClass::PlaneView,
                         FsWheelInPageClass::SettingZoom => FsWheelInPageClass::SettingZoom,
                         FsWheelInPageClass::Legacy => FsWheelInPageClass::Legacy,
                     },
@@ -42583,7 +42738,8 @@ impl App {
             route_music_intervals,
             wheel_input,
             mut page_nav,
-            canvas_click,
+            mut canvas_click,
+            click_anchor,
             secondary_action,
             side_panel_click_chrome,
             full_rect,
@@ -42627,6 +42783,11 @@ impl App {
                 (actions, input)
             }
         };
+        if input.plane_lens_owned
+            || click_anchor != self.fullscreen_idx.map(|idx| self.plane_view_anchor(idx))
+        {
+            canvas_click = FsCanvasClickAction::None;
+        }
         let suppress_intermediate_navigation = suppress_wheel_navigation
             || secondary_action.closes_viewer(self, side_panel_click_chrome)
             // This existing command owner can change the page, context, mode,
@@ -42638,7 +42799,35 @@ impl App {
         let mut page_scroll_moved = false;
         let mut wheel_actions = accepted_wheel.into_iter().peekable();
         while let Some(wheel_action) = wheel_actions.next() {
+            self.plane_view_may_continue(self.fullscreen_idx.unwrap_or(usize::MAX));
             let wheel = wheel_action.input;
+            if wheel_action.class == FsWheelInPageClass::PlaneView {
+                if !wheel_navigation_produced
+                    && self.plane_wheel_action_matches_page(&wheel_action)
+                    && self.plane_wheel_route(wheel.modifiers)
+                {
+                    if let Some(input) = self.plane_view_wheel_input(
+                        default_image_rect,
+                        input.pointer_pos,
+                        wheel_action.segment.vertical_before_axis_mapping
+                            / WHEEL_ZOOM_POINTS_PER_NOTCH,
+                        self.fs_zoom,
+                        self.fs_pan,
+                        self.plane_view_pose(),
+                    ) {
+                        let mut outcome = crate::plane_view::plane_view_wheel_transition(input);
+                        outcome.pan = clamp_fullscreen_pan_from_layout(
+                            &self.fullscreen_page_layout,
+                            outcome.zoom,
+                            outcome.pan,
+                        );
+                        self.clear_fs_initial_placement_request();
+                        self.apply_plane_view_outcome(ctx, outcome);
+                        self.maybe_rerender_pdf(self.fs_zoom);
+                    }
+                }
+                continue;
+            }
             if let FsWheelInPageClass::InPageScroll(_) = wheel_action.class {
                 if !wheel_navigation_produced
                     && !suppress_wheel_navigation
@@ -42905,6 +43094,8 @@ impl App {
                 self.maybe_rerender_pdf(1.0);
             }
             // 右クリックは analysis_panel 側で処理
+        } else if input.plane_lens_owned {
+            // Admission binds the entire primary stream, including its release pass.
         } else if self.handle_panorama_drag_if_active(
             ctx,
             full_rect,
@@ -42938,7 +43129,7 @@ impl App {
                     && self.fs_bounded_drag_pan_surface(false)
                     && primary_down
                     && let Some(total_delta) = input.total_drag_delta
-                    && let Some((_, origin_pan)) = self.fs_pan_drag_start.as_mut()
+                    && let Some((_, origin_pan)) = self.fs_canvas_drag.pan_start_mut()
                 {
                     // Resume from the current pan after the Ctrl-owned frames (§8.6).
                     *origin_pan = self.fs_pan - total_delta;
@@ -42946,10 +43137,11 @@ impl App {
                 // Ctrl+ドラッグ → 回転
                 if primary_pressed && can_start_drag {
                     if let Some(pos) = pointer_pos {
-                        self.fs_rotation_drag_start = Some((pos, self.fs_free_rotation));
+                        self.fs_canvas_drag
+                            .set_rotation_start(Some((pos, self.fs_free_rotation)));
                     }
                 } else if primary_down {
-                    if let Some((start_pos, start_rot)) = self.fs_rotation_drag_start {
+                    if let Some((start_pos, start_rot)) = self.fs_canvas_drag.rotation_start() {
                         if let Some(pos) = pointer_pos {
                             let center = default_image_rect.center() + self.fs_pan;
                             let start_angle =
@@ -42998,9 +43190,10 @@ impl App {
                     && can_start_drag
                     && let (Some(pos), Some(total_delta)) = (pointer_pos, input.total_drag_delta)
                 {
-                    self.fs_pan_drag_start = Some((pos - total_delta, self.fs_pan));
+                    self.fs_canvas_drag
+                        .set_pan_start(Some((pos - total_delta, self.fs_pan)));
                 }
-                if let Some((_, start_pan)) = self.fs_pan_drag_start
+                if let Some((_, start_pan)) = self.fs_canvas_drag.pan_start()
                     && let Some(total_delta) = input.total_drag_delta
                 {
                     let proposed_pan = start_pan + total_delta;
@@ -43015,7 +43208,7 @@ impl App {
                         }
                         in_page_scroll::FsBoundedDragPanOutcome::WaitingForLayout => {}
                         in_page_scroll::FsBoundedDragPanOutcome::Position(pan) => {
-                            if let Some((_, origin_pan)) = self.fs_pan_drag_start.as_mut() {
+                            if let Some((_, origin_pan)) = self.fs_canvas_drag.pan_start_mut() {
                                 for axis in 0..2 {
                                     if pan[axis] != proposed_pan[axis] {
                                         // Discard only the motion stopped by the bound (§8.1).
@@ -43028,9 +43221,14 @@ impl App {
                 }
             }
             if primary_released {
-                self.fs_pan_drag_start = None;
-                self.fs_rotation_drag_start = None;
+                self.fs_canvas_drag.set_pan_start(None);
+                self.fs_canvas_drag.set_rotation_start(None);
             }
+        }
+        if input.plane_lens_owned
+            || click_anchor != self.fullscreen_idx.map(|idx| self.plane_view_anchor(idx))
+        {
+            canvas_click = FsCanvasClickAction::None;
         }
         close |= self.apply_fs_canvas_click(
             canvas_click,
@@ -43097,6 +43295,12 @@ impl App {
             FsCanvasClickAction::None | FsCanvasClickAction::DepthFocusAt(_) => {}
             FsCanvasClickAction::CloseViewer => close = true,
             FsCanvasClickAction::ResetTransform => {
+                if self.fs_exclusive_view.is_plane_view() {
+                    self.set_fs_exclusive_view(
+                        crate::fs_exclusive_view::FsExclusiveView::None,
+                        "plane_reset",
+                    );
+                }
                 self.clear_fs_initial_placement_request();
                 self.fs_automatic_initial_view = None;
                 self.fs_zoom = 1.0;
@@ -43126,7 +43330,7 @@ impl App {
         image_rect: egui::Rect,
         actions: &[FsWheelAction],
     ) -> (f32, egui::Vec2) {
-        let (zoom, pan, _) = self.predict_fs_wheel_frame(ctx, image_rect, actions);
+        let (zoom, pan, _, _) = self.predict_fs_wheel_frame(ctx, image_rect, actions);
         (zoom, pan)
     }
 
@@ -43137,7 +43341,8 @@ impl App {
         ctx: &egui::Context,
         image_rect: egui::Rect,
         actions: &[FsWheelAction],
-    ) -> (f32, egui::Vec2, bool) {
+    ) -> (f32, egui::Vec2, bool, bool) {
+        let mut plane = self.plane_view_pose();
         let mut zoom = self.fs_zoom;
         let mut pan = self.fs_pan;
         let mut moved = false;
@@ -43156,6 +43361,32 @@ impl App {
         let mouse = ctx.input(|input| input.pointer.hover_pos());
         for action in actions {
             match action.class {
+                FsWheelInPageClass::PlaneView => {
+                    if !navigation
+                        && self.plane_wheel_action_matches_page(action)
+                        && self.plane_wheel_route(action.input.modifiers)
+                    {
+                        if let Some(input) = self.plane_view_wheel_input(
+                            image_rect,
+                            mouse,
+                            action.segment.vertical_before_axis_mapping
+                                / WHEEL_ZOOM_POINTS_PER_NOTCH,
+                            zoom,
+                            pan,
+                            plane,
+                        ) {
+                            let outcome = crate::plane_view::plane_view_wheel_transition(input);
+                            plane = outcome.pose;
+                            zoom = outcome.zoom;
+                            pan = clamp_fullscreen_pan_from_layout(
+                                &self.fullscreen_page_layout,
+                                zoom,
+                                outcome.pan,
+                            );
+                        }
+                    }
+                    continue;
+                }
                 FsWheelInPageClass::InPageScroll(delta) => {
                     if self.fs_context_menu_idx.is_none()
                         && action.scroll_origin.as_ref().is_some_and(|origin| {
@@ -43242,7 +43473,7 @@ impl App {
                 pan = clamp_fullscreen_pan_from_layout(&self.fullscreen_page_layout, zoom, pan);
             }
         }
-        (zoom, pan, navigation)
+        (zoom, pan, navigation, plane.is_some())
     }
     fn plan_fs_canvas_click(
         &mut self,
@@ -43260,6 +43491,7 @@ impl App {
         pan: egui::Vec2,
         front: Option<&FsFrontPointerFrameInput>,
         close_mode_primary_suppression: FullscreenPrimarySuppressionDecision,
+        plane_active: bool,
     ) -> FsCanvasClickAction {
         let close_mode = self.fs_double_click_close_active(is_video);
         let excluded = self.is_overlay_edit_mode_active()
@@ -43272,17 +43504,19 @@ impl App {
             return FsCanvasClickAction::None;
         }
         let rotation = self.fs_free_rotation;
-        let has_transform = zoom_differs_from_fit(zoom)
+        let has_transform = plane_active
+            || zoom_differs_from_fit(zoom)
             || rotation.abs() > TRANSFORM_EPSILON
             || pan.length_sq() > PAN_EPSILON_SQ;
         // Dedicated media, continuous, zoom-mode and editing surfaces retain
         // their released click/reset policy.
         let ordinary_still = !is_video && !continuous_active && self.fs_in_page_scroll_surface();
-        let belongs_to_view = if ordinary_still {
-            self.fs_view_has_moved(zoom, pan, rotation)
-        } else {
-            zoom > ZOOM_NEAR_ONE || rotation.abs() > TRANSFORM_EPSILON
-        };
+        let belongs_to_view = plane_active
+            || if ordinary_still {
+                self.fs_view_has_moved(zoom, pan, rotation)
+            } else {
+                zoom > ZOOM_NEAR_ONE || rotation.abs() > TRANSFORM_EPSILON
+            };
         let can_reset = if ordinary_still {
             belongs_to_view
         } else {
@@ -45336,7 +45570,7 @@ impl App {
         }
     }
 
-    fn show_fullscreen_nav_noop(
+    pub(crate) fn show_fullscreen_nav_noop(
         &mut self,
         ctx: &egui::Context,
         reason: FsNavNoOpReason,
@@ -45400,6 +45634,10 @@ impl App {
     /// false の場合は既存の no-op 案内と同じ単一 state を更新するため、キーリピートや
     /// 非同期 continuation が重なっても通知を積み上げない。
     pub(crate) fn fullscreen_edit_mode_entry_allowed(&mut self, fs_idx: usize) -> bool {
+        if self.fs_exclusive_view.is_plane_view() {
+            self.show_feedback_toast("魚眼を終了してから編集してください".into());
+            return false;
+        }
         if self.fs_exclusive_view.is_depth() {
             self.show_feedback_toast("3D 写真を終了してから編集してください".to_owned());
             return false;
@@ -45432,6 +45670,7 @@ impl App {
 
     pub(crate) fn nav_noop_title(reason: FsNavNoOpReason) -> &'static str {
         match reason {
+            FsNavNoOpReason::PlaneEntry(reason) => reason.message(),
             FsNavNoOpReason::LocalFilterActive => "Ctrl+F検索中はフォルダ移動しません",
             FsNavNoOpReason::SearchResultList => "検索結果を開いてからCtrl+↑↓で移動できます",
             FsNavNoOpReason::SearchSiblingUnsupported => "検索中は兄弟フォルダ移動しません",
@@ -46763,6 +47002,7 @@ impl App {
             matches!(layout_source, FsPageLayoutSource::CurrentItem),
             false,
         )
+        .map(|draw| draw.transform)
     }
 
     fn commit_fs_single_page_placement(
@@ -46828,7 +47068,11 @@ impl App {
         mut flat_crop: page_turn::FlatCropPaint<'_>,
         selected_current: bool,
         original_preview_active: bool,
-    ) -> Option<DisplayedImageTransform> {
+    ) -> Option<FsSinglePageDraw> {
+        let pixel_grid_enabled = pixel_grid_enabled && !self.fs_exclusive_view.is_plane_view();
+        if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
+            self.clear_plane_last_drawn();
+        }
         if matches!(layout_source, FsPageLayoutSource::CurrentItem)
             && !self.fs_exclusive_view.is_depth()
             && self.fs_pdf_rerender_demand.resume_after_depth()
@@ -47013,7 +47257,50 @@ impl App {
             let depth_selected = matches!(layout_source, FsPageLayoutSource::CurrentItem)
                 && self.depth_view_may_continue(page_idx)
                 && self.depth_paint_ready(resource);
-            let paint_resource = if depth_selected {
+            let mut plane_selected = if matches!(layout_source, FsPageLayoutSource::CurrentItem)
+                && self.plane_view_may_continue(page_idx)
+            {
+                self.select_plane_material(
+                    ui.ctx(),
+                    resource,
+                    transform_input.source_size,
+                    transform_input.texture_size,
+                )
+                .and_then(|material| {
+                    let old = material.description;
+                    let basis_view = crate::material_display_basis::MaterialDisplayView::Single;
+                    let old_fit = self
+                        .fs_basis_fit_input(fit_mode, old.display_basis, basis_view)
+                        .ok()?;
+                    let old_layout = match old.display_basis.legacy(basis_view) {
+                        crate::material_display_basis::MaterialLegacyBasis::Raster {
+                            layout_size,
+                            ..
+                        } => Some(layout_size),
+                        crate::material_display_basis::MaterialLegacyBasis::SourceLayout {
+                            basis,
+                        } => Some(basis.layout_size),
+                        crate::material_display_basis::MaterialLegacyBasis::Unavailable(_) => None,
+                    };
+                    let old_size = egui::vec2(old.source_size[0] as f32, old.source_size[1] as f32);
+                    let input = DisplayedImageTransformInput {
+                        source_size: old_size,
+                        texture_size: old.texture_size,
+                        fit_mode: old_fit,
+                        ..transform_input
+                    };
+                    let drawn = resolve_fs_image_transform(input, old_layout)?;
+                    crate::plane_view::placement_frames_match(
+                        transform.placement_frame,
+                        drawn.placement_frame,
+                        transform_input.pixels_per_point,
+                    )
+                    .then_some((material, drawn, input, old_layout))
+                })
+            } else {
+                None
+            };
+            let paint_resource = if depth_selected || plane_selected.is_some() {
                 resource.clone()
             } else {
                 let Some(prepared) = self.prepare_fs_paged_paint_payload(
@@ -47030,6 +47317,10 @@ impl App {
                 };
                 prepared
             };
+            let mut pdf_demand_rect = transform.layout_full_image_rect;
+            if let Some((_, drawn, _, _)) = &plane_selected {
+                transform = *drawn;
+            }
             let mut page = PreparedPagedPage {
                 crop,
                 occurrence: SpreadPageOccurrence {
@@ -47049,9 +47340,9 @@ impl App {
             let mut bounded_pan = None;
             if matches!(layout_source, FsPageLayoutSource::CurrentItem)
                 && self.fs_draw_pan_eligible(selected_current, original_preview_active)
-                && (depth_selected || page.resource.page_material_kind() == FullscreenPageMaterialKind::Complete)
+                && (depth_selected || plane_selected.as_ref().map_or(page.resource.page_material_kind(), |(material,_,_,_)| material.description.material_kind) == FullscreenPageMaterialKind::Complete)
                 // Freeze the existing binding choice using the uncorrected view.
-                && (depth_selected || submitted.is_none() || self.page_turn_prepared_held_page(&page).is_none())
+                && (depth_selected || plane_selected.is_some() || submitted.is_none() || self.page_turn_prepared_held_page(&page).is_none())
                 && normal_zoom_pan(transform).is_some()
             {
                 let correction = draw_pan_correction(std::slice::from_ref(&transform));
@@ -47070,10 +47361,18 @@ impl App {
                         }
                         _ => ResolvedDisplayPlacement::Normal { zoom_pan },
                     };
-                    transform = resolve_fs_image_transform(transform_input, layout_source_size)?;
+                    let current_transform =
+                        resolve_fs_image_transform(transform_input, layout_source_size)?;
+                    pdf_demand_rect = current_transform.layout_full_image_rect;
+                    transform = if let Some((_, _, old_input, old_layout)) = &mut plane_selected {
+                        old_input.placement = transform_input.placement;
+                        resolve_fs_image_transform(*old_input, *old_layout)?
+                    } else {
+                        current_transform
+                    };
                     live_eligible &= zoom_pan.is_none();
                     painter = painter_for(zoom_pan);
-                    if !depth_selected {
+                    if !depth_selected && plane_selected.is_none() {
                         let Some(prepared) = self.prepare_fs_paged_paint_payload(
                             resource,
                             &transform,
@@ -47113,10 +47412,30 @@ impl App {
                 if depth_selected {
                     FullscreenPageMaterialKind::Complete
                 } else {
-                    page.resource.page_material_kind()
+                    plane_selected
+                        .as_ref()
+                        .map_or(page.resource.page_material_kind(), |(material, _, _, _)| {
+                            material.description.material_kind
+                        })
                 },
                 bounded_pan,
             );
+            if let Some((material, _, _, _)) = plane_selected {
+                assert!(self.paint_plane_view(&painter, material, &transform, full_rect, bg_style));
+                if let Some(submitted) = submitted {
+                    submitted.pages.clear();
+                    submitted.pages.push(FsNavigatorTextureSource {
+                        occurrence: SpreadPageOccurrence::navigation(page_idx, page_idx),
+                        resource: resource.clone(),
+                        provenance: FsDisplayUnitPageProvenance::Live,
+                    });
+                    submitted.submission = FsDisplayUnitSubmission::LegacyRendered;
+                }
+                return Some(FsSinglePageDraw {
+                    transform,
+                    pdf_demand_rect,
+                });
+            }
             if depth_selected {
                 let mut export_input = transform_input;
                 export_input.free_rotation_rad = 0.0;
@@ -47163,7 +47482,10 @@ impl App {
                     });
                     submitted.submission = FsDisplayUnitSubmission::LegacyRendered;
                 }
-                return Some(transform);
+                return Some(FsSinglePageDraw {
+                    transform,
+                    pdf_demand_rect,
+                });
             }
             if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
                 self.observe_raw_presentation(page_idx);
@@ -47233,7 +47555,10 @@ impl App {
                     ui.ctx().pixels_per_point(),
                 );
             }
-            return Some(transform);
+            return Some(FsSinglePageDraw {
+                transform,
+                pdf_demand_rect,
+            });
         }
         if let Some(submitted) = submitted {
             submitted.pages.clear();
@@ -47807,6 +48132,12 @@ impl App {
     }
 
     fn reset_fullscreen_fit_transform(&mut self, fs_idx: usize) {
+        if self.fs_exclusive_view.is_plane_view() {
+            self.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::None,
+                "plane_fit_reset",
+            );
+        }
         self.clear_fs_initial_placement_request();
         self.fs_automatic_initial_view = None;
         self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Legacy;
@@ -57428,6 +57759,10 @@ impl App {
                 vec!["V キーで 360° ビューを終了してから編集してください"],
             ),
             FsBoundaryHint::NavNoOp {
+                reason: reason @ FsNavNoOpReason::PlaneEntry(_),
+                ..
+            } => (Self::nav_noop_title(reason), Vec::new()),
+            FsBoundaryHint::NavNoOp {
                 reason:
                     reason @ (FsNavNoOpReason::RawDevelopmentPending
                     | FsNavNoOpReason::RawDevelopmentUnavailable),
@@ -58007,6 +58342,10 @@ impl App {
     }
 
     pub(crate) fn begin_capture_region_selection(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.fs_exclusive_view.is_plane_view() {
+            self.show_feedback_warning("魚眼中は範囲コピーを使用できません".into());
+            return;
+        }
         if self.is_overlay_edit_mode_active() || self.analysis_mode {
             self.show_feedback_warning("通常表示で範囲コピーしてください".to_string());
             return;
@@ -58036,8 +58375,8 @@ impl App {
 
         let wait_for_release = ctx.input(|i| i.pointer.primary_down());
         self.capture_region_selection = Some(CaptureRegionSelection::new(fs_idx, wait_for_release));
-        self.fs_pan_drag_start = None;
-        self.fs_rotation_drag_start = None;
+        self.fs_canvas_drag.set_pan_start(None);
+        self.fs_canvas_drag.set_rotation_start(None);
         self.show_feedback_warning("ドラッグでコピー範囲を選択".to_string());
         ctx.request_repaint();
     }
@@ -58441,6 +58780,16 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Result<crate::capture::CapturePixelWork, String> {
+        if self.fs_exclusive_view.is_plane_view() {
+            let request =
+                self.plane_frame_request(crate::plane_view_wgpu::PlaneOutputChoice::Canvas)?;
+            let basename = format!(
+                "{}_fisheye",
+                self.capture_basename_for_idx(idx)
+                    .unwrap_or_else(|| "image".into())
+            );
+            return Ok(crate::capture::CapturePixelWork::PlaneView { basename, request });
+        }
         match self.resolve_visible_spread_output_pair(idx) {
             SpreadPair::Single => self
                 .prepare_capture_pixel_job(ctx, idx)
@@ -59594,7 +59943,11 @@ impl App {
                 }
                 (frames, Some(source_size))
             }
-            (Some(_), crate::export_dialog::ExportComposite::Spread { .. }) => {
+            (
+                Some(_),
+                crate::export_dialog::ExportComposite::Spread { .. }
+                | crate::export_dialog::ExportComposite::PlaneView(_),
+            ) => {
                 self.show_feedback_warning("SNS 分割の単ページを準備できませんでした".to_string());
                 return false;
             }
@@ -59619,6 +59972,12 @@ impl App {
             if !selection.iter().any(|&v| v) {
                 selection[0] = true;
             }
+        }
+        if matches!(
+            &target.composite,
+            crate::export_dialog::ExportComposite::PlaneView(_)
+        ) {
+            selection = [true, false, false, false, false];
         }
         let original_include_metadata = self.settings.export_embed_metadata;
 
@@ -59647,7 +60006,14 @@ impl App {
             } else {
                 self.settings.export_default_scale
             },
-            basename: crate::capture::basename_from_text(&format!("{}_edited", target.basename)),
+            basename: crate::capture::basename_from_text(&if matches!(
+                &target.composite,
+                crate::export_dialog::ExportComposite::PlaneView(_)
+            ) {
+                target.basename.clone()
+            } else {
+                format!("{}_edited", target.basename)
+            }),
             output_dir_text: output_dir.display().to_string(),
             source_dir: target.source_dir,
             include_metadata: original_include_metadata,
@@ -59670,6 +60036,21 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> Result<ExportDialogTarget, String> {
+        if self.fs_exclusive_view.is_plane_view() {
+            let request =
+                self.plane_frame_request(crate::plane_view_wgpu::PlaneOutputChoice::Export(
+                    crate::export_dialog::ExportScale::Full,
+                ))?;
+            let (_, label, _, source_dir, basename) = self.export_source_info_for_idx(fs_idx)?;
+            return Ok(ExportDialogTarget {
+                source: crate::export_dialog::ExportSource::RenderedSpread,
+                source_label: format!("魚眼の見た目: {label}"),
+                original_format: crate::save_with_metadata::SrcFormat::Other("fisheye".into()),
+                source_dir,
+                basename: format!("{basename}_fisheye"),
+                composite: crate::export_dialog::ExportComposite::PlaneView(request),
+            });
+        }
         match self.resolve_visible_spread_output_pair(fs_idx) {
             SpreadPair::Single => self.prepare_single_export_dialog_target(ctx, fs_idx),
             SpreadPair::Double { left, right } => {
@@ -60011,55 +60392,19 @@ impl App {
                     "書き出しの後で知らせます (隠した部分が縮小画像に残ることがあります)。",
                 ));
                 if !metadata_possible {
-                    ui.small("形式変換、PDF、見開き合成ではメタデータ保持は無効です");
+                    ui.small("形式変換、PDF、見開き合成、魚眼ではメタデータ保持は無効です");
                 }
 
                 ui.add_space(6.0);
                 ui.label("出力サイズ");
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 3.0;
-                    for scale in crate::export_dialog::ExportScale::FIXED {
-                        let [w, h] = scale.scaled_size(base_size);
-                        ui.radio_value(
-                            &mut state.scale,
-                            scale,
-                            format!("{} ({}×{})", scale.label(), w, h),
-                        );
-                    }
-                    // 長辺 px 指定 (AI アップスケールの巨大サイズを一定上限へ収める用途)。
-                    let mut long_edge_px = match state.scale {
-                        crate::export_dialog::ExportScale::LongEdge(px) => px,
-                        _ => crate::export_dialog::ExportScale::DEFAULT_LONG_EDGE,
-                    };
-                    let is_long_edge =
-                        matches!(state.scale, crate::export_dialog::ExportScale::LongEdge(_));
-                    let [lw, lh] = crate::export_dialog::ExportScale::LongEdge(long_edge_px)
-                        .scaled_size(base_size);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .radio(is_long_edge, format!("長辺指定 ({lw}×{lh})"))
-                            .clicked()
-                        {
-                            state.scale = crate::export_dialog::ExportScale::LongEdge(long_edge_px);
-                        }
-                        let resp = ui.add(
-                            egui::DragValue::new(&mut long_edge_px)
-                                .range(
-                                    crate::export_dialog::ExportScale::LONG_EDGE_MIN
-                                        ..=crate::export_dialog::ExportScale::LONG_EDGE_MAX,
-                                )
-                                .suffix("px"),
-                        );
-                        crate::ui_helpers::set_accessibility_label(&resp, "長辺指定");
-                        if resp.changed() {
-                            state.scale = crate::export_dialog::ExportScale::LongEdge(long_edge_px);
-                        }
-                    });
-                });
+                let composite = &state.composite;
+                draw_export_size_options(ui, &mut state.scale, |scale| composite.output_size(scale, base_size));
 
                 ui.separator();
                 ui.label("出力するバリエーション");
-                if sns_split_export {
+                if matches!(&state.composite,crate::export_dialog::ExportComposite::PlaneView(_)) {
+                    ui.label("魚眼の見た目を書き出します");
+                } else if sns_split_export {
                     let reason = "SNS 分割では現在の設定のみ書き出します";
                     let mut current_selected = true;
                     ui.add_enabled(
@@ -70978,6 +71323,7 @@ mod tests {
                             egui::Vec2::ZERO,
                             None,
                             FullscreenPrimarySuppressionDecision::Allow,
+                            false,
                         );
                         if frame == 2 {
                             assert!(response.clicked(), "zoom={zoom}");
@@ -75190,7 +75536,7 @@ mod tests {
                     assert!(matches!(result.0, FsPageNav::None));
                     assert_eq!(app.fs_zoom, if frame == 0 { 2.0 } else { 4.0 });
                     assert_eq!(app.fs_middle_zoom_drag.is_some(), frame < 3);
-                    assert!(app.fs_pan_drag_start.is_none());
+                    assert!(app.fs_canvas_drag.pan_start().is_none());
                 } else {
                     assert!(app.fs_middle_zoom_drag.is_none());
                     assert_eq!(app.fs_zoom, 2.0);
@@ -75572,7 +75918,7 @@ mod tests {
                 &transform,
                 vec![erase_preview_canvas_primary(pos, false)],
             );
-            assert!(app.fs_pan_drag_start.is_none());
+            assert!(app.fs_canvas_drag.pan_start().is_none());
             assert!(app.fs_middle_zoom_drag.is_none());
         }
     }
@@ -76357,7 +76703,7 @@ mod tests {
             false,
             Some(pos)
         ));
-        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_canvas_drag.pan_start().is_none());
         assert!(app.fs_middle_zoom_drag.is_some());
         // Continuing over a panel is allowed. The dead zone keeps the latest zoom/pan.
         let start = (app.fs_zoom, app.fs_pan);
@@ -76432,7 +76778,7 @@ mod tests {
             false,
             Some(pos)
         ));
-        assert!(app.fs_pan_drag_start.is_some());
+        assert!(app.fs_canvas_drag.pan_start().is_some());
         assert!(app.handle_overlay_space_pan_drag(
             &ctx,
             false,
@@ -76444,7 +76790,7 @@ mod tests {
             false,
             Some(pos)
         ));
-        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_canvas_drag.pan_start().is_none());
         assert!(app.fs_middle_zoom_drag.is_none());
         assert!(app.fs_primary_suppression.is_active());
     }
@@ -95407,6 +95753,70 @@ mod tests {
     /// 2026-08-26 に `still_touch_chrome_latched` が実機でこれを踏み、フルスクリーン動画の
     /// シーク中に UI スレッドが固まった。当時この形はコードベース全体でその 1 箇所だけだった。
     /// 見つけたら、`ctx` を要る値へ先に落としてから closure に入る。
+    /// The older helper-argument audit does not recognize direct Context methods
+    /// or a newline between `ctx` and `.input`. Cover both in the new PlaneView
+    /// adapters and harness, without extending this change to unrelated old tests.
+    #[test]
+    fn plane_context_lock_closures_do_not_read_context_again() {
+        fn recursive_reads(source: &str) -> Vec<usize> {
+            let opener = regex::Regex::new(
+                r"\bctx\s*\.\s*(?:data_mut|data|input_mut|input|memory_mut|memory|options|fonts|output_mut|output)\s*\("
+            ).unwrap();
+            let read = regex::Regex::new(
+                r"\bctx\s*\.\s*(?:data_mut|data|input_mut|input|memory_mut|memory|options|fonts|output_mut|output|viewport_id|cumulative_frame_nr|pixels_per_point)\s*\("
+            ).unwrap();
+            let mut violations = Vec::new();
+            for start in opener.find_iter(source) {
+                if !source[start.end()..].trim_start().starts_with('|') {
+                    continue;
+                }
+                let mut depth = 1;
+                let mut end = start.end();
+                for (offset, ch) in source[start.end()..].char_indices() {
+                    match ch {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        end = start.end() + offset;
+                        break;
+                    }
+                }
+                if read.is_match(&source[start.end()..end]) {
+                    violations.push(source[..start.start()].lines().count());
+                }
+            }
+            violations
+        }
+        assert!(
+            !recursive_reads(
+                "ctx.data_mut(|data| data.insert_temp(id, ctx.cumulative_frame_nr()))"
+            )
+            .is_empty()
+        );
+        assert!(
+            !recursive_reads(
+                "ctx\n.input(|input| segments(input, ctx.options(|opts| opts.input_options)))"
+            )
+            .is_empty()
+        );
+        assert!(recursive_reads("ctx.data_mut(|data| data.insert_temp(id, frame_nr))").is_empty());
+        for (name, source) in [
+            ("app/plane_view.rs", include_str!("app/plane_view.rs")),
+            (
+                "ui_fullscreen/plane_view_tests.rs",
+                include_str!("ui_fullscreen/plane_view_tests.rs"),
+            ),
+        ] {
+            assert!(
+                recursive_reads(source).is_empty(),
+                "{name}: recursive Context reads at {:?}",
+                recursive_reads(source)
+            );
+        }
+    }
+
     #[test]
     fn egui_context_closures_do_not_hand_ctx_to_helpers() {
         fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
@@ -104248,4 +104658,45 @@ fn export_done_message(success: usize, skipped: usize) -> String {
         (0, _) => format!("既にある {skipped} 件をスキップしました (書き出した画像はありません)"),
         _ => format!("{success} 件をエクスポートしました (既にある {skipped} 件はスキップ)"),
     }
+}
+
+/// Shared dialog renderer; PlaneView resolves each choice against the frozen canvas/device limits.
+fn draw_export_size_options(
+    ui: &mut egui::Ui,
+    scale: &mut crate::export_dialog::ExportScale,
+    mut output_size: impl FnMut(crate::export_dialog::ExportScale) -> [usize; 2],
+) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 3.;
+        for choice in crate::export_dialog::ExportScale::FIXED {
+            let [w, h] = output_size(choice);
+            ui.radio_value(scale, choice, format!("{} ({}×{})", choice.label(), w, h));
+        }
+        let mut long_edge_px = match *scale {
+            crate::export_dialog::ExportScale::LongEdge(px) => px,
+            _ => crate::export_dialog::ExportScale::DEFAULT_LONG_EDGE,
+        };
+        let is_long_edge = matches!(*scale, crate::export_dialog::ExportScale::LongEdge(_));
+        let [lw, lh] = output_size(crate::export_dialog::ExportScale::LongEdge(long_edge_px));
+        ui.horizontal(|ui| {
+            if ui
+                .radio(is_long_edge, format!("長辺指定 ({lw}×{lh})"))
+                .clicked()
+            {
+                *scale = crate::export_dialog::ExportScale::LongEdge(long_edge_px);
+            }
+            let resp = ui.add(
+                egui::DragValue::new(&mut long_edge_px)
+                    .range(
+                        crate::export_dialog::ExportScale::LONG_EDGE_MIN
+                            ..=crate::export_dialog::ExportScale::LONG_EDGE_MAX,
+                    )
+                    .suffix("px"),
+            );
+            crate::ui_helpers::set_accessibility_label(&resp, "長辺指定");
+            if resp.changed() {
+                *scale = crate::export_dialog::ExportScale::LongEdge(long_edge_px);
+            }
+        });
+    });
 }

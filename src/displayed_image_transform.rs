@@ -203,6 +203,8 @@ pub(crate) struct DisplayedImageGeometry {
     /// SpecifiedScale demand and captured layout use this A/O-derived extent; a rounded
     /// AI/PDF raster may only alter the contained paint rectangle.
     pub(crate) layout_full_image_rect: egui::Rect,
+    /// Fit placement before sampler containment and physical pixel snapping.
+    pub(crate) placement_frame: egui::Rect,
     /// 実際に texture を paint する矩形。表示 trim 時は bbox 部分だけになる。
     pub(crate) paint_rect: egui::Rect,
     /// ポインタ判定の broad phase。自由回転時は paint quad の AABB。
@@ -491,6 +493,7 @@ impl DisplayedImageGeometry {
         );
         let mut geometry = Self::from_resolved_rect(input, full_image_rect)?;
         geometry.layout_full_image_rect = layout_full_image_rect;
+        geometry.placement_frame = layout_full_image_rect;
         Some(geometry)
     }
 
@@ -513,6 +516,7 @@ impl DisplayedImageGeometry {
         if !total_scale.is_finite() || total_scale <= 0.0 {
             return None;
         }
+        let placement_frame = full_image_rect;
         let full_image_rect = match input.pixel_fit {
             RectPixelFit::Texels => snap_rect_to_physical_pixels(
                 full_image_rect,
@@ -555,6 +559,7 @@ impl DisplayedImageGeometry {
             viewport_rect: input.viewport_rect,
             full_image_rect,
             layout_full_image_rect: full_image_rect,
+            placement_frame,
             paint_rect,
             hit_rect,
             uv_rect,
@@ -569,6 +574,12 @@ impl DisplayedImageGeometry {
             pixels_per_point: input.pixels_per_point,
             pixel_fit: input.pixel_fit,
         })
+    }
+
+    /// Sampler containment must not change the placement frame used for material adoption.
+    pub(crate) fn with_placement_frame(mut self, frame: egui::Rect) -> Self {
+        self.placement_frame = frame;
+        self
     }
 
     /// 貼り先を **平行移動だけ** する。倍率・UV・寸法は動かさない。
@@ -592,6 +603,7 @@ impl DisplayedImageGeometry {
         Self {
             full_image_rect,
             layout_full_image_rect: self.layout_full_image_rect.translate(offset),
+            placement_frame: self.placement_frame.translate(offset),
             paint_rect,
             hit_rect,
             ..self

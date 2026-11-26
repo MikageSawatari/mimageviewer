@@ -92,7 +92,8 @@ fn single(
             current,
             original,
         )
-        .unwrap();
+        .unwrap()
+        .transform;
     app.fullscreen_page_layout
         .begin(FullscreenPageLayoutKind::Single);
     let composition = app.spread_display_composition_for_anchor(idx);
@@ -818,7 +819,8 @@ fn rejected_native_discards_pan_proposal_before_provisional_fallback() {
                 true,
                 false,
             )
-            .unwrap();
+            .unwrap()
+            .transform;
         assert_eq!(t.texture_size, fallback.full_source_size_vec2());
         assert_eq!(normal_zoom_pan(t).unwrap().1, pan);
         assert_eq!(app.fs_pan, pan);

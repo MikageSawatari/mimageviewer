@@ -91,6 +91,10 @@ pub struct CapturePixelJob {
 }
 
 pub enum CapturePixelWork {
+    PlaneView {
+        basename: String,
+        request: crate::plane_view_wgpu::PlaneFrameRequest,
+    },
     Single(CapturePixelJob),
     Spread {
         basename: String,
@@ -609,6 +613,10 @@ pub fn rotate_color_image(
 
 pub fn run_pixel_work(work: CapturePixelWork) -> Result<(String, u32, u32, Vec<u8>), String> {
     match work {
+        CapturePixelWork::PlaneView { basename, request } => {
+            let rgba = request.render()?;
+            Ok((basename, request.size[0], request.size[1], rgba))
+        }
         CapturePixelWork::Single(job) => run_pixel_job(job),
         CapturePixelWork::Spread {
             basename,

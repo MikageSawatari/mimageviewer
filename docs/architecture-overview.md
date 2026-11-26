@@ -1,5 +1,16 @@
 # アーキテクチャ概観
 
+## 魚眼ズーム (PlaneView)
+
+- `plane_view.rs`: レンズの設定型、ページ/slice anchor、純粋なホイール遷移、CPU参照式、キャンバスドラッグの所有型。
+- `app/plane_view.rs`: 共通の入口/継続照合、素材採用、描画snapshot、出力要求、表示所有者交代時のDepth/PlaneView退役。
+- `plane_view_wgpu.rs` / `plane_view_wgpu/export.rs`: 共通WGSL、format別pipeline、不変素材、callback別uniform、workerでのoffscreen描画とreadback。
+- `gpu_color_copy.rs`: DepthとPlaneView共用のblit/mip生成。context共通の可変素材slotは置かない。
+
+状態は既存 `FsExclusiveView` のvariant。detachedの配送とviewportは拡張せず、既存ownerの中で完結する。
+キャプチャ/コピー/書き出しの既存workerへ不変snapshotを渡し、GPU待機をUIへ持ち込まない。
+[正本と実装記録](fisheye-plane-view-plan.md)を参照。
+
 ## ブラウザ閲覧の保存先のページ構成（§1.870）
 
 `browser_view_policy` は保存先の根と実フォルダの走査元情報だけで対象を判定する。

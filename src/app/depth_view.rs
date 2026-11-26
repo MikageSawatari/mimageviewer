@@ -904,9 +904,7 @@ impl App {
                 && !app.fullscreen_embedded_still_active()
             {
                 app.depth_setup.invalidate_mode_entry(main);
-                if app.fs_exclusive_view.is_depth() {
-                    app.set_fs_exclusive_view(FsExclusiveView::None, "main_live_pass_handoff");
-                }
+                app.retire_exclusive_view_for_owner_change("main_live_pass_handoff");
             }
         })
         .expect("independent activation keeps the main context available");
@@ -923,6 +921,7 @@ impl App {
     /// All live transitions retire the old owner before publishing its replacement.
     pub(crate) fn set_fs_exclusive_view(&mut self, target: FsExclusiveView, _cause: &'static str) {
         let leaving_panorama = matches!(self.fs_exclusive_view, FsExclusiveView::Panorama(_));
+        self.fs_canvas_drag.retire_lens();
         if leaving_panorama {
             self.panorama_projection_popup_open = false;
             self.clear_pano_upload();
@@ -951,6 +950,7 @@ impl App {
     pub(crate) fn fs_exclusive_view_active(&self, fs_idx: usize) -> Option<ExclusiveViewKind> {
         match &self.fs_exclusive_view {
             FsExclusiveView::Depth(_) => Some(ExclusiveViewKind::Depth),
+            FsExclusiveView::PlaneView(_) => Some(ExclusiveViewKind::PlaneView),
             FsExclusiveView::Panorama(_) if self.is_panorama_mode_active(fs_idx) => {
                 Some(ExclusiveViewKind::Panorama)
             }
@@ -1054,11 +1054,10 @@ impl App {
         target_independent: bool,
         cause: &'static str,
     ) -> Option<String> {
-        let feedback = if self.fs_exclusive_view.is_depth()
-            && (target != self.viewer_presentation
-                || target_independent != self.detached_viewer_independent_active)
-        {
-            self.set_fs_exclusive_view(FsExclusiveView::None, cause);
+        let owner_changed = target != self.viewer_presentation
+            || target_independent != self.detached_viewer_independent_active;
+        let was_depth = owner_changed && self.retire_exclusive_view_for_owner_change(cause);
+        let feedback = if was_depth {
             let message = match self.keymap.first_chord_label(KeyAction::FsDepthParallax) {
                     Some(key) => format!(
                         "3D 写真を終了しました: 表示を切り替えました。{key} キーでもう一度使えます"

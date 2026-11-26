@@ -1,5 +1,26 @@
 # 表示パイプライン (サムネイル / フルスクリーン)
 
+## 魚眼の表示レイヤー (PlaneView)
+
+正本: [魚眼と板の傾け設計](fisheye-plane-view-plan.md) §3〜§6。段1は単ページの静止画を対象とし、
+`FsExclusiveView::PlaneView` が context ごとの強さ・レンズ中心・素材・直近の描画 snapshot を所有する。
+2D の selector、zoom / pan / 回転 / trim / fit と `commit_fs_single_page_placement` を共用する。
+resampler の準備より前に採用を決め、元の TextureHandle から `gpu_color_copy` (Depth と共用) で mip を作る。
+PlaneView は拡大方式の resampler を通らず、最終の補正・AI・元画像ホールドの選択をそのまま描く。
+
+`PlaneGpuCopy` は TextureId、`PlaneMaterial` は幾何の記述全体で照合する。登録待ちは所有 viewport の次passを要求し、
+配置枠の各辺が1/64物理画素以内で一致すれば前の不変素材をその素材自身の変換で描く。
+`DisplayedImageGeometry::placement_frame` は sampler を contain / 丸めする前の枠で、旧来の SourceLayout もこれを返す。
+`fullscreen_page_layout` / last_drawn は実際に描いた変換を記録する。PDF の需要は止めず、指定倍率の需要用矩形は
+単ページ描画の戻り値 `FsSinglePageDraw` で現在素材の変換から並べて返す。
+
+画面と書き出しは `PLANE_SHADER` 1本。group0 は不変素材、group1 は callback / 出力ごとの uniform、pipeline は target format ごと。
+傾きの uniform は段1では0。CPU参照式は `plane_view::{camera_point,texture_point}`。
+2Dで描いたpassは last_drawn を消す。キャプチャ・画像コピー・Ctrl+E は一致する last_drawn の Arc だけを要求へ渡し、
+既存workerで `PlaneFrameRenderer` の描画・読み戻しを行う。出力座標と市松の座標はcanvas基準。
+寸法の上限は行padding込みbufferとtextureの両方を resolver で守り、Ctrl+Eの追加縮小は通さない。
+写しのVRAMは allocation lifetime のRAII会計で、終了後にcallback / 出力要求だけが持つ世代も重複なく数える。
+
 ## 3D 写真の表示レイヤー（2026-11-07、段 B 実装・独立レビュー中）
 
 3D は既存の final / comic / source の優先順位を変更しない。

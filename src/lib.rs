@@ -304,6 +304,7 @@ pub mod depth_parallax;
 pub mod depth_parallax_wgpu;
 pub(crate) mod focus_debug;
 mod fs_exclusive_view;
+mod gpu_color_copy;
 mod manual_mask_tools;
 pub mod margin_fit;
 pub mod mask_db;
@@ -331,6 +332,8 @@ pub mod page_split;
 pub mod panorama;
 pub mod panorama_wgpu;
 pub mod path_key;
+pub mod plane_view;
+pub mod plane_view_wgpu;
 pub mod reading_history_db;
 pub(crate) mod reading_history_thumbnail_sources;
 #[cfg(any(test, feature = "test-script"))]

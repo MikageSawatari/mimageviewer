@@ -316,7 +316,7 @@ fn depth_focus_canvas_click_uses_release_modifiers_and_preserves_prior_exclusion
                         let response = ui.interact(rect, egui::Id::unique("focus-canvas"), egui::Sense::click_and_drag());
                         app.fs_front_pointer.accept_backing_click(&response, false);
                         let action = app.plan_fs_canvas_click(&ctx, &response, rect, StillSeekGeometry::bar_only(),
-                            false, exclusion == "suppressed", false, false, None, false, 1., egui::Vec2::ZERO, None, FullscreenPrimarySuppressionDecision::Allow);
+                            false, exclusion == "suppressed", false, false, None, false, 1., egui::Vec2::ZERO, None, FullscreenPrimarySuppressionDecision::Allow, false);
                         if response.clicked() {
                             clicked = true;
                             if exclusion == "suppressed" || exclusion == "popup" || exclusion == "panel" && depth {
@@ -397,7 +397,7 @@ fn depth_focus_batched_clicks_use_the_last_primary_release_after_pointer_move() 
                             egui::Vec2::ZERO,
                             None,
                             FullscreenPrimarySuppressionDecision::Allow,
-                        );
+                         false);
                         assert_eq!(matches!(action, FsCanvasClickAction::DepthFocusAt(_)), ctrl);
                         if ctrl { assert!(matches!(action, FsCanvasClickAction::DepthFocusAt(point) if point == pos)); }
                         assert_eq!(matches!(action, FsCanvasClickAction::PageSide(_)), !ctrl);

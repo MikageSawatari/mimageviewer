@@ -1,5 +1,10 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.917: `FsFisheyeIn` / `FsFisheyeOut` を FsImage / Press・既定なしで追加する。
+ini名、説明、ALL_ACTIONS、context / trigger / default、利用側と `docs/keymap.ini.default` を揃える。
+リング・マウスボタンの候補には追加しない。Ctrl+Shift+ホイールと魚眼中のShift+左ドラッグは
+ポインター位置と連続量を使うため固定入力。詳細は [キー仕様](keymap-spec.md#魚眼ズーム)。
+
 §1.476: 閲覧中のタグ欄の検索確定は、既存の固定 TextEdit Enter 受付を共用する。
 通常の欄とフォーカス予約からの受付を `submit_tag_search_input` にそろえ、IME・modal の拒否条件と
 egui/native の入力所有を保つ。新しい KeyAction・割当・pending 状態は追加しない。

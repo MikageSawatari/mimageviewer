@@ -3071,7 +3071,8 @@ mod tests {
                         if path == &app.tmp.path().join("sns-left.png")
                 ));
             }
-            crate::export_dialog::ExportComposite::Spread { .. } => {
+            crate::export_dialog::ExportComposite::Spread { .. }
+            | crate::export_dialog::ExportComposite::PlaneView(_) => {
                 panic!("SNS 分割は編集対象の単ページだけを worker 合成へ渡す")
             }
         }

@@ -578,8 +578,332 @@ PlaneView 中だけ、3 つの出口の **元の素材を「見えていると�
 
 ## 11. 実装記録
 
-(実装担当が書く。`is_depth()` / `ExclusiveViewKind::Depth` / `fs_exclusive_view_active` の全出現の分類表、Depth の終了処理の全出現と
-§3.6 の共通 helper への振り分け、レンズの移動の所有の形、環境設定の置き場所、変更ファイル、設計との差分、実行したテストと結果、perf の数値。)
+### 実装の範囲と未検証の境界 (2026-11-27)
+
+段 1 の差分を `fisheye-917` (着手時 `57d54274a`) に作成。段 2 の傾け入力は追加していない。
+`PlaneTilt` は uniform に保持するが、製品の状態生成は常に yaw/pitch 0。
+ビルド・test・check・clippy は利用者の指示により実行していない。コミット・アプリ起動も行っていない。
+以下はソース上の実装記録であり、動作の成功や受入の記録ではない。
+
+### 設計との差分 (既存コードの事実)
+
+1. §3.2 の前提と異なり、既存の `should_handle_fullscreen_wheel` は通常パネル上の Ctrl+ホイールも通す
+   (`ctrl_wheel_is_handled_even_over_panels` が既存の回帰)。通常の入力規則は保ち、PlaneView の segment の
+   入場だけを既存のパネル位置の判定で拒否した。popup/modal の先行所有・消費は既存のまま。
+2. §3.6 の注が列挙する `pause_mounted_background_work_keep_current_frame` そのものには、着手時には Depth の
+   終了処理が無かった。上位の park 処理が終了を行っていた。段 1 では pause の入口も共通 helper を通す。
+   snapshot を作る既存の順序や detached の配送は変えず、Depth/PlaneView の資源だけを終了させる。
+   この追加経路を含む既存 Depth 回帰は共有 runner で確認が必要。
+
+設計判断待ちで止めた箇所はない。追加の recovery・タイマー・待機・無条件 repaint は作っていない。
+renderer 未登録の次 pass 要求は §5.2 の登録境界だけで使う。
+
+### 状態・入力・描画・出力
+
+- 既存の 2 つの通常ドラッグ起点を `FsCanvasDrag::Image { pan, rotation }` にまとめ、
+  `PlaneLens { anchor, start, center }` と排他にした。通常の毎 frame の Ctrl による回転/パンの規則は保持する。
+  レンズ所有中は通常ドラッグ・クリック・scrub へ渡さず、release pass の消費も context ごとの frame key で保持する。
+  release、ページ/slice/世代変更、projection の終了、focus 喪失、modal で所有を終了する。
+- `WheelSegment::vertical_before_axis_mapping` は既存の未消費 event 投影で unit を換算してから集約する。
+  Shift による軸交換より前の縦だけを魚眼に渡す。予測/実適用は `plane_view_wheel_transition` を共用し、
+  `used`、fractional notches、navigation 後の破棄と click anchor を揃える。
+  遅延した segment 自身の page_owner も予測/実適用で照合する。キーは既存のキーの段で先に適用する。
+- 設定の位置は全画面の表示の `spread/wheel-zoom-step` の直後、anchor `spread/plane-view-lens`。
+  値は serde default の等距離。既定キーなしの `FsFisheyeIn/Out` を action registry、INI、表示、trigger/context、
+  既定、競合、位置を変えない action の意味の網羅表へ追加した。
+- `PlaneGpuCopy` は TextureId と GPU 写しの生存期間、`PlaneMaterial` は不変の記述全体を所有する。
+  source サイズに加え、2D resolver の独立入力である texture サイズも記述に保持する。
+  metadata の変更だけなら写しを共有し、新 TextureId なら共通 `ColorMipCopier` で blit/mip を作る。
+- `DisplayedImageGeometry::placement_frame` を比較し、各辺 1/64 物理画素以内だけ前の素材を採用する。
+  前の素材自身のサイズ・基準・kind と今の入力で描き直し、配置の確定には実際の kind を渡す。
+  `FsSinglePageDraw { transform, pdf_demand_rect }` で実描画と現在素材の PDF 需要を分け、
+  `fullscreen_page_layout` と snapshot に需要用の変換を混ぜない。
+- 画面/出力は `PLANE_SHADER` を共用する。素材 group 0、private uniform group 1、target format 別 pipeline。
+  CPU 参照式は `camera_point` / `texture_point`。下地と出力は canvas の物理座標で写す。
+  登録待ちで素材が無い/配置が違う/NativeOnly の frame は既存 2D へ描画を戻し、last_drawn を消す。
+- callback/snapshot/出力要求は Arc で実際に描いた素材を保持する。出力要求は context とページ/slice anchor を照合する。
+  保存・コピーは canvas、Ctrl+E は canvas 2 倍から最終選択を解決し、texture と padded readback buffer の両上限を守る。
+  worker が描画と readback を行い、PlaneView は追加の `scale_export_pixels` を通らない。
+  書き出しは現在の見た目 1 種、basename `_fisheye`、元 EXIF を引き継がない。
+- VRAM は写しごとの RAII allocation を `VramSubsystem::PlaneView` に一度加算する。
+  3 世代以上と、状態終了後に callback/保存要求だけが保持する写しも計上し、同じ Arc を重複しない。
+  renderer cache は pipeline/copier だけで、context 共通の可変素材や uniform は持たない。
+
+### 表示所有者の交代と終了処理の振り分け
+
+| 境界 | 段 1 の扱い | 既存の通知/他モード |
+| --- | --- | --- |
+| `commit_viewer_session_deferred_feedback` (F11/F12/session 確定) | `retire_exclusive_view_for_owner_change` | was_depth のときだけ既存再入場案内。PlaneView は追加通知なし |
+| `retire_main_depth_for_independent_activation` (live pass 引渡し) | 同 helper | setup の無効化は従来どおり。main の条件/配送は変更なし |
+| `split_current_context_preserving_main_grid_payload` (両 fork) | identity を動かす前に同 helper | Panorama の state/intent の既存 transfer は維持 |
+| `reset_detached_pause_foreground_modes` (park) | 同 helper、後段の Panorama 終了は従来どおり | Panorama intent を残す |
+| `pause_mounted_background_work_keep_current_frame` | 同 helper を追加 | 上記「設計との差分」参照。sibling は触らない |
+| parked live media の snapshot 作成/退避 (`park_active_live_media`) | 同 helper | snapshot/viewport の順序は維持 |
+| `close_fullscreen` と `ViewerContextBundle::cancel_all_context_work`/Drop | 既存の全 variant の終了に含まれる | bundle の terminal は App を mount せず自分の所有物だけ drop |
+| `depth_view_may_continue` / D の終了 / Depth panel の閉じる | Depth 固有のまま | PlaneView は独自の継続照合・入力の終了を使う |
+| scoped mount / `with_viewer_context` | 終了しない | 状態をその owner の bundle に往復するだけ |
+| PlaneView の強さ 0・ダブルクリック・fit reset・ページ/slice 不一致 | `set_fs_exclusive_view(None)` | ページ/slice は無通知、それ以外の継続拒否は1回通知 |
+| V / D の新 projection の採用 | `set_fs_exclusive_view` が前の所有物を drop | Panorama/Depth の固有通知の規則は変更しない |
+
+### 占有判定の全出現の分類
+
+対象は `src/**/*.rs` の呼び出し/variant/定義。行番号はこの実装差分のもの。
+同一行に複数の対象表記がある場合は1行にまとめる。試験コードも別表に全行を列挙する。
+`is_depth` の意味自体は変えない。PlaneView を含める境界と、Depth 固有の境界を区別する。
+
+| 箇所 | 表記 | PlaneView の扱い・理由 |
+| --- | --- | --- |
+| `src/app/depth_view.rs:821` `depth_slideshow_prefetch_active` | `is_depth()` | Depth 固有の計算先読みのみ。PlaneView は既存の slideshow。 |
+| `src/app/depth_view.rs:872` `depth_slideshow_gate` | `is_depth()` | Depth 固有の計算待ちのみ。PlaneView は既存の slideshow。 |
+| `src/app/depth_view.rs:950` `fs_exclusive_view_active` | `fs_exclusive_view_active` | PlaneView variant を返す。Depth 判定の意味は維持。 |
+| `src/app/depth_view.rs:952` `fs_exclusive_view_active` | `ExclusiveViewKind::Depth` | PlaneView variant を返す。Depth 判定の意味は維持。 |
+| `src/app/depth_view.rs:969` `depth_entry_allowed` | `is_depth()` | 他 context の Depth だけを拒否。PlaneView は sibling の Depth/PlaneView を妨げない。 |
+| `src/app/depth_view.rs:998` `depth_view_may_continue` | `is_depth()` | Depth の継続/通知だけ。PlaneView は独自の継続照合。 |
+| `src/app/depth_view.rs:1077` `toggle_depth_parallax` | `is_depth()` | Depth のトグル終了だけ。PlaneView からの D は新 Depth 採用時に置き換える。 |
+| `src/app/gamepad_input.rs:6143` `change_ring_picker_value` | `is_depth()` | Depth の fit 制限だけ。PlaneView は通常の fit 入力へ。 |
+| `src/app/gamepad_input.rs:6363` `preview_image_picker_row` | `is_depth()` | Depth の fit 制限だけ。PlaneView は通常の fit 入力へ。 |
+| `src/app/gamepad_input.rs:6561` `enter_ring_picker_list_for_current_row` | `is_depth()` | Depth の fit 制限だけ。PlaneView は通常の fit 入力へ。 |
+| `src/app/gamepad_input.rs:6684` `set_ring_picker_row_value_selection` | `is_depth()` | Depth の fit 制限だけ。PlaneView は通常の fit 入力へ。 |
+| `src/app/gamepad_input.rs:7750` `apply_image_picker_state` | `is_depth()` | Depth の fit 制限だけ。PlaneView の fit 確定は共通 setter で終了。 |
+| `src/app/gamepad_input.rs:8469` `apply_ring_action` | `fs_exclusive_view_active` | Depth 固有の panel/キー制限を維持。PlaneView は通常入口、Z は共通入口、比較へ変われば継続照合で終了。 |
+| `src/app/gamepad_input.rs:8470` `apply_ring_action` | `ExclusiveViewKind::Depth` | Depth 固有の panel/キー制限を維持。PlaneView は通常入口、Z は共通入口、比較へ変われば継続照合で終了。 |
+| `src/app/page_overview.rs:225` `page_overview_unavailable_reason` | `is_depth()` | 占有に含めページ一覧との同時表示を拒否 (既存の集約した理由の経路)。 |
+| `src/app/page_overview.rs:233` `page_overview_unavailable_reason` | `fs_exclusive_view_active` | 占有に含めページ一覧との同時表示を拒否 (既存の集約した理由の経路)。 |
+| `src/app/plane_view.rs:143` `plane_view_entry_allowed` | `is_depth()` | Depth/360 を入口で拒否。自分の PlaneView は継続可。 |
+| `src/app/plane_view.rs:216` `retire_exclusive_view_for_owner_change` | `is_depth()` | Depth の戻り値は既存通知のためだけ。実際の終了は Depth/PlaneView を共通に扱う。 |
+| `src/app.rs:54666` `fullscreen_adjustment_panel_draw_reachable` | `fs_exclusive_view_active` | 占有として背面の補正/分析描画を抑止。パネル状態が変われば継続照合で終了。 |
+| `src/app.rs:54670` `fullscreen_adjustment_panel_draw_reachable` | `fs_exclusive_view_active` | 占有として背面の補正/分析描画を抑止。パネル状態が変われば継続照合で終了。 |
+| `src/app.rs:63334` `notify_depth_slideshow_folder_nav_exit` | `is_depth()` | Depth 固有の再入場通知だけ。PlaneView は通常の slideshow を継続し次ページで終了。 |
+| `src/app.rs:82668` `resume_original_material_entry` | `fs_exclusive_view_active` | 編集用の原寸素材の遅延再入場を占有中は拒否。元画像ホールドの選択とは別の経路。 |
+| `src/app.rs:82769` `page_edit_target_switch_is_current` | `fs_exclusive_view_active` | 占有中の編集対象の再入場を拒否。 |
+| `src/app.rs:95267` `pdf_native_rerender_pending` | `is_depth()` | Depth のみ倍率を除外。PlaneView は通常の PDF 倍率需要を維持。 |
+| `src/app.rs:98949` `panorama_entry_allowed` | `is_depth()` | Depth 固有の拒否を維持。PlaneView は既存の V 入口へ進み採用時に終了。 |
+| `src/app.rs:99366` `apply_panorama_mode_toggle` | `is_depth()` | Depth 固有の拒否を維持。PlaneView は Panorama の採用で置き換える。 |
+| `src/ui_fullscreen.rs:15313` `fs_zoom_mode_context_ok` | `fs_exclusive_view_active` | PlaneView も新しい Z モードの入口の占有に含める。 |
+| `src/ui_fullscreen.rs:15384` `fs_zoom_reset_for_blocked_context` | `is_depth()` | PlaneView を含め、退避中の Z と PDF の倍率需要を破壊しない。 |
+| `src/ui_fullscreen.rs:15778` `fs_zoom_owner` | `is_depth()` | PlaneView は通常の Image の倍率/パンを共用。 |
+| `src/ui_fullscreen.rs:16247` `maybe_rerender_pdf` | `is_depth()` | Depth の抑止だけ。PlaneView は倍率の需要を続ける。 |
+| `src/ui_fullscreen.rs:23162` `similar_preview_session` | `fs_exclusive_view_active` | 占有に含め、2D の画素位置を使う類似プレビューを出さない。 |
+| `src/ui_fullscreen.rs:26197` `fs_front_menu_presented_for_viewport` | `fs_exclusive_view_active` | PlaneView は占有の制限から除き、通常の fit/回転メニューを使う。 |
+| `src/ui_fullscreen.rs:26278` `still_info_panel_eligible_for_idx` | `fs_exclusive_view_active` | PlaneView は Panorama/Depth のパネル抑止から除き、情報パネルを使う。 |
+| `src/ui_fullscreen.rs:29263` `render_fullscreen_viewport_with_root_input` | `fs_exclusive_view_active` | PlaneView は通常の上部メニュー/overflow/情報パネルを許可する例外。Depth/Panorama の制限は維持。 |
+| `src/ui_fullscreen.rs:29297` `render_fullscreen_viewport_with_root_input` | `fs_exclusive_view_active` | 占有として分析用の PDF 矩形を選ばず、通常の PDF 需要を使う。 |
+| `src/ui_fullscreen.rs:29650` `render_fullscreen_viewport_with_root_input` | `fs_exclusive_view_active` | PlaneView は通常の上部メニュー/overflow/情報パネルを許可する例外。Depth/Panorama の制限は維持。 |
+| `src/ui_fullscreen.rs:29916` `render_fullscreen_viewport_with_root_input` | `is_depth()` | Depth の素材採用/専用パネル/ボタン状態だけ。PlaneView は別の描画・通常パネル。 |
+| `src/ui_fullscreen.rs:30548` `render_fullscreen_viewport_with_root_input` | `is_depth()` | Depth の素材採用/専用パネル/ボタン状態だけ。PlaneView は別の描画・通常パネル。 |
+| `src/ui_fullscreen.rs:30700` `render_fullscreen_viewport_with_root_input` | `fs_exclusive_view_active` | PlaneView は通常の上部メニュー/overflow/情報パネルを許可する例外。Depth/Panorama の制限は維持。 |
+| `src/ui_fullscreen.rs:30798` `render_fullscreen_viewport_with_root_input` | `is_depth()` | Depth の素材採用/専用パネル/ボタン状態だけ。PlaneView は別の描画・通常パネル。 |
+| `src/ui_fullscreen.rs:31901` `fs_page_turn_ordinary_context_blocker` | `fs_exclusive_view_active` | 占有に含め紙めくりを抑止。通常のページ移動は継続。 |
+| `src/ui_fullscreen.rs:33358` `reconcile_specified_pdf_demand_with_single` | `is_depth()` | Depth のみ需要を抑止。PlaneView は現在素材の別戻り値で需要を継続。 |
+| `src/ui_fullscreen.rs:35708` `apply_still_reader_escape` | `fs_exclusive_view_active` | 占有中の Esc は既存の閲覧終了へ。 |
+| `src/ui_fullscreen.rs:35881` `begin_page_turn_viewer_frame` | `is_depth()` | Depth 固有の閉じる通知。PlaneView は追加通知なしの既存終了。 |
+| `src/ui_fullscreen.rs:37360` `handle_fs_key_input_with_operation` | `fs_exclusive_view_active` | 占有キー制限に含む。slideshow/背景は Panorama 固有、metadata は PlaneView で通常パネル、Depth focus/panel は Depth のみ。 |
+| `src/ui_fullscreen.rs:37369` `handle_fs_key_input_with_operation` | `fs_exclusive_view_active` | 占有キー制限に含む。slideshow/背景は Panorama 固有、metadata は PlaneView で通常パネル、Depth focus/panel は Depth のみ。 |
+| `src/ui_fullscreen.rs:37378` `handle_fs_key_input_with_operation` | `is_depth()` | 占有キー制限に含む。slideshow/背景は Panorama 固有、metadata は PlaneView で通常パネル、Depth focus/panel は Depth のみ。 |
+| `src/ui_fullscreen.rs:38116` `handle_fs_key_input_with_operation` | `is_depth()` | 占有キー制限に含む。slideshow/背景は Panorama 固有、metadata は PlaneView で通常パネル、Depth focus/panel は Depth のみ。 |
+| `src/ui_fullscreen.rs:38882` `fs_navigator_allowed_for_display_unit` | `is_depth()` | PlaneView も固定表示/Alt ナビゲータを抑止。設定のトグルは保持。 |
+| `src/ui_fullscreen.rs:41258` `handle_fs_wheel_and_click_frame` | `fs_exclusive_view_active` | PlaneView は通常の左右パネル。Depth panel の矩形/フォーカスだけは Depth 固有。 |
+| `src/ui_fullscreen.rs:41540` `handle_fs_wheel_and_click_frame` | `is_depth()` | PlaneView は通常の左右パネル。Depth panel の矩形/フォーカスだけは Depth 固有。 |
+| `src/ui_fullscreen.rs:43534` `plan_fs_canvas_click` | `is_depth()` | Depth focus/閉じるパネルは Depth のみ。PlaneView は別の plane_active で変換ありに分類。 |
+| `src/ui_fullscreen.rs:43585` `plan_fs_canvas_click` | `is_depth()` | Depth focus/閉じるパネルは Depth のみ。PlaneView は別の plane_active で変換ありに分類。 |
+| `src/ui_fullscreen.rs:44093` `advance_slideshow` | `is_depth()` | Depth の先読み待ちだけ。PlaneView の slideshow は通常どおり。 |
+| `src/ui_fullscreen.rs:44384` `current_slideshow_frame_ready` | `is_depth()` | Depth の ready 判定だけ。PlaneView の slideshow は通常どおり。 |
+| `src/ui_fullscreen.rs:44415` `sync_slideshow_anchor_for_frame` | `is_depth()` | Depth の input-only 描画待ちだけ。PlaneView は通常のタイマー。 |
+| `src/ui_fullscreen.rs:45008` `complete_book_slideshow_target` | `is_depth()` | Depth の専用 target 準備だけ。PlaneView は通常のページ移動後に終了。 |
+| `src/ui_fullscreen.rs:45641` `fullscreen_edit_mode_entry_allowed` | `is_depth()` | PlaneView はこの分岐より前に魚眼の理由で拒否。Depth/Panorama の理由は維持。 |
+| `src/ui_fullscreen.rs:45645` `fullscreen_edit_mode_entry_allowed` | `fs_exclusive_view_active` | PlaneView はこの分岐より前に魚眼の理由で拒否。Depth/Panorama の理由は維持。 |
+| `src/ui_fullscreen.rs:46559` `handle_fs_navigation_with_render_perf` | `is_depth()` | Depth の素材先読みだけ。PlaneView の通常 navigation は保持し継続照合で終了。 |
+| `src/ui_fullscreen.rs:47077` `draw_fs_image_with_initial_placement` | `is_depth()` | Depth の需要復帰の境界は維持。PlaneView は PDF 需要を止めず別の shader 採用を行う。 |
+| `src/ui_fullscreen.rs:48239` `set_fullscreen_fit_mode_for_current` | `is_depth()` | Depth の変更拒否のみ。PlaneView は変更を受け付け reset で終了。 |
+| `src/ui_fullscreen.rs:48288` `cycle_fullscreen_fit_mode` | `fs_exclusive_view_active` | Depth の変更拒否のみ。PlaneView は循環を受け付け reset で終了。 |
+| `src/ui_fullscreen.rs:48289` `cycle_fullscreen_fit_mode` | `ExclusiveViewKind::Depth` | Depth の変更拒否のみ。PlaneView は循環を受け付け reset で終了。 |
+| `src/ui_fullscreen.rs:52817` `draw_fs_loupe_if_active` | `fs_exclusive_view_active` | 占有に含め、割当/物理修飾にかかわらずルーペを描かない。 |
+| `src/ui_video_tile.rs:69` `toggle_video_tile_mode` | `fs_exclusive_view_active` | 占有に含め、静止画の projection から動画タイルを開始しない。 |
+| `src/ui_view_trim.rs:993` `view_trim_original_request_is_current` | `fs_exclusive_view_active` | 占有中に表示トリム編集の遅延再入場を行わない。 |
+
+`src/fs_exclusive_view.rs` の `is_depth(&self)` 定義は Depth variant のみを返すまま。新しい `retires_for_owner_change` が Depth/PlaneView を含む。
+
+試験コードの全出現 (各行の期待は Depth 固有のまま。既存テストの期待を PlaneView へ広げていない):
+
+| 箇所 | 対象行 (各行を列挙) | PlaneView の扱い・理由 |
+| --- | --- | --- |
+| `src/app/book_composition_permission_tests.rs` | `939` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/app/collection_navigation/depth_slideshow_tests.rs` | `158`, `237`, `306` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/app/depth_export_main_window_tests.rs` | `300`, `741` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/app/depth_main_window_tests.rs` | `584`, `690`, `992`, `1117`, `1121` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/app/depth_setup_entry_tests.rs` | `38`, `64`, `125`, `134`, `205`, `225`, `230`, `244`, `275`, `301`, `336`, `340`, `349` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/app/depth_view.rs` | `664`, `726` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/app/depth_view_tests.rs` | `699`, `700`, `704`, `749`, `752`, `883`, `945`, `1366`, `1493`, `1647`, `1648`, `1689`, `1826`, `1889`, `2093`, `2098`, `2127`, `2212`, `2227`, `2703`, `2755`, `2997`, `3074`, `3122`, `3189`, `3254`, `3350`, `3386`, `3419` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/app/detached_media_exchange_tests.rs` | `219` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/app/multiwindow_scenario_tests.rs` | `1017` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/app/tests/startup_restore.rs` | `822` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/app/tests.rs` | `100596`, `100608` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/app.rs` | `110895`, `110907`, `110986`, `111046`, `111049`, `111125` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/ui_fullscreen/depth_slideshow_tests.rs` | `826`, `1036`, `1052`, `1145`, `1189` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/ui_fullscreen/depth_view_transform_tests.rs` | `266`, `282` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/ui_fullscreen/page_turn.rs` | `2003` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/ui_fullscreen/plane_view_tests.rs` | `536` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+
+上記は呼び出し等 142 行 (製品 67、試験 75) と定義1件。
+
+### 変更ファイル一覧
+
+全パスを列挙する。既存ドラッグ/クリック/配置の回帰ファイルは、所有型の accessor 化、新しい引数/variant、戻り値の `.transform` 取得へ合わせ、既存期待値は維持する。
+
+- `docs/architecture-overview.md`
+- `docs/detached-rework-plan.md`
+- `docs/display-pipeline.md`
+- `docs/fisheye-plane-view-plan.md`
+- `docs/gpu-test-groups.md`
+- `docs/key-customization-impl-plan.md`
+- `docs/keymap-spec.md`
+- `docs/keymap.ini.default`
+- `docs/next-release-backlog.md`
+- `docs/settings-export-import-plan.md`
+- `docs/spec.md`
+- `docs/ui-responsiveness.md`
+- `docs/ui-snapshot-policy.md`
+- `htdocs/mimageviewer/index.html`
+- `htdocs/mimageviewer/manual/fullscreen.html`
+- `src/app.rs`
+- `src/app/depth_view.rs`
+- `src/app/plane_view.rs`
+- `src/app/search_nav_entry_inventory_tests.rs`
+- `src/app/tests.rs`
+- `src/app/viewer_context_registry.rs`
+- `src/app/vram_accounting.rs`
+- `src/books.rs`
+- `src/capture.rs`
+- `src/depth_parallax_wgpu.rs`
+- `src/displayed_image_transform.rs`
+- `src/export_dialog.rs`
+- `src/fs_exclusive_view.rs`
+- `src/gpu_color_copy.rs`
+- `src/keymap.rs`
+- `src/lib.rs`
+- `src/plane_view.rs`
+- `src/plane_view_wgpu.rs`
+- `src/plane_view_wgpu/export.rs`
+- `src/plane_view_wgpu/gpu_tests.rs`
+- `src/settings.rs`
+- `src/settings_transfer.rs`
+- `src/settings_transfer/stage1.rs`
+- `src/touch_input.rs`
+- `src/ui_adjustment_panel/click_timing_1679_tests.rs`
+- `src/ui_conceal.rs`
+- `src/ui_crop.rs`
+- `src/ui_dialogs/preferences/pages.rs`
+- `src/ui_dialogs/preferences/search_index.rs`
+- `src/ui_erase.rs`
+- `src/ui_fullscreen.rs`
+- `src/ui_fullscreen/depth_focus_tests.rs`
+- `src/ui_fullscreen/depth_tests.rs`
+- `src/ui_fullscreen/depth_view_transform_tests.rs`
+- `src/ui_fullscreen/double_click_close_tests.rs`
+- `src/ui_fullscreen/double_click_close_tests/suppression_906_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/drag_bound_handler_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/drag_bound_input_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/handler_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/wheel_zoom_tests.rs`
+- `src/ui_fullscreen/initial_placement/tests.rs`
+- `src/ui_fullscreen/initial_placement/tests/viewport_input/canvas_click.rs`
+- `src/ui_fullscreen/overlay_navigation_tests.rs`
+- `src/ui_fullscreen/page_turn/prepare_boundary_tests/pan_bounds_tests.rs`
+- `src/ui_fullscreen/page_turn/resident_placement_tests.rs`
+- `src/ui_fullscreen/page_turn/wait_indicator_tests.rs`
+- `src/ui_fullscreen/pan_bounds/tests.rs`
+- `src/ui_fullscreen/plane_view_tests.rs`
+- `src/ui_fullscreen/side_panel_secondary_input_tests.rs`
+- `src/ui_sns_split.rs`
+- `src/vram_budget.rs`
+- `src/wheel_input.rs`
+
+### 共通 runner のコンパイル診断への修正 1
+
+設計担当から受領した `cargo check -p mimageviewer --bin mimageviewer-core --tests --message-format short`
+(exit 101、lib test 28 errors) に対応する差分を追加した。実装担当による cargo check/test の再実行はしていない。
+
+- 既存の単ページ描画試験は、結果の `.transform` を取り出して従来の寸法・配置・pan の全検査を維持する。
+- shader 検証は既存の依存の再公開 `wgpu::naga` を使う。
+- 設定転送には `plane_view_lens` を通常の enum と同じ検証付きで追加し、網羅の分解・件数・変化検査・往復/欠落/不正値の試験を揃えた。
+- `PlaneEntry` は RawDevelopment の通知と同じく、拒否の具体的な理由を title に表示し、不要な補足文は付けない。
+- キーの geometry 計算は seek geometry を先にローカルへ確定する。レンズ入力の上部バー判定は、既存の panel 更新と top_bar_visible の計算後へ移す。clone は追加しない。
+- scoped mount の試験は既存の `with_window_context_for_test` を使い、可視性は広げない。
+- texture delta は TextureId ごとの SmallVec を順に renderer へ渡す。レンズの frame ID は生成/参照とも `Id::unique` に揃える。
+
+### 共通 runner のコンパイル診断への修正 2
+
+`PlaneLensKind` の `Stage1Value` に3候補を追加し、表示名は環境設定と共通の `label()` を使う。
+試験の `TexturesDelta` は `set` を `std::mem::take` で取り出し、Drop のある所有者から直接 move しない。
+実装担当による cargo check/test の再実行はしていない。
+
+### 関連試験の失敗への修正 3
+
+設計担当から、共通実行口の cargo check 成功と、関連 nextest 1577件中1566成功・11失敗の報告を受領した。
+下表はコードを照合した原因と変更。修正後の cargo check/test は実装担当では実行していない。
+PNG の生成は設計担当へ引き継いだまま。レビューの判定は記録していない。
+
+| 失敗 | 原因の分類 | 変更・維持する検査 |
+| --- | --- | --- |
+| stage1 の全キー/anchor | 試験の旧件数 | export 173、rows 230 へ更新。全キー/重複/anchor 検査は残し、レンズ3候補の wire 値と環境設定と同じ表示名も検査する。 |
+| real_preferences_controls_ok_persistence | 製品の accessible name 欠落 | レンズ ComboBox の Response を表示ラベルへ labelled_by で結び付ける。accessibility check は有効のまま。 |
+| preferences_wheel_zoom_ok_save | 同じ製品の欠落 | 同じ共通 renderer の修正が適用される。既存の入力/保存検査は変更しない。 |
+| plane_view_lens_settings_light | 同じ製品の欠落 | 同じ labelled_by。PNG は未生成なので設計担当が生成・目視・通常比較する。 |
+| plane_view_lens_settings_dark | 同じ製品の欠落 | 同上。accessibility check は有効のまま。 |
+| plane_export_size_choices_snapshot_dark | 試験成果物が未生成 | コード/検査は変更しない。PNG の生成・目視・通常比較は設計担当。 |
+| plane_key_stage_precedes_wheel | 試験の位相の前提 | viewer の navigation は画像の描画後、frame tail で確定する。旧静止画でキーが先に strength 1/8 を作った証拠を検査し、次の pass の描画前の照合で終了することを検査する。raw event の両順と同一 pass の下ホイールで終了する検査は残す。終了を個々の移動関数へ追加しない。 |
+| plane_lens_owner_survives_modifiers | 試験の focus 前提 | 初回 pass が作る300msの focus-restoring click 猶予が press を拒否していた。既存 drag 試験同様に fs_focus_regained_at を消して既に focused の press を作る。既存 synthetic timeline を使い、handler 前の物理 Shift/非Ctrl/primary press も検査する。owner を試験側で直接作らない。 |
+| plane_pending_pdf_reraster | 試験の旧素材との比較 | legacy の layout_full_image_rect は contain/丸め後なので再ラスタで変わる。需要は現在素材の独立した resolver 結果との完全一致、描画は前素材、比較の配置枠は1/64物理画素以内と検査する。旧素材の需要と違う fixture であることも検査する。 |
+| plane_deferred_segment | 試験で直接起きた再帰 lock / 製品にも同型あり | 試験の ctx.input の内側の ctx.options を外へ出す。製品のレンズ frame 記録も ctx.data_mut 内の ctx.cumulative_frame_nr を外へ出す。 |
+| plane_same_pass_prediction | 試験で直接起きた再帰 lock / 製品にも同型あり | 同じ内側の ctx.options を先に取得する。製品の semantic input も frame key・frame number を ctx.data の外で確定する。予測/実適用/クリックの一致検査は維持。 |
+
+`edit_request_owner_context` は App の context table を読むだけで egui Context は読まないが、semantic input の key も closure 前へ移した。
+`plane_view_wheel_transition` は Context を持たない計算であり、予測・適用側の Context 読みと切り離している。
+既存 `egui_context_closures_do_not_hand_ctx_to_helpers` は `(ctx)` / `(ctx,` の引数渡しだけを調べ、
+`ctx.cumulative_frame_nr()` / `ctx.options(...)` の直接呼び出しを検出しない。opener も `ctx.input(` などの
+連続した文字列なので `ctx` と `.input` の間の改行を見落とす。
+新規 adapter と harness の直接再帰/改行形を検出する補助試験
+`plane_context_lock_closures_do_not_read_context_again` を追加した。旧走査は残す。
+
+### 残りの検索索引と未使用警告への修正 4
+
+環境設定の `spread/plane-view-lens` を検索索引へ追加し、表示と同じ「魚眼のレンズ」、3候補名、魚眼ズーム・Ctrl/Shift/ホイール等を検索語にした。anchor の網羅検査は維持し、個々の検索語から同じ項目が見つかる回帰試験を追加。
+
+**設計との差分 (表現の整理)**: 未使用だった Pending の `texture_id` と snapshot の独立した `pixels_per_point` を削除した。Pending の採用判定は毎 pass の現在の TextureId を使い、snapshot の描画・出力は凍結済みの物理座標 uniform を使う。素材の所有・DPI・出力寸法の計算は変えていない。未使用の `PlaneColorPhase::material()` も削除した。
+
+CPU 参照式 (`theta` / `camera_point` / `texture_point`) と検査用の pipeline format は `#[cfg(test)]` に限定した。GPU の寿命を保つ所有 field は `MipColor::_texture` と `PlaneGpuResources::_color` に改名し、所有の理由をコメントした。資源の保持・VRAM の会計は維持する。`STAGE1_MARKED_ANCHORS` は着手時の HEAD から同じ宣言・参照だったので触れていない。
+
+修正後の cargo check/test は実装担当では実行していない。未生成の3枚のPNGは設計担当が生成する。
+
+### 検証の引き継ぎ
+
+実装担当では cargo の build/test/check/clippy を実行していない。
+許可された `cargo fmt` は正常終了。`python scripts/check_ui_glyphs.py` は危険な字形なし、
+`python scripts/check_site_cards.py` は54カード・超過0。最終差分の再確認も同じ結果。
+`git diff --check` の指摘なし。
+GPU/perf の実測値は未取得。PNGは生成・目視・通常比較とも未実施。
+
+共有 runner の対象 (GPU 子 module は既存 nextest の `test(/(^|::)gpu_tests::/)` により gpu group):
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/plane_/) | test(/ui_dialogs::preferences::search_index::tests/)'
+cargo nextest run -p mimageviewer --lib -E 'test(/depth_/) | test(/displayed_image_transform::/) | test(/wheel_input::/) | test(/touch_input::/) | test(/keymap::tests::/) | test(/search_nav_entry_inventory_tests::/) | test(/settings_transfer::tests::/)'
+cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen::in_page_scroll::/) | test(/ui_fullscreen::initial_placement::/) | test(/double_click_close_tests::/) | test(/overlay_navigation_tests::/) | test(/side_panel_secondary_input_tests::/) | test(/edited_clipboard_copy::/) | test(/vram_accounting::/) | test(/viewer_context_registry::/)'
+cargo nextest run -p mimageviewer --test export_integration --test settings_integration --test ui_snapshot
+```
+
+追加/変更した試験の中心は `plane_view::tests`、`plane_view_wgpu::{tests,gpu_tests}`、
+`app::plane_view::tests`、`ui_fullscreen::plane_view_tests`、`touch_input::tests`、`keymap::tests`、
+`ui_dialogs::preferences::pages::plane_view_lens_tests::gpu_tests`、`settings_transfer::tests`。新しい統合テストファイルはない。
+UI PNGは `plane_view_lens_settings_light`、`plane_view_lens_settings_dark`、`plane_export_size_choices_dark` の3枚。
+生成指定ありで作成・目視した後、指定なしで比較する。書き出しダイアログ全体の文言も受入で確認する。
+マニュアル変更に伴う同梱 MCP help の抽出/検索/transport 回帰も既存の共通実行口で確認する。
+変更が入力・描画・資源/終了・出力にまたがるため、focused 結果の後は既存の full gate が必要。
+利用者の指示に従い、実装担当から追加の cargo 実行やアプリ起動は行わない。
+
+実機では通常/別ウィンドウ、DPI、PDF の再ラスタ、RAW の差替え、右 Ctrl+Shift と変更した hold 割当、
+旧来の Ctrl+Shift+左ドラッグ、3つの出力、scope をまたがない資源解放と perf を確認する。
+承認のない対話テストは開始していない。検証用 build は共有 runner 側へ引き継ぐ。
 
 ## 12. 文書
 
@@ -593,7 +917,9 @@ PlaneView 中だけ、3 つの出口の **元の素材を「見えていると�
 
 ## 13. CHANGELOG の下書き
 
-(段 1 の実装後に書く。)
+- 魚眼ズームを追加しました。1ページの静止画で Ctrl+Shift+ホイールを回すと、拡大しながら魚眼レンズのような歪みを加えられます。下へ回すと戻ります。
+- 魚眼中は Shift+左ドラッグでレンズの中心を動かせます。通常のズーム・パン・自由回転と組み合わせて使えます。レンズの種類は環境設定で選べます。
+- 魚眼の見た目をキャプチャ保存・画像のコピー・エクスポートで出力できます。「魚眼で寄る」「魚眼で離れる」には操作カスタマイズでキーを割り当てられます。
 
 ## 14. 独立設計レビュー
 

@@ -304,6 +304,15 @@ no_choices!(
     FileOrganizeDestination,
     crate::external_tool::ExternalTool
 );
+impl Stage1Value for crate::plane_view::PlaneLensKind {
+    fn candidates() -> Option<Vec<(Self, String)>> {
+        Some(vec![
+            (Self::Equidistant, Self::Equidistant.label().into()),
+            (Self::Stereographic, Self::Stereographic.label().into()),
+            (Self::EquisolidAngle, Self::EquisolidAngle.label().into()),
+        ])
+    }
+}
 impl Stage1Value for AiFeatureMode {
     fn candidates() -> Option<Vec<(Self, String)>> {
         Some(vec![
@@ -1034,11 +1043,24 @@ mod tests {
         assert_eq!(rows.len(), keys.len());
         let (export, issues) = project(capture_export(&settings));
         assert!(issues.is_empty(), "{issues:?}");
-        assert_eq!(export.len(), 172);
+        assert_eq!(export.len(), 173);
         assert_eq!(STAGE1_MARKED_ANCHORS.len(), 57);
-        assert_eq!(rows.len(), 229);
+        assert_eq!(rows.len(), 230);
         for key in export.keys() {
             assert!(keys.contains(key.as_str()), "{key}");
+        }
+        let lens_row = rows
+            .iter()
+            .find(|row| row.key == "plane_view_lens")
+            .unwrap();
+        let choices = lens_row
+            .choices
+            .as_ref()
+            .expect("lens choices are public settings");
+        assert_eq!(choices.len(), crate::plane_view::PlaneLensKind::ALL.len());
+        for (choice, lens) in choices.iter().zip(crate::plane_view::PlaneLensKind::ALL) {
+            assert_eq!(choice.value, serde_json::to_value(lens).unwrap());
+            assert_eq!(choice.label, lens.label());
         }
         let index = include_str!("../ui_dialogs/preferences/search_index.rs");
         for (key, anchor) in STAGE1_MARKED_ANCHORS {

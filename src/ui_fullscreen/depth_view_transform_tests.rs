@@ -121,6 +121,7 @@ fn depth_transform_click_classification_focus_and_double_reset_use_the_shared_vi
                         pan,
                         None,
                         FullscreenPrimarySuppressionDecision::Allow,
+                        false,
                     );
                     if response.clicked() {
                         clicks += 1;
@@ -135,7 +136,7 @@ fn depth_transform_click_classification_focus_and_double_reset_use_the_shared_vi
                         }
                     }
                     assert_eq!(app.fs_free_rotation, 0.25, "click planning must not rotate");
-                    assert!(app.fs_rotation_drag_start.is_none());
+                    assert!(app.fs_canvas_drag.rotation_start().is_none());
                 },
             )
             .drop_without_applying_deltas();
@@ -397,7 +398,7 @@ fn depth_transform_wheel_prediction_matches_2d_for_default_navigation_and_local_
                         assert_eq!(actions.len(), 1);
                         predicted = Some(app.predict_fs_wheel_frame(ctx, media, &actions));
                     });
-                    let (zoom, pan, navigation) = predicted.unwrap();
+                    let (zoom, pan, navigation, _) = predicted.unwrap();
                     let response = viewer
                         .ctx
                         .read_response(egui::Id::unique("fs_click"))
@@ -423,6 +424,7 @@ fn depth_transform_wheel_prediction_matches_2d_for_default_navigation_and_local_
                                 pan,
                                 None,
                                 FullscreenPrimarySuppressionDecision::Allow,
+                                false
                             ),
                             FsCanvasClickAction::None
                         ),
@@ -521,8 +523,8 @@ fn depth_transform_panel_rejects_wheel_and_drag_starts() {
             viewer.frame(&mut app, events);
         }
         assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), before);
-        assert!(app.fs_pan_drag_start.is_none());
-        assert!(app.fs_rotation_drag_start.is_none());
+        assert!(app.fs_canvas_drag.pan_start().is_none());
+        assert!(app.fs_canvas_drag.rotation_start().is_none());
     }
     crate::key_input::clear_test_frame();
 }
@@ -851,7 +853,7 @@ fn depth_transform_ctrl_click_does_not_apply_a_rotation_drag() {
         unreachable!()
     };
     assert!(state.focus_highlight.is_some());
-    assert!(app.fs_rotation_drag_start.is_none());
+    assert!(app.fs_canvas_drag.rotation_start().is_none());
     crate::key_input::clear_test_frame();
 }
 
@@ -899,9 +901,9 @@ fn depth_transform_drag_start_follows_press_origin_across_panel() {
             viewer.frame(&mut app, vec![egui::Event::PointerMoved(crossing)]);
             assert_eq!(
                 if ctrl {
-                    app.fs_rotation_drag_start.is_some()
+                    app.fs_canvas_drag.rotation_start().is_some()
                 } else {
-                    app.fs_pan_drag_start.is_some()
+                    app.fs_canvas_drag.pan_start().is_some()
                 },
                 !starts_on_panel,
                 "the press owns admission: ctrl={ctrl}, starts_on_panel={starts_on_panel}"
@@ -924,7 +926,10 @@ fn depth_transform_drag_start_follows_press_origin_across_panel() {
                     modifiers,
                 }],
             );
-            assert!(app.fs_pan_drag_start.is_none() && app.fs_rotation_drag_start.is_none());
+            assert!(
+                app.fs_canvas_drag.pan_start().is_none()
+                    && app.fs_canvas_drag.rotation_start().is_none()
+            );
             assert_eq!(app.fullscreen_idx, Some(0));
             let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
                 unreachable!()
@@ -1021,7 +1026,7 @@ fn depth_transform_907_primary_semantic_origin_survives_release_after_crossing_p
         },
     );
     assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), before);
-    assert!(app.fs_pan_drag_start.is_none());
-    assert!(app.fs_rotation_drag_start.is_none());
+    assert!(app.fs_canvas_drag.pan_start().is_none());
+    assert!(app.fs_canvas_drag.rotation_start().is_none());
     crate::key_input::clear_test_frame();
 }

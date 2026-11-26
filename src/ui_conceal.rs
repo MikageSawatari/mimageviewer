@@ -300,7 +300,7 @@ impl App {
         self.conceal_line_end = None;
         self.conceal_shape_drag_start = None;
         self.conceal_shape_drag_end = None;
-        self.fs_pan_drag_start = None;
+        self.fs_canvas_drag.set_pan_start(None);
 
         // 見開きから入っていた場合は spread_mode と表示ページを復元
         let pivot = self.conceal_spread_ctx.take();

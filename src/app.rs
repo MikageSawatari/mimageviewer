@@ -851,6 +851,7 @@ mod depth_dialog;
 mod depth_export;
 mod depth_progress;
 pub(crate) mod depth_view;
+mod plane_view;
 pub(crate) use depth_dialog::DepthDialogSurface;
 pub(crate) use depth_view::DepthEntryRequest;
 #[cfg(all(test, windows))]
@@ -18290,8 +18291,8 @@ pub struct App {
     /// in-flight をキャンセルし続けて永久に完了しないため (Codex P1)。
     pub(crate) fs_pdf_rerender_demand: PdfRerenderDemand,
     pub(crate) fs_continuous_fit_reference: crate::ui_fullscreen::ContinuousSpecifiedFitReference,
-    /// 通常フルスクリーンのパンドラッグ開始状態
-    pub(crate) fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    /// 通常のパン・回転、または押下時に所有を固定したレンズ移動。
+    pub(crate) fs_canvas_drag: crate::plane_view::FsCanvasDrag,
     /// 連結読みモードのスクロール量。現在ページ中心を 0 とし、正方向で次のユニットへ進む。
     pub(crate) fs_vertical_scroll: f32,
     /// フルスクリーン下部シークバーをドラッグ中か。下端ホバー外へ出てもバーを維持する。
@@ -18320,8 +18321,6 @@ pub struct App {
         std::collections::HashMap<usize, ContinuousPageTransition>,
     /// 任意角度回転（ラジアン、一時的・保存しない）
     pub(crate) fs_free_rotation: f32,
-    /// 回転ドラッグ開始状態（開始位置, 開始時の回転角）
-    pub(crate) fs_rotation_drag_start: Option<(egui::Pos2, f32)>,
     /// ルーペ常時表示トグル (M キー)。Shift ホールドは独立に追加表示される。
     /// フルスクリーンを閉じても保持されるが、フォーカス喪失中はレンダリングしない。
     pub(crate) fs_loupe_locked: bool,
@@ -21737,7 +21736,7 @@ impl App {
             fs_pdf_rerender_demand: PdfRerenderDemand::default(),
             fs_continuous_fit_reference:
                 crate::ui_fullscreen::ContinuousSpecifiedFitReference::Legacy,
-            fs_pan_drag_start: None,
+            fs_canvas_drag: crate::plane_view::FsCanvasDrag::default(),
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
             fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture::Idle,
@@ -21748,7 +21747,6 @@ impl App {
             page_turn_leases: Default::default(),
             continuous_page_transitions: std::collections::HashMap::new(),
             fs_free_rotation: 0.0,
-            fs_rotation_drag_start: None,
             fs_loupe_locked: false,
             fs_pixel_grid_enabled: true,
             fullscreen_page_layout: crate::displayed_image_transform::FullscreenPageLayout::default(
@@ -66687,6 +66685,7 @@ impl App {
         self.clear_fullscreen_tag_picker_state();
 
         self.deactivate_compare_view();
+        self.retire_exclusive_view_for_owner_change("park_or_fork");
         if !matches!(
             self.fs_exclusive_view,
             crate::fs_exclusive_view::FsExclusiveView::None
@@ -71522,12 +71521,7 @@ impl App {
         }
         let snapshot = self
             .with_viewer_context(active_id, |app| {
-                if app.fs_exclusive_view.is_depth() {
-                    app.set_fs_exclusive_view(
-                        crate::fs_exclusive_view::FsExclusiveView::None,
-                        "park_active_live_media",
-                    );
-                }
+                app.retire_exclusive_view_for_owner_change("park_active_live_media");
                 let snapshot = app.build_parked_live_media_window_snapshot(ctx)?;
                 let window_id = snapshot.id;
                 app.activate_mounted_as_independent_detached(window_id);
@@ -74431,7 +74425,7 @@ impl App {
                 }
             },
         );
-        self.fs_pan_drag_start = None;
+        self.fs_canvas_drag.set_pan_start(None);
         self.fs_vertical_scroll = 0.0;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
@@ -74442,7 +74436,7 @@ impl App {
         self.fs_vertical_cache_keep_set.clear();
         self.continuous_page_transitions.clear();
         self.fs_free_rotation = 0.0;
-        self.fs_rotation_drag_start = None;
+        self.fs_canvas_drag.set_rotation_start(None);
         // 透過背景は「一時的な好み」なので画像切替時にリセット (plan-v0.7.0.md の方針)
         self.fs_transparent_bg_mode = 0;
 

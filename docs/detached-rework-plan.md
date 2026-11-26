@@ -1458,6 +1458,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 魚眼ズームの既存占有ownerへの追加 (§1.917、2026-11-27)
+
+`FsExclusiveView::PlaneView` を既存のcontext所有variantへ追加した。
+変更範囲は設計書 [§4.4](fisheye-plane-view-plan.md#44-別ウィンドウ-detached--リワーク中の規則との関係) のとおり、
+Depthの表示所有者交代の退役を `retire_exclusive_view_for_owner_change` に集約してPlaneViewも通すこと。
+F11/F12/session確定、fork、live pass引き渡し、parkとpauseで使い、scoped mountは保持する。
+Panoramaの既存退役・intent保持、Depthの再入場案内は既存の分岐に残す。
+キャンバスドラッグは既存2起点を `FsCanvasDrag::Image` にまとめ、`PlaneLens` と排他にした (bundleの項目は1つ減る)。
+新しいdetached述語・viewport・入力配送・時間窓は追加しない。登録待ちの次pass要求は素材のrenderer登録境界でだけ行う。
+実装後のコンパイル・自動検証・実機確認は未実施。実装記録・ソースとの相違は設計書§11へ記載する。
+
 ### 2026-11-26: 閉じるモードの数え方の区切りと、この pass の押下位置 (§1.900・§1.907)
 
 - 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §14・§15。F12 の別ウィンドウと共有する

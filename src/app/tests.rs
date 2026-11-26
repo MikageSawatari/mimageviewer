@@ -51433,7 +51433,8 @@ mod favorite_adjustment_defaults_tests {
                         if path == std::path::Path::new("c:/p/b.jpg")
                 ));
             }
-            crate::export_dialog::ExportComposite::Single(_) => {
+            crate::export_dialog::ExportComposite::Single(_)
+            | crate::export_dialog::ExportComposite::PlaneView(_) => {
                 panic!("spread export should prepare both page sources")
             }
         }
@@ -51461,7 +51462,8 @@ mod favorite_adjustment_defaults_tests {
                         if path == std::path::Path::new("c:/p/b.jpg")
                 ));
             }
-            crate::export_dialog::ExportComposite::Single(_) => {
+            crate::export_dialog::ExportComposite::Single(_)
+            | crate::export_dialog::ExportComposite::PlaneView(_) => {
                 panic!("right-page entry should still prepare the visible spread")
             }
         }
@@ -51503,7 +51505,8 @@ mod favorite_adjustment_defaults_tests {
             crate::export_dialog::ExportComposite::Single(page) => {
                 assert!(page.has_conceal_mask);
             }
-            crate::export_dialog::ExportComposite::Spread { .. } => {
+            crate::export_dialog::ExportComposite::Spread { .. }
+            | crate::export_dialog::ExportComposite::PlaneView(_) => {
                 panic!("single page export should not prepare a spread")
             }
         }
@@ -51560,7 +51563,8 @@ mod favorite_adjustment_defaults_tests {
             crate::export_dialog::ExportComposite::Single(page) => {
                 assert!(!page.has_conceal_mask);
             }
-            crate::export_dialog::ExportComposite::Spread { .. } => {
+            crate::export_dialog::ExportComposite::Spread { .. }
+            | crate::export_dialog::ExportComposite::PlaneView(_) => {
                 panic!("single page export should not prepare a spread")
             }
         }
@@ -52314,7 +52318,8 @@ mod favorite_adjustment_defaults_tests {
                         if path == std::path::Path::new("c:/p/b.jpg")
                 ));
             }
-            crate::export_dialog::ExportComposite::Single(_) => {
+            crate::export_dialog::ExportComposite::Single(_)
+            | crate::export_dialog::ExportComposite::PlaneView(_) => {
                 panic!("visible spread layout should prepare both page sources")
             }
         }

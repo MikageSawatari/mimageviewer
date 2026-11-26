@@ -393,6 +393,8 @@ fn key_entry(action: KeyAction) -> Entry {
         | FsPanorama
         | FsPanoramaProjection
         | FsDepthParallax
+        | FsFisheyeIn
+        | FsFisheyeOut
         | FsNavigatorToggle
         | FsPageTurnAnimationToggle
         | FsNavigatorHold

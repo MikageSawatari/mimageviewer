@@ -77,6 +77,8 @@ pub(crate) struct TapZoneGeometry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TouchSurfaceBehavior {
     Grid,
+    /// Same viewer gesture delivery, with page-side taps suppressed from contact start.
+    TransformedViewer,
     Viewer {
         accepts_pinch: bool,
         /// タップをページ送り / 中央タップとして解釈するか。
@@ -97,6 +99,7 @@ impl TouchSurfaceBehavior {
         matches!(
             self,
             Self::Grid
+                | Self::TransformedViewer
                 | Self::Viewer {
                     accepts_pinch: true,
                     ..
@@ -106,7 +109,7 @@ impl TouchSurfaceBehavior {
 
     fn uses_tap_zones(self) -> bool {
         match self {
-            Self::Grid => true,
+            Self::Grid | Self::TransformedViewer => true,
             Self::Viewer { tap_zones, .. } => tap_zones,
         }
     }
@@ -197,16 +200,18 @@ struct Contact {
     pos: Pos2,
     start_ms: u64,
     max_distance_sq: f32,
+    start_behavior: TouchSurfaceBehavior,
 }
 
 impl Contact {
-    fn new(sample: TouchSample) -> Self {
+    fn new(sample: TouchSample, start_behavior: TouchSurfaceBehavior) -> Self {
         Self {
             id: sample.id,
             start_pos: sample.pos,
             pos: sample.pos,
             start_ms: sample.now_ms,
             max_distance_sq: 0.0,
+            start_behavior,
         }
     }
 
@@ -371,7 +376,7 @@ impl TouchRecognizer {
         if self.contacts.iter().any(|contact| contact.id == sample.id) {
             return Vec::new();
         }
-        self.contacts.push(Contact::new(sample));
+        self.contacts.push(Contact::new(sample, geom.behavior));
 
         let mut commands = Vec::new();
         if self.contacts.len() >= PINCH_CONTACT_COUNT && geom.behavior.accepts_pinch() {
@@ -488,7 +493,8 @@ impl TouchRecognizer {
                         // double-click path. Re-tap open is a separate step.
                         self.owner = TouchOwner::WidgetPassthrough;
                     }
-                    TouchSurfaceBehavior::Viewer { .. } => {
+                    TouchSurfaceBehavior::Viewer { .. }
+                    | TouchSurfaceBehavior::TransformedViewer => {
                         match classify_tap(geom, contact.pos) {
                             TapZone::Center => {
                                 self.owner = TouchOwner::ViewerTapZone;
@@ -498,7 +504,10 @@ impl TouchRecognizer {
                             TapZone::PageSide { left } => {
                                 self.owner = TouchOwner::ViewerTapZone;
                                 self.suppress_primary = true;
-                                commands.push(TouchCommand::PageSide { left });
+                                if contact.start_behavior != TouchSurfaceBehavior::TransformedViewer
+                                {
+                                    commands.push(TouchCommand::PageSide { left });
+                                }
                             }
                             TapZone::Excluded => {
                                 // The press began on the viewer, so do not pass its
@@ -511,14 +520,18 @@ impl TouchRecognizer {
             } else if !contact.is_stationary_press() {
                 self.owner = match geom.behavior {
                     TouchSurfaceBehavior::Grid => TouchOwner::GridScroll,
-                    TouchSurfaceBehavior::Viewer { .. } => TouchOwner::ViewerPointerPassthrough,
+                    TouchSurfaceBehavior::Viewer { .. }
+                    | TouchSurfaceBehavior::TransformedViewer => {
+                        TouchOwner::ViewerPointerPassthrough
+                    }
                 };
             } else {
                 match geom.behavior {
                     TouchSurfaceBehavior::Grid => {
                         self.owner = TouchOwner::WidgetPassthrough;
                     }
-                    TouchSurfaceBehavior::Viewer { .. } => {
+                    TouchSurfaceBehavior::Viewer { .. }
+                    | TouchSurfaceBehavior::TransformedViewer => {
                         // A stationary long press is not a tap, but its synthetic
                         // primary release must not become a page command.
                         self.suppress_primary = true;
@@ -676,6 +689,59 @@ mod tests {
             phase,
             now_ms,
         }
+    }
+
+    #[test]
+    fn plane_touch_page_side_is_bound_to_contact_start_and_chrome_stays_available() {
+        let normal = geom();
+        let plane = TapZoneGeometry {
+            behavior: TouchSurfaceBehavior::TransformedViewer,
+            ..geom()
+        };
+        for (start, end, expects_page) in [
+            (&normal, &plane, true),
+            (&plane, &normal, false),
+            (&plane, &plane, false),
+        ] {
+            let mut recognizer = TouchRecognizer::new();
+            recognizer.handle_sample(start, sample(1, 100., 400., TouchPhase::Start, 0));
+            let commands =
+                recognizer.handle_sample(end, sample(1, 100., 400., TouchPhase::End, 100));
+            assert_eq!(
+                commands.contains(&TouchCommand::PageSide { left: true }),
+                expects_page
+            );
+            assert!(recognizer.should_suppress_primary());
+        }
+        let mut recognizer = TouchRecognizer::new();
+        recognizer.handle_sample(&plane, sample(1, 500., 400., TouchPhase::Start, 0));
+        assert_eq!(
+            recognizer.handle_sample(&plane, sample(1, 500., 400., TouchPhase::End, 100)),
+            vec![TouchCommand::ToggleChrome]
+        );
+    }
+
+    #[test]
+    fn plane_touch_pinch_preserves_zoom_and_two_finger_pan_commands() {
+        let plane = TapZoneGeometry {
+            behavior: TouchSurfaceBehavior::TransformedViewer,
+            ..geom()
+        };
+        let mut recognizer = TouchRecognizer::new();
+        recognizer.handle_sample(&plane, sample(1, 100., 200., TouchPhase::Start, 0));
+        recognizer.handle_sample(&plane, sample(2, 110., 200., TouchPhase::Start, 1));
+        assert_eq!(
+            recognizer.handle_sample(&plane, sample(2, 120., 200., TouchPhase::Move, 2)),
+            vec![
+                TouchCommand::Zoom {
+                    factor: 2.,
+                    pivot: pos2(110., 200.)
+                },
+                TouchCommand::Pan {
+                    delta: vec2(5., 0.)
+                },
+            ]
+        );
     }
 
     #[test]

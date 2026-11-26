@@ -2184,7 +2184,7 @@ pub(in crate::app) struct ViewerContextBundle {
     fs_zoom_factor: f32,
     fs_pdf_rerender_demand: PdfRerenderDemand,
     fs_continuous_fit_reference: crate::ui_fullscreen::ContinuousSpecifiedFitReference,
-    fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    fs_canvas_drag: crate::plane_view::FsCanvasDrag,
     fs_vertical_scroll: f32,
     fs_seek_drag_active: bool,
     fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture,
@@ -2194,7 +2194,6 @@ pub(in crate::app) struct ViewerContextBundle {
     page_turn_presentation: crate::ui_fullscreen::PageTurnPresentation,
     continuous_page_transitions: std::collections::HashMap<usize, ContinuousPageTransition>,
     fs_free_rotation: f32,
-    fs_rotation_drag_start: Option<(egui::Pos2, f32)>,
     analysis_zoom: f32,
     analysis_pan: egui::Vec2,
     analysis_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
@@ -3472,7 +3471,7 @@ impl ViewerContextBundle {
             fs_pdf_rerender_demand: PdfRerenderDemand::default(),
             fs_continuous_fit_reference:
                 crate::ui_fullscreen::ContinuousSpecifiedFitReference::Legacy,
-            fs_pan_drag_start: None,
+            fs_canvas_drag: crate::plane_view::FsCanvasDrag::default(),
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
             fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture::Idle,
@@ -3482,7 +3481,6 @@ impl ViewerContextBundle {
             page_turn_presentation: Default::default(),
             continuous_page_transitions: std::collections::HashMap::new(),
             fs_free_rotation: 0.0,
-            fs_rotation_drag_start: None,
             analysis_zoom: 1.0,
             analysis_pan: egui::Vec2::ZERO,
             analysis_pan_drag_start: None,
@@ -3608,6 +3606,7 @@ impl ViewerContextBundle {
 impl App {
     #[cfg(windows)]
     pub(in crate::app) fn pause_mounted_background_work_keep_current_frame(&mut self) {
+        self.retire_exclusive_view_for_owner_change("context_pause");
         self.grid_scroll.renew_session();
         if let Some(holdover) = self.fs_holdover_tex.as_mut() {
             holdover.finish_navigation_diagnostic("context_parked");
@@ -3909,7 +3908,7 @@ impl App {
             fs_zoom_factor,
             fs_pdf_rerender_demand,
             fs_continuous_fit_reference,
-            fs_pan_drag_start,
+            fs_canvas_drag,
             fs_vertical_scroll,
             fs_seek_drag_active,
             fs_seek_gesture,
@@ -3919,7 +3918,6 @@ impl App {
             page_turn_presentation,
             continuous_page_transitions,
             fs_free_rotation,
-            fs_rotation_drag_start,
             analysis_zoom,
             analysis_pan,
             analysis_pan_drag_start,
@@ -4249,7 +4247,7 @@ impl App {
         swap_field!(fs_zoom_factor);
         swap_field!(fs_pdf_rerender_demand);
         swap_field!(fs_continuous_fit_reference);
-        swap_field!(fs_pan_drag_start);
+        swap_field!(fs_canvas_drag);
         swap_field!(fs_vertical_scroll);
         swap_field!(fs_seek_drag_active);
         swap_field!(fs_seek_gesture);
@@ -4259,7 +4257,6 @@ impl App {
         swap_field!(page_turn_presentation);
         swap_field!(continuous_page_transitions);
         swap_field!(fs_free_rotation);
-        swap_field!(fs_rotation_drag_start);
         swap_field!(analysis_zoom);
         swap_field!(analysis_pan);
         swap_field!(analysis_pan_drag_start);
@@ -4456,12 +4453,7 @@ impl App {
         // Depth belongs to the original main fullscreen identity. Retire its request
         // and callback slot before moving viewer state to a new owner. Panorama's
         // existing state/intent transfer below remains unchanged.
-        if self.fs_exclusive_view.is_depth() {
-            self.set_fs_exclusive_view(
-                crate::fs_exclusive_view::FsExclusiveView::None,
-                "fork_exclusive_owner",
-            );
-        }
+        self.retire_exclusive_view_for_owner_change("fork_exclusive_owner");
         // The transient reader and its return lifetime move as one owner; the main
         // projection receives the unchanged, already prepared physical basis.
         let direct_owner = self.direct_media_reader_active().then(|| {
@@ -4692,7 +4684,7 @@ impl App {
             fs_zoom_factor,
             fs_pdf_rerender_demand,
             fs_continuous_fit_reference,
-            fs_pan_drag_start,
+            fs_canvas_drag,
             fs_vertical_scroll,
             fs_seek_drag_active,
             fs_seek_gesture,
@@ -4702,7 +4694,6 @@ impl App {
             page_turn_presentation,
             continuous_page_transitions,
             fs_free_rotation,
-            fs_rotation_drag_start,
             analysis_zoom,
             analysis_pan,
             analysis_pan_drag_start,
@@ -4933,7 +4924,7 @@ impl App {
             fs_zoom_factor,
             fs_pdf_rerender_demand,
             fs_continuous_fit_reference,
-            fs_pan_drag_start,
+            fs_canvas_drag,
             fs_vertical_scroll,
             fs_seek_drag_active,
             fs_seek_gesture,
@@ -4943,7 +4934,6 @@ impl App {
             page_turn_presentation,
             continuous_page_transitions,
             fs_free_rotation,
-            fs_rotation_drag_start,
             analysis_zoom,
             analysis_pan,
             analysis_pan_drag_start,

@@ -57,7 +57,8 @@ fn draw_current_with_initial_placement(
             true,
             false,
         )
-        .expect("the selected resident single page paints");
+        .expect("the selected resident single page paints")
+        .transform;
     app.fullscreen_page_layout
         .begin(FullscreenPageLayoutKind::Single);
     app.fullscreen_page_layout

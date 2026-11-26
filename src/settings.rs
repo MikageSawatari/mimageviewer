@@ -6106,6 +6106,8 @@ pub struct Settings {
     /// 静止画をホイールで拡大・縮小するときの倍率の刻み。
     #[serde(default)]
     pub fullscreen_wheel_zoom_step: FullscreenWheelZoomStep,
+    #[serde(default)]
+    pub plane_view_lens: crate::plane_view::PlaneLensKind,
     /// ページ内の次へ / 前へスクロールで用いる順序。
     #[serde(default)]
     pub fullscreen_n_scroll_order: FullscreenNScrollOrder,
@@ -8681,6 +8683,7 @@ impl Default for Settings {
             fullscreen_up_down_key_action: FullscreenUpDownKeyAction::default(),
             fullscreen_wheel_action: FullscreenWheelAction::default(),
             fullscreen_wheel_zoom_step: FullscreenWheelZoomStep::default(),
+            plane_view_lens: crate::plane_view::PlaneLensKind::default(),
             fullscreen_n_scroll_order: FullscreenNScrollOrder::default(),
             fullscreen_n_scroll_step_percent: default_fullscreen_n_scroll_step_percent(),
             fullscreen_n_scroll_wrap_step_percent: None,

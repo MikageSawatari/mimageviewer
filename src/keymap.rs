@@ -1798,6 +1798,8 @@ pub enum KeyAction {
     FsPanorama,
     FsPanoramaProjection,
     FsDepthParallax,
+    FsFisheyeIn,
+    FsFisheyeOut,
     FsNavigatorToggle,
     FsPageTurnAnimationToggle,
     FsNavigatorHold,
@@ -2427,6 +2429,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsPanorama,
     KeyAction::FsPanoramaProjection,
     KeyAction::FsDepthParallax,
+    KeyAction::FsFisheyeIn,
+    KeyAction::FsFisheyeOut,
     KeyAction::FsNavigatorToggle,
     KeyAction::FsPageTurnAnimationToggle,
     KeyAction::FsNavigatorHold,
@@ -4735,6 +4739,8 @@ impl KeyAction {
             FsPanorama => "FsPanorama",
             FsPanoramaProjection => "FsPanoramaProjection",
             FsDepthParallax => "FsDepthParallax",
+            FsFisheyeIn => "FsFisheyeIn",
+            FsFisheyeOut => "FsFisheyeOut",
             FsNavigatorToggle => "FsNavigatorToggle",
             FsPageTurnAnimationToggle => "FsPageTurnAnimationToggle",
             FsNavigatorHold => "FsNavigatorHold",
@@ -5529,6 +5535,8 @@ impl KeyAction {
             FsPanorama => "360度表示または通常動画の拡大表示を切り替える",
             FsPanoramaProjection => "360度パノラマの投影方式を切り替える",
             FsDepthParallax => "3D 写真の表示を切り替える",
+            FsFisheyeIn => "魚眼で寄る",
+            FsFisheyeOut => "魚眼で離れる",
             FsNavigatorToggle => "ナビゲータの表示を切り替える",
             FsPageTurnAnimationToggle => "ページめくりアニメーションを切り替える",
             FsNavigatorHold => "押している間だけナビゲータを表示する",
@@ -6137,6 +6145,8 @@ impl KeyAction {
             | FsImageAnalysis
             | FsZoomMode
             | FsDepthParallax
+            | FsFisheyeIn
+            | FsFisheyeOut
             | FsNavigatorToggle
             | FsPageTurnAnimationToggle
             | FsNavigatorHold
@@ -6716,6 +6726,8 @@ impl KeyAction {
             | FsPanorama
             | FsPanoramaProjection
             | FsDepthParallax
+            | FsFisheyeIn
+            | FsFisheyeOut
             | FsNavigatorToggle
             | FsPageTurnAnimationToggle
             | FsPixelGrid
@@ -7309,6 +7321,7 @@ impl KeyAction {
             FsPanorama => ChordList::one(Chord::key(V)),
             FsPanoramaProjection => ChordList::one(Chord::shift(V)),
             FsDepthParallax => ChordList::one(Chord::key(D)),
+            FsFisheyeIn | FsFisheyeOut => ChordList::EMPTY,
             FsNavigatorToggle => ChordList::one(Chord::alt(N)),
             FsPageTurnAnimationToggle => ChordList::EMPTY,
             FsNavigatorHold => ChordList::one(Chord::modifier(ModKind::Alt)),
@@ -12678,6 +12691,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Chord::ctrl(KeyName::Right)]
         );
+    }
+
+    #[test]
+    fn plane_fisheye_actions_have_no_defaults_roundtrip_and_conflict_with_each_other() {
+        for action in [KeyAction::FsFisheyeIn, KeyAction::FsFisheyeOut] {
+            assert!(ALL_ACTIONS.contains(&action));
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().iter().next().is_none());
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+        }
+        let bound = Keymap::from_ini_str("[FsImage]\nFsFisheyeIn = F13\nFsFisheyeOut = F13\n");
+        assert!(
+            bound
+                .binding_conflicts()
+                .iter()
+                .any(|conflict| conflict.action == KeyAction::FsFisheyeIn
+                    && conflict.other_action == Some(KeyAction::FsFisheyeOut)
+                    || conflict.action == KeyAction::FsFisheyeOut
+                        && conflict.other_action == Some(KeyAction::FsFisheyeIn))
+        );
+        let wire = serde_json::to_string(&KeymapSettings::from_keymap(&bound)).unwrap();
+        let restored = Keymap::from_settings(&serde_json::from_str(&wire).unwrap());
+        for action in [KeyAction::FsFisheyeIn, KeyAction::FsFisheyeOut] {
+            assert_eq!(
+                bound.effective_chords(action),
+                restored.effective_chords(action)
+            );
+        }
+        let reference = include_str!("../docs/keymap.ini.default");
+        assert!(reference.contains("# FsFisheyeIn = none"));
+        assert!(reference.contains("# FsFisheyeOut = none"));
     }
 
     #[test]

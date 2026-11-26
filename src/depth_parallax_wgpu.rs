@@ -68,17 +68,6 @@ fn depth_at(p:vec2<f32>)->f32 {
     return select(vec4(0.),result,all(in_uv>=vec2(0.)) && all(in_uv<=vec2(1.)));
 }
 "#;
-const BLIT_SHADER: &str = r#"
-struct Vertex { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> };
-@vertex fn vs_main(@builtin(vertex_index) i:u32)->Vertex {
-    var p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));
-    var o:Vertex;o.position=vec4(p[i],0.,1.);o.uv=vec2((p[i].x+1.)*.5,(1.-p[i].y)*.5);return o;
-}
-@group(0) @binding(0) var color:texture_2d<f32>;
-@group(0) @binding(1) var samp:sampler;
-@fragment fn fs_main(in:Vertex)->@location(0) vec4<f32> {return textureSample(color,samp,in.uv);}
-"#;
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DepthRenderParams {
     pub offset: egui::Vec2,
@@ -401,17 +390,7 @@ pub(crate) fn guide_size(width: u32, height: u32) -> [u32; 2] {
         ]
     }
 }
-pub(crate) struct DepthColor {
-    pub texture: wgpu::Texture,
-    pub view: wgpu::TextureView,
-    pub width: u32,
-    pub height: u32,
-}
-impl DepthColor {
-    pub(crate) fn byte_size(&self) -> u64 {
-        color_byte_size(self.width, self.height)
-    }
-}
+pub(crate) use crate::gpu_color_copy::MipColor as DepthColor;
 pub(crate) struct DepthTexture {
     pub texture: wgpu::Texture,
     pub view: wgpu::TextureView,
@@ -476,29 +455,12 @@ impl DepthTexture {
 }
 
 pub(crate) struct DepthGpu {
-    layout: wgpu::BindGroupLayout,
-    pipeline: wgpu::RenderPipeline,
-    sampler: wgpu::Sampler,
-    mips: egui_wgpu::MipmapGenerator,
+    copier: crate::gpu_color_copy::ColorMipCopier,
 }
 impl DepthGpu {
     pub(crate) fn new(device: &wgpu::Device) -> Self {
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("depth blit bindings"),
-            entries: &[texture_entry(0), sampler_entry(1)],
-        });
-        let pipeline = pipeline(
-            device,
-            &layout,
-            BLIT_SHADER,
-            wgpu::TextureFormat::Rgba8Unorm,
-            None,
-        );
         Self {
-            layout,
-            pipeline,
-            sampler: sampler(device),
-            mips: egui_wgpu::MipmapGenerator::new(device),
+            copier: crate::gpu_color_copy::ColorMipCopier::new(device),
         }
     }
     fn blit(
@@ -508,36 +470,7 @@ impl DepthGpu {
         source: &wgpu::TextureView,
         target: &wgpu::TextureView,
     ) {
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("depth blit"),
-            layout: &self.layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(source),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("depth color blit"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.draw(0..3, 0..1);
+        self.copier.blit(device, encoder, source, target);
     }
     pub(crate) fn copy_color(
         &self,
@@ -545,42 +478,9 @@ impl DepthGpu {
         queue: &wgpu::Queue,
         source: &wgpu::Texture,
     ) -> Result<DepthColor, String> {
-        if source.format() != wgpu::TextureFormat::Rgba8Unorm
-            || source.width() == 0
-            || source.height() == 0
-        {
-            return Err("3D 写真の元テクスチャ形式が不正です".into());
-        }
-        let (width, height) = (source.width(), source.height());
-        let texture = texture(
-            device,
-            width,
-            height,
-            wgpu::TextureFormat::Rgba8Unorm,
-            egui_wgpu::mip_level_count(width, height),
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
-        );
-        let source = source.create_view(&wgpu::TextureViewDescriptor {
-            base_mip_level: 0,
-            mip_level_count: Some(1),
-            ..Default::default()
-        });
-        let target = texture.create_view(&wgpu::TextureViewDescriptor {
-            base_mip_level: 0,
-            mip_level_count: Some(1),
-            ..Default::default()
-        });
-        let mut encoder = device.create_command_encoder(&Default::default());
-        self.blit(device, &mut encoder, &source, &target);
-        queue.submit(Some(encoder.finish()));
-        self.mips.generate(device, queue, &texture);
-        let view = texture.create_view(&Default::default());
-        Ok(DepthColor {
-            texture,
-            view,
-            width,
-            height,
-        })
+        self.copier
+            .copy_color(device, queue, source)
+            .map_err(|_| "3D 写真の元テクスチャ形式が不正です".to_owned())
     }
     pub(crate) fn readback(
         &self,

@@ -11413,6 +11413,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/wheel-zoom-step", |ui, state| {
         draw_fullscreen_wheel_zoom_step_setting(ui, &mut state.settings.fullscreen_wheel_zoom_step);
     });
+    anchored(ui, state, "spread/plane-view-lens", |ui, state| {
+        draw_plane_view_lens_setting(ui, &mut state.settings.plane_view_lens);
+    });
     anchored(ui, state, "spread/n-scroll-order", |ui, state| {
         draw_fullscreen_n_scroll_order_setting(ui, &mut state.settings.fullscreen_n_scroll_order);
     });
@@ -15203,6 +15206,62 @@ mod spread_step_assignment_tests {
                 RingShortcutContext::VideoFullscreen,
                 &ring
             ));
+        }
+    }
+}
+
+fn draw_plane_view_lens_setting(ui: &mut egui::Ui, value: &mut crate::plane_view::PlaneLensKind) {
+    ui.horizontal(|ui| {
+        let label = ui.label("魚眼のレンズ");
+        let combo = egui::ComboBox::from_id_salt("plane_view_lens")
+            .selected_text(value.label())
+            .show_ui(ui, |ui| {
+                for lens in crate::plane_view::PlaneLensKind::ALL {
+                    ui.selectable_value(value, lens, lens.label());
+                }
+            });
+        combo.response.labelled_by(label.id);
+    });
+}
+
+#[cfg(test)]
+mod plane_view_lens_tests {
+    mod gpu_tests {
+        fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme) {
+            let mut ready = false;
+            let mut value = crate::plane_view::PlaneLensKind::default();
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(420., 100.))
+                .build_ui(move |root| {
+                    crate::test_ui::full_viewport_ui(root, |root| {
+                        crate::os_theme::apply_resolved(root.ctx(), theme);
+                        if !ready {
+                            crate::ui_fonts::configure_fonts(root.ctx());
+                            ready = true;
+                            root.ctx().request_repaint();
+                            return;
+                        }
+                        egui::CentralPanel::default().show(root, |ui| {
+                            super::super::draw_plane_view_lens_setting(ui, &mut value)
+                        });
+                    });
+                });
+            harness.run();
+            harness.snapshot(name);
+        }
+        #[test]
+        fn plane_view_lens_settings_light() {
+            snapshot(
+                "plane_view_lens_settings_light",
+                crate::os_theme::ResolvedTheme::Light,
+            );
+        }
+        #[test]
+        fn plane_view_lens_settings_dark() {
+            snapshot(
+                "plane_view_lens_settings_dark",
+                crate::os_theme::ResolvedTheme::Dark,
+            );
         }
     }
 }

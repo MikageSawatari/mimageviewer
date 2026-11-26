@@ -297,7 +297,7 @@ fn crossing_panel_case(mode: Mode, navigation: Navigation) {
     );
     match navigation {
         Navigation::Scrub => assert!(app.fs_middle_zoom_drag.is_some()),
-        Navigation::Pan => assert!(app.fs_pan_drag_start.is_some()),
+        Navigation::Pan => assert!(app.fs_canvas_drag.pan_start().is_some()),
     }
     let initial = (app.fs_zoom, app.fs_pan);
     frame(&mut app, &ctx, mode, on_panel, None, modifiers);
@@ -328,7 +328,7 @@ fn crossing_panel_case(mode: Mode, navigation: Navigation) {
         "{mode:?}: scrub release must retire"
     );
     assert!(
-        app.fs_pan_drag_start.is_none(),
+        app.fs_canvas_drag.pan_start().is_none(),
         "{mode:?}: pan release must retire"
     );
     frame(
@@ -343,7 +343,7 @@ fn crossing_panel_case(mode: Mode, navigation: Navigation) {
         mode.ordinary_drag_started(&app),
         "{mode:?} {navigation:?}: next press must reach the tool"
     );
-    assert!(app.fs_middle_zoom_drag.is_none() && app.fs_pan_drag_start.is_none());
+    assert!(app.fs_middle_zoom_drag.is_none() && app.fs_canvas_drag.pan_start().is_none());
     frame(
         &mut app,
         &ctx,
@@ -356,7 +356,7 @@ fn crossing_panel_case(mode: Mode, navigation: Navigation) {
     hold(navigation, true);
     frame(&mut app, &ctx, mode, on_panel, Some(true), modifiers);
     assert!(
-        app.fs_middle_zoom_drag.is_none() && app.fs_pan_drag_start.is_none(),
+        app.fs_middle_zoom_drag.is_none() && app.fs_canvas_drag.pan_start().is_none(),
         "{mode:?}: panel start must be rejected"
     );
     hold(navigation, false);

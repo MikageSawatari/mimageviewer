@@ -1,3 +1,9 @@
+§1.917: `plane_view_lens_settings_light` / `plane_view_lens_settings_dark` (420×100) と
+`plane_export_size_choices_dark` (460×230、テスト名 `plane_export_size_choices_snapshot_dark`) を追加する。
+環境設定の1行と書き出しの寸法の選択は製品と同じ renderer を使う。PNGは未生成・未目視・比較未実行。
+設計担当が共有 runner で対象3件を生成・目視し、更新指定なしで比較する。
+書き出しダイアログ全体の魚眼向け文言・バリエーションと寸法表示も受入で確認する。
+
 §1.843 第 2 段では、AI 連携の許可補足・見せる情報・許す操作にキー・リング・マウスボタン・ジェスチャーを加える。
 更新対象は既存の `agent_integration_window_{disabled,read,open,organize,records}_{light,dark}` の10枚。
 2026-11-25 に設計担当が共有 runner で再生成し、目視と通常比較 (10 件成功)、glyph lint を行った。

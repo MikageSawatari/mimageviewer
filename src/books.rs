@@ -2787,7 +2787,8 @@ fn destination_for_source(
         BookPageSource::Rendered { work, format, .. } => {
             let basename = match work {
                 crate::capture::CapturePixelWork::Single(job) => job.basename.as_str(),
-                crate::capture::CapturePixelWork::Spread { basename, .. } => basename.as_str(),
+                crate::capture::CapturePixelWork::Spread { basename, .. }
+                | crate::capture::CapturePixelWork::PlaneView { basename, .. } => basename.as_str(),
             };
             format!(
                 "{}.{}",

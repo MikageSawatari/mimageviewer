@@ -1324,6 +1324,25 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "spread/plane-view-lens",
+        SpreadMode,
+        "魚眼のレンズ",
+        [
+            "魚眼ズーム",
+            "魚眼レンズ",
+            "等距離",
+            "立体射影",
+            "等立体角",
+            "ズーム",
+            "拡大",
+            "縮小",
+            "Ctrl",
+            "Shift",
+            "ホイール",
+            "fisheye"
+        ]
+    ),
+    entry!(
         "spread/n-scroll-order",
         SpreadMode,
         "N 字スクロールの順序",
@@ -2401,6 +2420,26 @@ mod tests {
                 .find(|entry| entry.anchor == anchor)
                 .expect("ページ内スクロール設定が検索できる");
             assert_eq!(entry.page, PreferencesPage::SpreadMode);
+        }
+    }
+
+    #[test]
+    fn plane_view_lens_setting_is_searchable() {
+        for query in [
+            "魚眼のレンズ",
+            "魚眼 ズーム",
+            "等距離",
+            "立体射影",
+            "等立体角",
+            "fisheye",
+            "Ctrl Shift ホイール",
+        ] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "spread/plane-view-lens")
+                .expect("魚眼のレンズが検索できる");
+            assert_eq!(entry.page, PreferencesPage::SpreadMode);
+            assert_eq!(entry.title, "魚眼のレンズ");
         }
     }
 

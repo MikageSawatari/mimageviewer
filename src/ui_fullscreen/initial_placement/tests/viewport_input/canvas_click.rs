@@ -161,6 +161,7 @@ fn planned_click(app: &mut App, is_video: bool, double: bool) -> FsCanvasClickAc
                     app.fs_pan,
                     None,
                     FullscreenPrimarySuppressionDecision::Allow,
+                    false,
                 );
             },
         )

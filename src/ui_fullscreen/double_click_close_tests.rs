@@ -169,6 +169,7 @@ impl Canvas {
                         } else {
                             FullscreenPrimarySuppressionDecision::Allow
                         },
+                        false,
                     )
                     .into();
             },
@@ -1332,7 +1333,7 @@ fn close_mode_focus_restore_899_f1_split_frames_close_on_second_click() {
         canvas.app.fs_primary_suppression,
         FullscreenPrimarySuppression::Idle
     );
-    assert!(canvas.app.fs_pan_drag_start.is_none());
+    assert!(canvas.app.fs_canvas_drag.pan_start().is_none());
     assert_eq!(canvas.app.fullscreen_idx, Some(0));
     assert_eq!(canvas.split_click(egui::Modifiers::NONE), (true, false));
 }
