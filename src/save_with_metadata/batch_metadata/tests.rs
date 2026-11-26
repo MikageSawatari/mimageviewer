@@ -834,13 +834,15 @@ fn single_page_metadata_bytes_match_legacy_except_ifd1_and_icc() {
                     legacy = splice_jpeg_app1_segments(&legacy, &segments).unwrap();
                 }
                 SrcFormat::Png => {
-                    let chunks: Vec<_> = extract_png_metadata_chunks(&src)
+                    let icc: Vec<_> = extract_png_metadata_chunks(&src)
                         .unwrap()
                         .into_iter()
-                        .filter(|chunk| &chunk[4..8] != b"eXIf")
+                        .filter(|chunk| &chunk[4..8] == b"iCCP")
                         .collect();
-                    let raw = encode_png_rgba(&input, 4, 2).unwrap();
-                    legacy = splice_png_text_chunks(&raw, &chunks).unwrap();
+                    assert_eq!(icc.len(), 1);
+                    // Keep the independent PngEncoder output and legacy text
+                    // bytes above. Only prepend the fixture's RGB ICC chunk.
+                    legacy = splice_png_text_chunks(&legacy, &icc).unwrap();
                 }
                 SrcFormat::Webp => {
                     let (icc, mut exif, xmp) = extract_webp_metadata_chunks(&legacy).unwrap();
