@@ -5,7 +5,7 @@
 - ブランチ / worktree: `fisheye-917` / `G:\home\mimageviewer-fisheye917` (基点 master `f2e332bb8`)。
 - 役割: 設計・作業指示・検収 = ClaudeCode Opus 5.5、実装 = Codex GPT-6.1 Sol / high、
   独立レビュー = 実装者とは別の GPT-6.1 Sol / xhigh (AGENTS.md)。
-- 状態: 設計 (R0)。製品コードは未変更。
+- 状態: 設計 R1 (独立設計レビュー R1 の指摘を反映、§14)。製品コードは未変更。
 
 ## 0. 利用者の決定 (2026-11-27、設計担当のセッションで直接)
 
@@ -20,6 +20,10 @@
 
 設計担当が既定で決めたこと (利用者へ報告済み、異論なし): 対象は 1 ページ表示の静止画だけ、
 レンズの種類は環境設定 (既定 等距離)、ページを移ると終わる、3D 写真の深度を使った「本当に近寄る」見え方は入れない。
+
+**利用者への説明の訂正 (R1)**: 仕様案の段階で「今の Ctrl+Shift+ホイールは普通のズームなので挙動が変わる」と説明したが誤り。
+今の全画面の静止画では Ctrl+Shift+ホイールは**何もしない** (§2)。したがって魚眼を割り当てても既存の挙動は変わらない。
+統括経由で利用者へ訂正を伝える。
 
 ## 1. 範囲
 
@@ -38,13 +42,13 @@
 | --- | --- |
 | 見開き・縦横連結 | 2 枚以上のテクスチャを 1 つのレンズで描く必要がある。まず 1 ページで使い方を確かめる |
 | 動画・音声・アニメーション画像 | 動画は native presenter の別経路。アニメーションは毎フレームの mip 作り直しが要る |
-| タッチのピンチ・ゲームパッド | 今どおり普通のズーム。要望が出てから |
+| タッチ・ゲームパッドからの魚眼の操作 | 今どおり普通のズーム・パン (§4.3 の touch の配送)。要望が出てから |
 | 3D 写真の深度を使う透視 | 別機能の組み合わせになる。必要になれば別の段 |
-| 魚眼中の Ctrl+ホイール等のカーソル基準の補正 | §3.2 の「既知の挙動」。普通のズームの計算のまま |
+| 魚眼中の Ctrl+ホイール等の基準点の補正 | §3.2 の「既知の挙動」。普通のズームの計算のまま |
 
 ### 段 2 (傾け、§1.819)
 
-§9 にまとめる。段 1 の実装・実機確認の後に、残りの論点 (傾けられる範囲・裏面・回転の中心) を利用者に確かめてから着手する。
+§9 にまとめる。段 1 の実装・実機確認の後に、残りの論点 (傾けられる範囲・裏面・回転の中心・透視の画角) を利用者に確かめてから着手する。
 
 ## 2. 今の作り (コード確認、master `f2e332bb8`)
 
@@ -53,27 +57,40 @@
   `fs_zoom` / `fs_pan` は viewer context ごと (viewer_context_registry.rs の退避対象) で、ページを移ると
   `fs_zoom = 1.0`・`fs_pan = 0` に戻る (app.rs の画像切り替え時のリセット)。
 - 一表示一投影の持ち主 `FsExclusiveView { None, Panorama, Depth }` (src/fs_exclusive_view.rs) があり、
-  遷移は `App::set_fs_exclusive_view` (src/app/depth_view.rs) だけが行う。占有中かの集約は
-  `fs_exclusive_view_active(fs_idx) -> Option<ExclusiveViewKind>`。`FsExclusiveView` は viewer context の束の中にあり、
-  context の退避・切替に乗っている。
+  遷移は `App::set_fs_exclusive_view` (src/app/depth_view.rs:924) だけが行う。占有中かの集約は
+  `fs_exclusive_view_active(fs_idx) -> Option<ExclusiveViewKind>` (同 951)。`FsExclusiveView` は viewer context の束の中にある。
+  Depth はこの持ち主のほかに、fork 前 (viewer_context_registry.rs:4454)、独立窓の live pass 引き渡し
+  (depth_view.rs:893)、ParkedLive の snapshot 前 (app.rs:71523 付近) などに専用の終了処理を持つ。
 - 3D 写真 (src/depth_parallax_wgpu.rs) は egui_wgpu の callback で画面全体の三角形を描き、フラグメントの物理画素から
-  「2D と同じ四角形の局所座標 → 90 度回転 → トリム → UV」と逆にたどる ([3D の表示変換 §3.2](depth-view-transform-plan.md))。
-  元テクスチャは `DepthGpu::copy_color` で mipmap 付きの `Rgba8Unorm` へ GPU だけで写す。
-  書き出しは同じ WGSL を `DepthFrameRenderer` (src/depth_parallax_wgpu/export.rs) でオフスクリーンに描き、
-  透過の下地 (黒・白・市松) も shader で合成する ([3D 写真 §7.2](depth-parallax-plan.md))。
-- 360 度パノラマ (src/panorama.rs `PanoProjection` / `ProjectionMap`、src/panorama_wgpu.rs `projection_theta`) に、
-  立体射影・等距離・等立体角の「画面の半径 ↔ 入射角」の式が CPU / WGSL の 1:1 の対で既にある。
-- ホイール: 全画面の静止画では `modifiers.ctrl` だけを見てズームに振る (ui_fullscreen.rs `should_zoom_fullscreen_wheel`)。
-  したがって今の Ctrl+Shift+ホイールは Ctrl+ホイールと同じズーム。360 度は修飾に関係なくホイールを画角に使い、
+  「自由回転を戻した四角形の局所座標 `in_uv` → 90 度回転 → トリム → source UV」と逆にたどる
+  ([3D の表示変換 §3.2](depth-view-transform-plan.md))。画像の外の判定は **source UV ではなく `in_uv`** で行う (同 44・68 行)。
+  元テクスチャは `DepthGpu::copy_color` で mipmap 付きの `Rgba8Unorm` へ GPU だけで写す (egui のテクスチャは
+  `Rgba8Unorm`、vendor/egui-wgpu/src/renderer.rs:782)。renderer への登録が UI 処理の後になる場合は `TexturePending`
+  として 2D で描く (depth_view.rs:1470)。単ページ描画は Depth の採用を resampler の準備より前に決め、配置の確定は共通の境界を通す
+  (ui_fullscreen.rs:47013・47107)。書き出しは同じ WGSL を `DepthFrameRenderer` (src/depth_parallax_wgpu/export.rs) で
+  オフスクリーンに描き、描画時に記録した snapshot をページ・世代・resource ID で照合してから使う (src/app/depth_export.rs:575・741)。
+- 360 度パノラマ (src/panorama.rs `PanoProjection`) に、立体射影・等距離・等立体角の表がある。ただしパノラマの係数は
+  画角の定義が違い (立体射影 `k = tan(fov/4)` など、係数 2 を含まない。panorama.rs:168)、**係数はそのまま流用できない**。
+  流用するのは「方式ごとに `θ` の定義域外を明示的に拒否する」書き方 (panorama.rs:214 の `θ > π` の拒否など)。
+- ホイール: 共通の投影 (src/wheel_input.rs:70) が egui の `horizontal_scroll_modifier` (既定 Shift、
+  vendor/egui/src/input_state/mod.rs:118) を見て、**Shift 付きの縦の回転量を横へ移す**。全画面の静止画は縦の量だけを使うので
+  (ui_fullscreen.rs:42343)、**今の Ctrl+Shift+ホイールは何もしない**。Ctrl だけならズーム (`should_zoom_fullscreen_wheel`)。
+  隣り合う同じ修飾のイベントは 1 つの segment に合算される (wheel_input.rs:115)。360 度は修飾に関係なくホイールを画角に使い、
   Z の全画面ズーム・分析モード・編集モードは先にホイールを取る。
-- 修飾だけの押している間の操作: Shift = ルーペ (`FsLoupeHold`)、Alt = ナビゲータ (`FsNavigatorHold`)、
-  右 Ctrl = 元画像表示 (`FsOriginalPreviewHold`)。いずれも「その修飾だけ」が押されているときに働く (keymap.rs `matches_only`)。
-- 左ドラッグ: 修飾なし = パン、Ctrl (+ほかの修飾) = 自由回転 (ui_fullscreen.rs の通常モードのドラッグ)。
-  今の Shift+左ドラッグはパン (Shift でルーペも出る)、Ctrl+Shift+左ドラッグは回転。
+- ズームの 1 段: `apply_wheel_zoom` (ui_fullscreen.rs:16205) は回転量 `wheel_y` から連続の倍率を出す
+  (`WHEEL_ZOOM_POINTS_PER_NOTCH = 40` points で 1 ノッチ)。キーの段階ズーム (`FsZoomIn/Out`) は**表示中央基準** (同 15891)。
+- 修飾だけの押している間の操作 (Shift = ルーペ `FsLoupeHold`、Alt = ナビゲータ、右 Ctrl = 元画像表示) は、
+  **指定の修飾キーの物理状態だけを読み、ほかの修飾があっても成立する** (keymap.rs:10560・10743。`matches_only` は切り取り専用の helper)。
+  したがって Ctrl+Shift を押している間もルーペの押下は成立し、右 Ctrl+Shift なら元画像表示も成立する。
+- 左ドラッグ: 通常モードのドラッグは **毎フレームの `mods.ctrl`** でパン / 回転を切り替え、Ctrl 中はパンの起点を調整し直す
+  (ui_fullscreen.rs:42919・42936)。開始時に所有を固定する規則ではない。
+- タッチの `PageSide` のタップはマウスの「変換あり」判定を通らず直接ページを送る (ui_fullscreen.rs:42004)。
+- 表示トリムの編集 (`view_trim_mode`) は、占有モードの上部バーの処理で false にされる (ui_fullscreen.rs:30692)。
 - 保存の入口: Ctrl+S / リングの「キャプチャ保存」= `save_image_capture_to_file` → `prepare_capture_pixel_work` →
   worker で `capture::run_pixel_work` → `save_rgba_unique_with_matte`。Ctrl+E = `open_export_dialog` →
-  `ExportComposite::{Single, Spread}`。画像のコピー = `FsCopyImage` (既定キーなし、リング等)。範囲コピーは
-  `begin_capture_region_selection`。
+  `ExportComposite::{Single, Spread}` → 描いた後に `scale_export_pixels` で縮小 (export_dialog.rs:1215)。
+  画像のコピー (`FsCopyImage`) は共通の pending の排他を持たず、毎回 worker を作る (ui_fullscreen.rs:58394)。
+- VRAM の会計 (src/app/vram_accounting.rs:146) は `FsExclusiveView::Depth` だけを数えている。
 
 ## 3. 操作
 
@@ -83,18 +100,26 @@
 
 ```rust
 pub(crate) struct PlaneViewState {
-    /// 入ったときのページ。描く直前の照合 (§4.2) で今のページと違えば終わる。
-    anchor: PlaneViewAnchor,            // fs_idx と、その項目を同一と判定できる既存の identity
+    /// 入ったときの表示単位。fs_idx・項目の identity・fullscreen_page_slice (横長分割の左右半ページ) を含む。
+    anchor: PlaneViewAnchor,
     /// 0 < strength <= 1。0 にする操作はこの状態を None へ戻す (strength 0 の PlaneView は作らない)。
     strength: f32,
     /// レンズの中心。表示領域 (canvas) に対する 0..1 の位置。窓の大きさが変わっても同じ割合の位置に残る。
     lens_center: egui::Vec2,
     /// 段 2 で使う。段 1 では常に 0 (shader へは渡す)。
     tilt: PlaneTilt,                    // { yaw: f32, pitch: f32 }
-    /// mip 付きの色の写し (§5.2)。表示テクスチャの TextureId を鍵にする。
+    /// mip 付きの色の写し (§5.2)。
     color: PlaneColorPhase,
-    /// Shift+左ドラッグの開始点 (押した位置と、そのときの lens_center)。
-    lens_drag: Option<(egui::Pos2, egui::Vec2)>,
+    /// 直近に実際に描いた frame の不変 snapshot (§5.3)。保存・コピー・書き出しはこれだけを使う。
+    last_drawn: Option<Arc<PlaneFrameSnapshot>>,
+}
+
+enum PlaneColorPhase {
+    /// まだ写していない。描く frame は 2D (§5.2)。
+    Empty,
+    /// 2D の素材の TextureHandle はあるが renderer への登録がまだ。前の写しがあればそれで描く。
+    Pending { texture_id: egui::TextureId, previous: Option<Arc<PlaneGpuResources>> },
+    Ready(Arc<PlaneGpuResources>),      // 鍵 = 写し元の TextureId
 }
 ```
 
@@ -102,30 +127,41 @@ pub(crate) struct PlaneViewState {
   変換は持たない (3D 写真の [表示変換 §3.1](depth-view-transform-plan.md) と同じ判断)。ズームの持ち主は `FsZoomOwner::Image`。
 - `strength` と `tilt` が両方 0 になったら PlaneView を終える (段 1 では strength だけ)。「何も変形しない PlaneView」は作らない。
 - レンズの種類は `Settings` (§3.5) にあり、状態には持たない。
+- Shift+左ドラッグの所有は、既存のパン / 回転と同じ所有の型に 1 つの値として足す (§3.3)。`PlaneViewState` には持たない。
 
 ### 3.2 Ctrl+Shift+ホイール — 寄る / 離れる
 
-1 ノッチ (ホイールの 1 段。普通のズームと同じ単位) ごとに:
+**入力の取り方**: Ctrl+Shift の segment (`ctrl && shift && !alt`) だけは、共通の投影で横へ移される前の縦の回転量
+(`wheel_input` の正規化済みの値) を使う。共通の投影に「軸を移さない縦の量」を返す口を 1 つ足し、パネル・ポップアップ等の
+所有と消費の規則は今の segment のまま使う。チルト (物理的な横の回転) は使わない。予測と実適用は同じ量を使う。
 
-- **上 (寄る)**: PlaneView でなく入口条件 (§4.1) を通れば、`strength = 1/8`、`lens_center = カーソル位置`
-  (カーソルが表示領域の外なら中央) で入る。PlaneView 中なら `strength = min(1, strength + 1/8)`。
-  どちらも、倍率を Ctrl+ホイールと同じ 1 段上げる (`apply_wheel_zoom`、`fullscreen_wheel_zoom_step`)。
-  **ズームの基準点はカーソルではなくレンズの中心** にする。レンズの中心は歪みの不動点で、そこでの倍率は 2D の倍率と
-  同じ (§5.1) なので、2D の「基準点を固定するズーム」の計算がそのまま正しい。
-  strength が 1 になった後の上ノッチは倍率だけ上がる。
-- **下 (離れる)**: PlaneView 中なら `strength = max(0, strength - 1/8)` と倍率を 1 段下げる (基準点はレンズの中心)。
-  strength が 0 になったノッチで PlaneView を終える。PlaneView でないときの下ノッチは、今の Ctrl+Shift+ホイールと
-  同じ普通の縮小 (カーソル基準)。
-- 入口条件を満たさないとき (見開き・連結・動画・3D 写真中など) の上ノッチは、今どおり普通の拡大。理由の案内は既存の
-  `show_fullscreen_nav_noop` の流儀で出す (同じ理由の連続表示の扱いも既存に従う。新しい時間窓は作らない)。
-- 先にホイールを取る既存のモード (360 度・Z の全画面ズーム・分析・編集モード・パネル上・ポップアップ) では、
-  今と同じ扱いのまま (ここへは届かない)。
-- 判定は wheel segment の `modifiers` (`ctrl && shift && !alt`) で行う。同じ pass の予測 (`predict_fs_wheel_frame`) と
-  実適用 (`apply_fs_wheel_frame_proposal`) は同じ分類を使う (3D の §3.5 と同じ規則)。
+**量**: segment の縦の量 `wheel_y` を `notches = wheel_y / WHEEL_ZOOM_POINTS_PER_NOTCH` に換算する (合算された segment・
+タッチパッドの小さな量もそのまま比例で扱う。segment の数で数えない)。
 
-魚眼中のほかのズーム入力 (Ctrl+ホイール・`FsZoomIn/Out`・中ボタン・Ctrl+Space のスクラブ・ナビゲータは休止中) は
-strength を変えず、倍率だけを今の計算 (カーソル基準) で変える。**既知の挙動**: 歪みのため、カーソルの下の点が少しずれる
-(レンズの中心にカーソルがあればずれない)。段 1 では直さない。
+- **寄る (notches > 0)**: PlaneView でなく入口条件 (§4.1) を通れば、`lens_center = カーソル位置` (表示領域の外なら中央)、
+  `strength = 0` から始めて次の規則で増やし、PlaneView に入る。PlaneView 中も同じ規則:
+  `strength = min(1, strength + notches / 8)`。倍率は同じ `wheel_y` で `apply_wheel_zoom` を通して上げる
+  (`fullscreen_wheel_zoom_step` の設定どおり)。**ズームの基準点はカーソルではなくレンズの中心**。レンズの中心は歪みの不動点で、
+  そこでの倍率は 2D の倍率と同じ (§5.1) なので、2D の「基準点を固定するズーム」の計算がそのまま正しい。
+  strength が 1 になった後は倍率だけ上がる。
+- **離れる (notches < 0)**: PlaneView 中なら `strength = max(0, strength + notches / 8)`、倍率も同じ量だけ下げる
+  (基準点はレンズの中心)。strength が 0 になったら PlaneView を終え、その segment の残りの量は使わない。
+  PlaneView でないときは何もしない (今と同じ)。
+- 入口条件を満たさないときの寄る操作は何もしない (今と同じ)。理由は既存の `show_fullscreen_nav_noop` の流儀で出し、
+  同じ理由の続けての表示の扱いも既存に従う (新しい時間窓は作らない)。
+- 先にホイールを取る既存のモード (360 度・Z の全画面ズーム・分析・編集モード・パネル上・ポップアップ) は今のまま
+  (ここへは届かない)。
+
+**遷移を 1 つの純粋な関数にする (同じ pass の予測と実適用の一致)**: `plane_view_wheel_transition(input) -> PlaneViewWheelOutcome`
+を作る。入力は「今の PlaneView (無し / strength・中心・anchor)・今の表示単位・zoom・pan・カーソル・canvas・`notches`・入口条件の結果」、
+出力は「PlaneView の有無・strength・中心・zoom・pan」。今の予測 (`predict_fs_wheel_frame`) と実適用
+(`apply_fs_wheel_frame_proposal`) の両方がこれを呼び、クリックの分類 (変換の有無) もこの出力を含めて決める
+(予測の結果に PlaneView の有無を足す)。実適用のループが途中の segment でページを移した場合、次の segment を処理する前に
+anchor を照合し、違えば PlaneView を終えてから次を処理する (古い anchor のまま次のページで強さを足さない)。
+
+魚眼中のほかのズーム入力 (Ctrl+ホイール・中ボタン・Ctrl+Space のスクラブはカーソル基準、`FsZoomIn/Out` は表示中央基準。
+ナビゲータは休止中) は strength を変えず、倍率だけを今の計算で変える。**既知の挙動**: 基準点がレンズの中心でないときは、
+歪みのため基準点の下の絵が少しずれる。段 1 では直さない。
 
 ### 3.3 ドラッグ
 
@@ -136,28 +172,39 @@ strength を変えず、倍率だけを今の計算 (カーソル基準) で変�
 | Ctrl+左ドラッグ | 自由回転 (今どおり) | 今どおり |
 | Ctrl+Shift+左ドラッグ | 段 1: 今どおり (自由回転)。段 2 で傾けに変える | 段 1: 今どおり |
 
-- Shift+左ドラッグの判定は押した瞬間の修飾で決め、ドラッグの途中で Shift を離しても同じドラッグはレンズの移動のまま
-  (既存の「開始で所有を決める」規則と同じ)。修飾はフルスクリーンの stale な修飾を避けるため OS から読む既存の helper を使う。
+- **レンズの移動だけは、押した時点で所有を決める新しい規則**にする。押した時点で PlaneView 中かつ Shift あり・Ctrl なし
+  (OS から読む既存の修飾の helper) なら、そのドラッグはレンズの移動が所有し、離すまで途中の修飾の変化 (Shift を離す・
+  Ctrl を押す) でパン / 回転へ移らない。既存のパン / 回転の「毎フレームの修飾で切り替える」規則は変えない。
+- 所有の表し方: 既存のパンの起点 (`fs_pan_drag_start`) と回転の起点 (`fs_rotation_drag_start`) と同時に立たないよう、
+  レンズの移動の起点を同じ所有の型の 1 つの値として持つ (3 つの Option を並べない。実装担当は既存の 2 つの Option の扱いを
+  変えずに済む最小の形を選び、§11 に書く)。
+- 終わり: 離したとき、PlaneView が終わったとき、窓のフォーカスを失ったとき、modal が開いたとき、ページが変わったとき。
+  どれもレンズの位置はその時点のまま残す。
 - PlaneView 中はルーペを描かない (§4.3) ので、Shift を押してもルーペは出ない。
 
 ### 3.4 キー (`KeyAction`)
 
 - `FsFisheyeIn` (魚眼で寄る) / `FsFisheyeOut` (魚眼で離れる): `KeyContext::FsImage`、`KeyTrigger::Press`、
-  **既定キーなし** (利用者の判断)。1 回の押下が 1 ノッチと同じ。PlaneView でないときの `FsFisheyeIn` はレンズの中心を
-  表示領域の中央にして入る (キーにはカーソル位置の意味が無いため)。
+  **既定キーなし** (利用者の判断)。1 回の押下は 1 ノッチ (`notches = ±1`) と同じで、§3.2 の純粋な関数を通る。
+  PlaneView でないときの `FsFisheyeIn` はレンズの中心を表示領域の中央にして入る (キーにはカーソル位置の意味が無いため)。
 - keymap の決まりどおり `ini_name()` / `context()` / `trigger()` / `default_chords()` (EMPTY) / `ALL_ACTIONS` /
   説明文 / 呼び出し側 helper / `docs/keymap.ini.default` / `docs/keymap-spec.md` を揃える。リング・マウスボタンの
   候補には段 1 では出さない。
 - Ctrl+Shift+ホイールと Shift+左ドラッグは、今の Ctrl+ホイール・ドラッグと同じく **固定入力** (keymap の対象外)。
   `docs/keymap-spec.md` の固定入力の表に理由 (ポインター位置を使う連続操作) を書く。
+- **修飾だけの押している間の操作との重なり**: Ctrl+Shift を押している間もルーペの押下 (既定 Shift) は成立するが、
+  PlaneView 中はルーペを描かない。入る前の最初のノッチまでは今どおりルーペが出る (そのまま)。右 Ctrl+Shift の場合は
+  元画像表示 (既定 右 Ctrl) も成立する。**元画像表示中の PlaneView は、2D がその pass に選んだ素材 (元画像) をそのまま
+  レンズで描く** (素材の選び方を PlaneView 側で変えない)。保存は §6 のとおり「実際に描いた frame」なので、元画像表示中に
+  保存すれば元画像の魚眼になる。割り当てを変えた場合も、PlaneView は押下の解決に関与しない (同じ規則)。
 
 ### 3.5 設定
 
 - `Settings` に `plane_view_lens: PlaneLensKind` (`Equidistant` 既定 / `Stereographic` / `EquisolidAngle`) を足す。
   未リリースの項目なので serde の既定値で読め、移行は不要 (コミットメッセージに一言書く)。
-- 環境設定の画面: 全画面の表示の設定の近くに 1 行 (置き場所は実装担当が既存の構成を見て決め、実装記録に書く)。
+- 環境設定の画面: 全画面の表示の設定の近くに 1 行 (置き場所は実装担当が既存の構成を見て決め、§11 に書く)。
   変えたら次の描画から効く (状態は持たないので作り直しは要らない)。
-- 段 1 では strength の刻み (1/8)、最大の強さ (§5.1 の `h_min`)、基準の画角 (§5.1 の `α0`) は定数。実機で見て詰める。
+- 段 1 では strength の刻み (1 ノッチ 1/8)、最大の強さ (§5.1 の `h_min`) は定数。実機で見て詰める。
 
 ### 3.6 終わり方
 
@@ -166,11 +213,18 @@ strength を変えず、倍率だけを今の計算 (カーソル基準) で変�
 | Ctrl+Shift+ホイール下 / `FsFisheyeOut` で strength 0 | 終わる |
 | 変換中のダブルクリック (`FsCanvasClickAction::ResetTransform`) | 倍率・パン・回転と一緒に終わる |
 | フィット方式の切替・リセット (`reset_fullscreen_fit_transform`) | 終わる |
-| ページ移動 (どの入口でも) | 描く直前の照合 (§4.2) で終わる。各移動の関数に終了処理を足さない |
+| ページ移動・同じ項目の左右半ページ (slice) の移動 (どの入口でも) | 描く直前の照合 (§4.2) と、ホイールの実適用ループ内の照合 (§3.2) で終わる。各移動の関数に終了処理を足さない |
 | 360 度 (V)・3D 写真 (D) に入る | `set_fs_exclusive_view` が PlaneView を捨てて切り替える |
-| F11 (MainWindow ⇔ Fullscreen)、F12 (別ウィンドウの ON/OFF)、session の独立性の実切替 | 3D 写真と同じ共通の確定点で終わる。通知はしない (強さはホイールですぐ戻せる) |
-| 別ウィンドウの中の F11、窓の大きさ・DPI の変更 | 続ける。`lens_center` は割合なので同じ位置に残る |
+| **Depth を終える detached / session の全経路** | 同じ helper で PlaneView も終える (下の注)。通知はしない (強さはホイールですぐ戻せる) |
+| 別ウィンドウの中の F11、窓の大きさ・DPI の変更、一時的な context の mount (scoped mount) | 続ける。`lens_center` は割合なので同じ位置に残る |
 | 閲覧の終了 (Esc・一覧へ戻る) | 既存の閲覧終了で終わる |
+
+注: Depth を終える経路は、F11 (MainWindow ⇔ Fullscreen)・F12 (別ウィンドウの ON/OFF)・session の独立性の実切替の共通確定点、
+fork 前 (viewer_context_registry.rs:4454)、独立窓への live pass の引き渡し (`retire_main_depth_for_independent_activation`)、
+ParkedLive の snapshot 前、pause・park・terminal close。実装担当は Depth の終了処理の全出現を列挙し (§11)、
+「Depth 専用の理由で終える経路」(モデル確認・書き出しの modal 等) と「表示の持ち主が変わるので終える経路」を分け、後者を
+`FsExclusiveView` の占有の値 (Depth と PlaneView) に共通の helper `retire_exclusive_view_for_owner_change` へまとめる。
+scoped mount で保持する経路は、Depth が保持しているものと同じにする。
 
 ## 4. ほかの機能との関係 (状態の組み合わせを減らす)
 
@@ -179,19 +233,22 @@ strength を変えず、倍率だけを今の計算 (カーソル基準) で変�
 `plane_view_entry_allowed(fs_idx) -> Result<(), PlaneViewEntryBlock>` を 1 つ作り、ホイール・キーが同じ答えを使う。
 弾く条件: 画像の閲覧中でない、動画・音声・音楽表示、アニメーション画像、見開きの 2 ページ表示、連結読み、
 wgpu の描画状態が無い、編集系のモード (消しゴム・隠蔽加工・補正レイヤー・テキスト注釈・切り取り・SNS 分割)、
-補正パネル、分析、比較 (Wipe・差分・ピン表示)、Z の全画面ズーム (照準・確定)、紙めくりの最中、
-3D 写真・360 度が有効。
+**表示トリムの編集 (`view_trim_mode`)** (適用済みのトリムは弾かない)、補正パネル、分析、比較 (Wipe・差分・ピン表示)、
+Z の全画面ズーム (照準・確定)、紙めくりの最中、3D 写真・360 度が有効。
 
 - **入るときにほかのモードを閉じない** (ホイールの 1 ノッチで別のモードが閉じるのは驚きが大きい)。弾いて理由を出す。
   3D 写真の入口が補正パネル等を閉じるのとは違う判断 (あちらはキー / ボタンでの明示の入場)。
-- 3D 写真と違い、ほかの context が PlaneView を持っていても弾かない (GPU の資源を context ごとに callback が持つため。§5.3)。
+- PlaneView 中は、上部バーの占有モードの処理が `view_trim_mode` を false にする既存の分岐 (ui_fullscreen.rs:30692) に
+  PlaneView を含めず、代わりに表示トリムの編集の入口を PlaneView 中は弾く (「入る時に閉じない」と揃える)。
+- 3D 写真と違い、ほかの context が PlaneView を持っていても弾かない (GPU の資源を context ごとに持つため。§5.3)。
 
 ### 4.2 続けてよいかの照合
 
 3D 写真の `depth_view_may_continue` と同じ形の `plane_view_may_continue(fs_idx)` を作り、**同じ 2 か所**
-(viewer の pass の先頭、描画分岐の直前) から呼ぶ。入口条件のうちページと表示の状態に関わるもの
-(静止画・1 ページ・連結でない・編集系でない・anchor が今のページ) を満たさなければ `set_fs_exclusive_view(None)` で終わる。
-通知はページ移動では出さず、それ以外 (同じページで見開きに切り替わった等) は 1 回出す。
+(viewer の pass の先頭、描画分岐の直前) から呼ぶ。加えて §3.2 の実適用ループの segment 間でも anchor を照合する。
+入口条件のうちページと表示の状態に関わるもの (静止画・1 ページ・連結でない・編集系でない・anchor が今の表示単位) を
+満たさなければ `set_fs_exclusive_view(None)` で終わる。通知はページ・slice の移動では出さず、それ以外
+(同じページで見開きに切り替わった等) は 1 回出す。
 
 ### 4.3 占有中の扱い
 
@@ -203,26 +260,31 @@ wgpu の描画状態が無い、編集系のモード (消しゴム・隠蔽加�
 | 相手 | PlaneView 中 |
 | --- | --- |
 | ズーム・パン・自由回転・ページ内スクロール | 2D と共用 (`FsZoomOwner::Image`) |
-| 修飾なしのクリック・タップ | 変換ありとして扱う (ページを送らない、画像の外のクリックで閉じない)。ダブルクリックでリセット (§3.6) |
+| 修飾なしのマウスのクリック | 変換ありとして扱う (ページを送らない、画像の外のクリックで閉じない)。ダブルクリックでリセット (§3.6) |
+| タッチ | `PageSide` のタップによるページ送りは止める (マウスと同じ「変換あり」)。ピンチ・2 本指のパン・上下のバーなど chrome の操作は今どおり (ピンチは倍率だけを変え strength は変えない)。入る前から続いている接触は、その接触が終わるまで今の配送のまま (接触の途中で配送を切り替えない) |
 | ルーペ・ピクセルグリッド・ナビゲータ (固定表示・Alt 押下) | 描かない (カーソル ↔ 画素の対応が変わるため)。トグルの状態は変えず、抜ければ戻る |
 | 紙めくり | 対象外 (`page_turn_view_eligible` を占有の述語で判定。3D と同じ)。ページ移動は紙めくり無しで切り替わり、§4.2 で終わる |
 | スライドショー | 止めない。次のページで §4.2 により終わる |
 | 範囲コピー | 弾く (理由: 魚眼中は使えない) |
 | Ctrl+S・画像のコピー・Ctrl+E | 見えているとおりの絵 (§6) |
 | フィットの循環 (`0`)・上部のメニュー | 受け付ける。フィットが変わったら終わる (§3.6) |
+| 表示トリムの編集 | 入口で弾く (§4.1) |
 | 透過の背景 (Shift+B) | 受け付ける。shader の下地に反映 (§5.1) |
-| 補正・AI 拡大・ポストフィルタの効果 | 最終の表示テクスチャをそのまま使うので効く。テクスチャが変われば mip を作り直す |
+| 元画像の押している間の表示 | 2D が選んだ素材をそのまま描く (§3.4) |
+| 補正・AI 拡大・ポストフィルタの効果 | 最終の表示テクスチャをそのまま使うので効く。テクスチャが変われば mip を作り直す (§5.2) |
 | 拡大方式 (シャープ / アニメ塗り / ドット絵 / Lanczos 縮小) | 効かない。PlaneView は `FullscreenPaintResource` の resampler を通らず、元の `TextureHandle` から mip を作る |
-| PDF の再ラスタ | レンズの中心の倍率 = 2D の倍率なので、今の需要のまま |
+| PDF の再ラスタ | レンズの中心の倍率 = 2D の倍率なので、今の需要のまま。再ラスタで素材が変われば §5.2 の規則で写し直す |
 | 左右のパネル (メタデータ等) | 今どおり |
 | mIV Remote・MCP・操作のスクリプト | 端末ローカルの見た目だけで、共有する状態を変えないので対象外 |
 
 ### 4.4 別ウィンドウ (detached) — リワーク中の規則との関係
 
 - 状態は既存の `FsExclusiveView` の中に置くので、**viewer context の退避項目を足さない**。detached の述語・viewport の経路・
-  入力の配送は変えない。終了の確定点 (§3.6 の F11 / F12) は 3D 写真が既に使っている共通の確定点に PlaneView を加えるだけ。
-- これは症状パッチではなく、新しい表示状態を既存の持ち主に置く構造上の追加である、という主張について、
-  CLAUDE.md の規則どおり独立設計レビューで合意を取り、合意の結果を [detached-rework-plan.md](detached-rework-plan.md) に記録する。
+  入力の配送は変えない。終了は §3.6 の注のとおり、Depth が既に持つ終了経路を「表示の持ち主の交代」の共通 helper にまとめ、
+  PlaneView もそれを通す。変更範囲は「新しい値を既存の持ち主に置き、既存の終了経路をその値にも効かせる」ことに限る。
+- 独立設計レビュー R1 は「既存 owner 内への追加であり、時間窓や症状 guard を足す設計ではない」として、構造上の追加という分類に
+  **合意** した (§14)。ClaudeCode も同じ判断。CLAUDE.md の規則どおり、実装レビューでも合意を確かめ、結果を
+  [detached-rework-plan.md](detached-rework-plan.md) に記録する。
 
 ## 5. 描画
 
@@ -231,92 +293,120 @@ wgpu の描画状態が無い、編集系のモード (消しゴム・隠蔽加�
 記号 (すべて物理画素):
 
 - `canvas`: その pass の画像の表示領域 (2D の `full_rect`)。`R = 0.5 × min(canvas の幅, 高さ)`。
-- `c = canvas.min + lens_center × canvas.size`。画面の点 `p` について `u = (p − c) / R`、`r = |u|`、`û = u / r`。
-- レンズの式 `g` と逆関数 (パノラマと同じ表): 等距離 `g(θ) = θ`、立体射影 `g(θ) = 2·tan(θ/2)`、
-  等立体角 `g(θ) = 2·sin(θ/2)`。いずれも `g'(0) = 1`。
-- 画角: `r = 1` に写る入射角 `α(s) = α0 + s × (α_max − α0)`、`k = g(α(s))`。
-  `α0 = 30°`、`α_max` は「地平線 (θ = 90°) の円の半径が `h_min = 0.8`」になる値 (`g(α_max) = g(90°) / 0.8`。
-  等距離で 112.5°)。等立体角で `g(α_max) > 2` になり逆関数の定義域を超える場合は、`α_max` を定義域の内側
-  (`g(α_max) ≤ 2`) へ制限する (実装担当が定数で確定し、テストで固定する)。
+- `c = canvas.min + lens_center × canvas.size`。画面の点 `p` について `u = (p − c) / R`、`r = |u|`。
+- レンズの式 `g` (いずれも `g(0) = 0`、`g'(0) = 1`。**パノラマの係数とは別**、§2):
+  等距離 `g(θ) = θ`、立体射影 `g(θ) = 2·tan(θ/2)`、等立体角 `g(θ) = 2·sin(θ/2)`。
+- 画角: `r = 1` に写る入射角 `α(s) = s × α_max`、`k = g(α(s))`。`α_max` は「地平線 (θ = 90°) の円の半径が
+  `h_min = 0.8`」になる値、すなわち `g(α_max) = g(90°) / 0.8`: 等距離 **112.5°**、立体射影 **102.6804°**、
+  等立体角 **124.2289°** (どれも定義域の内側)。定数として持ち、テストで固定する。
+  (R0 の `α0 = 30°` の下限は削除した。`s → 0` で恒等にならず、入った瞬間に段差が出るため。§14 の P1-2)
 
-1 画素の計算:
+1 画素の計算 (無効な画素も**有限な代用値**を通してから微分する):
 
-1. 入射角 `θ = g⁻¹(k · r)`。定義域の外 (`k·r` が等立体角の 2 を超える等) は画像なし。
-2. カメラの向き (z が前、画面の y は下向きのまま): `d = (sin θ · û, cos θ)`。
-3. 板: カメラから距離 1 の点 `P0 = (0, 0, 1)` を通り、法線 `n = Rot(tilt) · (0, 0, −1)` の平面。
-   交点 `t = (n · P0) / (n · d)`。`n · d ≥ 0` 側 (板の裏・地平線の外) と `t ≤ 0` は画像なし。
-4. 板の局所座標 `L = Rot(tilt)⁻¹ · (t·d − P0)` の xy。傾き 0 なら `L = tan θ · û`。
-5. **2D の画面の点** `q = c + (R / k) · L`。これを今の 2D の逆写像 (3D 写真と同じ「四角形の局所座標 → 90 度回転 →
-   トリム → UV」) にかけて色を引く。
-6. 透過部分には下地 (黒・白・市松。画像の左上を原点とする市松の升目は 3D 写真と同じ規則) を shader で合成する。
-   画像なし (1・3) と UV が [0,1]² の外は透明 (premultiplied で 0) にし、egui が描いている背景がそのまま見える。
+1. 入射角 `θ = g⁻¹(k · r)`。定義域: 等距離・立体射影は `θ ∈ [0, π)`、等立体角は `k·r ≤ 2` (`θ ≤ π`)。
+   外なら無効の印を立て、代用値 `θ = 0` で続ける。
+2. 方向の横成分 `σ = sin θ / r` (中心 `r < ε` では解析的な極限 `σ = k`。`θ ≈ k·r` のため)。
+   カメラの向き (z が前、画面の y は下向きのまま): `d = (σ · u, cos θ)`。
+3. 板: カメラから距離 1 の点 `P0 = (0, 0, 1)` を通り、法線 `n = Rot(tilt) · (0, 0, 1)` の平面。
+   `den = n · d`。`den ≤ ε` (板と平行・裏側・地平線の外) なら無効の印を立て、代用値 `den = ε` で続ける。
+   交点 `t = (n · P0) / den`。`t ≤ 0` も無効 (代用値で続ける)。
+4. 板の局所座標 `L = (Rot(tilt)⁻¹ · (t·d − P0)).xy`。傾き 0 なら `L = tan θ · u / r` (中心では 0)。
+5. **2D の画面の点** `q = c + (R / k) · L`。
+6. `q` を 2D の逆写像にかける: 自由回転を戻した **paint 四角形の局所座標 `in_uv`** → 90 度回転 → トリム → source UV
+   (3D 写真と同じ式)。
+7. 色は `textureSampleGrad(source_uv, dpdx(source_uv), dpdy(source_uv))`。微分は 1〜6 の非線形写像の結果に対して、
+   一様な制御フローで (分岐や早い return の前に) 取る。
+8. 最後に有効性の印を適用する: 1・3 の無効、または `in_uv ∉ [0,1]²` (**表示トリムの外を含む。source UV の範囲では判定しない**)
+   なら透明 (premultiplied で 0)。透過部分には下地 (黒・白・市松。画像の左上を原点とする升目は 3D 写真と同じ規則) を合成する。
+   透明の画素は egui が描いている背景がそのまま見える。
 
 性質 (テストで固定する):
 
 - 傾き 0 では `q = c + (p − c) · W(r)`、`W(r) = tan θ(r) / (k · r)`、`W(0) = 1`、`W` は単調増加。
   レンズの中心の倍率は 2D の倍率と同じで、周りほど広い範囲が押し込まれて見える。
-- `s → 0` で `W → 1` に近づく (段 1 では strength 0 の PlaneView は無いので、恒等は「PlaneView を抜けると 2D」で保つ)。
+- `s → 0` で `k → 0`、`W → 1` (一様に)。入った直後の 1 ノッチ目は小さな歪みから始まり、段差は出ない。
 - 平らな板なので、カメラが寄ることと 2D の拡大は同じになる。寄るほど歪むのは、対象が画面の歪む部分に広がるため。
   §3.2 で倍率と強さを一緒に上げるのはこのため。
-- 90 度回転・自由回転・トリム・フィットは 5 の 2D の逆写像の中にあるので、そのまま効く。
+- 90 度回転・自由回転・トリム・横長分割・フィットは 6 の 2D の逆写像の中にあるので、そのまま効く。
 
 ### 5.2 shader と色の写し
 
 - egui_wgpu の `CallbackTrait` で、callback の矩形は **canvas と painter の clip の交わり** (レンズの中心が画像の外にある場合や
   傾けた場合は、画像が 2D の四角形の外に出るため)。頂点は画面全体の三角形 (3D 写真と同じ)。
-- フラグメント: `@builtin(position)` から 5.1 の 1〜5 → `textureSampleGrad`。微分 (`dpdx` / `dpdy`) は一様な制御フローで
-  先頭に取り、画像なし・範囲外は最後に `select` で差し替える (WGSL の制約。3D の §3.2 と同じ)。
-- 色: 表示テクスチャ (2D が選んだ素材の元の `TextureHandle`) を `DepthGpu::copy_color` と同じ方法で mip 付きの
-  `Rgba8Unorm` へ写す (縮む周辺のちらつきを防ぐ)。写す処理は 3D 写真と共用の関数に括り出す (WGSL・blit を 2 つ持たない)。
-  写すのは PlaneView に入ったときと、表示テクスチャの `TextureId` が変わったときだけ。形式が `Rgba8Unorm` でない等で
-  写せないときは PlaneView に入らず理由を出す (継続中に起きたら終わって通知。silent fallback にしない)。
+- 画面の点の取り方: uniform の「出力の画素 → canvas の物理画素」の写像 (倍率と原点) で `@builtin(position)` を canvas の座標へ
+  移してから 5.1 を計算する。画面では恒等 (原点 0、倍率 1)、書き出し (§6) では出力の寸法から決める。
+- 色: 2D がその pass に選んだ素材の元の `TextureHandle` を、`DepthGpu::copy_color` と同じ方法で mip 付きの `Rgba8Unorm` へ写す。
+  写す処理 (blit・mip 生成) は 3D 写真と共用の関数に括り出す (WGSL・blit を 2 つ持たない)。
+- **素材の採用 (通常の準備待ちとして扱う。まれな失敗ではない)**:
+  - PlaneView の採用は、単ページ描画の中で resampler の準備より前に決め (3D 写真の採用と同じ位置)、パン・初期配置の確定は
+    共通の境界 (`commit_fs_single_page_placement`) を通す。PlaneView 中も 2D の素材選択 (final / provisional / 元画像の
+    押している間 / RAW の現像前後 / PDF の再ラスタ前後) は変えない。
+  - 選ばれた素材の `TextureId` が `Ready` の鍵と同じなら、その写しで描く。違えば写し直す。renderer への登録がまだ
+    (`TexturePending` と同じ状況) なら `Pending` にし、前の写し (`previous`) があればそれで描く。無ければ (入った最初の frame 等)
+    その frame は 2D で描く。素材が `NativeOnly` 等で元の `TextureHandle` が無い場合も 2D で描き、PlaneView は続ける。
+  - 写しを作れない (形式が `Rgba8Unorm` でない等) ときは PlaneView を終えて理由を通知する (silent fallback にしない)。
 - sampler は linear + mipmap linear。異方性フィルタは使える環境なら 16 (実装担当が wgpu の features を確かめ、無ければ無し)。
-- 2D と同じ下地・背景・clip の規則を使い、2D の `paint_image_underlay` は PlaneView 中は描かない (shader が描く)。
-- WGSL は 1 つ。画面用と書き出し用 (§6) で同じ文字列を使う。レンズの式はパノラマの `projection_theta` と同じ表に揃え、
-  CPU 版 (テスト・§6 の検証用) と 1:1 にする。naga で parse / validate するテストを置く (panorama_wgpu の先例)。
+- 2D の `paint_image_underlay` は PlaneView で描いた frame では描かない (shader が描く)。2D で描いた frame は今どおり。
+- WGSL は 1 つ。画面用と書き出し用 (§6) で同じ文字列を使う。CPU 版 (テスト・§6 の検証用) と 1:1 にし、naga で parse / validate
+  するテストを置く (panorama_wgpu の先例)。
 
 ### 5.3 資源の持ち主と寿命
 
-- mip の写し・uniform buffer・bind group は `Arc<PlaneGpuResources>` にまとめ、**PlaneViewState が持ち、callback も Arc で持つ**。
-  egui_wgpu の `CallbackResources` に context 共通の slot を置かない (3D 写真の slot は 1 context 前提のため。PlaneView は
-  複数の窓で同時に使える)。uniform は callback の `prepare` で自分の buffer に書く。
-- 解放: PlaneView を抜けたとき (`set_fs_exclusive_view` で state が drop)、テクスチャが変わって写し直したとき。
-  callback が持つ Arc は描画の終わりで落ちる (Lanczos の出力の寿命と同じ考え方。§2.4.1)。
-- メモリ: 表示テクスチャの約 1.33 倍 (6000×4000 で約 128 MB)。PlaneView 1 つにつき 1 枚。
+- **共有するもの**: 不変の pipeline・blit / mip の copier (renderer ごとに 1 つ、`CallbackResources` に置いてよい)。
+- **context ごとのもの**: mip の写し・bind group は `Arc<PlaneGpuResources>` にまとめ、`PlaneColorPhase` が持つ。
+  egui_wgpu の `CallbackResources` に context 共通の slot を置かない (3D 写真の slot は 1 context 前提。PlaneView は複数の窓で
+  同時に使え、同じ renderer を共有する viewport が並ぶ)。
+- **uniform は callback ごと**: 画面の callback は自分の uniform buffer を持ち (`Arc` で callback が保持)、`prepare` でそれに書く。
+  書き出しは別の uniform を持つ (§6)。画面と書き出しで uniform を共有しない。
+- **frame snapshot**: 描画で PlaneView を採用した frame で、`PlaneFrameSnapshot` (context・anchor の表示単位・素材の `TextureId`・
+  `Arc<PlaneGpuResources>`・canvas の物理矩形と `pixels_per_point`・5.1 の全 uniform の値・下地と背景の色) を不変の `Arc` として
+  確定し、callback と `PlaneViewState::last_drawn` が同じものを持つ。
+- 解放: PlaneView を抜けたとき (`set_fs_exclusive_view` で state が drop)、写し直したとき (前の写しは、それを持つ callback・
+  snapshot・保存の要求が落ちた時点で解放)。callback が持つ Arc は描画の終わりで落ちる (Lanczos の出力の寿命と同じ考え方。
+  [表示パイプライン §2.4.1](display-pipeline.md))。
+- **VRAM の会計**: `vram_accounting` に PlaneView の写しを足す。数えるのは実際の確保の寿命 (同じ `Arc` を複数の持ち主が持つときは
+  重ねて数えない)。保存・コピー・書き出しの要求が持つ写しも、状態が終わった後に残る間は数える。
+- メモリ: 写し 1 枚は表示テクスチャの約 1.33 倍 (6000×4000 で約 128 MB)。PlaneView 1 つにつき通常 1 枚、写し直しの間と
+  保存の要求が残る間は一時的に 2 枚。
 
 ### 5.4 負荷
 
 - 1 画素あたり、三角関数数回 + `textureSampleGrad` 1 回。4K の画面 (約 830 万画素) でも 3D 写真 (1 画素約 45 サンプル) よりずっと軽い。
   描き直しは操作中だけ (今の 2D と同じ再描画の規則)。
-- 写しは GPU だけで、読み戻しなし。UI スレッドで待たない。`perf::event` を写しと書き出しの描画・読み戻しに入れる
-  ([ui-responsiveness.md](ui-responsiveness.md) §4 のチェックリストを通す)。数値は実装後に測って §11 に書く。
+- 写しは GPU だけで、読み戻しなし。UI スレッドで待たない。ただし CPU 側の確保・encode・submit の時間があるので、
+  `perf::event` を **写し (CPU 側の時間も含む)**・書き出しの描画・読み戻しに入れる ([ui-responsiveness.md](ui-responsiveness.md) §4
+  のチェックリストを通す)。数値は実装後に測って §11 に書く。
 
 ## 6. 書き出し・キャプチャ・コピー (見えているとおりの絵)
 
 PlaneView 中だけ、3 つの出口の **元の素材を「見えているとおりの絵」に替える**。PlaneView でないときは今と同じ。
 
-### 6.1 凍結した要求
+### 6.1 何を出すか — 実際に描いた frame
 
-入口で `PlaneFrameRequest` を作り、worker はこれだけを見る:
-mip の写しの `Arc`、uniform の値 (§5.1 の `c`・`R`・`k`・レンズの種類・傾き・2D の逆写像の値)、出力の寸法、
-下地の種類と市松の升目 (出力の寸法の比で拡大縮小)、画像の外の色 (画面で画像の外に見えている背景の色)。
-
-- 出力の範囲は **canvas そのもの** (上下のバー・パネル・HUD は入れない)。縦横比は canvas と同じ。
-- 画像の外と透過部分は不透明に合成する (3D 写真の書き出しと同じ。JPEG・PNG で挙動を分けない)。
+- 保存の操作は次の描画より前に処理されるので、要求は **`PlaneViewState::last_drawn` (直近に実際に描いた frame snapshot)** から作る。
+  snapshot の context・表示単位 (anchor)・素材の `TextureId` が今の PlaneView と一致しないとき、または snapshot が無いとき
+  (入った直後で 2D で描いた frame しかない等) は、保存せず「魚眼の表示の準備中です」と通知する (3D 写真の照合と同じ考え方)。
+- `PlaneFrameRequest` = snapshot の `Arc` + 出力の寸法 + 出力の画素から canvas の物理座標への写像。worker はこれだけを見る。
+- 出力の範囲は **canvas そのもの** (上下のバー・パネル・HUD は入れない)。canvas の原点が 0 でない場合 (MainWindow の一覧の中の閲覧など)
+  も、写像で canvas の左上を出力の原点に合わせる。縦横比は canvas と同じ。
+- 画像の外と透過部分は不透明に合成する (3D 写真の書き出しと同じ。JPEG・PNG で挙動を分けない)。画像の外の色は snapshot の背景の色、
+  透過部分の市松の升目は出力の寸法の比で拡大縮小する。
 
 ### 6.2 描画
 
-- 3D 写真の `DepthFrameRenderer` と同じ型の `PlaneFrameRenderer`: 同じ WGSL、書き出し専用の pipeline・uniform・bind group、
-  オフスクリーンの `Rgba8Unorm` に描いて読み戻す。worker が encode → submit → `poll(Wait)` する (UI スレッドは待たない)。
-- 寸法が device の上限を超える場合は、上限に収まるよう縮めた寸法で描く (縦横比は保つ)。
+- 3D 写真の `DepthFrameRenderer` と同じ型の `PlaneFrameRenderer`: 同じ WGSL、書き出し専用の uniform・bind group (pipeline は共有の
+  不変のものでよい)、オフスクリーンの `Rgba8Unorm` に描いて読み戻す。worker が encode → submit → `poll(Wait)` する (UI スレッドは待たない)。
+- **寸法の resolver を 1 つにする**: `resolve_plane_output_size(canvas_px, choice, device_limits) -> [u32; 2]`。
+  device の texture の最大寸法と、行の詰め物 (256 バイト境界) を含む読み戻しの buffer の上限の両方に収まるよう、縦横比を保って縮める。
+  3 つの出口とダイアログの表示はこの結果だけを使う。
 
 ### 6.3 3 つの出口
 
 | 出口 | PlaneView 中の動作 |
 | --- | --- |
-| Ctrl+S / リングの「キャプチャ保存」 | `CapturePixelWork` に PlaneView の要求の値を足し、worker で描いて読み戻した RGBA を今の `save_rgba_unique_with_matte` へ渡す。寸法 = canvas の物理画素 (画面と同じ)。保存先・形式・名前の規則は今どおり (名前に `_fisheye` を付ける) |
-| 画像のコピー (`FsCopyImage` とその入口) | 同じ要求で描いた RGBA を今のクリップボードの経路へ渡す。寸法は画面と同じ |
-| Ctrl+E (書き出しダイアログ) | `ExportComposite` に `PlaneView(PlaneFrameRequest)` を足す。基準の寸法 (ダイアログの「元の大きさ」) は **canvas の物理画素の 2 倍** (長辺 8192 まで)。既存の倍率 (1/2 = 画面と同じ、1/4、長辺指定) はそのまま使え、縮小は描く寸法を変えて行う (描いてから縮めない)。隠蔽プリセットの出力 (`_1`〜`_4`) は出さない。メタデータの埋め込みは元画像の EXIF を引き継がない (見た目の作り直しのため)。ダイアログの表示は「魚眼の見た目」と分かる文言にする |
+| Ctrl+S / リングの「キャプチャ保存」 | `CapturePixelWork` に PlaneView の要求を足し、worker で描いて読み戻した RGBA を今の `save_rgba_unique_with_matte` へ渡す。寸法 = canvas の物理画素 (resolver を通す)。保存先・形式・既存の `capture_pending` の排他は今どおり。名前に `_fisheye` を付ける |
+| 画像のコピー (`FsCopyImage` とその入口) | 同じ要求で描いた RGBA を今のクリップボードの経路へ渡す。寸法は canvas の物理画素。今のコピーの経路 (毎回 worker、共通の pending の排他なし) は変えない。要求は snapshot の `Arc` を持つだけで写しを複製しない |
+| Ctrl+E (書き出しダイアログ) | `ExportComposite` に `PlaneView(PlaneFrameRequest)` を足す。基準 (ダイアログの「元の大きさ」) = canvas の物理画素の 2 倍。既存の倍率 (1/2・1/4・長辺指定) を選べ、**実際の出力の寸法 (resolver の結果) をダイアログに表示する** (上限で縮められた場合、1/2 が画面と同じとは限らないため)。PlaneView はその最終寸法へ直接描き、**既存の `scale_export_pixels` の縮小段を通さない** (二重の縮小を避ける)。隠蔽プリセットの出力 (`_1`〜`_4`) は出さない。メタデータの埋め込みは元画像の EXIF を引き継がない (見た目の作り直しのため)。ダイアログの表示は「魚眼の見た目」と分かる文言にする |
 
 - 範囲コピーは §4.3 のとおり弾く。
 - 書き出しダイアログ・保存中の扱い (モーダル・既存の pending の排他) は今の各出口のまま。
@@ -328,49 +418,65 @@ mip の写しの `Arc`、uniform の値 (§5.1 の `c`・`R`・`k`・レンズ�
 | --- | --- |
 | 魚眼専用の倍率・パンを持つか | 持たない。2D の状態を共用する (3D 写真と同じ)。持つと全ズーム入力に書き先が 2 つになる |
 | 入るときにほかのモードを閉じるか | 閉じずに弾く (§4.1)。ホイール 1 ノッチの副作用を小さくする |
-| ページを移っても続けるか | 続けない。倍率と同じ寿命にし、終わりの照合は描く直前の 1 関数 (§4.2) に集める |
-| F11 / F12 で引き継ぐか | 引き継がない。3D 写真と同じ確定点で終える |
+| ページを移っても続けるか | 続けない。倍率と同じ寿命にし、終わりの照合は描く直前の 1 関数とホイールの segment 間 (§3.2・§4.2) に集める |
+| F11 / F12・fork・park で引き継ぐか | 引き継がない。Depth と同じ経路で終える。経路は共通の helper にまとめる (§3.6) |
 | 見開き・連結・アニメーション | 段 1 は弾く (組み合わせを増やさない) |
-| GPU 資源を context 共通の slot に置くか | 置かない。Arc を状態と callback が持ち、context 間の取り違えを型で無くす |
-| 書き出しの寸法の選択肢 | 既存のダイアログの倍率をそのまま使い、PlaneView の基準だけ決める |
+| ホイールの遷移を予測と実適用で別々に書くか | 書かない。1 つの純粋な関数を両方が呼ぶ (§3.2) |
+| GPU 資源を context 共通の slot に置くか | 置かない。Arc を状態・snapshot・callback が持ち、context 間の取り違えを型で無くす |
+| 保存は今の状態から作るか、描いた frame から作るか | 描いた frame の snapshot から作る。保存の時点で状態から組み立て直すと、次の描画との食い違いが出る |
+| 書き出しの寸法の選択肢 | 既存のダイアログの倍率をそのまま使い、PlaneView の基準と resolver だけ足す |
 | strength 0 の PlaneView | 作らない (「何もしていないのに占有中」を無くす) |
+| レンズの移動のドラッグ | 押した時点で所有を固定する。途中の修飾で切り替える組み合わせを作らない |
 
 ## 8. まれな失敗
 
 既定の割り切り (ログ + 通知)。写しの失敗は入らない / 終わる + 通知、書き出しの失敗はエラー通知。再試行はしない。
+通常の準備待ち (renderer への登録待ち・素材の差し替え) はまれな失敗ではなく、§5.2 の規則で扱う。
 
 ## 9. 段 2 — 写真の板の 3D 傾け (§1.819)
 
 - 操作: **Ctrl+Shift+左ドラッグで板を傾ける** (Hamana と同じ組み合わせ)。左右のドラッグで縦軸まわり (yaw)、
   上下で横軸まわり (pitch)。今の Ctrl+Shift+左ドラッグ (自由回転) から変わる (1 ページ表示の静止画だけ。利用者へ報告済み)。
-- 状態は段 1 の `PlaneViewState::tilt`。strength 0 でも傾きがあれば PlaneView を続ける。傾けを始めたときの PlaneView の
-  入り方 (strength 0 のときは基準の画角 `α0` の普通の透視で描く) は段 2 の設計で詰める。
-- shader は段 1 のまま (§5.1 の 3・4 が傾けを扱う)。書き出しも同じ要求に傾きが入るだけ。
-- 段 2 の前に利用者へ確かめる点: 傾けられる範囲 (案: 縦横それぞれ ±75 度)、裏側を見せるか、回転の中心
-  (レンズの中心の下の点か、画像の中心か)、見開きを含めるか、キーでのリセット。
+- 状態は段 1 の `PlaneViewState::tilt`。strength 0 でも傾きがあれば PlaneView を続ける。
+- shader は段 1 のまま (§5.1 の 3・4 が傾けを扱う)。書き出しも同じ snapshot に傾きが入るだけ。
+- 段 2 で決めること: **透視の画角** (段 1 の式では strength 0 で `k → 0` となり透視が消えるので、傾けには strength と別の
+  最小の画角が要る。strength と傾けを同時に持つときの画角の合成も含め、`s → 0` で段差を出さない形を段 2 の設計で決める)、
+  傾けられる範囲 (案: 縦横それぞれ ±75 度)、裏側を見せるか、回転の中心 (レンズの中心の下の点か、画像の中心か)、
+  見開きを含めるか、キーでのリセット。利用者へ確かめてから着手する。
 
 ## 10. テスト
 
-- 式: 傾き 0 で `W(0) = 1`・単調・地平線の判定・定義域の外、3 種のレンズで CPU 版と WGSL の係数の一致、
-  傾き 0 の交点の式が `tan θ · û` と一致すること。
-- WGSL: naga で parse / validate (画面用・書き出し用は同じ文字列)。
-- 状態遷移 (App の状態のテスト): Ctrl+Shift+ホイール上で入る (lens_center = カーソル)、8 ノッチで strength 1、その後は倍率だけ、
-  下で戻って 0 で終わる、PlaneView でない下ノッチは普通の縮小、入口条件で弾く各条件 (見開き・連結・動画・アニメーション・
-  3D・360・編集・比較・分析・Z・紙めくり中) で普通のズームのまま、ページ移動・ダブルクリック・フィット切替・V・D で終わる。
-- ホイールの振り分け (handler-level): Ctrl+Shift と Ctrl だけの区別、パネル上・ポップアップ・編集モードでは今どおり、
-  同じ pass の予測と実適用の一致。
-- ドラッグ: Shift+左ドラッグでレンズだけ動く (pan 不変)、途中で Shift を離しても同じドラッグ、PlaneView でないときは今どおり。
-- 占有: ルーペ・ピクセルグリッド・ナビゲータを描かない、紙めくりの対象外、クリックでページを送らない。
-- keymap: 2 つの Action の既定が空、ini の往復、競合検出、`docs/keymap.ini.default` との一致。
-- 別ウィンドウ: 2 つの context が同時に PlaneView を持ち、互いの状態・資源を変えないこと (sibling context 不変)。
-- 書き出し: 小さな画像と既知の uniform で、オフスクリーン描画の画素が CPU 版の式の結果と一致すること (中心・周辺・地平線の外・透過の下地)。
+- 式 (CPU 版): 傾き 0 で `W(0) = 1`・単調・`s → 0` で `W → 1`、3 種のレンズの `α_max` (112.5° / 102.6804° / 124.2289°)、
+  地平線の判定、`θ > π` と等立体角の定義域外の拒否、中心・地平線の近くで値が有限なこと、傾き 0 の交点の式が `tan θ · u / r` と一致すること、
+  トリムの外 (`in_uv ∉ [0,1]²` だが source UV はテクスチャ内) が透明になること (トリム・横長分割・90 度回転の組み合わせ)。
+- WGSL: naga で parse / validate (画面用・書き出し用は同じ文字列)。CPU 版と同じ入力で係数が一致すること。
+- ホイールの入力: Shift の軸の付け替えを通る**実際の handler** で、Ctrl+Shift の縦の回転が届くこと、チルトは使わないこと、
+  合算された segment と分割された segment で同じ結果になること (`notches` の比例)、パネル上・ポップアップ・編集モードでは今どおり。
+- 純粋な遷移関数: 入る (lens_center = カーソル)、8 ノッチで strength 1、その後は倍率だけ、下で戻って 0 で終わりその segment の残りを使わない、
+  PlaneView でない下ノッチは何もしない、入口条件で弾く各条件 (見開き・連結・動画・アニメーション・3D・360・編集・表示トリムの編集・比較・
+  分析・Z・紙めくり中) で何もしない。
+- 同じ pass: 入場・終了だけが起きる segment で、予測と実適用の結果 (クリックの分類を含む) が一致すること。segment の間でページが移ったとき、
+  次の segment が古い anchor で強さを足さないこと。同じ項目の左右半ページ (slice) の移動で終わること。
+- 状態遷移: ページ移動・ダブルクリック・フィット切替・V・D で終わる。F11・F12・fork・live pass の引き渡し・park・terminal close で終わり、
+  scoped mount では続く。
+- ドラッグ: Shift+左ドラッグでレンズだけ動く (pan 不変)、途中で Shift を離す・Ctrl を押しても同じドラッグ、離す・PlaneView の終了・
+  フォーカス喪失・modal・ページ変更で所有が終わる、PlaneView でないときは今どおり (パン / 毎フレームの Ctrl で回転)。
+- 占有: ルーペ・ピクセルグリッド・ナビゲータを描かない、紙めくりの対象外、マウスのクリックとタッチの `PageSide` でページを送らない、
+  ピンチは倍率だけ。Ctrl+Shift 中・右 Ctrl+Shift 中の押している間の操作の扱い (ルーペを描かない、元画像の素材をそのまま描く)、割り当てを変えた場合も同じ。
+- 素材: `TexturePending` で前の写しを使う / 無ければ 2D、素材の差し替え (PDF の再ラスタ・RAW の現像完了) で写し直す、写せない形式で終わって通知。
+- 資源: 同じ renderer を共有する 2 つの context が同時に PlaneView を持ち、互いの状態・資源・uniform を変えないこと (sibling context 不変)。
+  状態が drop された後も、callback・snapshot・保存の要求が持つ写しが生きていて、それらが落ちると解放されること。VRAM の会計が重ねて数えないこと。
+- 書き出し: canvas の原点が 0 でない場合、`pixels_per_point` が 1 でない場合、出力が canvas の 2 倍・1/2・長辺指定の場合に、
+  オフスクリーン描画の画素が CPU 版の式の結果と一致すること (中心・周辺・地平線の外・透過の下地)。寸法の resolver が texture と読み戻しの
+  上限の両方を守ること。`last_drawn` が無い / 一致しないときに保存しないこと。`scale_export_pixels` を通らないこと。
   GPU を使うテストは既存の `test-group gpu` に入れる。
+- keymap: 2 つの Action の既定が空、ini の往復、競合検出、`docs/keymap.ini.default` との一致。
 - UI スナップショット: 環境設定の 1 行と書き出しダイアログの文言を変えたら更新する ([ui-snapshot-policy.md](ui-snapshot-policy.md))。
 
 ## 11. 実装記録
 
-(実装担当が書く。`is_depth()` / `ExclusiveViewKind::Depth` / `fs_exclusive_view_active` の全出現の分類表、変更ファイル、
-設計との差分、実行したテストと結果、perf の数値。)
+(実装担当が書く。`is_depth()` / `ExclusiveViewKind::Depth` / `fs_exclusive_view_active` の全出現の分類表、Depth の終了処理の全出現と
+§3.6 の共通 helper への振り分け、レンズの移動の所有の形、環境設定の置き場所、変更ファイル、設計との差分、実行したテストと結果、perf の数値。)
 
 ## 12. 文書
 
@@ -388,4 +494,23 @@ mip の写しの `Arc`、uniform の値 (§5.1 の `c`・`R`・`k`・レンズ�
 
 ## 14. 独立設計レビュー
 
-(依頼と結果を記録する。)
+### R1 (2026-11-27、GPT-6.1 Sol / xhigh、read-only、対象 `9e7ea3d6a`、session `01a218a0-07a6-7601-aa6f-3564f5381a09`)
+
+判定: 要修正。P1 6 件・P2 8 件。設計担当 (ClaudeCode) が各指摘の根拠のコードを読み、全件を正しいと判断した (false positive なし)。
+
+| # | 指摘 | 対応 (本書 R1) |
+| --- | --- | --- |
+| P1-1 | Shift の軸の付け替えで Ctrl+Shift+ホイールの縦の量が消え、今は何もしない (R0 の「今は普通のズーム」は誤り)。合算された segment の量を定義していない | §2 を訂正。§3.2 で軸を移す前の縦の量を使う口と `notches` の比例を定義。§0 に利用者への説明の訂正 |
+| P1-2 | `α0 = 30°` のため `s → 0` で `W → 1` にならない。`α_max` の値、パノラマの係数の違い | `α(s) = s × α_max` に変更。`α_max` 3 値を明記。パノラマの係数は流用しないと明記 (§2・§5.1)。段 2 の透視の画角は §9 へ |
+| P1-3 | 角度の主値範囲、中心の極限、平行光線、微分前の NaN / Inf | §5.1 の手順 1〜3・7・8 (定義域、`σ` の極限、`den` の代用値、有限な代用値を通してから微分) |
+| P1-4 | source UV の範囲判定では表示トリムの外が描かれる | §5.1 の 8 で `in_uv` で判定。テストに組み合わせを追加 |
+| P1-5 | 同じ pass の予測に PlaneView の遷移が無い。segment 間のページ移動、slice | §3.2 の純粋な遷移関数、segment 間の anchor 照合、anchor に slice (§3.1) |
+| P1-6 | 書き出しの要求に出力座標の写像と「実際に描いた frame」の確定が無い | §5.3 の frame snapshot、§6.1 の `last_drawn` と照合、§5.2 の出力座標の写像 |
+| P2-7 | 既存ドラッグは開始時に所有を決める規則ではない。レンズの移動との所有の重なり | §2 を訂正。§3.3 でレンズの移動だけを開始時に固定し、所有の型・終わりを定義 |
+| P2-8 | ModifierHold は物理状態だけを読む。キーのズームは表示中央基準 | §2 を訂正。§3.4 で重なりの扱い (ルーペを描かない、元画像をそのまま描く)。§3.2 の基準点の記述を訂正 |
+| P2-9 | detached の終了経路は session の確定点だけではない | §3.6 の注 (Depth の終了経路の列挙と共通 helper)、§4.4。**構造上の追加という分類には合意** |
+| P2-10 | 素材の準備待ちと採用の順序が未定義 | §3.1 の `PlaneColorPhase`、§5.2 の素材の採用 |
+| P2-11 | 表示トリムの編集と touch の扱い | §4.1 で表示トリムの編集を弾く、§4.3 の touch の配送 |
+| P2-12 | 出力の寸法の説明が上限・既存の縮小段と食い違う | §6.2 の寸法の resolver、§6.3 で実寸の表示と縮小段を通さないこと |
+| P2-13 | VRAM の会計と、状態の後も残る要求の資源 | §5.3 の会計・共有と分離 (pipeline は共有、uniform は分離)、§5.4 の写しの CPU 時間の計測 |
+| P2-14 | 境界の受入テスト | §10 に追加 |
