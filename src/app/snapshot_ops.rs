@@ -5488,7 +5488,11 @@ mod tests {
             Some(SpreadMode::Ltr)
         );
         app.load_folder(folder);
-        app.finish_page_identity_preparation_for_test();
+        // A plain directory reload now admits a worker scan. Identity preparation
+        // alone cannot adopt it or restore the browser directory's NON_BOOK default.
+        assert!(app.direct_navigation_scan_pending());
+        assert_eq!(app.spread_mode, SpreadMode::Ltr);
+        app.finish_direct_navigation_scan_for_test();
         assert_eq!(app.spread_mode, SpreadMode::Single);
     }
 }

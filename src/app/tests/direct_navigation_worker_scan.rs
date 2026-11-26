@@ -1341,6 +1341,43 @@ fn direct_navigation_worker_preserves_unmarked_presentation_intents() {
 }
 
 #[test]
+fn direct_navigation_worker_busy_install_refuses_before_scan_admission() {
+    let mut app = setup_app();
+    app.active_quick_folder_slot = None;
+    app.settings.detached_viewer_open_images_in_window = false;
+    app.settings.auto_fullscreen_image_folders = false;
+    app.settings.sidecar_backup_enabled = true;
+    let source = folder(&app, "busy-source");
+    let target = folder(&app, "busy-target");
+    image::RgbaImage::new(2, 2)
+        .save(source.join("page.png"))
+        .unwrap();
+    app.load_folder(source.clone());
+    assert!(app.direct_navigation_scan_pending());
+    app.finish_direct_navigation_scan_before_hydration_for_test();
+    assert!(app.sidecar_restore_active());
+    assert!(!app.direct_navigation_scan_pending());
+    assert!(!app.items.is_empty());
+    let items = app.items.clone();
+    let generation = app.items_generation;
+    let history = app.folder_nav_history_snapshot();
+
+    assert!(!app.load_folder_with_scan_owned(
+        target,
+        None,
+        OpenRequestOwner::Navigation,
+        StartupListIntent::ExplicitList,
+    ));
+    assert!(!app.direct_navigation_scan_pending());
+    assert!(app.folder_pane_open_pending.is_none());
+    assert!(app.sidecar_restore_active());
+    assert_eq!(app.current_folder.as_ref(), Some(&source));
+    assert_eq!(app.items, items);
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.folder_nav_history_snapshot(), history);
+}
+
+#[test]
 fn section1853_worker_continuation_commits_captured_effects_and_selection_once() {
     let mut app = setup_app();
     app.active_quick_folder_slot = None;
@@ -1376,13 +1413,17 @@ fn section1853_worker_continuation_commits_captured_effects_and_selection_once()
     assert!(matches!(call.owner, OpenRequestOwner::Navigation));
     let effects = call.grid_effects.as_ref().unwrap();
     assert_eq!(
-        effects.rating_suppression,
+        effects.rating_suppression.as_deref().cloned(),
         Some((target.clone(), app.settings.rating_filter))
     );
     assert!(!effects.suppress_facet_filter);
     assert!(!effects.auto_fullscreen);
     assert_eq!(
-        call.navigation.as_ref().unwrap().selection_after_load,
+        call.navigation
+            .as_ref()
+            .unwrap()
+            .selection_after_load()
+            .cloned(),
         Some(AfterLoadSelection::Name("chosen".into()))
     );
     assert_eq!(app.reading_history_return_from, Some(old_return));

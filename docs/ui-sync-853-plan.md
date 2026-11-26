@@ -1727,6 +1727,63 @@ cargo nextest run -p mimageviewer --lib --features test-script -E $scan853R2Filt
 .\scripts\test-lib-full.ps1 -Features test-script
 ```
 
+#### テスト実行後の修正 (r3)
+
+2026-11-27、設計担当が `de9b6a308`（r2＋cargo fmt）で lib 全件を再実行した。
+既定は 20,864 件中 20,861 成功・3 失敗、test-script は 21,026 件中 21,022 成功・4 失敗。
+最新 2 run（`20261126T170315449Z-ed5b5df1`、`20261126T173114087Z-480a17be`）の診断を読んだ。
+`stdout.log` は空で、panic とサイズの実測値は `stderr.log` にある。
+実装担当自身はコンパイル・cargo／nextest・テスト・ビルド・製品起動・コミットを行っていない。
+
+| 失敗テスト | 根因・修正 |
+| --- | --- |
+| `history_transition_storage_keeps_app_stack_footprint_bounded` | r2 後も App は既定 110,448 bytes／test-script 110,464 bytes。CloseReturn 内側の Box 化だけでは、navigation ごとの search／close／選択と grid effects の増分が残った。`MainListNavigationPayload` にこの 3 値をまとめ、既存の inline 選択ヒントも含め `Option<Box<…>>` へ移す。Grid の履歴帰路と受付時の★解除決定もそれぞれ `Option<Box<…>>` にする。空の navigation payload は持たず、同じ要求が全効果を所有する。App の 110,000 上限は維持し、各 field の pointer-size と navigation／effects の型別上限も追加 |
+| `browser818_presentation_activation_restore_materialized_keeps_request_seed` | r2 fixture の `folder_scan=None` では loader が Classifying を返すため、startup の Loaded 限定の明示ファイル継続に入らず、sidecar の viewer request が無い。実 resolver は main Directory に走査結果と policy を付けてから返すため、この fixture を実 worker の応答の受信・確認・再送へ修正。seed／窓／選択の最終期待は維持 |
+| `browser870_snapshot_child_pdf_round_trip_restores_directory_source` | 最後の `load_folder(folder)` だけ採用待ちがなく、直前に操作した PDF の Ltr のまま検査していた。それ以前の Directory source 復帰・親 DB 未保存・PDF DB の Ltr 保存はログ上通過。最終読込の pending と採用前 Ltr を確認し、実完了 helper 後に元の Single を検査する。最終期待は変更しない |
+| `release_pin_refresh_must_finish_before_a_following_open`（test-script のみ） | 製品の受付順の退行。既存 `prepare_visible_install` の `sidecar_restore_active() || book_append_undo_in_progress()` が worker 分岐より後に残り、先に Classifying を返していた。この既存の在メモリの拒否条件を共通 helper にし、未走査 main Directory の分岐で予約取得・旧要求退役・worker 起動より前にも適用。可視 install 時の再確認は維持。即時 false の期待は変更せず、worker を発行していない検査も追加 |
+
+最後の拒否は scan の I/O エラーや走査した rows の内容によるものではなく、既存の可視採用の busy 条件である。
+最新指示の「走査だけを遅らせ、受付拒否は遅らせない」に従い、その条件を受付側でも評価する。
+document modal 全体や main 以外へ対象を広げず、受付後に復元が始まった場合の既存 poll の保留は変えない。
+両構成でこの境界を検査する `direct_navigation_worker_busy_install_refuses_before_scan_admission` を追加した。
+新たな返却事項はない（従前のお気に入り検索の重複 stack の判断待ちは継続）。
+
+64-bit Windows のサイズ影響（修正前 App は設計担当ログの実測、下記の型／field は layout からの見積もりで未実測）:
+
+| 移動する field | r2 の inline 見積もり | r3 の inline | 影響 |
+| --- | ---: | ---: | --- |
+| navigation の選択＋CloseReturn＋検索 admission | 32＋16＋48＝96 bytes | payload pointer 8 bytes | navigation 1 値あたり約 88 bytes 減。型全体は約 768→680 bytes、§6 前の約 704 bytes より小さい見込み |
+| grid の `rating_suppression` | 32 bytes | 8 bytes | effects 1 値あたり約 24 bytes 減 |
+| grid の `reading_history_return_from` | 32 bytes | 8 bytes | effects 1 値あたり約 24 bytes 減。上と合わせ effects は約 72→24 bytes（§6 前は約 40 bytes） |
+
+App 所有 pending へ埋め込まれた複数の値にこの削減が効く。App 全体の削減量と上限通過は再実行で測る。
+既存サイズテストへ実 field の 1 pointer 検査、`MainListNavigation <= 704`、`GridVirtualOpenEffects <= 40`、
+診断用の各型・payload サイズ出力を追加した。閾値を引き上げる変更はしていない。
+変更した Rust 13 ファイルの単体 `rustfmt --edition 2024 --check --config skip_children=true` と
+`git diff --check` は成功。これはコンパイル・テストや修正後サイズの測定ではない。
+
+変更ファイルと設計項目:
+
+- `app.rs`・`close_return.rs`・`startup_ops.rs`・`update_phases.rs`: §6.3(2・3・8・9)／§6.12 の要求所有を維持した storage。
+  busy admission の共通化と worker より前の拒否も `app.rs`。
+- `collection_grid.rs`: §6.3(8) の idx 判定を再評価せず、捕捉時に Box へ包み採用で元の値を消費。
+- `browser818_presentation_tests.rs`・`snapshot_ops.rs`・`release_checks.rs`: 上表 3 テストの修正。
+- `tests.rs`: サイズ検査の補強と `main_container_open_via_gamepad_defers_reading_history_return_until_adoption` の値比較の型追従。
+- `tests/direct_navigation_worker_scan.rs`: 新規 busy admission 回帰と既存の captured effects／選択比較の型追従。
+- `list_order_ratingnav649_tests.rs`・`tests/search_scan_853_tests.rs`・`tests/ui_scan_853_tests.rs`:
+  Box の中身／navigation accessor を通して、従来の値をそのまま比較する。最終期待は変更しない。
+
+設計担当へ渡す r3 filter（未実行）:
+
+```powershell
+$scan853R3Filter = 'test(history_transition_storage_keeps_app_stack_footprint_bounded) | test(browser818_presentation_activation_restore_materialized_keeps_request_seed) | test(browser870_snapshot_child_pdf_round_trip_restores_directory_source) | test(release_pin_refresh_must_finish_before_a_following_open) | test(direct_navigation_worker_) | test(grid_folder_) | test(ratingnav649_) | test(search_scan_853_tests) | test(ui_scan_853_tests) | test(close_return_) | test(section1335_) | test(section1853_)'
+cargo nextest run -p mimageviewer --lib -E $scan853R3Filter
+cargo nextest run -p mimageviewer --lib --features test-script -E $scan853R3Filter
+# 関連 gate の後の全件確認も従来どおり必要。
+.\scripts\test-lib-full.ps1
+.\scripts\test-lib-full.ps1 -Features test-script
+```
+
 <!-- scan853-test-inventory -->
 
 #### `src/app/native_video.rs`
@@ -2204,6 +2261,7 @@ direct_navigation_worker_history_wait_keeps_released_escape_stack_toggle
 direct_navigation_worker_original_navigation_is_not_recaptured
 direct_navigation_worker_pane_retirement_does_not_retain_older_direct_scan
 direct_navigation_worker_preserves_unmarked_presentation_intents
+direct_navigation_worker_busy_install_refuses_before_scan_admission
 direct_navigation_worker_quick_folder_round_trip_retires_old_epoch
 direct_navigation_worker_ready_scan_yields_to_same_frame_navigation_inputs
 direct_navigation_worker_rejected_address_input_cancels_prior_scan_in_actual_frame

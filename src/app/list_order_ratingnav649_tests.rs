@@ -339,7 +339,7 @@ fn scenario(zip_books: bool, entry: Entry, date_desc: bool) {
                 "ordinary Folder clears the old history return at adoption"
             );
             assert_eq!(
-                intent.effects.rating_suppression.as_ref().map(|(p, _)| p),
+                intent.effects.rating_suppression.as_deref().map(|(p, _)| p),
                 Some(first)
             );
             assert_eq!(intent.effects.auto_fullscreen, auto_open);
@@ -512,7 +512,7 @@ fn ratingnav649_enter_and_pointer_folder_receipt_preserve_history_return() {
                 Some(&book)
             );
             assert_eq!(
-                intent.effects.rating_suppression.as_ref().map(|(p, _)| p),
+                intent.effects.rating_suppression.as_deref().map(|(p, _)| p),
                 Some(&book)
             );
             assert_eq!(intent.effects.auto_fullscreen, auto_open);

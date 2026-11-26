@@ -476,6 +476,7 @@ mod tests {
             super::super::OpenRequestOwner::Navigation,
             super::super::StartupListIntent::ExplicitList,
         ));
+        assert!(!app.direct_navigation_scan_pending());
         assert_eq!(app.current_folder.as_ref(), Some(&child));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.sidecar_restore_active() {

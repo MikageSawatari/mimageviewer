@@ -1817,8 +1817,9 @@ impl App {
                         navigation = self.capture_physical_open_navigation(&navigate_owner, &p);
                     }
                     if let Some(navigation) = navigation.as_mut() {
-                        navigation.close_return_presentation =
-                            self.take_fullscreen_close_return_presentation();
+                        navigation.set_close_return_presentation(
+                            self.take_fullscreen_close_return_presentation(),
+                        );
                     }
                 }
                 self.open_direct_navigation_target_at_stage(

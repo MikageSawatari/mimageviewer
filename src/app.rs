@@ -1607,12 +1607,99 @@ pub(crate) struct MainListNavigation {
     pub(crate) source_proof: MainListSourceProof,
     pub(crate) history: MainHistoryOperation,
     pub(crate) destination: MainListRestoreDestination,
+    /// Optional adoption effects stay off every inline copy of a navigation owner.
+    payload: Option<Box<MainListNavigationPayload>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MainListNavigationPayload {
     selection_after_load: Option<AfterLoadSelection>,
     close_return_presentation: Option<crate::ui_fullscreen::FsCloseReturnPresentation>,
     search_admission: SearchNavigationAdmission,
 }
 
+impl MainListNavigationPayload {
+    fn is_empty(&self) -> bool {
+        self.selection_after_load.is_none()
+            && self.close_return_presentation.is_none()
+            && self.search_admission == SearchNavigationAdmission::default()
+    }
+
+    fn capture(
+        selection_after_load: Option<AfterLoadSelection>,
+        search_admission: SearchNavigationAdmission,
+    ) -> Option<Box<Self>> {
+        (selection_after_load.is_some() || search_admission != SearchNavigationAdmission::default())
+            .then(|| {
+                Box::new(Self {
+                    selection_after_load,
+                    close_return_presentation: None,
+                    search_admission,
+                })
+            })
+    }
+}
+
 impl MainListNavigation {
+    fn payload_mut(&mut self) -> &mut MainListNavigationPayload {
+        self.payload.get_or_insert_with(Default::default)
+    }
+
+    fn remove_empty_payload(&mut self) {
+        if self
+            .payload
+            .as_ref()
+            .is_some_and(|payload| payload.is_empty())
+        {
+            self.payload = None;
+        }
+    }
+
+    fn search_admission(&self) -> SearchNavigationAdmission {
+        self.payload
+            .as_ref()
+            .map_or_else(Default::default, |payload| payload.search_admission.clone())
+    }
+
+    fn set_search_admission(&mut self, admission: SearchNavigationAdmission) {
+        if self.payload.is_some() || admission != SearchNavigationAdmission::default() {
+            self.payload_mut().search_admission = admission;
+            self.remove_empty_payload();
+        }
+    }
+
+    fn search_admission_mut(&mut self) -> &mut SearchNavigationAdmission {
+        &mut self.payload_mut().search_admission
+    }
+
+    fn close_return_presentation(
+        &self,
+    ) -> Option<&crate::ui_fullscreen::FsCloseReturnPresentation> {
+        self.payload.as_ref()?.close_return_presentation.as_ref()
+    }
+
+    fn set_close_return_presentation(
+        &mut self,
+        presentation: Option<crate::ui_fullscreen::FsCloseReturnPresentation>,
+    ) {
+        if self.payload.is_some() || presentation.is_some() {
+            self.payload_mut().close_return_presentation = presentation;
+            self.remove_empty_payload();
+        }
+    }
+
+    fn set_selection_after_load(&mut self, selection: Option<AfterLoadSelection>) {
+        if self.payload.is_some() || selection.is_some() {
+            self.payload_mut().selection_after_load = selection;
+            self.remove_empty_payload();
+        }
+    }
+
+    #[cfg(test)]
+    fn selection_after_load(&self) -> Option<&AfterLoadSelection> {
+        self.payload.as_ref()?.selection_after_load.as_ref()
+    }
+
     fn exits_temporary_view(&self) -> bool {
         matches!(
             self.history,
@@ -2043,9 +2130,9 @@ pub(crate) enum GridVirtualOpenSource {
 
 #[derive(Clone, Debug)]
 pub(crate) struct GridVirtualOpenEffects {
-    reading_history_return_from: Option<ReadingHistoryBookReturn>,
+    reading_history_return_from: Option<Box<ReadingHistoryBookReturn>>,
     suppress_rating_filter: bool,
-    rating_suppression: Option<(PathBuf, [bool; 6])>,
+    rating_suppression: Option<Box<(PathBuf, [bool; 6])>>,
     suppress_facet_filter: bool,
     auto_fullscreen: bool,
 }
@@ -6802,9 +6889,7 @@ impl FolderOpenScanPurpose {
         &self,
     ) -> Option<&crate::ui_fullscreen::FsCloseReturnPresentation> {
         match self {
-            Self::DirectNavigation(call) => {
-                call.navigation.as_ref()?.close_return_presentation.as_ref()
-            }
+            Self::DirectNavigation(call) => call.navigation.as_ref()?.close_return_presentation(),
             _ => None,
         }
     }
@@ -25209,8 +25294,9 @@ impl App {
         let navigation = if close_origin {
             let mut navigation = self.capture_physical_open_navigation(&owner, &path);
             if let Some(navigation) = navigation.as_mut() {
-                navigation.close_return_presentation =
-                    self.take_fullscreen_close_return_presentation();
+                navigation.set_close_return_presentation(
+                    self.take_fullscreen_close_return_presentation(),
+                );
             }
             navigation
         } else {
@@ -25998,9 +26084,10 @@ impl App {
             source_proof,
             history,
             destination: MainListRestoreDestination::Native,
-            selection_after_load: self.select_after_load.take(),
-            close_return_presentation: None,
-            search_admission: self.capture_search_navigation_admission(),
+            payload: MainListNavigationPayload::capture(
+                self.select_after_load.take(),
+                self.capture_search_navigation_admission(),
+            ),
         }
     }
 
@@ -26286,7 +26373,9 @@ impl App {
                 self.sync_facet_name_runtime_from_filter();
             }
         }
-        self.select_after_load = navigation.selection_after_load;
+        self.select_after_load = navigation
+            .payload
+            .and_then(|payload| payload.selection_after_load);
         if exits_temporary_view {
             self.dismiss_transparent_view_for_admitted_jump();
         }
@@ -26442,9 +26531,7 @@ impl App {
         items: &[GridItem],
         logical_source: Option<&Path>,
     ) -> Result<PreparedVisibleInstall, OpenAdmissionRefusal> {
-        if self.sidecar_restore_active() || self.book_append_undo_in_progress() {
-            return Err(OpenAdmissionRefusal::DocumentOpenBusy);
-        }
+        self.admit_visible_install_busy_state()?;
         let logical = logical_source.unwrap_or(source_path);
         let display_epub_source = if items.iter().any(|item| matches!(item, GridItem::PdfPage { pdf_path, .. } if crate::folder_tree::path_eq(pdf_path, logical))) {
             let owner = crate::pdf_loader::LeasedEpubPath::try_new(logical.to_path_buf()).map_err(OpenAdmissionRefusal::from)?;
@@ -26455,6 +26542,16 @@ impl App {
             book_append_refresh: None,
             install_boundary: MainListInstallBoundary::UseInstallerBoundary,
         })
+    }
+
+    /// This in-memory admission does not depend on scanned rows. Keep it before
+    /// asynchronous directory dispatch as well as at the final visible install.
+    fn admit_visible_install_busy_state(&self) -> Result<(), OpenAdmissionRefusal> {
+        if self.sidecar_restore_active() || self.book_append_undo_in_progress() {
+            Err(OpenAdmissionRefusal::DocumentOpenBusy)
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn physical_main_list_boundary_plan(
@@ -32873,7 +32970,7 @@ impl App {
         let search_admission =
             self.search_navigation_admission(navigation.as_ref(), tag_admission.clone());
         if let Some(navigation) = navigation.as_mut() {
-            navigation.search_admission = search_admission.clone();
+            navigation.set_search_admission(search_admission.clone());
         }
         if !detached_physical
             && pre_scan.is_none()
@@ -32962,6 +33059,11 @@ impl App {
                 matches!(authority, VisibleInstallAuthority::Ordinary),
                 "an unscanned main directory load must have ordinary install authority"
             );
+            if let Err(reason) = self.admit_visible_install_busy_state() {
+                span.outcome(CloseNavOutcome::AdmissionRefused);
+                self.show_open_admission_refusal(reason);
+                return FolderOpenOutcome::Ignored;
+            }
             let auto_fullscreen = std::mem::take(&mut self.pending_auto_fs_open);
             self.retire_replaced_main_list_requests_with_startup_intent(
                 Some(MainListRequestOwner::Pane),
@@ -33094,7 +33196,7 @@ impl App {
         let boundary_plan = self.physical_main_list_boundary_plan(&token);
         let close_return_id = navigation
             .as_ref()
-            .and_then(|nav| nav.close_return_presentation.as_ref())
+            .and_then(MainListNavigation::close_return_presentation)
             .map(|p| p.request_id);
         let install = move |app: &mut Self, boundary| {
             if let Some(id) = close_return_id {
@@ -38082,12 +38184,12 @@ impl App {
     }
 
     fn commit_grid_virtual_open_effects(&mut self, path: &Path, effects: GridVirtualOpenEffects) {
-        self.reading_history_return_from = effects.reading_history_return_from;
+        self.reading_history_return_from = effects.reading_history_return_from.map(|value| *value);
         if effects.suppress_rating_filter {
             self.maybe_suppress_rating_filter_for_opened_container_path(path);
         }
         if let Some(suppression) = effects.rating_suppression {
-            self.commit_rating_filter_suppression(suppression);
+            self.commit_rating_filter_suppression(*suppression);
         }
     }
 
@@ -39803,7 +39905,7 @@ impl App {
         let mut navigation = self
             .capture_physical_open_navigation(&OpenRequestOwner::Navigation, &path)
             .expect("main D2 admission must capture its navigation owner");
-        navigation.search_admission.favsearch = Some(admission);
+        navigation.search_admission_mut().favsearch = Some(admission);
         // Favorite Back/Sibling used load_folder, rather than the conversion
         // dispatcher. Preserve that format contract while carrying the effect.
         self.load_folder_with_scan_owned_outcome_and_effects_at_stage_with_navigation(
@@ -39822,7 +39924,7 @@ impl App {
         let mut navigation = self
             .capture_physical_open_navigation(&OpenRequestOwner::Navigation, &path)
             .expect("main D2 admission must capture its navigation owner");
-        navigation.search_admission.tag_view = Some(TagViewNavAdmission::Back);
+        navigation.search_admission_mut().tag_view = Some(TagViewNavAdmission::Back);
         self.load_folder_or_convert_archive_with_auto_fullscreen_owned_with_navigation(
             path,
             false,
@@ -39843,7 +39945,7 @@ impl App {
     ) -> SearchNavigationAdmission {
         let mut admission = navigation.map_or_else(
             || self.capture_search_navigation_admission(),
-            |navigation| navigation.search_admission.clone(),
+            MainListNavigation::search_admission,
         );
         if !matches!(admission.tag_view, Some(TagViewNavAdmission::Back))
             && let Some(tag) = tag_admission
@@ -42126,7 +42228,10 @@ impl App {
                 tag_view_origin: search_admission.tag_view,
                 global_search_origin: self.capture_search_open_origin(),
                 grid_open_effects: auto_fullscreen.then(|| GridVirtualOpenEffects {
-                    reading_history_return_from: self.reading_history_return_from.clone(),
+                    reading_history_return_from: self
+                        .reading_history_return_from
+                        .clone()
+                        .map(Box::new),
                     suppress_rating_filter: false,
                     rating_suppression: None,
                     suppress_facet_filter: false,
@@ -63008,7 +63113,7 @@ impl App {
         } = *call;
         let close_return_id = navigation
             .as_ref()
-            .and_then(|nav| nav.close_return_presentation.as_ref())
+            .and_then(MainListNavigation::close_return_presentation)
             .map(|p| p.request_id);
         self.pending_auto_fs_open = auto_fullscreen;
         let outcome = self.load_folder_with_scan_claimed_with_search_origin(

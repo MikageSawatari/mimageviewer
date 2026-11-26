@@ -240,9 +240,7 @@ impl App {
                 source_proof: self.copied_destination_source_proof(),
                 history: MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation),
                 destination: super::MainListRestoreDestination::Native,
-                selection_after_load: None,
-                close_return_presentation: None,
-                search_admission: Default::default(),
+                payload: None,
             },
         })
     }

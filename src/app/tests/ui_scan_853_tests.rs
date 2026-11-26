@@ -42,8 +42,7 @@ fn issue_close(app: &mut App) -> u64 {
     call.navigation
         .as_ref()
         .unwrap()
-        .close_return_presentation
-        .as_ref()
+        .close_return_presentation()
         .unwrap()
         .request_id
 }
@@ -750,7 +749,11 @@ fn section1853_retired_context_bundle_drops_request_owned_fullscreen_and_selecti
         };
         assert!(call.auto_fullscreen);
         assert_eq!(
-            call.navigation.as_ref().unwrap().selection_after_load,
+            call.navigation
+                .as_ref()
+                .unwrap()
+                .selection_after_load()
+                .cloned(),
             Some(AfterLoadSelection::Name("must-not-leak".into()))
         );
         assert!(!owner.pending_auto_fs_open);

@@ -2248,7 +2248,7 @@ impl App {
             if let Some(navigation) = navigation.as_mut() {
                 // Adoption publishes the request-owned hint before installing the list.
                 // Writing App here would be overwritten by that earlier captured value.
-                navigation.selection_after_load = selection;
+                navigation.set_selection_after_load(selection);
             } else {
                 self.select_after_load = selection;
             }

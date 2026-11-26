@@ -3777,6 +3777,36 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         size_of::<usize>()
     );
     assert!(size_of::<PdfPasswordRequestOwner>() < 32);
+    fn navigation_storage<T>(_: fn(&MainListNavigation) -> &T) -> usize {
+        size_of::<T>()
+    }
+    fn effects_storage<T>(_: fn(&GridVirtualOpenEffects) -> &T) -> usize {
+        size_of::<T>()
+    }
+    assert_eq!(navigation_storage(|nav| &nav.payload), size_of::<usize>());
+    assert_eq!(
+        effects_storage(|effects| &effects.rating_suppression),
+        size_of::<usize>()
+    );
+    assert_eq!(
+        effects_storage(|effects| &effects.reading_history_return_from),
+        size_of::<usize>()
+    );
+    // x64 pre-§1.853 inline budgets. Cold additions must not multiply through
+    // the navigation/effects values embedded in App-owned pending requests.
+    assert!(size_of::<MainListNavigation>() <= 704);
+    assert!(size_of::<GridVirtualOpenEffects>() <= 40);
+    println!(
+        "cold navigation storage MainListNavigation={} payload={} selection={} search={} close={} GridVirtualOpenEffects={} rating={} history_return={}",
+        size_of::<MainListNavigation>(),
+        size_of::<MainListNavigationPayload>(),
+        size_of::<Option<AfterLoadSelection>>(),
+        size_of::<SearchNavigationAdmission>(),
+        size_of::<Option<crate::ui_fullscreen::FsCloseReturnPresentation>>(),
+        size_of::<GridVirtualOpenEffects>(),
+        size_of::<Option<(PathBuf, [bool; 6])>>(),
+        size_of::<Option<ReadingHistoryBookReturn>>(),
+    );
     assert!(
         size_of::<crate::ui_fullscreen::FsCloseReturnPresentation>() <= 2 * size_of::<usize>(),
         "close-return rendering payload must stay off the App stack"
@@ -34869,7 +34899,11 @@ mod phase_c_drill_nav_tests {
             };
             assert_eq!(intent.path, book.clone());
             assert_eq!(
-                intent.effects.reading_history_return_from,
+                intent
+                    .effects
+                    .reading_history_return_from
+                    .as_deref()
+                    .cloned(),
                 from_history.then(|| crate::app::tests::reading_history_return_for_test(book))
             );
             assert_eq!(

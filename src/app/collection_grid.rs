@@ -1553,9 +1553,13 @@ impl App {
         auto_fullscreen: bool,
     ) -> super::GridVirtualOpenEffects {
         super::GridVirtualOpenEffects {
-            reading_history_return_from: self.capture_reading_history_book_return(path),
+            reading_history_return_from: self
+                .capture_reading_history_book_return(path)
+                .map(Box::new),
             suppress_rating_filter: false,
-            rating_suppression: self.capture_rating_filter_suppression_for_opened_container(index),
+            rating_suppression: self
+                .capture_rating_filter_suppression_for_opened_container(index)
+                .map(Box::new),
             suppress_facet_filter: false,
             auto_fullscreen,
         }
@@ -1591,7 +1595,9 @@ impl App {
                 path: path.clone(),
                 source,
                 effects: super::GridVirtualOpenEffects {
-                    reading_history_return_from: self.capture_reading_history_book_return(&path),
+                    reading_history_return_from: self
+                        .capture_reading_history_book_return(&path)
+                        .map(Box::new),
                     suppress_rating_filter: true,
                     rating_suppression: None,
                     // Grid activation only exposes rows accepted by the current facet filter.
@@ -4172,9 +4178,16 @@ mod tests {
                 intent.source,
                 super::super::GridVirtualOpenSource::Direct
             ));
-            assert_eq!(intent.effects.reading_history_return_from, expected_return);
             assert_eq!(
-                intent.effects.rating_suppression,
+                intent
+                    .effects
+                    .reading_history_return_from
+                    .as_deref()
+                    .cloned(),
+                expected_return
+            );
+            assert_eq!(
+                intent.effects.rating_suppression.as_deref().cloned(),
                 Some((folder, app.settings.rating_filter))
             );
             assert!(!intent.effects.suppress_rating_filter);
@@ -4206,7 +4219,7 @@ mod tests {
             app.record_rating_session_write(key.clone(), admitted, true);
             let effects = app.capture_grid_folder_open_effects(0, &folder, false);
             assert_eq!(
-                effects.rating_suppression,
+                effects.rating_suppression.as_deref().cloned(),
                 (admitted == 5).then(|| (folder.clone(), app.settings.rating_filter))
             );
             app.record_rating_session_write(key.clone(), later, true);

@@ -248,7 +248,7 @@ fn section1853_tag_back_survives_classification_and_staged_zip_adoption() {
     };
     assert_eq!(candidate.tag_view_origin, Some(TagViewNavAdmission::Back));
     assert_eq!(
-        candidate.navigation.search_admission.tag_view,
+        candidate.navigation.search_admission().tag_view,
         Some(TagViewNavAdmission::Back)
     );
     assert_eq!(app.tag_view.nav_stack, original);
@@ -292,7 +292,7 @@ fn section1853_tag_back_intent_is_owned_by_pdf_and_conversion_classification() {
                 .unwrap()
         };
         assert_eq!(
-            navigation.search_admission.tag_view,
+            navigation.search_admission().tag_view,
             Some(TagViewNavAdmission::Back)
         );
         assert_eq!(app.tag_view.nav_stack, original);
@@ -325,7 +325,7 @@ fn section1853_tag_back_is_preserved_by_prepared_direct_pdf_adoption() {
     let mut navigation = app
         .capture_physical_open_navigation(&OpenRequestOwner::Navigation, &pdf)
         .unwrap();
-    navigation.search_admission.tag_view = Some(TagViewNavAdmission::Back);
+    navigation.search_admission_mut().tag_view = Some(TagViewNavAdmission::Back);
     let source = crate::pdf_loader::LeasedEpubPath::try_new(pdf.clone()).unwrap();
     assert!(app.adopt_direct_pdf_rows(
         &pdf,
@@ -360,9 +360,9 @@ fn section1853_conversion_phase_uses_captured_search_back_instead_of_new_descend
             .capture_physical_open_navigation(&OpenRequestOwner::Navigation, &target)
             .unwrap();
         if tag {
-            navigation.search_admission.tag_view = Some(TagViewNavAdmission::Back);
+            navigation.search_admission_mut().tag_view = Some(TagViewNavAdmission::Back);
         } else {
-            navigation.search_admission.favsearch = Some(FavsearchNavAdmission::Back);
+            navigation.search_admission_mut().favsearch = Some(FavsearchNavAdmission::Back);
         }
         assert!(app.admit_physical_history_phase(
             PhysicalHistoryIntent::Navigation {
@@ -423,7 +423,7 @@ fn section1853_search_back_classifies_suffix_directories_before_virtual_dispatch
                     .as_ref()
                     .unwrap()
             };
-            let admitted = &navigation.search_admission;
+            let admitted = navigation.search_admission();
             if tag {
                 assert_eq!(admitted.tag_view, Some(TagViewNavAdmission::Back));
             } else {
@@ -472,7 +472,7 @@ fn section1853_favorite_sibling_keeps_suffix_directory_classification_and_single
         Some(FavsearchNavAdmission::Sibling)
     );
     assert_eq!(
-        candidate.navigation.search_admission.favsearch,
+        candidate.navigation.search_admission().favsearch,
         Some(FavsearchNavAdmission::Sibling)
     );
     settle(&mut app);
