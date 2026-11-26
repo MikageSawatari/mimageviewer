@@ -62,5 +62,166 @@
     "heading_id": "スペクトラムオーバーレイ",
     "before_heading_id": "プラグイン一覧",
     "reason": "Preserve shared spectrum instructions at category level before splitting plugin sections, including the existing heading id."
+  },
+  {
+    "operation": "replace_inline",
+    "reason": "Bundled native DSP has no standalone WASM engine setting.",
+    "replacement": "",
+    "anchor": "使用にはWASM DSPエンジンが必要で、利用できない場合は信号が変更されずに通過します。",
+    "scope_heading_id": "headphone-eq"
+  },
+  {
+    "operation": "replace_inline",
+    "reason": "Match the bundled search placeholder and AutoEQ-only link policy.",
+    "replacement": "Search headphones or paste an AutoEQ link",
+    "anchor": "Search headphones (AutoEQ) or paste a URL",
+    "scope_heading_id": "headphone-eq"
+  },
+  {
+    "operation": "replace_inline",
+    "reason": "User decision 2026-11-26: retain AutoEQ downloads, refuse other repositories/sites, retain local file loading.",
+    "replacement": "AutoEQの測定CSV、GitHub上のAutoEQの結果ページやフォルダーへのリンクを貼り付け、Enterキーを押しても読み込めます。他のリポジトリやサイトへのリンクは使えません。他の測定元のファイルは端末に保存して **Load Measurement** で読み込んでください。",
+    "anchor": "測定データファイルへのリンクを貼り付けてEnterキーを押しても読み込めます。GitHub上のAutoEQの結果ページやフォルダへのリンクも使えます。",
+    "scope_heading_id": "headphone-eq"
+  },
+  {
+    "operation": "replace_inline",
+    "reason": "Describe the verified index/measurement GET timing, local matching, browser headers, and offline option.",
+    "replacement": "検索欄に初めてフォーカスしたときに機種の一覧を取得し、機種を選ぶかAutoEQのリンクを読み込んだときに測定CSVを取得します。取得先はGitHubのAutoEQプロジェクトのファイル配信用ホスト（raw.githubusercontent.com）です。入力した検索語は端末内で照合し、外部へ送りません。音声、設定、端末内のファイル名や内容も送りません。通信先にはIPアドレスやブラウザーの識別情報、音響調整の端末内ページを示す参照元の情報が伝わります。**Load Measurement** や **Load Target** で端末内のファイルだけを読み込む場合は通信しません。",
+    "anchor": "この欄を使ったときにだけGitHubからダウンロードされます。",
+    "scope_heading_id": "headphone-eq"
+  },
+  {
+    "operation": "replace_inline",
+    "reason": "The standalone measurement page and pipeline handoff are not shipped; preserve bundled JSON import.",
+    "replacement": "測定の取り込みには、測定選択欄の **測定をインポート…** ボタンを使ってください。",
+    "anchor": "測定を選んだ状態のRoom EQを追加するには、周波数応答測定ツールで結果の下にある **Room EQ設定をコピー** をクリックし、エフェクトパイプラインの空いている所をクリックしてCtrl+Vで貼り付けます。マルチチャンネル測定では、測定した各チャンネルの **Measurement ChN** が設定されます。",
+    "scope_heading_id": "room-eq"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Give new Headphone EQ subsections distinct IDs to preserve published fragments.",
+    "replacement": "<h3 id=\"headphone-eq-パラメータ\">パラメータ</h3>",
+    "anchor": "<h3 id=\"パラメータ-10\">パラメータ</h3>",
+    "scope_heading_id": "headphone-eq"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"パラメータ-10\">パラメータ</h3>",
+    "anchor": "<h3 id=\"パラメータ-11\">パラメータ</h3>",
+    "scope_heading_id": "hi-pass-filter"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"パラメータ-11\">パラメータ</h3>",
+    "anchor": "<h3 id=\"パラメータ-12\">パラメータ</h3>",
+    "scope_heading_id": "lo-pass-filter"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"パラメータ-12\">パラメータ</h3>",
+    "anchor": "<h3 id=\"パラメータ-13\">パラメータ</h3>",
+    "scope_heading_id": "loudness-equalizer"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"パラメータ-13\">パラメータ</h3>",
+    "anchor": "<h3 id=\"パラメータ-14\">パラメータ</h3>",
+    "scope_heading_id": "narrow-range"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"パラメータ-14\">パラメータ</h3>",
+    "anchor": "<h3 id=\"パラメータ-15\">パラメータ</h3>",
+    "scope_heading_id": "room-eq"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"パラメータ-15\">パラメータ</h3>",
+    "anchor": "<h3 id=\"パラメータ-16\">パラメータ</h3>",
+    "scope_heading_id": "tilt-eq"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"パラメータ-16\">パラメータ</h3>",
+    "anchor": "<h3 id=\"パラメータ-17\">パラメータ</h3>",
+    "scope_heading_id": "tonal-balance-eq"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"パラメータ-17\">パラメータ</h3>",
+    "anchor": "<h3 id=\"パラメータ-18\">パラメータ</h3>",
+    "scope_heading_id": "tone-control"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Give new Headphone EQ subsections distinct IDs to preserve published fragments.",
+    "replacement": "<h3 id=\"headphone-eq-ビジュアル表示\">ビジュアル表示</h3>",
+    "anchor": "<h3 id=\"ビジュアル表示-10\">ビジュアル表示</h3>",
+    "scope_heading_id": "headphone-eq"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"ビジュアル表示-10\">ビジュアル表示</h3>",
+    "anchor": "<h3 id=\"ビジュアル表示-11\">ビジュアル表示</h3>",
+    "scope_heading_id": "hi-pass-filter"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"ビジュアル表示-11\">ビジュアル表示</h3>",
+    "anchor": "<h3 id=\"ビジュアル表示-12\">ビジュアル表示</h3>",
+    "scope_heading_id": "lo-pass-filter"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"ビジュアル表示-12\">ビジュアル表示</h3>",
+    "anchor": "<h3 id=\"ビジュアル表示-13\">ビジュアル表示</h3>",
+    "scope_heading_id": "loudness-equalizer"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"ビジュアル表示-13\">ビジュアル表示</h3>",
+    "anchor": "<h3 id=\"ビジュアル表示-14\">ビジュアル表示</h3>",
+    "scope_heading_id": "narrow-range"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"ビジュアル表示-14\">ビジュアル表示</h3>",
+    "anchor": "<h3 id=\"ビジュアル表示-15\">ビジュアル表示</h3>",
+    "scope_heading_id": "room-eq"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"ビジュアル表示-15\">ビジュアル表示</h3>",
+    "anchor": "<h3 id=\"ビジュアル表示-16\">ビジュアル表示</h3>",
+    "scope_heading_id": "tilt-eq"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"ビジュアル表示-16\">ビジュアル表示</h3>",
+    "anchor": "<h3 id=\"ビジュアル表示-17\">ビジュアル表示</h3>",
+    "scope_heading_id": "tonal-balance-eq"
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Preserve this existing subsection fragment after adding Headphone EQ.",
+    "replacement": "<h3 id=\"ビジュアル表示-17\">ビジュアル表示</h3>",
+    "anchor": "<h3 id=\"ビジュアル表示-18\">ビジュアル表示</h3>",
+    "scope_heading_id": "tone-control"
   }
 ]

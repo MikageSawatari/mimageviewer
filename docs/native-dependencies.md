@@ -156,9 +156,9 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 - **ソース**: [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)
   (毎週月曜に Chromium 最新版から自動ビルド)
 - **アセット**: `pdfium-win-x64.tgz` (V8 なし版、軽量)
-- **現在のバージョン**: `chromium/8165` (`160.0.8165.0`、2026-11-19 更新)。
-  `vendor/pdfium/VERSION` と資産照合・hash は [更新記録](dependency-update-20261119.md) を参照
-  (前回の 8138 は [2026-11-10 の記録](dependency-update-20261110.md))
+- **現在のバージョン**: `chromium/8179` (`160.0.8179.0`、2026-11-26 更新)。
+  `vendor/pdfium/VERSION` と資産照合・hash は [更新記録](dependency-update-20261126.md) を参照
+  (前回の 8165 は [2026-11-19 の記録](dependency-update-20261119.md))
 
 ### リリース前チェック (必須)
 

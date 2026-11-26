@@ -14,16 +14,16 @@
   {
     "operation": "replace_metadata",
     "field": "title",
-    "anchor": "その他のプラグイン - テストトーン／ノイズジェネレーター、SoundFont Note Player、SoundFont Player - EffeTune",
+    "anchor": "その他のプラグイン - Distortion Correction、テストトーン／ノイズジェネレーター、SoundFont Note Player、SoundFont Player - EffeTune",
     "replacement": "その他のプラグイン - テストトーン／ノイズジェネレーターとSoundFont Note Player - EffeTune",
-    "reason": "Do not advertise MIDI SoundFont Player in the category title when its section is excluded for mIV."
+    "reason": "Do not advertise Distortion Correction or MIDI SoundFont Player in the category title when their sections are excluded for mIV."
   },
   {
     "operation": "replace_metadata",
     "field": "description",
-    "anchor": "スピーカーやヘッドホンの確認用にテストトーンやホワイト／ピンクノイズを出すOscillatorと、入力音から検出した音をSF2/SF3/SFZ音源で鳴らすSoundFont Note Playerを収録しています。SoundFont PlayerはSF2/SF3 SoundFontやSFZ音源でMIDI曲を演奏します。",
+    "anchor": "Distortion Correctionは、お使いのスピーカーで測定した歪みを低減します。スピーカーやヘッドホンの確認用にテストトーンやホワイト／ピンクノイズを出すOscillatorと、入力音から検出した音をSF2/SF3/SFZ音源で鳴らすSoundFont Note Playerを収録しています。SoundFont PlayerはSF2/SF3 SoundFontやSFZ音源でMIDI曲を演奏します。",
     "replacement": "スピーカーやヘッドホンの確認用にテストトーンやホワイト／ピンクノイズを出すOscillatorと、入力音から検出した音をSF2/SF3/SFZ音源で鳴らすSoundFont Note Playerを収録しています。",
-    "reason": "Remove the standalone MIDI player promise from search metadata as well as the visible body."
+    "reason": "Remove unavailable measurement correction and standalone MIDI playback from search metadata as well as the visible body."
   },
   {
     "operation": "replace_html",
@@ -54,5 +54,11 @@
     "heading_id": "プラグイン一覧",
     "content": "主要なエフェクトカテゴリーを補完する、専用のオーディオツールとジェネレーターをまとめたものです。スピーカー、ヘッドホン、左右チャンネルのバランス、再生時の挙動を、音楽を聴く前や聴いている途中に確認するために役立ちます。",
     "reason": "Retain the category introduction when exact heading selection excludes the standalone MIDI SoundFont Player section."
+  },
+  {
+    "operation": "replace_html",
+    "reason": "Distortion Correction is hidden from the add choices; its standalone measurement page is not shipped.",
+    "anchor": "<li><p><a href=\"#distortion-correction\">Distortion Correction</a> - お使いのスピーカーで測定した歪みを低減</p></li>",
+    "replacement": ""
   }
 ]

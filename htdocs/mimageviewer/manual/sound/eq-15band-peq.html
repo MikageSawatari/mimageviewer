@@ -37,6 +37,7 @@
 <a href="eq-earphone-cable-sim.html" class="sub">Earphone Cable Sim</a>
 <a href="eq-group-delay-eq.html" class="sub">Group Delay EQ</a>
 <a href="eq-group-delay-peq.html" class="sub">Group Delay PEQ</a>
+<a href="eq-headphone-eq.html" class="sub">Headphone EQ</a>
 <a href="eq-hi-pass-filter.html" class="sub">Hi Pass Filter</a>
 <a href="eq-lo-pass-filter.html" class="sub">Lo Pass Filter</a>
 <a href="eq-loudness-equalizer.html" class="sub">Loudness Equalizer</a>
@@ -57,7 +58,7 @@
 <a href="license.html">MIT License</a>
   </nav></aside>
   <main class="content">
-    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/5ffca1b31e8a74ada7140aefd0c9c9fe4b7740da/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
+    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/0ffa5c709ed1f1c99e5c94149ccd45c15e501e9d/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
 <h1 id="15band-peq" class="page-title">15Band PEQ</h1>
 
 <p><a href="eq.html">カテゴリの説明とプラグイン一覧</a></p>
@@ -92,6 +93,7 @@
 <li><p>4kHz, 6.3kHz, 10kHz, 16kHz (高音域)</p></li></ul></li></ul></li>
 <li><p><strong>各バンドのコントロール</strong></p>
 <ul>
+<li><p>各バンドのタブには Type、Freq、Gain、Q が 1 行ずつ並び、Freq、Gain、Q はスライダーでも数値入力でも設定できる</p></li>
 <li><p>Center Frequency: 20Hz から 20kHz まで調整可能</p></li>
 <li><p>Gain Range: Peaking と Low/High Shelf フィルターでは ±20dB</p></li>
 <li><p>Q Factor: 多くのフィルタータイプでは 0.1-10.0、Low/High Shelf では 0.1-2.0</p></li>
@@ -105,13 +107,17 @@
 <li><p>Band Pass: 特定帯域への集中</p></li>
 <li><p>Notch: 特定周波数の精密な除去</p></li>
 <li><p>AllPass: 位相を中心にした周波数調整</p></li></ul></li></ul></li>
+<li><p><strong>Master タブ</strong></p>
+<ul>
+<li><p>Gain: 全バンドを通ったあとの全体の音量を -20dB から +20dB の範囲で調整する。バンドで持ち上げた分のヘッドルームを確保したいときに下げる。応答グラフにもこの Gain が反映される</p></li></ul></li>
 <li><p><strong>プリセット管理</strong></p>
 <ul>
 <li><p>Import: Equalizer APO風のTXTフィルター行を読み込み</p></li>
-<li><p>最大15個の <code>ON</code> PK/LS/LSC/HS/HSC フィルターを読み込む。<code>Preamp</code> 行と未対応のフィルタータイプは無視される。</p>
+<li><p>最大15個の <code>ON</code> PK/LS/LSC/HS/HSC フィルターを読み込み、<code>Preamp</code> 行は Master タブの Gain に反映される(行がなければ 0dB)。未対応のフィルタータイプは無視される。</p>
 <ul>
 <li><p>形式例：</p>
-<pre><code>Filter 1: ON PK Fc 50 Hz Gain -3.0 dB Q 2.00
+<pre><code>Preamp: -6.0 dB
+Filter 1: ON PK Fc 50 Hz Gain -3.0 dB Q 2.00
 Filter 2: ON HS Fc 12000 Hz Gain 4.0 dB Q 0.70
 ...</code></pre></li></ul></li></ul></li></ul>
 <h2 id="ビジュアル表示-1">ビジュアル表示</h2>

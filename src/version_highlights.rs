@@ -1402,6 +1402,24 @@ const TABLE: &[VersionHighlights] = &[
             },
         ],
     },
+    VersionHighlights {
+        version: "5.8.0",
+        must_read: &[],
+        highlights: &[
+            HighlightItem {
+                title: "ヘルプの「AI で調べる」",
+                body: "ヘルプメニューから、案内の文を入れた AI の会話を開いて mIV の使い方を質問できます。AI 連携に登録した Claude Desktop・ChatGPT があれば、そのアプリで開きます。",
+            },
+            HighlightItem {
+                title: "音響調整の Headphone EQ",
+                body: "音響調整に、ヘッドホンの測定データから補正する Headphone EQ が加わりました。機種を検索したときだけ、測定データを取得します。",
+            },
+            HighlightItem {
+                title: "一括エクスポートの強化",
+                body: "一覧からの一括エクスポートで、形式・品質・サイズ・保存先・同じ名前の扱い・透かしを選べ、設定をプリセットとして保存できます。",
+            },
+        ],
+    },
 ];
 
 #[cfg(test)]

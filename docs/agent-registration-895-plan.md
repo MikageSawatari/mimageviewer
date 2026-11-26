@@ -223,3 +223,34 @@ ChatGPT (Codex) の登録先 (`CODEX_HOME` / `.codex`) も同じ関数の形で�
   - ui_snapshot の filter `agent_integration|agent_registration`: 300d98c9d で 11/11 成功。画像の更新はない (フィクスチャは「手順を見る」も成功の文も表示しない)。
   - `check_ui_glyphs` は成功。本体 lib の全件は未実行 (取り込みの後に統括)。
   - 修正後の mIV で Claude Desktop・ChatGPT へ登録する実機確認は、まだ誰も行っていない。
+
+## 9. 追加修正: 解除で空になった親を残さない (2026-11-26)
+
+サブ PC 担当の実機確認 (修正後の master、Claude Desktop 6.28899.6) では、登録前に `mcpServers` が無い設定へ
+登録してから解除すると、`"mcpServers": {}` が残り、4149 バイトから 4169 バイトになった。
+コードでも、Claude・ChatGPT とも登録時に作った親を解除時に残す経路になっていた。
+
+解除で `mimageviewer` を実際に消し、その結果 Claude の `mcpServers` / ChatGPT の `mcp_servers` が空になった場合だけ、
+親ごと消す。ただし ChatGPT では、利用者のデータを消さないため、親にコメントが付いていれば空になっても親を残す。
+親の key の装飾、表の見出しの前・行末、inline 表の値の装飾と内部 (TOML 1.1 の改行・コメントを含む) を
+1 つの関数で判定し、コメントは別の場所へ移さない。親を残す場合は従来どおり `mimageviewer` だけを消す。
+対象項目が無い解除では空の親もそのまま残し、`Unchanged` の判定を変えない。他のサーバーが在れば親を残す。
+ChatGPT の inline・dotted key の親にも同じ規則を使う。Claude の JSON の扱いは変えない。
+
+登録前の状態や `.orig.bak` は参照せず、新しい状態を持たない。登録前から空の親が在った場合も、コメントの付いた ChatGPT の親を除き、
+登録してから解除すれば親ごと消える。空の親と親が無い状態は AI アプリにとって同じ意味なので、この違いは割り切る。
+ChatGPT は登録時に親を新設する場合だけ `set_implicit(true)` とし、`[mcp_servers]` の見出しを出さず
+`[mcp_servers.mimageviewer]` を足す。既存の親の書き方は変えない。
+
+toml_edit 0.25.19 のソースでは、空の multiline inline 表の内部コメントは最初は親の `trailing` に在る。
+項目を足すだけでは、書き出した内容の再解析時に、そのコメントが追加項目の値の行末装飾へ取り込まれ、解除で値ごと消える。
+`{` と同じ行の内部コメントも同じ経路になる。登録時は親の `trailing` にコメントがある場合だけ末尾カンマを付け、
+再解析後も内容を親側に保つ。コメントの判定は親の保持判定と同じ小さな関数を使う。
+内部コメントのある改行入り inline 表は元から TOML 1.1 を必要とする。空白だけの場合は末尾カンマを追加せず、
+TOML 1.0 の読み手との互換性を保つ。解除で空になった inline 表にはカンマは出力されず、元のコメント・空白が残る。
+登録前の状態の保存や、解除時にコメントを移す処理は追加しない。
+
+追加修正のビルド・テストは設計担当の共有 runner へ引き継ぐ。実装担当は cargo・製品起動・実設定ファイルへのアクセスを行わない。
+
+記録 (2026-11-26): 実装は Codex GPT-6.1 Sol / high (a88b39101、b403ed764)。独立実装レビュー (別の GPT-6.1 Sol / xhigh): r1 REVISE (P2: 空の TOML の親を消すとコメントも消える) → r2 ACCEPT WITH CHANGES (P3: mcp-integration-plan の記述に例外が無い、直した)。
+設計担当の共有 runner で lib の filter `agent_registration::|ui_dialogs::agent_integration::` が 91/91 成功 (b403ed764)。修正後の実機確認は未。

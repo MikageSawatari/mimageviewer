@@ -1807,6 +1807,7 @@ impl App {
         // Drawing samples and a physical hold remaining after this pass are
         // different facts: a completed click must not latch primary suppression.
         if self.edit_preview_owns_canvas(
+            ctx,
             self.erase_preview_active,
             primary_down && ctx.input(|i| i.pointer.primary_down()),
         ) {

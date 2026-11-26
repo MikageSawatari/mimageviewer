@@ -178,5 +178,17 @@
     "anchor": "音声解析でもMIDIでも、1拍ごとに円周を1周する点の表示を切り替えられます。",
     "replacement": "音声解析による拍に合わせて、1拍ごとに円周を1周する点の表示を切り替えられます。",
     "reason": "Do not promise MIDI beat input from mIV."
+  },
+  {
+    "operation": "replace_paragraph",
+    "reason": "The standalone browser and its media information are unavailable in mIV Sound.",
+    "anchor": "デスクトップ版では、内蔵ブラウザのページがOSのメディア操作向けに提供する曲情報も、**Title**、**Artist**、**Album**、**Artwork**、**Track information**に表示できます。ブラウザが再生中のとき、またはプレーヤーに曲がないときはブラウザの情報を、それ以外はプレーヤーの曲を表示します。サイトが曲情報を提供しない場合、**Title**、**Artist**、**Album**、**Artwork**は空になります。**Track information**の先頭行は「ブラウザ - 」に続けてサイトのホスト名が入ります。",
+    "replacement": ""
+  },
+  {
+    "operation": "replace_paragraph",
+    "reason": "Counter uses the existing mIV playback position; no standalone browser is shipped.",
+    "anchor": "内蔵ブラウザで再生中のページでは、**Counter** と **Seek Bar** は再生位置と長さを表示するだけです。AirPlayと同様に、シークや**Playback Control**の操作は使えません。",
+    "replacement": ""
   }
 ]

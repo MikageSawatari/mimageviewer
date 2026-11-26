@@ -77,9 +77,17 @@ impl EditPreviewHoldState {
 
 impl App {
     /// Navigation is resolved first. Preview owns any remaining canvas press until release.
-    pub(crate) fn edit_preview_owns_canvas(&mut self, active: bool, primary_down: bool) -> bool {
+    pub(crate) fn edit_preview_owns_canvas(
+        &mut self,
+        ctx: &egui::Context,
+        active: bool,
+        primary_down: bool,
+    ) -> bool {
         if active && primary_down {
-            self.fs_primary_suppression.arm_pointer_stream();
+            let _ = self.arm_fs_primary_suppression(
+                ctx,
+                crate::ui_fullscreen::FullscreenPrimarySuppressionReason::Other,
+            );
         }
         active
     }
