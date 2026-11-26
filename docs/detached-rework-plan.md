@@ -1491,6 +1491,8 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   - 合意: 段 2b の実装の独立レビュー (GPT-6 Astra / medium、read-only、新しい会話、対象 e4447cd07、判定 ACCEPT) で、レビュー担当の言葉:「既存の context・表示先・遷移の述語によってメイン専用の利用範囲を定義する構造的な決定であり、症状パッチではありません。今回の差分は detached の述語、viewport、窓の寿命、context の取り付け、bundle の所有境界を変更していません。」設計担当 ClaudeCode も、要求を描画の所有者へ返して既存の判定で実行するだけの構造的な修正であることに同意する。
 - 実装の段 3 (2026-11-25、adc256441〜13558102f): native 動画のリング・ジェスチャーの、既存の別ウィンドウの命令へ委ねる経路 (`queue_recognized_detached_right_drag_command` 等) は変えず、`ScriptSlot*` に解決された要求は共通の利用資格の関数で拒否される。native 動画の入口 (キー・Browser キー・XButton・中ボタン・リング) と egui の動画・音楽の表示は、同じ利用資格を通してから実行する。別ウィンドウの述語・viewport・窓の寿命・context の取り付け・bundle は変えていない。App の pending や bundle の項目は足していない。
   - 合意: 段 3 の実装の独立レビュー (GPT-6 Astra / medium、read-only、新しい会話、対象 13558102f、判定 ACCEPT WITH CHANGES、指摘は設計書の文書の P3 だけ) で、レビュー担当の言葉:「今回の触れ方は、既存の context・表示先・遷移の事実でメイン専用の利用範囲を定める構造的な決定であり、症状パッチではありません。detached の述語、viewport、窓の寿命、context の取り付け、bundle の所有境界は変更していません。」設計担当 ClaudeCode も同意する。
+- 実装の段 4 (2026-11-25〜26、c7627e6fc〜47fdcb264): イベントの検出はメインの context だけで行う。基準・覚えておく本の構成の `Arc`・フレームの番号 (ROOT の `cumulative_frame_nr_for`)・時刻は App 側に置き、bundle に入れない。取り付け中の別の context からの検出は、基準を更新する前に共通の利用資格で拒否する。別ウィンドウの述語・viewport・窓の寿命・context の取り付け・bundle は変えていない。
+  - 合意: 段 4 の実装の独立レビュー (GPT-6 Astra / medium、read-only、1 回目は新しい会話・対象 cf856ebba、3 回目の 47fdcb264 で ACCEPT) で、レビュー担当の言葉 (1 回目):「既存の context・表示先・遷移の述語でメイン専用の所有範囲を定める構造的な決定であり、症状パッチではありません。」3 回目も「既存の所有境界に沿う構造的な決定であり、症状パッチではありません。今回もdetachedの述語・viewport・窓の寿命・contextの取り付け・bundleは変更されていません。」設計担当 ClaudeCode も同意する。
 - 段 4 (イベント) の実装の後に独立レビューを受け、結果をここに足す。
 
 ### 2026-11-23: ブラウザ閲覧の保存先のフォルダはページ構成の既定を単ページにする (§1.870、設計の段階。実装はこれから)
