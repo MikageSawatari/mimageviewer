@@ -75,12 +75,45 @@ fn image_combine_recipe_annotation_space_defaults_without_migration_and_rejects_
     let mut json = serde_json::to_value(&recipe).unwrap();
     for item in json["items"].as_array_mut().unwrap() {
         item.as_object_mut().unwrap().remove("annotation_space");
-        item.as_object_mut().unwrap().remove("composition_identity");
     }
     let decoded: CombineRecipe = serde_json::from_value(json).unwrap();
     assert_eq!(decoded, recipe);
     recipe.items[0].annotation_space = Some([0, 100]);
     assert!(save_recipe(data.path(), &data.path().join("output.png"), &recipe).is_err());
+}
+
+#[test]
+fn image_combine_recipe_requires_composition_identity_field_on_every_item() {
+    let data = tempfile::tempdir().unwrap();
+    let output = data.path().join("combined.png");
+    let recipe = recipe(data.path());
+    save_recipe(data.path(), &output, &recipe).unwrap();
+    let connection = connection(&data.path().join("combine.db"), true).unwrap();
+    let key = crate::adjustment_db::normalize_path(&output);
+    for missing in 0..recipe.items.len() {
+        let mut json = serde_json::to_value(&recipe).unwrap();
+        json["items"][missing]
+            .as_object_mut()
+            .unwrap()
+            .remove("composition_identity");
+        let json = serde_json::to_string(&json).unwrap();
+        connection
+            .execute(
+                "UPDATE combine_recipes SET recipe = ?1 WHERE output_key = ?2",
+                rusqlite::params![json, key],
+            )
+            .unwrap();
+        let error = load_recipe(data.path(), &output).unwrap_err();
+        assert!(error.contains("composition_identity"), "{error}");
+        let preserved: String = connection
+            .query_row(
+                "SELECT recipe FROM combine_recipes WHERE output_key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, json);
+    }
 }
 
 #[test]

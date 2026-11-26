@@ -384,6 +384,7 @@ mod tests {
             BookComposition, BookCompositionService, CompositionPageRef, PageDomain,
             ReadingDirection,
         };
+        use crate::ui_dialogs::image_combine::CombineSession;
         use std::io::Write;
         let mut app = crate::app::setup_app_for_test();
         let physical = app.tmp.path().join("converted.zip");
@@ -430,8 +431,9 @@ mod tests {
             format: crate::image_combine::CombineFormat::Png,
             items: vec![spec],
         };
-        crate::image_combine::store::save_recipe(app.tmp.path(), &output, &recipe).unwrap();
-        let spec = crate::image_combine::store::load_recipe(app.tmp.path(), &output)
+        let data_dir = crate::data_dir::get();
+        crate::image_combine::store::save_recipe(&data_dir, &output, &recipe).unwrap();
+        let spec = crate::image_combine::store::load_recipe(&data_dir, &output)
             .unwrap()
             .unwrap()
             .items
@@ -474,6 +476,79 @@ mod tests {
                     .unwrap()
             );
         }
+        // A development recipe without the identity must fail before a dialog
+        // or output worker can be admitted, rather than guessing from the cache.
+        let mut legacy = serde_json::to_value(&recipe).unwrap();
+        legacy["items"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("composition_identity");
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        let connection = rusqlite::Connection::open(data_dir.join("combine.db")).unwrap();
+        let key = crate::adjustment_db::normalize_path(&output);
+        connection
+            .execute(
+                "UPDATE combine_recipes SET recipe = ?1 WHERE output_key = ?2",
+                rusqlite::params![legacy_json, key],
+            )
+            .unwrap();
+        let previous_updated_at: i64 = connection
+            .query_row(
+                "SELECT updated_at FROM combine_recipes WHERE output_key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        app.items = vec![GridItem::Image(output.clone())];
+        app.image_combine
+            .index
+            .set_keys_for_test([key.clone()].into());
+        let ctx = eframe::egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        app.open_image_combine_reopen_context_dialog(&ctx, Some(0), false);
+        assert!(matches!(
+            app.image_combine.session,
+            Some(CombineSession::ReopenLoading(_))
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while matches!(
+            app.image_combine.session,
+            Some(CombineSession::ReopenLoading(_))
+        ) {
+            ctx.run_ui(Default::default(), |ui| {
+                app.draw_image_combine_dialog(ui.ctx())
+            })
+            .drop_without_applying_deltas();
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reopen read did not finish"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            app.image_combine.session.is_none(),
+            "legacy recipe must never open a dialog"
+        );
+        let message = &app.fs_feedback_toast.as_ref().unwrap().0;
+        assert!(
+            message.starts_with("結合の構成を読み込めません"),
+            "{message}"
+        );
+        assert!(message.contains("composition_identity"), "{message}");
+        assert!(
+            app.export_pending.is_none(),
+            "hidden page must never reach export"
+        );
+        assert!(!output.exists(), "hidden page must never be written");
+        let preserved: (String, i64) = connection
+            .query_row(
+                "SELECT recipe, updated_at FROM combine_recipes WHERE output_key = ?1",
+                [&key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, (legacy_json, previous_updated_at));
+        assert!(!original_check.permits().unwrap());
         owner.shutdown_and_join();
     }
 

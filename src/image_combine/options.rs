@@ -379,7 +379,9 @@ pub enum CombineSourceRef {
 pub struct CombineItemSpec {
     pub source: CombineSourceRef,
     /// Logical permission identity; the source may point into a conversion cache.
-    #[serde(default)]
+    /// The JSON field is required, including an explicit null for ordinary images.
+    // Plain Option deserialization accepts a missing field even without `default`.
+    #[serde(deserialize_with = "Deserialize::deserialize")]
     pub composition_identity: Option<crate::book_resume_db::PageIdentity>,
     #[serde(default)]
     pub label_override: Option<String>,
