@@ -59189,10 +59189,20 @@ impl App {
         std::collections::VecDeque<crate::ui_dialogs::export_batch::ExportBatchTarget>,
         usize,
     ) {
+        self.grid_batch_export_targets_for_indices(self.grid_selection_indices())
+    }
+
+    pub(crate) fn grid_batch_export_targets_for_indices(
+        &self,
+        indices: impl IntoIterator<Item = usize>,
+    ) -> (
+        std::collections::VecDeque<crate::ui_dialogs::export_batch::ExportBatchTarget>,
+        usize,
+    ) {
         use crate::ui_dialogs::export_batch::ExportBatchTarget;
         let mut targets = std::collections::VecDeque::new();
         let mut skipped = 0usize;
-        for idx in self.grid_selection_indices() {
+        for idx in indices {
             // スタックの集約セルは、本への追加と同じくメンバーを 1 枚ずつ展開する
             // (1 idx = N メンバーなので idx ベースの経路には乗らない)。
             if let Some(member_paths) = self.stack_member_paths(idx) {
@@ -60147,7 +60157,7 @@ impl App {
                     Some(crate::ui_dialogs::image_combine::CombineSession::Writing { .. })
                 )
             {
-                self.finish_combine_write();
+                self.finish_combine_write(ctx);
             }
             self.export_pending = None;
         }
@@ -60246,7 +60256,8 @@ impl App {
         }
 
         // Same-as-source can write into multiple folders. Refresh the displayed one once.
-        let first_success_path = if refresh_after_done {
+        // Combine schedules its operation rescan and selection in its finish handler.
+        let first_success_path = if refresh_after_done && !combine {
             let current = self.current_favorite_target();
             self.export_pending.as_ref().and_then(|p| {
                 p.successes
@@ -60272,7 +60283,7 @@ impl App {
                 Some(crate::ui_dialogs::image_combine::CombineSession::Writing { .. })
             )
         {
-            self.finish_combine_write();
+            self.finish_combine_write(ctx);
         }
         if clear_pending {
             self.export_pending = None;

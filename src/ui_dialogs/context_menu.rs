@@ -1617,6 +1617,12 @@ impl crate::app::App {
                     local: availability(crate::ui_pinned_search::PinnedSearchKind::Local),
                 }
             });
+        let combine_target_count = if target.surface == ContextMenuSurface::Grid {
+            self.image_combine_context_targets(target.item_index, target.is_folder_context)
+                .len()
+        } else {
+            0
+        };
         let input = ContextMenuInput {
             search_by_name,
             kind: ContextMenuItemKind::from_grid_item(&target.item),
@@ -1633,8 +1639,9 @@ impl crate::app::App {
             checked_count: target.checked_count,
             checked_file_operation_selection: target.checked_file_operation_selection,
             can_use_folder_commands: target.folder_command_target.is_some(),
+            combine_target_count,
             combine_disabled_reason: if target.surface == ContextMenuSurface::Grid {
-                self.grid_combine_disabled_reason()
+                self.combine_disabled_reason_for_count(combine_target_count)
             } else {None},
             caption_creation_disabled_reason: if target.surface == ContextMenuSurface::Grid {
                 self.caption_creation_disabled_reason(target.is_folder_context)
@@ -1987,7 +1994,11 @@ impl crate::app::App {
             }
             MenuCommand::CombineSelection => {
                 if target.surface == ContextMenuSurface::Grid {
-                    self.open_image_combine_dialog(ctx);
+                    self.open_image_combine_context_dialog(
+                        ctx,
+                        target.item_index,
+                        target.is_folder_context,
+                    );
                 }
                 None
             }

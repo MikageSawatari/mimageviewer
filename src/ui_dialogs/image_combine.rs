@@ -6,6 +6,7 @@ use crate::image_combine::{
     *,
 };
 use eframe::egui;
+use std::cell::{Ref, RefCell};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -26,7 +27,7 @@ impl CombineSession {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ItemStatus {
     Preparing,
     Loading,
@@ -34,6 +35,7 @@ enum ItemStatus {
     Failed(String),
 }
 
+#[derive(Clone, PartialEq, Eq)]
 struct DialogItem {
     id: usize,
     spec: CombineItemSpec,
@@ -51,6 +53,48 @@ struct Preview {
     direction: CombineDirection,
 }
 
+/// A draft's actual validation/render inputs, including text that has not parsed
+/// into options yet. Compare by reference on paints; snapshot only on a change.
+struct ValidationInputs {
+    options: CombineOptions,
+    items: Vec<DialogItem>,
+    preparing: bool,
+    split_text: String,
+    custom_ratio_text: Option<String>,
+}
+
+impl ValidationInputs {
+    fn matches(&self, state: &CombineDialogState) -> bool {
+        self.options == state.options
+            && self.items == state.items
+            && self.preparing == !state.pending.is_empty()
+            && self.split_text == state.split_text
+            && self.custom_ratio_text == state.custom_ratio_text
+    }
+
+    fn capture(state: &CombineDialogState) -> Self {
+        Self {
+            options: state.options.clone(),
+            items: state.items.clone(),
+            preparing: !state.pending.is_empty(),
+            split_text: state.split_text.clone(),
+            custom_ratio_text: state.custom_ratio_text.clone(),
+        }
+    }
+}
+
+struct ValidatedDraft {
+    inputs: ValidationInputs,
+    revision: u64,
+    result: Result<Layout, String>,
+}
+
+/// Only successfully submitted render commands belong here, never invalid drafts.
+struct SubmittedPreview {
+    revision: u64,
+    spec: RenderSpec,
+}
+
 pub(crate) struct CombineDialogState {
     request: u64,
     options: CombineOptions,
@@ -58,11 +102,17 @@ pub(crate) struct CombineDialogState {
     pending: VecDeque<(usize, ExportBatchTarget)>,
     /// Taken on transfer to Writing; Drop otherwise cancels the dialog worker.
     worker: Option<worker::Connection>,
-    selected: Option<usize>,
+    /// Stable image ID inside this dialog, independent of App's grid cursor.
+    selected_item_id: Option<usize>,
     dragging: Option<usize>,
     preview: Option<Preview>,
     generation: u64,
-    requested: Option<RenderSpec>,
+    requested: Option<SubmittedPreview>,
+    validation: RefCell<Option<ValidatedDraft>>,
+    #[cfg(test)]
+    layout_searches: std::cell::Cell<usize>,
+    #[cfg(test)]
+    spec_builds: std::cell::Cell<usize>,
     render_error: Option<String>,
     error: Option<String>,
     split_text: String,
@@ -82,6 +132,8 @@ impl Drop for CombineDialogState {
 
 impl CombineDialogState {
     fn spec(&self) -> RenderSpec {
+        #[cfg(test)]
+        self.spec_builds.set(self.spec_builds.get() + 1);
         RenderSpec {
             options: self.options.normalized(),
             items: self
@@ -101,7 +153,24 @@ impl CombineDialogState {
                 .all(|item| matches!(item.status, ItemStatus::Loaded(_)))
     }
 
-    fn validation(&self) -> Result<Layout, String> {
+    fn validation(&self) -> Ref<'_, ValidatedDraft> {
+        let mut cached = self.validation.borrow_mut();
+        if cached
+            .as_ref()
+            .is_none_or(|draft| !draft.inputs.matches(self))
+        {
+            let revision = cached.as_ref().map_or(1, |draft| draft.revision + 1);
+            *cached = Some(ValidatedDraft {
+                inputs: ValidationInputs::capture(self),
+                revision,
+                result: self.compute_validation(),
+            });
+        }
+        drop(cached);
+        Ref::map(self.validation.borrow(), |cached| cached.as_ref().unwrap())
+    }
+
+    fn compute_validation(&self) -> Result<Layout, String> {
         if let Some(item) = self
             .items
             .iter()
@@ -133,7 +202,9 @@ impl CombineDialogState {
                 }
             })
             .collect::<Vec<_>>();
-        let started = std::time::Instant::now();
+        #[cfg(test)]
+        self.layout_searches.set(self.layout_searches.get() + 1);
+        let started = crate::perf::is_enabled().then(std::time::Instant::now);
         let result =
             layout(&self.options, &dims, self.options.labels.band_height()).map_err(|error| {
                 match error {
@@ -145,19 +216,21 @@ impl CombineDialogState {
                     _ => error.to_string(),
                 }
             });
-        crate::perf::event(
-            "image_combine/layout",
-            "complete",
-            None,
-            self.generation,
-            &[
-                ("items", serde_json::json!(dims.len())),
-                (
-                    "ms",
-                    serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
-                ),
-            ],
-        );
+        if let Some(started) = started {
+            crate::perf::event(
+                "image_combine/layout",
+                "complete",
+                None,
+                self.generation,
+                &[
+                    ("items", serde_json::json!(dims.len())),
+                    (
+                        "ms",
+                        serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
         result
     }
 
@@ -174,7 +247,7 @@ impl CombineDialogState {
     }
 
     fn can_write(&self) -> bool {
-        self.validation().is_ok()
+        self.validation().result.is_ok()
             && self.render_error.is_none()
             && self
                 .preview
@@ -194,32 +267,41 @@ impl CombineDialogState {
     }
 
     fn invalidate_and_request(&mut self, ctx: &egui::Context) {
-        let spec = self.spec();
-        if self.requested.as_ref() == Some(&spec) {
+        let (revision, valid) = {
+            let draft = self.validation();
+            (draft.revision, draft.result.is_ok())
+        };
+        if !valid
+            || self
+                .requested
+                .as_ref()
+                .is_some_and(|sent| sent.revision == revision)
+        {
             return;
         }
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        let spec = self.spec();
         self.generation = self.generation.wrapping_add(1);
         self.render_error = None;
-        self.requested = Some(spec.clone());
-        if self.validation().is_ok() {
-            if let Some(worker) = &self.worker {
-                #[cfg(test)]
-                crate::ime_focus::typing_probe::job(
-                    "image_combine_label",
-                    self.typing_label(),
-                    crate::ime_focus::typing_probe::Outcome::Started,
-                );
-                if worker
-                    .tx
-                    .send(Command::Render {
-                        generation: self.generation,
-                        spec,
-                    })
-                    .is_err()
-                {
-                    self.render_error = Some("結合 worker が中断されました".into());
-                }
-            }
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::job(
+            "image_combine_label",
+            self.typing_label(),
+            crate::ime_focus::typing_probe::Outcome::Started,
+        );
+        if worker
+            .tx
+            .send(Command::Render {
+                generation: self.generation,
+                spec: spec.clone(),
+            })
+            .is_err()
+        {
+            self.render_error = Some("結合 worker が中断されました".into());
+        } else {
+            self.requested = Some(SubmittedPreview { revision, spec });
         }
         ctx.request_repaint();
     }
@@ -236,7 +318,6 @@ impl CombineDialogState {
                     if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
                         item.status = ItemStatus::Loaded(dims);
                     }
-                    self.requested = None; // All dimensions must be available before rendering.
                 }
                 Ok(Event::Failed { id, message }) => {
                     if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
@@ -278,18 +359,18 @@ impl CombineDialogState {
                 ids: self
                     .requested
                     .as_ref()
-                    .map(|spec| spec.items.iter().map(|(id, _)| *id).collect())
+                    .map(|sent| sent.spec.items.iter().map(|(id, _)| *id).collect())
                     .unwrap_or_default(),
                 generation,
                 not_drawn,
                 kind: self
                     .requested
                     .as_ref()
-                    .map_or(self.options.layout, |spec| spec.options.layout),
+                    .map_or(self.options.layout, |sent| sent.spec.options.layout),
                 direction: self
                     .requested
                     .as_ref()
-                    .map_or(self.options.direction, |spec| spec.options.direction),
+                    .map_or(self.options.direction, |sent| sent.spec.options.direction),
             });
             #[cfg(test)]
             crate::ime_focus::typing_probe::job(
@@ -325,17 +406,20 @@ impl CombineDialogState {
         if let Some(worker) = &self.worker {
             let _ = worker.tx.send(Command::Remove { ids });
         }
-        if !self.items.iter().any(|item| Some(item.id) == self.selected) {
-            self.selected = self.items.first().map(|item| item.id);
+        if !self
+            .items
+            .iter()
+            .any(|item| Some(item.id) == self.selected_item_id)
+        {
+            self.selected_item_id = self.items.first().map(|item| item.id);
         }
-        self.requested = None;
     }
 
     #[cfg(test)]
     fn typing_label(&self) -> &str {
         self.items
             .iter()
-            .find(|item| Some(item.id) == self.selected)
+            .find(|item| Some(item.id) == self.selected_item_id)
             .and_then(|item| item.spec.label_override.as_deref())
             .unwrap_or("")
     }
@@ -469,8 +553,12 @@ impl App {
     }
 
     pub(crate) fn grid_combine_disabled_reason(&self) -> Option<String> {
+        self.combine_disabled_reason_for_count(self.grid_batch_export_targets().0.len())
+    }
+
+    pub(crate) fn combine_disabled_reason_for_count(&self, count: usize) -> Option<String> {
         entry_disabled_reason(
-            self.grid_batch_export_targets().0.len(),
+            count,
             self.combine_session.is_some(),
             self.export_pending.is_some(),
         )
@@ -478,11 +566,44 @@ impl App {
     }
 
     pub(crate) fn open_image_combine_dialog(&mut self, ctx: &egui::Context) {
-        if let Some(reason) = self.grid_combine_disabled_reason() {
+        let (targets, _) = self.grid_batch_export_targets();
+        self.open_image_combine_with_targets(ctx, targets);
+    }
+
+    pub(crate) fn image_combine_context_targets(
+        &self,
+        clicked: Option<usize>,
+        is_folder_context: bool,
+    ) -> VecDeque<ExportBatchTarget> {
+        let indices = if is_folder_context {
+            Vec::new()
+        } else if self.checked.is_empty() {
+            clicked.into_iter().collect()
+        } else {
+            self.grid_selection_indices()
+        };
+        self.grid_batch_export_targets_for_indices(indices).0
+    }
+
+    pub(crate) fn open_image_combine_context_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        clicked: Option<usize>,
+        is_folder_context: bool,
+    ) {
+        let targets = self.image_combine_context_targets(clicked, is_folder_context);
+        self.open_image_combine_with_targets(ctx, targets);
+    }
+
+    fn open_image_combine_with_targets(
+        &mut self,
+        ctx: &egui::Context,
+        targets: VecDeque<ExportBatchTarget>,
+    ) {
+        if let Some(reason) = self.combine_disabled_reason_for_count(targets.len()) {
             self.show_feedback_warning(reason);
             return;
         }
-        let (targets, _) = self.grid_batch_export_targets();
         let items = targets
             .iter()
             .enumerate()
@@ -546,7 +667,7 @@ impl App {
         self.combine_session = Some(CombineSession::Dialog(Box::new(CombineDialogState {
             request: self.combine_request_sequence,
             options,
-            selected: items.first().map(|item| item.id),
+            selected_item_id: items.first().map(|item| item.id),
             items,
             pending: targets.into_iter().enumerate().collect(),
             worker: Some(worker),
@@ -554,6 +675,11 @@ impl App {
             preview: None,
             generation: 0,
             requested: None,
+            validation: RefCell::new(None),
+            #[cfg(test)]
+            layout_searches: Default::default(),
+            #[cfg(test)]
+            spec_builds: Default::default(),
             render_error: None,
             error: None,
             split_text,
@@ -677,7 +803,7 @@ impl App {
     }
 
     /// Session take is the exactly-once latch, even when completed progress stays open.
-    pub(crate) fn finish_combine_write(&mut self) {
+    pub(crate) fn finish_combine_write(&mut self, ctx: &egui::Context) {
         if !matches!(self.combine_session, Some(CombineSession::Writing { .. })) {
             return;
         }
@@ -692,15 +818,7 @@ impl App {
             .and_then(|pending| pending.successes.first())
             .map(|success| success.path.clone());
         if let Some(path) = path {
-            if let Some(folder) = self.current_folder.clone().filter(|folder| {
-                path.parent()
-                    .is_some_and(|parent| crate::folder_tree::path_eq(parent, folder))
-            }) {
-                self.request_post_operation_selection(
-                    folder,
-                    crate::post_operation_selection::ExpectedOutputs::Known(vec![path.clone()]),
-                );
-            }
+            self.refresh_image_combine_output(ctx, &path);
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             self.show_saved_output_feedback(format!("結合しました: {name}"));
             self.fs_feedback_toast_action =
@@ -891,7 +1009,7 @@ fn footer_error(state: &CombineDialogState) -> Option<String> {
                     .items
                     .iter()
                     .any(|item| matches!(item.status, ItemStatus::Failed(_))))
-            .then(|| state.validation().err())
+            .then(|| state.validation().result.as_ref().err().cloned())
             .flatten()
         })
         .or_else(|| state.output_validation().err())
@@ -942,7 +1060,7 @@ fn footer_height(ui: &egui::Ui, state: &CombineDialogState) -> f32 {
 }
 
 fn status_text(state: &CombineDialogState) -> String {
-    if let Ok(layout) = state.validation() {
+    if let Ok(layout) = &state.validation().result {
         format!(
             "出力 {} × {} px・切り取り 最大 {:.0}%{}",
             layout.canvas_size.0,
@@ -1061,7 +1179,7 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut CombineDialogState, height: f32) 
     if let Some(index) = preview
         .ids
         .iter()
-        .position(|id| Some(*id) == state.selected)
+        .position(|id| Some(*id) == state.selected_item_id)
     {
         if let Some(rect) = rects.get(index) {
             ui.painter().rect_stroke(
@@ -1077,7 +1195,7 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut CombineDialogState, height: f32) 
         .and_then(|pos| rects.iter().position(|rect| rect.contains(pos)));
     if response.clicked() {
         if let Some(index) = hit {
-            state.selected = Some(preview.ids[index]);
+            state.selected_item_id = Some(preview.ids[index]);
         }
     }
     if response.drag_started() {
@@ -1087,8 +1205,8 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut CombineDialogState, height: f32) 
             .input(|input| input.pointer.press_origin())
             .and_then(|pos| rects.iter().position(|rect| rect.contains(pos)))
         {
-            state.selected = Some(preview.ids[index]);
-            state.dragging = state.selected;
+            state.selected_item_id = Some(preview.ids[index]);
+            state.dragging = state.selected_item_id;
         }
     }
     let mut insert = None;
@@ -1135,7 +1253,7 @@ fn draw_item_controls(ui: &mut egui::Ui, state: &mut CombineDialogState) {
     if let Some(index) = state
         .items
         .iter()
-        .position(|item| Some(item.id) == state.selected)
+        .position(|item| Some(item.id) == state.selected_item_id)
     {
         ui.add(egui::Label::new(format!("選んだ画像: {}", state.items[index].name)).truncate());
         ui.horizontal(|ui| {
@@ -1288,7 +1406,7 @@ fn fixture_state_with_fonts(
         items,
         pending: VecDeque::new(),
         worker: None,
-        selected: Some(2),
+        selected_item_id: Some(2),
         dragging: None,
         preview: Some(Preview {
             texture: ctx.load_texture("image_combine_fixture", image, Default::default()),
@@ -1301,6 +1419,11 @@ fn fixture_state_with_fonts(
         }),
         generation: 0,
         requested: None,
+        validation: RefCell::new(None),
+        #[cfg(test)]
+        layout_searches: Default::default(),
+        #[cfg(test)]
+        spec_builds: Default::default(),
         render_error: None,
         error: None,
         split_text: String::new(),

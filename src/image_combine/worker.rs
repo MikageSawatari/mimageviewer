@@ -255,16 +255,18 @@ impl Worker {
                             }
                             Err(message) => Event::Failed { id, message },
                         };
-                        crate::perf::event(
-                            "image_combine/preview_load",
-                            "complete",
-                            None,
-                            id as u64,
-                            &[(
-                                "ms",
-                                serde_json::json!(start.elapsed().as_secs_f64() * 1000.0),
-                            )],
-                        );
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "image_combine/preview_load",
+                                "complete",
+                                None,
+                                id as u64,
+                                &[(
+                                    "ms",
+                                    serde_json::json!(start.elapsed().as_secs_f64() * 1000.0),
+                                )],
+                            );
+                        }
                         if events.send(event).is_err() {
                             return;
                         }
@@ -327,16 +329,18 @@ impl Worker {
                         message,
                     },
                 };
-                crate::perf::event(
-                    "image_combine/preview_render",
-                    "complete",
-                    None,
-                    generation,
-                    &[(
-                        "ms",
-                        serde_json::json!(start.elapsed().as_secs_f64() * 1000.0),
-                    )],
-                );
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "image_combine/preview_render",
+                        "complete",
+                        None,
+                        generation,
+                        &[(
+                            "ms",
+                            serde_json::json!(start.elapsed().as_secs_f64() * 1000.0),
+                        )],
+                    );
+                }
                 if events.send(event).is_err() {
                     return;
                 }
@@ -448,18 +452,20 @@ impl Worker {
                 )
                 .map_err(|e| e.to_string())?;
             }
-            crate::perf::event(
-                "image_combine/item",
-                "complete",
-                None,
-                *id as u64,
-                &[
-                    ("decode_ms", serde_json::json!(decode_ms)),
-                    ("compose_ms", serde_json::json!(compose_ms)),
-                    ("resize_ms", serde_json::json!(resize_ms)),
-                    ("draw_ms", serde_json::json!(draw_ms)),
-                ],
-            );
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "image_combine/item",
+                    "complete",
+                    None,
+                    *id as u64,
+                    &[
+                        ("decode_ms", serde_json::json!(decode_ms)),
+                        ("compose_ms", serde_json::json!(compose_ms)),
+                        ("resize_ms", serde_json::json!(resize_ms)),
+                        ("draw_ms", serde_json::json!(draw_ms)),
+                    ],
+                );
+            }
             let _ = spec.progress.send(ExportEvent::Step {
                 label: loaded.item.filename.clone(),
             });
@@ -481,21 +487,23 @@ impl Worker {
             &save_options,
         )
         .map_err(|e| e.to_string())?;
-        crate::perf::event(
-            "image_combine/encode",
-            "complete",
-            None,
-            0,
-            &[
-                ("width", serde_json::json!(canvas.width())),
-                ("height", serde_json::json!(canvas.height())),
-                ("format", serde_json::json!(extension)),
-                (
-                    "ms",
-                    serde_json::json!(start.elapsed().as_secs_f64() * 1000.0),
-                ),
-            ],
-        );
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "image_combine/encode",
+                "complete",
+                None,
+                0,
+                &[
+                    ("width", serde_json::json!(canvas.width())),
+                    ("height", serde_json::json!(canvas.height())),
+                    ("format", serde_json::json!(extension)),
+                    (
+                        "ms",
+                        serde_json::json!(start.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                ],
+            );
+        }
         drop(canvas);
         Ok(encoded.bytes)
     }

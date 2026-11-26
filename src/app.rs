@@ -48453,6 +48453,34 @@ impl App {
         }
     }
 
+    /// Combine owns its completion selection and operation rescan together.
+    /// A physical listing below the book root need not be a favorite target.
+    pub(crate) fn refresh_image_combine_output(&mut self, ctx: &egui::Context, path: &Path) {
+        if !self.current_listing_accepts_folder_scan()
+            || self.current_folder_last_mtime.is_none()
+            || self.favsearch.on_results_grid()
+            || self.tag_view.on_results_grid()
+        {
+            return;
+        }
+        let Some(folder) = self.current_folder.clone().filter(|folder| {
+            path.parent()
+                .is_some_and(|parent| crate::folder_tree::path_eq(parent, folder))
+        }) else {
+            return;
+        };
+        self.request_post_operation_selection(
+            folder.clone(),
+            crate::post_operation_selection::ExpectedOutputs::Known(vec![path.to_path_buf()]),
+        );
+        self.start_external_rescan_with_cause(
+            ctx,
+            folder,
+            std::time::SystemTime::UNIX_EPOCH,
+            book_append_refresh::FolderRefreshCause::Operation,
+        );
+    }
+
     /// 先送りされた現在フォルダの変更をグリッドへ反映する。
     ///
     /// メイン viewer 中に `load_folder` すると表示が閉じてしまうため、呼び出し側は

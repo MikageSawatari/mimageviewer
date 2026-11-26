@@ -113,6 +113,76 @@ fn image_combine_entry_selection_is_checked_first_and_counts_eligible_targets() 
 }
 
 #[test]
+fn image_combine_context_targets_are_checked_first_else_clicked_independent_of_cursor() {
+    use crate::grid_item::GridItem;
+    let mut app = crate::app::setup_app_for_test();
+    app.items = vec![
+        GridItem::Image("C:/images/cursor.png".into()),
+        GridItem::Video("C:/images/clicked.mp4".into()),
+        GridItem::Image("C:/images/clicked.png".into()),
+    ];
+    app.visible_indices = vec![0, 1, 2];
+    app.move_grid_cursor(Some(0), crate::app::GridCursorIntent::Automatic);
+    assert!(app.image_combine_context_targets(Some(1), false).is_empty());
+    let targets = app.image_combine_context_targets(Some(2), false);
+    assert!(matches!(
+        targets.front(),
+        Some(ExportBatchTarget::Item { idx: 2, .. })
+    ));
+    app.checked.insert(0);
+    let targets = app.image_combine_context_targets(Some(1), false);
+    assert!(matches!(
+        targets.front(),
+        Some(ExportBatchTarget::Item { idx: 0, .. })
+    ));
+    app.checked.clear();
+    app.checked.insert(1);
+    assert!(app.image_combine_context_targets(Some(2), false).is_empty());
+    app.checked.insert(0);
+    assert!(app.image_combine_context_targets(None, true).is_empty());
+    assert_eq!(app.selected, Some(0));
+}
+
+#[test]
+fn image_combine_context_stack_expansion_enforces_the_target_limit() {
+    use crate::filename_stack::{StackMember, StackView};
+    let mut app = crate::app::setup_app_for_test();
+    for count in [100, 101] {
+        let view = StackView::build(
+            PathBuf::from("C:/images"),
+            Vec::new(),
+            Vec::new(),
+            (0..count)
+                .map(|n| StackMember {
+                    path: PathBuf::from(format!("C:/images/post_{n:03}.png")),
+                    mtime: 0,
+                    size: Some(8),
+                    sort_meta: crate::settings::ListingSortMetadata::new(0, Some(8)),
+                    is_video: false,
+                })
+                .collect(),
+            '_',
+            crate::settings::SortOrder::FileName,
+        );
+        app.items = view.materialize_aggregated().0;
+        app.stack_view = Some(Arc::new(view));
+        let targets = app.image_combine_context_targets(Some(0), false);
+        assert_eq!(targets.len(), count);
+        assert!(
+            targets
+                .iter()
+                .all(|target| matches!(target, ExportBatchTarget::StackMember(_)))
+        );
+        let reason = app.combine_disabled_reason_for_count(targets.len());
+        if count == 100 {
+            assert!(reason.is_none());
+        } else {
+            assert!(reason.unwrap().contains("101 枚"));
+        }
+    }
+}
+
+#[test]
 fn image_combine_escape_closes_and_late_worker_result_has_no_receiver() {
     let ctx = egui::Context::default();
     crate::ime_focus::install_ime_input_policy(&ctx);
@@ -155,6 +225,15 @@ fn image_combine_preparation_failure_is_retained_until_explicit_removal() {
     let ctx = egui::Context::default();
     let mut app = crate::app::setup_app_for_test();
     let mut state = fixture_state(&ctx, false);
+    app.items = state
+        .items
+        .iter()
+        .map(|item| crate::grid_item::GridItem::Image(source_path(&item.spec.source).to_path_buf()))
+        .collect();
+    app.move_grid_cursor(Some(3), crate::app::GridCursorIntent::Automatic);
+    app.checked.insert(3);
+    let grid_selection = (app.selected, app.checked.clone());
+    state.selected_item_id = Some(0);
     let (commands, _events, _cancel) = connection(&mut state);
     let count = state.items.len();
     state.pending.push_back((
@@ -170,6 +249,8 @@ fn image_combine_preparation_failure_is_retained_until_explicit_removal() {
     assert!(!state.can_write());
     state.remove_failed();
     assert_eq!(state.items.len(), count - 1);
+    assert_eq!(state.selected_item_id, Some(1));
+    assert_eq!((app.selected, app.checked.clone()), grid_selection);
     assert!(matches!(commands.try_recv().unwrap(),Command::Remove{ids} if ids==vec![0]));
 }
 
@@ -179,8 +260,12 @@ fn image_combine_preview_generation_discards_stale_results_and_reorder_keeps_lab
     let mut state = fixture_state(&ctx, true);
     let (_commands, events, _) = connection(&mut state);
     state.generation = 8;
-    state.requested = Some(state.spec());
-    let layout = state.validation().unwrap();
+    let revision = state.validation().revision;
+    state.requested = Some(SubmittedPreview {
+        revision,
+        spec: state.spec(),
+    });
+    let layout = state.validation().result.as_ref().unwrap().clone();
     for generation in [7, 8] {
         events
             .send(Event::Rendered {
@@ -246,41 +331,221 @@ fn image_combine_poll_step_finish_refresh_selection_and_toast_exactly_once() {
         matches!(&app.fs_feedback_toast_action,Some(crate::feedback::FeedbackAction::OpenInViewer(p)) if *p==path)
     );
     assert!(app.post_operation_selection.is_some());
-    assert_eq!(app.folder_refresh_pending.as_ref().unwrap().folder, folder);
+    assert_eq!(app.external_rescan_pending.as_ref().unwrap().folder, folder);
+    assert!(matches!(
+        app.external_rescan_pending.as_ref().unwrap().cause,
+        crate::app::book_append_refresh::FolderRefreshCause::Operation
+    ));
     app.fs_feedback_toast_action = None;
     app.folder_refresh_pending = None;
     app.poll_export_pending(&ctx);
-    app.finish_combine_write();
+    app.finish_combine_write(&ctx);
     assert!(app.fs_feedback_toast_action.is_none());
+    assert!(app.folder_refresh_pending.is_none());
+    assert!(
+        !app.external_rescan_pending
+            .as_ref()
+            .unwrap()
+            .restart_requested
+    );
+}
+
+#[test]
+fn image_combine_completion_in_other_folder_does_not_refresh_or_select() {
+    let ctx = egui::Context::default();
+    let mut app = crate::app::setup_app_for_test();
+    let books = app.tmp.path().join("books");
+    app.current_folder = Some(books.join("current"));
+    app.current_folder_last_mtime = Some(std::time::SystemTime::now());
+    app.settings.book_root = Some(books);
+    let (p, tx) = pending();
+    app.export_pending = Some(p);
+    app.combine_session = Some(CombineSession::Writing { request: 1 });
+    tx.send(ExportEvent::Completed(ExportSuccess {
+        label: "combined".into(),
+        path: app.tmp.path().join("other/combined.png"),
+    }))
+    .unwrap();
+    tx.send(ExportEvent::AllDone).unwrap();
+    app.poll_export_pending(&ctx);
+    assert!(app.combine_session.is_none());
+    assert!(app.post_operation_selection.is_none());
+    assert!(app.external_rescan_pending.is_none());
     assert!(app.folder_refresh_pending.is_none());
 }
 
 #[test]
-fn image_combine_finish_selection_depends_on_output_folder_not_favorite_eligibility() {
-    for same_folder in [true, false] {
+fn image_combine_poll_completion_refreshes_and_selects_output_under_book_root() {
+    use crate::grid_item::GridItem;
+    for relative in ["", "book", "book/nested"] {
+        let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
         let books = app.tmp.path().join("books");
-        let folder = books.join("current");
-        app.settings.book_root = Some(books);
-        app.current_folder = Some(folder.clone());
-        app.current_folder_last_mtime = Some(std::time::SystemTime::now());
-        assert!(app.current_favorite_target().is_none());
-        let path = if same_folder {
-            folder.join("combined.png")
+        // Joining an empty component adds a trailing separator; the accepted
+        // directory and the output's parent must use the same physical spelling.
+        let folder = if relative.is_empty() {
+            books.clone()
         } else {
-            app.tmp.path().join("other/combined.png")
+            books.join(relative)
         };
-        let (mut p, _tx) = pending();
-        p.end = Some(ExportEnd::Done);
-        p.successes.push(ExportSuccess {
-            label: "combined".into(),
-            path,
-        });
+        std::fs::create_dir_all(&folder).unwrap();
+        app.settings.book_root = Some(books);
+        let first = folder.join("first.png");
+        let output = folder.join("combined.png");
+        for path in [&first, &output] {
+            image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]))
+                .save(path)
+                .unwrap();
+        }
+        app.current_folder = Some(folder.clone());
+        app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
+        app.items = vec![GridItem::Image(first)];
+        app.visible_indices = vec![0];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.selected = Some(0);
+        app.checked.insert(0);
+        let generation_before_refresh = app.items_generation;
+        assert!(app.current_favorite_target().is_none());
+        let (p, tx) = pending();
         app.export_pending = Some(p);
         app.combine_session = Some(CombineSession::Writing { request: 1 });
-        app.finish_combine_write();
-        assert_eq!(app.post_operation_selection.is_some(), same_folder);
+        tx.send(ExportEvent::Completed(ExportSuccess {
+            label: "combined".into(),
+            path: output.clone(),
+        }))
+        .unwrap();
+        tx.send(ExportEvent::AllDone).unwrap();
+        app.poll_export_pending(&ctx);
+        assert!(app.export_pending.is_none());
+        assert!(crate::folder_tree::path_eq(
+            output.parent().unwrap(),
+            &folder
+        ));
+        let scan = app
+            .external_rescan_pending
+            .as_ref()
+            .expect("matching displayed folder must be rescanned");
+        assert_eq!(scan.folder, folder);
+        assert!(matches!(
+            scan.cause,
+            crate::app::book_append_refresh::FolderRefreshCause::Operation
+        ));
+        assert!(!scan.restart_requested);
+        crate::app::tests::phase_c_support::wait_for_external_rescan(&mut app);
+        app.finish_history_restore_preparation_for_test();
+        assert!(
+            app.items_generation > generation_before_refresh,
+            "{relative}: operation refresh must install a new listing"
+        );
+        let index = app.items.iter().position(|item| {
+            matches!(item, GridItem::Image(path) if crate::folder_tree::path_eq(path, &output))
+        }).expect("operation rescan must install the output");
+        assert_eq!(app.selected, Some(index), "{relative}");
+        // The shared operation-selection policy puts only the cursor on a
+        // single output and clears the previous checkmarks.
+        assert!(
+            app.checked.is_empty(),
+            "{relative}: one output has no checkmark"
+        );
+        let selection = app
+            .post_operation_selection
+            .as_ref()
+            .expect("applied Known request is retained");
+        assert!(
+            selection.has_applied(),
+            "{relative}: Known selection must be applied during adoption"
+        );
+        assert!(
+            selection.still_owns_selection(Some(&output), &[]),
+            "{relative}: applied output must own the cursor with nothing checked"
+        );
+        let generation = app.items_generation;
+        app.poll_export_pending(&ctx);
+        app.finish_combine_write(&ctx);
+        app.consume_folder_refresh_pending(&ctx);
+        assert!(app.external_rescan_pending.is_none());
+        assert_eq!(app.items_generation, generation);
     }
+}
+
+fn image_combine_deliver_preview(
+    state: &mut CombineDialogState,
+    commands: &mpsc::Receiver<Command>,
+    events: &mpsc::Sender<Event>,
+    ctx: &egui::Context,
+) -> RenderSpec {
+    let Command::Render { generation, spec } = commands.try_recv().expect("render submitted")
+    else {
+        panic!("expected a render command");
+    };
+    events
+        .send(Event::Rendered {
+            generation,
+            rgba: image::RgbaImage::new(1, 1),
+            layout: state.validation().result.as_ref().unwrap().clone(),
+            not_drawn: 0,
+        })
+        .unwrap();
+    state.poll(ctx);
+    assert!(
+        state.can_write(),
+        "repaired draft must be exportable after preview delivery"
+    );
+    spec
+}
+
+#[test]
+fn image_combine_invalid_manual_split_margin_change_then_repair_submits_preview() {
+    let ctx = egui::Context::default();
+    let mut state = fixture_state(&ctx, false);
+    let (commands, events, _) = connection(&mut state);
+    state.options.split = Split::Counts(vec![2, 2]);
+    state.split_text = "2-2".into();
+    state.invalidate_and_request(&ctx);
+    image_combine_deliver_preview(&mut state, &commands, &events, &ctx);
+    let sent_revision = state.requested.as_ref().unwrap().revision;
+    state.split_text = "2-".into();
+    state.invalidate_and_request(&ctx);
+    state.options.margin = 40;
+    state.invalidate_and_request(&ctx);
+    assert!(!state.can_write());
+    assert!(commands.try_recv().is_err());
+    assert_eq!(state.requested.as_ref().unwrap().revision, sent_revision);
+    state.split_text = "2-2".into();
+    state.invalidate_and_request(&ctx);
+    assert!(!state.can_write());
+    let sent = image_combine_deliver_preview(&mut state, &commands, &events, &ctx);
+    assert_eq!(sent.options.margin, 40);
+    assert_eq!(sent.options.split, Split::Counts(vec![2, 2]));
+    state.invalidate_and_request(&ctx);
+    assert!(commands.try_recv().is_err());
+}
+
+#[test]
+fn image_combine_invalid_custom_ratio_margin_change_then_repair_submits_preview() {
+    let ctx = egui::Context::default();
+    let mut state = fixture_state(&ctx, false);
+    let (commands, events, _) = connection(&mut state);
+    state.options.canvas_ratio = Some((5, 4));
+    state.custom_ratio_text = Some("5:4".into());
+    state.invalidate_and_request(&ctx);
+    image_combine_deliver_preview(&mut state, &commands, &events, &ctx);
+    let sent_revision = state.requested.as_ref().unwrap().revision;
+    state.custom_ratio_text = Some("5:".into());
+    state.invalidate_and_request(&ctx);
+    state.options.margin = 40;
+    state.invalidate_and_request(&ctx);
+    assert!(!state.can_write());
+    assert!(commands.try_recv().is_err());
+    assert_eq!(state.requested.as_ref().unwrap().revision, sent_revision);
+    state.custom_ratio_text = Some("5:4".into());
+    state.invalidate_and_request(&ctx);
+    assert!(!state.can_write());
+    let sent = image_combine_deliver_preview(&mut state, &commands, &events, &ctx);
+    assert_eq!(sent.options.margin, 40);
+    assert_eq!(sent.options.canvas_ratio, Some((5, 4)));
+    state.invalidate_and_request(&ctx);
+    assert!(commands.try_recv().is_err());
 }
 
 #[test]
@@ -490,6 +755,99 @@ fn image_combine_small_viewports_keep_controls_and_settings_scroll_to_end() {
 }
 
 #[test]
+fn image_combine_validation_cache_tracks_dimensions_order_labels_and_options() {
+    let ctx = egui::Context::default();
+    let mut state = fixture_state(&ctx, false);
+    assert!(state.validation().result.is_ok());
+    assert_eq!(state.layout_searches.get(), 1);
+    for change in 0..4 {
+        let previous_revision = state.validation().revision;
+        match change {
+            0 => state.items[0].status = ItemStatus::Loaded((700, 800)),
+            1 => state.move_item(2, Some(0)),
+            2 => state.items[0].spec.label_override = Some("changed".into()),
+            3 => state.options.margin = 40,
+            _ => unreachable!(),
+        }
+        assert!(state.validation().result.is_ok());
+        assert!(state.validation().revision > previous_revision);
+        assert_eq!(state.layout_searches.get(), change + 2);
+        // Selection and output name do not change the composition.
+        state.selected_item_id = Some(1);
+        state.name.push('a');
+        assert!(state.validation().result.is_ok());
+        assert_eq!(state.layout_searches.get(), change + 2);
+    }
+}
+
+#[test]
+fn image_combine_100_target_unchanged_paints_reuse_validation_and_submitted_spec() {
+    const PAINTS: usize = 30;
+    let mut h = harness(egui::vec2(1093.0, 614.0), 1.0, false);
+    h.run_steps(6);
+    let ctx = h.ctx.clone();
+    let state = h.state_mut().dialog.as_mut().unwrap();
+    let template = state.items[0].clone();
+    state.items = (0..100)
+        .map(|id| {
+            let mut item = template.clone();
+            item.id = id;
+            item.name = format!("image-{id}.png");
+            item.spec.source = CombineSourceRef::File {
+                path: PathBuf::from(format!("C:/Pictures/image-{id}.png")),
+            };
+            item.status = ItemStatus::Loaded((600 + (id % 7) as u32 * 100, 800));
+            item
+        })
+        .collect();
+    assert!(matches!(state.options.split, Split::Auto));
+    let (commands, events, _) = connection(state);
+    state.layout_searches.set(0);
+    state.spec_builds.set(0);
+    let cold = std::time::Instant::now();
+    state.invalidate_and_request(&ctx);
+    let cold_elapsed = cold.elapsed();
+    image_combine_deliver_preview(state, &commands, &events, &ctx);
+    assert_eq!(state.layout_searches.get(), 1);
+    assert_eq!(state.spec_builds.get(), 1);
+    // Settle the Window's sizing passes before timing steady-state paints.
+    h.run_steps(6);
+    let start = std::time::Instant::now();
+    for _ in 0..PAINTS {
+        h.state_mut()
+            .dialog
+            .as_mut()
+            .unwrap()
+            .invalidate_and_request(&ctx);
+        h.step();
+        h.state_mut()
+            .dialog
+            .as_mut()
+            .unwrap()
+            .invalidate_and_request(&ctx);
+    }
+    let elapsed = start.elapsed();
+    let state = h.state().dialog.as_ref().unwrap();
+    assert_eq!(
+        state.layout_searches.get(),
+        1,
+        "unchanged paints must not search layouts"
+    );
+    assert_eq!(
+        state.spec_builds.get(),
+        1,
+        "unchanged pre/post paint checks must not clone specs"
+    );
+    assert!(commands.try_recv().is_err());
+    eprintln!(
+        "image_combine 100 targets: cold validation+submit={:.3} ms; {PAINTS} unchanged paints={:.3} ms ({:.3} ms/paint); layout_searches=1 spec_builds=1",
+        cold_elapsed.as_secs_f64() * 1000.0,
+        elapsed.as_secs_f64() * 1000.0,
+        elapsed.as_secs_f64() * 1000.0 / PAINTS as f64,
+    );
+}
+
+#[test]
 fn image_combine_loading_completion_preserves_label_click_target() {
     for size in [egui::vec2(1093.0, 614.0), egui::vec2(1600.0, 900.0)] {
         let mut h = harness(size, 1.0, false);
@@ -605,7 +963,7 @@ fn image_combine_fast_preview_drag_keeps_press_owner_and_label() {
         dialog.items[0].spec.label_override.as_deref(),
         Some("商品3")
     );
-    assert_eq!(dialog.selected, Some(2));
+    assert_eq!(dialog.selected_item_id, Some(2));
 }
 
 #[test]
