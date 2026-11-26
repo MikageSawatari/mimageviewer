@@ -21,6 +21,11 @@ adding a new manual page and re-running this script keeps changelog.html's
 sidebar in sync automatically. That sibling page must already contain the
 "更新履歴" link (added once to every manual page's sidebar).
 
+The versions are grouped into one tab per major version (v5 / v4 / …, plus
+"すべて"), newest major open first. A version anchor (#v4.2.0) opens the tab that
+holds it. Without JavaScript the tab bar stays hidden and every version is shown.
+Tests: python -m unittest scripts/test_gen_changelog_html.py
+
 Usage:
     python scripts/gen-changelog-html.py
 """
@@ -132,18 +137,71 @@ def render_items(items):
     return "\n".join(out)
 
 
-def render_versions(versions):
-    blocks = []
+def render_version(v):
+    if v.get("date"):
+        head = '<h2 id="{ver}">{ver} <span class="ver-date">{date}</span></h2>'.format(
+            ver=v["ver"], date=v["date"]
+        )
+    else:
+        head = '<h2 id="{ver}">{ver}</h2>'.format(ver=v["ver"])
+    return head + "\n\n" + render_items(v["items"])
+
+
+def major_of(ver):
+    """'v5.8.0' -> 'v5'. Every heading must start with v<major>; anything else
+    would land in no tab, so stop instead of guessing."""
+    m = re.match(r"^v(\d+)\.", ver)
+    if not m:
+        sys.exit("ERROR: version heading '{}' does not start with v<major>.".format(ver))
+    return "v" + m.group(1)
+
+
+def group_by_major(versions):
+    """Keep CHANGELOG order (newest first) and split it into runs of one major
+    version. A major that reappears after another one means the CHANGELOG is out
+    of order, which would split a tab in two, so it is an error."""
+    groups = []
     for v in versions:
-        if v.get("date"):
-            blocks.append(
-                '<h2 id="{ver}">{ver} <span class="ver-date">{date}</span></h2>'.format(
-                    ver=v["ver"], date=v["date"]
-                )
+        major = major_of(v["ver"])
+        if groups and groups[-1]["major"] == major:
+            groups[-1]["versions"].append(v)
+            continue
+        if any(g["major"] == major for g in groups):
+            sys.exit("ERROR: {} versions are not contiguous in CHANGELOG.md.".format(major))
+        groups.append({"major": major, "versions": [v]})
+    return groups
+
+
+# The tab bar starts hidden and every group starts shown, so a browser without
+# JavaScript (or with the script failing) still shows the whole history. The
+# script below reveals the bar and hides the groups that are not selected.
+def render_tabs(groups):
+    out = ['<div class="ver-tabs" role="tablist" aria-label="メジャー版" hidden>']
+    for g in groups:
+        out.append(
+            '  <button type="button" role="tab" class="ver-tab" id="tab-{m}" '
+            'aria-controls="{m}" data-major="{m}">{m}</button>'.format(m=g["major"])
+        )
+    out.append(
+        '  <button type="button" role="tab" class="ver-tab" id="tab-all" '
+        'data-major="all">すべて</button>'
+    )
+    out.append("</div>")
+    return "\n".join(out)
+
+
+def render_versions(versions):
+    groups = group_by_major(versions)
+    blocks = [render_tabs(groups)]
+    for g in groups:
+        body = "\n\n".join(render_version(v) for v in g["versions"])
+        # role="tabpanel" is added by the script, together with the tabs, so a
+        # page without JavaScript does not announce panels with no tabs.
+        blocks.append(
+            '<section class="ver-group" id="{m}">\n{body}\n</section>'.format(
+                m=g["major"], body=indent(body, 2)
             )
-        else:
-            blocks.append('<h2 id="{ver}">{ver}</h2>'.format(ver=v["ver"]))
-        blocks.append(render_items(v["items"]))
+        )
     return "\n\n".join(blocks)
 
 
@@ -172,6 +230,94 @@ def build_sidebar():
     )
     # normalise line endings inherited from the sibling page to LF
     return sidebar.replace("\r\n", "\n")
+
+
+# Tab switching for the major-version groups. It runs inline right after the
+# content, before the page is first shown, so the other groups never flash.
+# Links that carry a version anchor (#v4.2.0) open the tab holding that version;
+# the tab itself is addressable as #v4, and #all shows every version. The query
+# string (the app opens this page with ?version=<app version>) is left alone.
+TAB_SCRIPT = """<script>
+(function () {
+  var tabs = document.querySelector(".ver-tabs");
+  if (!tabs || !window.history || !Element.prototype.closest) return;
+  var buttons = Array.prototype.slice.call(tabs.querySelectorAll(".ver-tab"));
+  var groups = Array.prototype.slice.call(document.querySelectorAll(".ver-group"));
+  var content = tabs.parentNode;
+  if (!buttons.length || !groups.length) return;
+
+  function hashId() {
+    try { return decodeURIComponent(location.hash.slice(1)); } catch (e) { return ""; }
+  }
+  // The tab that holds the element with this id, "all", or null.
+  function majorFor(id) {
+    if (id === "all") return "all";
+    var el = id ? document.getElementById(id) : null;
+    var group = el ? el.closest(".ver-group") : null;
+    return group ? group.id : null;
+  }
+  function select(major, focus) {
+    buttons.forEach(function (b) {
+      var on = b.getAttribute("data-major") === major;
+      b.setAttribute("aria-selected", on ? "true" : "false");
+      b.tabIndex = on ? 0 : -1;
+      if (on && focus) b.focus();
+    });
+    groups.forEach(function (g) { g.hidden = major !== "all" && g.id !== major; });
+    content.classList.toggle("ver-show-all", major === "all");
+  }
+  // Jump without the page's smooth scrolling: the content has just changed, so
+  // gliding across thousands of pixels of it only blurs where we landed.
+  // behavior: "instant" is not honoured everywhere, so switch the stylesheet's
+  // scroll-behavior off around the call instead.
+  function scrollToTop(el) {
+    var root = document.documentElement;
+    var prev = root.style.scrollBehavior;
+    root.style.scrollBehavior = "auto";
+    el.scrollIntoView(true);
+    root.style.scrollBehavior = prev;
+  }
+  function jumpTo(id) {
+    var el = id && id !== "all" ? document.getElementById(id) : null;
+    if (el) scrollToTop(el);
+  }
+  // A tab was chosen: show it from its top when the bar has stuck to the header.
+  function choose(button, focus) {
+    var major = button.getAttribute("data-major");
+    var stuck = tabs.getBoundingClientRect().top <= parseFloat(getComputedStyle(tabs).top) + 1;
+    select(major, focus);
+    history.replaceState(null, "", "#" + major);
+    if (stuck) scrollToTop(major === "all" ? groups[0] : document.getElementById(major));
+  }
+
+  groups.forEach(function (g) {
+    g.setAttribute("role", "tabpanel");
+    g.setAttribute("aria-labelledby", "tab-" + g.id);
+  });
+  buttons.forEach(function (b, i) {
+    b.addEventListener("click", function () { choose(b, false); });
+    b.addEventListener("keydown", function (e) {
+      var next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: buttons.length - 1 }[e.key];
+      if (next === undefined) return;
+      e.preventDefault();
+      choose(buttons[(next + buttons.length) % buttons.length], true);
+    });
+  });
+  window.addEventListener("hashchange", function () {
+    var id = hashId();
+    var major = majorFor(id);
+    if (!major) return;
+    select(major);
+    jumpTo(id);
+  });
+
+  var id = hashId();
+  select(majorFor(id) || groups[0].id);
+  tabs.hidden = false;
+  content.classList.add("ver-tabs-on");
+  if (majorFor(id)) jumpTo(id);
+})();
+</script>"""
 
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -224,6 +370,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   </main>
 </div>
 
+{script}
+
 <footer>
   <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
 </footer>
@@ -239,7 +387,7 @@ def main():
     versions = parse_changelog(changelog_text)
     content = indent(render_versions(versions), 4)
     sidebar = build_sidebar()
-    page = PAGE_TEMPLATE.format(sidebar=sidebar, content=content)
+    page = PAGE_TEMPLATE.format(sidebar=sidebar, content=content, script=TAB_SCRIPT)
     with open(OUT, "w", encoding="utf-8", newline="\n") as f:
         f.write(page)
     print("Wrote {} ({} versions)".format(OUT, len(versions)))
