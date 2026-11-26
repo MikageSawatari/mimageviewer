@@ -710,19 +710,6 @@ mod section1452_book_cover_cache {
     }
 }
 
-fn folder_open_scan_reply_for_test(scan: std::io::Result<ScannedDir>) -> FolderOpenScanResult {
-    FolderOpenScanResult {
-        scan,
-        policy: folder_scan::FolderScanPolicy::capture(
-            &crate::settings::Settings::default(),
-            false,
-            None,
-            PathBuf::new(),
-        ),
-        policy_mixed: false,
-    }
-}
-
 #[test]
 fn review_a_search_completion_requires_current_list_and_request_identity() {
     for case in ["generation", "context", "request", "current"] {
@@ -22101,7 +22088,7 @@ mod folder_pane_open_nav_tests {
         app.current_folder = Some(current);
 
         let (tx, rx) = mpsc::channel();
-        tx.send(folder_open_scan_reply_for_test(Ok(empty_scan())))
+        tx.send(app.folder_open_scan_reply_for_test(Ok(empty_scan())))
             .expect("send scan");
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
             started_at: std::time::Instant::now(),
@@ -22200,7 +22187,7 @@ mod folder_pane_open_nav_tests {
         );
         assert!(
             pane_tx
-                .send(folder_open_scan_reply_for_test(Ok(empty_scan())))
+                .send(app.folder_open_scan_reply_for_test(Ok(empty_scan())))
                 .is_ok()
         );
         app.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
@@ -30196,7 +30183,9 @@ mod phase_c_folder_nav_history_tests {
             app.context_folder_jump_pending(),
             "a same-query result refresh cannot cancel a path-based jump"
         );
-        scan_tx.send(Ok(scan_directory(&destination))).unwrap();
+        scan_tx
+            .send(app.folder_open_scan_reply_for_test(Ok(scan_directory(&destination))))
+            .unwrap();
         let ready = app
             .poll_folder_pane_open(&ctx)
             .expect("the original scan still owns adoption");
@@ -34931,7 +34920,7 @@ mod phase_c_drill_nav_tests {
 
             let (scan_tx, scan_rx) = mpsc::channel();
             scan_tx
-                .send(folder_open_scan_reply_for_test(Ok(scan)))
+                .send(app.folder_open_scan_reply_for_test(Ok(scan)))
                 .unwrap();
             let real_pending = app
                 .folder_pane_open_pending
@@ -74687,7 +74676,7 @@ mod still_window_mode_key_tests {
         );
 
         scan_tx
-            .send(folder_open_scan_reply_for_test(Ok(physical_scan)))
+            .send(app.folder_open_scan_reply_for_test(Ok(physical_scan)))
             .expect("release controlled physical scan");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -74838,7 +74827,7 @@ mod still_window_mode_key_tests {
 
         let (scan_tx, scan_rx) = mpsc::channel();
         scan_tx
-            .send(folder_open_scan_reply_for_test(Ok(physical_scan)))
+            .send(app.folder_open_scan_reply_for_test(Ok(physical_scan)))
             .unwrap();
         app.with_active_viewer_context(|mounted| {
             let real_pending = mounted
@@ -75567,9 +75556,11 @@ mod still_window_mode_key_tests {
         .expect("loading owner must remain mountable until retirement");
         assert!(cancel_probe.load(std::sync::atomic::Ordering::Relaxed));
         assert!(
-            tx.send(folder_open_scan_reply_for_test(Err(std::io::Error::other(
-                "late detached scan"
-            ))))
+            tx.send(
+                app.folder_open_scan_reply_for_test(Err(std::io::Error::other(
+                    "late detached scan"
+                )))
+            )
             .is_err()
         );
         assert_eq!(
@@ -77015,7 +77006,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.folder_pane_open_pending.is_some());
 
         scan_tx
-            .send(folder_open_scan_reply_for_test(Ok(physical_scan)))
+            .send(app.folder_open_scan_reply_for_test(Ok(physical_scan)))
             .unwrap();
         let ready = app
             .poll_folder_pane_open(&ctx)
@@ -77117,7 +77108,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(app.current_folder, Some(parent));
 
         scan_tx
-            .send(folder_open_scan_reply_for_test(Ok(scan_directory(&child))))
+            .send(app.folder_open_scan_reply_for_test(Ok(scan_directory(&child))))
             .unwrap();
         let ready = app
             .poll_folder_pane_open(&ctx)
@@ -77627,7 +77618,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         let (scan_tx, scan_rx) = mpsc::channel();
         scan_tx
-            .send(folder_open_scan_reply_for_test(Err(std::io::Error::new(
+            .send(app.folder_open_scan_reply_for_test(Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "simulated listing failure",
             ))))
@@ -77688,7 +77679,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.open_grid_container_in_detached_book_context(&ctx, requested_idx));
         let (scan_tx, scan_rx) = mpsc::channel();
         scan_tx
-            .send(folder_open_scan_reply_for_test(Ok(physical_scan)))
+            .send(app.folder_open_scan_reply_for_test(Ok(physical_scan)))
             .unwrap();
         app.with_active_viewer_context(|mounted| {
             let real_pending = mounted

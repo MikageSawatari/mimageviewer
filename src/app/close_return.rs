@@ -186,6 +186,12 @@ impl App {
         crate::ui_main::AddressBarNav::ZipListReturn(request)
     }
 
+    /// Rendering needs the close-return ownership predicate, not registry identities.
+    /// Keep the same main-context check used by the close-return owner here.
+    pub(crate) fn fullscreen_close_return_is_main_context(&self) -> bool {
+        self.projected_viewer_context_id() == self.viewer_context_main()
+    }
+
     /// A captured Terminal recipe still has to be current when its reader is
     /// torn down. Later delivery cannot repair a stale bookmark-preserve policy.
     pub(super) fn fullscreen_close_destination(&self) -> FullscreenCloseDestination {

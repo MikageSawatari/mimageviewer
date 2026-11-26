@@ -370,7 +370,7 @@ fn tag_view_open_supersession_tag_refuses_current_view_order_refresh_and_keeps_n
         .rx
         .recv_timeout(Duration::from_secs(15))
         .expect("real sort scan");
-    assert!(scan.is_ok());
+    assert!(scan.scan.is_ok());
     let cancel = pending.cancel.clone();
     let (sender, receiver) = mpsc::channel();
     pending.rx = receiver;
@@ -456,7 +456,7 @@ fn tag_view_open_supersession_tag_accepts_and_retires_direct_navigation_scan() {
         .rx
         .recv_timeout(Duration::from_secs(15))
         .expect("real direct scan");
-    assert!(scan.is_ok());
+    assert!(scan.scan.is_ok());
     let cancel = pending.cancel.clone();
     let (sender, receiver) = mpsc::channel();
     pending.rx = receiver;
@@ -1081,7 +1081,7 @@ fn tag_view_open_supersession_sibling_edge_keeps_real_current_view_order_refresh
         .rx
         .recv_timeout(Duration::from_secs(15))
         .expect("real sort scan result");
-    assert!(scan.is_ok());
+    assert!(scan.scan.is_ok());
     let cancel = pending.cancel.clone();
     let (sender, receiver) = mpsc::channel();
     pending.rx = receiver;

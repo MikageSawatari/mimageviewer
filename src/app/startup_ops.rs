@@ -3654,12 +3654,18 @@ mod tests {
         app.finish_history_restore_preparation_for_test();
         app.finish_page_identity_preparation_for_test();
         let _ = app.with_active_viewer_context(|reader| {
+            let policy = reader.folder_scan_policy();
             if let Some(pending) = reader.folder_pane_open_pending.as_mut() {
                 let path = pending.path.clone();
                 pending.cancel.store(true, Ordering::Relaxed);
                 pending.cancel = Arc::new(AtomicBool::new(false));
                 let (tx, rx) = mpsc::channel();
-                tx.send(Ok(scan_directory(&path))).unwrap();
+                tx.send(FolderOpenScanResult {
+                    scan: Ok(scan_directory(&path)),
+                    policy,
+                    policy_mixed: false,
+                })
+                .unwrap();
                 pending.rx = rx;
                 assert!(matches!(
                     reader.poll_detached_physical_folder_open(ctx),
@@ -4079,7 +4085,12 @@ mod tests {
                     let late_a = |app: &mut App| {
                         if let Some((tx, cancel)) = &pane {
                             assert!(cancel.load(Ordering::Relaxed));
-                            assert!(tx.send(Ok(scan_directory(&a))).is_err());
+                            assert!(
+                                tx.send(
+                                    app.folder_open_scan_reply_for_test(Ok(scan_directory(&a)))
+                                )
+                                .is_err()
+                            );
                             assert!(app.poll_folder_pane_open(&ctx).is_none());
                         }
                         if let Some((tx, cancel)) = &classification {
@@ -4597,7 +4608,10 @@ mod tests {
         result.resolved = None;
         b_tx.send(result).unwrap();
         app.poll_startup_open_path_resolve(&ctx);
-        assert!(tx.send(Ok(scan_directory(&a))).is_err());
+        assert!(
+            tx.send(app.folder_open_scan_reply_for_test(Ok(scan_directory(&a))))
+                .is_err()
+        );
         assert!(app.poll_folder_pane_open(&ctx).is_none());
         assert_eq!(app.current_folder.as_ref(), Some(&origin));
     }
@@ -5010,7 +5024,8 @@ mod tests {
         pending.cancel.store(true, Ordering::Relaxed);
         pending.cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
-        tx.send(Ok(scan_directory(path))).unwrap();
+        tx.send(app.folder_open_scan_reply_for_test(Ok(scan_directory(path))))
+            .unwrap();
         pending.rx = rx;
         app.folder_pane_open_pending = Some(pending);
         app.post_render_main_navigation(

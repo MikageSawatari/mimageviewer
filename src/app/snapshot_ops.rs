@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::app::{App, FsPageTransfer};
+use crate::app::{App, DirectoryScanRoute, FsPageTransfer, UiThreadScanReason};
 use crate::grid_item::GridItem;
 use crate::snapshot::{
     FilterState, SnapshotEntry, SnapshotKey, SnapshotSourceLabel, SnapshotState, is_inside_fs,

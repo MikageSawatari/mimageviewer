@@ -1565,6 +1565,32 @@ native 実機・snapshot 生成と確認・perf 計測・検証用 binary のビ
 ファイル別の追加・変更テスト／共有 helper 名（同期採用待ちだけの移行を含む）は以下に記録する。
 
 
+#### 初回コンパイル後の型修正（2026-11-26）
+
+設計担当が `5f0ab660f` で既定 feature の lib test をコンパイルし、26 エラーを報告した。
+提供された `test-default.log` 全文を読み、今回の型変更の追従漏れを修正した。
+実装担当自身は cargo／nextest／ビルド／テスト／製品起動／コミットを行っていない。
+
+- `snapshot_ops.rs`: 同期例外の `DirectoryScanRoute`／`UiThreadScanReason` の import を補った（6 エラー）。
+- `image_folder_zip_operation.rs`: modal が所有する PaneNavigation の返信から、型付き結果の `scan` を取り出す（2 エラー）。
+  DirectNavigation の policy 採用経路は変更しない。
+- `app.rs`・`tests.rs`・`startup_ops.rs`: 偽の pane 返信を作る helper を `cfg(test)` の App メソッドへ集約し、
+  現在の App の policy を付ける。親テスト module の import 依存と、裸の `io::Result` を送る箇所を修正した（6 エラー）。
+  mutable な pending を借りたまま差し替える fixture は、先に policy を捕捉する。
+- `location_jump.rs`: 完成候補を組み立てる fixture は返信の `scan` を取り出して成功／失敗を検査する（6 エラー）。
+- `tag_view_open_supersession_tests.rs`: 返信全体を保持・再送する fixture は `scan.scan.is_ok()` を検査し、policy も保持する（3 エラー）。
+- `ui_scan_853_tests.rs`: App の所有型に合わせ `ArchiveConvertState` を Box に入れる（1 エラー）。
+- `close_return.rs`・`ui_fullscreen.rs`: registry の二つの ID メソッドの可視性は維持したまま、
+  close-return owner が main であるかの述語だけを owner 側から描画側へ提供する（2 エラー）。判定条件は同じ。
+
+テストの期待する一覧・選択・履歴・成功／失敗は変更していない。ログの本体 115 警告は、
+診断行と import の使用箇所を基点 `30cdc0774` と照合し、今回追加由来と判断するものは見つからなかったため既存警告を残した。
+`test-script` 側も、走査要求の数え上げ・`folder_load_recorded` の二つの initializer・ReleaseCheck・
+親一覧の modal scan 返信を静的に点検した。今回の修正には feature 固有の field を追加していない。
+両 feature 構成のコンパイル成功とテスト実行結果は、設計担当の runner での確認が必要。
+今回変更した Rust 10 ファイルは単体ごとの `rustfmt --edition 2024 --check --config skip_children=true` に成功。
+`git diff --check` も成功した。これらはコンパイル・テストの結果ではない。
+
 <!-- scan853-test-inventory -->
 
 #### `src/app/native_video.rs`

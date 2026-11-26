@@ -30918,6 +30918,18 @@ impl App {
     }
 
     #[cfg(test)]
+    pub(crate) fn folder_open_scan_reply_for_test(
+        &self,
+        scan: std::io::Result<ScannedDir>,
+    ) -> FolderOpenScanResult {
+        FolderOpenScanResult {
+            scan,
+            policy: self.folder_scan_policy(),
+            policy_mixed: false,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn load_folder_and_finish_for_test(&mut self, path: PathBuf) {
         self.load_folder(path);
         self.finish_direct_navigation_scan_for_test();

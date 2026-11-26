@@ -1083,7 +1083,8 @@ mod tests {
             let scan = pending
                 .rx
                 .recv_timeout(std::time::Duration::from_secs(30))
-                .expect("vanished address scan reply");
+                .expect("vanished address scan reply")
+                .scan;
             assert!(
                 scan.is_err(),
                 "the candidate's resolved directory vanished after Enter"
@@ -1180,7 +1181,8 @@ mod tests {
                         let result = pending
                             .rx
                             .recv_timeout(std::time::Duration::from_secs(30))
-                            .expect("missing path scan reply");
+                            .expect("missing path scan reply")
+                            .scan;
                         assert!(result.is_err());
                         result
                     } else {
@@ -1588,7 +1590,8 @@ mod tests {
                                 let result = pending
                                     .rx
                                     .recv_timeout(std::time::Duration::from_secs(30))
-                                    .expect("missing-directory scan reply");
+                                    .expect("missing-directory scan reply")
+                                    .scan;
                                 assert!(result.is_err());
                                 result
                             }

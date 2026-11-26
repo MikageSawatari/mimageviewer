@@ -129,7 +129,7 @@ fn section1853_created_sibling_zip_completion_keeps_output_selection_with_worker
     let output = parent.join("created.zip");
     std::fs::write(&output, []).unwrap();
     let (_tx, rx) = mpsc::channel();
-    app.archive_convert = Some(ArchiveConvertState {
+    app.archive_convert = Some(Box::new(ArchiveConvertState {
         src_path: parent.join("source.7z"),
         input_seq: 0,
         format: crate::archive_converter::ArchiveFormat::SevenZ,
@@ -148,7 +148,7 @@ fn section1853_created_sibling_zip_completion_keeps_output_selection_with_worker
         deferred_fullscreen: None,
         suppress_confirm: false,
         suppress_confirm_next_time: false,
-    });
+    }));
     let scans = folder_scan::caller_scan_count_for_test();
     let generation = app.items_generation;
     app.show_archive_convert_dialog(&egui::Context::default());

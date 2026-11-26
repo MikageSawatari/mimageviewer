@@ -14129,7 +14129,7 @@ impl App {
     pub(crate) fn capture_fullscreen_close_return_presentation(
         &mut self,
     ) -> Option<FsCloseReturnPresentation> {
-        if self.projected_viewer_context_id() != self.viewer_context_main()
+        if !self.fullscreen_close_return_is_main_context()
             || (self.fullscreen_idx.is_none() && self.fs_holdover_tex.is_none())
         {
             return None;
