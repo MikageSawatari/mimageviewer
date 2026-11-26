@@ -5,7 +5,7 @@
 - ブランチ / worktree: `fisheye-917` / `G:\home\mimageviewer-fisheye917` (基点 master `f2e332bb8`)。
 - 役割: 設計・作業指示・検収 = ClaudeCode Opus 5.5、実装 = Codex GPT-6.1 Sol / high、
   独立レビュー = 実装者とは別の GPT-6.1 Sol / xhigh (AGENTS.md)。
-- 状態: 設計 R2 (独立設計レビュー R1・R2 の指摘を反映、§14)。製品コードは未変更。
+- 状態: 設計 R3 (独立設計レビュー R1〜R3 の指摘を反映、§14)。製品コードは未変更。
 
 ## 0. 利用者の決定 (2026-11-27、設計担当のセッションで直接)
 
@@ -123,15 +123,27 @@ enum PlaneColorPhase {
     Ready(Arc<PlaneMaterial>),
 }
 
-/// 写しと、その写しを正しく描くための幾何を一体で持つ。別々に持たない。
+/// GPU の写し。鍵は写し元の TextureId だけ。
+struct PlaneGpuCopy {
+    texture_id: egui::TextureId,
+    gpu: PlaneGpuResources,             // mip の写しと、それを参照する不変の bind group (group 0、§5.3)
+}
+
+/// 素材の記述。写しと、その写しを正しく描くための幾何を一体で持つ。別々に持たない。不変。
 struct PlaneMaterial {
-    texture_id: egui::TextureId,        // 写し元
-    gpu: PlaneGpuResources,             // mip の写しと、それを参照する不変の bind group (§5.3)
+    copy: Arc<PlaneGpuCopy>,
+    source_size: [usize; 2],            // 採用時の source / sampler の寸法
     coverage: egui::Rect,               // 素材が収録する元画像の範囲 (部分素材なら全体の一部)
     sampler_roi: egui::Rect,            // native の sampler の範囲 (2D の material_source の計算と同じ入力)
-    layout_basis: PlaneLayoutBasis,     // 2D の変換の解決に使う配置の基準 (layout source の寸法・表示の基準)
+    display_basis: MaterialDisplayBasis, // 採用時に受け入れた表示の基準 (PDF の page-box と raster の reference_size を含む)
+    material_kind: FullscreenPageMaterialKind, // Complete / Provisional (初期配置の確定に使う)
 }
 ```
+
+- **鍵を 2 つに分ける**: GPU の写しは `TextureId` で照合し、`PlaneMaterial` は記述全体 (coverage・sampler の幾何・
+  表示の基準・material kind) で照合する。テクスチャを変えずに PDF の表示の基準だけを更新する経路がある
+  (`readopt_loaded_pdf_thumbnail_basis`、app.rs:22735 付近) ので、`TextureId` が同じでも記述が変われば、
+  **写しを共有した新しい不変の `PlaneMaterial`** を作る。旧い snapshot は旧い記述を持ったまま。
 
 - 倍率・パン・回転は **2D の状態そのもの** (`fs_zoom` / `fs_pan` / `fs_free_rotation`) を使い、PlaneView 専用の
   変換は持たない (3D 写真の [表示変換 §3.1](depth-view-transform-plan.md) と同じ判断)。ズームの持ち主は `FsZoomOwner::Image`。
@@ -170,8 +182,10 @@ struct PlaneMaterial {
 (`apply_fs_wheel_frame_proposal`) の両方がこれを呼び、クリックの分類 (変換の有無) もこの出力を含めて決める
 (予測の結果に PlaneView の有無を足す)。
 
-**ページ送りをまたぐ frame の規則 (組み合わせを減らす)**: 同じ frame の segment の中で、ページ送りを要求する action の
-**後に来た** Ctrl+Shift の量と `FsFisheyeIn/Out` は、**予測でも実適用でも使わない** (捨てる)。予測は今のページのまま
+**ページ送りをまたぐ frame の規則 (組み合わせを減らす)**: 同じ frame の wheel segment の中で、ページ送りを要求する action の
+**後に来た** Ctrl+Shift の量は、**予測でも実適用でも使わない** (捨てる)。キーの `FsFisheyeIn/Out` は今のキーの段
+(ホイールより先に処理される。ui_fullscreen.rs:29442 → 29519) で先に適用し、この破棄の規則の対象にしない
+(raw event の前後の順と処理の順が違っても、キーの段 → ホイールの段の順で決まる)。予測は今のページのまま
 後続を評価するが、実適用はループの中で実際にページを移すので、ページ送りの後の魚眼の遷移は両者で食い違う
 (例: 適格な静止画 A → 通常のホイールで動画 B → Ctrl+Shift 上。予測は A で入場、実適用は B で拒否)。
 ページ送りの前の量は通常どおり使い、ページが移ったら §4.2 で PlaneView は終わる。クリックの分類は、その frame の
@@ -368,15 +382,27 @@ Z の全画面ズーム (照準・確定)、紙めくりの最中、3D 写真・
   - PlaneView の採用は、単ページ描画の中で resampler の準備より前に決め (3D 写真の採用と同じ位置)、パン・初期配置の確定は
     共通の境界 (`commit_fs_single_page_placement`) を通す。PlaneView 中も 2D の素材選択 (final / provisional / 元画像の
     押している間 / RAW の現像前後 / PDF の再ラスタ前後) は変えない。
-  - 選ばれた素材の `TextureId` が `Ready` の鍵と同じなら、その `PlaneMaterial` で描く。違えば写し直して `Ready` を置き換える。
+  - 選ばれた素材の記述が `Ready` の `PlaneMaterial` と同じなら、それで描く。`TextureId` だけ同じで記述が違えば、写しを共有した
+    新しい `PlaneMaterial` に置き換える。`TextureId` が違えば写し直して置き換える (§3.1)。
   - renderer への登録がまだ (3D 写真の `TexturePending` と同じ状況。新しく読み込んだ素材は UI の処理の後に登録される) なら
     `Pending` にし、**所有する viewport の次の pass を要求する** (`ctx.request_repaint_of(viewport)`、depth_view.rs:1470 と同じ。
     タイマーや再試行ではなく、通常の登録の境界を進めるため)。その frame は:
-    - 前の素材 (`previous`) があり、その `layout_basis` が今の素材と同じなら、**前の素材と、その素材自身の幾何
-      (coverage・sampler_roi・layout_basis) と、今の表示状態 (zoom・pan・回転・canvas)** で 2D の変換を解決し直して描く。
+    - 前の素材 (`previous`) があれば、2D の変換を **前の素材の記述と今の frame の入力** で解決し直す。
+      - 前の素材から取るもの: source / sampler の寸法、coverage、sampler_roi、受け入れた表示の基準、material kind。
+      - 今の frame から取るもの: zoom・pan、保存された 90 度回転・自由回転、表示トリム、フィットの設定と拡大・縮小の制限、
+        canvas、`pixels_per_point`、1 ページの配置 (singleton placement)。
+    - **使ってよい条件は、結果の一致で判定する**: 今の素材で解決した変換と、前の素材で解決した変換の **配置の矩形
+      (`full_image_rect`) が一致する** とき (物理画素に寄せた後の値で比較)。表示の基準の項目どうしを `==` で比べない
+      (PDF の再ラスタでは raster の `reference_size` が変わっても、Page fit なら配置は変わらない)。一致すれば前の素材で
+      魚眼のまま描き、一致しなければ (原寸表示・拡大の制限つきのフィットで配置が変わる場合など) その frame は 2D で描く。
       PDF の倍率由来の再ラスタ・RAW の現像完了・補正の完了で、魚眼の途中に歪みの無い絵が 1 frame 挟まらないようにするため
       (通常の操作で毎回起き得るので、まれな失敗ではない)。
-    - `previous` が無い、または `layout_basis` が違うなら、その frame は 2D で描く。
+    - `previous` が無いときも、その frame は 2D で描く。
+    - **配置の確定**: 共通の `commit_fs_single_page_placement` には、**実際に描いた素材の material kind** と、その素材で解決した
+      変換を渡す。PlaneView で描いたことだけを理由に Complete として扱わない (初期配置の要求の消費・保持が material kind で決まるため。
+      initial_placement.rs:263)。
+    - **PDF の需要**: 再ラスタの需要は今どおり今の zoom と今のページの metadata から作る。前の素材の寸法を需要の基準に戻さない
+      (ui_fullscreen.rs:16241 の `maybe_rerender_pdf` の経路のまま)。
   - 素材が `NativeOnly` 等で元の `TextureHandle` が無い場合は 2D で描き、PlaneView は続ける。
   - **描いた結果の記録**: 各 frame の描画の確定時に、PlaneView で描いたなら `last_drawn = Some(snapshot)`、2D で描いたなら
     `last_drawn = None` にする。2D で描いた frame の後に古い魚眼の snapshot を保存しないため (§6.1)。
@@ -428,9 +454,12 @@ PlaneView 中だけ、3 つの出口の **元の素材を「見えていると�
   `last_drawn` が `None` (直近の frame を 2D で描いた。§5.2)、または snapshot の context・表示単位 (anchor) が今の PlaneView と
   一致しないときは、保存せず「魚眼の表示の準備中です」と通知する (3D 写真の照合と同じ考え方)。
 - `PlaneFrameRequest` = snapshot の `Arc` + 出力の寸法 + 出力の画素から canvas の物理座標への写像。worker はこれだけを見る。
-- 出力の範囲は **canvas そのもの** (上下のバー・パネル・HUD は入れない)。縦横比は canvas と同じ。出力の画素 `o` は
-  `p_canvas = canvas.min + (o + 0.5) × canvas.size / output.size` で canvas の物理座標へ戻してから §5.1 を計算する
-  (canvas の原点が 0 でない MainWindow の一覧の中の閲覧でも、canvas の左上が出力の原点になる)。
+- 出力の範囲は **canvas そのもの** (上下のバー・パネル・HUD は入れない)。縦横比は canvas と同じ。共通の WGSL は
+  fragment の座標 (`@builtin(position).xy`、画素の中心で既に +0.5 を含む) をそのまま使い、
+  `p_canvas = canvas.min + fragment_position.xy × canvas.size / output.size` で canvas の物理座標へ戻してから §5.1 を計算する
+  (画面では `output = canvas` の大きさ・原点 0 の写像を渡すので恒等。3D 写真の depth_parallax_wgpu.rs:42 と同じ扱い)。
+  CPU 版で整数の画素の番号 `i` を使うときだけ `i + 0.5` を fragment の座標とする。canvas の原点が 0 でない
+  MainWindow の一覧の中の閲覧でも、canvas の左上が出力の原点になる。
 - 画像の外と透過部分は不透明に合成する (3D 写真の書き出しと同じ。JPEG・PNG で挙動を分けない)。画像の外の色は snapshot の背景の色。
   透過部分の下地は §5.1 の 9 のとおり canvas の座標で計算するので、出力の寸法の比で升目を拡大縮小し直さない
   (2 倍の出力では升目も 2 倍の画素になり、画面と同じ見た目になる)。
@@ -506,8 +535,13 @@ PlaneView 中だけ、3 つの出口の **元の素材を「見えていると�
   フォーカス喪失・modal・ページ変更で所有が終わる、PlaneView でないときは今どおり (パン / 毎フレームの Ctrl で回転)。
 - 占有: ルーペ・ピクセルグリッド・ナビゲータを描かない、紙めくりの対象外、マウスのクリックとタッチの `PageSide` でページを送らない、
   ピンチは倍率だけ。Ctrl+Shift 中・右 Ctrl+Shift 中の押している間の操作の扱い (ルーペを描かない、元画像の素材をそのまま描く)、割り当てを変えた場合も同じ。
-- 素材: 登録待ちで次の pass を要求すること、前の素材をその素材自身の幾何で描くこと (`layout_basis` が同じとき) / 違えば・無ければ 2D、
+- 素材: 登録待ちで次の pass を要求すること、前の素材をその素材自身の記述で描くこと (配置の矩形が一致するとき) / 一致しない・無ければ 2D、
   素材の差し替え (PDF の再ラスタ・RAW の現像完了) で写し直す、写せない形式で終わって通知。
+  - Page fit の PDF の再ラスタ (`reference_size` が変わる) では魚眼のまま描くこと。原寸表示・拡大の制限つきのフィットで配置が変わる場合は 2D で描くこと。
+  - 同じ `TextureId` のまま PDF の metadata (表示の基準) だけが更新された場合、写しを共有した新しい `PlaneMaterial` になり、旧い snapshot は旧い記述を持つこと。
+  - 前の素材で描いた frame の配置の確定に、その素材の material kind (Provisional なら初期配置の要求を保持) が渡ること。
+- キーとホイールの順: 同じ frame に `FsFisheyeIn` とページ送りのホイールがあるとき、raw event の前後に関係なく、キーの段 → ホイールの段の順で決まること。
+- 出力の座標: canvas と同じ寸法の出力が、画面と同じ画素の中心を参照すること (半画素ずれないこと)。
 - 部分素材: coverage が全体の一部の素材 (切り取り済みの編集プレビュー。回帰例は src/ui_fullscreen/coverage_tests.rs:16) で、
   texture UV の変換と coverage の外の除外が 2D の `SourceRegionTextureQuad` と一致すること。
 - 保存の失効: 2D で描いた frame の後 (`last_drawn = None`) に保存しないこと。前の素材で描いた frame の snapshot は、実際に描いた素材を持つこと。
@@ -575,7 +609,7 @@ PlaneView 中だけ、3 つの出口の **元の素材を「見えていると�
 
 | # | 指摘 | 対応 (本書 R2) |
 | --- | --- | --- |
-| P1-1 | 部分素材の coverage が写像から抜けている (displayed_image_transform.rs:986〜1005) | §5.1 の 7 (source UV → texture UV、coverage の外を無効)、§3.1 の `PlaneMaterial` に coverage・sampler_roi・layout_basis |
+| P1-1 | 部分素材の coverage が写像から抜けている (displayed_image_transform.rs:986〜1005) | §5.1 の 7 (source UV → texture UV、coverage の外を無効)、§3.1 の `PlaneMaterial` に coverage・sampler_roi (R3 で記述を拡張) |
 | P1-2 | 2D で描いた後も古い snapshot を保存できる。`Pending.previous` で選択と描画が分かれる | §5.2 の `last_drawn` を frame ごとに Some / None で記録。前の素材は幾何と一体の `PlaneMaterial` として持ち、その素材自身の幾何で描く (レビュー担当の 2 案のうち、PDF の再ラスタのたびに 2D が 1 frame 挟まるのを避けられる方を採った) |
 | P1-3 | ページ送りをまたぐ frame で予測と実適用が食い違う | §3.2 でページ送りの後の魚眼の量を予測・実適用とも捨てる。クリックの分類を計画元の表示単位に束縛 |
 | P2-4 | 登録待ちの後の次の pass の起床が無い | §5.2 で所有 viewport の次の pass を要求 |
@@ -583,3 +617,16 @@ PlaneView 中だけ、3 つの出口の **元の素材を「見えていると�
 | P2-6 | 書き出しで升目を二重に拡大縮小する | §5.1 の 9・§6.1 で下地を canvas の座標に統一、出力の画素の写像を式で明記 |
 | P2-7 | bind group と target format の分け方 | §5.3 (group 0 = 素材、group 1 = uniform、pipeline は format ごと) |
 | P3-8 | 「一時的に 2 枚」は上限ではない | §5.3 の記述を訂正、§10 に 3 世代以上の会計のテスト |
+
+### R3 (2026-11-27、同じセッションの継続、対象 `5135c8dc1`)
+
+判定: 要修正。R2 の 8 件は resolved 6・partially 2。新しい指摘は P1 2 件・P2 2 件。設計担当がコードで確かめ、全件を正しいと判断した。
+旧い素材を今の表示状態で解決し直す方式は成立する、`last_drawn` と書き出しの方針・クリックの束縛・canvas の座標の下地・group の分離・
+format ごとの pipeline に構造上の問題は無い、との評価。
+
+| # | 指摘 | 対応 (本書 R3) |
+| --- | --- | --- |
+| P1-1 | `TextureId` だけでは `PlaneMaterial` の再利用を判定できない (テクスチャを変えずに PDF の表示の基準だけ更新する経路、app.rs:22735 付近) | §3.1 で鍵を 2 つに分けた (`PlaneGpuCopy` は `TextureId`、`PlaneMaterial` は記述全体)。記述だけ変われば写しを共有した新しい記述 |
+| P1-2 | `layout_basis` の等価条件と、旧い素材から引き継ぐ配置の入力が未定義。material kind が無い | §5.2 で前の素材から取るもの / 今の frame から取るものを列挙。使ってよい条件は「配置の矩形の一致」(基準の `==` ではない)。配置の確定に実際に描いた素材の material kind。PDF の需要は今のまま |
+| P2-3 | キーの `FsFisheyeIn/Out` はホイールより先に処理されるので「ページ送りの後」の順が無い | §3.2 でキーは今のキーの段で先に適用し、破棄の規則は wheel segment だけ |
+| P2-4 | 出力の座標で +0.5 を二重に足す | §6.1 で WGSL は fragment の座標をそのまま使い、CPU 版の整数の番号だけ `i + 0.5` |
