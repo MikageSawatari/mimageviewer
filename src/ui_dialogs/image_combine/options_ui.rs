@@ -294,26 +294,13 @@ fn draw_canvas(ui: &mut egui::Ui, o: &mut CombineOptions) {
     }
     number(ui, "外周の余白 (px)", &mut o.margin, 0..=500);
     let jpeg = matches!(o.format, CombineFormat::Jpeg { .. });
-    let mut transparent = o.background == Background::Transparent;
-    if jpeg && transparent {
-        transparent = false;
-        o.background = Background::Color([255; 3]);
-    }
-    if ui
-        .add_enabled(!jpeg, egui::Checkbox::new(&mut transparent, "透明な背景"))
-        .changed()
-    {
-        o.background = if transparent {
-            Background::Transparent
-        } else {
-            Background::Color([255; 3])
-        };
-    }
+    color(ui, "背景色", &mut o.background_color);
+    ui.add_enabled(
+        !jpeg,
+        egui::Checkbox::new(&mut o.transparent_background, "透明な背景"),
+    );
     if jpeg {
         ui.small("JPEG は透明にできないため、背景色で保存します");
-    }
-    if let Background::Color(rgb) = &mut o.background {
-        color(ui, "背景色", rgb);
     }
     ui.strong("角丸・枠線");
     number(ui, "角丸の半径 (px)", &mut o.corner_radius, 0..=500);
@@ -476,9 +463,6 @@ fn draw_output(ui: &mut egui::Ui, state: &mut CombineDialogState, action: &mut A
     if let CombineFormat::Webp { lossless, .. } = &mut o.format {
         ui.add_enabled_ui(!replacing, |ui| ui.checkbox(lossless, "可逆圧縮"));
     }
-    if format == 1 && o.background == Background::Transparent {
-        o.background = Background::Color([255; 3]);
-    }
     ui.small("元の情報 (EXIF・AI プロンプトなど) は書きません");
     ui.add_enabled_ui(!replacing, |ui| {
         let first = matches!(o.destination, Destination::FirstImageFolder);
@@ -509,6 +493,60 @@ fn draw_output(ui: &mut egui::Ui, state: &mut CombineDialogState, action: &mut A
 mod image_combine_tests {
     use super::*;
     use egui_kittest::kittest::{NodeT, Queryable};
+
+    #[test]
+    fn image_combine_transparency_toggle_and_jpeg_selection_preserve_color() {
+        let ctx = egui::Context::default();
+        let mut state = super::super::fixture_state(&ctx, false);
+        state.options.background_color = [12, 34, 56];
+        let mut h = crate::test_ui::builder()
+            .with_size(egui::vec2(700.0, 1100.0))
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .build_ui_state(
+                |ui, state: &mut CombineDialogState| {
+                    draw_canvas(ui, &mut state.options);
+                    draw_output(ui, state, &mut Action::default());
+                },
+                state,
+            );
+        h.run();
+        for transparent in [true, false, true] {
+            h.get_by_label("透明な背景").click();
+            h.run();
+            assert_eq!(h.state().options.transparent_background, transparent);
+            assert_eq!(h.state().options.background_color, [12, 34, 56]);
+            assert!(!h.get_by_label("背景色").accesskit_node().is_disabled());
+        }
+        h.get_by_label("形式").click();
+        h.run();
+        h.get_by_label("JPEG").click();
+        h.run();
+        assert!(matches!(
+            h.state().options.format,
+            CombineFormat::Jpeg { .. }
+        ));
+        assert!(h.get_by_label("透明な背景").accesskit_node().is_disabled());
+        h.get_by_label("JPEG は透明にできないため、背景色で保存します");
+        assert!(h.state().options.transparent_background);
+        assert_eq!(h.state().options.background_color, [12, 34, 56]);
+        assert_eq!(
+            h.state().options.effective_background(),
+            EffectiveBackground::Color([12, 34, 56])
+        );
+        for format in ["PNG", "WebP"] {
+            h.get_by_label("形式").click();
+            h.run();
+            h.get_by_label(format).click();
+            h.run();
+            assert!(!h.get_by_label("透明な背景").accesskit_node().is_disabled());
+            assert!(h.state().options.transparent_background);
+            assert_eq!(h.state().options.background_color, [12, 34, 56]);
+            assert_eq!(
+                h.state().options.effective_background(),
+                EffectiveBackground::Transparent
+            );
+        }
+    }
 
     #[test]
     fn image_combine_replace_output_controls_lock_target_and_show_edit_warning() {

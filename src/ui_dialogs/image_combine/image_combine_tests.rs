@@ -7,6 +7,204 @@ use egui_kittest::{Harness, kittest::Queryable};
 use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
 #[test]
+fn image_combine_remove_all_failed_shows_empty_reason_and_disables_export() {
+    use egui_kittest::kittest::NodeT;
+
+    let ctx = egui::Context::default();
+    let mut state = fixture_state(&ctx, false);
+    for item in &mut state.items {
+        item.status = ItemStatus::Failed("decode failed".into());
+    }
+    let (commands, _events, _) = connection(&mut state);
+    let mut h = crate::test_ui::builder()
+        .with_size(egui::vec2(700.0, 700.0))
+        .with_context_setup(crate::ui_fonts::configure_fonts)
+        .build_ui_state(
+            |ui, state: &mut CombineDialogState| {
+                draw_item_controls(ui, state);
+                draw_footer(ui, state, &mut Action::default());
+            },
+            state,
+        );
+    h.run();
+    assert!(h.state().loading_finished());
+    assert!(
+        footer_error(h.state())
+            .unwrap()
+            .starts_with("読めない画像を外してください:")
+    );
+    h.get_by_label("読めない画像を外す").click();
+    h.run();
+    assert!(
+        matches!(commands.try_recv().unwrap(), Command::Remove { ids } if ids == vec![0, 1, 2, 3])
+    );
+    assert!(h.state().items.is_empty());
+    assert_eq!(h.state().selected_item_id, None);
+    assert!(h.state().loading_finished());
+    assert!(!h.state().ready());
+    assert!(!h.state().can_write());
+    let status = "出力: 計算できません (下の理由を直してください)";
+    let reason = "結合する画像がありません";
+    assert_eq!(status_text(h.state()), status);
+    assert_eq!(footer_error(h.state()).as_deref(), Some(reason));
+    assert_eq!(h.state().validation().result.as_ref().unwrap_err(), reason);
+    h.get_by_label(status);
+    // This is the production footer's error_fg_color label, not a test label.
+    h.get_by_label(reason);
+    assert!(h.get_by_label("書き出す").accesskit_node().is_disabled());
+}
+
+#[test]
+fn image_combine_status_loading_invalid_split_valid_and_failed() {
+    let ctx = egui::Context::default();
+    let mut state = fixture_state(&ctx, false);
+    state.items = (0..8)
+        .map(|id| {
+            let mut item = state.items[id % 4].clone();
+            item.id = id;
+            item.status = ItemStatus::Loading;
+            item
+        })
+        .collect();
+    assert_eq!(status_text(&state), "読み込み中 0/8");
+    assert!(!state.loading_finished());
+    assert!(footer_error(&state).is_none());
+    state.items[0].status = ItemStatus::Loaded((600, 800));
+    state.items[1].status = ItemStatus::Failed("decode failed".into());
+    assert_eq!(status_text(&state), "読み込み中 2/8");
+    assert!(
+        footer_error(&state)
+            .unwrap()
+            .starts_with("読めない画像を外してください:")
+    );
+    for item in &mut state.items {
+        item.status = ItemStatus::Loaded((600, 800));
+    }
+    state.options.split = Split::Counts(vec![3, 3]);
+    state.split_text = "3-3".into();
+    let invalid = "出力: 計算できません (下の理由を直してください)";
+    assert_eq!(status_text(&state), invalid);
+    assert!(footer_error(&state).is_some());
+    state.options.split = Split::Auto;
+    state.split_text.clear();
+    let size = state.validation().result.as_ref().unwrap().canvas_size;
+    assert!(status_text(&state).starts_with(&format!("出力 {} × {} px", size.0, size.1)));
+    assert!(footer_error(&state).is_none());
+    state.items[0].status = ItemStatus::Failed("decode failed".into());
+    assert!(!state.ready());
+    assert_eq!(status_text(&state), invalid);
+    assert!(
+        footer_error(&state)
+            .unwrap()
+            .starts_with("読めない画像を外してください:")
+    );
+    state.reopened = Some(ReopenedOutput {
+        path: PathBuf::from("C:/Pictures/combined.png"),
+        format: CombineFormat::Png,
+        replace: true,
+        has_edits: false,
+    });
+    assert_eq!(
+        status_text(&state),
+        format!("{invalid}\n元の結合画像を置き換えます (元に戻せません): combined.png")
+    );
+}
+
+#[test]
+fn image_combine_preview_checker_follows_delivered_options_while_draft_changes() {
+    let ctx = egui::Context::default();
+    let checker = crate::ui_helpers::checker_texture(&ctx);
+    let mut state = fixture_state(&ctx, false);
+    let (_commands, events, _) = connection(&mut state);
+    for (format, transparent, expected_checker) in [
+        (CombineFormat::Png, false, false),
+        (CombineFormat::Png, true, true),
+        (
+            CombineFormat::Webp {
+                quality: 90,
+                lossless: true,
+            },
+            false,
+            false,
+        ),
+        (
+            CombineFormat::Webp {
+                quality: 90,
+                lossless: true,
+            },
+            true,
+            true,
+        ),
+        (CombineFormat::Jpeg { quality: 95 }, false, false),
+        (CombineFormat::Jpeg { quality: 95 }, true, false),
+    ] {
+        state.options.format = format;
+        state.options.transparent_background = transparent;
+        state.generation += 1;
+        let layout = state.validation().result.as_ref().unwrap().clone();
+        let rgba = create_canvas(&layout, &state.options, 0.1).unwrap();
+        let revision = state.validation().revision;
+        state.requested = Some(SubmittedPreview {
+            revision,
+            spec: state.spec(),
+        });
+        events
+            .send(Event::Rendered {
+                generation: state.generation,
+                rgba,
+                layout,
+                not_drawn: 0,
+            })
+            .unwrap();
+        // Change the draft before delivery. Painting must use the submitted
+        // options, then retain that decision after another request is pending.
+        state.options.format = CombineFormat::Png;
+        state.options.transparent_background = !expected_checker;
+        state.poll(&ctx);
+        state.invalidate_and_request(&ctx);
+        let output = crate::test_ui::headless_paint_output(ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 300.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| draw_preview(ui, &mut state, 240.0));
+            },
+        ));
+        let meshes = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) => Some(mesh),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let checks = meshes
+            .iter()
+            .filter(|mesh| mesh.texture_id == checker.id())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            checks.len(),
+            usize::from(expected_checker),
+            "{format:?}, {transparent}"
+        );
+        if let Some(check) = checks.first() {
+            let image = meshes
+                .iter()
+                .find(|mesh| mesh.texture_id == state.preview.as_ref().unwrap().texture.id())
+                .unwrap();
+            assert_eq!(check.calc_bounds(), image.calc_bounds());
+            let uv = crate::ui_helpers::checker_quad_uvs(image.calc_bounds().size());
+            assert_eq!(check.vertices[0].uv, uv[0]);
+            assert!(check.vertices.iter().any(|vertex| vertex.uv == uv[2]));
+        }
+    }
+}
+
+#[test]
 fn image_combine_app_state_storage_is_one_pointer() {
     fn storage<T>(_: fn(&App) -> &T) -> usize {
         std::mem::size_of::<T>()

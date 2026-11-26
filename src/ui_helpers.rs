@@ -55,6 +55,50 @@ pub(crate) fn any_button_press_origin(input: &egui::InputState) -> Option<egui::
 #[cfg(test)]
 mod pointer_press_tests;
 
+/// Shared transparency checker, owned by the egui Context and reused by viewers
+/// and the combine preview. The fullscreen App cache holds the same texture.
+pub(crate) fn checker_texture(ctx: &egui::Context) -> egui::TextureHandle {
+    let key = egui::Id::unique("transparent-background-checker");
+    if let Some(texture) = ctx.data(|data| data.get_temp::<egui::TextureHandle>(key)) {
+        return texture;
+    }
+    // 16×16 の 2 値グレー。タイルは 8×8 の 2 色。
+    // Photoshop / GIMP 標準に近い中間グレーで、目に邪魔にならない配色。
+    let mut rgba = Vec::with_capacity(16 * 16 * 4);
+    for y in 0..16 {
+        for x in 0..16 {
+            let cell = ((x / 8) + (y / 8)) % 2;
+            let v: u8 = if cell == 0 { 224 } else { 176 };
+            rgba.extend_from_slice(&[v, v, v, 255]);
+        }
+    }
+    let ci = egui::ColorImage::from_rgba_unmultiplied([16, 16], &rgba);
+    let options = egui::TextureOptions {
+        magnification: egui::TextureFilter::Nearest,
+        minification: egui::TextureFilter::Nearest,
+        wrap_mode: egui::TextureWrapMode::Repeat,
+        mipmap_mode: None,
+    };
+    let tex = ctx.load_texture("fs_transparent_checker", ci, options);
+    ctx.data_mut(|data| data.insert_temp(key, tex.clone()));
+    tex
+}
+
+pub(crate) const CHECKER_TILE_PX: f32 = 16.0;
+
+pub(crate) fn checker_quad_uvs(local_size: egui::Vec2) -> [egui::Pos2; 4] {
+    let uv_max = egui::pos2(
+        local_size.x / CHECKER_TILE_PX,
+        local_size.y / CHECKER_TILE_PX,
+    );
+    [
+        egui::pos2(0.0, 0.0),
+        egui::pos2(uv_max.x, 0.0),
+        uv_max,
+        egui::pos2(0.0, uv_max.y),
+    ]
+}
+
 /// Own immutable snapshot assets until their Context is dropped. kittest 0.37
 /// handles texture frees before capture, so draw-local handles cannot own them.
 /// Content and sampling are part of the key: fixture names alone can repeat.

@@ -42,6 +42,8 @@ fn image_combine_recipe_roundtrip_upsert_and_key_only_index() {
     let data = tempfile::tempdir().unwrap();
     let output = data.path().join("joined.png");
     let mut recipe = recipe(data.path());
+    recipe.options.background_color = [12, 34, 56];
+    recipe.options.transparent_background = true;
     recipe.items[2].annotation_space = Some([1600, 2400]);
     save_recipe(data.path(), &output, &recipe).unwrap();
     assert_eq!(

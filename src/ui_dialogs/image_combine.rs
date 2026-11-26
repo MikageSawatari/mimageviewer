@@ -96,6 +96,7 @@ struct Preview {
     not_drawn: usize,
     kind: CombineLayout,
     direction: CombineDirection,
+    background: EffectiveBackground,
 }
 
 /// A draft's actual validation/render inputs, including text that has not parsed
@@ -245,6 +246,15 @@ impl CombineDialogState {
                 .all(|item| matches!(item.status, ItemStatus::Loaded(_)))
     }
 
+    /// All loading work has terminated, including when no images remain.
+    fn loading_finished(&self) -> bool {
+        self.pending.is_empty()
+            && self
+                .items
+                .iter()
+                .all(|item| matches!(item.status, ItemStatus::Loaded(_) | ItemStatus::Failed(_)))
+    }
+
     fn validation(&self) -> Ref<'_, ValidatedDraft> {
         let mut cached = self.validation.borrow_mut();
         if cached
@@ -263,6 +273,9 @@ impl CombineDialogState {
     }
 
     fn compute_validation(&self) -> Result<Layout, String> {
+        if self.items.is_empty() {
+            return Err("結合する画像がありません".into());
+        }
         if let Some(item) = self
             .items
             .iter()
@@ -270,7 +283,7 @@ impl CombineDialogState {
         {
             return Err(format!("読めない画像を外してください: {}", item.name));
         }
-        if !self.ready() {
+        if !self.loading_finished() {
             return Err("画像を読み込み中です".into());
         }
         if matches!(
@@ -440,6 +453,11 @@ impl CombineDialogState {
             }
         }
         if let Some((generation, rgba, layout, not_drawn)) = rendered {
+            // A Rendered event belongs to the last submitted generation. The
+            // draft may already differ while its next render is still pending.
+            let Some(sent) = &self.requested else {
+                return;
+            };
             let image = egui::ColorImage::from_rgba_unmultiplied(
                 [rgba.width() as usize, rgba.height() as usize],
                 rgba.as_raw(),
@@ -451,21 +469,12 @@ impl CombineDialogState {
                     egui::TextureOptions::LINEAR,
                 ),
                 layout,
-                ids: self
-                    .requested
-                    .as_ref()
-                    .map(|sent| sent.spec.items.iter().map(|(id, _)| *id).collect())
-                    .unwrap_or_default(),
+                ids: sent.spec.items.iter().map(|(id, _)| *id).collect(),
                 generation,
                 not_drawn,
-                kind: self
-                    .requested
-                    .as_ref()
-                    .map_or(self.options.layout, |sent| sent.spec.options.layout),
-                direction: self
-                    .requested
-                    .as_ref()
-                    .map_or(self.options.direction, |sent| sent.spec.options.direction),
+                kind: sent.spec.options.layout,
+                direction: sent.spec.options.direction,
+                background: sent.spec.options.effective_background(),
             });
             #[cfg(test)]
             crate::ime_focus::typing_probe::job(
@@ -1305,7 +1314,7 @@ fn footer_error(state: &CombineDialogState) -> Option<String> {
         // Loading already has a status row. Treating it as an error adds a
         // temporary footer row and moves the label's click target on completion.
         .or_else(|| {
-            (state.ready()
+            (state.loading_finished()
                 || state
                     .items
                     .iter()
@@ -1329,6 +1338,8 @@ fn status_text(state: &CombineDialogState) -> String {
                 ""
             }
         )
+    } else if state.loading_finished() {
+        "出力: 計算できません (下の理由を直してください)".into()
     } else {
         let loaded = state
             .items
@@ -1439,6 +1450,25 @@ fn card_rect(card: Rect, rect: egui::Rect, canvas: (u32, u32)) -> egui::Rect {
     )
 }
 
+fn paint_preview_image(painter: &egui::Painter, preview: &Preview, image_rect: egui::Rect) {
+    if preview.background == EffectiveBackground::Transparent {
+        let checker = crate::ui_helpers::checker_texture(painter.ctx());
+        let uvs = crate::ui_helpers::checker_quad_uvs(image_rect.size());
+        painter.image(
+            checker.id(),
+            image_rect,
+            egui::Rect::from_min_max(uvs[0], uvs[2]),
+            egui::Color32::WHITE,
+        );
+    }
+    painter.image(
+        preview.texture.id(),
+        image_rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
 fn draw_preview(ui: &mut egui::Ui, state: &mut CombineDialogState, height: f32) {
     let (area, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
@@ -1459,12 +1489,7 @@ fn draw_preview(ui: &mut egui::Ui, state: &mut CombineDialogState, height: f32) 
     let size = preview.texture.size_vec2();
     let fit = (area.width() / size.x).min(area.height() / size.y);
     let image_rect = egui::Rect::from_center_size(area.center(), size * fit);
-    ui.painter().image(
-        preview.texture.id(),
-        image_rect,
-        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
-    );
+    paint_preview_image(ui.painter(), preview, image_rect);
     let rects = preview
         .layout
         .cards
@@ -1643,15 +1668,23 @@ fn draw_item_controls(ui: &mut egui::Ui, state: &mut CombineDialogState) {
 }
 
 fn fixture_state(ctx: &egui::Context, band: bool) -> CombineDialogState {
-    fixture_state_with_fonts(ctx, band, None)
+    fixture_state_with_fonts(ctx, band, None, false)
 }
 
 fn fixture_state_with_fonts(
     ctx: &egui::Context,
     band: bool,
     fonts: Option<&comic_core::FontSet>,
+    transparent: bool,
 ) -> CombineDialogState {
     let mut options = CombineOptions::default();
+    if transparent {
+        options.transparent_background = true;
+        options.margin = 24;
+        options.gap_x = 18;
+        options.gap_y = 18;
+        options.corner_radius = 40;
+    }
     if band {
         options.labels.placement = LabelPlacement::Band;
     }
@@ -1709,6 +1742,7 @@ fn fixture_state_with_fonts(
         [rgba.width() as usize, rgba.height() as usize],
         rgba.as_raw(),
     );
+    let background = options.effective_background();
     CombineDialogState {
         request: 0,
         options,
@@ -1726,6 +1760,7 @@ fn fixture_state_with_fonts(
             not_drawn: 0,
             kind: CombineLayout::JustifiedRows,
             direction: CombineDirection::LeftToRight,
+            background,
         }),
         generation: 0,
         requested: None,
@@ -1747,7 +1782,16 @@ fn fixture_state_with_fonts(
 /// Production window fixture without App, file IO or a worker.
 #[doc(hidden)]
 pub fn draw_image_combine_snapshot_fixture(ctx: &egui::Context, band: bool) {
-    let id = egui::Id::unique(("image_combine_fixture", band));
+    draw_image_combine_snapshot_with_background(ctx, band, false);
+}
+
+#[doc(hidden)]
+pub fn draw_image_combine_transparent_snapshot_fixture(ctx: &egui::Context) {
+    draw_image_combine_snapshot_with_background(ctx, false, true);
+}
+
+fn draw_image_combine_snapshot_with_background(ctx: &egui::Context, band: bool, transparent: bool) {
+    let id = egui::Id::unique(("image_combine_fixture", band, transparent));
     let state = ctx
         .data_mut(|data| data.get_temp::<std::sync::Arc<std::sync::Mutex<CombineDialogState>>>(id));
     let state = state.unwrap_or_else(|| {
@@ -1777,6 +1821,7 @@ pub fn draw_image_combine_snapshot_fixture(ctx: &egui::Context, band: bool) {
             ctx,
             band,
             fonts.as_ref(),
+            transparent,
         )));
         ctx.data_mut(|data| data.insert_temp(id, state.clone()));
         state

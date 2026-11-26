@@ -60,9 +60,9 @@ fn rgba(rgb: [u8; 3], alpha: u8) -> Rgba<u8> {
 }
 
 fn background(o: &CombineOptions) -> Rgba<u8> {
-    match o.background {
-        Background::Color(rgb) => rgba(rgb, 255),
-        Background::Transparent => Rgba([0; 4]),
+    match o.effective_background() {
+        EffectiveBackground::Color(rgb) => rgba(rgb, 255),
+        EffectiveBackground::Transparent => Rgba([0; 4]),
     }
 }
 

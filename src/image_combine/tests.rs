@@ -40,6 +40,156 @@ fn no_labels(count: usize) -> LabelLayout {
 }
 
 #[test]
+fn image_combine_effective_background_format_and_transparency_matrix() {
+    for format in [
+        CombineFormat::Png,
+        CombineFormat::Webp {
+            quality: 90,
+            lossless: false,
+        },
+        CombineFormat::Jpeg { quality: 95 },
+    ] {
+        for transparent_background in [false, true] {
+            let o = CombineOptions {
+                format,
+                background_color: [12, 34, 56],
+                transparent_background,
+                ..Default::default()
+            };
+            let expected =
+                if transparent_background && !matches!(format, CombineFormat::Jpeg { .. }) {
+                    EffectiveBackground::Transparent
+                } else {
+                    EffectiveBackground::Color([12, 34, 56])
+                };
+            assert_eq!(
+                o.effective_background(),
+                expected,
+                "{format:?}, {transparent_background}"
+            );
+            assert_eq!(o.normalized(), o);
+        }
+    }
+}
+
+#[test]
+fn image_combine_jpeg_roundtrip_keeps_background_choices() {
+    for format in [
+        CombineFormat::Png,
+        CombineFormat::Webp {
+            quality: 90,
+            lossless: true,
+        },
+    ] {
+        let original = CombineOptions {
+            format,
+            background_color: [12, 34, 56],
+            transparent_background: true,
+            ..Default::default()
+        };
+        let mut o = original.clone();
+        o.format = CombineFormat::Jpeg { quality: 95 };
+        o = o.normalized();
+        assert!(o.transparent_background);
+        assert_eq!(o.background_color, original.background_color);
+        assert_eq!(
+            o.effective_background(),
+            EffectiveBackground::Color([12, 34, 56])
+        );
+        o.format = format;
+        assert_eq!(o.normalized(), original);
+        assert_eq!(o.effective_background(), EffectiveBackground::Transparent);
+    }
+}
+
+#[test]
+fn image_combine_canvas_and_background_band_use_effective_background() {
+    for format in [
+        CombineFormat::Png,
+        CombineFormat::Webp {
+            quality: 90,
+            lossless: true,
+        },
+        CombineFormat::Jpeg { quality: 95 },
+    ] {
+        for transparent_background in [false, true] {
+            let mut o = options(CombineLayout::Row);
+            o.format = format;
+            o.background_color = [12, 34, 56];
+            o.transparent_background = transparent_background;
+            o.margin = 4;
+            o.labels.placement = LabelPlacement::Band;
+            o.labels.text_size_px = 8;
+            let layout = calculate(&o, &[(32, 24)]);
+            let expected = match o.effective_background() {
+                EffectiveBackground::Transparent => Rgba([0; 4]),
+                EffectiveBackground::Color([r, g, b]) => Rgba([r, g, b, 255]),
+            };
+            let canvas = create_canvas(&layout, &o, 1.0).unwrap();
+            assert_eq!(*canvas.get_pixel(0, 0), expected);
+            // Start empty so an opaque canvas cannot hide an incorrect band fill.
+            let mut canvas = RgbaImage::new(layout.canvas_size.0, layout.canvas_size.1);
+            draw_card(
+                &mut canvas,
+                &layout.cards[0],
+                &RgbaImage::from_pixel(32, 24, Rgba([255; 4])),
+                &o,
+                1.0,
+            )
+            .unwrap();
+            let band = layout.cards[0].band.unwrap();
+            assert_eq!(
+                *canvas.get_pixel((band.x + 2.0) as u32, (band.y + 2.0) as u32),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn image_combine_old_background_json_uses_new_field_defaults_without_migration() {
+    for background in [
+        serde_json::json!({"Color": [12, 34, 56]}),
+        serde_json::json!("Transparent"),
+    ] {
+        let value = serde_json::json!({"background": background, "margin": 17});
+        let expected = CombineOptions {
+            margin: 17,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::from_value::<CombineOptions>(value.clone()).unwrap(),
+            expected
+        );
+        let preset: CombinePreset =
+            serde_json::from_value(serde_json::json!({"name": "old", "options": value.clone()}))
+                .unwrap();
+        assert_eq!(preset.options, expected);
+        let recipe: CombineRecipe = serde_json::from_value(
+            serde_json::json!({"v": 1, "options": value.clone(), "items": [spec(None)]}),
+        )
+        .unwrap();
+        assert_eq!(recipe.v, 1);
+        assert_eq!(recipe.options, expected);
+        let settings: crate::settings::Settings = serde_json::from_value(serde_json::json!({
+            "combine_options": value.clone(),
+            "combine_presets": [{"name": "old", "options": value}]
+        }))
+        .unwrap();
+        assert_eq!(settings.combine_options.as_ref(), Some(&expected));
+        assert_eq!(settings.combine_presets[0].options, expected);
+    }
+    let o = CombineOptions {
+        background_color: [12, 34, 56],
+        transparent_background: true,
+        ..Default::default()
+    };
+    let value = serde_json::to_value(&o).unwrap();
+    assert!(value.get("background").is_none());
+    assert_eq!(serde_json::from_value::<CombineOptions>(value).unwrap(), o);
+}
+
+#[test]
 fn serde_defaults_normalization_and_recipe_roundtrip() {
     let defaults: CombineOptions = serde_json::from_str("{}").unwrap();
     assert_eq!(defaults, CombineOptions::default());
@@ -60,7 +210,7 @@ fn serde_defaults_normalization_and_recipe_roundtrip() {
     o.labels.number_start = u32::MAX;
     o.labels.overlay_margin_px = u32::MAX;
     o.output_size = OutputSize::Width(0);
-    o.background = Background::Transparent;
+    o.transparent_background = true;
     o.format = CombineFormat::Jpeg { quality: 0 };
     let o = o.normalized();
     assert_eq!(
@@ -80,7 +230,11 @@ fn serde_defaults_normalization_and_recipe_roundtrip() {
     assert_eq!(o.labels.fill_opacity, 100);
     assert_eq!(o.labels.overlay_margin_px, 500);
     assert_eq!(o.output_size, OutputSize::Width(16));
-    assert_eq!(o.background, Background::Color([255; 3]));
+    assert!(o.transparent_background);
+    assert_eq!(
+        o.effective_background(),
+        EffectiveBackground::Color([255; 3])
+    );
     let recipe = CombineRecipe {
         v: 1,
         options: o,
@@ -713,7 +867,7 @@ fn rounded_coverage_is_smooth_and_clamps_radius_to_half_short_side() {
 #[test]
 fn transparent_rounded_corners_border_arc_band_and_jpeg_background() {
     let mut o = options(CombineLayout::Row);
-    o.background = Background::Transparent;
+    o.transparent_background = true;
     o.corner_radius = 20;
     o.border = Border {
         width_px: 4,
@@ -785,7 +939,7 @@ fn border_fully_covers_interior_ring_on_all_edges_and_arcs() {
         (20, 20, 0, 10, 100), // Border consumes the entire card.
     ] {
         let mut o = options(CombineLayout::Row);
-        o.background = Background::Transparent;
+        o.transparent_background = true;
         o.margin = 3;
         o.corner_radius = radius;
         o.border = Border {
@@ -975,7 +1129,7 @@ fn labels_are_clipped_to_rounded_card_and_band_without_touching_neighbors() {
     let fonts = fonts();
     for placement in [LabelPlacement::Overlay, LabelPlacement::Band] {
         let mut o = options(CombineLayout::Row);
-        o.background = Background::Transparent;
+        o.transparent_background = true;
         o.corner_radius = 500;
         o.gap_x = 20;
         o.labels.placement = placement;
@@ -1200,7 +1354,7 @@ fn preview_badge_and_text_pixel_bounds_match_reduced_output_within_one_pixel() {
     for style in [BadgeStyle::Box, BadgeStyle::Pill] {
         for placement in [LabelPlacement::Overlay, LabelPlacement::Band] {
             let mut o = options(CombineLayout::Row);
-            o.background = Background::Transparent;
+            o.transparent_background = true;
             o.labels.placement = placement;
             o.labels.style = style;
             o.labels.fill_color = [255, 0, 0];
@@ -1278,7 +1432,7 @@ fn fractional_grid_width_4093_has_no_background_seam() {
     o.grid_columns = Some(12);
     o.cell_fit = CellFit::Fill;
     o.output_size = OutputSize::Width(4093);
-    o.background = Background::Transparent;
+    o.transparent_background = true;
     let sources = vec![RgbaImage::from_pixel(1, 1, Rgba([17, 93, 211, 255])); 12];
     for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
         o.direction = direction;
@@ -1322,7 +1476,7 @@ fn justified_rows_fractional_widths_have_no_background_seam() {
     let mut o = options(CombineLayout::JustifiedRows);
     o.split = Split::Counts(vec![12]);
     o.output_size = OutputSize::Width(4093);
-    o.background = Background::Transparent;
+    o.transparent_background = true;
     let sources = vec![RgbaImage::from_pixel(1, 1, Rgba([41, 123, 209, 255])); 12];
     for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
         o.direction = direction;
@@ -1377,7 +1531,7 @@ fn all_layouts_share_card_image_band_and_gap_endpoints() {
         } else {
             OutputSize::Width(509)
         };
-        o.background = Background::Transparent;
+        o.transparent_background = true;
         o.labels.band_color = BandColor::Color([11, 59, 173]);
         let sources = vec![RgbaImage::from_pixel(1, 1, Rgba([211, 73, 31, 255])); 12];
         for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
@@ -1564,7 +1718,7 @@ fn grid_width_1363_keeps_all_seven_pixel_gaps() {
     o.cell_fit = CellFit::Fill;
     o.output_size = OutputSize::Width(1363);
     o.gap_x = 7;
-    o.background = Background::Transparent;
+    o.transparent_background = true;
     let sources = vec![RgbaImage::from_pixel(1, 1, Rgba([31, 107, 233, 255])); 12];
     for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
         o.direction = direction;
@@ -1611,7 +1765,7 @@ fn rendered_fixed_gaps_margins_and_bands_are_exact_in_all_layouts_and_directions
         } else {
             OutputSize::Width(1363)
         };
-        o.background = Background::Transparent;
+        o.transparent_background = true;
         o.labels.band_color = BandColor::Color([19, 61, 179]);
         let sources = vec![RgbaImage::from_pixel(1, 1, Rgba([211, 73, 31, 255])); 12];
         for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
@@ -1929,7 +2083,7 @@ fn unmatched_fractional_rows_and_columns_keep_rendered_fixed_gaps() {
         let mut o = options(kind);
         o.line_size = LineSize::None;
         o.margin = 3;
-        o.background = Background::Transparent;
+        o.transparent_background = true;
         o.labels.band_color = BandColor::Color([19, 61, 179]);
         o.output_size = if vertical {
             OutputSize::Height(1363)

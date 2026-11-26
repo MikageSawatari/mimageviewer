@@ -1,6 +1,7 @@
 //! Paged presentation owns neither navigation nor producers. A prepared unit is submitted once.
 use super::*;
 use crate::settings::PageTurnAnimationStyle;
+use crate::ui_helpers::CHECKER_TILE_PX;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
