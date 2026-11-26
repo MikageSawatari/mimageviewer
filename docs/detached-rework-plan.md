@@ -1458,6 +1458,19 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-26: 押す・離すが同じフレームのクリックの止めの寿命 (§1.906)
+
+- 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §13。共有 viewer 入力の
+  `FullscreenPrimarySuppression` に「離し済みの流れを、この pass の残りだけ止める」状態 (`ReleasedThisPass`) を足し、
+  止めを立てる入口を 1 つ (`App::arm_fs_primary_suppression`、`ctx` の最終の押下を読む) にする。
+  `advance_viewer_primary_pointer_frame` は今ある流れへの離しを先に渡し、その後で右ドラッグ取消・F1 を立てる。
+- detached の述語・viewport の経路・窓の所有は変更しない。`fs_primary_suppression` は今どおり前面 viewer に 1 つの
+  App の状態で、open・close・park・新しい窓・passive の採用での初期化も変えない。離し済みの入力から持続する止めを
+  作っていた生成の境界を直す構造的修正であり、guard・遅延・再試行・時間切れによる症状パッチではない。
+- 構造的修正であることの合意: Codex 独立設計レビュー r1 (方針に合意、第 1 版は不合意)・r2 (第 2 版全体に合意、
+  GPT-6.1 Sol / xhigh) と ClaudeCode (設計担当)。実装の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh、
+  r1 REVISE → r2 ACCEPT、`8a6c2f541..be712caf9`) も、最終版全体が構造的修正であることに合意。
+
 ### 2026-11-25: 閉じるモードのフォーカス復帰クリック (§1.899)
 
 - 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §12。共有 viewer 入力の

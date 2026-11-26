@@ -37,6 +37,7 @@
 <a href="eq-earphone-cable-sim.html" class="sub">Earphone Cable Sim</a>
 <a href="eq-group-delay-eq.html" class="sub">Group Delay EQ</a>
 <a href="eq-group-delay-peq.html" class="sub">Group Delay PEQ</a>
+<a href="eq-headphone-eq.html" class="sub">Headphone EQ</a>
 <a href="eq-hi-pass-filter.html" class="sub">Hi Pass Filter</a>
 <a href="eq-lo-pass-filter.html" class="sub">Lo Pass Filter</a>
 <a href="eq-loudness-equalizer.html" class="sub">Loudness Equalizer</a>
@@ -57,7 +58,7 @@
 <a href="license.html">MIT License</a>
   </nav></aside>
   <main class="content">
-    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/5ffca1b31e8a74ada7140aefd0c9c9fe4b7740da/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
+    <div class="box info"><div class="box-body">mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve、MIT License) を元にした mImageViewer 専用の派生版です。<a href="https://github.com/MikageSawatari/miv-sound">mIV Sound のソース</a>を公開しています。この説明は EffeTune の<a href="https://github.com/Frieve-A/effetune/tree/0ffa5c709ed1f1c99e5c94149ccd45c15e501e9d/docs/i18n/ja">公式ドキュメント</a> (<a href="license.html">MIT License</a>) を音響調整に合わせて転載・一部修正したものです。</div></div>
 <h1 id="room-eq" class="page-title">Room EQ</h1>
 
 <p><a href="eq.html">カテゴリの説明とプラグイン一覧</a></p>
@@ -76,7 +77,7 @@
 <blockquote><p>測定データは端末内の参照です。URLやプリセットには選択した測定の名前と識別子だけが保存され、測定データ自体は含まれません。上流のデスクトップ版の測定画面で <strong>測定JSONのエクスポートにインパルス応答を含める</strong> を有効にして書き出し、mImageViewer の Room EQ で取り込んでから選択してください。このオプションは初期状態ではオンで、インパルス応答を含めるとファイルが数十MB大きくなる場合があります。測定が見つからない場合は警告が表示され、Room EQは古い補正データを使わず時間を合わせたバイパスになります。</p></blockquote>
 <h2 id="パラメータ-14">パラメータ</h2>
 <ul>
-<li><p><strong>Measurement</strong> - 共有の保存済み測定を選びます（名前、ポイント数、インパルスデータがある場合は <code>IR</code> を表示）。測定を追加・編集した後は <strong>Refresh measurements</strong> をクリックします。</p></li>
+<li><p><strong>Measurement</strong> - 共有の保存済み測定を選びます（名前、ポイント数、インパルスデータがある場合は <code>IR</code> を表示）。測定を追加・編集した後は <strong>Refresh measurements</strong> をクリックします。測定の取り込みには、測定選択欄の <strong>測定をインポート…</strong> ボタンを使ってください。</p></li>
 <li><p><strong>Measurement ChN</strong> - ルーティングされた各バスチャンネルの測定を個別に指定する、任意の設定です。<strong>(Shared)</strong> のままにすると、共有の <strong>Measurement</strong> を使います。</p></li>
 <li><p><strong>Delay</strong>（0～20 ms）- ルーティングされたすべてのチャンネルに加える手動ディレイです。報告される処理遅延には含まれません。</p></li>
 <li><p><strong>Phase</strong> - FIRの位相特性を選びます。</p>
@@ -100,7 +101,7 @@
 <li><p><strong>Reverb Max Freq</strong>（20～20000 Hz、初期値 250 Hz）- <strong>Reverb Correction</strong> の上限周波数で、<strong>Correction High</strong> を超えません（250 Hz付近に保つと、近くの座席どうしで同じように振る舞う低域の室内減衰に絞って補正できます）。</p></li>
 <li><p><strong>Reverb Smoothing</strong>（0.02～1.00 oct）- 残響の余剰位相遅延に適用するガウス平滑化の幅です。</p></li>
 <li><p><strong>Reference Point</strong> - 余剰位相の解析に使う基準として、<strong>Consensus (all points)</strong>（全測定ポイントを信頼度で重み付けした平均）か、単一の測定ポイントを選びます。選んだポイントが削除されると、Consensusに戻ります。</p></li>
-<li><p><strong>Additional EQ（FIRに統合）</strong> - 目標特性を整えてFIRフィルターへ直接組み込む、5つのパラメトリックバンドです（Peak / Low shelf / High shelf、20 Hz～20 kHz、±20 dB、Q 0.1～10、シェルフは2まで）。位相は、Linearモードではゼロ位相、MinimumとCorrectionモードではミニマムフェーズになります。</p></li>
+<li><p><strong>Additional EQ（FIRに統合）</strong> - 目標特性を整えてFIRフィルターへ直接組み込む、5つのパラメトリックバンドです（タイプは <strong>Peaking</strong> / <strong>LowShelv</strong> / <strong>HighShel</strong>、20 Hz～20 kHz、±20 dB、Q 0.1～10、シェルフは2まで）。<strong>Peaking</strong> ではQを上げると狭い帯域、下げると広い帯域に作用し、シェルフではQが切り替わり付近の形を変えます。位相は、Linearモードではゼロ位相、MinimumとCorrectionモードではミニマムフェーズになります。</p></li>
 <li><p><strong>Gain</strong>（-12～+12 dB）- 出力レベルを調整します。</p></li></ul>
 <h2 id="ビジュアル表示-14">ビジュアル表示</h2>
 <ul>

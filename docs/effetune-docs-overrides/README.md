@@ -8,9 +8,9 @@
 名称・クレジットは §2、保存と初回コピーは §4〜5、ポータブルの有効化は F4、統合文書と Counter 復帰は §19。
 原文 EffeTune / EffeTune Mixwright（Frieve、MIT）の名前は転載注記・license に残す。
 
-現行版は **0.17.0-miv.1**（上流説明書 **v0.17.0**）。既定 snapshot は
-`third_party/effetune-docs/5ffca1b3/`、公開出力は134 HTML＋4画像。
-更新記録は [派生版計画 §20](../effetune-fork-plan.md#20-0170-miv1-への更新-2026-11-11) を参照。
+現行版は **0.19.0-miv.1**（上流説明書 **v0.19.0**）。既定 snapshot は
+`third_party/effetune-docs/0ffa5c70/`、公開出力は135 HTML＋4画像。
+更新記録は [派生版計画 §21](../effetune-fork-plan.md#21-0190-miv1-への更新-2026-11-26) を参照。
 
 2026-10-10 の v0.13.0 実装レビュー訂正（履歴）:
 
@@ -139,7 +139,23 @@ SoundFont Note Player の旧アンカーは、重複しないよう h2 へ移し
 | トラブルシューティングとFAQ、技術情報（ブラウザ互換性、ブラウザサポートの詳細、推奨サンプルレート） | ブラウザ／独立アプリの要件・設定。mIV の利用条件は mIV ページで案内 |
 | 利用可能なエフェクト、開発ガイド | エフェクト一覧は生成目次に全111件掲載済み。開発ガイドは利用者向け操作の対象外 |
 
-## mIV Sound 向け訂正 (2026-11-11 更新)
+## 同梱版更新 (2026-11-26)
+
+既定 snapshot は `0ffa5c709ed1f1c99e5c94149ccd45c15e501e9d`（EffeTune 2.19.0）。
+Mixwright v0.19.0 release `855ca5a9c931cfc67055c0f4aed77f157a0f7b38` の submodule に対応する。
+`config/miv-sound.rs` の派生版 `0.19.0-miv.1`・説明書 `v0.19.0` と照合し、135 HTML＋4画像を生成する。
+
+- Headphone EQ は AutoEQ のダウンロードも含めて掲載する。初回フォーカスの一覧取得、機種選択・AutoEQリンクの
+  CSV取得、検索語の端末内照合、通信先に伝わる情報、AutoEQ以外のリンク拒否、ローカルファイル読込を説明する。
+  独立版のWASM設定条件は除く。追加でずれるEQの小見出しIDは `scope_heading_id` による完全一致の訂正で維持する。
+- Distortion Correction は追加候補にないため、節・一覧と検索用メタ情報から除外する。
+  Live Audio Receive / Send も除外する。SoundFont Player の除外と SoundFont Note Player の旧URL・保存先説明は維持する。
+- 15Band PEQ の Master Gain と Preamp 読込、プリセット一覧の検索を掲載する。
+  READMEの節選別と既存フラグメントを保ち、Room EQの独立測定画面からのコピー操作は同梱版のJSON取込へ訂正する。
+- Visualizerのブラウザ曲情報・再生位置説明を除き、mIVの曲情報・歌詞・Counterの説明は維持する。
+  独立版のプレーヤー・測定・ネットワーク出力・更新確認は案内しない。
+
+## mIV Sound 向け訂正 (2026-11-11、履歴)
 
 - 原文は `5ffca1b3` の日本語 snapshot（上流 v0.17.0、Mixwright release `60c7629`）。
   `config/miv-sound.rs` と `SOURCE.md` の派生版を対応づけて、`manual/sound/` に134 HTML＋4画像を生成する。

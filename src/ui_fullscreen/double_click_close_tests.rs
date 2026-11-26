@@ -2,6 +2,8 @@
 use super::*;
 use crate::settings::FullscreenPrimaryClickMode;
 
+mod suppression_906_tests;
+
 fn viewport() -> egui::Rect {
     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))
 }
@@ -175,6 +177,29 @@ impl Canvas {
         })
     }
 
+    fn redraw_canvas_after_release(&mut self) {
+        // F2 returns before registering fs_click in PageTurn mode. Real UI
+        // frames redraw it before the next physical click; egui hit-tests the
+        // previous pass's widgets. Do not synthesize another release here:
+        // the old stranded PointerStream must remain detectable by this test.
+        assert_eq!(
+            self.merge_using(vec![], true, None, |app, ui| {
+                assert!(ui.ctx().input(|i| {
+                    !i.pointer.primary_pressed()
+                        && !i.pointer.primary_released()
+                        && !i.pointer.primary_down()
+                }));
+                let (result, _) = super::wheel_frame_tests::actual_merge(app, ui, false);
+                (result.close, !result.page_nav.is_none())
+            }),
+            (false, false)
+        );
+        assert_eq!(
+            self.app.fs_primary_suppression,
+            FullscreenPrimarySuppression::Idle
+        );
+    }
+
     #[cfg(windows)]
     fn for_focus_restore() -> Self {
         let mut canvas = Self::new();
@@ -192,33 +217,52 @@ impl Canvas {
         events: Vec<egui::Event>,
         focused: bool,
         hud: Option<egui::Rect>,
+        run: impl FnMut(&mut App, &mut egui::Ui) -> (bool, bool),
+    ) -> (bool, bool) {
+        self.merge_using_on(egui::ViewportId::ROOT, events, focused, hud, run)
+    }
+
+    fn merge_using_on(
+        &mut self,
+        viewport_id: egui::ViewportId,
+        events: Vec<egui::Event>,
+        focused: bool,
+        hud: Option<egui::Rect>,
         mut run: impl FnMut(&mut App, &mut egui::Ui) -> (bool, bool),
     ) -> (bool, bool) {
         self.time += 0.04;
         let mut facts = (false, false);
         let ctx = self.ctx.clone();
-        ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(viewport()),
-                time: Some(self.time),
-                focused,
-                events,
+        let mut input = egui::RawInput {
+            viewport_id,
+            screen_rect: Some(viewport()),
+            time: Some(self.time),
+            focused,
+            events,
+            ..Default::default()
+        };
+        input.viewports.insert(
+            viewport_id,
+            egui::ViewportInfo {
+                parent: (viewport_id != egui::ViewportId::ROOT).then_some(egui::ViewportId::ROOT),
+                inner_rect: Some(viewport()),
+                focused: Some(focused),
                 ..Default::default()
             },
-            |ui| {
-                if let Some(hud) = hud {
-                    egui::Area::new(egui::Id::new("restore-close-test-hud"))
-                        .order(egui::Order::Foreground)
-                        .fixed_pos(hud.min)
-                        .default_size(hud.size())
-                        .movable(false)
-                        .show(&ctx, |ui| {
-                            let _ = ui.allocate_exact_size(hud.size(), egui::Sense::click());
-                        });
-                }
-                facts = run(&mut self.app, ui);
-            },
-        )
+        );
+        ctx.run_ui(input, |ui| {
+            if let Some(hud) = hud {
+                egui::Area::new(egui::Id::new("restore-close-test-hud"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(hud.min)
+                    .default_size(hud.size())
+                    .movable(false)
+                    .show(&ctx, |ui| {
+                        let _ = ui.allocate_exact_size(hud.size(), egui::Sense::click());
+                    });
+            }
+            facts = run(&mut self.app, ui);
+        })
         .drop_without_applying_deltas();
         facts
     }
@@ -876,7 +920,9 @@ fn close_mode_actual_handler_suppressed_stream_cannot_start_a_close_pair() {
     let _input = crate::key_input::lock_test_input();
     let mut canvas = Canvas::new();
     canvas.merge(vec![egui::Event::PointerMoved(canvas_pos())]);
-    canvas.app.fs_primary_suppression.arm_pointer_stream();
+    canvas.app.fs_primary_suppression = FullscreenPrimarySuppression::pointer_stream_for_test(
+        FullscreenPrimarySuppressionReason::Other,
+    );
     assert_eq!(
         canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)),
         (false, false)
@@ -1429,7 +1475,9 @@ fn close_mode_focus_restore_899_other_cancellation_and_terminal_priority() {
         ),
     );
     // Another producer takes over the in-flight focus stream before its release.
-    canvas.app.fs_primary_suppression.arm_pointer_stream();
+    canvas.app.fs_primary_suppression = FullscreenPrimarySuppression::pointer_stream_for_test(
+        FullscreenPrimarySuppressionReason::Other,
+    );
     assert_eq!(
         canvas.merge(vec![button(canvas_pos(), false, egui::Modifiers::NONE)]),
         (false, false),
@@ -1651,13 +1699,8 @@ fn close_mode_focus_restore_899_page_turn_still_suppresses_restoring_click() {
             }
             canvas.app.settings.vst3_gui_visible = false;
             canvas.app.fs_focus_regained_at = None;
-            if f2 && !split {
-                // F2 still leaves its owner armed after a same-frame release;
-                // the next click is also suppressed in the released PageTurn policy.
-                assert_eq!(
-                    canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)),
-                    (false, false)
-                );
+            if f2 {
+                canvas.redraw_canvas_after_release();
             }
             assert_eq!(
                 canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)),
@@ -1701,23 +1744,17 @@ fn close_mode_focus_restore_899_reason_priority_and_terminal_idle() {
     use FullscreenPrimarySuppressionDecision::{Allow, Preserve, Suppress};
     use FullscreenPrimarySuppressionReason::{FocusRestore, Other};
     let mut suppression = FullscreenPrimarySuppression::Idle;
-    assert_eq!(
-        suppression.arm_focus_restore_pointer_stream(),
-        Suppress(FocusRestore)
-    );
+    assert_eq!(suppression.arm(true, FocusRestore), Suppress(FocusRestore));
     assert!(suppression.is_active());
-    suppression.arm_pointer_stream();
-    assert_eq!(
-        suppression.arm_focus_restore_pointer_stream(),
-        Suppress(Other)
-    );
+    let _ = suppression.arm(true, Other);
+    assert_eq!(suppression.arm(true, FocusRestore), Suppress(Other));
     let terminal =
         suppression.apply(FullscreenPrimarySuppressionEvent::PointerFrame { released: true });
     assert_eq!(suppression, FullscreenPrimarySuppression::Idle);
     assert!(!suppression.is_active());
     assert_eq!(terminal, Suppress(Other));
     assert_eq!(
-        terminal.overridden_by(suppression.arm_focus_restore_pointer_stream()),
+        terminal.overridden_by(suppression.arm(true, FocusRestore)),
         Suppress(Other),
     );
     assert_eq!(
@@ -1743,10 +1780,7 @@ fn close_mode_focus_restore_899_reason_priority_and_terminal_idle() {
         completed: false,
         cancelled: false,
     });
-    assert_eq!(
-        suppression.arm_focus_restore_pointer_stream(),
-        Suppress(Other)
-    );
+    assert_eq!(suppression.arm(true, FocusRestore), Suppress(Other));
 }
 
 #[cfg(windows)]
@@ -1908,15 +1942,26 @@ fn close_mode_focus_restore_899_context_focus_roundtrip_does_not_reuse_pair() {
         false,
     );
     canvas.app.fs_focus_regained_at = Some(std::time::Instant::now());
-    // Leave A with a candidate and a focus-only stream still armed (F2's
-    // same-frame terminal delivery); focus loss must retire the candidate.
+    // Leave A with a candidate and suppression for the remainder of this pass.
+    // The next advance retires the ended flow; focus loss still retires the candidate.
     canvas.app.settings.vst3_enabled = true;
     canvas.app.settings.vst3_gui_visible = true;
     assert_eq!(
         canvas.merge_window(a, 18993, click(canvas_pos(), egui::Modifiers::NONE), false),
         (false, false),
     );
-    assert!(canvas.app.fs_primary_suppression.is_active());
+    assert_eq!(
+        canvas.app.fs_primary_suppression,
+        FullscreenPrimarySuppression::ReleasedThisPass(
+            FullscreenPrimarySuppressionReason::FocusRestore
+        ),
+    );
+    assert!(canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+    canvas.merge_window(a, 18993, vec![], false);
+    assert_eq!(
+        canvas.app.fs_primary_suppression,
+        FullscreenPrimarySuppression::Idle
+    );
     assert!(canvas.app.fs_front_pointer.clicks.previous_close_candidate);
     for (context, window) in [(b, 18994), (a, 18993)] {
         assert_eq!(

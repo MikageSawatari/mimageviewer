@@ -40,6 +40,10 @@
 
 ## 1. 優先候補
 
+### 1.907 ドラッグ拡大の和音を押したまま速くクリックすると、ページが送られる — §1.906 の実装レビューから (2026-11-26)
+
+- 状態: **未着手、収録版未定 (v5.7.0 から既存)**。原因 (dblclick-899 の担当、コードから、実機未確認): egui が同じ pass の離しで press_origin を消すため、ドラッグ拡大の開始位置を取れずクリック扱いになる。Depth パネルの除外など同じ値を使う箇所とまとめて扱う。§1.906 の実装で Codex が開始位置の取り方を変えたが、Depth の除外と食い違うと実装レビュー r1 で指摘され、範囲外として戻した。
+
 ### 1.906 押す・離すが同じフレームの復帰クリックで、止めが次のクリックまで残る (従来モードで前面を戻した後の 2 回目のクリックも送らない) — §1.899 のサブ PC 確認から (2026-11-26)
 
 - 状態: **v5.8.0 で直す (利用者決定 2026-11-26、AskUserQuestion「v5.8.0 で直す」)、担当 dblclick-899 (設計 → Sol レビュー → 実装)。v5.7.0 から既存、§1.899 の退行ではない**。観測 (サブ PC のエージェント、v580d の B 手順 5、master 9bd6ce49c を含むビルド): 従来モードで前面を外した後、1 回目のクリックは抑止 (期待どおり)、約 7 秒後の 2 回目も送らない。別ウィンドウでも同じ。前面を外さなければ毎回送る。結果は subpc の v580d\results-B。
@@ -57,7 +61,7 @@
 
 ### 1.903 v5.8.0 の依存物の更新 (PDFium 8179・mIV Sound の元 (EffeTune Mixwright) 0.19.0・crate 22 件) — v5.7.0 のリリース時の確認から (2026-11-26)
 
-- 状態: **v5.8.0 で行う (利用者決定 2026-11-25「依存物の更新は、v5.8.0にしたいと思います」)、2026-11-26 に着手 (利用者「並行して着手可能でしょうか」)、担当 deps-903**。 crate 23 件 (472f507bf) と PDFium 8179 (8d5780125、メイン checkout の vendor/pdfium も 8179 に差し替え) は独立レビュー ACCEPT で master 入り (11-26)。mIV Sound 0.19.0 は担当でレビュー指摘の修正中。CHANGELOG の文案「PDF の表示に使う PDFium を更新しました。」(crate は利用者向けの記載なし)。サブ PC の確認点: PDF のサムネイル・ページ送り・見開き・拡大、文字の多い PDF (縦書き・横書き)、図形・半透明の多い PDF、スキャン PDF、パスワード付き PDF、About の PDFium の版 160.0.8179.0。
+- 状態: **v5.8.0 で行う (利用者決定 2026-11-25「依存物の更新は、v5.8.0にしたいと思います」)、2026-11-26 に着手 (利用者「並行して着手可能でしょうか」)、担当 deps-903**。 crate 23 件 (472f507bf) と PDFium 8179 (8d5780125、メイン checkout の vendor/pdfium も 8179 に差し替え) は独立レビュー ACCEPT で master 入り (11-26)。mIV Sound 0.19.0-miv.1 は独立レビュー ACCEPT・サブ PC の確認 (deps903、耳で聞く確認は未実施) の後に利用者が採用 (2026-11-26、AskUserQuestion「採用する」)、承認して master 入り (15040331f、メイン checkout の vendor/miv-sound も 0.19.0-miv.1 に差し替え)。公開前に mIV Sound.vst3 の VirusTotal と派生版 miv-0.19 (と miv-0.17) の push が要る。CHANGELOG の文案 (mIV Sound): 「音響調整 (mIV Sound) を EffeTune Mixwright 0.19.0 を元にした版に更新しました。ヘッドホンの測定データ (AutoEQ) から補正する Headphone EQ を使えます (機種を検索したときだけ、AutoEQ の測定データを GitHub から取得します)。15Band PEQ に全体の音量 (Master) が付きました。」CHANGELOG の文案「PDF の表示に使う PDFium を更新しました。」(crate は利用者向けの記載なし)。サブ PC の確認点: PDF のサムネイル・ページ送り・見開き・拡大、文字の多い PDF (縦書き・横書き)、図形・半透明の多い PDF、スキャン PDF、パスワード付き PDF、About の PDFium の版 160.0.8179.0。
 - 中身: v5.7.0 のリリースの Phase 2 (依存物の確認) で見つかった更新。PDFium 8179 (今の版から)、mIV Sound の元 (EffeTune Mixwright) の上流 0.19.0 (派生版の取り込み)、cargo の crate 22 件。手順は docs/native-dependencies.md と docs/release-checklist.md の Phase 2。
 - 注意: mIV Sound の DLL や VST3 host の中身が変わると、公開前のポータブル版の VirusTotal 検査が要る (release-checklist 12.6)。FFmpeg は LGPL の DLL のまま。
 

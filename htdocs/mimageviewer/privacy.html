@@ -120,7 +120,7 @@
       本アプリは利用者の PC 上で動作するデスクトップアプリケーションです。
       <strong>開発者が利用者の個人情報を収集・送信・販売することはありません。</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月23日</p>
+    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月26日</p>
   </section>
 
   <section>
@@ -176,7 +176,7 @@
       <li>操作の組み合わせを記したスクリプト（データフォルダ内の <code>operation_scripts.rhai</code>）。実行の有効・無効と初回説明の確認記録は設定に保存します。スクリプト自身は通信できません</li>
       <li>スタック表示の分け方を変更するカスタムスクリプト（データフォルダ内の <code>stack_rules.rhai</code>）。AI に変更を許可した場合も、このファイルに保存します</li>
       <li>本ごとの見開き1ページずらしの調整（記憶をOFFにしても保存済み調整は保持し、明示的に解除できます。メタ情報の移行で持ち運べます）</li>
-      <li>音響調整 (mIV Sound) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像</li>
+      <li>音響調整 (mIV Sound) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像。Headphone EQ でダウンロードまたは読み込んだ測定カーブとターゲットカーブは、エフェクトの保存済み状態やプリセットに含まれます</li>
       <li>登録した SFZ 音源の名前と保存場所。サンプルファイルはコピーしません</li>
       <li>サムネイルキャッシュ（コレクションの一覧用も元フォルダ単位で保存・共有します。登録解除では削除せず、キャッシュ管理から削除できます。動画・音声の長さ、解像度、形式、読取可否の情報、動画の場面と音声波形の解析結果を含みます）</li>
       <li>EPUB を変換した閲覧用 PDF（キャッシュ管理画面でその場で削除できます。表示中など使用中の本は削除されず、理由が表示されます）</li>
@@ -317,6 +317,11 @@
       <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。AI 説明文のモデル、文字起こしのモデルと 3D 写真用の深度モデルは、確認画面でダウンロードを選んだときだけ mImageViewer の GitHub Releases から取得します。説明文の作成・文字起こし・奥行きの計算のために、画像や画像内の文字、動画・音声の音声を送信しません。</li>
       <li><strong>撮影地点を地図で開く</strong>: 情報パネルの GPS 欄で「Google マップで開く」を押したときだけ、既定のブラウザーが開き、撮影位置の緯度・経度が Google に渡ります。写真そのものやファイル名は渡しません。<a href="manual/fullscreen.html#exif">操作方法を見る</a></li>
       <li><strong>利用者が追加したユーザー VST</strong>: プラグイン独自の通信は各プラグインの動作に従います。利用前に提供元の説明をご確認ください。</li>
+      <li><strong>Headphone EQ の測定データ取得（使う場合のみ）</strong>: 音響調整 (mIV Sound) の Headphone EQ で検索欄に初めてフォーカスしたときに機種の一覧を取得し、機種を選ぶか AutoEQ のリンクを読み込んだときに測定 CSV を取得します。
+        取得先は GitHub の AutoEQ プロジェクトのファイル配信用ホスト（<code>raw.githubusercontent.com/jaakkopasanen/AutoEq/</code>）です。他のリポジトリやサイトへのリンクは使えません。
+        通信は本文のない GET 要求です。入力した検索語は PC 内で照合し、送信しません。音声、設定、PC 内のファイル名や内容も送信しません。
+        通信先には IP アドレスと、ブラウザーの通常の要求情報（User-Agent、音響調整の PC 内ページを示す Origin / Referer）が伝わります。
+        この検索・リンク読込を使ったときだけ取得し、端末内の測定ファイルを読み込むだけなら通信しません。</li>
       <li><strong>音響調整の画面表示</strong>: 音響調整を開いている間、画面表示に使う Windows の機能 (WebView2) が、Microsoft に自身の更新を確認することがあります。曲名や画像は送信しません。</li>
       <li><strong>AI で調べる（ヘルプメニュー）</strong>: 選んだときだけ、AI アプリまたは既定のブラウザーが開きます。AI アプリでは、入力欄に mIV の MCP ツールでマニュアルを調べるよう頼む固定の案内の文が入ります。
         Web の AI では、mIV の版と公式マニュアルの場所を含む固定の案内の文をクリップボードに入れ、各サービスの入口のページを開きます。案内の文に利用者のファイル・場所・設定は含めません。
@@ -448,7 +453,7 @@
       mImageViewer ("the App") respects your privacy. The App is a desktop application that
       runs on your PC. <strong>The developer does not collect, transmit, or sell your personal information.</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">Last updated: November 23, 2026</p>
+    <p style="font-size:0.85rem; color:#888;">Last updated: November 26, 2026</p>
   </section>
 
   <section>
@@ -502,7 +507,7 @@
       <li>A script for combining viewer operations (<code>operation_scripts.rhai</code> in the data folder). Whether scripts are enabled and whether the initial explanation was confirmed are saved in settings. The script itself cannot communicate over a network</li>
       <li>A custom script for grouping images in stack view (<code>stack_rules.rhai</code> in the data folder). Changes made with AI permission are saved to the same file</li>
       <li>Per-book spread-pairing adjustments (saved adjustments remain when remembering is turned off and can be explicitly cleared or moved using metadata transfer)</li>
-      <li>mIV Sound adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images</li>
+      <li>mIV Sound adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images. Measurement and target curves downloaded or loaded in Headphone EQ are included in the effect's saved state and presets</li>
       <li>Registered SFZ instrument names and locations. Sample files are not copied</li>
       <li>Thumbnail cache (including video frames and audio waveform analysis)</li>
       <li>PDFs converted from EPUBs for reading (you can delete them in the cache manager immediately; books in use remain and the App shows why they could not be deleted)</li>
@@ -622,6 +627,11 @@
       <li><strong>Optional component download</strong>: only when you choose to, the App downloads optional components (such as AI acceleration packs) from the distribution source. AI caption models, transcription models, and depth models for 3D photos are downloaded from mImageViewer's GitHub Releases only after you confirm the download. Images, text within images, and the audio of videos and audio files are not sent for caption generation, transcription, or depth calculation.</li>
       <li><strong>Opening a shooting location on a map</strong>: only when you press "Google マップで開く" (Open in Google Maps) in the GPS field of the information panel, your default browser opens and the latitude and longitude of the shooting location are passed to Google. The photo itself and its file name are not passed. <a href="manual/fullscreen.html#exif">Read the manual</a></li>
       <li><strong>User VST plug-ins you add</strong>: independent network activity follows each plug-in’s behavior. Check the provider’s documentation before use.</li>
+      <li><strong>Headphone EQ measurement downloads (only when used)</strong>: in Headphone EQ in mIV Sound, focusing the search box for the first time retrieves the headphone index. Choosing a headphone or loading an AutoEQ link retrieves its measurement CSV.
+        Downloads come from GitHub's raw content host for the AutoEQ project (<code>raw.githubusercontent.com/jaakkopasanen/AutoEq/</code>). Links to other repositories or sites are refused.
+        These are GET requests with no body. Search text is matched on your PC and is not sent. Audio, settings, and local file names or contents are not sent either.
+        The destination receives your IP address and the usual browser request information (User-Agent and Origin / Referer identifying the plug-in's local page).
+        Downloads occur only when you use this search or load a link; loading a local measurement file alone does not initiate network communication.</li>
       <li><strong>Audio adjustment display</strong>: while audio adjustment is open, the Windows feature used to display it (WebView2) may contact Microsoft to check for its own updates. It does not send song titles or artwork.</li>
       <li><strong>Ask AI (Help menu)</strong>: only when you select it, an AI app or your default browser opens. For an AI app, the input field is filled with fixed guidance asking it to consult the manual using mIV's MCP tools.
         For web AI services, fixed guidance containing the mIV version and the official manual's address is copied to the clipboard, and the service's entry page opens. The guidance contains none of your files, locations, or settings.

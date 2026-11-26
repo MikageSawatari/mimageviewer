@@ -2236,7 +2236,10 @@ impl crate::app::App {
         // - ダブルクリックで動画を開いたとき、2 打目クリックが fullscreen の動画 play/pause を
         //   トグルしないよう抑制する (静止画は open_fullscreen の focus-regain グレースで足りる)。
         if from_double_click && matches!(self.items.get(agg_idx), Some(GridItem::Video(_))) {
-            self.fs_primary_suppression.arm_pointer_stream();
+            let _ = self.arm_fs_primary_suppression(
+                ctx,
+                crate::ui_fullscreen::FullscreenPrimarySuppressionReason::Other,
+            );
         }
         self.capture_main_list_restore_cursor();
         self.stack_enter_flat_fullscreen(ctx, flat_idx);

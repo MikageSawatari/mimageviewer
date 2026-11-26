@@ -262,3 +262,145 @@ viewer の入力ハンドラ (`handle_fs_wheel_and_click_frame`・`advance_viewe
 - r2 (同じレビュー担当、f92536c35): **ACCEPT**、指摘なし。r1 の P2・P3 は解消。detached の合意は第 2 版でも維持。
 - 実装 (2026-11-26、207f247b6): Codex GPT-6.1 Sol / high。テストの固定具 2 件 (App を 2 つ同時に作り、テスト用データフォルダの再入不可のロックで止まっていた) は ClaudeCode が直した。検証 (ClaudeCode が run-heavy で実行): 関連 nextest 61 件と周辺 916 件成功、`cargo fmt --check` 成功。クリックの数え方を旧の動き (FocusRestore も列を初期化、F2 で数えない) に一時的に戻すと、F1・F2 の回帰を含む 9 件が落ちることを確認。本体 lib 全件は統括の master 取り込み後。実機は未確認。
 - 実装の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh、read-only、`39ae1d3c6..207f247b6`): **ACCEPT**、指摘なし。detached: 「症状パッチではなく構造的修正」に合意。
+
+## 13. §1.906 修正: 押す・離すが同じフレームのクリックで、止めが次のクリックまで残らないようにする
+
+- 状態: 実装済み (d3c2c7bbe・be712caf9、ブランチ dblclick-906)。設計第 2 版 (2026-11-26)。独立設計レビュー r1 REVISE → r2 **ACCEPT**、独立実装レビュー r1 REVISE → r2 **ACCEPT** (§13.8)。利用者の実機確認待ち・master 未統合。
+- 報告: [backlog §1.906](next-release-backlog.md)。観測 (サブ PC のエージェント、§1.899 の確認の手順 5): 従来モード (クリックでページ送り) で前面を外した後、1 回目のクリックは送らない (期待どおり)。約 7 秒後の 2 回目も送らない。別ウィンドウでも同じ。前面を外さなければ毎回送る。
+- 方針: 利用者決定 (2026-11-26)「v5.8.0 で直す」。
+
+### 13.1 原因 (コード)
+
+- 1 フレームの順序: 先に `viewer_chrome.rs::advance_viewer_primary_pointer_frame` が、止めの状態 (`fs_primary_suppression`) へ「このフレームで離されたか」を渡す (`PointerFrame { released }`)。`PointerStream` ならこのフレームを止め、離されていれば `Idle` に戻す。
+- その後で、押したことを見て止めを立てる箇所がある (`PointerStreamStarted`)。押す・離すが同じフレームに入ったクリックでは、離しはもう渡し終えている。立てた `PointerStream` には終わりの合図が来ず、**次の流れの離しまで残る**。次のクリック (やドラッグ) は、物理的には別の流れなのに丸ごと止められる。
+- 観測との対応: 上の欠陥はコードで確かめた。観測 (2 回目も送らない) はこれで説明できる。同じ結果を作れる別の経路として「VST の編集画面の表示中は毎回 F2」(§12.7) があるが、1 回目のクリックのログが `vst_gui_visible=false` なので当たらない (2 回目は F2 の条件が立たずログが出ない)。実機での再現はしていない。
+- 守るべき不変条件: **持続する止め (`PointerStream`) は「左ボタンが今も押されていて、その離しをまだ渡していない流れ」だけを表す**。離し済みの流れを、次の流れまで残る止めにしない。一方で、**止めたクリックはその pass の後段 (消しゴム・隠蔽・ローカル補正のキャンバス) にも止まって見える**必要がある。これらは決定値を受け取らず、`fs_primary_suppression.is_active()` を直接見ている (`ui_erase.rs`・`ui_conceal.rs`・`ui_adjustment_panel.rs`)。今は残った `PointerStream` がこの役も果たしている。
+
+止めを立てる箇所 (src 全体で 11 か所。レビューで漏れなしを確認):
+
+| 箇所 | 離しを渡す前/後 | 立てる条件 | 同じフレームの離しで残るか |
+| --- | --- | --- | --- |
+| 右ドラッグ中の左押し (`advance_viewer_primary_pointer_frame` 内) | 前 | 押した | 残らない。ただし同じフレームの離し→押しでは、新しい流れの止めを古い離しが消す |
+| F1 (同上) | 前 | 最終の `primary_down` | 同上 |
+| F2 (`handle_fs_wheel_and_click_frame` の `focus_restore_click`) | 後 | 押した | **残る** (今回の報告) |
+| 左ボタンのドラッグ拡大の開始 (viewer、`if used \|\| (scrub_held && can_start && pressed)`) | 後 | 押した (開始条件を満たすとき) | 同じ pass の離しで `press_origin` が消えるので開始条件が成り立たず、止めを立てない (**残らない**)。押したままなら離しまで止める |
+| 同じ和音 (overlay、`if !used && primary_pressed`、既存の中ボタンドラッグが scrub の開始を拒むとき) | 後 | 押した | **残る** |
+| `retire_changed_drag_zoom` | 後 | `ctx` の最終の押下 | 残らない |
+| `handle_drag_zoom` の持ち主替え | 後 | 引数 `down` (overlay では途中の入力サンプル) | overlay では**残り得る** |
+| Space 移動中の Ctrl (overlay) | 後 | 途中の入力サンプルの `primary_down` (離しは `Move` → `Release` に展開され、`Move` は押下中) | **残り得る** |
+| `edit_preview_owns_canvas` | 後 | 呼び出し側で `ctx` の最終の押下と AND | 残らない |
+| 一覧から動画を開く 2 回目のクリック (`ui_main.rs`) | 一覧の viewport | 無条件 (ダブルクリックは離しで判定) | 通常は直後の `open_fullscreen` の初期化で消える。初期化しない早期 return では**残る** |
+| 同 (`filename_stack_ui.rs`、worker を経て後で開く) | 一覧の viewport | 同上 | 開くまでの間と、開く処理が初期化しないときに**残る** |
+
+### 13.2 直し方
+
+止めの状態に「離し済みの流れを、この pass の残りだけ止める」状態を足し、止めを立てる入口を 1 つにして、その時点の最終の押下を必ず読むようにする。
+
+1. **状態**: `FullscreenPrimarySuppression` に `ReleasedThisPass(理由)` を足す。
+   - 意味: この pass で止めた流れはもう離されている。この pass の残り (後段の編集キャンバス) では止まって見え (`is_active()` が真)、次の pass の `PointerFrame` で終わる。
+   - `PointerFrame` (次の pass の先頭): `ReleasedThisPass` は `Idle` と同じく `Allow` を返し、`Idle` に戻す。次の pass の押す・離すは新しい流れなので止めない。
+   - production では `PointerFrame` は 1 pass に 1 回 (`advance_viewer_primary_pointer_frame` の呼び出しは viewer の描画の 1 か所と、テスト用・ページ一覧の単独入口だけ)。
+2. **立てる入口**: `App::arm_fs_primary_suppression(ctx, 理由) -> FullscreenPrimarySuppressionDecision` (`#[must_use]`) を 1 つ置き、全 11 か所をこれに替える。生の `arm_pointer_stream()` / `arm_focus_restore_pointer_stream()` は外から呼べなくする。
+   - 中で `ctx.input(|i| i.pointer.primary_down())` (この pass のイベントを処理した後の最終状態) を読む。呼び出し側の途中の入力サンプル (overlay の `CanvasPointerInput::down()` など) は使わない。
+   - 押されている: `PointerStream(理由)` (今と同じ)。
+   - 押されていない: `ReleasedThisPass(理由)`。
+   - 理由の合成は今と同じ (`Other` が勝つ、`TouchStream` に重ねたら `Other`)。押されていないときに今の状態が `TouchStream` なら `TouchStream` のまま (タッチの持ち主が終える) で `Suppress(Other)` を返す。`ReleasedThisPass(r)` に重ねたら理由は `r` と合成する (離し→押しが 1 フレームに入るまれな場合も、`Other` 側に倒れるだけ)。
+   - 返り値: どの場合も、このフレームは `Suppress(合成した理由)`。
+3. **順序 (`advance_viewer_primary_pointer_frame`)**: 先に今ある流れへ `PointerFrame` を渡し、その決定を取っておく。その後で右ドラッグ中の左押し・F1 を入口 2 で立て、決定を合わせて返す (`pointer_frame.overridden_by(arm)`、`Suppress` が勝つ)。これで 11 か所すべてが「離しを渡した後に立てる」にそろう。同じフレームの離し→押しで、新しい流れの止めを古い離しが消すこともなくなる。F1 の「止めが無ければ」の判定も、古い流れの離しを渡した後に行う。
+4. 離しを渡した後に立てる箇所 (F2・ドラッグ拡大) は、返った決定をこのフレームの判定に合わせる (F2 は今も合わせている。ドラッグ拡大は早期 return するので、このフレームは今どおり止まる)。後段の編集キャンバスは `is_active()` のまま (`ReleasedThisPass` で真) なので、変えない。
+5. 一覧から開く 2 か所: 最終の押下が偽なら `ReleasedThisPass` になり、閲覧側の次の pass の `PointerFrame` で消える。一覧と閲覧は別の viewport で、一覧の離しが閲覧側へ届くことはない。通常の開く処理の初期化は今のまま。開く処理が初期化しない経路で、閲覧側の最初のクリックを止めていたのが直る。`filename_stack_ui.rs` は worker を経て後で開くので、開くまでの間に別の閲覧の pass があれば、そこで消える。保護 (2 回目のクリックで再生を切り替えない) が壊れないことは、2 つの実際の開く入口でテストする。
+
+閉じるモード (§12) への影響: 同じフレームの復帰クリックの後、次のクリックは止めずに受け付ける (今は残った `FocusRestore` の止めのまま数えていた)。止めていない離しは普通に数えるので、ダブルクリックで閉じる結果は変わらない。次の単クリックで「…」を閉じる等も、今度は起きる (正しい動き)。
+
+### 13.3 採らなかった案
+
+- F2 の判定を `PointerFrame` より前へ移す: F2 は前面窓の検出やタッチの相関など、`handle_fs_wheel_and_click_frame` の中の材料を使う。別ウィンドウと共有する処理の順序を大きく変えるので採らない。代わりに `advance_viewer_primary_pointer_frame` の中の 2 か所を `PointerFrame` の後へ動かし、全部を「後」にそろえる。
+- 第 1 版の案 (押されていなければ持続状態を作らず、このフレームの決定だけ返す): 後段の編集キャンバスが決定値を受け取らず `is_active()` を見ているため、復帰クリックが消しゴム等へ漏れる (r1 P1)。決定値を編集キャンバスまで配る案は、配る先が多く、今後の編集ツールでも漏れやすいので採らない。
+- 状態にフレーム番号を持たせる: `PointerFrame` が 1 pass に 1 回なので、`ReleasedThisPass` が次の `PointerFrame` で終わるだけで足りる。
+- 残った止めを時間で切る (猶予): 症状パッチ (CLAUDE.md のバグ修正の原則)。
+
+### 13.4 状態の組み合わせ
+
+状態は 1 つ増える (`ReleasedThisPass`) が、「離し済みなのに次の流れまで止めている」組み合わせは無くなる。止めを立てる入口は 1 つで、押下はその入口が `ctx` から読むので、呼び出し側ごとに押下の意味が食い違う組み合わせも無くなる。
+
+### 13.5 テスト (handler-level、旧コードで落ちるもの)
+
+テストの道具は `double_click_close_tests.rs` の `Canvas` (`merge` / `split_click` 等) と F2 の入口 (§12.5 と同じ、`vst3_enabled` + `vst3_gui_visible` か前フレームの前面窓)。F1 の 300ms は実時間の `Instant` なので、`fs_focus_regained_at` を明示して切る (`Canvas.time` とは別)。
+
+- 従来モード、F2: 同じフレームの復帰クリック → ページを送らない。F2 が立たない次の同じフレームのクリック → **送る** (旧コードで落ちる)。別フレームの復帰クリック → 次のクリックで送る (対照)。
+- 従来モード、F2 の同じフレームの復帰クリックの後のドラッグ (拡大中の移動): 移動できる (旧コードで落ちる)。
+- 編集キャンバス: 消しゴム (ブラシ) の編集中、同じフレームの復帰クリック → 塗らない・Undo を積まない (同じ pass で実際の編集ハンドラまで通す)。その次のクリックは塗る (旧コードで落ちる)。
+- 離し→押しが同じフレーム (F1 の猶予中、または右ドラッグ中): 新しい流れは離しまで止まる (旧コードで落ちる)。
+- ドラッグ拡大の和音 (viewer、対照): 押す・離すが同じ pass では `press_origin` が消えるため scrub は開始せず、止めも立たず `Idle` のまま。そのクリックのページ送りの結果はこのテストでは固定しない (別件、§13.9)。押したまま → 離しまで止める。両方とも、その後の普通のクリックで送る。
+- overlay: 既存の中ボタンドラッグが scrub の開始を拒む状態で、左の押す・離すが同じフレーム → その後のクリックが止められない (旧コードで落ちる)。Space 移動中に Ctrl を足し、同じフレームで左を離す → 次のクリックが止められない (旧コードで落ちる)。
+- 右ドラッグ中の左押し: 同じフレーム・別フレームとも、そのクリックは止め、その後は止めない (回帰の検査)。
+- 閉じるモード: §12 のテストは通す。ただし `close_mode_focus_restore_899_context_focus_roundtrip_does_not_reuse_pair` の「F2 の同じフレームのクリックの後も止めが残る」という確認は、この修正で正しくなくなるので、「その pass では止まり、次の pass で消える」に改める (フォーカスの往復で候補を外す本来の確認は残す)。加えて、同じフレームの復帰クリックの後の単クリックで「…」を閉じる。
+- 一覧から動画をダブルクリックで開く (`ui_main.rs` と `filename_stack_ui.rs` の 2 入口、それぞれ実際の開く処理と初期化を通す): 2 回目のクリックで再生が切り替わらない。開いた後の最初のクリックは再生を切り替える。Windows の通常の動画は native presenter 経路で egui の viewer ハンドラを通らないことがあるので、その場合はどの入力経路で確かめたかを書く。
+- 状態の単体: 押されていなければ `ReleasedThisPass`・その pass は止める・次の `PointerFrame` で `Allow` と `Idle`・`TouchStream` を壊さない・理由の合成。
+- 別ウィンドウ: F12 の別ウィンドウの viewer context で、同じフレームの復帰クリック → 次のクリックで送る。兄弟の context の内容・表示を変えない。止めの判定を別の viewport で使い回さない (入力の viewport を実際に替えて確かめる。今の `merge_window` は context を替えても入力の viewport が ROOT のままなので、それだけでは証拠にならない)。
+
+### 13.6 detached の決まり
+
+F2 と `advance_viewer_primary_pointer_frame` は F12 の別ウィンドウと共有している。`fs_primary_suppression` は context ごとの bundle ではなく前面の viewer に 1 つの App の状態で、open・close・park・新しい窓・passive の採用で初期化される ([detached-rework-plan.md](detached-rework-plan.md) の該当の記録)。今回 bundle へは移さない。detached の述語・viewport の経路・窓ごとの所有は変えない。止めの作り手の寿命と生成の境界 (「離し済みの流れから持続する止めを作らない」「止めを立てるのは離しを渡した後」) を直す構造的修正と考える (guard・遅延・再試行・時間切れを足さない)。ClaudeCode と Codex の双方の合意を取り、§11 に記録する。
+
+### 13.7 まれな失敗
+
+対象外 (入力の状態だけで、保存や外部の失敗は関わらない)。
+
+### 13.8 レビュー記録
+
+- r1 (GPT-6.1 Sol / xhigh、独立設計レビュー、39a44ec42): REVISE。原因の分析と 11 か所の列挙は正しいと確認。P1: 第 1 版では止めたクリックが後段の編集キャンバス (`is_active()` を見る) へ漏れる。P2: 離し→押しが同じフレームのとき、前段で立てた新しい流れの止めを古い離しが消す。P2: overlay の 2 か所は途中の入力サンプルの押下を見ており、「押したまま」に分類できない。P3: §12 の既存テストの 1 か所の確認を改める必要、overlay のテストの条件。提案: `advance_viewer_primary_pointer_frame` の中で `PointerFrame` を先にし、全部を「後」にそろえる。detached: 「離し済みの入力から持続する止めを作らない」方針は構造的修正であることに合意、第 1 版全体には不合意。第 2 版で §13.1〜§13.6 に反映。
+- r2 (同じレビュー担当、3de6acb73): **ACCEPT**、指摘なし。r1 の 4 件は解消。`PointerFrame` の呼び出しを全件確かめ、production では 1 pass に 1 回 (通常の viewer の描画の 1 か所。ページ一覧はその決定を受け取り、単独入口はテスト経路)。`is_active()` を読む production の消費者 (F1 と編集キャンバス 3 か所) はすべて advance の後。advance を通らない経路 (native presenter 等) では編集の消費者も動かない。既存テスト (`double_click_close_tests.rs` のフォーカス往復) の更新では、`is_active()` ではなく状態の種類と次の advance での解除を確かめる。detached: 第 2 版全体が「症状パッチではなく構造的修正」であることに合意 (単一の生成入口と共通の終端順序で、持続する止めと pass 内の止めを分ける。前面 viewer の所有・viewport の経路・兄弟 context の所有境界は変えず、時間切れや guard に頼らない)。
+
+### 13.9 実装時の判断・検証引き継ぎ (2026-11-26)
+
+- `ReleasedThisPass` はタッチ相関による `TouchStream` への昇格条件に加えない。
+  `PointerStream` はまだ押下中の仮の所有なので相関でタッチへ引き渡すが、`ReleasedThisPass` は
+  既に離されたマウスの流れであり、`Idle` 同様、別の active touch だけでは昇格させない。
+  `suppresses_current_frame` が真なら従来どおり昇格し、completed / cancelled の解除も変えない。
+- 全 11 か所は `App::arm_fs_primary_suppression` を使う。`edit_preview_owns_canvas` に `ctx` を渡す
+  引数を追加したが、立てる条件と編集キャンバス 3 か所の `is_active()` 判定は維持した。
+  早期 return の経路では返った決定を明示的に捨て、今までどおりその経路全体で入力を止める。
+- テストは `double_click_close_tests/suppression_906_tests.rs` と
+  `app/tests/primary_suppression_906.rs` に追加。後者は実際の grid double-click → open_fullscreen
+  (スタックでは worker の採用も含む) の初期化を通す。デコードの開始だけを既存の startup gate で
+  保留し、初期化後に disconnected player を与える。動画のクリックは egui の viewer handler ではなく
+  `handle_native_video_output_event` の presenter mouse button 入力経路で確かめる。
+- 既存テストの期待値変更は 2 件:
+  `close_mode_focus_restore_899_context_focus_roundtrip_does_not_reuse_pair` は
+  `ReleasedThisPass(FocusRestore)` と次の advance での `Idle` を確かめ、フォーカス往復による候補解除は残す。
+  `close_mode_focus_restore_899_page_turn_still_suppresses_restoring_click` は、同じフレームの F2 の後に
+  さらに 1 クリックを捨てる旧不具合の期待を外し、直後のクリックで送ることを確かめる。
+  ほかの既存テストの raw arm は明示的なテスト用 constructor / 状態遷移の操作へ置き換えた。
+- detached の述語・viewport 経路・窓の所有・open / close 等の初期化は変更しない。
+  §11 の既存の記録と範囲は一致する。下記の scrub 開始位置の変更は範囲外として戻したため、
+  detached-rework-plan.md に足した「テスト修正時の範囲追加」の段落も削除する (既存の合意の行は変更しない)。
+- 利用者の負荷管理の指示により cargo コマンド・コンパイル・テスト・製品起動は実行していない。
+  §12 の既存テスト全件、追加テスト、旧コードへ戻した比較実行は ClaudeCode へ引き継ぐ。
+  UI 文言と htdocs の説明は変更していない。
+- テスト固定具の追補: ClaudeCode の run-heavy 実行ではコンパイル成立、関連 82 件中 77 件成功・5 件失敗と報告された。
+  従来モードの F2 と開始済みの scrub は `fs_click` を登録する前に return するため、次の操作前にボタン入力のない
+  描画 pass を置き、egui の前 pass のウィジェットによる当たり判定を準備する。その pass で `Idle` になることも
+  検査する。離しを追加しないので、旧実装の残った `PointerStream` はこの pass を経ても消えず、回帰の検出を維持する。
+  detached の描画 pass も実際の A の viewport で行い、A の実ページ移動と兄弟・main の不変確認を残す。
+  scrub の固定具は既存の handler テストと同じ Ctrl+Tab の明示設定と合成キー保持にそろえ、fixture の
+  初期化後に入力を arm する。物理 Tab / Ctrl の保持、フォーカス許可、入力所有、製品の `key_held_action` が
+  押下中／解放後をそれぞれ観測することを handler の直前で確かめる。
+  `Keymap::empty()` は上書きが空でも既定の和音へフォールバックするので、既定キーが無効という説明は誤り。
+- scrub の開始位置: 実装中に「この pass の最後の primary press イベントから取る」変更を足したが、
+  独立実装レビュー r1 の P2 を受け、設計担当の判断により §1.906 の範囲外として戻した。
+  近接する Depth パネル除外は `pointer.press_origin()` を使っており、片側だけの変更では両者が食い違う。
+  viewer の開始位置も従来の `i.pointer.press_origin()` だけを使う。止めの共通生成入口は維持する。
+  §13.1 の表で viewer の同一 pass の和音を「残る」としたのは設計の誤りであり、表と対照テストを訂正した。
+- 別件: 和音を押したままの速いクリックでページが送られる。同じ pass の離しで `press_origin` が消えるため、
+  viewer の scrub は開始せず、止めも立たない (v5.7.0 からの挙動)。Depth 除外など同じ値を使う箇所とまとめて
+  扱う入力境界の問題として統括へ引き継ぐ。今回のテストでは最初のクリックのページ送りを assert せず、
+  scrub が始まらないこと・`Idle` のままであること・次の普通のクリックで送ることを確かめる。
+  この差し戻し後のコンパイル・テストは実装担当では未実行。
+
+### 13.10 実装の検証とレビュー記録
+
+- 実装 (2026-11-26): Codex GPT-6.1 Sol / high (d3c2c7bbe)。初回の実行で 5 件が失敗し、テストの組み立てを直した: 従来モードの F2 の pass は `fs_click` を作る前に早期 return するので、egui の当たり判定 (前のフレームのウィジェットを使う) により直後の pass のクリックが当たらない。実際の操作ではクリックの間に何フレームも描かれるので、入力の無い pass を挟む (製品の不具合ではない)。
+- 検証 (ClaudeCode が run-heavy で実行、be712caf9): `cargo fmt --check` 成功。関連 nextest 418 件 (suppression_906・close_mode・double_click_close・primary_suppression・erase_preview_canvas・focus_restore・scrub・drag_zoom・depth ほか) と周辺 2573 件 (ui_fullscreen:: ほか) が成功。変異確認: `arm` を「離し済みでも `PointerStream` を残す」に戻すと 15 件、advance の順序を旧に戻すと 2 件 (離し→押し、右ドラッグ) が落ちる。本体 lib 全件は統括の master 取り込み後。実機は未確認。
+- 実装の独立レビュー r1 (実装者とは別の GPT-6.1 Sol / xhigh、read-only、`8a6c2f541..d3c2c7bbe`): REVISE。P2: 実装中に足した viewer の scrub 開始位置の変更 (この pass の press イベントから取る) が、Depth パネル除外 (`press_origin` のまま) と食い違う。P3: その範囲が detached の §11 に未記録。ClaudeCode の判断で開始位置の変更を範囲から外して戻し (be712caf9)、§13.1 の表と §13.5・§13.9 を直した。
+- 実装の独立レビュー r2 (同じレビュー担当、`d3c2c7bbe..be712caf9`): **ACCEPT**、指摘なし。範囲から外す判断に同意。detached: 最終版全体が「症状パッチではなく構造的修正」であることに合意。
