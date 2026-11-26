@@ -1005,7 +1005,7 @@ P2-2 `InvokeCommand` の戻りは Shell の画面の役目が終わった証拠�
 
 ## 6. §1.853 の残り C・D・E (v5.9.0 予定、ブランチ `ui-scan-853b`)
 
-状態: 設計 r4 (2026-11-26、設計レビュー r1〜r3 の指摘と、全画面の経路を範囲に入れる利用者決定を反映。§6.9〜§6.12。§6.12 の全画面の待ち方は利用者の確認待ち)。担当: 設計・検収 = ClaudeCode Opus 5.5 (uiscan-853b)、実装 = Codex GPT-6.1 Sol / high、
+状態: 設計 r5 (2026-11-26、設計レビュー r1〜r4 の指摘と、全画面の経路を範囲に入れる利用者決定を反映。§6.9〜§6.13。§6.12 の全画面の待ち方は利用者の確認待ち)。担当: 設計・検収 = ClaudeCode Opus 5.5 (uiscan-853b)、実装 = Codex GPT-6.1 Sol / high、
 独立レビュー = GPT-6.1 Sol / xhigh。作業ツリー `G:\home\mimageviewer-uiscan853b`。コードの記述は master `451ad09db` の読み取り。
 本担当は実行時の挙動を観測していない。時間の数字はサブ PC 担当の perf ログ (§1.853、3004 件のネットワークフォルダで約 7.6 秒)。
 
@@ -1171,8 +1171,10 @@ main の context で同期走査に届く入口 (今回の対象):
    積み上げを確定している。**戻る・兄弟への置き換えもこの確定に型で渡す**: お気に入り検索の bool を型
    (例: `FavsearchNavAdmission::{Descend, Back, Sibling}`) に、タグ表示に `TagViewNavAdmission::Back` を足し、
    `favsearch_back`・`favsearch_navigate_sibling`・`tag_view_back` は読込の前に積み上げを変えない (選択のヒントと
-   `cancel_pending_folder_nav` は今のまま先に行う)。`tag_view_back` の Ignored/Refused の巻き戻し (35472〜35478) は、
-   先に何も変えないので不要になる。積み上げが空になって検索結果へ戻る枝 (`execute_favsearch` / `execute_tag_view`) は
+   `cancel_pending_folder_nav` は今のまま先に行う)。`tag_view_back` の Ignored/Refused の巻き戻し (35472〜35478) のうち、
+   積み上げとアドレスの巻き戻しは先に変えないので不要になる。r5 (設計レビュー r4 P3-5): **選択のヒントの巻き戻しは残す**
+   (`select_after_load` は先に置くので、navigation が捕捉する前の即時の拒否 (modal、`app.rs` 31189) で次の読込へ漏れない
+   ようにする)。お気に入り検索の BS も同じく、即時の拒否ではヒントを戻す。積み上げが空になって検索結果へ戻る枝 (`execute_favsearch` / `execute_tag_view`) は
    読込ではないので今のまま。`tag_view_back` の行き先が ZIP/PDF/変換書庫のとき (staged・分類の経路) も同じ型付きの戻りを
    確定時に適用する。運べない経路があれば設計担当へ返す。今の `favsearch_back` は pop の後の読込で同じ path をもう一度
    push している可能性がある (棚卸しの所見、未確認)。実装担当はテストで確かめ、型にした後の積み上げが今の利用者に
@@ -1187,6 +1189,13 @@ main の context で同期走査に届く入口 (今回の対象):
    待ちが取り消されたときは、合成一覧とその状態がそろったまま残る (行だけ残って状態が消える、を作らない)。定義を削除した
    スマートフォルダが待ちの取消で表示に残った場合、その一覧の操作が無効化済みの定義を既存の扱い (無効化の経路) で扱うことを
    確かめる。
+   r5 (設計レビュー r4 P2-1): 状態を残したまま普通の読込を出すと、帰り先がスマートフォルダの entry やその配下のとき
+   スマート専用の分岐 (`app.rs` 31932、entry 自身も対象 `top_level_grid_view.rs` 129) へ入り直し、抜けられない。**抜ける操作は
+   既存の型付きの「一時表示から出る」navigation (`MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView {..})`)
+   として出す**。この navigation はスマートの分岐を通らず (`app.rs` 31444・31930 の条件)、採用時に
+   `dismiss_transparent_view_for_admitted_jump` (26285〜26310、呼び出しは 26199) がスマート・検索・タグの状態を片付ける。
+   サブフォルダ展開を抜ける操作も同じ型にする。実装担当は、同じ子への帰還でも `preserve_smart_folder_session` が働かないこと、
+   取消のときに表示中の session が残ること (採用で初めて終わること) を確かめる。
 
 ### 6.4 待ちの間の入力・表示
 
@@ -1270,7 +1279,8 @@ main の context で同期走査に届く入口 (今回の対象):
 - 採用: 呼び出しの外で変えていた状態 (フォルダを開く効果・検索の積み上げ・合成一覧の後始末・全画面の close) は、新しい
   保留を作らず、install の中の既存の確定点 (`commit_grid_virtual_open_effects`・`commit_staged_search_navigation_effects`・
   `install_loading_items_inner` の後始末・`change_main_context_for_visible_grid…`) に寄せる。取消時の巻き戻しは作らない。
-- 採用: 全画面の待ちはモーダルにする (§6.12)。待ちの間に全画面で何かが起きる組み合わせを消す。
+- 採用: 全画面の待ちは、既存の「全画面のまま次のフォルダを待つ」(Ctrl+↑↓) の sequence に乗せる (§6.12)。全部止めるモーダルは
+  入力の面ごとに新しい止めが要るので採らない (r4 の検討)。
 - 不採用: ★固定の移動まで今回広げること。続きの型が既存の `RequiredFullscreenTarget` と 4 点で違う (§6.2)。
 
 ### 6.9 設計レビュー r1 (GPT-6.1 Sol / xhigh、read-only、30ee454c7、2026-11-26): REJECT
@@ -1310,54 +1320,79 @@ r2 の 3 件のうち D5 の限定と設定変更の分割は解消と判定。�
 | P2-1 フォルダに ZIP/PDF と同じ効果を使うと `suppress_facet_filter=true` になり、通常フォルダの履歴が `FacetScope::Book` になる | フォルダでは false と明記し、facet の親→子→孫→戻るの検査を追加 (§6.3 の 8、§6.6 の 6a) |
 | P2-2 ★の判定を採用時に path 版 (DB) でやり直すと、受付時の idx 版 (session の書き込み・cache 優先) と食い違う | 受付時の idx 版の決定を別の field で運び、採用時に判定し直さない (§6.3 の 8) |
 
-### 6.12 C5 全画面から戻る経路: 待ちの間は全画面を残したモーダル (案、利用者の確認待ち)
+### 6.12 C5 全画面から戻る経路: 全画面の Ctrl+↑↓ の待ちと同じ扱い (案 r5、利用者の確認待ち)
 
-統括へ返した案 (2026-11-26、共有メモ `uiscan-853b-fullscreen-close-proposal.md`)。利用者の回答で変わる場合は直す。
+統括へ返した案 (2026-11-26、共有メモ `uiscan-853b-fullscreen-close-proposal.md` の「改めた案」)。r4 の「全部止めるモーダル」は
+設計レビュー r4 で、専用の全画面 viewport の入力 (`ui_fullscreen.rs` 28906・35595)・native HUD の output event
+(`native_video.rs` 6212・6833)・root の focus guard (`app.rs` 65578)・App 共通のゲームパッドの解放 (`gamepad_input.rs` 4745、
+前面の detached の操作まで途切れる) に新しい止めが要ると分かり、取り下げた (§6.13)。利用者の回答で変わる場合は直す。
 
 今の作り: 「閉じる」で親の一覧 (L1) へ戻る経路は、その場では全画面を閉じず `pending_return_to_parent` を立て、同じフレームの
 入力の合流点 (`app.rs` 103668〜103683、もう 1 か所 103814) で `Direct(親)` / `CollectionSource` の読込を出す。全画面を閉じるのは
 読込の install の中 (`install_loading_items_inner` 45042〜45048 → `change_main_context_for_visible_grid_for_destination`
 71740〜71777 → `close_fullscreen_content_for_destination` 84669)。閉じる要求の時点で `finish_fullscreen_navigation_for_true_close`
-(`snapshot_ops.rs` 2271〜2294) がスライドショー・ナビの sequence 等を終える。読込が失敗・拒否されると全画面のまま
-(`app.rs` 25206〜25231、再試行なし)。
+(`snapshot_ops.rs` 2271〜2294) がスライドショー・ナビの sequence を終え、holdover も消える (`release_fs_nav_lock`、
+`ui_fullscreen.rs` 14902)。読込が失敗・拒否されると全画面のまま (`app.rs` 25206〜25231、再試行なし)。
 
 **見え方とキー (利用者に確かめる点)**:
 
 - 閉じる操作の後、親の一覧を worker で読み終わるまで全画面 (今のページ) を出したまま。読み終わったら今と同じ install の中で
-  全画面を閉じて親の一覧に替わる。ページ一覧は今どおり見せない。
-- 500 ms を超えたら、全画面の既存の「読み込み中」表示 (`fs_page_wait_indicator_visible` が使う表示、`ui_fullscreen.rs` 30358) と
-  同じ描画を出す。述語は混ぜず、この待ち専用の述語から同じ描画関数を呼ぶ。
-- 待ちの間は全画面のキー・マウス・ゲームパッドを受け付けない (押し直しが要る)。2 回目の「閉じる」も届かない。
-  ウィンドウを閉じる・最小化は止めない (閉じれば要求は退役)。
+  全画面を閉じて親の一覧に替わる。ページ一覧は今どおり見せない。読み込み中の表示は出さない (全画面の Ctrl+↑↓ の待ちと同じ。
+  `fs_page_wait_indicator_visible` は `FolderItems` の待ちでは偽、`ui_fullscreen.rs` 4801)。
+- 待ちの間のページ送り・ジャンプ・スクロールは受け付けない (押し直しが要る)。拡大・回転・★などは今のページに効く。もう一度
+  「閉じる」を押すと、閉じる要求をやり直し (true-close の後始末 → 同じ親への読込を受け付け直し、前の待ちは退役)、結果は同じ
+  親の一覧。
 - 読めなかった・別の要求 (Remote・起動の転送・agent 等の受付) に退役させられたとき: 全画面のまま。失敗は今と同じ通知。
-- 不採用: 先に全画面を閉じて待つ (ページ一覧が見え、今の作りに反する)。
+- 不採用: 先に全画面を閉じて待つ (ページ一覧が見え、今の作りに反する)。全部止めるモーダル (上記)。
 
-**仕組み (状態を増やさない)**:
+**仕組み (既存の sequence に乗せる)**:
 
-1. 受付: 今の入力の合流点で出す読込が、§6.3 の 1 の判定で worker になる。continuation に「この要求は main の全画面から
-   戻る」印 (例: `closes_main_fullscreen: bool`、受付時に main の全画面が出ていたか) を持たせる。新しい pending は作らない
-   (`FolderOpenScanPurpose::DirectNavigation` の 1 つ)。
-2. モーダル: 毎フレームの root の入力ゲート (`update_phases.rs` 73 の `consume_sidecar_restore_input_at_root_gate`) は、
-   今はサイドカー復元のときだけ意味のある入力を捨てる (`sanitize_sidecar_restore_viewport_input`・ジェスチャの終了、
-   離した瞬間は残す)。**このゲートに停止理由を型で足し** (例: `ProjectedInputHold::{SidecarRestore, FullscreenCloseScan}`)、
-   main を投影していて上の印の pending があるあいだも同じ捨て方をする。root の窓を閉じる扱い (`cancel_close`) は
-   サイドカー復元の規則のまま (root では閉じる操作を止めない)。サイドカー復元の既存の挙動は変えない。
-   native の動画 presenter のキー・ゲームパッドが egui の入力を通らない場合は、その入口でも同じ述語で止める (実装担当が
-   入口を列挙する。止められない入口があれば返す)。
+1. 受付: 今の入力の合流点で出す読込が、§6.3 の 1 の判定で worker になる。continuation に「main の全画面から戻る」印
+   (例: `closes_main_fullscreen: bool`、受付時に main の全画面が出ていたか) を持たせる。新しい pending は作らない。
+2. 待ちの間の全画面: worker を出した直後 (§6.3 の 5 の受付時の後始末、DFS holdover の `Superseded` 終了の**後**)、
+   全画面の Ctrl+↑↓ と同じく、今描いている表示単位を holdover に取り (`capture_fs_nav_holdover` 15045 と同じ取り方)、
+   `FsNavigationSequenceTarget::FolderItems` の sequence を、この待ち専用の目的 (例: `FsNavigationPurpose::CloseReturn`) で
+   始める (`begin_fs_folder_navigation_sequence` 14088)。r5 (設計レビュー r4 P2-2): true-close の後始末が消した holdover を
+   取り直すので、移動先が未準備のまま閉じても黒や loading を挟まない。今の表示単位が無い (まだ描けていない) ときは、既存の
+   gap surface (`draw_fs_navigation_gap_surface`) のとおり。
+   ページ送り・ジャンプ・スクロールは、既存の `fs_nav_is_locked()`・`fs_navigation_sequence_blocks_new_target()` の判定
+   (全画面・専用 viewport・page overview・in-page scroll・動画の側にある) でそのまま止まる。新しい入力の止めは作らない。
+   閉じる操作は Ctrl+↑↓ の待ちと同じく止めない。
 3. 完了の poll: 全画面のフレームは通常の navigation の末尾 (`post_render_main_navigation`) に届かない (embedded の
    early-return 103809〜103870、native の背景 `update_phases.rs` 31〜46)。既存の `poll_main_embedded_required_fullscreen_folder_open`
    (`app.rs` 62636) が `RequiredFullscreenTarget` だけを回収している場所で、上の印の `DirectNavigation` も回収し、§6.3 の 3 の
-   採用 (modal・policy の照合 → 遅らせた同じ呼び出し) を行う。全画面のまま入力が止まっているので、同じフレームの他の nav との
-   裁定は要らない (全画面では一覧の nav 源が無い)。native の背景の経路にも同じ回収を置く。
-4. 終端: 採用 = install の中で全画面が閉じる (今と同じ)。走査の失敗・退役・`Disconnected` = 全画面のまま、モーダルが解ける
-   (pending が消えるので述語が偽になる)。予約・選択のヒントは §6.3 の 2 のとおり要求と一緒に消える。
-5. 待ちの間に始まり得る他の要求 (Remote の取得、起動の転送、agent の open、ブックマーク): 既存の受付の境界
-   (`claim_open_request_owner…` の成功、`retire_replaced_main_list_requests`) が待ちを退役させ、その要求の採用が全画面を扱う
-   (§1.805 の規則 2 と同じ)。
+   採用 (modal・policy の照合 → 遅らせた同じ呼び出し) を行う。native の背景の経路にも同じ回収を置く。全画面では一覧の nav 源が
+   無く、全画面の移動の入力は 2 で止まっているので、同じフレームの裁定は通常の末尾と同じ規則で足りる (実装担当は、全画面の
+   フレームで同じ pending を奪い合う別の nav が無いことを確かめる)。
+4. 終端: 採用 = install の中で全画面が閉じ、sequence は既存の終わり方 (全画面の close の `ViewerExited`、または
+   `poll_fs_nav_lock` の items の入れ替わり) で終わる。採用以外の終端 (走査の失敗・退役・`Disconnected`・`cancel_folder_pane_open`)
+   では、**同じ要求が始めた sequence を `Superseded` で終え**、全画面のまま入力が戻る。sequence の終わりは pending の purpose 別の
+   後始末 1 か所に置く (入口ごとに書かない)。
+5. もう一度「閉じる」: `handle_fullscreen_close_request` は今どおり true-close の後始末 (sequence の終了) から始まり、
+   `pending_return_to_parent` の受付 → 合流点の読込が §6.3 の 5 の受付で前の待ちを退役させる。予約・選択のヒントは前の要求と
+   一緒に消え、新しい要求が受付時のものを持つ (閉じる要求ごとに子の名前を置き直す今の `take_close_return_navigation` のまま)。
+6. 待ちの間に始まり得る他の要求 (Remote の取得、起動の転送、agent の open、ブックマーク): 既存の受付の境界が待ちを退役させ
+   (4 の後始末で sequence も終わる)、その要求の採用が全画面を扱う (§1.805 の規則 2 と同じ)。
+7. 待ちの間の focus guard (`app.rs` 65578) などによる全画面の close は、Ctrl+↑↓ の待ちの間と同じ扱いになる (既存の挙動)。
+   実装担当は、その close が L2 を出して待ちを残す組み合わせになるかを確かめ、なるなら返す。
 
 **テスト**: (a) 「ページを直接開く」の本を閉じる・ブックマーク・コレクションの物理元の閉じ戻りで、閉じたフレームに UI 走査 0 回、
-待ちの間は全画面が出たまま (`fullscreen_idx` が残る)、完了で今と同じ親の一覧・選択になり、ページ一覧を経由しない (その間の
-フレームで一覧が L2 にならない)。(b) 待ちの間のキー (→・Esc・Enter)・マウス・ゲームパッドが何も起こさず、採用後の一覧にも届かない。
-離した瞬間は残る。(c) 500 ms 未満は表示なし、超えたら表示。(d) 走査失敗・Remote 等による退役で全画面のまま、入力が戻る。
-(e) サイドカー復元の入力ゲートの既存テストが変わらない。(f) 動画の全画面から戻る経路の入力停止と完了。(g) detached を投影している
-間は止めない。
+待ちの間は全画面が出たまま (`fullscreen_idx` が残る)、描画は閉じる前の表示単位の holdover (移動先が未準備のまま閉じた場合も)、
+完了で今と同じ親の一覧・選択になり、その間のフレームで一覧が L2 にならない。(b) 待ちの間の →・PageDown・ジャンプが何も
+起こさず、採用後の一覧にも届かない。(c) 走査失敗・Remote 等による退役で全画面のまま、sequence が終わってページ送りが戻る。
+(d) もう一度「閉じる」で前の待ちが退役し、新しい待ちの完了で同じ親の一覧になる。(e) 動画の全画面から戻る経路 (native の背景) の
+完了と、待ちの間の動画側のページ送りの止め。(f) detached を投影している間は main の待ちの影響を受けない。(g) 全画面の Ctrl+↑↓ の
+既存テストが変わらない。
+
+### 6.13 設計レビュー r4 (同じ担当の継続、20ae1c90e、2026-11-26): REJECT
+
+r3 の 2 件は解消と判定。新たに P2×4・P3×2。設計担当がコードで照合し、r5 で直した。
+
+| 指摘 | 対応 (r5) |
+| --- | --- |
+| P2-1 D3 で状態を残して普通の読込を出すと、帰り先がスマートの entry・配下のときスマートの分岐へ入り直す | 抜ける操作を既存の `ExitTemporaryView` の navigation で出し、採用時の `dismiss_transparent_view_for_admitted_jump` に片付けさせる (§6.3 の 10) |
+| P2-2 C5 の true-close の後始末が holdover を消し、待ちの間に黒/loading を挟む | worker を出した後に holdover を取り直し、Ctrl+↑↓ と同じ sequence を始める (§6.12 の 2) |
+| P2-3 root のゲートだけでは全画面の入力を止められない (専用 viewport・native HUD・focus guard) | 全部止めるモーダルをやめ、既存の Ctrl+↑↓ の待ちの止めに乗せる。統括へ案を改めて返した (§6.12) |
+| P2-4 sidecar のジェスチャ終了の流用は detached のゲームパッド操作まで壊す | sidecar のゲートを流用しない (§6.12) |
+| P3-5 D2 の巻き戻しを全部外すと、選択のヒントが即時の拒否で漏れる | ヒントの巻き戻しは残す (§6.3 の 9) |
+| P3-6 native 動画では待機表示の描画に届かない | 待機表示を出さない案に変えた (Ctrl+↑↓ の待ちと同じ。§6.12) |
