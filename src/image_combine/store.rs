@@ -154,11 +154,18 @@ fn load_keys(data_dir: &Path) -> Result<HashSet<String>, String> {
 
 type IndexResult = (u64, Result<HashSet<String>, String>);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IndexReloadState {
+    Stale,
+    Loading,
+    Complete,
+}
+
 pub(crate) struct CombineIndex {
     keys: HashSet<String>,
     loaded: bool,
     generation: u64,
-    stale: bool,
+    reload: IndexReloadState,
     tx: mpsc::Sender<IndexResult>,
     rx: mpsc::Receiver<IndexResult>,
 }
@@ -170,7 +177,7 @@ impl Default for CombineIndex {
             keys: HashSet::new(),
             loaded: false,
             generation: 0,
-            stale: true,
+            reload: IndexReloadState::Stale,
             tx,
             rx,
         }
@@ -183,7 +190,7 @@ impl CombineIndex {
         self.generation = self.generation.wrapping_add(1);
         self.keys = keys;
         self.loaded = true;
-        self.stale = false;
+        self.reload = IndexReloadState::Complete;
     }
 
     pub(crate) fn contains_or_unloaded(&self, normalized_key: &str) -> bool {
@@ -191,45 +198,82 @@ impl CombineIndex {
     }
 
     pub(crate) fn request_reload(&mut self, data_dir: PathBuf, ctx: egui::Context) {
-        self.stale = false;
+        self.request_reload_with(data_dir, ctx, |job| {
+            std::thread::Builder::new()
+                .name("combine-index".into())
+                .spawn(job)
+                .map(|_| ())
+        });
+    }
+
+    fn request_reload_with(
+        &mut self,
+        data_dir: PathBuf,
+        ctx: egui::Context,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) {
+        self.reload = IndexReloadState::Loading;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let tx = self.tx.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name("combine-index".into())
-            .spawn(move || {
-                let _ = tx.send((generation, load_keys(&data_dir)));
-                ctx.request_repaint();
-            })
-        {
-            crate::logger::log(format!("combine index worker could not start: {error}"));
+        let worker_ctx = ctx.clone();
+        if let Err(error) = spawn(Box::new(move || {
+            let _ = tx.send((generation, load_keys(&data_dir)));
+            worker_ctx.request_repaint();
+        })) {
+            // Share adoption and notification with read failures, including generation checks.
+            let _ = self
+                .tx
+                .send((generation, Err(format!("worker could not start: {error}"))));
+            ctx.request_repaint();
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_worker_start_for_test(&mut self, error: &str) {
+        self.request_reload_with(PathBuf::new(), egui::Context::default(), |_| {
+            Err(std::io::Error::other(error.to_owned()))
+        });
     }
 
     /// UI-only: adoption performs no SQLite or filesystem calls. Errors preserve the last index.
     pub(crate) fn mark_stale(&mut self) {
-        self.stale = true;
+        self.reload = IndexReloadState::Stale;
     }
 
-    pub(crate) fn poll(&mut self, data_dir: &Path, ctx: &egui::Context) {
-        if self.stale {
+    /// Returns a latest-generation failure once, for the App's feedback notification.
+    pub(crate) fn poll(&mut self, data_dir: &Path, ctx: &egui::Context) -> Option<String> {
+        if self.reload == IndexReloadState::Stale {
             self.request_reload(data_dir.to_owned(), ctx.clone());
         }
+        let mut failure = None;
         while let Ok((generation, result)) = self.rx.try_recv() {
-            self.apply(generation, result);
+            if let Some(error) = self.apply(generation, result) {
+                failure = Some(error);
+            }
         }
+        failure
     }
 
-    fn apply(&mut self, generation: u64, result: Result<HashSet<String>, String>) {
-        if generation != self.generation {
-            return;
+    fn apply(
+        &mut self,
+        generation: u64,
+        result: Result<HashSet<String>, String>,
+    ) -> Option<String> {
+        if generation != self.generation || self.reload != IndexReloadState::Loading {
+            return None;
         }
+        self.reload = IndexReloadState::Complete;
         match result {
             Ok(keys) => {
                 self.keys = keys;
                 self.loaded = true;
+                None
             }
-            Err(error) => crate::logger::log(format!("combine index load failed: {error}")),
+            Err(error) => {
+                crate::logger::log(format!("combine index load failed: {error}"));
+                Some(error)
+            }
         }
     }
 }

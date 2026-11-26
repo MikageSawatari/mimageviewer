@@ -3758,6 +3758,12 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         storage(|app| &app.settings.video_resume_positions),
         size_of::<HashMap<String, f64>>(),
     );
+    println!(
+        "image combine storage={} payload={}",
+        storage(|app| &app.image_combine),
+        size_of::<crate::ui_dialogs::image_combine::ImageCombineState>(),
+    );
+    assert_eq!(storage(|app| &app.image_combine), size_of::<usize>());
     // A staged history request is rarely active and must not be stored inline in every App.
     // The capture/fullscreen input test creates several App values on a default test stack.
     assert_eq!(

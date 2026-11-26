@@ -10,6 +10,7 @@ fn recipe(source: &Path, label: &str) -> CombineRecipe {
         options: CombineOptions::default(),
         format: CombineFormat::Png,
         items: vec![CombineItemSpec {
+            composition_identity: None,
             annotation_space: None,
             source: CombineSourceRef::File {
                 path: source.to_owned(),

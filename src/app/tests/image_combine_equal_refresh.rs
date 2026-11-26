@@ -68,7 +68,7 @@ fn complete_combine(app: &mut App, output: &Path, ctx: &egui::Context) {
         end: None,
         cancel_requested: false,
     });
-    app.combine_session = Some(CombineSession::Writing { request: 1 });
+    app.image_combine.session = Some(CombineSession::Writing { request: 1 });
     tx.send(ExportEvent::Completed(ExportSuccess {
         label: "combine".into(),
         path: output.to_path_buf(),

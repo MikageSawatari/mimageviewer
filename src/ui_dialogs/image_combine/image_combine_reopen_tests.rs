@@ -11,6 +11,7 @@ fn recipe(paths: &[PathBuf]) -> CombineRecipe {
             .iter()
             .enumerate()
             .map(|(i, path)| CombineItemSpec {
+                composition_identity: None,
                 annotation_space: None,
                 source: CombineSourceRef::File { path: path.clone() },
                 label_override: Some(format!("商品{i}")),
@@ -39,6 +40,101 @@ fn loaded(dir: &Path, request: u64) -> ReopenLoaded {
         recipe,
         found,
         missing: vec![],
+    }
+}
+
+#[test]
+fn image_combine_reopen_busy_scan_refuses_handler_without_blocking_scan_adoption() {
+    use crate::grid_item::GridItem;
+    use crate::settings::SortOrder;
+
+    for navigation in [false, true] {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("image-combine-reopen-origin");
+        let destination = app.tmp.path().join("image-combine-reopen-destination");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let output = folder.join("A.jpg");
+        let last = folder.join("Z.jpg");
+        for path in [&output, &last, &destination.join("next.jpg")] {
+            image::RgbImage::new(2, 2).save(path).unwrap();
+        }
+        app.settings.sort_order = SortOrder::FileName;
+        app.load_folder(folder.clone());
+        app.finish_page_identity_preparation_for_test();
+        app.image_combine
+            .index
+            .set_keys_for_test([crate::adjustment_db::normalize_path(&output)].into());
+        let idx = app
+            .items
+            .iter()
+            .position(|item| matches!(item, GridItem::Image(path) if path == &output))
+            .unwrap();
+        assert!(
+            app.image_combine_reopen_disabled_reason(Some(idx), false)
+                .is_none()
+        );
+        let items = app.items.clone();
+        let request_sequence = app.image_combine.request_sequence;
+
+        if navigation {
+            app.dispatch_address_input(crate::ui_main::LocationJumpTarget::Physical(
+                destination.clone(),
+            ));
+            assert!(app.direct_navigation_scan_pending());
+        } else {
+            app.settings.sort_order = SortOrder::FileNameDesc;
+            app.apply_sort_change_reload();
+            assert!(app.view_order_refresh_scan_pending());
+        }
+        // Hold adoption at the frame-tail poll boundary. The real worker keeps
+        // its request and result channel; it cannot replace the App's listing.
+        assert!(!app.grid_item_input_allowed());
+        let ctx = egui::Context::default();
+        for checked in [false, true] {
+            if checked {
+                app.checked.insert(idx);
+            }
+            let clicked = (!checked).then_some(idx);
+            assert_eq!(
+                app.image_combine_reopen_disabled_reason(clicked, checked)
+                    .as_deref(),
+                Some("一覧の準備中です")
+            );
+            app.open_image_combine_reopen_context_dialog(&ctx, clicked, checked);
+            assert!(app.image_combine.session.is_none());
+            assert_eq!(app.image_combine.request_sequence, request_sequence);
+            assert!(!app.document_open_modal_admission_blocked());
+            assert_eq!(app.current_folder.as_ref(), Some(&folder));
+            assert_eq!(app.items, items);
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.direct_navigation_scan_pending() || app.view_order_refresh_scan_pending() {
+            app.poll_sidecar_restore(&ctx);
+            app.poll_direct_navigation_scan_for_test(&ctx);
+            app.poll_current_view_order_refresh_for_test(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "scan adoption stalled"
+            );
+            std::thread::yield_now();
+        }
+        app.finish_page_identity_preparation_for_test();
+        assert!(app.grid_item_input_allowed());
+        assert!(app.image_combine.session.is_none());
+        if navigation {
+            assert_eq!(app.current_folder.as_ref(), Some(&destination));
+            assert!(app.items.iter().any(|item| {
+                matches!(item, GridItem::Image(path) if path == &destination.join("next.jpg"))
+            }));
+        } else {
+            assert_eq!(app.current_folder.as_ref(), Some(&folder));
+            assert_eq!(
+                app.items,
+                vec![GridItem::Image(last), GridItem::Image(output)]
+            );
+        }
     }
 }
 
@@ -90,6 +186,7 @@ fn image_combine_reopen_recipe_restores_output_options_labels_and_replace_defaul
     assert!(matches!(
         &state.pending[0].1,
         PreparationTarget::Reopen {
+            composition_identity: None,
             annotation_space: Some([1600, 2400]),
             ..
         }
@@ -110,6 +207,7 @@ fn image_combine_reopen_missing_confirmation_and_all_missing_refuses_dialog() {
     let ctx = egui::Context::default();
     let mut input = loaded(temp.path(), 2);
     input.missing.push(CombineItemSpec {
+        composition_identity: None,
         annotation_space: None,
         source: CombineSourceRef::File {
             path: temp.path().join("missing.png"),
@@ -132,13 +230,14 @@ fn image_combine_reopen_missing_confirmation_button_opens_only_found_sources() {
     let temp = tempfile::tempdir().unwrap();
     let mut input = loaded(temp.path(), 8);
     input.missing.push(CombineItemSpec {
+        composition_identity: None,
         annotation_space: None,
         source: CombineSourceRef::File {
             path: temp.path().join("missing.png"),
         },
         label_override: Some("外す".into()),
     });
-    app.combine_session = Some(CombineSession::ReopenMissing(Box::new(input)));
+    app.image_combine.session = Some(CombineSession::ReopenMissing(Box::new(input)));
     assert!(app.document_open_modal_admission_blocked());
     assert_eq!(app.modal_dialog_block_reason(), Some("image_combine"));
     let mut harness = crate::test_ui::builder()
@@ -146,8 +245,8 @@ fn image_combine_reopen_missing_confirmation_button_opens_only_found_sources() {
         .with_context_setup(crate::ui_fonts::configure_fonts)
         .build_ui_state(
             |ui, app: &mut crate::app::AppTestEnvForTest| {
-                if let Some(session) = app.combine_session.take() {
-                    app.combine_session = app.advance_image_combine_reopen(ui.ctx(), session);
+                if let Some(session) = app.image_combine.session.take() {
+                    app.image_combine.session = app.advance_image_combine_reopen(ui.ctx(), session);
                 }
             },
             app,
@@ -155,7 +254,7 @@ fn image_combine_reopen_missing_confirmation_button_opens_only_found_sources() {
     harness.run();
     harness.get_by_label("見つからない画像を外して開く").click();
     harness.run();
-    let Some(CombineSession::Dialog(state)) = &harness.state().combine_session else {
+    let Some(CombineSession::Dialog(state)) = &harness.state().image_combine.session else {
         panic!("dialog");
     };
     assert_eq!(state.items.len(), 1);
@@ -242,11 +341,13 @@ fn image_combine_reopen_replace_window_locks_name_and_preserves_format() {
 #[test]
 fn image_combine_reopen_loading_modal_escape_drops_late_result_and_reentry() {
     let mut app = crate::app::setup_app_for_test();
-    app.combine_index.set_keys_for_test(Default::default());
-    app.combine_request_sequence = 12;
+    app.image_combine
+        .index
+        .set_keys_for_test(Default::default());
+    app.image_combine.request_sequence = 12;
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
-    app.combine_session = Some(CombineSession::ReopenLoading(Box::new(ReopenRequest {
+    app.image_combine.session = Some(CombineSession::ReopenLoading(Box::new(ReopenRequest {
         request: 12,
         cancel: cancel.clone(),
         rx,
@@ -257,7 +358,7 @@ fn image_combine_reopen_loading_modal_escape_drops_late_result_and_reentry() {
     crate::ime_focus::install_ime_input_policy(&ctx);
     app.open_image_combine_dialog(&ctx);
     assert!(matches!(
-        app.combine_session,
+        app.image_combine.session,
         Some(CombineSession::ReopenLoading(_))
     ));
     ctx.run_ui(
@@ -278,7 +379,7 @@ fn image_combine_reopen_loading_modal_escape_drops_late_result_and_reentry() {
         |ui| app.draw_image_combine_dialog(ui.ctx()),
     )
     .drop_without_applying_deltas();
-    assert!(app.combine_session.is_none());
+    assert!(app.image_combine.session.is_none());
     assert!(cancel.load(Ordering::Relaxed));
     assert!(tx.send((12, Ok(None))).is_err());
 }
@@ -287,7 +388,7 @@ fn image_combine_reopen_loading_modal_escape_drops_late_result_and_reentry() {
 fn image_combine_reopen_stale_request_cannot_adopt_or_reload_index() {
     let mut app = crate::app::setup_app_for_test();
     let ctx = egui::Context::default();
-    app.combine_request_sequence = 2;
+    app.image_combine.request_sequence = 2;
     let (tx, rx) = mpsc::channel();
     tx.send((1, Ok(None))).unwrap();
     let mut pending = Some(ReopenRequest {
@@ -313,8 +414,10 @@ fn image_combine_reopen_missing_row_marks_loaded_index_stale() {
     let mut app = crate::app::setup_app_for_test();
     let temp = tempfile::tempdir().unwrap();
     let key = crate::adjustment_db::normalize_path(&temp.path().join("output.png"));
-    app.combine_index.set_keys_for_test([key.clone()].into());
-    app.combine_request_sequence = 3;
+    app.image_combine
+        .index
+        .set_keys_for_test([key.clone()].into());
+    app.image_combine.request_sequence = 3;
     let (tx, rx) = mpsc::channel();
     tx.send((3, Ok(None))).unwrap();
     let ctx = egui::Context::default();
@@ -337,8 +440,8 @@ fn image_combine_reopen_missing_row_marks_loaded_index_stale() {
     .drop_without_applying_deltas();
     // Polling against an empty disposable store must remove the old key.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while app.combine_index.contains_or_unloaded(&key) {
-        app.combine_index.poll(temp.path(), &ctx);
+    while app.image_combine.index.contains_or_unloaded(&key) {
+        assert!(app.image_combine.index.poll(temp.path(), &ctx).is_none());
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     }
@@ -348,7 +451,9 @@ fn image_combine_reopen_missing_row_marks_loaded_index_stale() {
 fn image_combine_store_effects_reload_index_even_when_content_identity_disabled() {
     let mut app = crate::app::setup_app_for_test();
     app.settings.edit_restore_prompt_enabled = false;
-    app.combine_index.set_keys_for_test(Default::default());
+    app.image_combine
+        .index
+        .set_keys_for_test(Default::default());
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("copy.jpg");
     crate::image_combine::store::save_recipe(
@@ -367,8 +472,8 @@ fn image_combine_store_effects_reload_index_even_when_content_identity_disabled(
     let key = crate::adjustment_db::normalize_path(&output);
     let ctx = egui::Context::default();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !app.combine_index.contains_or_unloaded(&key) {
-        app.combine_index.poll(temp.path(), &ctx);
+    while !app.image_combine.index.contains_or_unloaded(&key) {
+        assert!(app.image_combine.index.poll(temp.path(), &ctx).is_none());
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     }

@@ -734,6 +734,12 @@ fn save_recipe_stage_c_hook(
         .map(|(id, spec)| {
             let loaded = snapshots.get(id).ok_or("構成の元画像を特定できません")?;
             let mut spec = spec.clone();
+            spec.composition_identity = loaded
+                .item
+                .composition_check
+                .as_ref()
+                .map(|check| check.identity().clone())
+                .or(spec.composition_identity);
             spec.annotation_space = loaded
                 .item
                 .edits

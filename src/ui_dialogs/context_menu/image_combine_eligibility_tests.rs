@@ -60,7 +60,8 @@ fn menu_repaints(app: &mut App, rows: usize, stack_lookups: usize) {
         ContextMenuSurface::Grid,
         None,
     );
-    app.combine_eligibility_work
+    app.image_combine
+        .eligibility_work
         .set(CombineEligibilityWork::default());
     app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
     assert_eq!(app.context_menu_idx.unwrap().combine_target_count, 101);
@@ -83,7 +84,7 @@ fn menu_repaints(app: &mut App, rows: usize, stack_lookups: usize) {
         );
     }
     assert_eq!(
-        app.combine_eligibility_work.get(),
+        app.image_combine.eligibility_work.get(),
         CombineEligibilityWork {
             passes: 1,
             rows,
@@ -95,9 +96,9 @@ fn menu_repaints(app: &mut App, rows: usize, stack_lookups: usize) {
     // Both execution routes must reject before sorting/materializing anything.
     app.open_image_combine_context_dialog(&ctx, Some(0), false);
     app.open_image_combine_dialog(&ctx);
-    assert!(app.combine_session.is_none());
-    assert_eq!(app.combine_eligibility_work.get().materializations, 0);
-    assert_eq!(app.combine_eligibility_work.get().page_keys, 0);
+    assert!(app.image_combine.session.is_none());
+    assert_eq!(app.image_combine.eligibility_work.get().materializations, 0);
+    assert_eq!(app.image_combine.eligibility_work.get().page_keys, 0);
 }
 
 #[test]
@@ -181,7 +182,7 @@ fn image_combine_reopen_production_menu_uses_loaded_index_for_the_effective_imag
     app.visible_indices = vec![0, 1];
     app.move_grid_cursor(Some(0), crate::app::GridCursorIntent::Automatic);
     app.cached_handlers.insert(".png".into(), Vec::new());
-    app.combine_index.set_keys_for_test(
+    app.image_combine.index.set_keys_for_test(
         [crate::adjustment_db::normalize_path(&second)]
             .into_iter()
             .collect(),
@@ -216,7 +217,9 @@ fn image_combine_reopen_production_menu_uses_loaded_index_for_the_effective_imag
             expected
         );
     }
-    app.combine_index.set_keys_for_test(Default::default());
+    app.image_combine
+        .index
+        .set_keys_for_test(Default::default());
     assert!(!app.image_combine_reopen_visible(Some(0), false));
     assert!(
         app.image_combine_reopen_disabled_reason(Some(0), false)
@@ -228,7 +231,8 @@ fn image_combine_reopen_production_menu_uses_loaded_index_for_the_effective_imag
 fn image_combine_tools_production_menu_reuses_snapshot_and_recounts_after_close() {
     let mut app = images();
     let ctx = egui::Context::default();
-    app.combine_eligibility_work
+    app.image_combine
+        .eligibility_work
         .set(CombineEligibilityWork::default());
     let mut first = None;
     for _ in 0..5 {
@@ -258,7 +262,7 @@ fn image_combine_tools_production_menu_reuses_snapshot_and_recounts_after_close(
         .drop_without_applying_deltas();
     }
     assert_eq!(
-        app.combine_eligibility_work.get(),
+        app.image_combine.eligibility_work.get(),
         CombineEligibilityWork {
             passes: 1,
             rows: 101,
@@ -266,12 +270,12 @@ fn image_combine_tools_production_menu_reuses_snapshot_and_recounts_after_close(
         }
     );
     // The menu bar clears this owner when MenuResponse.inner is None.
-    app.combine_tools_menu_owner = None;
+    app.image_combine.tools_menu_owner = None;
     app.checked.clear();
     app.checked.insert(0);
     assert!(app.combine_tools_menu_disabled_reason().is_none());
     assert_eq!(
-        app.combine_eligibility_work.get(),
+        app.image_combine.eligibility_work.get(),
         CombineEligibilityWork {
             passes: 2,
             rows: 102,

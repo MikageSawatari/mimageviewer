@@ -746,7 +746,7 @@ impl App {
     /// グリッド選択を一括エクスポートするダイアログを開く。対象が 1 件も無ければ
     /// 開かずに理由を出す。
     pub(crate) fn open_export_batch_dialog(&mut self, ctx: &egui::Context) {
-        if self.combine_session.is_some() {
+        if self.image_combine.session.is_some() {
             self.show_feedback_warning("結合の操作中です".into());
             return;
         }

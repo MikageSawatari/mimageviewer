@@ -60155,7 +60155,7 @@ impl App {
         if dismiss_finished {
             if pending.origin == crate::export_dialog::ExportOrigin::Combine
                 && matches!(
-                    self.combine_session,
+                    self.image_combine.session,
                     Some(crate::ui_dialogs::image_combine::CombineSession::Writing { .. })
                 )
             {
@@ -60281,7 +60281,7 @@ impl App {
         if combine
             && (refresh_after_done || clear_pending)
             && matches!(
-                self.combine_session,
+                self.image_combine.session,
                 Some(crate::ui_dialogs::image_combine::CombineSession::Writing { .. })
             )
         {

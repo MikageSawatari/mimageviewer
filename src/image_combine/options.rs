@@ -378,6 +378,9 @@ pub enum CombineSourceRef {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CombineItemSpec {
     pub source: CombineSourceRef,
+    /// Logical permission identity; the source may point into a conversion cache.
+    #[serde(default)]
+    pub composition_identity: Option<crate::book_resume_db::PageIdentity>,
     #[serde(default)]
     pub label_override: Option<String>,
     /// Source-pixel canvas used by the saved annotation snapshot, never output size.

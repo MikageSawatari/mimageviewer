@@ -85,7 +85,8 @@ impl App {
             .and_then(|idx| self.items.get(idx))
             .is_some_and(|item| match item {
                 crate::grid_item::GridItem::Image(path) => self
-                    .combine_index
+                    .image_combine
+                    .index
                     .contains_or_unloaded(&crate::adjustment_db::normalize_path(path)),
                 _ => false,
             })
@@ -96,12 +97,14 @@ impl App {
         clicked: Option<usize>,
         folder: bool,
     ) -> Option<String> {
-        if self.combine_session.is_some() {
+        if self.image_combine.session.is_some() {
             Some("結合の操作中です".into())
         } else if self.export_pending.is_some() {
             Some("エクスポート中です".into())
         } else if self.fullscreen_idx.is_some() {
             Some("一覧で画像を選んでください".into())
+        } else if !self.grid_item_input_allowed() {
+            Some("一覧の準備中です".into())
         } else if self.image_combine_reopen_index(clicked, folder).is_none() {
             Some("画像を 1 枚だけ選んでください".into())
         } else if !self.image_combine_reopen_visible(clicked, folder) {
@@ -135,8 +138,8 @@ impl App {
             || self.export_crop_page_keys.contains(&key)
             || self.export_crop_page_settings.contains_key(&idx)
             || self.comic_page_keys.contains(&key);
-        self.combine_request_sequence = self.combine_request_sequence.wrapping_add(1);
-        let request = self.combine_request_sequence;
+        self.image_combine.request_sequence = self.image_combine.request_sequence.wrapping_add(1);
+        let request = self.image_combine.request_sequence;
         let cancel = Arc::new(AtomicBool::new(false));
         let worker_cancel = cancel.clone();
         let (tx, rx) = mpsc::channel();
@@ -152,7 +155,7 @@ impl App {
                 }
             }) {
             Ok(_) => {
-                self.combine_session =
+                self.image_combine.session =
                     Some(CombineSession::ReopenLoading(Box::new(ReopenRequest {
                         request,
                         cancel,
@@ -189,11 +192,11 @@ impl App {
                 match pending.rx.try_recv() {
                     Ok((request, result))
                         if request == pending.request
-                            && request == self.combine_request_sequence =>
+                            && request == self.image_combine.request_sequence =>
                     {
                         match result {
                             Ok(None) => {
-                                self.combine_index.mark_stale();
+                                self.image_combine.index.mark_stale();
                                 self.show_feedback_warning(
                                     "この画像には結合の構成がありません".into(),
                                 );
@@ -326,6 +329,13 @@ impl App {
             .into_owned();
         let custom_ratio_text = options_ui::custom_ratio_text(&options);
         let mut pending = VecDeque::new();
+        let lookup = resolver::ReopenLookup::new(
+            self,
+            loaded
+                .found
+                .iter()
+                .map(|(spec, _)| resolver::source_page_key(&spec.source)),
+        );
         let items = loaded
             .found
             .into_iter()
@@ -336,6 +346,8 @@ impl App {
                     PreparationTarget::Reopen {
                         source: spec.source.clone(),
                         annotation_space: spec.annotation_space,
+                        composition_identity: spec.composition_identity.clone(),
+                        mounted_idx: None,
                         prepared,
                     },
                 ));
@@ -347,6 +359,9 @@ impl App {
                 }
             })
             .collect::<Vec<_>>();
+        if !self.items.is_empty() {
+            pending.push_front((0, PreparationTarget::ReopenLookup(lookup)));
+        }
         // A recipe can refer to a previous output. Keep export available with replacement OFF.
         let key = crate::adjustment_db::normalize_path(&loaded.output);
         let replace = !items.iter().any(|item| {

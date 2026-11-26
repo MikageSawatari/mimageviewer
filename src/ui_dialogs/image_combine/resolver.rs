@@ -8,6 +8,51 @@ use crate::grid_item::GridItem;
 use crate::image_combine::CombineSourceRef;
 use std::path::Path;
 
+/// Built once per reopen, yielding between rows rather than scanning per source.
+pub(super) struct ReopenLookup {
+    cursor: usize,
+    generation: u64,
+    keys: std::collections::HashMap<String, Option<usize>>,
+}
+
+impl ReopenLookup {
+    pub(super) fn new(app: &App, sources: impl Iterator<Item = String>) -> Self {
+        Self {
+            cursor: 0,
+            generation: app.items_generation,
+            keys: sources.map(|key| (key, None)).collect(),
+        }
+    }
+
+    pub(super) fn advance(
+        &mut self,
+        app: &App,
+        mut remaining: impl FnMut() -> bool,
+    ) -> Result<bool, String> {
+        if app.items_generation != self.generation {
+            return Err("一覧が変更されました。結合を開き直してください".into());
+        }
+        while self.cursor < app.items.len() {
+            let idx = self.cursor;
+            self.cursor += 1;
+            if let Some(key) = app.page_path_key(idx)
+                && let Some(found) = self.keys.get_mut(&key)
+                && found.is_none()
+            {
+                *found = Some(idx);
+            }
+            if !remaining() {
+                return Ok(self.cursor == app.items.len());
+            }
+        }
+        Ok(true)
+    }
+
+    pub(super) fn get(&self, source: &CombineSourceRef) -> Option<usize> {
+        self.keys.get(&source_page_key(source)).copied().flatten()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SourcePreparation {
     page_key: String,
@@ -52,7 +97,7 @@ pub(crate) fn read_source_preparation(
     })
 }
 
-fn source_page_key(source: &CombineSourceRef) -> String {
+pub(super) fn source_page_key(source: &CombineSourceRef) -> String {
     match source {
         CombineSourceRef::File { path } => crate::adjustment_db::normalize_path(path),
         CombineSourceRef::ZipEntry {
@@ -89,6 +134,8 @@ impl App {
         source: &CombineSourceRef,
         prepared: &SourcePreparation,
         annotation_space: Option<[u32; 2]>,
+        composition_identity: Option<&crate::book_resume_db::PageIdentity>,
+        mounted_idx: Option<usize>,
     ) -> Result<BatchExportItem, String> {
         if annotation_space.is_some_and(|[width, height]| width == 0 || height == 0) {
             return Err("結合の構成に無効な注釈の基準寸法があります".into());
@@ -101,9 +148,10 @@ impl App {
         }
         // Mounted pages retain live hydrated edits and the ordinary output
         // permission. Do not rebuild their snapshots through the absent path.
-        if let Some(idx) = (0..self.items.len())
-            .find(|&idx| self.page_path_key(idx).as_deref() == Some(key.as_str()))
-        {
+        if let Some(idx) = mounted_idx {
+            if self.page_path_key(idx).as_deref() != Some(key.as_str()) {
+                return Err("一覧が変更されました。結合を開き直してください".into());
+            }
             // A recipe owns its source list independently of the current smart
             // folder's rule mask. The key was resolved above; direct snapshotting
             // also retains hydrated edits of a currently filtered-out row.
@@ -119,6 +167,11 @@ impl App {
             // currently mounted at a different PDF render size. Missing PDF
             // spaces are resolved (or rejected) by the worker before composition.
             item.edits.comic_source_dims = annotation_space;
+            if let Some(identity) = composition_identity
+                && let Some(check) = item.composition_check.take()
+            {
+                item.composition_check = Some(check.with_identity(identity.clone()));
+            }
             return Ok(item);
         }
 
@@ -203,7 +256,9 @@ impl App {
             && let Some(service) = self.book_composition_service.as_ref()
         {
             let grid_item = source_grid_item(source);
-            if let Some(identity) = crate::book_resume_db::PageIdentity::for_item(&grid_item, None)
+            if let Some(identity) = composition_identity
+                .cloned()
+                .or_else(|| crate::book_resume_db::PageIdentity::for_item(&grid_item, None))
             {
                 item.composition_check =
                     Some(crate::book_composition::CompositionOutputCheck::new(
@@ -246,6 +301,181 @@ mod tests {
     use super::*;
     use crate::adjustment::AdjustParams;
     use crate::rotation_db::Rotation;
+
+    impl App {
+        fn image_combine_test_item_for_source(
+            &mut self,
+            source: &CombineSourceRef,
+            prepared: &SourcePreparation,
+            annotation_space: Option<[u32; 2]>,
+        ) -> Result<BatchExportItem, String> {
+            let mut lookup = ReopenLookup::new(self, std::iter::once(source_page_key(source)));
+            assert!(lookup.advance(self, || true).unwrap());
+            self.image_combine_item_for_source(
+                source,
+                prepared,
+                annotation_space,
+                None,
+                lookup.get(source),
+            )
+        }
+    }
+
+    #[test]
+    fn image_combine_reopen_large_absent_sources_lookup_is_linear_and_yields_between_rows() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..100_000)
+            .map(|idx| GridItem::Image(app.tmp.path().join(format!("row{idx}.png"))))
+            .collect();
+        let sources = (0..100)
+            .map(|idx| CombineSourceRef::File {
+                path: app.tmp.path().join(format!("absent{idx}.png")),
+            })
+            .collect::<Vec<_>>();
+        let before = app.image_combine.eligibility_work.get().page_keys;
+        let mut lookup = ReopenLookup::new(&app, sources.iter().map(source_page_key));
+        let mut done = false;
+        while !done {
+            let start = lookup.cursor;
+            let mut rows = 0;
+            done = lookup
+                .advance(&app, || {
+                    rows += 1;
+                    rows < 257
+                })
+                .unwrap();
+            assert!(lookup.cursor - start <= 257);
+        }
+        assert_eq!(
+            app.image_combine.eligibility_work.get().page_keys - before,
+            100_000
+        );
+        let prepared = SourcePreparation {
+            page_key: String::new(),
+            page_params: None,
+        };
+        for source in sources {
+            assert_eq!(lookup.get(&source), None);
+            let prepared = SourcePreparation {
+                page_key: source_page_key(&source),
+                ..prepared.clone()
+            };
+            app.image_combine_item_for_source(&source, &prepared, None, None, lookup.get(&source))
+                .unwrap();
+        }
+        assert_eq!(
+            app.image_combine.eligibility_work.get().page_keys - before,
+            100_000,
+            "absent snapshot preparation never scans mounted rows"
+        );
+    }
+
+    #[test]
+    fn image_combine_reopen_lookup_rejects_replaced_list() {
+        let mut app = crate::app::setup_app_for_test();
+        let mut lookup = ReopenLookup::new(&app, std::iter::empty());
+        app.items_generation += 1;
+        assert!(lookup.advance(&app, || true).is_err());
+    }
+
+    #[test]
+    fn image_combine_reopen_converted_archive_mounted_and_off_list_reject_newly_hidden_page() {
+        use crate::book_composition::{
+            BookComposition, BookCompositionService, CompositionPageRef, PageDomain,
+            ReadingDirection,
+        };
+        use std::io::Write;
+        let mut app = crate::app::setup_app_for_test();
+        let physical = app.tmp.path().join("converted.zip");
+        let logical = app.tmp.path().join("original.rar");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&physical).unwrap());
+        zip.start_file("page.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"fixture").unwrap();
+        zip.finish().unwrap();
+        let (service, owner) =
+            BookCompositionService::spawn_at(app.tmp.path().join("composition"), None).unwrap();
+        app.book_composition_service = Some(service.clone());
+        let scope = crate::book_scope::BookScopeKey::archive(&logical, &[]).unwrap();
+        let domain = PageDomain::ArchiveLevel {
+            prefix: String::new(),
+        };
+        service
+            .prepare(scope.clone(), domain.clone())
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        let source = CombineSourceRef::ZipEntry {
+            zip_path: physical.clone(),
+            entry_name: "page.png".into(),
+        };
+        app.items = vec![source_grid_item(&source)];
+        app.current_folder = Some(physical);
+        app.archive_source_override = Some(logical);
+        let mounted = app.batch_export_item_for_idx(0).unwrap().unwrap();
+        let original_check = mounted.composition_check.as_ref().unwrap();
+        assert!(original_check.permits().unwrap());
+        let spec = crate::image_combine::CombineItemSpec {
+            source: source.clone(),
+            label_override: None,
+            annotation_space: None,
+            composition_identity: Some(original_check.identity().clone()),
+        };
+        // Exercise persistence: the physical cache and original identity are independent.
+        let output = app.tmp.path().join("combined.png");
+        let recipe = crate::image_combine::CombineRecipe {
+            v: 1,
+            options: Default::default(),
+            format: crate::image_combine::CombineFormat::Png,
+            items: vec![spec],
+        };
+        crate::image_combine::store::save_recipe(app.tmp.path(), &output, &recipe).unwrap();
+        let spec = crate::image_combine::store::load_recipe(app.tmp.path(), &output)
+            .unwrap()
+            .unwrap()
+            .items
+            .remove(0);
+        let page = CompositionPageRef::ArchiveEntry {
+            entry_name: "page.png".into(),
+        };
+        let mut book = BookComposition::new(ReadingDirection::Ltr, vec![page.clone()]);
+        book.hidden_pages = vec![page];
+        service
+            .save(scope, domain, book)
+            .recv()
+            .unwrap()
+            .status
+            .unwrap();
+        // The mounted check was captured before the hide and must still read fresh policy.
+        assert!(!original_check.permits().unwrap());
+        let prepared = read_source_preparation(&crate::data_dir::get(), &source).unwrap();
+        for mounted_idx in [Some(0), None] {
+            if mounted_idx.is_none() {
+                app.items.clear();
+                app.current_folder = None;
+                app.archive_source_override = None;
+            }
+            let reopened = app
+                .image_combine_item_for_source(
+                    &spec.source,
+                    &prepared,
+                    None,
+                    spec.composition_identity.as_ref(),
+                    mounted_idx,
+                )
+                .unwrap();
+            assert!(
+                !reopened
+                    .composition_check
+                    .as_ref()
+                    .unwrap()
+                    .permits()
+                    .unwrap()
+            );
+        }
+        owner.shutdown_and_join();
+    }
 
     fn params(brightness: f32) -> AdjustParams {
         AdjustParams {
@@ -344,7 +574,7 @@ mod tests {
         };
         let expected = app.batch_export_item_for_target(&target).unwrap().unwrap();
         let mounted = app
-            .image_combine_item_for_source(source, &preparation, None)
+            .image_combine_test_item_for_source(source, &preparation, None)
             .unwrap();
         assert_snapshot_eq(&expected, &mounted);
         app.items.clear();
@@ -352,7 +582,7 @@ mod tests {
         app.rotation_cache.clear();
         app.export_crop_page_settings.clear();
         let actual = app
-            .image_combine_item_for_source(source, &preparation, None)
+            .image_combine_test_item_for_source(source, &preparation, None)
             .unwrap();
         (expected, actual)
     }
@@ -507,7 +737,7 @@ mod tests {
                 Vec::new()
             };
             let actual = app
-                .image_combine_item_for_source(&source, &prepared, None)
+                .image_combine_test_item_for_source(&source, &prepared, None)
                 .unwrap();
             assert!(matches!(
                 actual.source,
@@ -516,7 +746,7 @@ mod tests {
         }
         app.current_folder = Some(pdf_path);
         let actual = app
-            .image_combine_item_for_source(&source, &prepared, None)
+            .image_combine_test_item_for_source(&source, &prepared, None)
             .unwrap();
         assert!(
             matches!(actual.source, crate::books::CompositeSource::PdfPage { password: Some(password), .. } if password == "unrelated-secret")
@@ -543,7 +773,7 @@ mod tests {
         app.pdf_current_password = Some("wrong-secret".into());
         let prepared = read_source_preparation(&crate::data_dir::get(), &source).unwrap();
         let actual = app
-            .image_combine_item_for_source(&source, &prepared, None)
+            .image_combine_test_item_for_source(&source, &prepared, None)
             .unwrap();
         assert!(
             matches!(actual.source, crate::books::CompositeSource::PdfPage { password: Some(password), .. } if password == "saved-secret")
@@ -592,7 +822,7 @@ mod tests {
         };
         let prepared = read_source_preparation(&crate::data_dir::get(), &first).unwrap();
         assert!(
-            app.image_combine_item_for_source(&second, &prepared, None)
+            app.image_combine_test_item_for_source(&second, &prepared, None)
                 .is_err()
         );
     }
@@ -613,7 +843,7 @@ mod tests {
         app.adjustment_page_params.insert(0, params(29.0));
         app.rotation_cache.insert(0, Rotation::Cw90);
         let actual = app
-            .image_combine_item_for_source(&source, &prepared, None)
+            .image_combine_test_item_for_source(&source, &prepared, None)
             .unwrap();
         assert_eq!(actual.edits.params.brightness, 29.0);
         assert_eq!(actual.edits.rotation, Rotation::Cw90);
@@ -671,7 +901,7 @@ mod tests {
         let prepared = read_source_preparation(&crate::data_dir::get(), &source).unwrap();
         app.items.clear();
         let actual = app
-            .image_combine_item_for_source(&source, &prepared, recorded)
+            .image_combine_test_item_for_source(&source, &prepared, recorded)
             .unwrap();
         assert_snapshot_eq(&expected, &actual);
         assert_eq!(
@@ -685,7 +915,7 @@ mod tests {
         // Missing record is left unresolved for the worker's typed PDF analysis,
         // which rejects vectors instead of inventing a coordinate canvas.
         let missing = app
-            .image_combine_item_for_source(&source, &prepared, None)
+            .image_combine_test_item_for_source(&source, &prepared, None)
             .unwrap();
         assert!(missing.edits.comic.is_some());
         assert!(missing.edits.comic_source_dims.is_none());

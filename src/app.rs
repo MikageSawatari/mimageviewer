@@ -17301,15 +17301,8 @@ pub struct App {
     pub(crate) export_dialog: Option<Box<crate::export_dialog::ExportDialogState>>,
     /// Ctrl+E / グリッド選択の一括エクスポートのダイアログ状態。
     pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
-    pub(crate) combine_session: Option<crate::ui_dialogs::image_combine::CombineSession>,
-    pub(crate) combine_request_sequence: u64,
-    pub(crate) combine_index: Box<crate::image_combine::store::CombineIndex>,
-    /// Snapshot owned by one open Tools menu; cleared when its body closes.
-    pub(crate) combine_tools_menu_owner:
-        Option<crate::ui_dialogs::context_menu::GridContextMenuOwner>,
-    #[cfg(test)]
-    pub(crate) combine_eligibility_work:
-        std::cell::Cell<crate::ui_dialogs::image_combine::CombineEligibilityWork>,
+    /// Grid image-combine state stays off the App stack, including menu snapshots.
+    pub(crate) image_combine: Box<crate::ui_dialogs::image_combine::ImageCombineState>,
     /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。単ページと一括の両方が使う。
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
     /// OS-global clipboard output; intentionally stays outside viewer context bundles.
@@ -21361,12 +21354,7 @@ impl App {
             pipeline_debug_export_pending: None,
             export_dialog: None,
             export_batch_dialog: None,
-            combine_session: None,
-            combine_request_sequence: 0,
-            combine_index: Default::default(),
-            combine_tools_menu_owner: None,
-            #[cfg(test)]
-            combine_eligibility_work: Default::default(),
+            image_combine: Default::default(),
             export_pending: None,
             edited_clipboard_copy: None,
             folder_refresh_pending: None,

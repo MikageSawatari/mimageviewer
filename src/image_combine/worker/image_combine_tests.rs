@@ -38,6 +38,7 @@ fn spec(count: usize) -> RenderSpec {
                 (
                     id,
                     CombineItemSpec {
+                        composition_identity: None,
                         annotation_space: None,
                         source: CombineSourceRef::File {
                             path: format!("source{id}.png").into(),
@@ -590,6 +591,59 @@ fn image_combine_worker_vector_without_recorded_annotation_space_fails_target() 
         if message == "注釈の位置を再現できません。一覧から結合し直してください")
     );
     assert!(worker.items.is_empty());
+}
+
+#[test]
+fn image_combine_worker_saves_logical_composition_identity_from_accepted_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let (service, owner) = crate::book_composition::BookCompositionService::spawn_at(
+        directory.path().join("composition"),
+        None,
+    )
+    .unwrap();
+    let mut worker = worker(Box::new(|_, _| Ok(pixels())));
+    load_into(&mut worker, 1);
+    let mut render = spec(1);
+    let physical = directory.path().join("converted.zip");
+    render.items[0].1.source = CombineSourceRef::ZipEntry {
+        zip_path: physical.clone(),
+        entry_name: "page.png".into(),
+    };
+    let (progress, _) = mpsc::channel();
+    let write = WriteSpec {
+        render,
+        directory: directory.path().to_path_buf(),
+        name: "joined".into(),
+        replace: None,
+        data_dir: directory.path().join("data"),
+        progress,
+    };
+    let output = directory.path().join("joined.png");
+    for original in ["original.rar", "replacement.rar"] {
+        let identity = crate::book_resume_db::PageIdentity::Archive {
+            container: crate::path_key::normalize_keep_drive(&directory.path().join(original)),
+            entry_name: "page.png".into(),
+        };
+        worker.items.get_mut(&0).unwrap().item.composition_check =
+            Some(crate::book_composition::CompositionOutputCheck::new(
+                service.clone(),
+                crate::book_composition::CandidatePage {
+                    identity: identity.clone(),
+                    physical_archive: Some(physical.clone()),
+                    raw_tree: None,
+                },
+            ));
+        save_recipe_stage_c_hook(&output, &write, &worker.items).unwrap();
+        let saved = super::super::store::load_recipe(&write.data_dir, &output)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.items[0].composition_identity.as_ref(),
+            Some(&identity)
+        );
+        assert_eq!(saved.items[0].source, write.render.items[0].1.source);
+    }
+    owner.shutdown_and_join();
 }
 
 #[test]

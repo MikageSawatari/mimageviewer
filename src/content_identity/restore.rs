@@ -1424,6 +1424,7 @@ mod tests {
             options: CombineOptions::default(),
             format: CombineFormat::Png,
             items: vec![CombineItemSpec {
+                composition_identity: None,
                 annotation_space: None,
                 source: CombineSourceRef::File {
                     path: data.path().join("private-source.png"),

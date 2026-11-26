@@ -20,9 +20,12 @@ mod resolver;
 
 enum PreparationTarget {
     Selection(ExportBatchTarget),
+    ReopenLookup(resolver::ReopenLookup),
     Reopen {
         source: CombineSourceRef,
         annotation_space: Option<[u32; 2]>,
+        composition_identity: Option<crate::book_resume_db::PageIdentity>,
+        mounted_idx: Option<usize>,
         prepared: Result<resolver::SourcePreparation, String>,
     },
 }
@@ -39,6 +42,18 @@ pub(crate) enum CombineSession {
     ReopenMissing(Box<reopen::ReopenLoaded>),
     Dialog(Box<CombineDialogState>),
     Writing { request: u64 },
+}
+
+/// App keeps one pointer; session, index and menu snapshots share this owner.
+#[derive(Default)]
+pub(crate) struct ImageCombineState {
+    pub(crate) session: Option<CombineSession>,
+    pub(crate) request_sequence: u64,
+    pub(crate) index: crate::image_combine::store::CombineIndex,
+    /// Snapshot owned by one open Tools menu; cleared when its body closes.
+    pub(crate) tools_menu_owner: Option<super::context_menu::GridContextMenuOwner>,
+    #[cfg(test)]
+    pub(crate) eligibility_work: std::cell::Cell<CombineEligibilityWork>,
 }
 
 #[cfg(test)]
@@ -604,7 +619,7 @@ pub(crate) fn entry_disabled_reason(
 impl App {
     #[cfg(test)]
     pub(crate) fn prepare_image_combine_typing_for_test(&mut self) {
-        if let Some(CombineSession::Dialog(state)) = &mut self.combine_session {
+        if let Some(CombineSession::Dialog(state)) = &mut self.image_combine.session {
             if let Some(item) = state.items.first_mut() {
                 item.spec.label_override = Some(String::new());
             }
@@ -613,7 +628,7 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn image_combine_typing_state_for_test(&self) -> (&str, bool, usize) {
-        if let Some(CombineSession::Dialog(state)) = &self.combine_session {
+        if let Some(CombineSession::Dialog(state)) = &self.image_combine.session {
             (
                 state.typing_label(),
                 state
@@ -627,7 +642,8 @@ impl App {
         }
     }
     pub(crate) fn combine_dialog_modal(&self) -> bool {
-        self.combine_session
+        self.image_combine
+            .session
             .as_ref()
             .is_some_and(CombineSession::modal)
     }
@@ -682,17 +698,17 @@ impl App {
 
     #[cfg(test)]
     pub(crate) fn note_combine_work(&self, update: impl FnOnce(&mut CombineEligibilityWork)) {
-        let mut work = self.combine_eligibility_work.get();
+        let mut work = self.image_combine.eligibility_work.get();
         update(&mut work);
-        self.combine_eligibility_work.set(work);
+        self.image_combine.eligibility_work.set(work);
     }
 
     pub(crate) fn combine_tools_menu_disabled_reason(&mut self) -> Option<String> {
         let context_id = self.collection_grid_context_id();
-        if self.combine_tools_menu_owner.is_none_or(|owner| {
+        if self.image_combine.tools_menu_owner.is_none_or(|owner| {
             owner.context_id != context_id || owner.items_generation != self.items_generation
         }) {
-            self.combine_tools_menu_owner = Some(super::context_menu::GridContextMenuOwner {
+            self.image_combine.tools_menu_owner = Some(super::context_menu::GridContextMenuOwner {
                 index: self.selected.unwrap_or(usize::MAX),
                 context_id,
                 items_generation: self.items_generation,
@@ -700,14 +716,17 @@ impl App {
             });
         }
         self.combine_disabled_reason_for_count(
-            self.combine_tools_menu_owner.unwrap().combine_target_count,
+            self.image_combine
+                .tools_menu_owner
+                .unwrap()
+                .combine_target_count,
         )
     }
 
     pub(crate) fn combine_disabled_reason_for_count(&self, count: usize) -> Option<String> {
         entry_disabled_reason(
             count,
-            self.combine_session.is_some(),
+            self.image_combine.session.is_some(),
             self.export_pending.is_some(),
         )
         .or_else(|| (!self.grid_item_input_allowed()).then(|| "一覧の準備中です".into()))
@@ -772,6 +791,7 @@ impl App {
                     id,
                     name: source_name(&source, false),
                     spec: CombineItemSpec {
+                        composition_identity: None,
                         annotation_space: None,
                         source,
                         label_override: None,
@@ -802,7 +822,7 @@ impl App {
                 return;
             }
         };
-        self.combine_request_sequence = self.combine_request_sequence.wrapping_add(1);
+        self.image_combine.request_sequence = self.image_combine.request_sequence.wrapping_add(1);
         let options = self
             .settings
             .combine_options
@@ -823,8 +843,8 @@ impl App {
         };
         let name = format!("{}_結合", source_name(&items[0].spec.source, true));
         let custom_ratio_text = options_ui::custom_ratio_text(&options);
-        self.combine_session = Some(CombineSession::Dialog(Box::new(CombineDialogState {
-            request: self.combine_request_sequence,
+        self.image_combine.session = Some(CombineSession::Dialog(Box::new(CombineDialogState {
+            request: self.image_combine.request_sequence,
             options,
             selected_item_id: items.first().map(|item| item.id),
             items,
@@ -859,7 +879,7 @@ impl App {
     pub(crate) fn reject_busy_image_combine_shortcut(&mut self, ctx: &egui::Context) {
         if self.fullscreen_idx.is_none()
             && ctx.viewport_id() == egui::ViewportId::ROOT
-            && (self.combine_session.is_some() || self.export_pending.is_some())
+            && (self.image_combine.session.is_some() || self.export_pending.is_some())
             && !self.shortcuts_blocked_by_text_input(ctx)
             && !self.ime_input_active(ctx)
             && !egui::Popup::is_any_open(ctx)
@@ -870,7 +890,7 @@ impl App {
                     .keymap
                     .consume_action(ctx, crate::keymap::KeyAction::GridCombineReopen))
         {
-            let reason = if self.combine_session.is_some() {
+            let reason = if self.image_combine.session.is_some() {
                 "結合の操作中です"
             } else {
                 "エクスポート中です"
@@ -882,16 +902,61 @@ impl App {
     fn advance_image_combine_preparation(&mut self, state: &mut CombineDialogState) {
         let start = std::time::Instant::now();
         while let Some((id, target)) = state.pending.pop_front() {
+            let target = match target {
+                PreparationTarget::ReopenLookup(mut lookup) => {
+                    let result = lookup.advance(self, || {
+                        start.elapsed() < std::time::Duration::from_millis(6)
+                    });
+                    match result {
+                        Ok(false) => {
+                            state
+                                .pending
+                                .push_front((id, PreparationTarget::ReopenLookup(lookup)));
+                            break;
+                        }
+                        result => {
+                            for (_, target) in &mut state.pending {
+                                if let PreparationTarget::Reopen {
+                                    source,
+                                    mounted_idx,
+                                    prepared,
+                                    ..
+                                } = target
+                                {
+                                    match &result {
+                                        Ok(_) => *mounted_idx = lookup.get(source),
+                                        Err(error) => *prepared = Err(error.clone()),
+                                    }
+                                }
+                            }
+                            if start.elapsed() >= std::time::Duration::from_millis(6) {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                target => target,
+            };
             let result = match target {
+                PreparationTarget::ReopenLookup(_) => unreachable!(),
                 PreparationTarget::Selection(target) => self
                     .batch_export_item_for_target(&target)
                     .and_then(|item| item.ok_or_else(|| "この対象は結合できません".into())),
                 PreparationTarget::Reopen {
                     source,
                     annotation_space,
+                    composition_identity,
+                    mounted_idx,
                     prepared,
                 } => prepared.and_then(|prepared| {
-                    self.image_combine_item_for_source(&source, &prepared, annotation_space)
+                    self.image_combine_item_for_source(
+                        &source,
+                        &prepared,
+                        annotation_space,
+                        composition_identity.as_ref(),
+                        mounted_idx,
+                    )
                 }),
             };
             let status = match result {
@@ -917,11 +982,13 @@ impl App {
     }
 
     pub(crate) fn draw_image_combine_dialog(&mut self, ctx: &egui::Context) {
-        self.combine_index.poll(&crate::data_dir::get(), ctx);
-        if self.combine_session.is_some() {
+        if let Some(error) = self.image_combine.index.poll(&crate::data_dir::get(), ctx) {
+            self.show_feedback_warning(format!("結合の構成の一覧を読み込めません: {error}"));
+        }
+        if self.image_combine.session.is_some() {
             self.reject_busy_image_combine_shortcut(ctx);
         }
-        let Some(session) = self.combine_session.take() else {
+        let Some(session) = self.image_combine.session.take() else {
             return;
         };
         let session = match self.advance_image_combine_reopen(ctx, session) {
@@ -929,7 +996,7 @@ impl App {
             None => return,
         };
         let CombineSession::Dialog(mut state) = session else {
-            self.combine_session = Some(session);
+            self.image_combine.session = Some(session);
             return;
         };
         self.advance_image_combine_preparation(&mut state);
@@ -971,7 +1038,7 @@ impl App {
                     }
                     state.worker.take(); // Writing now owns cancellation through ExportPending.
                     self.export_pending = Some(pending);
-                    self.combine_session = Some(CombineSession::Writing {
+                    self.image_combine.session = Some(CombineSession::Writing {
                         request: state.request,
                     });
                     return;
@@ -982,15 +1049,18 @@ impl App {
         if !state.ready() && state.render_error.is_none() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        self.combine_session = Some(CombineSession::Dialog(state));
+        self.image_combine.session = Some(CombineSession::Dialog(state));
     }
 
     /// Session take is the exactly-once latch, even when completed progress stays open.
     pub(crate) fn finish_combine_write(&mut self, ctx: &egui::Context) {
-        if !matches!(self.combine_session, Some(CombineSession::Writing { .. })) {
+        if !matches!(
+            self.image_combine.session,
+            Some(CombineSession::Writing { .. })
+        ) {
             return;
         }
-        let session = self.combine_session.take();
+        let session = self.image_combine.session.take();
         if let Some(CombineSession::Writing { request }) = session {
             crate::logger::log(format!("image combine finished request={request}"));
         }
@@ -1001,7 +1071,7 @@ impl App {
             .and_then(|pending| pending.successes.first())
             .map(|success| success.path.clone());
         if let Some(path) = path {
-            self.combine_index.mark_stale();
+            self.image_combine.index.mark_stale();
             self.refresh_image_combine_output(ctx, &path);
             let name = path.file_name().unwrap_or_default().to_string_lossy();
             self.show_saved_output_feedback(format!("結合しました: {name}"));
@@ -1590,6 +1660,7 @@ fn fixture_state_with_fonts(
         .map(|id| DialogItem {
             id,
             spec: CombineItemSpec {
+                composition_identity: None,
                 annotation_space: None,
                 source: CombineSourceRef::File {
                     path: PathBuf::from(format!("C:/Pictures/商品{}.png", id + 1)),

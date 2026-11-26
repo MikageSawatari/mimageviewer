@@ -874,7 +874,9 @@ detachedは既存の共通パネルを使い、述語・viewport・bundleの交�
 ### UI オーバーレイ / ダイアログ
 
 画像の結合 (§1.904) は `image_combine/` の options / layout / label / render / worker / store と、
-`ui_dialogs/image_combine.rs` (設定欄・プリセット・やり直しは子モジュール) を使う。App の `combine_session` が
+`ui_dialogs/image_combine.rs` (設定欄・プリセット・やり直しは子モジュール) を使う。
+App は `image_combine: Box<ImageCombineState>` の1ポインタを持ち、session・要求番号・索引・Tools メニューの判定用 snapshot
+(テスト時の作業量カウンタも含む) をその中にまとめる。`image_combine.session` が
 ReopenLoading / ReopenMissing / Dialog / Writing の単独所有者で、書き出し以外は共通モーダルと document-open admission の両方へ登録する。
 専用スレッド1本が batch の編集snapshotを下見から出力まで保持し、共通 `ExportPending` へ Step / Completed / 終端を送る。
 `ExportOrigin::Combine` の終端・切断・完了後の閉じるは同じ finish handlerへ入り、sessionのtakeで1回だけ採用する。
@@ -882,7 +884,7 @@ ReopenLoading / ReopenMissing / Dialog / Writing の単独所有者で、書き�
 構成は worker が `combine.db` へ保存し、画像・フォルダ側サイドカー・設定の持ち運び・メタ情報転送には入れない。
 元画像ごとの `annotation_space` は実際に使った snapshot の注釈座標基準を保存し、再読込で同じ基準を使う。
 記録がなく正確に基準を得られない注釈付きベクター PDF は対象ごとの読込失敗にし、推定した寸法で合成しない。
-App の `combine_index` は構成のある出力キーだけを持つ。書き出し完了・構成なしの再確認・STORES の変更確定後に
+`image_combine.index` は構成のある出力キーだけを持つ。書き出し完了・構成なしの再確認・STORES の変更確定後に
 全件を非同期で読み直し、最新世代だけを採用する。右クリックのやり直し可否はこの索引から I/O なしで決める。
 改名・移動は出力キーだけを引き継ぎ、削除は行を消す。構成内の元画像の絶対パスは変更しない。
 やり直しは worker が構成と元画像の有無を読み、既存の編集snapshot規則で下見へ渡す。置き換えは形式・場所・名前を

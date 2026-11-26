@@ -6,6 +6,94 @@ use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
 use egui_kittest::{Harness, kittest::Queryable};
 use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
+#[test]
+fn image_combine_app_state_storage_is_one_pointer() {
+    fn storage<T>(_: fn(&App) -> &T) -> usize {
+        std::mem::size_of::<T>()
+    }
+    assert_eq!(
+        storage(|app| &app.image_combine),
+        std::mem::size_of::<usize>()
+    );
+}
+
+#[test]
+fn image_combine_index_failure_reaches_app_feedback_once_without_retry() {
+    let mut app = crate::app::setup_app_for_test();
+    let key = crate::adjustment_db::normalize_path(&app.tmp.path().join("combined.png"));
+    app.image_combine
+        .index
+        .set_keys_for_test([key.clone()].into());
+    app.image_combine
+        .index
+        .fail_worker_start_for_test("injected index worker failure");
+    let ctx = egui::Context::default();
+    app.draw_image_combine_dialog(&ctx);
+    assert!(
+        app.fs_feedback_toast
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("injected index worker failure")
+    );
+    assert!(app.image_combine.index.contains_or_unloaded(&key));
+    app.fs_feedback_toast = None;
+    app.draw_image_combine_dialog(&ctx);
+    assert!(app.fs_feedback_toast.is_none());
+    assert!(app.image_combine.index.contains_or_unloaded(&key));
+}
+
+#[test]
+fn image_combine_reopen_keyed_lookup_routes_mounted_snapshot() {
+    let mut app = crate::app::setup_app_for_test();
+    app.settings.bake_stage_export_batch = crate::bake_stage::BakeStage::Edits;
+    let source = CombineSourceRef::File {
+        path: app.tmp.path().join("mounted.png"),
+    };
+    let key = resolver::source_page_key(&source);
+    app.items = vec![crate::grid_item::GridItem::Image(
+        crate::image_combine::store::source_path(&source).into(),
+    )];
+    app.adjustment_page_params.insert(
+        0,
+        crate::adjustment::AdjustParams {
+            brightness: 29.0,
+            ..Default::default()
+        },
+    );
+    let prepared = resolver::read_source_preparation(app.tmp.path(), &source).unwrap();
+    let ctx = egui::Context::default();
+    let mut state = fixture_state(&ctx, false);
+    let (commands, _events, _cancel) = connection(&mut state);
+    state.pending = VecDeque::from([
+        (
+            0,
+            PreparationTarget::ReopenLookup(resolver::ReopenLookup::new(
+                &app,
+                std::iter::once(key),
+            )),
+        ),
+        (
+            0,
+            PreparationTarget::Reopen {
+                source,
+                annotation_space: None,
+                composition_identity: None,
+                mounted_idx: None,
+                prepared: Ok(prepared),
+            },
+        ),
+    ]);
+    while !state.pending.is_empty() {
+        app.advance_image_combine_preparation(&mut state);
+    }
+    let Command::Prepare { item, .. } = commands.try_recv().unwrap() else {
+        panic!("prepared source");
+    };
+    assert_eq!(item.edits.params.brightness, 29.0);
+    assert!(commands.try_recv().is_err());
+}
+
 fn connection(
     state: &mut CombineDialogState,
 ) -> (
@@ -67,18 +155,18 @@ fn image_combine_entry_limits_and_modal_owner_reentry() {
     let mut app = crate::app::setup_app_for_test();
     let mut state = fixture_state(&ctx, false);
     let (_commands, _events, cancel) = connection(&mut state);
-    app.combine_session = Some(CombineSession::Dialog(Box::new(state)));
+    app.image_combine.session = Some(CombineSession::Dialog(Box::new(state)));
     assert_eq!(app.modal_dialog_block_reason(), Some("image_combine"));
     assert!(app.document_open_modal_admission_blocked());
     app.open_image_combine_dialog(&ctx);
     assert!(matches!(
-        app.combine_session,
+        app.image_combine.session,
         Some(CombineSession::Dialog(_))
     ));
-    app.combine_session = None;
+    app.image_combine.session = None;
     assert!(cancel.load(Ordering::Relaxed));
     assert!(!app.document_open_modal_admission_blocked());
-    app.combine_session = Some(CombineSession::Writing { request: 1 });
+    app.image_combine.session = Some(CombineSession::Writing { request: 1 });
     assert!(!app.document_open_modal_admission_blocked());
     assert!(
         app.grid_combine_disabled_reason()
@@ -189,7 +277,7 @@ fn image_combine_escape_closes_and_late_worker_result_has_no_receiver() {
     let mut app = crate::app::setup_app_for_test();
     let mut state = fixture_state(&ctx, false);
     let (_commands, events, cancel) = connection(&mut state);
-    app.combine_session = Some(CombineSession::Dialog(Box::new(state)));
+    app.image_combine.session = Some(CombineSession::Dialog(Box::new(state)));
     ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -208,7 +296,7 @@ fn image_combine_escape_closes_and_late_worker_result_has_no_receiver() {
         |ui| app.draw_image_combine_dialog(ui.ctx()),
     )
     .drop_without_applying_deltas();
-    assert!(app.combine_session.is_none());
+    assert!(app.image_combine.session.is_none());
     assert!(cancel.load(Ordering::Relaxed));
     assert!(
         events
@@ -301,7 +389,7 @@ fn image_combine_poll_step_finish_refresh_selection_and_toast_exactly_once() {
     app.current_folder = Some(folder.clone());
     app.current_folder_last_mtime = Some(std::time::SystemTime::now());
     let path = folder.join("combined.png");
-    app.combine_session = Some(CombineSession::Writing { request: 42 });
+    app.image_combine.session = Some(CombineSession::Writing { request: 42 });
     let (p, tx) = pending();
     app.export_pending = Some(p);
     tx.send(ExportEvent::Step {
@@ -326,7 +414,7 @@ fn image_combine_poll_step_finish_refresh_selection_and_toast_exactly_once() {
     drop(tx);
     app.poll_export_pending(&ctx);
     assert!(app.export_pending.is_none());
-    assert!(app.combine_session.is_none());
+    assert!(app.image_combine.session.is_none());
     assert!(
         matches!(&app.fs_feedback_toast_action,Some(crate::feedback::FeedbackAction::OpenInViewer(p)) if *p==path)
     );
@@ -356,8 +444,10 @@ fn image_combine_recipe_only_failure_adopts_output_and_requests_index_reload() {
     let temp = tempfile::tempdir().unwrap();
     let output = temp.path().join("joined.png");
     let stale = "old-output-key".to_string();
-    app.combine_index.set_keys_for_test([stale.clone()].into());
-    app.combine_session = Some(CombineSession::Writing { request: 8 });
+    app.image_combine
+        .index
+        .set_keys_for_test([stale.clone()].into());
+    app.image_combine.session = Some(CombineSession::Writing { request: 8 });
     let (pending, tx) = pending();
     app.export_pending = Some(pending);
     tx.send(ExportEvent::Completed(ExportSuccess {
@@ -373,7 +463,7 @@ fn image_combine_recipe_only_failure_adopts_output_and_requests_index_reload() {
     tx.send(ExportEvent::AllDone).unwrap();
     let ctx = egui::Context::default();
     app.poll_export_pending(&ctx);
-    assert!(app.combine_session.is_none());
+    assert!(app.image_combine.session.is_none());
     assert_eq!(
         app.export_pending.as_ref().unwrap().successes[0].path,
         output
@@ -386,8 +476,8 @@ fn image_combine_recipe_only_failure_adopts_output_and_requests_index_reload() {
         matches!(&app.fs_feedback_toast_action, Some(crate::feedback::FeedbackAction::OpenInViewer(path)) if path == &output)
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while app.combine_index.contains_or_unloaded(&stale) {
-        app.combine_index.poll(temp.path(), &ctx);
+    while app.image_combine.index.contains_or_unloaded(&stale) {
+        assert!(app.image_combine.index.poll(temp.path(), &ctx).is_none());
         assert!(std::time::Instant::now() < deadline);
         std::thread::yield_now();
     }
@@ -403,7 +493,7 @@ fn image_combine_completion_in_other_folder_does_not_refresh_or_select() {
     app.settings.book_root = Some(books);
     let (p, tx) = pending();
     app.export_pending = Some(p);
-    app.combine_session = Some(CombineSession::Writing { request: 1 });
+    app.image_combine.session = Some(CombineSession::Writing { request: 1 });
     tx.send(ExportEvent::Completed(ExportSuccess {
         label: "combined".into(),
         path: app.tmp.path().join("other/combined.png"),
@@ -411,7 +501,7 @@ fn image_combine_completion_in_other_folder_does_not_refresh_or_select() {
     .unwrap();
     tx.send(ExportEvent::AllDone).unwrap();
     app.poll_export_pending(&ctx);
-    assert!(app.combine_session.is_none());
+    assert!(app.image_combine.session.is_none());
     assert!(app.post_operation_selection.is_none());
     assert!(app.external_rescan_pending.is_none());
     assert!(app.folder_refresh_pending.is_none());
@@ -451,7 +541,7 @@ fn image_combine_poll_completion_refreshes_and_selects_output_under_book_root() 
         assert!(app.current_favorite_target().is_none());
         let (p, tx) = pending();
         app.export_pending = Some(p);
-        app.combine_session = Some(CombineSession::Writing { request: 1 });
+        app.image_combine.session = Some(CombineSession::Writing { request: 1 });
         tx.send(ExportEvent::Completed(ExportSuccess {
             label: "combined".into(),
             path: output.clone(),
@@ -596,7 +686,7 @@ fn image_combine_poll_disconnect_cancel_and_failed_completion_release_session() 
     for terminal in [None, Some(ExportEnd::Cancelled), Some(ExportEnd::Done)] {
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
-        app.combine_session = Some(CombineSession::Writing { request: 1 });
+        app.image_combine.session = Some(CombineSession::Writing { request: 1 });
         let (p, tx) = pending();
         app.export_pending = Some(p);
         if terminal == Some(ExportEnd::Done) {
@@ -612,7 +702,7 @@ fn image_combine_poll_disconnect_cancel_and_failed_completion_release_session() 
         }
         drop(tx);
         app.poll_export_pending(&ctx);
-        assert!(app.combine_session.is_none());
+        assert!(app.image_combine.session.is_none());
         if terminal == Some(ExportEnd::Done) {
             assert_eq!(app.export_pending.as_ref().unwrap().errors.len(), 1);
             app.poll_export_pending(&ctx);
@@ -630,7 +720,7 @@ fn image_combine_disconnect_after_completed_without_terminal_is_interruption() {
     let mut app = crate::app::setup_app_for_test();
     let (p, tx) = pending();
     app.export_pending = Some(p);
-    app.combine_session = Some(CombineSession::Writing { request: 1 });
+    app.image_combine.session = Some(CombineSession::Writing { request: 1 });
     tx.send(ExportEvent::Completed(ExportSuccess {
         label: "combined".into(),
         path: app.tmp.path().join("combined.png"),
@@ -638,7 +728,7 @@ fn image_combine_disconnect_after_completed_without_terminal_is_interruption() {
     .unwrap();
     drop(tx);
     app.poll_export_pending(&ctx);
-    assert!(app.combine_session.is_none());
+    assert!(app.image_combine.session.is_none());
     assert!(app.export_pending.is_none());
     assert!(app.fs_feedback_toast_action.is_none());
     assert!(app.fs_feedback_toast.as_ref().unwrap().0.contains("中断"));
@@ -675,7 +765,7 @@ fn image_combine_progress_cancel_keeps_owner_until_terminal() {
     let (p, tx) = pending();
     let cancel = p.cancel.clone();
     app.export_pending = Some(p);
-    app.combine_session = Some(CombineSession::Writing { request: 1 });
+    app.image_combine.session = Some(CombineSession::Writing { request: 1 });
     let mut h = progress_harness(app);
     h.run_steps(5);
     h.get_by_label("キャンセル").click();
@@ -683,13 +773,13 @@ fn image_combine_progress_cancel_keeps_owner_until_terminal() {
     assert!(cancel.load(Ordering::Relaxed));
     assert!(h.state().export_pending.as_ref().unwrap().cancel_requested);
     assert!(matches!(
-        h.state().combine_session,
+        h.state().image_combine.session,
         Some(CombineSession::Writing { .. })
     ));
     tx.send(ExportEvent::Cancelled).unwrap();
     let ctx = h.ctx.clone();
     h.state_mut().poll_export_pending(&ctx);
-    assert!(h.state().combine_session.is_none());
+    assert!(h.state().image_combine.session.is_none());
     assert!(h.state().export_pending.is_none());
 }
 
@@ -704,12 +794,12 @@ fn image_combine_completed_progress_close_and_x_release_unfinished_owner() {
             message: "failed".into(),
         });
         app.export_pending = Some(p);
-        app.combine_session = Some(CombineSession::Writing { request: 1 });
+        app.image_combine.session = Some(CombineSession::Writing { request: 1 });
         let mut h = progress_harness(app);
         h.run_steps(5);
         h.get_by_label(label).click();
         h.run_steps(2);
-        assert!(h.state().combine_session.is_none());
+        assert!(h.state().image_combine.session.is_none());
         assert!(h.state().export_pending.is_none());
     }
 }

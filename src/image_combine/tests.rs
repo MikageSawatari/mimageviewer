@@ -18,6 +18,7 @@ fn close(actual: f64, expected: f64) {
 
 fn spec(text: Option<&str>) -> CombineItemSpec {
     CombineItemSpec {
+        composition_identity: None,
         annotation_space: None,
         source: CombineSourceRef::File {
             path: "C:\\combine-test\\source.png".into(),
@@ -87,6 +88,7 @@ fn serde_defaults_normalization_and_recipe_roundtrip() {
         items: vec![
             spec(Some("商品A")),
             CombineItemSpec {
+                composition_identity: None,
                 annotation_space: None,
                 source: CombineSourceRef::ZipEntry {
                     zip_path: "C:\\test.zip".into(),
@@ -95,6 +97,7 @@ fn serde_defaults_normalization_and_recipe_roundtrip() {
                 label_override: None,
             },
             CombineItemSpec {
+                composition_identity: None,
                 annotation_space: None,
                 source: CombineSourceRef::PdfPage {
                     pdf_path: "C:\\test.pdf".into(),

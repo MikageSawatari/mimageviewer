@@ -10456,7 +10456,7 @@ impl App {
                                 crate::ui_tools_menu::draw(ui, &resolved_top_menu.commands, &self.keymap, state)
                             });
                             if response.inner.is_none() {
-                                self.combine_tools_menu_owner = None;
+                                self.image_combine.tools_menu_owner = None;
                             }
                             if let Some(Some(command)) = response.inner {
                                 match command {

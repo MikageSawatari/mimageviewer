@@ -418,7 +418,7 @@ impl App {
         // do not require an authoritative ledger reload. Captions are shared
         // across viewer contexts and must still reflect the committed copies.
         if report.store_mutations.combine_index_stale() {
-            self.combine_index.mark_stale();
+            self.image_combine.index.mark_stale();
         }
         self.caption_display.invalidate_rotation_keys(
             report
@@ -906,13 +906,16 @@ mod tests {
         app.settings.edit_restore_prompt_enabled = true;
         app.content_identity_ledger_state =
             crate::content_identity::ContentIdentityLedgerState::Ready;
-        app.combine_index.set_keys_for_test(Default::default());
+        app.image_combine
+            .index
+            .set_keys_for_test(Default::default());
         let output = app.tmp.path().join("restored.png");
         let recipe = crate::image_combine::CombineRecipe {
             v: 1,
             options: Default::default(),
             format: crate::image_combine::CombineFormat::Png,
             items: vec![crate::image_combine::CombineItemSpec {
+                composition_identity: None,
                 annotation_space: None,
                 source: crate::image_combine::CombineSourceRef::File {
                     path: app.tmp.path().join("source.png"),
@@ -942,8 +945,8 @@ mod tests {
         assert!(app.content_identity_index_load_pending.is_none());
         let key = crate::adjustment_db::normalize_path(&output);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !app.combine_index.contains_or_unloaded(&key) {
-            app.combine_index.poll(&data_dir, &ctx);
+        while !app.image_combine.index.contains_or_unloaded(&key) {
+            assert!(app.image_combine.index.poll(&data_dir, &ctx).is_none());
             assert!(std::time::Instant::now() < deadline);
             std::thread::yield_now();
         }
