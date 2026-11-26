@@ -507,16 +507,81 @@ impl FsFrontPointerOwnership {
         })
     }
 
-    fn accept_backing_click(&mut self, response: &egui::Response, suppressed: bool) {
-        if self.viewport == Some(response.ctx.viewport_id())
-            && !suppressed
-            && response.clicked()
-            && response.ctx.input(|input| input.pointer.primary_clicked())
-        {
-            if self.clicks.current_accepted == 0 {
-                self.clicks.current_accepted = (self.clicks.previous_accepted + 1).min(3);
-            }
+    fn accept_backing_click(
+        &mut self,
+        response: &egui::Response,
+        suppressed: bool,
+        front: &FsFrontPointerFrameInput,
+    ) {
+        let ctx = &response.ctx;
+        if self.viewport != Some(ctx.viewport_id()) || suppressed || !response.clicked() {
+            return;
         }
+        let Some(mut boundary) = front.backing_clicks_at_start else {
+            return;
+        };
+        let events = front.canvas_events(ctx);
+        // Match the close-mode fold's edge provenance, while retaining PageTurn's
+        // saturating count (its third click is not a new double-click pair).
+        let front_layers: Vec<bool> = events
+            .iter()
+            .map(|(event, _)| match event {
+                egui::Event::PointerButton { pos, .. } => ctx
+                    .layer_id_at(*pos)
+                    .is_some_and(|layer| layer != response.layer_id),
+                _ => false,
+            })
+            .collect();
+        ctx.input(|input| {
+            let mut releases = input.pointer.released_buttons_with_click_counts();
+            let mut focused = true;
+            for ((event, owned), front_layer) in events.iter().zip(&front_layers) {
+                match event {
+                    egui::Event::WindowFocused(value) => {
+                        focused = *value;
+                        if !focused {
+                            boundary = FsBackingClickBoundary::default();
+                        }
+                    }
+                    egui::Event::PointerButton { pressed: true, .. } if *owned || *front_layer => {
+                        boundary = FsBackingClickBoundary::default();
+                    }
+                    egui::Event::PointerButton {
+                        button,
+                        pressed: false,
+                        ..
+                    }
+                    | egui::Event::PointerButtonReleased { button, .. } => {
+                        let (released_button, click) = releases
+                            .next()
+                            .expect("each raw release must have one adjudicated egui release");
+                        debug_assert_eq!(*button, released_button);
+                        if *owned || *front_layer || !focused {
+                            boundary = FsBackingClickBoundary::default();
+                            continue;
+                        }
+                        let Some((pos, _raw_count)) = click else {
+                            continue;
+                        };
+                        if *button != egui::PointerButton::Primary || !response.rect.contains(pos) {
+                            boundary = FsBackingClickBoundary::default();
+                            continue;
+                        }
+                        // Response aggregates all clicks in a pass, so count each
+                        // accepted release rather than adding one for the Response.
+                        boundary.current_accepted = (boundary.current_accepted + 1).min(3);
+                        boundary.previous_close_candidate = false;
+                    }
+                    _ => {}
+                }
+            }
+            debug_assert!(releases.next().is_none());
+            if !input.focused || input.viewport().focused == Some(false) {
+                boundary = FsBackingClickBoundary::default();
+            }
+        });
+        boundary.frame = Some((ctx.viewport_id(), ctx.cumulative_frame_nr()));
+        self.clicks = boundary;
     }
 
     fn accept_navigator_click(
@@ -37345,15 +37410,8 @@ impl App {
                     self.fs_pan,
                     self.plane_view_pose(),
                 ) {
-                    let mut outcome = crate::plane_view::plane_view_wheel_transition(input);
-                    outcome.pan = clamp_fullscreen_pan_from_layout(
-                        &self.fullscreen_page_layout,
-                        outcome.zoom,
-                        outcome.pan,
-                    );
-                    self.clear_fs_initial_placement_request();
+                    let outcome = crate::plane_view::plane_view_wheel_transition(input);
                     self.apply_plane_view_outcome(ctx, outcome);
-                    self.maybe_rerender_pdf(self.fs_zoom);
                 }
             }
         }
@@ -42323,8 +42381,11 @@ impl App {
             );
         }
         // ── フォーカス復帰クリック / touch replacement の抑制 ──
-        self.fs_front_pointer
-            .accept_backing_click(&fs_response, primary_suppression.suppresses_current_frame());
+        self.fs_front_pointer.accept_backing_click(
+            &fs_response,
+            primary_suppression.suppresses_current_frame(),
+            &overflow_pointer_input,
+        );
         let wheel_options = ctx.options(|o| o.input_options);
         let wheel_segments =
             ctx.input(|input| crate::wheel_input::remaining_wheel_segments(input, wheel_options));
@@ -42815,15 +42876,8 @@ impl App {
                         self.fs_pan,
                         self.plane_view_pose(),
                     ) {
-                        let mut outcome = crate::plane_view::plane_view_wheel_transition(input);
-                        outcome.pan = clamp_fullscreen_pan_from_layout(
-                            &self.fullscreen_page_layout,
-                            outcome.zoom,
-                            outcome.pan,
-                        );
-                        self.clear_fs_initial_placement_request();
+                        let outcome = crate::plane_view::plane_view_wheel_transition(input);
                         self.apply_plane_view_outcome(ctx, outcome);
-                        self.maybe_rerender_pdf(self.fs_zoom);
                     }
                 }
                 continue;
@@ -43334,6 +43388,55 @@ impl App {
         (zoom, pan)
     }
 
+    pub(crate) fn apply_plane_view_outcome(
+        &mut self,
+        ctx: &egui::Context,
+        mut out: crate::plane_view::PlaneViewWheelOutcome,
+    ) {
+        if let Some(block) = out.blocked {
+            self.show_fullscreen_nav_noop(
+                ctx,
+                crate::ui_fullscreen::FsNavNoOpReason::PlaneEntry(block),
+                false,
+            );
+            return;
+        }
+        // The pure transition drops stale poses before interpreting this page's
+        // input. Retiring that old owner is the continuation boundary's job;
+        // it must not turn a no-op into a user transform on the new page.
+        let current = self.plane_view_pose().filter(|pose| {
+            self.fullscreen_idx
+                .is_some_and(|idx| pose.anchor == self.plane_view_anchor(idx))
+        });
+        if !out.changes_view(current, self.fs_zoom, self.fs_pan) {
+            return;
+        }
+        out.pan = clamp_fullscreen_pan_from_layout(&self.fullscreen_page_layout, out.zoom, out.pan);
+        self.clear_fs_initial_placement_request();
+        self.fs_zoom = out.zoom;
+        self.fs_pan = out.pan;
+        match (&mut self.fs_exclusive_view, out.pose) {
+            (crate::fs_exclusive_view::FsExclusiveView::PlaneView(state), Some(pose))
+                if state.pose.anchor == pose.anchor =>
+            {
+                state.pose = pose
+            }
+            (_, Some(pose)) => self.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::PlaneView(
+                    crate::plane_view::PlaneViewState::new(pose),
+                ),
+                "plane_enter",
+            ),
+            (crate::fs_exclusive_view::FsExclusiveView::PlaneView(_), None) => self
+                .set_fs_exclusive_view(
+                    crate::fs_exclusive_view::FsExclusiveView::None,
+                    "plane_leave",
+                ),
+            _ => {}
+        }
+        self.maybe_rerender_pdf(self.fs_zoom);
+    }
+
     /// Ordered simulation is shared by click planning and delayed-merge admission.
     /// The page-local step itself is the same pure proposal used at application.
     fn predict_fs_wheel_frame(
@@ -43342,7 +43445,10 @@ impl App {
         image_rect: egui::Rect,
         actions: &[FsWheelAction],
     ) -> (f32, egui::Vec2, bool, bool) {
-        let mut plane = self.plane_view_pose();
+        let mut plane = self.plane_view_pose().filter(|pose| {
+            self.fullscreen_idx
+                .is_some_and(|idx| pose.anchor == self.plane_view_anchor(idx))
+        });
         let mut zoom = self.fs_zoom;
         let mut pan = self.fs_pan;
         let mut moved = false;
@@ -43376,13 +43482,15 @@ impl App {
                             plane,
                         ) {
                             let outcome = crate::plane_view::plane_view_wheel_transition(input);
-                            plane = outcome.pose;
-                            zoom = outcome.zoom;
-                            pan = clamp_fullscreen_pan_from_layout(
-                                &self.fullscreen_page_layout,
-                                zoom,
-                                outcome.pan,
-                            );
+                            if outcome.changes_view(plane, zoom, pan) {
+                                plane = outcome.pose;
+                                zoom = outcome.zoom;
+                                pan = clamp_fullscreen_pan_from_layout(
+                                    &self.fullscreen_page_layout,
+                                    zoom,
+                                    outcome.pan,
+                                );
+                            }
                         }
                     }
                     continue;
@@ -58735,6 +58843,12 @@ impl App {
         work: crate::capture::CapturePixelWork,
         toast: &str,
     ) {
+        #[cfg(test)]
+        let Some(work) =
+            crate::ui_dialogs::context_menu::intercept_capture_clipboard_work_for_test(work)
+        else {
+            return;
+        };
         let clipboard_seq = crate::ui_dialogs::context_menu::reserve_clipboard_write_sequence();
         std::thread::Builder::new()
             .name("image-capture-clipboard".into())
@@ -71301,13 +71415,14 @@ mod tests {
                         ..Default::default()
                     },
                     |ui| {
-                        app.capture_fs_front_pointer_input(&ctx, rect);
+                        let (front, _) = app.capture_fs_front_pointer_input(&ctx, rect);
                         let response = ui.interact(
                             rect,
                             egui::Id::new("zoom-reset-canvas"),
                             egui::Sense::click_and_drag(),
                         );
-                        app.fs_front_pointer.accept_backing_click(&response, false);
+                        app.fs_front_pointer
+                            .accept_backing_click(&response, false, &front);
                         let action = app.plan_fs_canvas_click(
                             &ctx,
                             &response,

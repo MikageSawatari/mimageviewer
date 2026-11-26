@@ -4,6 +4,8 @@ use crate::fs_exclusive_view::FsExclusiveView;
 use crate::plane_view::*;
 
 mod gpu_tests {
+    mod additional_coverage;
+    mod transition_and_click_tests;
     use super::*;
     use crate::app::depth_main_window_tests::RootDepthViewer;
     fn viewer(app: &mut App) -> RootDepthViewer {
@@ -273,19 +275,22 @@ mod gpu_tests {
         let _keys = crate::key_input::lock_test_input();
         let mut app = crate::app::setup_app_for_test();
         let mut viewer = viewer(&mut app);
-        viewer.frame(
-            &mut app,
-            vec![
-                egui::Event::PointerMoved(egui::pos2(500., 300.)),
-                wheel(0., -40., egui::Modifiers::NONE),
-                wheel(0., 40., egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
-            ],
-        );
+        app.fs_focus_regained_at = None;
+        let mut events = vec![
+            egui::Event::PointerMoved(egui::pos2(500., 300.)),
+            wheel(0., -40., egui::Modifiers::NONE),
+            wheel(0., 40., egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+        ];
+        events.extend(transition_and_click_tests::click(
+            egui::pos2(700., 300.),
+            false,
+        ));
+        viewer.frame(&mut app, events);
         assert!(!app.fs_exclusive_view.is_plane_view());
         assert_eq!(
             app.fullscreen_idx,
             Some(1),
-            "the first segment navigates to the video; the later fisheye segment is spent"
+            "the mixed frame turns exactly one page; the later fisheye segment is spent"
         );
     }
     #[test]
@@ -294,42 +299,46 @@ mod gpu_tests {
         let mut app = crate::app::setup_app_for_test();
         let mut viewer = viewer(&mut app);
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size);
+        app.fs_focus_regained_at = None;
+        let mut events = vec![
+            egui::Event::PointerMoved(rect.center()),
+            wheel(0., 40., egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+        ];
+        events.extend(transition_and_click_tests::click(rect.center(), false));
         let mut expected = None;
-        viewer.frame_with_before(
-            &mut app,
-            vec![
-                egui::Event::PointerMoved(rect.center()),
-                wheel(0., 40., egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
-            ],
-            |app, ctx| {
-                let wheel_options = ctx.options(|o| o.input_options);
-                let actions = ctx
-                    .input(|i| crate::wheel_input::remaining_wheel_segments(i, wheel_options))
-                    .into_iter()
-                    .map(|segment| FsWheelAction {
-                        input: segment.input,
-                        segment,
-                        operation: None,
-                        class: FsWheelInPageClass::PlaneView,
-                        scroll_origin: None,
-                        page_owner: (
-                            app.items_generation,
-                            app.fullscreen_idx,
-                            app.fullscreen_page_slice,
-                        ),
-                        seek_hover: false,
-                    })
-                    .collect::<Vec<_>>();
-                let idx = app.fullscreen_idx.unwrap();
-                let canvas = app.fullscreen_media_rect(rect, idx, false);
-                expected = Some(app.predict_fs_wheel_frame(ctx, canvas, &actions));
-            },
-        );
+        viewer.frame_with_before(&mut app, events, |app, ctx| {
+            let wheel_options = ctx.options(|o| o.input_options);
+            let actions = ctx
+                .input(|i| crate::wheel_input::remaining_wheel_segments(i, wheel_options))
+                .into_iter()
+                .map(|segment| FsWheelAction {
+                    input: segment.input,
+                    segment,
+                    operation: None,
+                    class: FsWheelInPageClass::PlaneView,
+                    scroll_origin: None,
+                    page_owner: (
+                        app.items_generation,
+                        app.fullscreen_idx,
+                        app.fullscreen_page_slice,
+                    ),
+                    seek_hover: false,
+                })
+                .collect::<Vec<_>>();
+            let idx = app.fullscreen_idx.unwrap();
+            let canvas = app.fullscreen_media_rect(rect, idx, false);
+            expected = Some(app.predict_fs_wheel_frame(ctx, canvas, &actions));
+        });
         let expected = expected.unwrap();
         assert!(expected.3);
         assert_eq!(app.fs_zoom, expected.0);
         assert_eq!(app.fs_pan, expected.1);
         assert!(app.fs_exclusive_view.is_plane_view());
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "the entering click cannot turn a page"
+        );
     }
     #[test]
     fn plane_deferred_segment_cannot_enter_a_page_other_than_its_planned_owner() {

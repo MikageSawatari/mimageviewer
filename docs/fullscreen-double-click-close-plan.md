@@ -642,3 +642,9 @@ guard・遅延・再試行・時間切れを足さない。ClaudeCode と Codex 
   UI スナップショットの変更は見込まない。
 - 995eeba7c の runner で新規 Depth 2 件の GPU group 登録漏れが判明したため、`.config/nextest.toml` の
   既存 gpu filter に完全名 2 件を追加した。group の並列数・timeout・retry は変えない。修正後の Rust 検証は未実行。
+
+## 16. 同じ pass の通常キャンバスのクリック回数 (§1.917 の境界試験)
+
+従来の PageTurn の `accept_backing_click` は Response ごとに一度だけ加算していたため、1 pass に2組の押下/離しが届くと2打目をダブルクリックとして受け付けなかった。通常のクリックでも所有情報・前面 layer・focus・egui の認定・canvas の位置を離しごとに照合し、従来どおり3で飽和する受け付け数へ加算する。frame の初めの境界から再演し、同じ入力を再参照しても二重に足さない。DoubleClickClose 固有の2回ごとの区切りは従来の専用処理に残す。
+
+これは §4.3/§5 の従来経路維持のうち、同じ pass の複数の離しを取りこぼす点だけの訂正。従来の3打目のページ送り、一覧から持ち越した raw count だけではダブルクリックにしない規則、前面の所有・focus の境界を保つ。detached の述語・viewport 経路・入力配送は変更しない。魚眼の入場/終了と同一 pass のクリック/ダブルクリックと、通常キャンバスの受付の回帰を共有 runner へ引き継ぐ。実装担当による cargo の検証・製品起動・コミットは未実施。

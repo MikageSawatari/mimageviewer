@@ -5,6 +5,11 @@ use eframe::egui;
 #[cfg(test)]
 #[path = "context_menu/image_combine_eligibility_tests.rs"]
 mod image_combine_eligibility_tests;
+#[cfg(test)]
+#[path = "context_menu/plane_copy_tests.rs"]
+mod plane_copy_tests;
+#[cfg(test)]
+pub(crate) use plane_copy_tests::intercept_capture_clipboard_work_for_test;
 use std::path::{Path, PathBuf};
 
 use crate::app::is_synthetic_view_path;
@@ -492,15 +497,17 @@ impl NativeGridContextMenuTarget {
         }
     }
 
-    fn copy_command(&self, requested: MenuCommand) -> Option<MenuCommand> {
+    fn copy_command(&self, requested: MenuCommand, plane_view_copy: bool) -> Option<MenuCommand> {
         match &self.copy_subject {
             ItemCopyMenuSubject::BookmarkSource(_) => {
                 (requested == MenuCommand::CopyPath).then_some(requested)
             }
             ItemCopyMenuSubject::Unavailable => None,
-            ItemCopyMenuSubject::Item => crate::context_menu_model::item_copy_command(
+            ItemCopyMenuSubject::Item => crate::context_menu_model::surface_item_copy_command(
                 ContextMenuItemKind::from_grid_item(&self.item),
                 self.has_checked,
+                self.surface,
+                plane_view_copy,
                 requested,
             ),
         }
@@ -976,7 +983,7 @@ impl crate::app::App {
         };
         let has_checked = surface == ContextMenuSurface::Grid && !self.checked.is_empty();
         let target = self.context_menu_target(idx, item, false, has_checked, None, surface, None);
-        let command = target.copy_command(requested);
+        let command = target.copy_command(requested, self.fs_exclusive_view.is_plane_view());
         // Preserve the released GridCopyFiles refusal for a virtual selection.
         let Some(command) =
             command.or_else(|| (action == GridCopyFiles).then_some(MenuCommand::CopyFiles))
@@ -1654,6 +1661,7 @@ impl crate::app::App {
             search_by_name,
             kind: ContextMenuItemKind::from_grid_item(&target.item),
             surface: target.surface,
+            plane_view_copy: self.fs_exclusive_view.is_plane_view(),
             is_folder_context: target.is_folder_context,
             has_checked: target.has_checked,
             has_epub_target: if target.has_checked {
@@ -2148,6 +2156,14 @@ impl crate::app::App {
             }
             MenuCommand::CopyImageToClipboard => {
                 if let Some(idx) = target.item_index {
+                    if target.surface == ContextMenuSurface::Fullscreen
+                        && self.fs_exclusive_view.is_plane_view()
+                    {
+                        // Freeze the last drawn canvas through the shared capture worker;
+                        // source-file copy cannot reproduce the PlaneView projection.
+                        self.copy_image_capture_to_clipboard(ctx, idx);
+                        return None;
+                    }
                     let rotation = self.get_rotation(idx);
                     match &target.item {
                         GridItem::Image(path) => copy_image_to_clipboard(

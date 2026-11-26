@@ -312,9 +312,9 @@ fn depth_focus_canvas_click_uses_release_modifiers_and_preserves_prior_exclusion
                     ctx.run_ui(egui::RawInput { screen_rect: Some(rect), events,
                         // Ctrl is already up in the current input level.
                         time: Some(frame as f64 * 0.05), ..Default::default() }, |ui| {
-                        app.capture_fs_front_pointer_input(&ctx, rect);
+                        let (front, _) = app.capture_fs_front_pointer_input(&ctx, rect);
                         let response = ui.interact(rect, egui::Id::unique("focus-canvas"), egui::Sense::click_and_drag());
-                        app.fs_front_pointer.accept_backing_click(&response, false);
+                        app.fs_front_pointer.accept_backing_click(&response, false, &front);
                         let action = app.plan_fs_canvas_click(&ctx, &response, rect, StillSeekGeometry::bar_only(),
                             false, exclusion == "suppressed", false, false, None, false, 1., egui::Vec2::ZERO, None, FullscreenPrimarySuppressionDecision::Allow, false);
                         if response.clicked() {

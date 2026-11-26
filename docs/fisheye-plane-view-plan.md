@@ -5,7 +5,7 @@
 - ブランチ / worktree: `fisheye-917` / `G:\home\mimageviewer-fisheye917` (基点 master `f2e332bb8`)。
 - 役割: 設計・作業指示・検収 = ClaudeCode Opus 5.5、実装 = Codex GPT-6.1 Sol / high、
   独立レビュー = 実装者とは別の GPT-6.1 Sol / xhigh (AGENTS.md)。
-- 状態: 設計 R5、**独立設計レビュー R6 で「実装開始可」** (2026-11-27、§14)。段 1 の実装に着手。
+- 状態: 段 1 実装済み (ブランチ `fisheye-917`)。独立実装レビュー I1 の指摘を修正し、再レビュー待ち (§15)。設計は R6 で「実装開始可」(§14)。
 
 ## 0. 利用者の決定 (2026-11-27、設計担当のセッションで直接)
 
@@ -670,7 +670,7 @@ renderer 未登録の次 pass 要求は §5.2 の登録境界だけで使う。
 | `src/app/page_overview.rs:225` `page_overview_unavailable_reason` | `is_depth()` | 占有に含めページ一覧との同時表示を拒否 (既存の集約した理由の経路)。 |
 | `src/app/page_overview.rs:233` `page_overview_unavailable_reason` | `fs_exclusive_view_active` | 占有に含めページ一覧との同時表示を拒否 (既存の集約した理由の経路)。 |
 | `src/app/plane_view.rs:143` `plane_view_entry_allowed` | `is_depth()` | Depth/360 を入口で拒否。自分の PlaneView は継続可。 |
-| `src/app/plane_view.rs:216` `retire_exclusive_view_for_owner_change` | `is_depth()` | Depth の戻り値は既存通知のためだけ。実際の終了は Depth/PlaneView を共通に扱う。 |
+| `src/app/plane_view.rs:188` `retire_exclusive_view_for_owner_change` | `is_depth()` | Depth の戻り値は既存通知のためだけ。実際の終了は Depth/PlaneView を共通に扱う。 |
 | `src/app.rs:54666` `fullscreen_adjustment_panel_draw_reachable` | `fs_exclusive_view_active` | 占有として背面の補正/分析描画を抑止。パネル状態が変われば継続照合で終了。 |
 | `src/app.rs:54670` `fullscreen_adjustment_panel_draw_reachable` | `fs_exclusive_view_active` | 占有として背面の補正/分析描画を抑止。パネル状態が変われば継続照合で終了。 |
 | `src/app.rs:63334` `notify_depth_slideshow_folder_nav_exit` | `is_depth()` | Depth 固有の再入場通知だけ。PlaneView は通常の slideshow を継続し次ページで終了。 |
@@ -679,51 +679,49 @@ renderer 未登録の次 pass 要求は §5.2 の登録境界だけで使う。
 | `src/app.rs:95267` `pdf_native_rerender_pending` | `is_depth()` | Depth のみ倍率を除外。PlaneView は通常の PDF 倍率需要を維持。 |
 | `src/app.rs:98949` `panorama_entry_allowed` | `is_depth()` | Depth 固有の拒否を維持。PlaneView は既存の V 入口へ進み採用時に終了。 |
 | `src/app.rs:99366` `apply_panorama_mode_toggle` | `is_depth()` | Depth 固有の拒否を維持。PlaneView は Panorama の採用で置き換える。 |
-| `src/ui_fullscreen.rs:15313` `fs_zoom_mode_context_ok` | `fs_exclusive_view_active` | PlaneView も新しい Z モードの入口の占有に含める。 |
-| `src/ui_fullscreen.rs:15384` `fs_zoom_reset_for_blocked_context` | `is_depth()` | PlaneView を含め、退避中の Z と PDF の倍率需要を破壊しない。 |
-| `src/ui_fullscreen.rs:15778` `fs_zoom_owner` | `is_depth()` | PlaneView は通常の Image の倍率/パンを共用。 |
-| `src/ui_fullscreen.rs:16247` `maybe_rerender_pdf` | `is_depth()` | Depth の抑止だけ。PlaneView は倍率の需要を続ける。 |
-| `src/ui_fullscreen.rs:23162` `similar_preview_session` | `fs_exclusive_view_active` | 占有に含め、2D の画素位置を使う類似プレビューを出さない。 |
-| `src/ui_fullscreen.rs:26197` `fs_front_menu_presented_for_viewport` | `fs_exclusive_view_active` | PlaneView は占有の制限から除き、通常の fit/回転メニューを使う。 |
-| `src/ui_fullscreen.rs:26278` `still_info_panel_eligible_for_idx` | `fs_exclusive_view_active` | PlaneView は Panorama/Depth のパネル抑止から除き、情報パネルを使う。 |
-| `src/ui_fullscreen.rs:29263` `render_fullscreen_viewport_with_root_input` | `fs_exclusive_view_active` | PlaneView は通常の上部メニュー/overflow/情報パネルを許可する例外。Depth/Panorama の制限は維持。 |
-| `src/ui_fullscreen.rs:29297` `render_fullscreen_viewport_with_root_input` | `fs_exclusive_view_active` | 占有として分析用の PDF 矩形を選ばず、通常の PDF 需要を使う。 |
-| `src/ui_fullscreen.rs:29650` `render_fullscreen_viewport_with_root_input` | `fs_exclusive_view_active` | PlaneView は通常の上部メニュー/overflow/情報パネルを許可する例外。Depth/Panorama の制限は維持。 |
-| `src/ui_fullscreen.rs:29916` `render_fullscreen_viewport_with_root_input` | `is_depth()` | Depth の素材採用/専用パネル/ボタン状態だけ。PlaneView は別の描画・通常パネル。 |
-| `src/ui_fullscreen.rs:30548` `render_fullscreen_viewport_with_root_input` | `is_depth()` | Depth の素材採用/専用パネル/ボタン状態だけ。PlaneView は別の描画・通常パネル。 |
-| `src/ui_fullscreen.rs:30700` `render_fullscreen_viewport_with_root_input` | `fs_exclusive_view_active` | PlaneView は通常の上部メニュー/overflow/情報パネルを許可する例外。Depth/Panorama の制限は維持。 |
-| `src/ui_fullscreen.rs:30798` `render_fullscreen_viewport_with_root_input` | `is_depth()` | Depth の素材採用/専用パネル/ボタン状態だけ。PlaneView は別の描画・通常パネル。 |
-| `src/ui_fullscreen.rs:31901` `fs_page_turn_ordinary_context_blocker` | `fs_exclusive_view_active` | 占有に含め紙めくりを抑止。通常のページ移動は継続。 |
-| `src/ui_fullscreen.rs:33358` `reconcile_specified_pdf_demand_with_single` | `is_depth()` | Depth のみ需要を抑止。PlaneView は現在素材の別戻り値で需要を継続。 |
-| `src/ui_fullscreen.rs:35708` `apply_still_reader_escape` | `fs_exclusive_view_active` | 占有中の Esc は既存の閲覧終了へ。 |
-| `src/ui_fullscreen.rs:35881` `begin_page_turn_viewer_frame` | `is_depth()` | Depth 固有の閉じる通知。PlaneView は追加通知なしの既存終了。 |
-| `src/ui_fullscreen.rs:37360` `handle_fs_key_input_with_operation` | `fs_exclusive_view_active` | 占有キー制限に含む。slideshow/背景は Panorama 固有、metadata は PlaneView で通常パネル、Depth focus/panel は Depth のみ。 |
-| `src/ui_fullscreen.rs:37369` `handle_fs_key_input_with_operation` | `fs_exclusive_view_active` | 占有キー制限に含む。slideshow/背景は Panorama 固有、metadata は PlaneView で通常パネル、Depth focus/panel は Depth のみ。 |
-| `src/ui_fullscreen.rs:37378` `handle_fs_key_input_with_operation` | `is_depth()` | 占有キー制限に含む。slideshow/背景は Panorama 固有、metadata は PlaneView で通常パネル、Depth focus/panel は Depth のみ。 |
-| `src/ui_fullscreen.rs:38116` `handle_fs_key_input_with_operation` | `is_depth()` | 占有キー制限に含む。slideshow/背景は Panorama 固有、metadata は PlaneView で通常パネル、Depth focus/panel は Depth のみ。 |
-| `src/ui_fullscreen.rs:38882` `fs_navigator_allowed_for_display_unit` | `is_depth()` | PlaneView も固定表示/Alt ナビゲータを抑止。設定のトグルは保持。 |
-| `src/ui_fullscreen.rs:41258` `handle_fs_wheel_and_click_frame` | `fs_exclusive_view_active` | PlaneView は通常の左右パネル。Depth panel の矩形/フォーカスだけは Depth 固有。 |
-| `src/ui_fullscreen.rs:41540` `handle_fs_wheel_and_click_frame` | `is_depth()` | PlaneView は通常の左右パネル。Depth panel の矩形/フォーカスだけは Depth 固有。 |
-| `src/ui_fullscreen.rs:43534` `plan_fs_canvas_click` | `is_depth()` | Depth focus/閉じるパネルは Depth のみ。PlaneView は別の plane_active で変換ありに分類。 |
-| `src/ui_fullscreen.rs:43585` `plan_fs_canvas_click` | `is_depth()` | Depth focus/閉じるパネルは Depth のみ。PlaneView は別の plane_active で変換ありに分類。 |
-| `src/ui_fullscreen.rs:44093` `advance_slideshow` | `is_depth()` | Depth の先読み待ちだけ。PlaneView の slideshow は通常どおり。 |
-| `src/ui_fullscreen.rs:44384` `current_slideshow_frame_ready` | `is_depth()` | Depth の ready 判定だけ。PlaneView の slideshow は通常どおり。 |
-| `src/ui_fullscreen.rs:44415` `sync_slideshow_anchor_for_frame` | `is_depth()` | Depth の input-only 描画待ちだけ。PlaneView は通常のタイマー。 |
-| `src/ui_fullscreen.rs:45008` `complete_book_slideshow_target` | `is_depth()` | Depth の専用 target 準備だけ。PlaneView は通常のページ移動後に終了。 |
-| `src/ui_fullscreen.rs:45641` `fullscreen_edit_mode_entry_allowed` | `is_depth()` | PlaneView はこの分岐より前に魚眼の理由で拒否。Depth/Panorama の理由は維持。 |
-| `src/ui_fullscreen.rs:45645` `fullscreen_edit_mode_entry_allowed` | `fs_exclusive_view_active` | PlaneView はこの分岐より前に魚眼の理由で拒否。Depth/Panorama の理由は維持。 |
-| `src/ui_fullscreen.rs:46559` `handle_fs_navigation_with_render_perf` | `is_depth()` | Depth の素材先読みだけ。PlaneView の通常 navigation は保持し継続照合で終了。 |
-| `src/ui_fullscreen.rs:47077` `draw_fs_image_with_initial_placement` | `is_depth()` | Depth の需要復帰の境界は維持。PlaneView は PDF 需要を止めず別の shader 採用を行う。 |
-| `src/ui_fullscreen.rs:48239` `set_fullscreen_fit_mode_for_current` | `is_depth()` | Depth の変更拒否のみ。PlaneView は変更を受け付け reset で終了。 |
-| `src/ui_fullscreen.rs:48288` `cycle_fullscreen_fit_mode` | `fs_exclusive_view_active` | Depth の変更拒否のみ。PlaneView は循環を受け付け reset で終了。 |
-| `src/ui_fullscreen.rs:48289` `cycle_fullscreen_fit_mode` | `ExclusiveViewKind::Depth` | Depth の変更拒否のみ。PlaneView は循環を受け付け reset で終了。 |
-| `src/ui_fullscreen.rs:52817` `draw_fs_loupe_if_active` | `fs_exclusive_view_active` | 占有に含め、割当/物理修飾にかかわらずルーペを描かない。 |
+| `src/ui_fullscreen.rs:15378` `fs_zoom_mode_context_ok` | `fs_exclusive_view_active` | PlaneView も新しい Z モードの入口の占有に含める。 |
+| `src/ui_fullscreen.rs:15449` `fs_zoom_reset_for_blocked_context` | `is_depth()` | PlaneView を含め、退避中の Z と PDF の倍率需要を破壊しない。 |
+| `src/ui_fullscreen.rs:15843` `fs_zoom_owner` | `is_depth()` | PlaneView は通常の Image の倍率/パンを共用。 |
+| `src/ui_fullscreen.rs:16312` `maybe_rerender_pdf` | `is_depth()` | Depth の抑止だけ。PlaneView は倍率の需要を続ける。 |
+| `src/ui_fullscreen.rs:23227` `similar_preview_session` | `fs_exclusive_view_active` | 占有に含め、2D の画素位置を使う類似プレビューを出さない。 |
+| `src/ui_fullscreen.rs:26262` `fs_front_menu_presented_for_viewport` | `fs_exclusive_view_active` | PlaneView は占有の制限から除き、通常の fit/回転メニューを使う。 |
+| `src/ui_fullscreen.rs:26343` `still_info_panel_eligible_for_idx` | `fs_exclusive_view_active` | PlaneView は Panorama/Depth のパネル抑止から除き、情報パネルを使う。 |
+| `src/ui_fullscreen.rs:29328` `render_fullscreen_viewport_with_root_input` | `fs_exclusive_view_active` | 占有として分析用の PDF 矩形を選ばず、通常の PDF 需要を使う。 |
+| `src/ui_fullscreen.rs:29362` `render_fullscreen_viewport_with_root_input` | `fs_exclusive_view_active` | 占有として分析用の PDF 矩形を選ばず、通常の PDF 需要を使う。 |
+| `src/ui_fullscreen.rs:29715` `render_fullscreen_viewport_with_root_input` | `fs_exclusive_view_active` | PlaneView は通常の上部メニュー/overflow/情報パネルを許可する例外。Depth/Panorama の制限は維持。 |
+| `src/ui_fullscreen.rs:29981` `render_fullscreen_viewport_with_root_input` | `is_depth()` | Depth の素材採用/専用パネル/ボタン状態だけ。PlaneView は別の描画・通常パネル。 |
+| `src/ui_fullscreen.rs:30613` `render_fullscreen_viewport_with_root_input` | `is_depth()` | Depth の素材採用/専用パネル/ボタン状態だけ。PlaneView は別の描画・通常パネル。 |
+| `src/ui_fullscreen.rs:30765` `render_fullscreen_viewport_with_root_input` | `fs_exclusive_view_active` | PlaneView は通常の上部メニュー/overflow/情報パネルを許可する例外。Depth/Panorama の制限は維持。 |
+| `src/ui_fullscreen.rs:30863` `render_fullscreen_viewport_with_root_input` | `is_depth()` | Depth の素材採用/専用パネル/ボタン状態だけ。PlaneView は別の描画・通常パネル。 |
+| `src/ui_fullscreen.rs:31966` `fs_page_turn_ordinary_context_blocker` | `fs_exclusive_view_active` | 占有に含め紙めくりを抑止。通常のページ移動は継続。 |
+| `src/ui_fullscreen.rs:33423` `reconcile_specified_pdf_demand_with_single` | `is_depth()` | Depth のみ需要を抑止。PlaneView は現在素材の別戻り値で需要を継続。 |
+| `src/ui_fullscreen.rs:35773` `apply_still_reader_escape` | `fs_exclusive_view_active` | 占有中の Esc は既存の閲覧終了へ。 |
+| `src/ui_fullscreen.rs:35946` `begin_page_turn_viewer_frame` | `is_depth()` | Depth 固有の閉じる通知。PlaneView は追加通知なしの既存終了。 |
+| `src/ui_fullscreen.rs:37418` `handle_fs_key_input_with_operation` | `fs_exclusive_view_active` | 占有キー制限に含む。slideshow/背景は Panorama 固有、metadata は PlaneView で通常パネル、Depth focus/panel は Depth のみ。 |
+| `src/ui_fullscreen.rs:37427` `handle_fs_key_input_with_operation` | `fs_exclusive_view_active` | 占有キー制限に含む。slideshow/背景は Panorama 固有、metadata は PlaneView で通常パネル、Depth focus/panel は Depth のみ。 |
+| `src/ui_fullscreen.rs:37436` `handle_fs_key_input_with_operation` | `is_depth()` | 占有キー制限に含む。slideshow/背景は Panorama 固有、metadata は PlaneView で通常パネル、Depth focus/panel は Depth のみ。 |
+| `src/ui_fullscreen.rs:38174` `handle_fs_key_input_with_operation` | `is_depth()` | 占有キー制限に含む。slideshow/背景は Panorama 固有、metadata は PlaneView で通常パネル、Depth focus/panel は Depth のみ。 |
+| `src/ui_fullscreen.rs:38940` `fs_navigator_allowed_for_display_unit` | `is_depth()` | PlaneView も固定表示/Alt ナビゲータを抑止。設定のトグルは保持。 |
+| `src/ui_fullscreen.rs:41316` `handle_fs_wheel_and_click_frame` | `fs_exclusive_view_active` | PlaneView は通常の左右パネル。Depth panel の矩形/フォーカスだけは Depth 固有。 |
+| `src/ui_fullscreen.rs:41598` `handle_fs_wheel_and_click_frame` | `is_depth()` | PlaneView は通常の左右パネル。Depth panel の矩形/フォーカスだけは Depth 固有。 |
+| `src/ui_fullscreen.rs:43642` `plan_fs_canvas_click` | `is_depth()` | Depth focus/閉じるパネルは Depth のみ。PlaneView は別の plane_active で変換ありに分類。 |
+| `src/ui_fullscreen.rs:43693` `plan_fs_canvas_click` | `is_depth()` | Depth focus/閉じるパネルは Depth のみ。PlaneView は別の plane_active で変換ありに分類。 |
+| `src/ui_fullscreen.rs:44201` `advance_slideshow` | `is_depth()` | Depth の先読み待ちだけ。PlaneView の slideshow は通常どおり。 |
+| `src/ui_fullscreen.rs:44492` `current_slideshow_frame_ready` | `is_depth()` | Depth の ready 判定だけ。PlaneView の slideshow は通常どおり。 |
+| `src/ui_fullscreen.rs:44523` `sync_slideshow_anchor_for_frame` | `is_depth()` | Depth の input-only 描画待ちだけ。PlaneView は通常のタイマー。 |
+| `src/ui_fullscreen.rs:45116` `complete_book_slideshow_target` | `is_depth()` | Depth の専用 target 準備だけ。PlaneView は通常のページ移動後に終了。 |
+| `src/ui_fullscreen.rs:45749` `fullscreen_edit_mode_entry_allowed` | `is_depth()` | PlaneView はこの分岐より前に魚眼の理由で拒否。Depth/Panorama の理由は維持。 |
+| `src/ui_fullscreen.rs:45753` `fullscreen_edit_mode_entry_allowed` | `fs_exclusive_view_active` | PlaneView はこの分岐より前に魚眼の理由で拒否。Depth/Panorama の理由は維持。 |
+| `src/ui_fullscreen.rs:46667` `handle_fs_navigation_with_render_perf` | `is_depth()` | Depth の素材先読みだけ。PlaneView の通常 navigation は保持し継続照合で終了。 |
+| `src/ui_fullscreen.rs:47185` `draw_fs_image_with_initial_placement` | `is_depth()` | Depth の需要復帰の境界は維持。PlaneView は PDF 需要を止めず別の shader 採用を行う。 |
+| `src/ui_fullscreen.rs:48347` `set_fullscreen_fit_mode_for_current` | `is_depth()` | Depth の変更拒否のみ。PlaneView は変更を受け付け reset で終了。 |
+| `src/ui_fullscreen.rs:48396` `cycle_fullscreen_fit_mode` | `fs_exclusive_view_active` | Depth の変更拒否のみ。PlaneView は循環を受け付け reset で終了。 |
+| `src/ui_fullscreen.rs:48397` `cycle_fullscreen_fit_mode` | `ExclusiveViewKind::Depth` | Depth の変更拒否のみ。PlaneView は循環を受け付け reset で終了。 |
+| `src/ui_fullscreen.rs:52925` `draw_fs_loupe_if_active` | `fs_exclusive_view_active` | 占有に含め、割当/物理修飾にかかわらずルーペを描かない。 |
 | `src/ui_video_tile.rs:69` `toggle_video_tile_mode` | `fs_exclusive_view_active` | 占有に含め、静止画の projection から動画タイルを開始しない。 |
 | `src/ui_view_trim.rs:993` `view_trim_original_request_is_current` | `fs_exclusive_view_active` | 占有中に表示トリム編集の遅延再入場を行わない。 |
 
-`src/fs_exclusive_view.rs` の `is_depth(&self)` 定義は Depth variant のみを返すまま。新しい `retires_for_owner_change` が Depth/PlaneView を含む。
-
-試験コードの全出現 (各行の期待は Depth 固有のまま。既存テストの期待を PlaneView へ広げていない):
+試験コードの全出現 (各行の期待は Depth 固有のまま。既存テストの期待を PlaneView へ広げていない。追加の PlaneView 試験は占有を検査):
 
 | 箇所 | 対象行 (各行を列挙) | PlaneView の扱い・理由 |
 | --- | --- | --- |
@@ -740,11 +738,12 @@ renderer 未登録の次 pass 要求は §5.2 の登録境界だけで使う。
 | `src/app/tests.rs` | `100596`, `100608` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
 | `src/app.rs` | `110895`, `110907`, `110986`, `111046`, `111049`, `111125` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
 | `src/ui_fullscreen/depth_slideshow_tests.rs` | `826`, `1036`, `1052`, `1145`, `1189` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
-| `src/ui_fullscreen/depth_view_transform_tests.rs` | `266`, `282` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/ui_fullscreen/depth_view_transform_tests.rs` | `267`, `283` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
 | `src/ui_fullscreen/page_turn.rs` | `2003` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
-| `src/ui_fullscreen/plane_view_tests.rs` | `536` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
+| `src/ui_fullscreen/plane_view_tests/gpu_tests/additional_coverage.rs` | `148` | PlaneView の占有を維持し、元画像ホールドでも専用の描画を続ける。 |
+| `src/ui_fullscreen/plane_view_tests.rs` | `545` | Depth 回帰の対象を維持。新規 PlaneView の置換試験では Depth への採用を検査。 |
 
-上記は呼び出し等 142 行 (製品 67、試験 75) と定義1件。
+上記は呼び出し等 143 行 (製品 67、試験 76) と定義1件。
 
 ### 変更ファイル一覧
 
@@ -754,6 +753,7 @@ renderer 未登録の次 pass 要求は §5.2 の登録境界だけで使う。
 - `docs/detached-rework-plan.md`
 - `docs/display-pipeline.md`
 - `docs/fisheye-plane-view-plan.md`
+- `docs/fullscreen-double-click-close-plan.md`
 - `docs/gpu-test-groups.md`
 - `docs/key-customization-impl-plan.md`
 - `docs/keymap-spec.md`
@@ -774,6 +774,7 @@ renderer 未登録の次 pass 要求は §5.2 の登録境界だけで使う。
 - `src/app/vram_accounting.rs`
 - `src/books.rs`
 - `src/capture.rs`
+- `src/context_menu_model.rs`
 - `src/depth_parallax_wgpu.rs`
 - `src/displayed_image_transform.rs`
 - `src/export_dialog.rs`
@@ -793,6 +794,8 @@ renderer 未登録の次 pass 要求は §5.2 の登録境界だけで使う。
 - `src/ui_conceal.rs`
 - `src/ui_crop.rs`
 - `src/ui_dialogs/preferences/pages.rs`
+- `src/ui_dialogs/context_menu.rs`
+- `src/ui_dialogs/context_menu/plane_copy_tests.rs`
 - `src/ui_dialogs/preferences/search_index.rs`
 - `src/ui_erase.rs`
 - `src/ui_fullscreen.rs`
@@ -813,6 +816,8 @@ renderer 未登録の次 pass 要求は §5.2 の登録境界だけで使う。
 - `src/ui_fullscreen/page_turn/wait_indicator_tests.rs`
 - `src/ui_fullscreen/pan_bounds/tests.rs`
 - `src/ui_fullscreen/plane_view_tests.rs`
+- `src/ui_fullscreen/plane_view_tests/gpu_tests/additional_coverage.rs`
+- `src/ui_fullscreen/plane_view_tests/gpu_tests/transition_and_click_tests.rs`
 - `src/ui_fullscreen/side_panel_secondary_input_tests.rs`
 - `src/ui_sns_split.rs`
 - `src/vram_budget.rs`
@@ -874,6 +879,66 @@ PNG の生成は設計担当へ引き継いだまま。レビューの判定は�
 CPU 参照式 (`theta` / `camera_point` / `texture_point`) と検査用の pipeline format は `#[cfg(test)]` に限定した。GPU の寿命を保つ所有 field は `MipColor::_texture` と `PlaneGpuResources::_color` に改名し、所有の理由をコメントした。資源の保持・VRAM の会計は維持する。`STAGE1_MARKED_ANCHORS` は着手時の HEAD から同じ宣言・参照だったので触れていない。
 
 修正後の cargo check/test は実装担当では実行していない。未生成の3枚のPNGは設計担当が生成する。
+
+### コピー配送・入力の副作用・境界試験への修正 5
+
+対象の基点は `6c83a526d`。cargo の実行・コミットは実装担当では行っていない。
+
+- Fullscreen の `MenuCommand::CopyImageToClipboard` で PlaneView を判定し、既存の `copy_image_capture_to_clipboard` → `prepare_capture_pixel_work` → `plane_frame_request(Canvas)` へ配送する。キーの `FsCopyImage`、右クリックの native/egui メニュー、リング (ゲームパッドを含む) はこの配送点を共有する。snapshot が無い・context/anchor が違う場合は準備中の通知とし、元ファイルのコピーへ戻さない。PDF は Fullscreen の PlaneView のときだけ画像コピーの候補に加える。Grid と通常 Fullscreen の適格性と処理は維持する。
+- コピー試験は実際の action・メニューコマンド・リングから worker 入口まで通す。試験で明示的に有効にした thread-local sink だけが `CapturePixelWork` を受け取り、OS のクリップボードへは書かない。snapshot の Arc、Canvas の出力寸法、未描画・context/slice の不一致を検査する。
+- キーとホイールの成功時の適用を `apply_plane_view_outcome` にまとめた。拒否は通知だけ、pose/zoom/pan が同じ no-op は何も書かない。実際に表示が変わるときだけ pan の clamp、初期配置要求の取消、PDF の需要更新を行う。予測も同じ差分条件で clamp する。古い anchor の pose は純粋な遷移と同じく比較の基準から外し、古い owner の終了を新ページのユーザー変換として扱わない。初期配置要求が残ることと pan が変わらないことをキー/ホイール各 handler の実入力で検査する。
+- 既存のクリック名の試験にも本物の primary press/release を加えた。入場/終了と同一 pass のクリック/ダブルクリックを両クリック設定で送り、ページ送り・閉じる・リセットの結果を検査する。さらに実入力から作った配送待ちの click proposal が、実際の navigation handler によるページ/slice の交代後に PageSide/リセットとして再束縛されないことを検査する。
+- ModifierHold は Ctrl/Alt のカスタム割当と物理 synthetic timeline で、通常素材/元画像素材の選択、PlaneView の継続、ルーペの抑止を検査する。ピンチは2接点の raw Touch イベントを通し、倍率だけが変わり lens/page は変わらないことを検査する。
+- PDF は `GridItem::PdfPage` と PDF metadata の実描画経路で、未登録の現在素材の代わりに前素材を描いたまま、ホイールの `maybe_rerender_pdf` と指定倍率の描画後の需要がそれぞれ現在素材から決まることを検査する。登録待ちは余分な repaint の無い pass を先に確認し、所有 viewport の次 pass 要求と登録後の採用を検査する。
+- `docs/spec.md` の魚眼の節を、既存のフォルダ背景色の見出し・本文の後へ移した。本文自体は変更しない。
+
+追加・強化した試験 (いずれも実装担当では未実行):
+
+- `context_menu_model::tests::plane_copy_pdf_eligibility_is_limited_to_the_fullscreen_snapshot`
+- `ui_dialogs::context_menu::plane_copy_tests::plane_copy_action_menu_and_ring_reject_a_frame_that_has_not_been_drawn`
+- 同 `gpu_tests::{plane_copy_action_menu_and_ring_submit_the_same_frozen_canvas_frame, plane_copy_action_rejects_stale_context_and_page_slice_snapshots}`
+- `ui_fullscreen::plane_view_tests::gpu_tests::transition_and_click_tests::{plane_key_noop_and_rejection_preserve_pending_initial_placement_and_pan, plane_wheel_noop_and_rejection_preserve_pending_initial_placement_and_pan, plane_same_pass_entry_exit_clicks_turn_close_or_reset_from_the_predicted_view, plane_deferred_real_clicks_do_not_rebind_to_another_page_or_slice}`
+- 同 `gpu_tests::additional_coverage::{plane_modifier_hold_selects_original_with_custom_binding_and_keeps_plane_paint, plane_actual_two_contact_pinch_changes_image_zoom_without_changing_lens_or_page, plane_real_pdf_routes_keep_both_demands_current_while_previous_material_is_painted, plane_registration_wait_requests_the_owning_viewport_next_pass}`
+- 既存の `plane_real_frame_drops_fisheye_after_wheel_page_request_and_does_not_rebind_click` / `plane_same_pass_prediction_and_application_use_the_same_pose_and_click_classification` を実クリック入力付きに強化。
+
+共有 runner の対象:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/plane_/) | test(/context_menu_model::tests::/) | test(/wheel_frame_tests::/) | test(/ui_fullscreen::initial_placement::/) | test(/double_click_close_tests::/)'
+```
+
+新しい統合テスト・UI snapshot の更新は不要。GPU 試験は `gpu_tests` の子 module に置き、既存 nextest の gpu group に入る。既定 RightCtrl の OS 側物理キー判定は synthetic timeline が左右の modifier を注入できず、この追加試験では直接確認していない。新しい入力注入の仕組みは作らず、実キーでの確認は設計担当へ引き継ぐ。
+
+### 追加試験の前提と同一 pass のクリック受付への修正 6
+
+設計担当から関連 nextest 2746件中2739成功・新規7件失敗の結果を受領。以下はソースで照合した原因と修正であり、実装担当による cargo の再実行結果ではない。
+
+| 試験 | 原因の分類 | 修正・維持する検査 |
+| --- | --- | --- |
+| plane_key_noop_and_rejection_preserve_pending_initial_placement_and_pan | 試験の通知先の前提 | 拒否は `show_fullscreen_nav_noop` → `fs_boundary_hint::NavNoOp` に出る。トーストの unwrap を理由付き境界ヒントの検査へ直す。実キー消費、初期配置要求・pan の保持、古い slice の no-op の検査を維持する。 |
+| plane_wheel_noop_and_rejection_preserve_pending_initial_placement_and_pan | 同じ試験の前提 | 実 wheel handler 後の境界ヒントと `PlaneEntry(Trim)` を検査する。初期配置要求と pan が変わらない検査は維持。 |
+| plane_deferred_real_clicks_do_not_rebind_to_another_page_or_slice | 試験の移動要求の前提 | 失敗は配送待ち click の適用前。`FsPageNav::Delta` は `signum()` で隣接方向を表すため、3番への明示移動は `Target(3)` にする。移動後の click 破棄、ページ/slice/zoom/pan/rotation の保持はそのまま検査する。 |
+| plane_same_pass_entry_exit_clicks_turn_close_or_reset_from_the_predicted_view | 製品の通常クリック受付 | `accept_backing_click` が pass ごとに一度だけ加算していたため、同じ pass の受理済み2クリックを1回と数えた。所有・前面 layer・focus・egui の受理を離しごとに照合し、従来の3で飽和する回数を保って畳む。予測された魚眼状態でのリセット/終了分類と、両クリック設定の実入力検査は維持する。 |
+| plane_actual_two_contact_pinch_changes_image_zoom_without_changing_lens_or_page | 試験の backend 入力列の前提 | 製品の touch correlation は先頭接点と pointer promotion の相関を要求する。egui-winit と既存 touch 試験に合わせ、先頭接点の開始・移動・終了へ pointer mirror を加える。2接点の Touch から倍率が変わり、pose/page が変わらない検査は維持する。 |
+| plane_modifier_hold_selects_original_with_custom_binding_and_keeps_plane_paint | 試験の keyboard owner の前提 | 単独で作った pass に owner の発行が無く、`keymap_owner_blocks_shortcuts` が拒否していた。実 `keyboard_owner_for_pass` を通してから hold の成立とルーペ無描画を両方検査する。素材IDとposeの検査も維持。 |
+| plane_real_pdf_routes_keep_both_demands_current_while_previous_material_is_painted | 試験の GPU 登録の前提 | RootDepthViewer は FullOutput の texture delta を破棄する。描画後に tex manager を drain しても登録できないため、実 final material と保持画素で renderer 登録を再現する。初回は描画前、差し替え完了時は現在素材を登録する。両 PDF 需要入口・前素材の描画・現在素材の採用の検査は維持。 |
+
+**設計との差分 (既存クリック実装の事実)**: fullscreen-double-click-close-plan §4.3/§5 の「従来経路を変えない」前提には、通常 PageTurn の同一 pass 複数クリックを一度しか数えない実装も含まれていた。§1.917 の同一 pass のダブルクリック検査に合わせ、その受付の粒度だけを離しごとに修正する。PageTurn の3で飽和する規則と DoubleClickClose の2回で組を区切る規則は混ぜない。detached の述語・viewport 経路・配送は変更しない。
+
+通常 PageTurn の受付に `page_turn_batched_double_and_triple_click_reset_the_moved_canvas`、`page_turn_list_open_double_click_still_counts_only_the_canvas_release`、`page_turn_batched_canvas_click_acceptance_is_idempotent`、`page_turn_batched_front_and_canvas_clicks_cannot_form_a_double_click`、`page_turn_batched_clicks_on_both_sides_of_focus_loss_cannot_form_a_double_click` を追加した。既存の Depth/初期配置/パネルの試験は front snapshot を helper へ渡すだけで検査を維持する。
+
+共有 runner は修正5の filter に加え、`test(/depth_focus_tests::/) | test(/depth_view_transform_tests::/) | test(/side_panel_secondary_input_tests::/)` を含める。実装担当は cargo check/test・コミット・アプリ起動を行っていない。
+
+### 時刻と PDF 需要列の試験前提への修正 7
+
+設計担当から関連3630件中3628成功・新規2件失敗の結果を受領。以下の2件は試験の前提を訂正し、製品コードは変更していない。
+
+- ModifierHold の単独 `run_pass` が time 未指定だったため、egui は f32 の predicted_dt で進み、次の RootDepthViewer の f64 `frame_counter / 60` より僅かに先へ進んでいた。既存の viewport 入力試験と同じく frame_counter を加算し、その f64 時刻を明示する。前 pass より進むことも検査する。実 hold・ルーペ抑止・素材ID・pose の検査は維持する。
+- PDF の991は `render_fullscreen_viewport` の入力前の `ensure_pdf_display_resolution` → `pdf_display_render_long_edge_for_idx` → `request_pdf_rerender_at_target` から出る。vector ページの寸法は現在の `fs_cache` の634×819、表示先は1200×900。Page fit の900物理画素へ既存の1.10 headroomを掛けた f32 の ceil で991となる。現在の819長辺は991の90%未満なので要求する。その後、Ctrl+ホイールの適用が `maybe_rerender_pdf` → `request_pdf_rerender` を通り、新倍率約1.21に対応する1200を要求する。どちらも現在素材から作り、`FsSinglePageDraw.transform` (前素材の描画変換) は参照しない。
+- PDF 試験は素材採用直後に要求がまだ無いことを検査し、実 frame の期待を `[(0, fit_target), (0, wheel_target)]` の正確な列へ直す。両 target は現在素材と表示先から独立に算出し、異なる値であることも検査する。指定倍率の描画後の需要、前素材の描画と現在素材の採用の検査は維持する。
+
+共有 runner: `cargo nextest run -p mimageviewer --lib -E 'test(/plane_modifier_hold_selects_original_with_custom_binding_and_keeps_plane_paint|plane_real_pdf_routes_keep_both_demands_current_while_previous_material_is_painted/)'`。
+実装担当は cargo check/test・アプリ起動・コミットを行っていない。
 
 ### 検証の引き継ぎ
 
@@ -998,3 +1063,28 @@ coverage・trim・回転は、今の入力の分担で追加の誤参照は無�
 判定: **実装開始可**。R5 の 2 件はどちらも resolved、新しい指摘なし。レビュー担当が既報の条件を `f32` で再現し、倍率 1・1.1、
 `pixels_per_point` 1・1.25・2 で配置枠の最大の辺の差が約 0.000061 物理画素 (許容 1/64 = 0.015625 の内側) であることを確かめた。
 §4.4 の構造上の追加という分類への合意は R2 の条件つきで維持。
+
+## 15. 独立実装レビュー
+
+### I1 (2026-11-27、GPT-6.1 Sol / xhigh、read-only、実装者とは別のセッション、対象 `6c83a526d`)
+
+判定: 要修正。設計担当がコードで確かめ、P1〜P3 はすべて正しいと判断した。
+§11 の設計との差分 2 点 (パネル上の Ctrl+Shift+ホイールの入場の拒否、pause の入口への共通の終了 helper の追加) には合意。
+detached への変更は既存の owner への variant の追加と終了の共通化で、症状パッチではない、との判断。
+式・`alpha_max`・地平線 / 定義域のマスク・微分の位置・coverage / 回転 / trim・CPU 参照との対応、Arc の保持・callback ごとの uniform・
+format ごとの pipeline・VRAM の会計・登録待ちの次 pass の要求、`ColorMipCopier` の括り出しによる 3D 写真の変化、
+UI スレッドの I/O・読み戻しの待ち・Context の再帰 lock には、追加の欠陥は無い、との評価。
+
+| # | 指摘 | 対応 |
+| --- | --- | --- |
+| P1-1 | 全画面の「画像をコピー」(`FsCopyImage`・右クリック・リング) が元ファイルを読み直し、魚眼が反映されない | 画像コピーの共通の配送点で PlaneView を判定し、照合済みの snapshot の出力要求 (Canvas の寸法) へつないだ。3 つの入口の試験を追加 |
+| P2-2 | 魚眼が成立しないキー / ホイールでも初期配置の要求を消し、pan の clamp・PDF の需要の処理を走らせる | 遷移が成立したときだけ副作用を適用する `apply_plane_view_outcome` に集めた。拒否 / no-op で初期配置の要求と pan が残る回帰を追加 |
+| P2-3 | クリックの境界の試験が実際のクリックを入力していない | 入場 / 終了と同じ pass のクリック・ダブルクリック、ページ / slice の交代後の破棄を実入力で検査 |
+| P3-4 | spec.md の既存の節の見出しと本文が分かれた | 魚眼の節を既存の節の本文の後へ移した |
+| (不足) | §10 の元画像ホールド・実ピンチ・PDF の需要の両入口・登録待ちの起床要求 | それぞれ試験を追加 |
+
+修正の途中で、PageTurn の通常キャンバスのクリックが、1 pass に届いた複数の離しを 1 回と数えていた既存の欠陥が見つかった
+(同じ pass の入場とダブルクリックの試験で露見)。DoubleClickClose 側の既存の数え方 (離しごとに照合) に揃えて直した
+([fullscreen-double-click-close-plan.md §16](fullscreen-double-click-close-plan.md))。再レビューで名指しで確かめる。
+
+関連の nextest (plane_・context_menu・click・double_click・touch・page_turn・depth_・preferences・capture・gamepad ほか) 3630 件が共有 runner で成功。

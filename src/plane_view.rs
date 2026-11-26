@@ -237,6 +237,12 @@ pub(crate) struct PlaneViewWheelOutcome {
     pub pan: Vec2,
     pub blocked: Option<PlaneViewEntryBlock>,
 }
+impl PlaneViewWheelOutcome {
+    pub(crate) fn changes_view(self, pose: Option<PlaneViewPose>, zoom: f32, pan: Vec2) -> bool {
+        self.blocked.is_none() && (self.pose != pose || self.zoom != zoom || self.pan != pan)
+    }
+}
+
 pub(crate) fn plane_view_wheel_transition(input: PlaneViewWheelInput) -> PlaneViewWheelOutcome {
     let current = input.current.filter(|pose| pose.anchor == input.anchor);
     let mut out = PlaneViewWheelOutcome {

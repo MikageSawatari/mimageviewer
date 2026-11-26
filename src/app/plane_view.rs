@@ -161,34 +161,6 @@ impl App {
         }
         true
     }
-    pub(crate) fn apply_plane_view_outcome(
-        &mut self,
-        ctx: &egui::Context,
-        out: PlaneViewWheelOutcome,
-    ) {
-        self.fs_zoom = out.zoom;
-        self.fs_pan = out.pan;
-        match (&mut self.fs_exclusive_view, out.pose) {
-            (FsExclusiveView::PlaneView(state), Some(pose)) if state.pose.anchor == pose.anchor => {
-                state.pose = pose
-            }
-            (_, Some(pose)) => self.set_fs_exclusive_view(
-                FsExclusiveView::PlaneView(PlaneViewState::new(pose)),
-                "plane_enter",
-            ),
-            (FsExclusiveView::PlaneView(_), None) => {
-                self.set_fs_exclusive_view(FsExclusiveView::None, "plane_leave")
-            }
-            _ => {}
-        }
-        if let Some(block) = out.blocked {
-            self.show_fullscreen_nav_noop(
-                ctx,
-                crate::ui_fullscreen::FsNavNoOpReason::PlaneEntry(block),
-                false,
-            );
-        }
-    }
     pub(crate) fn plane_view_wheel_input(
         &mut self,
         canvas: egui::Rect,

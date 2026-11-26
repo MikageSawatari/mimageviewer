@@ -98,13 +98,14 @@ fn depth_transform_click_classification_focus_and_double_reset_use_the_shared_vi
                     ..Default::default()
                 },
                 |ui| {
-                    app.capture_fs_front_pointer_input(&ctx, rect);
+                    let (front, _) = app.capture_fs_front_pointer_input(&ctx, rect);
                     let response = ui.interact(
                         rect,
                         egui::Id::unique("transformed-click"),
                         egui::Sense::click_and_drag(),
                     );
-                    app.fs_front_pointer.accept_backing_click(&response, false);
+                    app.fs_front_pointer
+                        .accept_backing_click(&response, false, &front);
                     let (zoom, pan) = (app.fs_zoom, app.fs_pan);
                     let action = app.plan_fs_canvas_click(
                         &ctx,
