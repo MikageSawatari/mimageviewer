@@ -2353,7 +2353,7 @@ fn book_resume_meter_copied_data_dir_uses_existing_cache_save_restore_key() {
         Some(cached.clone())
     );
 
-    app.load_folder(source.parent().unwrap().to_path_buf());
+    app.load_folder_and_finish_for_test(source.parent().unwrap().to_path_buf());
     let idx = app
         .items
         .iter()
@@ -2371,7 +2371,7 @@ fn book_resume_meter_copied_data_dir_uses_existing_cache_save_restore_key() {
     );
     assert_eq!(stored_row(app.tmp.path(), &computed), None);
 
-    app.load_folder(source.parent().unwrap().to_path_buf());
+    app.load_folder_and_finish_for_test(source.parent().unwrap().to_path_buf());
     let idx = app
         .items
         .iter()
@@ -2419,7 +2419,7 @@ fn book_resume_meter_deleted_cache_reconversion_and_source_change_resume_same_ke
         Some((1, Some(2), Some(3)))
     );
 
-    app.load_folder(source.parent().unwrap().to_path_buf());
+    app.load_folder_and_finish_for_test(source.parent().unwrap().to_path_buf());
     let idx = app
         .items
         .iter()

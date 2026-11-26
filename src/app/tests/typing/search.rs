@@ -134,7 +134,7 @@ pub(super) fn seed_images(env: &mut AppTestEnv) -> Vec<PathBuf> {
         .collect();
     // Publish the physical source through its production owner, including page
     // identities and hydration. Harness::new drives full frames to its adoption.
-    env.load_folder(folder);
+    env.load_folder_and_finish_for_test(folder);
     paths
 }
 

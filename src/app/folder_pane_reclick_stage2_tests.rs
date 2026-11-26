@@ -21,7 +21,7 @@ pub(super) fn reclick_stage2_fixture() -> (AppTestEnvForTest, egui::Context, u64
     image::RgbImage::new(1, 1)
         .save(b.join("only-b.png"))
         .unwrap();
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     settle(&mut app, &ctx);
     app.folder_pane.test_seed_listing(&a, vec![child], true);
     app.folder_pane.set_cursor(a.clone());
@@ -590,7 +590,7 @@ fn reclick_stage2_aggregate_fixture() -> (AppTestEnvForTest, egui::Context, u64,
         }
     }
     app.stack_mode_requested = true;
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     settle(&mut app, &ctx);
     assert!(app.stack_mode_aggregated());
     assert!(

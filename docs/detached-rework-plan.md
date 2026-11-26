@@ -1458,6 +1458,22 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-26: main の未走査呼び出しの継続と全画面の閉じ戻り（§1.853 C・D・E、実装・検証待ち）
+
+判断は `main_folder_history_available()` と `!navigation_scope.is_detached_physical()` に限定し、
+detached／投影中の別 context の loader は従来どおり同期とする。`FolderOpenScanPurpose::DirectNavigation` は
+同じ呼び出しの引数を保持する boxed continuation となり、context 所有の pane pending が取消・採用・失敗を所有する。
+main の待ちは兄弟 context の入力・scan・cache を退役させない。
+
+main の全画面から親へ戻る場合だけ、true-close 前の描画単位を既存 close continuation → navigation へ移し、
+同じ要求 ID の `CloseReturn` sequence で保持する。新しい close の受付で待ちを退役させ、
+受付済み content-close の teardown では繰り返さない。通常描画に戻っても lock は保持し、採用境界だけで `ViewerExited` とする。
+native の対象入力の新規受付と受付済み非同期 continuation も型で区別する。
+
+ClaudeCode の設計合意と、本件の独立設計レビュー r1〜r7（[記録 §6.9〜§6.16](ui-sync-853-plan.md#69-設計レビュー-r1-gpt-61-sol--xhighread-only30ee454c72026-11-26-reject)）は、
+走査の判断・close の受付・採用済み teardown・描画資源の所有を各境界へ集める構造的修正であり、症状パッチではないことに AGREE。
+この記録はそれらの設計合意を参照するもので、今回の独立実装レビューは未実施。コンパイル・テスト・実機確認も未実施。
+
 ### 2026-11-26: 押す・離すが同じフレームのクリックの止めの寿命 (§1.906)
 
 - 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §13。共有 viewer 入力の

@@ -143,6 +143,7 @@ pub(super) fn settle(app: &mut App) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         app.settle_open_path_classification_for_test();
+        app.poll_direct_navigation_scan_for_test(&ctx);
         app.poll_collection_history_transition(&ctx);
         ctx.run_pass(egui::RawInput::default(), |ctx| {
             app.show_archive_convert_dialog(ctx);
@@ -184,6 +185,7 @@ pub(super) fn settle(app: &mut App) {
             && app.pdf_enumerate_pending.is_none()
             && app.reading_history_sources_pending.is_empty()
             && !app.sidecar_restore_active()
+            && !app.direct_navigation_scan_pending()
             && app.bookmark_browser_pending.is_none()
             && app.rating_view_pending.is_none()
             && app.tag_view_pending.is_none()
@@ -403,7 +405,7 @@ fn section1473_other_synthetic_roots_parent_inventory() {
                 configure(&mut app);
                 let (book, _) = fixture(&mut app, "folder");
                 let origin = book.parent().unwrap().to_owned();
-                app.load_folder(origin.clone());
+                app.load_folder_and_finish_for_test(origin.clone());
                 settle(&mut app);
                 enter_other_root(&mut app, kind, &origin);
                 eprintln!(
@@ -763,7 +765,7 @@ fn matrix(kind: &str) {
                 }
                 let (path, history_kind) = fixture(&mut app, kind);
                 add_history(&app, &path, history_kind);
-                app.load_folder(path.parent().unwrap().to_owned());
+                app.load_folder_and_finish_for_test(path.parent().unwrap().to_owned());
                 settle(&mut app);
                 eprintln!(
                     "1473 case={kind} entrance={entrance:?} parent={parent} data_dir={:?}",
@@ -1017,7 +1019,7 @@ fn section1473_reading_history_root_parent_never_opens_internal_data() {
                     configure(&mut app);
                     let (book, kind) = fixture(&mut app, "zip");
                     let origin = book.parent().unwrap().to_owned();
-                    app.load_folder(origin.clone());
+                    app.load_folder_and_finish_for_test(origin.clone());
                     settle(&mut app);
                     let origin_selection = app
                         .selected
@@ -1101,7 +1103,7 @@ fn section1473_returned_history_back_candidate_consumes_self_marker_first() {
     configure(&mut app);
     let (book, kind) = fixture(&mut app, "zip");
     let origin = book.parent().unwrap().to_owned();
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     settle(&mut app);
     add_history(&app, &book, kind);
     enter(&mut app, Entrance::Menu);
@@ -1144,7 +1146,7 @@ fn section1473_folder_bar_second_parent_keeps_physical_ancestors() {
             let (book, _) = fixture(&mut app, "zip");
             let origin = book.parent().unwrap().to_owned();
             let grandparent = origin.parent().unwrap().to_owned();
-            app.load_folder(origin.clone());
+            app.load_folder_and_finish_for_test(origin.clone());
             settle(&mut app);
             let openable = crate::folder_tree::resolve_openable_path(&book).unwrap();
             apply_on(
@@ -1256,7 +1258,7 @@ fn nested_rating_history_case(portable: bool, roundtrip: bool, physical_child: b
         .unwrap()
         .set(&crate::adjustment_db::normalize_path(&rated), 3)
         .unwrap();
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     settle(&mut app);
     add_history(&app, &book, kind);
     enter(&mut app, Entrance::Menu);
@@ -1325,7 +1327,7 @@ fn section1473_equal_entrance_revisit_via_rating_keeps_complete_back_forward() {
         let mut app = setup(portable);
         configure(&mut app);
         let (origin, kind) = fixture(&mut app, "folder");
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         settle(&mut app);
         let previous = app.tmp.path().join("previous");
         std::fs::create_dir_all(&previous).unwrap();
@@ -1378,7 +1380,7 @@ fn section1473_both_markers_truncated_equal_revisit_keeps_entrance_destination()
         let mut app = setup(portable);
         configure(&mut app);
         let (origin, kind) = fixture(&mut app, "folder");
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         settle(&mut app);
         let entrance = app.folder_nav_current_entry().unwrap();
         add_history(&app, &origin, kind);
@@ -1461,7 +1463,7 @@ fn section1473_expansion_entrance_owns_complete_restore() {
             image::RgbImage::new(3, 4)
                 .save(other.join("other.png"))
                 .unwrap();
-            app.load_folder(origin.clone());
+            app.load_folder_and_finish_for_test(origin.clone());
             settle(&mut app);
             app.start_subfolder_expansion_scan_roots(origin.clone(), vec![origin.clone(), other]);
             settle(&mut app);
@@ -1511,7 +1513,7 @@ fn section1473_rating_exit_keeps_its_own_complete_origin() {
                 configure(&mut app);
                 let (book, kind) = fixture(&mut app, "zip");
                 let origin = book.parent().unwrap().to_owned();
-                app.load_folder(origin.clone());
+                app.load_folder_and_finish_for_test(origin.clone());
                 settle(&mut app);
                 if entrance != "folder" {
                     enter_other_root(&mut app, entrance, &origin);
@@ -1553,7 +1555,7 @@ fn section1473_bookmark_entrance_direct_exit_must_not_cycle_parent() {
         configure(&mut app);
         let (book, _) = fixture(&mut app, "zip");
         let origin = book.parent().unwrap().to_owned();
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         settle(&mut app);
         enter_other_root(&mut app, "bookmarks", &origin);
         let bookmarks = app.current_top_level_restore_snapshot().unwrap();
@@ -1596,7 +1598,7 @@ fn section1473_other_owned_entrances_survive_history_and_book() {
                 configure(&mut app);
                 let (book, history_kind) = fixture(&mut app, "zip");
                 let origin = book.parent().unwrap().to_owned();
-                app.load_folder(origin.clone());
+                app.load_folder_and_finish_for_test(origin.clone());
                 settle(&mut app);
                 enter_other_root(&mut app, kind, &origin);
                 let expected = app.current_top_level_restore_snapshot().unwrap();
@@ -1638,7 +1640,7 @@ fn section1473_search_transfers_complete_canonical_origin() {
                 configure(&mut app);
                 let (book, history_kind) = fixture(&mut app, "zip");
                 let origin = book.parent().unwrap().to_owned();
-                app.load_folder(origin.clone());
+                app.load_folder_and_finish_for_test(origin.clone());
                 settle(&mut app);
                 enter_other_root(&mut app, origin_kind, &origin);
                 let expected = app.current_top_level_restore_snapshot().unwrap();
@@ -1671,7 +1673,7 @@ fn section1473_snapshot_keeps_input_specific_admission_and_parent_owner() {
             configure(&mut app);
             let (book, kind) = fixture(&mut app, "zip");
             let origin = book.parent().unwrap().to_owned();
-            app.load_folder(origin.clone());
+            app.load_folder_and_finish_for_test(origin.clone());
             settle(&mut app);
             let expected = app.capture_top_level_origin().unwrap();
             app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
@@ -1722,7 +1724,7 @@ fn section1473_snapshot_same_path_history_has_distinct_root_and_exits_to_its_cap
             configure(&mut app);
             let (book, kind) = fixture(&mut app, "zip");
             let origin = book.parent().unwrap().to_owned();
-            app.load_folder(origin.clone());
+            app.load_folder_and_finish_for_test(origin.clone());
             settle(&mut app);
             add_history(&app, &book, kind);
             enter(&mut app, Entrance::Menu);
@@ -1769,7 +1771,7 @@ fn section1473_snapshot_exit_cancel_keeps_visible_root_and_ends_fixed_scope() {
             configure(&mut app);
             let (book, kind) = fixture(&mut app, "zip");
             let origin = book.parent().unwrap().to_owned();
-            app.load_folder(origin.clone());
+            app.load_folder_and_finish_for_test(origin.clone());
             settle(&mut app);
             app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
             settle(&mut app);
@@ -1833,7 +1835,7 @@ fn section1473_snapshot_exit_restores_complete_native_canonical_owners() {
                 .unwrap()
                 .add(&video, 1.0, None, &[])
                 .unwrap();
-            app.load_folder(origin.clone());
+            app.load_folder_and_finish_for_test(origin.clone());
             settle(&mut app);
             enter_other_root(&mut app, kind, &origin);
             let expected = app.capture_top_level_origin().unwrap();
@@ -1857,7 +1859,7 @@ fn section1473_folder_descendant_does_not_resurrect_expired_book_return() {
         configure(&mut app);
         let (folder, kind) = fixture(&mut app, "folder");
         let origin = folder.parent().unwrap().to_owned();
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         settle(&mut app);
         add_history(&app, &folder, kind);
         enter(&mut app, Entrance::Menu);
@@ -1894,7 +1896,7 @@ fn section1473_marker_presence_selects_back_or_direct_without_losing_entrance_po
                 let path = origin.join(format!("folder-{number:03}"));
                 std::fs::create_dir_all(path).unwrap();
             }
-            app.load_folder(origin.clone());
+            app.load_folder_and_finish_for_test(origin.clone());
             settle(&mut app);
             let selected_path = origin.join("folder-040");
             app.selected = Some(
@@ -2006,7 +2008,7 @@ fn section1473_bookmark_entrance_restores_stable_key_and_scroll_then_its_parent(
         configure(&mut app);
         let (book, kind) = fixture(&mut app, "zip");
         let origin = book.parent().unwrap().to_owned();
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         settle(&mut app);
         for number in 0..45 {
             let path = origin.join(format!("video-{number:03}.mp4"));
@@ -2051,7 +2053,7 @@ fn section1473_smart_and_collection_physical_entrances_keep_native_root_and_orig
                 let origin = book.parent().unwrap().to_owned();
                 let source = origin.join("owned-source");
                 std::fs::create_dir_all(source.join("child")).unwrap();
-                app.load_folder(origin.clone());
+                app.load_folder_and_finish_for_test(origin.clone());
                 settle(&mut app);
                 enter_other_root(&mut app, kind, &origin);
                 let root = app.current_top_level_restore_snapshot().unwrap();
@@ -2086,7 +2088,7 @@ fn section1473_snapshot_subset_cannot_overwrite_ordinary_entrance_position() {
         for number in 0..70 {
             std::fs::create_dir_all(origin.join(format!("folder-{number:03}"))).unwrap();
         }
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         settle(&mut app);
         let selected_path = origin.join("folder-040");
         let selected = app
@@ -2108,10 +2110,10 @@ fn section1473_snapshot_subset_cannot_overwrite_ordinary_entrance_position() {
         app.dismiss_snapshot_with_origin();
         let other = app.settings.book_root.as_ref().unwrap().join("other");
         std::fs::create_dir_all(&other).unwrap();
-        app.load_folder(other);
+        app.load_folder_and_finish_for_test(other);
         settle(&mut app);
         assert_eq!(app.folder_history.get(&origin).copied(), Some(saved));
-        app.load_folder(origin);
+        app.load_folder_and_finish_for_test(origin);
         settle(&mut app);
         assert_eq!(
             app.selected

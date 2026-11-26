@@ -9486,7 +9486,7 @@ mod tests {
         let mut rating = crate::app::setup_app_for_test();
         let source = tempfile::tempdir().unwrap();
         std::fs::write(source.path().join("keep.jpg"), []).unwrap();
-        rating.load_folder(source.path().to_path_buf());
+        rating.load_folder_and_finish_for_test(source.path().to_path_buf());
         rating.enter_rating_view(5);
         assert!(rating.rating_view_pending.is_some());
         let rating_address = rating.address.clone();

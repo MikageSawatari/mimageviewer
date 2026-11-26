@@ -6,6 +6,7 @@ fn settle(app: &mut App, ctx: &egui::Context) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         app.settle_open_path_classification_for_test();
+        app.poll_direct_navigation_scan_for_test(ctx);
         app.poll_history_navigation_transition_for_test(ctx);
         app.poll_zip_enumerate();
         app.poll_reading_history_thumbnail_sources(ctx);
@@ -21,6 +22,7 @@ fn settle(app: &mut App, ctx: &egui::Context) {
             && app.fs_nav_after_pdf_enumerate.is_none()
             && app.reading_history_sources_pending.is_empty()
             && !app.sidecar_restore_active()
+            && !app.direct_navigation_scan_pending()
         {
             return;
         }
@@ -92,7 +94,7 @@ fn check_same_position(opening_batch_size: usize, second_batch_size: usize, recl
                 if target == 1 && source != "zipdir" {
                     std::fs::create_dir_all(root.join("000")).unwrap();
                 }
-                app.load_folder(if source == "zipdir" {
+                app.load_folder_and_finish_for_test(if source == "zipdir" {
                     root.join("book.zip")
                 } else {
                     root

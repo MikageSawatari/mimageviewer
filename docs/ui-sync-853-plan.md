@@ -1474,3 +1474,987 @@ r6 の P2×2・P3×1 は設計上解消、追加の P1/P2 は無しと判定。d
 **AGREE** (走査の判断・close の新しい受付・採用済みの teardown・描画資源の所有を、それぞれの境界へまとめている)。
 P3×2 は実装の注意として反映した: 4a に残っていた古い置き場所の記述を置き換えた。通常の描画への切り替えと sequence の終わりを
 分ける注意を §6.12 の 2 に足した。
+
+### 6.17 実装の記録
+
+2026-11-26、`ui-scan-853b`、基点 `30cdc0774`。§6 の C・D・E の実装差分。
+**コンパイル・Rust テスト・nextest・ビルド・製品起動は行っていない。独立実装レビューも未実施。**
+設計担当の共有 heavy-job runner へ検証を渡す。commit / stash / reset / checkout / branch switch は行っていない。
+ファイルの担当を分けた GPT-6.1 Sol / high の実装担当へ一部を委譲した。親のモデルをその設定へ変更したという意味ではない。
+
+最終の静的確認: 変更／追加した Rust 96 ファイルへ単体ごとの `rustfmt --edition 2024 --check --config skip_children=true`。
+95 ファイルが初回成功、残る新 C5 テストの整形差分を適用して当該 1 ファイルも再確認成功。
+`git diff --check` 成功、`python scripts/check_ui_glyphs.py` は危険な UI 字形 0 件。
+これは型検査・コンパイル・テストの成功を意味しない。
+
+| 変更ファイル | 設計項目と実装 |
+| --- | --- |
+| `src/app.rs` | §6.3(1–5): 共通走査点の既定反転、boxed continuation、modal／owner 再照合、同じ loader の再開、要求所有の選択・予約、理由付き例外。§6.3(6・8・9): D5 staged、Folder 効果・型付き検索帰路の確定。§6.12: close 捕捉・採用・取消 |
+| `src/app/folder_scan.rs`、`src/app/startup_ops.rs` | §6.3(3): 起動／pane 共通の policy・Susie 前後照合。不一致は同じ要求・token・開始時刻を保つ受信口交換 |
+| `src/app/update_phases.rs` | §6.3(3・5・8): 通常 nav 裁定・continuation 採用・生成点の worker 印の撤去。§6.12(3): native 背景／embedded 完了回収 |
+| `src/app/collection_grid.rs`、`src/app/gamepad_input.rs`、`src/ui_main.rs`、`src/global_search_ui.rs` | §6.3(8): GridFolder carrier、受付時の idx ★判定・履歴・auto-fullscreen の効果。Folder の facet suppression は false、Rating の固有 staged 着地は維持 |
+| `src/app/list_order_navigation.rs` | §6.3(9): 検索の Descend／Back／Sibling とタグ Back |
+| `src/app/smart_folder.rs`、`src/app/subfolder_expansion.rs` | §6.3(10): ExitTemporaryView の採用まで表示状態を保持、機能 worker 取消・定義無効化だけを受付で行う |
+| `src/app/close_return.rs`、`src/app/snapshot_ops.rs`、`src/app/startup_list_restore.rs`、`src/ui_fullscreen.rs` | §6.12: true-close 前の表示単位、request ID に属する CloseReturn、通常描画でも lock 維持、新 close 受付だけで退役。§6.3(4): SnapshotLeafOpen／TrayClose |
+| `src/app/native_video.rs` | §6.12(2): 新規入力の共通受付と受付済み continuation の区別 |
+| `src/app/release_checks.rs` | §6.3(4): ReleaseCheck の理由付き同期契約（PlayTest は app.rs、変換キャッシュの実フォルダ更新は ConvertedCacheReload） |
+| `src/app/location_jump.rs`、`src/app/drive_jump.rs`、`src/app/collection_navigation.rs` | §6.3(5): 生成点の worker 走査印を既定へ吸収、場所・履歴の意味を持つ nav 値は維持 |
+| `scripts/analyze_perf.py` | §6.5: purpose／owner／intent／auto_fs／rescan 別の内訳、旧ログの欠損値も扱う |
+| 下記のテストファイル・共有 fixture | §6.6・§6.12: worker 完了と実 post-render／fullscreen poll を通す採用待ち、回帰検査 |
+| `docs/ui-responsiveness.md`、`docs/async-architecture.md`、`docs/direct-navigation-worker-scan-plan.md`、`docs/detached-rework-plan.md`、`docs/display-pipeline.md`、`docs/video-architecture.md`、本書 | §6.7: 境界・例外・待ち方・既存設計合意・未検証の記録 |
+
+実装時の照合:
+
+- 未走査で入る二入口は Ordinary。main の navigation は既存 capture で得られ、選択は capture 時に App から take 済み。
+  採用で App の選択ヒントを読み直さない。owner の読み取り検査は snapshot・rating・Quick Folder・collection・bookmark の照合を含む。
+- 起動・書庫等、App の全画面 flag を立てる既存入口が残るため §6.3(2) の take を残した。Folder の入口は effects が予約を持つ。
+- D5 は既存の `current_sort_reload_is_physical_directory` と logical override 不在で実フォルダに限定する。
+  変換キャッシュの実ディレクトリは理由付きの同期、ZIP/PDF の早期 return は維持。
+- SnapshotLeafOpen の続きは別項目。RequiredFullscreen の `SnapshotTarget::Fs` は上流で既存 worker に分岐する。
+  横断ブックマーク一覧の Opening は従来の synthetic Bookmarks 復元であり、物理親の C5 に偽装しない。
+- D3 の entry 自身／同じ子への帰還も ExitTemporaryView。削除定義が取消で表示に残る場合は、既存の定義不在検査が refresh／child adoption を拒否する。
+- D2 の返却事項（§6.3(9) の「今と違う結果になるなら返す」）: 基点の `favsearch_back` は pop の後の loader が同じ親を push し、
+  `[root, child]` が `[root, root]` になる。Sibling も先の `[next]` への置換の後に loader が push して `[next, next]` になる。
+  次の BS の行き先を変えないため、今回の typed Back／Sibling はこの成功時の既存結果を採用時へ移す。
+  重複を除いて一段ずつ戻す既存不具合の修正は、設計担当／利用者の判断へ返す（質問は未回答、黙って変更していない）。
+  `commit_staged_search_navigation_effects` の Back／Sibling 分岐と新しい
+  `section1853_favorite_back_defers_effects_and_preserves_released_duplicate_parent`／
+  `section1853_favorite_sibling_defers_replace_and_preserves_released_duplicate_root` が証拠。
+  D2 の non-main は §6.2 の対象外規則に従って従来の同期順を維持する。
+- マニュアルの読み込み中のキーに関する既存記述を検索したが、変更すべき記述は見つからず htdocs は変更していない。
+  `docs/next-release-backlog.md` は統括担当のため変更していない。
+
+意図した既存期待値の変更（最終の一覧・選択・履歴・intent は保持）:
+
+- §6.6(11a): `direct_navigation_worker_admission_does_not_take_global_fullscreen_reservation` を
+  `direct_navigation_worker_admission_takes_and_retires_global_fullscreen_reservation` へ改名。App flag は false、予約は要求が所有。
+- §6.6(11b): `direct_navigation_worker_unmarked_producers_keep_synchronous_adoption` を
+  `direct_navigation_worker_unmarked_producers_scan_off_caller_and_keep_adoption` へ改名。
+  `direct_navigation_worker_preserves_unmarked_presentation_intents` と collection の
+  `direct_navigation_sync_preserves_collection_physical_owner`（新名 `direct_navigation_worker_preserves_collection_physical_owner`）も
+  同期走査 1 回の前提を 0 回＋完了待ちへ変更。
+- 同じ予約の所有変更: `section1335_bookshelf_compiled_folder_direct_read_and_explicit_list_restart_differ`、
+  `section1335_rating_folder_auto_request_records_the_actual_settled_physical_list` と共有 `open_selected_image_folder_book`。
+  同じ auto 値を GridFolder.effects で検査し、App に先行予約が無いことを確認する。
+- §6.3(8)・§6.6(6a): `ratingnav649_folder_enter_name`、`ratingnav649_folder_enter_date_desc`、
+  `ratingnav649_folder_double_click_name`、`ratingnav649_folder_double_click_date_desc`、
+  `ratingnav649_folder_gamepad_name`、`ratingnav649_folder_gamepad_date_desc`、
+  `ratingnav649_enter_and_pointer_folder_receipt_preserve_history_return`。
+  先行 history／★解除の値を effects へ移し、待ちの App は旧状態、採用後は従来の結果。
+- carrier を Direct／CollectionSource／RatingSource から GridFolder へ変えた箇所は、同じ path・owner・auto 値を検査する。
+  その他の変更は、同期採用の前提を共通の完了 helper へ移すか、型の引数を補ったもの。
+- C5 の描画資源を持つ LiveWithPresentation を、既存の Live と同じ pending として許容する型の補完は
+  `close_return_real_fullfeature_media_is_shared_until_promote_or_live_fork` と
+  `egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_owner` の既存の pending 検査にも適用した。
+
+共有 runner へ渡す exact nextest filter（この担当では未実行）:
+
+```powershell
+$scan853Filter = 'test(section1853_) | test(direct_navigation_worker_) | test(close_return_) | test(grid_folder_) | test(grid_collection_folder_) | test(ratingnav649_) | test(section1335_) | test(section1328_) | test(section1339_) | test(history_parent_) | test(same_position_double_click) | test(g1_) | test(tag_view_) | test(favsearch) | test(native_backdrop_) | test(native_target_) | test(fullscreen_) | test(folder_pane_) | test(section1285_)'
+cargo nextest run -p mimageviewer --lib -E $scan853Filter
+cargo nextest run -p mimageviewer --lib --features test-script -E $scan853Filter
+# 共通入口の既定変更なので focused 後に lib 全件も両構成で必要。
+cargo nextest run -p mimageviewer --lib -E 'all()'
+cargo nextest run -p mimageviewer --lib --features test-script -E 'all()'
+```
+
+設計担当は既存 run-heavy／ledger と `scripts/test-lib-full.ps1`／`scripts/test-full.ps1` の運用に載せる。
+native 実機・snapshot 生成と確認・perf 計測・検証用 binary のビルドも設計担当に残る。
+この担当から normal profile の製品を起動しない。
+
+ファイル別の追加・変更テスト／共有 helper 名（同期採用待ちだけの移行を含む）は以下に記録する。
+
+
+<!-- scan853-test-inventory -->
+
+#### `src/app/native_video.rs`
+
+```text
+native_home_end_and_hud_targeting_share_folder_wait_admission
+native_wait_gate_keeps_unblocked_inputs_and_swap_delta_coalescing
+```
+
+#### `src/app/book_composition_permission_tests.rs`
+
+```text
+resume_notice_follows_materialized_open_into_its_detached_context
+```
+
+#### `src/app/book_preferred_rating_tests.rs`
+
+```text
+book_preferred_loaded_extension_named_folders_do_not_write_or_record_undo
+```
+
+#### `src/app/book_resume_meter_tests.rs`
+
+```text
+book_resume_meter_copied_data_dir_uses_existing_cache_save_restore_key
+book_resume_meter_deleted_cache_reconversion_and_source_change_resume_same_key
+```
+
+#### `src/app/browser818_activation_tests.rs`
+
+```text
+exercise_activation_with_history
+```
+
+#### `src/app/browser818_presentation_tests.rs`
+
+```text
+browser870_browser818_linked_and_multiple_open_single_with_context_owned_saving
+```
+
+#### `src/app/close_return_tests.rs`
+
+```text
+close_return_real_fullfeature_media_is_shared_until_promote_or_live_fork
+enter_source
+```
+
+#### `src/app/collection_grid.rs`
+
+```text
+assert_collection_descendant_open_round_trip
+assert_collection_native_outer_complete_temporary_origin
+collection_child_backspace_back_forward_round_trip_uses_keyboard_history
+collection_grid_error
+direct_navigation_worker_preserves_collection_physical_owner
+direct_navigation_worker_rejects_collection_owner_staled_after_admission
+g1_collection_real_handler_reopen_preserves_vertical_flow_and_book_return
+grid_collection_folder_carries_owner_without_applying_effects
+grid_folder_enter_and_gamepad_defer_visible_effects_until_adoption
+grid_folder_rating_suppression_uses_admitted_session_value_at_commit
+poll_real_history_load
+rating_child_backspace_back_forward_round_trip_uses_keyboard_history
+real_cached_epub_direct_warm_placeholder_commits_before_worker_result
+real_epub_ab_switch_changes_slot_only_after_prepared_adoption
+real_epub_ordinary_back_and_forward_replay_adopts_one_outer_point
+```
+
+#### `src/app/collection_navigation.rs`
+
+```text
+ready_collection_child_preflight_waits_for_listing_identity_or_surface_switch
+ready_direct_classifier_waits_for_listing_identity_or_surface_switch
+```
+
+#### `src/app/drive_jump_tests.rs`
+
+```text
+drive_jump_classified_directories_keep_worker_scan_and_original_navigation
+```
+
+#### `src/app/folder_pane_reclick_stage2_tests.rs`
+
+```text
+reclick_stage2_aggregate_fixture
+reclick_stage2_fixture
+```
+
+#### `src/app/folder_pane_reclick_tests.rs`
+
+```text
+folder_pane_reclick_does_not_replace_pending_history_navigation
+folder_pane_reclick_same_pass_ready_order_refresh_is_replaced
+reclick_fixture
+reclick_pending_pane_scenario
+reclick_single_scenario
+```
+
+#### `src/app/folder_pane_refresh_tests.rs`
+
+```text
+folder_pane_label_req40_completed_navigation_collapses_prior_ancestors
+folder_pane_reported_delete_is_reflected_after_main_list_acceptance_without_tree_input
+frame_end_tree_toggle_scenario
+label_double_click_scenario
+navigation_tree_fixture
+scrollable_tree_click_fixture
+```
+
+#### `src/app/gamepad_input.rs`
+
+```text
+epub_modal_blocks_ring_and_keyboard_history_dispatch
+```
+
+#### `src/app/list_order_everything_tests.rs`
+
+```text
+commit_row
+finish_landing
+landing_fixture
+list_order_everything_admission_requires_current_outer_run_and_accepted_dataset_run
+list_order_everything_internal_open_physical_book_reports_unavailable_from_real_key_handler
+retained_parent_internal_open_repro
+```
+
+#### `src/app/list_order_ratingnav649_tests.rs`
+
+```text
+folder_enter_auto_open
+ratingnav649_enter_and_pointer_folder_receipt_preserve_history_return
+ratingnav649_gamepad_extension_named_folder_keeps_existing_receipt
+ratingnav649_smart_pointer_consumed_open_does_not_fall_through_to_secondary_click
+scenario
+settle
+```
+
+#### `src/app/list_order_tests.rs`
+
+```text
+list_order_cancelled_pdf_then_existing_folder_open_still_resolves_frozen_order
+list_order_capture_uses_folder_listing_name_and_date_sorts_both_ways
+```
+
+#### `src/app/list_order_virtual_tests.rs`
+
+```text
+configure_fixture
+finish_reopen
+```
+
+#### `src/app/location_jump.rs`
+
+```text
+location_and_address_plain_physical_dispatch_scan_off_caller_and_adopt_once
+location_jump_everything_physical_child_exits_to_drive_list_with_pre_search_history
+```
+
+#### `src/app/menubar_search_jump_tests.rs`
+
+```text
+menubar_plain_favorite_uses_existing_direct_navigation_and_history
+```
+
+#### `src/app/multiwindow_scenario_tests.rs`
+
+```text
+multiwindow_rating_folder_reload_keeps_sibling_order_and_generation
+rating_publication_reaches_main_and_two_detached_without_reordering_siblings
+run_scenario_a
+```
+
+#### `src/app/native_backdrop_navigation_tests.rs`
+
+```text
+native_backdrop_plain_favorite_and_direct_keep_immediate_loader_cleanup
+```
+
+#### `src/app/rar_archive_cache_tests.rs`
+
+```text
+load_settled_folder
+rar_archive_cache_completed_probe_cancelled_before_adoption_keeps_new_folder
+```
+
+#### `src/app/search_nav_book_tests.rs`
+
+```text
+search_nav_book_retained_result_child_records_saved_origin_route_and_real_back_restores_it
+settle_target
+```
+
+#### `src/app/search_nav_boundary_tests.rs`
+
+```text
+fixture
+poll
+settle
+```
+
+#### `src/app/search_nav_entry_inventory_tests.rs`
+
+```text
+physical_parent_case
+```
+
+#### `src/app/section375_c1_tests.rs`
+
+```text
+section1375_c1_promoted_physical_reader_ignores_actual_change_and_late_restart
+```
+
+#### `src/app/section375_tests.rs`
+
+```text
+fixture
+section1375_automatic_origin_survives_match_diff_restart_resume_and_defer
+section1375_delete_during_initial_stack_extraction_or_grouping_resumes_only_after_success
+section1375_delete_hidden_candidate_and_no_visible_idx_still_reconcile
+section1375_delete_mixed_directory_mtime_observes_without_display_sort_stamp_change
+section1375_direct_reader_both_forks_rebind_only_saved_physical_basis
+section1375_favorite_effective_projection_key_matches_worker_and_first_equal
+section1375_physical_folder_zip_pdf_epub_video_audio_delete_equal
+section1375_same_second_file_overwrite_is_observed_by_actual_worker
+section1375_search_root_delete_does_not_dispatch_physical_folder_reload
+section1375_stack_flat_and_retained_aggregate_rebind_physical_record_for_equal
+section1375_stack_flat_delete_rebuilds_retained_singleton_metadata_and_maps
+section1375_stack_late_hydration_keeps_automatic_import_policy_and_group_cursor_owner
+section1375_stack_member_changes_and_equal_facet_details_keep_projection
+section1375_stack_retained_read_failure_keeps_flat_until_ordinary_reload
+section1375_stack_self_delete_equal_opens_remaining_stack_after_image_or_folder
+section1375_stack_zero_success_keeps_view_and_pending_switch
+section1375_tag_and_edit_sidecar_policy_off_on_explicit_and_open
+```
+
+#### `src/app/sidecar_restore.rs`
+
+```text
+visibility_detached_folder_auto_first_display_completes_or_terminates_its_owner
+```
+
+#### `src/app/similar_navigation_tests.rs`
+
+```text
+control_required_scan
+controlled_scan_channel
+detached_required_scan_failure_without_a_page_exits_the_password_wait_owner
+disconnected_required_scan_uses_the_same_terminal_failure_boundary
+embedded_similar_move_update_pump_does_not_consume_a_passive_context_scan
+embedded_similar_move_update_pump_leaves_non_required_scan_for_normal_tail
+image_scan
+send
+```
+
+#### `src/app/smart_folder.rs`
+
+```text
+section1853_cancelled_smart_origin_fallback_keeps_visible_owner_until_install
+section1853_deleted_smart_return_wait_keeps_owner_and_rejects_deleted_definition
+```
+
+#### `src/app/startup_default_tests.rs`
+
+```text
+startup_default_and_explicit_global_search_entry_retire_pending_main_open
+startup_default_late_tree_favorite_and_dfs_requests_retire_the_old_default
+startup_default_remote_return_preserves_an_already_adopted_local_folder
+startup_default_same_folder_keeps_existing_history_without_an_extra_departure
+```
+
+#### `src/app/startup_ops.rs`
+
+```text
+section1285_deferred_modal_target_is_replaced_by_explicit_local_navigation
+section1285_reload_keeps_unresolved_initial_request_without_user_navigation
+section1285_remote_retains_deferred_target_through_operations_and_local_reload
+section1285_same_location_explicit_open_replaces_deferred_target_but_reload_keeps_it
+```
+
+#### `src/app/startup_scan_policy_tests.rs`
+
+```text
+fixture
+```
+
+#### `src/app/startup_scan_tests.rs`
+
+```text
+fixture
+```
+
+#### `src/app/subfolder_expansion.rs`
+
+```text
+g1_subfolder_real_handler_reopen_restores_legacy_flow_and_book_return
+section1853_subfolder_exit_and_toggle_keep_visible_state_until_return_install
+```
+
+#### `src/app/tag_view_list_order_tests.rs`
+
+```text
+tag_list_order_adoption_replaces_only_matching_run_and_row
+tag_list_order_grid_request_supersedes_direct_navigation_scan
+```
+
+#### `src/app/tag_view_open_supersession_tests.rs`
+
+```text
+fixture
+tag_view_open_supersession_sibling_edge_keeps_real_current_view_order_refresh
+tag_view_open_supersession_tag_accepts_and_retires_direct_navigation_scan
+```
+
+#### `src/app/tests.rs`
+
+```text
+a_ring_sort_order_reloads_the_window_the_ring_was_opened_in
+accepted_epub_retires_pending_dfs_after_classification_but_ignore_keeps_it
+archive_suffix_directories_open_as_folders_under_ignore
+auto_fullscreen_image_folder_ignores_mixed_folder_after_load
+auto_fullscreen_image_only_folder_opens_page_after_load
+auto_fullscreen_image_only_folder_preserves_grid_intent_for_always_new_detached
+bookmark_direct_open_retires_pending_history_preflight
+detached_pdf_password_owner_blocks_new_main_open_without_changing_sibling
+direct_epub_conversion_resumes_deferred_surface_adoption
+direct_epub_modal_or_cold_enumeration_preserves_source_through_history_request
+direct_pdf_password_continuation_keeps_source_until_retry_or_cancel
+direct_pdf_rows_and_surface_commit_with_enumeration_result
+ensure_final_composite_never_leaves_stuck_incomplete_entry
+epub_batch_completion_refreshes_grid_and_applies_same_name_pdf_priority
+failed_rating_read_opens_and_reloads_with_name_order_and_ordinary_prewarm
+file_organize_destinations_direct_handler_adopts_folder_and_history
+folder_history_back_and_forward_restore_reading_history_without_folder_load
+folder_history_back_restores_preserved_subfolder_expansion_snapshot
+folder_to_drive_list_records_back_target_and_restores_both_directions
+idle_upgrade_recheck_keeps_waking_inside_margin_window
+ignored_archive_file_does_not_retire_pending_direct_pdf_owner
+installed_prepared_cache_replays_a_write_after_read_even_if_seen_advanced
+later_rating_chunk_failure_installs_the_standard_order_cache_and_filter
+leaving_smart_folder_session_discards_result_and_synthetic_return_rescans
+letterbox_real_grid_folder_icon_touch_cancel_and_double_tap
+letterbox_real_grid_folder_icons_own_inner_area_with_setting_on_and_off
+listed_epub_directory_opens_as_folder_under_ignore
+main_folder_candidate_fallback_updates_reading_history_at_adoption
+main_window_title_hides_synthetic_path_during_search_close_and_restores_adopted_path
+mixed_path_history_replay_accepts_old_spelling_and_restores_the_same_folder
+mutation_refresh_rating_child_and_backing_alias_keep_parent_chain_and_history
+navigation_cancels_archive_bookmark_scan_and_drops_late_result
+navigation_cancels_book_request_after_resolver_completion
+nested_smart_convertible_history_keeps_logical_kind_and_cache_alias
+nested_smart_pdf_history_reopens_as_pdf_after_source_session_is_gone
+newer_open_classification_cancels_old_result_without_adopting_it
+no_resident_smart_pdf_history_back_rebuilds_root_then_restores_container
+no_resident_smart_pdf_history_cancel_restores_prior_folder_and_pop_snapshot
+no_resident_smart_pdf_missing_root_row_rolls_back_history
+no_resident_smart_pdf_password_cancel_rolls_back_history_after_root_prepare
+normal_navigation_cancels_normal_archive_scan
+normal_navigation_cancels_slow_bookmark_resolve_and_ignores_late_result
+offscreen_parked_root_delete_is_not_resurrected_by_history_back
+park_terminates_classification_history_pdf_and_zip_without_adopting
+pdf_password_prompt_blocks_new_direct_open_but_its_retry_proceeds
+phase_b_reading_history_opened_folder_resolves_masked_member_before_paint
+physical_rating_reload_restores_the_exact_selected_path
+poll_folder_pane_open_returns_ready_without_loading
+quick_folder_none_startup_pdf_password_cancel_exit_reload_preserves_ownership
+realmachine50_foreign_zip_offer_transfers_main_origin_and_cancel_does_not_handoff
+same_folder_reload_preserves_history_with_archive_dialog
+same_name_test_folder_reports_its_folded_and_unsupported_entries
+section1335_direct_zip_exit_restart_keeps_explicit_parent_list
+section1339_address_bar_zip_enter_keeps_copied_path_across_row_refresh
+section1339_cold_pdf_success_retires_ready_retained_warm_verification_once
+section1339_direct_password_retry_keeps_same_navigation_until_single_adoption
+section1339_direct_warm_pdf_adopts_facet_and_history_before_verification_once
+section1339_foreign_zip_conversion_cancel_and_cached_hydration_keep_same_location
+section1339_main_pane_admission_retires_classification_even_if_pane_is_cancelled
+section1339_main_pane_admission_retires_rating_navigation_even_if_pane_is_cancelled
+section1339_new_rating_admission_retires_old_classification_before_new_request_cancel
+section1339_new_smart_admission_retires_each_old_typed_request_before_smart_cancel
+section1339_parent_failure_and_supersession_do_not_leak_child_selection_hint
+section1339_plain_main_converted_archive_preserves_source_until_owned_cached_zip_adoption
+section1339_plain_zip_grid_handler_adopts_only_usable_rows_and_reload_keeps_manual_restore
+section1339_quick_native_proof_survives_rows_but_rejects_switch_epoch
+section1339_rating_zip_backspace_back_forward_restashes_live_parent
+section1339_reported_rating_zip_fullscreen_bs_toolbar_back_forward
+section1339_smart_surface_survives_real_pdf_verification_but_row_request_expires
+section1339_successful_parent_backspace_selects_the_exact_departed_child
+section1339_zip_nested_level_history_reentry_uses_the_prepared_fresh_root_route
+section1339_zip_same_location_reload_reconciles_prepared_prefix_and_manual_restore
+section1353_disappeared_level_uses_parent_facet_and_new_backspace_stack
+section1353_disappeared_level_with_root_collapse_restores_actual_parent_facet
+section1353_grid_reload_key_preserves_zip_level_cursor_facet_and_history
+section1353_refresh_cancel_and_stale_results_keep_the_current_location
+section1353_staged_folder_refresh_reexecutes_submitted_search_on_new_rows
+section1705_alt_history_from_focused_empty_local_input_moves_and_retires_focus
+section1705_local_filter_and_empty_bar_allow_history_keys_and_dispatch
+smart_convertible_zip_late_result_cannot_replace_a_new_folder
+smart_folder_drill_parent_search_snapshot_and_history_round_trip_keep_scope
+smart_fullscreen_folder_nav_carries_continuation_into_nested_zip_and_cancel
+snapshot_out_of_scope_load_is_refused_before_main_state_effects
+snapshot_refusal_before_both_claim_sites_preserves_running_archive_open_owner
+snapshot_refusal_preserves_conflicting_bookmark_open_owner
+snapshot_refusal_preserves_unresolved_startup_open_owner
+staged_and_direct_epub_modals_block_new_opens_on_same_path
+staged_epub_ask_stale_error_and_cancel_keep_old_location
+staged_epub_ignore_retires_only_request_and_convert_policy_has_typed_child
+staged_epub_publication_resumes_same_request_and_adopts_once
+staged_epub_save_pdf_is_explicit_destination_without_popping_epub_replay
+staged_smart_folder_superseded_child_keeps_new_folder_navigation
+staged_smart_history_root_commits_once_and_does_not_suppress_next_navigation
+successful_rating_load_installs_complete_zero_cache_without_ui_prewarm
+test_script_counts_delegated_smart_start_once_through_adoption
+test_script_counts_delegated_zip_start_once_through_adoption
+test_script_counts_direct_archive_owner_without_recounting_cache_hydration
+test_script_counts_history_back_once_through_adoption
+test_script_counts_superseded_refresh_starts_before_completion
+test_script_counts_the_actual_refresh_folder_request
+test_script_does_not_count_zip_foreign_conversion_continuation
+tree_sort_change_cancellation_rejects_old_order_result_but_keeps_exact_pane_open
+visible_thumb_adjustment_4k_175pct_timing
+warm_pdf_direct_open_absent_from_current_rows_adopts_placeholders
+warm_pdf_direct_open_commits_placeholder_and_history_failure_keeps_source
+warm_pdf_navigation_absent_from_rows_adopts_before_worker
+warm_pdf_verification_keeps_placeholder_thumbnail_workers_or_rebuilds_them
+warm_pdf_verifier_survives_failed_or_cancelled_cold_direct_candidate
+```
+
+#### `src/app/tests/archive_inner_book_s1.rs`
+
+```text
+section1675_snapshot_zipdir_keeps_explicit_list_navigation
+section1676_collection_live_and_terminal_close_preserve_owner_and_back_out
+section1676_physical_history_roundtrip_does_not_restore_list_choice
+section1676_subfolder_origin_keeps_existing_physical_backout_after_chosen_close
+settle
+settle_rating
+settle_smart
+```
+
+#### `src/app/tests/bookmark_build_adoption.rs`
+
+```text
+bookmark_build_folder_adoption_retires_worker_and_preserves_audio_sidecar
+bookmark_build_late_owner_proof_rejects_held_reply_after_folder_adoption
+```
+
+#### `src/app/tests/browser870.rs`
+
+```text
+browser870_directory_books_and_three_favorite_guards_do_not_remember
+browser870_live_root_switch_controls_saving_before_reload_and_retains_old_rows
+browser870_load_preserves_non_presentation_preferences
+browser870_metadata_completion_preserves_live_presentation_and_imports_other_values
+browser870_non_directory_and_replacement_do_not_inherit_directory_provenance
+```
+
+#### `src/app/tests/ctrl_down_close_1678.rs`
+
+```text
+section1678_direct_main_open_keeps_branch_list_but_wrapper_opens_page
+section1678_main_and_linked_ctrl_down_end_in_branch_list
+```
+
+#### `src/app/tests/direct_navigation_worker_scan.rs`
+
+```text
+capture_destination_existing_opens_like_pane_navigation
+capture_destination_missing_warns_without_replacing_current_listing
+capture_destination_other_scan_errors_keep_generic_warning
+direct_navigation_worker_admission_after_real_dfs_poll_retires_sequence
+direct_navigation_worker_admission_takes_and_retires_global_fullscreen_reservation
+direct_navigation_worker_dfs_admission_cancels_only_replaceable_scan
+direct_navigation_worker_dispatch_has_zero_caller_scans_and_adopts_once
+direct_navigation_worker_history_navigation_replaces_pending_scan
+direct_navigation_worker_history_wait_keeps_released_escape_stack_toggle
+direct_navigation_worker_original_navigation_is_not_recaptured
+direct_navigation_worker_pane_retirement_does_not_retain_older_direct_scan
+direct_navigation_worker_preserves_unmarked_presentation_intents
+direct_navigation_worker_quick_folder_round_trip_retires_old_epoch
+direct_navigation_worker_ready_scan_yields_to_same_frame_navigation_inputs
+direct_navigation_worker_rejected_address_input_cancels_prior_scan_in_actual_frame
+direct_navigation_worker_rejected_filtered_backspace_cancels_prior_scan
+direct_navigation_worker_route_excludes_virtual_and_sibling_contexts
+direct_navigation_worker_snapshot_refusal_keeps_existing_owner_and_history
+direct_navigation_worker_stale_failure_and_disconnect_preserve_listing
+direct_navigation_worker_successful_pdf_claim_outside_frame_retires_scan
+direct_navigation_worker_uncached_pdf_acceptance_retires_scan_before_pdf_completion
+direct_navigation_worker_unmarked_producers_scan_off_caller_and_keep_adoption
+section1853_policy_rescan_keeps_same_continuation_token_clock_and_admission
+section1853_reasoned_ui_scan_routes_keep_synchronous_adoption
+section1853_worker_continuation_commits_captured_effects_and_selection_once
+section1853_worker_error_and_disconnect_retire_reservation_and_selection
+section1853_worker_ready_rejects_sibling_document_modal_without_adoption
+```
+
+#### `src/app/tests/everything_close_return.rs`
+
+```text
+open
+```
+
+#### `src/app/tests/facet_835.rs`
+
+```text
+image_fixture
+```
+
+#### `src/app/tests/facet_835/ranges.rs`
+
+```text
+media_fixture
+```
+
+#### `src/app/tests/file_type_visibility_fixes.rs`
+
+```text
+assert_excluded
+visibility_bookmark_actor_routes_same_book_results_to_different_context_policies
+visibility_bookmark_cache_reopen_uses_accepted_policy_and_restores_rows
+visibility_bookmark_context_bundles_keep_concurrent_policies_completions_and_close_scoped
+visibility_bookmark_mutation_invalidates_matching_bundles_and_preserves_unrelated_owner
+visibility_bookmark_projection_rejects_same_context_late_container_completion
+visibility_settings_ok_snapshot_reader_close_and_reopen_reload_origin
+visibility_shared_archive_admission_uses_only_the_mounted_matching_source_pair
+```
+
+#### `src/app/tests/g1_extracted_handlers.rs`
+
+```text
+exercise_entrance
+```
+
+#### `src/app/tests/grid_edge_buttons_1855.rs`
+
+```text
+harness
+```
+
+#### `src/app/tests/history_parent_1473.rs`
+
+```text
+matrix
+nested_rating_history_case
+section1473_bookmark_entrance_direct_exit_must_not_cycle_parent
+section1473_bookmark_entrance_restores_stable_key_and_scroll_then_its_parent
+section1473_both_markers_truncated_equal_revisit_keeps_entrance_destination
+section1473_equal_entrance_revisit_via_rating_keeps_complete_back_forward
+section1473_expansion_entrance_owns_complete_restore
+section1473_folder_bar_second_parent_keeps_physical_ancestors
+section1473_folder_descendant_does_not_resurrect_expired_book_return
+section1473_marker_presence_selects_back_or_direct_without_losing_entrance_position
+section1473_other_owned_entrances_survive_history_and_book
+section1473_other_synthetic_roots_parent_inventory
+section1473_rating_exit_keeps_its_own_complete_origin
+section1473_reading_history_root_parent_never_opens_internal_data
+section1473_returned_history_back_candidate_consumes_self_marker_first
+section1473_search_transfers_complete_canonical_origin
+section1473_smart_and_collection_physical_entrances_keep_native_root_and_origin
+section1473_snapshot_exit_cancel_keeps_visible_root_and_ends_fixed_scope
+section1473_snapshot_exit_restores_complete_native_canonical_owners
+section1473_snapshot_keeps_input_specific_admission_and_parent_owner
+section1473_snapshot_same_path_history_has_distinct_root_and_exits_to_its_captured_visit
+section1473_snapshot_subset_cannot_overwrite_ordinary_entrance_position
+settle
+```
+
+#### `src/app/tests/history_parent_lifecycle_1473.rs`
+
+```text
+history_fixture
+```
+
+#### `src/app/tests/merge_adoption.rs`
+
+```text
+folder_adoption_prunes_audio_absence_on_its_new_worker_queue
+reading_shell_with_audio
+reading_source_reply_after_reselect_cannot_fill_new_folder
+```
+
+#### `src/app/tests/physical_parent_1672.rs`
+
+```text
+section1672_all_inputs_use_the_same_preview_and_exact_jump_selection
+section1672_history_and_search_books_exit_to_physical_list_without_old_return
+section1672_history_descendant_jump_does_not_resurrect_expired_return
+```
+
+#### `src/app/tests/plain_folder_spread.rs`
+
+```text
+plain_folder_spread_import_refresh_limits_opt_in_and_preserves_sibling_context
+plain_folder_spread_install_uses_scan_and_does_not_persist_defaults
+plain_folder_spread_requires_a_scan_fact_and_normalizes_only_the_new_default
+plain_folder_spread_saved_values_and_legacy_flow_win
+```
+
+#### `src/app/tests/rating_filter_parent_return_1721.rs`
+
+```text
+new_descendant_sibling_unrelated_and_startup_entries_still_suppress
+round_trip
+same_starred_folder_reload_does_not_suppress_after_badge_restore
+synthetic_search_and_smart_origins_allow_new_physical_entry
+unrated_child_parent_action_and_same_folder_reload_keep_explicit_filter
+zip_book_reload
+```
+
+#### `src/app/tests/rating_filter_return_1671.rs`
+
+```text
+same_backing_reload_and_switch_use_the_adopted_source
+scenario
+settle
+unadopted_canceled_and_failed_pdf_leave_the_converted_book_unchanged
+unadopted_pdf_password_terminal
+```
+
+#### `src/app/tests/same_position_double_click.rs`
+
+```text
+check_same_position
+settle
+```
+
+#### `src/app/tests/scroll_661.rs`
+
+```text
+adopt_input_destination_before_first_layout
+row_anchor_after_list_adoption
+```
+
+#### `src/app/tests/search_scan_853_tests.rs`
+
+```text
+section1853_conversion_phase_uses_captured_search_back_instead_of_new_descend
+section1853_favorite_back_defers_effects_and_preserves_released_duplicate_parent
+section1853_favorite_sibling_defers_replace_and_preserves_released_duplicate_root
+section1853_favorite_sibling_keeps_suffix_directory_classification_and_single_count
+section1853_search_back_classifies_suffix_directories_before_virtual_dispatch
+section1853_search_back_failure_or_replacement_keeps_old_stack_and_address
+section1853_search_back_immediate_refusal_restores_hint_without_stack_or_address_change
+section1853_search_back_keeps_ignored_file_classification_without_stack_effects
+section1853_tag_back_intent_is_owned_by_pdf_and_conversion_classification
+section1853_tag_back_is_preserved_by_prepared_direct_pdf_adoption
+section1853_tag_back_pops_only_at_adoption_and_next_back_requeries
+section1853_tag_back_survives_classification_and_staged_zip_adoption
+section1853_temporary_view_exit_shares_folder_preflight_and_keeps_exit_authority
+```
+
+#### `src/app/tests/search_thumb_1741.rs`
+
+```text
+section1741_everything_zip_generation_reuses_parent_catalog_and_folder_selection
+```
+
+#### `src/app/tests/section1328_session.rs`
+
+```text
+section1328_session_reading_deep_zip_parent_does_not_return_to_history
+section1328_session_subfolder_prepare_uses_destination_sort_and_category_order_for_new_and_return
+section1328_session_zip_bs_preserves_physical_and_expansion_parent_meaning
+session1328_settle
+```
+
+#### `src/app/tests/section1795.rs`
+
+```text
+finish_stack_entry
+open
+section1795_off_bookshelf_root_starts_first_but_compiled_book_keeps_positions
+section1795_off_stack_load_hints_survive_final_aggregation
+section1795_off_startup_cursor_remains_independent
+section1804_stack_hidden_load_hints_do_not_request_deselection
+section1804_stack_internal_install_keeps_departure_recording
+```
+
+#### `src/app/tests/sort_hold_838.rs`
+
+```text
+(fixture ??module)
+images
+```
+
+#### `src/app/tests/sort_hold_838/gamepad.rs`
+
+```text
+direct_replacement_blocks_item_rating
+media_fixture
+```
+
+#### `src/app/tests/sort_hold_838/lifecycle.rs`
+
+```text
+direct_navigation_replacement
+sort_hold_838_scan_error_releases_gate_without_replacing_rows
+```
+
+#### `src/app/tests/sort_hold_838/watch_849.rs`
+
+```text
+sort_worker_849_watch_and_refresh_resume_after_navigation_replacement
+```
+
+#### `src/app/tests/sort_hold_838/worker_849.rs`
+
+```text
+conversion_fixture
+```
+
+#### `src/app/tests/startup_restore.rs`
+
+```text
+book_env
+direct_tray_book_env
+direct_tray_image_folder_book_env
+extra_video_close_env
+open_selected_image_folder_book
+section1335_bookshelf_compiled_folder_direct_read_and_explicit_list_restart_differ
+section1335_collection_and_rating_folder_carriers_keep_owner_and_open_intent
+section1335_collection_root_child_and_descendant_use_adopted_physical_location
+section1335_collection_root_return_from_page_b_retains_departing_list_page_a
+section1335_departing_same_items_page_open_captures_list_cursor_before_page_navigation
+section1335_favorite_reading_sibling_fallbacks_preserve_last_accepted_physical_cursor
+section1335_filtered_search_with_retained_physical_path_keeps_parent_cursor_on_back_and_tray
+section1335_flat_filename_stack_acceptance_never_persists_member_name_as_aggregate_cursor
+section1335_grid_folder_candidate_classifies_mixed_and_image_only_without_main_commit_leak
+section1335_native_back_to_list_caller_rejects_repeat_and_accepts_explicit_press
+section1335_pending_grid_candidate_setting_change_uses_completed_scan_main_intent
+section1335_rating_folder_auto_request_records_the_actual_settled_physical_list
+section1335_reading_empty_normal_folder_then_inner_zip_keeps_restore_at_each_seam
+section1335_required_virtual_zip_exact_page_success_and_missing_page_keep_parent_record
+section1335_similar_exact_page_move_preserves_accepted_departure_before_physical_materialization
+section1335_single_image_startup_and_required_page_scan_do_not_adopt_parent_lists
+section1335_subfolder_scan_reinstall_and_read_close_preserve_parent_cursor
+section1335_synthetic_install_captures_changed_physical_departure_without_manual_capture
+section1335_tray_converted_book_returns_logical_source_parent_and_preserves_reading_resume
+section1335_tray_direct_book_with_unrelated_saved_parent_keeps_book_list_and_record
+section1335_tray_image_folder_book_setting_changed_in_f12_returns_parent_and_keeps_resume
+section1335_tray_persistence_and_restore_keep_reading_session_and_parent_list
+section1335_video_ring_close_accepts_current_folder_list_for_exit_and_restart
+section1795_off_image_folder_book_resumes_and_closes_to_same_list
+settle_book
+```
+
+#### `src/app/tests/typing/search.rs`
+
+```text
+seed_images
+```
+
+#### `src/app/tests/ui_scan_853_tests.rs`
+
+```text
+section1853_archive_named_directory_context_jump_scans_off_caller
+section1853_collection_descendant_close_keeps_physical_owner_through_parent_wait
+section1853_completed_bookmark_reader_close_uses_ordinary_parent_wait
+section1853_converted_cache_reload_keeps_logical_source_and_explicit_sync_route
+section1853_created_sibling_zip_completion_keeps_output_selection_with_worker
+section1853_delayed_terminal_close_effect_preserves_new_close_return_request
+section1853_fullscreen_close_error_and_replacement_keep_reader_and_release_lock
+section1853_fullscreen_close_keeps_reader_until_parent_install
+section1853_grid_folder_facet_parent_child_grandchild_and_back_stay_physical
+section1853_main_close_wait_does_not_block_projected_detached_context
+section1853_missing_mtime_real_folder_reload_uses_staged_refresh
+section1853_native_backdrop_seam_adopts_ready_fullscreen_close_return
+section1853_page_list_and_focus_close_retire_late_parent_reply
+section1853_parent_dialog_and_books_root_dispatch_scan_off_caller
+section1853_retired_context_bundle_drops_request_owned_fullscreen_and_selection
+section1853_second_fullscreen_close_retires_first_wait_and_adopts_same_parent
+section1853_sidecar_restore_keeps_ready_scan_owned_until_restore_terminal
+section1853_visibility_apply_retires_old_scan_before_current_list_refresh
+```
+
+#### `src/app/viewer_context_registry.rs`
+
+```text
+rating_request_reaches_park_terminal
+```
+
+#### `src/filename_stack_ui.rs`
+
+```text
+failed_rating_stack_keeps_name_order_across_saved_sort_and_rebase
+g1_subfolder_stack_book_reopen_preserves_vertical_flow_and_original_book
+hold_stack_grouping_completion
+pending_stack_rebase_keeps_prepared_sort_across_global_sort_changes
+physical_rating_request_reaches_async_stack_grouping_without_re_reading_sort_keys
+rating_read_failure_notice_survives_successful_async_stack_grouping
+visibility_settings_ok_retires_extracting_and_grouping_on_worker_scan_path
+```
+
+#### `src/global_search_ui.rs`
+
+```text
+g1_global_search_producer_new_open_reopen_and_return_preserve_flow_policy
+global_search_label_unapplied_physical_child_keeps_metadata_breadcrumb_on_everything_switch
+grid_scroll_session_search_renews_at_first_rows_and_drill_not_stream_reprojection
+```
+
+#### `src/global_search_ui/everything/tests.rs`
+
+```text
+cold_folder_video_pin_seed_cascades_and_retargets_thumbnail_owner_on_return
+folder_activation_parent_chain_gamepad_return_research_and_close_keep_one_owner
+section1431_drive_list_search_initializes_thumbnail_owner_and_restores_icons
+section1741_prepare_owner_replaced_before_ready_retries_with_current_search_pool
+section1741_search_from_folder_replaces_pool_once_for_both_producers
+```
+
+#### `src/global_search_ui/thumbnail_owner_tests.rs`
+
+```text
+section1741_metadata_prepare_owner_replaced_before_ready_retries_and_adopts
+section1741_nonsearch_pool_capture_never_borrows_outgoing_resources
+section1741_search_pool_adoption_leaves_sibling_context_unchanged
+```
+
+#### `src/remote_ipc/ui.rs`
+
+```text
+remote_static_page_progress_is_the_next_pc_open_position
+```
+
+#### `src/ui_dialogs/archive_convert/rar_cache_tests.rs`
+
+```text
+request_open
+```
+
+#### `src/ui_dialogs/favorites_editor.rs`
+
+```text
+favorite_cover_auto_crop_combo_saves_and_reloads_loaded_books_with_scoped_requests
+favorite_cover_auto_crop_delete_active_view_starts_one_order_refresh
+```
+
+#### `src/ui_dialogs/preferences.rs`
+
+```text
+assert_grid_background
+folder_cell_background_preferences_confirm_applies_saves_and_paints
+ignoring_open_epub_on_preferences_ok_does_not_select_same_named_item_in_next_book
+unrated_position_survives_preferences_ok_save_reopen_and_orders_folder
+```
+
+#### `src/ui_dialogs/preferences/transfer.rs`
+
+```text
+preferences_transfer_busy_background_menu_and_toolbar_pointer_handlers
+```
+
+#### `src/ui_fullscreen/close_return_tests.rs`
+
+```text
+close_return_captures_visible_previous_before_true_close_cleanup
+close_return_does_not_change_ctrl_folder_navigation_draw_policy
+close_return_live_render_keeps_fallback_and_input_lock_until_terminal
+close_return_page_and_jump_handlers_discard_new_targets_without_replay
+close_return_terminal_only_releases_its_own_request_and_exit_resets_panel
+close_return_waits_for_every_page_in_current_spread
+```
+
+#### `src/ui_fullscreen/page_turn/plain_folder_regression_tests.rs`
+
+```text
+folder_fixture
+```
+
+#### `src/ui_fullscreen/wheel_frame_tests.rs`
+
+```text
+egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_owner
+```
+
+#### `src/ui_main.rs`
+
+```text
+physical_parent_folder_menu_toggle_controls_toolbar_and_resets_to_hidden
+rating_and_duration_sort_controls_dispatch_one_reload_for_selected_order
+section1339_toolbar_projects_pending_cursor_and_allows_reverse_cancel
+section1684_folder_bar_native_quick_slots_and_history_keep_whitespace
+section1705_history_buttons_allow_local_filter_and_empty_bar
+section207_production_layout_all_controls_and_positions_keep_input_usable
+section207_reported_controls_keep_left_input_right_order
+section207_snapshot_label_keeps_input_minimum_order_and_panel_bounds
+section292_both_dropdowns_share_sort_and_facet_popup_consumes_wheel
+section292_locked_facet_sort_keeps_refresh_and_subfolder_grouping_usable
+```
+
+#### `src/ui_main/toolbar_bg_menu_1876_tests.rs`
+
+```text
+section1876_row_two_pinned_tag_secondary_click_keeps_tag_action
+```

@@ -1034,12 +1034,9 @@ impl App {
 
         match recv {
             Ok(result) => {
-                if result
-                    .scan_policy
-                    .as_ref()
-                    .is_some_and(|policy| *policy != self.folder_scan_policy())
-                    || result.scan_policy_mixed
-                {
+                if result.scan_policy.as_ref().is_some_and(|policy| {
+                    !policy.result_is_current(result.scan_policy_mixed, &self.folder_scan_policy())
+                }) {
                     self.continue_startup_scan(result, ctx);
                     return;
                 }
@@ -2086,7 +2083,7 @@ impl App {
                         .unwrap_or_else(|| super::StartupListIntent::container_open(auto_fullscreen)),
                     navigation,
                     MainListRequestStage::Continuation,
-                    super::DirectoryScanRoute::UiThread,
+                    super::DirectoryScanRoute::MainWorker,
                 ) {
                 FolderOpenOutcome::Loaded
                 | FolderOpenOutcome::Classifying
@@ -2281,7 +2278,7 @@ impl App {
                 restore_intent,
                 navigation,
                 MainListRequestStage::Continuation,
-                super::DirectoryScanRoute::UiThread,
+                super::DirectoryScanRoute::MainWorker,
             );
         if restore_default_cursor
             && matches!(
@@ -3323,10 +3320,9 @@ fn scan_startup_resolved_target(
         let span = correlation.map(|id| {
             event_span(Lane::Navigation, Stage::InitialTargetScan, id).watched_optional(watch)
         });
-        let before = crate::susie_loader::pool_revision();
-        let scan = policy.scan(&result.resolved.as_ref().unwrap().path, Some(cancel));
-        let after = crate::susie_loader::pool_revision();
-        result.scan_policy_mixed = before != after || before != policy.susie_pool_revision;
+        let (scan, mixed) =
+            policy.scan_checked(&result.resolved.as_ref().unwrap().path, Some(cancel));
+        result.scan_policy_mixed = mixed;
         if let Some(span) = span {
             span.finish(if cancel.load(Ordering::Relaxed) {
                 Outcome::Cancelled
@@ -4733,7 +4729,7 @@ mod tests {
         app.poll_deferred_startup_open_path(&ctx);
         assert_eq!(app.startup_open_path.as_deref(), Some(target.as_path()));
         app.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Abort);
-        app.load_folder(other.clone());
+        app.load_folder_and_finish_for_test(other.clone());
         assert!(app.startup_open_path.is_none());
         app.poll_deferred_startup_open_path(&ctx);
         assert!(app.startup_open_path_resolve_pending.is_none());
@@ -4745,12 +4741,12 @@ mod tests {
         let mut app = setup_app_for_test();
         let folder = app.tmp.path().join("adopted");
         std::fs::create_dir(&folder).unwrap();
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         let target = app.tmp.path().join("initial");
         app.set_startup_open_path(target.clone());
         app.reload_current_folder_preserving_override();
         assert_eq!(app.startup_open_path.as_deref(), Some(target.as_path()));
-        app.load_folder(folder);
+        app.load_folder_and_finish_for_test(folder);
         assert!(app.startup_open_path.is_none());
     }
 
@@ -4800,7 +4796,7 @@ mod tests {
         let target = app.tmp.path().join("initial");
         std::fs::create_dir(&folder).unwrap();
         std::fs::create_dir(&target).unwrap();
-        app.load_folder(folder);
+        app.load_folder_and_finish_for_test(folder);
         let (tx, cancel) = section1285_resolver(
             &mut app,
             StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
@@ -4844,7 +4840,7 @@ mod tests {
         let target = app.tmp.path().join("initial");
         std::fs::create_dir(&folder).unwrap();
         std::fs::create_dir(&target).unwrap();
-        app.load_folder(folder);
+        app.load_folder_and_finish_for_test(folder);
         let (_tx, cancel) = section1285_resolver(
             &mut app,
             StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),

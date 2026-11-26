@@ -48,7 +48,7 @@ fn fixture(
         GridRoute::PhysicalDfs => root.join("X.zip"),
     };
     write_zip(&x);
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     app.finish_page_identity_preparation_for_test();
     settle(app, &egui::Context::default());
     app.fullscreen_idx = None;
@@ -438,7 +438,7 @@ fn tag_view_open_supersession_tag_accepts_and_retires_direct_navigation_scan() {
         None,
         StartupListIntent::ExplicitList,
         MainListRequestStage::Admission,
-        DirectoryScanRoute::Worker,
+        DirectoryScanRoute::MainWorker,
     );
     app.settle_open_path_classification_for_test();
     assert_eq!(app.effective_folder(), Some(a.clone()));
@@ -450,7 +450,7 @@ fn tag_view_open_supersession_tag_accepts_and_retires_direct_navigation_scan() {
     assert_eq!(pending.path, target);
     assert!(matches!(
         pending.purpose,
-        FolderOpenScanPurpose::DirectNavigation
+        FolderOpenScanPurpose::DirectNavigation(_)
     ));
     let scan = pending
         .rx
@@ -1061,7 +1061,7 @@ fn tag_view_open_supersession_sibling_edge_keeps_real_current_view_order_refresh
             })
             .collect::<Vec<_>>()
     };
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     app.finish_page_identity_preparation_for_test();
     let ctx = egui::Context::default();
     settle(&mut app, &ctx);

@@ -36,6 +36,8 @@ pub(crate) use initial_placement::{
 };
 use pan_bounds::{draw_pan_correction, minimum_pan_correction};
 #[cfg(test)]
+mod close_return_tests;
+#[cfg(test)]
 mod continuous_quality_tests;
 #[cfg(all(test, windows))]
 mod depth_focus_tests;
@@ -4763,6 +4765,38 @@ enum FsNavHoldoverDecision {
     TargetReady(FsNavigationPresentation),
     Draw(FsDisplayUnitHoldover),
 }
+
+/// A close-return owns pixels, never the old sequence's input authority. Its ID
+/// joins the existing navigation payload to the new CloseReturn sequence.
+#[derive(Clone)]
+pub(crate) struct FsCloseReturnPresentation {
+    pub(crate) request_id: u64,
+    previous: Option<FsDisplayUnitHoldover>,
+    chrome: FsNavigationChromeContinuation,
+}
+
+impl std::fmt::Debug for FsCloseReturnPresentation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FsCloseReturnPresentation")
+            .field("request_id", &self.request_id)
+            .field(
+                "pages",
+                &self.previous.as_ref().map(|unit| unit.pages.len()),
+            )
+            .field("chrome", &self.chrome)
+            .finish()
+    }
+}
+
+impl PartialEq for FsCloseReturnPresentation {
+    fn eq(&self, other: &Self) -> bool {
+        self.request_id == other.request_id
+    }
+}
+impl Eq for FsCloseReturnPresentation {}
+
+static NEXT_CLOSE_RETURN_PRESENTATION_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 
 fn colorize_wait_indicator_visible(holdover: Option<&FsHoldover>, now: std::time::Instant) -> bool {
     holdover
@@ -13042,11 +13076,16 @@ impl App {
         ctx: Option<&egui::Context>,
         idx: usize,
     ) -> Option<CapturedPagedDisplayUnit> {
-        if let Some(mut unit) = self
-            .fs_holdover_tex
-            .as_ref()
-            .and_then(|holdover| holdover.last_painted_display_unit_for_snapshot(idx))
-            .cloned()
+        let close_return_draws_live = self.fs_close_return_navigation_wait_active()
+            && self.fs_close_return_current_unit_ready();
+        if let Some(mut unit) = (!close_return_draws_live)
+            .then(|| {
+                self.fs_holdover_tex
+                    .as_ref()
+                    .and_then(|holdover| holdover.last_painted_display_unit_for_snapshot(idx))
+                    .cloned()
+            })
+            .flatten()
         {
             // The holdover owns the resources, while `fullscreen_page_layout` owns the exact
             // placement produced by its most recent paint. Join those two halves here. In
@@ -14085,6 +14124,115 @@ impl App {
         crate::logger::log(format!("[fs-nav] dropped request: {signature}"));
     }
 
+    /// Called before true-close cleanup, while the currently painted unit still
+    /// owns its textures. An unresolved target must retain its previous unit.
+    pub(crate) fn capture_fullscreen_close_return_presentation(
+        &mut self,
+    ) -> Option<FsCloseReturnPresentation> {
+        if self.projected_viewer_context_id() != self.viewer_context_main()
+            || (self.fullscreen_idx.is_none() && self.fs_holdover_tex.is_none())
+        {
+            return None;
+        }
+        let close_return_draws_live = self.fs_close_return_navigation_wait_active()
+            && self.fs_close_return_current_unit_ready();
+        let painted_previous = (!close_return_draws_live)
+            .then(|| {
+                self.fullscreen_idx.and_then(|idx| {
+                    self.fs_holdover_tex
+                        .as_ref()
+                        .and_then(|holdover| holdover.last_painted_display_unit_for_snapshot(idx))
+                        .cloned()
+                })
+            })
+            .flatten();
+        let previous = painted_previous.or_else(|| match self.fs_nav_holdover_decision() {
+            FsNavHoldoverDecision::Draw(unit) => Some(unit),
+            FsNavHoldoverDecision::Unavailable | FsNavHoldoverDecision::TargetReady(_) => self
+                .fullscreen_idx
+                .and_then(|idx| self.capture_fs_display_unit(idx)),
+        });
+        let chrome = if let Some(idx) = self.fullscreen_idx {
+            self.capture_fs_navigation_chrome(idx)
+        } else {
+            self.fs_holdover_tex
+                .as_ref()
+                .and_then(FsHoldover::navigation_sequence)
+                .map_or(FsNavigationChromeContinuation::None, |sequence| {
+                    sequence.chrome
+                })
+        };
+        Some(FsCloseReturnPresentation {
+            request_id: NEXT_CLOSE_RETURN_PRESENTATION_ID
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            previous,
+            chrome,
+        })
+    }
+
+    /// Start only after the worker admission has retired the old DFS owner.
+    pub(crate) fn begin_close_return_navigation_sequence(
+        &mut self,
+        presentation: &FsCloseReturnPresentation,
+    ) {
+        self.fs_holdover_tex = Some(FsHoldover::NavigationSequence(FsNavigationSequence {
+            previous: presentation.previous.clone(),
+            chrome: presentation.chrome,
+            purpose: FsNavigationPurpose::CloseReturn {
+                request_id: presentation.request_id,
+            },
+            opened_at: std::time::Instant::now(),
+            target: FsNavigationSequenceTarget::FolderItems {
+                accepted_generation: self.items_generation,
+            },
+        }));
+        self.fs_nav_locked_gen = Some(self.items_generation);
+    }
+
+    pub(crate) fn finish_close_return_navigation_sequence(
+        &mut self,
+        request_id: u64,
+        finish: crate::app::FsNavigationSequenceFinish,
+    ) {
+        if self
+            .fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .is_some_and(|sequence| {
+                matches!(sequence.purpose,
+                FsNavigationPurpose::CloseReturn { request_id: owner } if owner == request_id)
+            })
+        {
+            self.finish_fs_navigation_sequence(finish);
+        }
+    }
+
+    fn fs_close_return_navigation_wait_active(&self) -> bool {
+        self.fs_holdover_tex
+            .as_ref()
+            .and_then(FsHoldover::navigation_sequence)
+            .is_some_and(|sequence| {
+                matches!(sequence.purpose, FsNavigationPurpose::CloseReturn { .. })
+            })
+    }
+
+    /// The live source stays installed throughout C5. Readiness is for the whole
+    /// current composition, including its supplemental cover page.
+    fn fs_close_return_current_unit_ready(&mut self) -> bool {
+        let Some(idx) = self.fullscreen_idx else {
+            return false;
+        };
+        let composition = self.spread_display_composition_for_anchor(idx);
+        composition.pages.iter().all(|page| {
+            self.resolve_fs_display_tex(page.idx, true).is_some()
+                && self
+                    .raw_navigation_display_ready(page.idx, false)
+                    .unwrap_or(true)
+                && (!self.colorize_display_requires_final_effect(page.idx)
+                    || self.current_final_composite_is_complete(page.idx))
+        })
+    }
+
     pub(crate) fn begin_fs_folder_navigation_sequence(
         &mut self,
         ctx: &egui::Context,
@@ -14206,7 +14354,9 @@ impl App {
     }
 
     pub(crate) fn finish_visible_container_fs_nav_failed(&mut self) {
-        if !self.fs_navigation_sequence_owned_by_smart_folder() {
+        if !self.fs_navigation_sequence_owned_by_smart_folder()
+            && !self.fs_close_return_navigation_wait_active()
+        {
             self.finish_fs_navigation_sequence(
                 crate::app::FsNavigationSequenceFinish::RequestFailed,
             );
@@ -14317,6 +14467,9 @@ impl App {
     }
 
     pub(crate) fn bind_fs_navigation_sequence_to_current_target(&mut self) -> bool {
+        if self.fs_close_return_navigation_wait_active() {
+            return false;
+        }
         let Some(idx) = self.fullscreen_idx else {
             return false;
         };
@@ -14782,7 +14935,14 @@ impl App {
     /// `fs_holdover_tex` は旧ページの見た目を一時的に残すビュー単位の状態。
     /// ページ枠の fallback には渡さず、描画側が `image_rect` 全体へ旧単ページ、または
     /// 画面順の旧見開き 2 ページを 1 unit としてオーバーレイする。
-    fn fs_nav_holdover_decision(&self) -> FsNavHoldoverDecision {
+    fn fs_nav_holdover_decision(&mut self) -> FsNavHoldoverDecision {
+        if self.fs_close_return_navigation_wait_active()
+            && self.fs_close_return_current_unit_ready()
+        {
+            // Ordinary drawing reflects live zoom/rotation/pan. It must not
+            // consume this sequence, its fallback, or the target-input lock.
+            return FsNavHoldoverDecision::Unavailable;
+        }
         if let Some(sequence) = self
             .fs_holdover_tex
             .as_ref()
@@ -14886,7 +15046,7 @@ impl App {
         }
     }
 
-    fn fs_nav_holdover_without_latching(&self) -> Option<FsDisplayUnitHoldover> {
+    fn fs_nav_holdover_without_latching(&mut self) -> Option<FsDisplayUnitHoldover> {
         match self.fs_nav_holdover_decision() {
             FsNavHoldoverDecision::Draw(unit) => Some(unit),
             FsNavHoldoverDecision::Unavailable | FsNavHoldoverDecision::TargetReady(_) => None,
@@ -14992,7 +15152,9 @@ impl App {
     }
 
     pub(crate) fn suspend_fs_navigation_sequence_for_password(&mut self) -> bool {
-        if self.fs_navigation_sequence_owned_by_smart_folder() {
+        if self.fs_navigation_sequence_owned_by_smart_folder()
+            || self.fs_close_return_navigation_wait_active()
+        {
             return false;
         }
         let Some(sequence) = self
@@ -15135,7 +15297,9 @@ impl App {
         // The old visible PDF/ZIP may finish verification while a Smart Ctrl traversal is
         // preparing offscreen. That generation belongs to the source view, not the new folder
         // target; only the staged request's visible adoption may satisfy this holdover.
-        if self.fs_navigation_sequence_owned_by_smart_folder() {
+        if self.fs_navigation_sequence_owned_by_smart_folder()
+            || self.fs_close_return_navigation_wait_active()
+        {
             return;
         }
         if let Some(sequence) = self
@@ -32726,6 +32890,7 @@ impl App {
                     self.similar_panel.observe_ordinary_book_page(location);
                 }
             }
+            FsNavigationPurpose::CloseReturn { .. } => return,
         }
         self.fs_nav_locked_gen = None;
         self.fs_holdover_tex = None;

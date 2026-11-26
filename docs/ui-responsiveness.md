@@ -19,9 +19,23 @@ Remote 取得では明示入力だけ延期し、既定の場所は既存の返�
 main の走査中だけ旧一覧の項目入力を止め、500 ms 後に既存の移動待ち表示を出す。解決中と兄弟 context は止めない。
 400 ms のパス確認通知は解決中だけとし、走査とその継続はブックマークの45秒の解決期限に数えない。
 検索外の `dispatch_location_jump` / `dispatch_address_input` の Physical も既存 `DirectNavigation` worker に載せる。
-通常の一覧フォルダ open・親移動・読み直し・「元の場所へ」は今回変更しない。
+§1.853 の C・D・E は、`load_folder_with_scan_claimed_with_search_origin` の唯一の未走査分岐で
+main の既定を worker へ反転した。フォルダを開く・親移動・コレクションの物理元・ダイアログ・本棚・
+検索の戻り／兄弟移動・合成一覧からの退出・ZIP 作成後の親・「元の場所へ」も、同じ呼び出しの引数を
+`DirectNavigationContinuation` に保持し、走査済みの同じ呼び出しで採用する。受付と test-script の要求数は一度だけ。
+走査の前後と採用前の policy／Susie 世代の照合は起動 resolver と共有し、不一致は同じ要求の受信口だけを交換する。
+実フォルダの読み直しは mtime が無い場合も既存の staged preflight を使う。
+フォルダを開く効果と検索の積み上げは採用時だけ確定し、合成一覧の表示状態も退出の採用まで保つ。
+待ちの間の一覧のキーは捨て、移動の入力は後勝ちにする（2026-11-26 利用者決定）。
+全画面から親へ戻る C5 は同じ worker を使い、全画面のまま `CloseReturn` sequence で待つ。
+読み込み中の表示は出さず、ページ送り・ジャンプ・スクロールは断る。拡大・回転・★は現在のページへ適用する。
+完了は通常の末尾に加え embedded／native の全画面の合流点でも回収する。
+同期の例外は理由付きの TrayClose・変換キャッシュの読直し・SnapshotLeafOpen・PlayTest・ReleaseCheck。
+main 以外の context は従来の同期経路を維持する。★固定の葉を開いて再開する続きは別項目で、
+C5・検索の戻り・合成一覧の退出は今回の対象である。
 `nav/startup_resolve_scan` に解決・走査時間と件数・source/outcome を記録する。Rust 検証・実機計測は未実施。
-詳細は [設計書 §1・§3](ui-sync-853-plan.md)。貼り付け (§1.859) の worker 化は本書 §4 と同設計書 §2 を参照。
+詳細は [設計書 §1・§3・§6](ui-sync-853-plan.md)。C・D・E のコンパイル・自動テスト・実機計測は未実施。
+貼り付け (§1.859) の worker 化は本書 §4 と同設計書 §2 を参照。
 
 ヘルプの「AI で調べる」（§1.894）の型付き AI アプリ URL と、AI 連携の窓の Codex 設定も同じ
 `external-open-*` worker に乗せる。Web の AI はその worker 内で、画像コピーと共有する世代照合付きの

@@ -29,9 +29,25 @@ pub(crate) enum ListOrderScope {
     Tag { run: u64 },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FavsearchNavAdmission {
+    Descend,
+    Back,
+    Sibling,
+}
+
+/// Search-stack effects belong to the accepted navigation, across classification,
+/// scanning and document/conversion preparation. No stack changes happen at input.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SearchNavigationAdmission {
+    pub(crate) favsearch: Option<FavsearchNavAdmission>,
+    pub(crate) tag_view: Option<TagViewNavAdmission>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TagViewNavAdmission {
     Descend,
+    Back,
     ListOrderRow { run: u64, row: PathBuf },
 }
 

@@ -327,7 +327,7 @@ fn tag_list_order_adoption_replaces_only_matching_run_and_row() {
         vec![a.clone()],
         "preparation cannot mutate return route"
     );
-    app.commit_staged_search_navigation_effects(&b, false, admission, None);
+    app.commit_staged_search_navigation_effects(&b, None, admission, None);
     assert_eq!(app.tag_view.nav_stack, vec![b.clone()]);
     assert!(app.address.ends_with("a-next"));
     for admission in [
@@ -342,7 +342,7 @@ fn tag_list_order_adoption_replaces_only_matching_run_and_row() {
         TagViewNavAdmission::Descend,
     ] {
         app.tag_view.nav_stack = vec![a.clone()];
-        app.commit_staged_search_navigation_effects(&b, false, Some(admission), None);
+        app.commit_staged_search_navigation_effects(&b, None, Some(admission), None);
         assert_eq!(app.tag_view.nav_stack, vec![a.clone(), b.clone()]);
     }
 }
@@ -540,7 +540,7 @@ fn tag_list_order_grid_request_supersedes_direct_navigation_scan() {
         None,
         StartupListIntent::ExplicitList,
         MainListRequestStage::Admission,
-        DirectoryScanRoute::Worker,
+        DirectoryScanRoute::MainWorker,
     );
     assert!(app.direct_navigation_scan_pending());
     assert!(!app.main_list_folder_navigation_adoption_pending());

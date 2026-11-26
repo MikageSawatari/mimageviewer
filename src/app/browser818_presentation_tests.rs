@@ -995,7 +995,7 @@ fn browser870_browser818_linked_and_multiple_open_single_with_context_owned_savi
         app.settings.auto_fullscreen_zip_pdf = true;
         app.settings.auto_fullscreen_image_folders = true;
         app.settings.detached_viewer_open_images_in_window = multiple;
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.spread_mode, SpreadMode::Single);
         let main_source = app.spread_presentation_source.clone();

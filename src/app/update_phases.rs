@@ -44,6 +44,9 @@ impl App {
             self.adopt_ready_drive_jump();
         } else if let Some(result) = self.poll_folder_nav() {
             self.apply_folder_nav_result(ctx, result);
+        } else {
+            #[cfg(windows)]
+            self.poll_main_embedded_required_fullscreen_folder_open(ctx);
         }
     }
 
@@ -1248,6 +1251,11 @@ impl App {
                 false,
             )
         };
+        let dispatches_fullscreen_close = fav_nav.is_none()
+            && toolbar_fav_nav.is_none()
+            && toolbar_drive_nav.is_none()
+            && input_nav.is_some()
+            && input_nav_from_fullscreen_close;
         let drive_jump_wins = fav_nav.is_none()
             && toolbar_fav_nav.is_none()
             && toolbar_drive_nav.is_none()
@@ -1350,11 +1358,9 @@ impl App {
             let mut navigate_owner = OpenRequestOwner::Navigation;
             let mut navigate_restore_intent = StartupListIntent::ExplicitList;
             let mut navigate_stage = MainListRequestStage::Admission;
-            let mut navigate_scan_route = DirectoryScanRoute::UiThread;
             let navigate = if let Some(target) = fav_nav {
                 match target {
                     crate::ui_main::LocationJumpTarget::Physical(path) => {
-                        navigate_scan_route = DirectoryScanRoute::Worker;
                         self.dispatch_favorite_navigation(path)
                     }
                     target => {
@@ -1363,7 +1369,6 @@ impl App {
                     }
                 }
             } else if let Some(path) = toolbar_fav_nav {
-                navigate_scan_route = DirectoryScanRoute::Worker;
                 self.dispatch_favorite_navigation(path)
             } else if let Some(input) = toolbar_drive_nav {
                 self.dispatch_drive_jump_input(input);
@@ -1375,20 +1380,16 @@ impl App {
                         None
                     }
                     crate::ui_main::AddressBarNav::WorkerFavorite(path) => {
-                        navigate_scan_route = DirectoryScanRoute::Worker;
                         self.dispatch_favorite_navigation(path)
                     }
                     crate::ui_main::AddressBarNav::AddressEnterPhysical(path) => {
                         self.dispatch_address_input_with_scan_route(
                             crate::ui_main::LocationJumpTarget::Physical(path),
-                            DirectoryScanRoute::Worker,
+                            DirectoryScanRoute::MainWorker,
                         );
                         None
                     }
-                    crate::ui_main::AddressBarNav::RecentFolder(path) => {
-                        navigate_scan_route = DirectoryScanRoute::Worker;
-                        Some(path)
-                    }
+                    crate::ui_main::AddressBarNav::RecentFolder(path) => Some(path),
                     crate::ui_main::AddressBarNav::Favorite(path) => {
                         self.dispatch_favorite_navigation(path)
                     }
@@ -1409,6 +1410,10 @@ impl App {
                     crate::ui_main::AddressBarNav::Direct(path, restore_intent) => {
                         navigate_restore_intent = restore_intent;
                         Some(path)
+                    }
+                    crate::ui_main::AddressBarNav::GridFolder(intent) => {
+                        self.start_grid_folder_open(intent);
+                        None
                     }
                     crate::ui_main::AddressBarNav::GridVirtual(intent) => {
                         self.start_grid_virtual_open(intent);
@@ -1498,20 +1503,16 @@ impl App {
                         .open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
                         .and_then(|nav| match nav {
                             crate::ui_main::AddressBarNav::WorkerFavorite(path) => {
-                                navigate_scan_route = DirectoryScanRoute::Worker;
                                 self.dispatch_favorite_navigation(path)
                             }
                             crate::ui_main::AddressBarNav::AddressEnterPhysical(path) => {
                                 self.dispatch_address_input_with_scan_route(
                                     crate::ui_main::LocationJumpTarget::Physical(path),
-                                    DirectoryScanRoute::Worker,
+                                    DirectoryScanRoute::MainWorker,
                                 );
                                 None
                             }
-                            crate::ui_main::AddressBarNav::RecentFolder(path) => {
-                                navigate_scan_route = DirectoryScanRoute::Worker;
-                                Some(path)
-                            }
+                            crate::ui_main::AddressBarNav::RecentFolder(path) => Some(path),
                             crate::ui_main::AddressBarNav::Favorite(path) => {
                                 self.dispatch_favorite_navigation(path)
                             }
@@ -1532,6 +1533,10 @@ impl App {
                             crate::ui_main::AddressBarNav::Direct(path, restore_intent) => {
                                 navigate_restore_intent = restore_intent;
                                 Some(path)
+                            }
+                            crate::ui_main::AddressBarNav::GridFolder(intent) => {
+                                self.start_grid_folder_open(intent);
+                                None
                             }
                             crate::ui_main::AddressBarNav::GridVirtual(intent) => {
                                 self.start_grid_virtual_open(intent);
@@ -1641,11 +1646,9 @@ impl App {
                         navigation: ready_navigation,
                     } = ready;
                     match (purpose, scan) {
-                        (FolderOpenScanPurpose::DirectNavigation, Ok(scan)) => {
-                            navigate_restore_intent = StartupListIntent::ExplicitList;
-                            navigate_pre_scan = Some(scan);
-                            navigation = ready_navigation;
-                            Some(path)
+                        (FolderOpenScanPurpose::DirectNavigation(call), Ok(scan)) => {
+                            self.resume_direct_navigation_scan(*call, scan);
+                            None
                         }
                         (
                             FolderOpenScanPurpose::JumpToPhysicalFolder { selection, origin },
@@ -1705,20 +1708,16 @@ impl App {
                         None
                     }
                     Some(crate::ui_main::AddressBarNav::WorkerFavorite(path)) => {
-                        navigate_scan_route = DirectoryScanRoute::Worker;
                         self.dispatch_favorite_navigation(path)
                     }
                     Some(crate::ui_main::AddressBarNav::AddressEnterPhysical(path)) => {
                         self.dispatch_address_input_with_scan_route(
                             crate::ui_main::LocationJumpTarget::Physical(path),
-                            DirectoryScanRoute::Worker,
+                            DirectoryScanRoute::MainWorker,
                         );
                         None
                     }
-                    Some(crate::ui_main::AddressBarNav::RecentFolder(path)) => {
-                        navigate_scan_route = DirectoryScanRoute::Worker;
-                        Some(path)
-                    }
+                    Some(crate::ui_main::AddressBarNav::RecentFolder(path)) => Some(path),
                     Some(crate::ui_main::AddressBarNav::Favorite(path)) => {
                         self.dispatch_favorite_navigation(path)
                     }
@@ -1739,6 +1738,10 @@ impl App {
                     Some(crate::ui_main::AddressBarNav::Direct(path, restore_intent)) => {
                         navigate_restore_intent = restore_intent;
                         Some(path)
+                    }
+                    Some(crate::ui_main::AddressBarNav::GridFolder(intent)) => {
+                        self.start_grid_folder_open(intent);
+                        None
                     }
                     Some(crate::ui_main::AddressBarNav::GridVirtual(intent)) => {
                         self.start_grid_virtual_open(intent);
@@ -1809,6 +1812,15 @@ impl App {
                 }
             };
             if let Some(p) = navigate {
+                if dispatches_fullscreen_close {
+                    if navigation.is_none() {
+                        navigation = self.capture_physical_open_navigation(&navigate_owner, &p);
+                    }
+                    if let Some(navigation) = navigation.as_mut() {
+                        navigation.close_return_presentation =
+                            self.take_fullscreen_close_return_presentation();
+                    }
+                }
                 self.open_direct_navigation_target_at_stage(
                     p,
                     navigate_pre_scan.take(),
@@ -1817,7 +1829,7 @@ impl App {
                     pane_epub_restore.take(),
                     navigate_restore_intent,
                     navigate_stage,
-                    navigate_scan_route,
+                    DirectoryScanRoute::MainWorker,
                 );
             }
         }

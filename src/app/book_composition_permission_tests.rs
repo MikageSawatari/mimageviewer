@@ -1021,7 +1021,7 @@ fn resume_notice_follows_materialized_open_into_its_detached_context() {
         b"fixture: no image decoding required",
     )
     .unwrap();
-    env.load_folder(folder.clone());
+    env.load_folder_and_finish_for_test(folder.clone());
     env.finish_page_identity_preparation_for_test();
     env.settings.detached_viewer_open_images_in_window = true;
     env.fs_open_intent_from_grid = true;

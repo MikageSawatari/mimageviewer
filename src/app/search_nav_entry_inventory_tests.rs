@@ -1087,7 +1087,7 @@ fn physical_parent_case(kind: usize) {
     let child = parent.join("child");
     std::fs::create_dir_all(&origin).unwrap();
     std::fs::create_dir_all(&child).unwrap();
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     let ctx = egui::Context::default();
     admit_search_result_child(&mut app, &ctx, kind, &child);
     assert!(app.grid_physical_parent_action().available());

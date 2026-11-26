@@ -209,12 +209,11 @@ impl App {
                         if !self.release_check_interaction_ready() {
                             return Err("environment: release open attempted before list interaction readiness".into());
                         }
-                        if !self.load_folder_with_scan_owned(
-                            path,
-                            None,
-                            super::OpenRequestOwner::Navigation,
+                        if !matches!(self.load_folder_or_convert_archive_with_auto_fullscreen_owned_at_scan_route(
+                            path, false, super::OpenRequestOwner::Navigation,
                             super::StartupListIntent::ExplicitList,
-                        ) {
+                            super::DirectoryScanRoute::UiThread(super::UiThreadScanReason::ReleaseCheck),
+                        ), super::FolderOpenOutcome::Loaded) {
                             return Err(
                                 "environment: normal release folder open was not admitted".into()
                             );

@@ -1807,7 +1807,7 @@ mod tests {
             view.sort_order = SortOrder::FileNameDesc;
             app.favorite_view_states.insert(favorite_id, view);
             app.settings.favorites = vec![favorite];
-            app.load_folder(root);
+            app.load_folder_and_finish_for_test(root);
             app.finish_page_identity_preparation_for_test();
             assert_eq!(app.settings.active_favorite_view_id(), Some(favorite_id));
             assert_eq!(app.settings.sort_order, SortOrder::FileNameDesc);
@@ -1962,7 +1962,7 @@ mod tests {
         app.settings.thumb_cover_auto_crop = true;
         app.settings.thumb_cover_auto_crop_folders = true;
         app.settings.favorites = vec![FavoriteEntry::new("inside".into(), inside.clone())];
-        app.load_folder(root.clone());
+        app.load_folder_and_finish_for_test(root.clone());
         app.finish_page_identity_preparation_for_test();
         assert!(!app.sidecar_restore_active());
         assert_eq!(app.items.len(), 2);

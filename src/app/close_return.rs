@@ -22,6 +22,12 @@ pub(crate) enum FullscreenCloseContinuation {
     #[default]
     None,
     Live,
+    /// Rendering resources captured before true-close cleanup. No authority from the
+    /// previous navigation sequence is transferred to this accepted close.
+    LiveWithPresentation(crate::ui_fullscreen::FsCloseReturnPresentation),
+    /// The navigation merge point has taken the return; its physical navigation
+    /// captures these resources before admission retires the return slot.
+    IssuedLive(crate::ui_fullscreen::FsCloseReturnPresentation),
     LiveZipListReturn(crate::zip_tree::ZipListReturnPlan),
     Terminal(Box<CloseReturn>),
     IssuedZipListReturn(archive_inner_book::ZipListReturnOwner),
@@ -29,7 +35,10 @@ pub(crate) enum FullscreenCloseContinuation {
 
 impl FullscreenCloseContinuation {
     pub(super) fn is_live(&self) -> bool {
-        matches!(self, Self::Live | Self::LiveZipListReturn(_))
+        matches!(
+            self,
+            Self::Live | Self::LiveWithPresentation(_) | Self::LiveZipListReturn(_)
+        )
     }
     pub(crate) fn is_pending(&self) -> bool {
         self.is_live() || matches!(self, Self::Terminal(_))
@@ -44,6 +53,14 @@ impl FullscreenCloseContinuation {
     pub(crate) fn request_live(&mut self) {
         if !self.has_accepted_request() {
             *self = Self::Live;
+        }
+    }
+    pub(crate) fn request_live_with_presentation(
+        &mut self,
+        presentation: Option<crate::ui_fullscreen::FsCloseReturnPresentation>,
+    ) {
+        if !self.has_accepted_request() {
+            *self = presentation.map_or(Self::Live, Self::LiveWithPresentation);
         }
     }
     pub(super) fn cancel_live_request(&mut self) {
@@ -77,6 +94,25 @@ enum CloseReturnEffect {
 }
 
 impl App {
+    /// Transfer only the issued close's immutable rendering payload into the normal
+    /// physical navigation owner. Unconsumed payloads retire with the return slot.
+    pub(super) fn take_fullscreen_close_return_presentation(
+        &mut self,
+    ) -> Option<crate::ui_fullscreen::FsCloseReturnPresentation> {
+        if !matches!(
+            self.pending_return_to_parent,
+            FullscreenCloseContinuation::IssuedLive(_)
+        ) {
+            return None;
+        }
+        let FullscreenCloseContinuation::IssuedLive(presentation) =
+            std::mem::take(&mut self.pending_return_to_parent)
+        else {
+            unreachable!()
+        };
+        Some(presentation)
+    }
+
     /// The accepted None -> Some reader transition ends only this context's
     /// Zip return. Other navigation variants keep their existing contract.
     pub(super) fn retire_zip_close_return_for_reader_acceptance(&mut self) {
@@ -199,6 +235,8 @@ impl App {
                 history: MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation),
                 destination: super::MainListRestoreDestination::Native,
                 selection_after_load: None,
+                close_return_presentation: None,
+                search_admission: Default::default(),
             },
         })
     }
@@ -419,7 +457,10 @@ impl App {
         use FullscreenCloseContinuation as State;
         // Input and post-render dispatch may both poll in one frame. A taken
         // return keeps its authority until execution or a new reader/admission.
-        if matches!(self.pending_return_to_parent, State::IssuedZipListReturn(_)) {
+        if matches!(
+            self.pending_return_to_parent,
+            State::IssuedZipListReturn(_) | State::IssuedLive(_)
+        ) {
             return None;
         }
         let nav = match std::mem::take(&mut self.pending_return_to_parent) {
@@ -427,11 +468,19 @@ impl App {
             State::LiveZipListReturn(plan) => Some(crate::ui_main::AddressBarNav::ZipListReturn(
                 ZipListReturnRequest::PreparedLive(plan),
             )),
-            State::Live => {
+            state @ (State::Live | State::LiveWithPresentation(_)) => {
                 if let Some((nav, selection)) = self.resolve_close_return_navigation() {
                     if selection.is_some() {
                         self.select_after_load =
                             selection.map(crate::app::AfterLoadSelection::Name);
+                    }
+                    if matches!(
+                        &nav,
+                        crate::ui_main::AddressBarNav::Direct(..)
+                            | crate::ui_main::AddressBarNav::CollectionSource { .. }
+                    ) && let State::LiveWithPresentation(presentation) = state
+                    {
+                        self.pending_return_to_parent = State::IssuedLive(presentation);
                     }
                     Some(nav)
                 } else {
@@ -465,6 +514,10 @@ impl App {
             }
             State::IssuedZipListReturn(owner) => {
                 self.pending_return_to_parent = State::IssuedZipListReturn(owner);
+                None
+            }
+            State::IssuedLive(presentation) => {
+                self.pending_return_to_parent = State::IssuedLive(presentation);
                 None
             }
         }?;

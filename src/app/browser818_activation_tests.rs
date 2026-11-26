@@ -55,13 +55,13 @@ fn exercise_activation_with_history(linked: bool) {
 
     // Establish the saved cursor by a real visit and departure, not by inserting
     // a fake DeferredFullscreen or invoking the loaded-file helper directly.
-    app.load_folder(target.clone());
+    app.load_folder_and_finish_for_test(target.clone());
     app.finish_page_identity_preparation_for_test();
     let saved_idx = image_index(&app, &historical);
     assert_ne!(saved_idx, image_index(&app, &requested));
     app.move_grid_cursor(Some(saved_idx), GridCursorIntent::Automatic);
     app.grid_scroll.set_position(123.0);
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     app.finish_page_identity_preparation_for_test();
     let saved_history = app.folder_history.get(&target).copied().unwrap();
     assert_eq!(saved_history.1, Some(saved_idx));

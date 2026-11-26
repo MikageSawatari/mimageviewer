@@ -5,7 +5,7 @@ fn reading_shell_with_audio() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf)
     app.active_quick_folder_slot = None;
     let origin = app.tmp.path().join("origin");
     std::fs::create_dir(&origin).unwrap();
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     let ctx = egui::Context::default();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while app.sidecar_restore_active() {
@@ -137,7 +137,7 @@ fn reading_source_reply_after_reselect_cannot_fill_new_folder() {
     let (mut app, _, _) = reading_shell_with_audio();
     let next = app.tmp.path().join("next");
     std::fs::create_dir(&next).unwrap();
-    app.load_folder(next.clone());
+    app.load_folder_and_finish_for_test(next.clone());
     finish_sources(&mut app);
     assert_eq!(app.current_folder.as_ref(), Some(&next));
     assert!(!app.items_are_reading_history_view);
@@ -176,7 +176,7 @@ fn folder_adoption_prunes_audio_absence_on_its_new_worker_queue() {
             .unwrap()
         );
     }
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     let ctx = egui::Context::default();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {

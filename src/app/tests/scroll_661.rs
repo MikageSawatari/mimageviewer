@@ -567,6 +567,7 @@ fn row_anchor_after_list_adoption(route: &str) {
                         OpenRequestOwner::Navigation,
                         resume
                     ));
+                    env.finish_direct_navigation_scan_for_test();
                 }
                 _ => unreachable!(),
             }
@@ -894,7 +895,7 @@ fn adopt_input_destination_before_first_layout(env: &mut App, destination: &std:
     let previous = env.grid_scroll.session();
     // Real navigation, preparation and hydration, with no destination layout yet.
     // The previous pass's stable transport widgets still own egui hit testing.
-    env.load_folder(destination.to_path_buf());
+    env.load_folder_and_finish_for_test(destination.to_path_buf());
     super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(env);
     env.finish_page_identity_preparation_for_test();
     configure_pointer_fixture_columns(env);

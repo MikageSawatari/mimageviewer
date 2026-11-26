@@ -68,7 +68,7 @@ impl App {
     }
 
     pub(crate) fn dispatch_address_input(&mut self, target: LocationJumpTarget) {
-        self.dispatch_address_input_with_scan_route(target, DirectoryScanRoute::Worker);
+        self.dispatch_address_input_with_scan_route(target, DirectoryScanRoute::MainWorker);
     }
 
     pub(crate) fn dispatch_address_input_with_scan_route(
@@ -104,7 +104,7 @@ impl App {
             return;
         }
         if !(self.global_search.active || self.favsearch.active || self.tag_view.active) {
-            self.dispatch_plain_location_jump(target, DirectoryScanRoute::Worker);
+            self.dispatch_plain_location_jump(target, DirectoryScanRoute::MainWorker);
             return;
         }
 
@@ -782,7 +782,7 @@ mod tests {
         let mut app = search_fixture(1);
         let row = app.tmp.path().join("result.zip");
         let origin = app.capture_search_open_origin();
-        app.commit_staged_search_navigation_effects(&row, false, None, origin);
+        app.commit_staged_search_navigation_effects(&row, None, None, origin);
         assert!(matches!(&app.global_search.accepted,
             crate::global_search_ui::SearchAccepted::Everything {
                 position: crate::global_search_ui::EverythingPosition::PhysicalChild { logical_source, .. }, ..
@@ -904,7 +904,7 @@ mod tests {
                 std::fs::create_dir_all(&origin).unwrap();
                 std::fs::create_dir_all(&target).unwrap();
                 std::fs::write(target.join("page.png"), []).unwrap();
-                app.load_folder(origin.clone());
+                app.load_folder_and_finish_for_test(origin.clone());
                 app.finish_page_identity_preparation_for_test();
                 let scans = super::super::folder_scan::caller_scan_count_for_test();
                 let destination = LocationJumpTarget::Physical(target.clone());

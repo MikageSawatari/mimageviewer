@@ -6350,7 +6350,7 @@ mod tests {
             std::fs::create_dir_all(&folder).unwrap();
             std::fs::write(main.join("main.jpg"), b"fixture").unwrap();
             std::fs::write(folder.join("page.jpg"), b"fixture").unwrap();
-            app.load_folder(main);
+            app.load_folder_and_finish_for_test(main);
             app.finish_page_identity_preparation_for_test();
             let main_rows = app.items.clone();
             let main_generation = app.items_generation;

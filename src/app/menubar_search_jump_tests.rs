@@ -148,7 +148,7 @@ fn menubar_plain_favorite_uses_existing_direct_navigation_and_history() {
         .expect("plain favorite must start a DirectNavigation scan");
     assert!(matches!(
         pending.purpose,
-        FolderOpenScanPurpose::DirectNavigation
+        FolderOpenScanPurpose::DirectNavigation(_)
     ));
     assert_eq!(pending.path, target);
     settle_menu_navigation(&mut app, Some(&target));

@@ -1,6 +1,13 @@
 #[cfg(windows)]
 use super::book_preferred_rating::{BookPreferredRatingTarget, ContainerRatingToast};
 use super::*;
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeVideoTargetAdmission {
+    NewInput,
+    AcceptedContinuation,
+}
 use crate::keymap::{
     CommandDisplayRow, CommandScope, FS_VIDEO_ACTIVE_SCOPES, KeyAction, VIDEO_ADJUST_SLOT_ACTIONS,
     VIDEO_SEEK_STRIP_ACTIONS,
@@ -13218,7 +13225,7 @@ impl App {
                     crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, false);
                 match target {
                     Some(idx) if idx != fs_idx => {
-                        self.open_native_video_fullscreen_from_navigation(
+                        self.open_native_video_fullscreen_from_input(
                             ctx,
                             idx,
                             crate::app::HistoryTrigger::UserChosen,
@@ -13237,7 +13244,7 @@ impl App {
                     crate::ui_helpers::boundary_navigable_idx(&self.items, &display_order, true);
                 match target {
                     Some(idx) if idx != fs_idx => {
-                        self.open_native_video_fullscreen_from_navigation(
+                        self.open_native_video_fullscreen_from_input(
                             ctx,
                             idx,
                             crate::app::HistoryTrigger::UserChosen,
@@ -15252,6 +15259,9 @@ impl App {
         fs_idx: usize,
         base_delta: i32,
     ) {
+        if !self.native_video_target_admission_allowed(NativeVideoTargetAdmission::NewInput) {
+            return;
+        }
         // tile/fast swap pending 中はナビを即時実行できないが、silent drop すると
         // 「ホイール / 前-次項目ボタンが反応しない」体感バグになる (実機 fb 2026-05-26)。
         // 最新 delta を deferred フィールドに格納し、swap 完了後の polling で drain する
@@ -15872,6 +15882,58 @@ impl App {
         ignore_resume: bool,
         history_trigger: crate::app::HistoryTrigger,
     ) {
+        self.open_native_video_target(
+            ctx,
+            idx,
+            autoplay_override,
+            ignore_resume,
+            history_trigger,
+            NativeVideoTargetAdmission::AcceptedContinuation,
+        );
+    }
+
+    /// Home/End and HUD targeting enter through the same input admission. Async
+    /// results and EOF have already been accepted and retain the continuation API.
+    #[cfg(windows)]
+    fn open_native_video_fullscreen_from_input(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        history_trigger: crate::app::HistoryTrigger,
+    ) {
+        self.open_native_video_target(
+            ctx,
+            idx,
+            None,
+            false,
+            history_trigger,
+            NativeVideoTargetAdmission::NewInput,
+        );
+    }
+
+    #[cfg(windows)]
+    fn native_video_target_admission_allowed(&self, admission: NativeVideoTargetAdmission) -> bool {
+        match admission {
+            NativeVideoTargetAdmission::AcceptedContinuation => true,
+            NativeVideoTargetAdmission::NewInput => {
+                !self.fs_nav_is_locked() && !self.fs_navigation_sequence_blocks_new_target()
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn open_native_video_target(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        autoplay_override: Option<bool>,
+        ignore_resume: bool,
+        history_trigger: crate::app::HistoryTrigger,
+        admission: NativeVideoTargetAdmission,
+    ) {
+        if !self.native_video_target_admission_allowed(admission) {
+            return;
+        }
         self.sync_main_selection_from_viewer_idx(idx);
 
         // 7e: VST ホスト表示中に native ナビ (native HUD の前後ファイル / NavigateItem / wheel) で別
@@ -16840,6 +16902,101 @@ mod native_video_display_mode_toggle_tests {
             select_native_video_display_mode_toggle(false, false),
             NativeVideoDisplayModeToggle::NoOp
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod close_return_target_admission_tests {
+    use super::*;
+
+    fn key(virtual_key: u32) -> crate::video::native_window::NativeVideoKeyEvent {
+        crate::video::native_window::NativeVideoKeyEvent {
+            receipt: crate::mouse_seek_debug::test_receipt(1),
+            virtual_key,
+            scan_code: 0,
+            extended: false,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn native_home_end_and_hud_targeting_share_folder_wait_admission() {
+        for close_return in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = crate::app::setup_app_for_test();
+            app.items = (0..3)
+                .map(|idx| GridItem::Video(PathBuf::from(format!("C:/c5/{idx}.mp4"))))
+                .collect();
+            app.visible_indices = vec![0, 1, 2];
+            app.fullscreen_idx = Some(1);
+            app.selected = Some(1);
+            if close_return {
+                let presentation = app.capture_fullscreen_close_return_presentation().unwrap();
+                app.begin_close_return_navigation_sequence(&presentation);
+            } else {
+                app.begin_fs_folder_navigation_sequence(&ctx, 1);
+            }
+            for virtual_key in [0x24, 0x23] {
+                app.dispatch_native_video_key_event(&ctx, 1, key(virtual_key));
+                assert_eq!(app.fullscreen_idx, Some(1));
+                assert_eq!(app.selected, Some(1));
+                assert!(app.native_video_fast_swap_pending.is_none());
+                assert!(app.native_video_source_swap_pending.is_none());
+            }
+            for delta in [-1, 1] {
+                app.handle_native_video_output_event(
+                    &ctx,
+                    1,
+                    0,
+                    crate::video::NativeVideoOutputEvent::NavigateItem {
+                        delta,
+                        via_wheel: false,
+                    },
+                );
+                assert_eq!(app.fullscreen_idx, Some(1));
+                assert_eq!(app.selected, Some(1));
+                assert!(app.native_video_deferred_nav_delta.is_none());
+            }
+            assert!(
+                app.native_video_target_admission_allowed(
+                    NativeVideoTargetAdmission::AcceptedContinuation
+                ),
+                "EOF and accepted asynchronous targets do not re-enter new-input admission"
+            );
+        }
+    }
+
+    #[test]
+    fn native_wait_gate_keeps_unblocked_inputs_and_swap_delta_coalescing() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Video(PathBuf::from("C:/c5/source.mp4"))];
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        assert!(app.native_video_target_admission_allowed(NativeVideoTargetAdmission::NewInput));
+        for virtual_key in [0x24, 0x23] {
+            assert!(matches!(
+                app.dispatch_native_video_key_event(&ctx, 0, key(virtual_key)),
+                NativeVideoKeyOutcome::Action(KeyAction::FsJumpFirst | KeyAction::FsJumpLast)
+            ));
+        }
+        let now = std::time::Instant::now();
+        app.native_video_fast_swap_pending = Some(NativeVideoFastSwapPending {
+            target_idx: 0,
+            target_path: PathBuf::from("C:/c5/source.mp4"),
+            source_epoch: 1,
+            started_at: now,
+            deadline: now + std::time::Duration::from_secs(2),
+            parked_live_window_id: None,
+        });
+        app.navigate_native_video_fullscreen(&ctx, 0, 1);
+        assert_eq!(app.native_video_deferred_nav_delta, Some(1));
+        app.navigate_native_video_fullscreen(&ctx, 0, -1);
+        assert_eq!(app.native_video_deferred_nav_delta, Some(-1));
+        assert_eq!(app.fullscreen_idx, Some(0));
     }
 }
 

@@ -19,7 +19,7 @@ fn media_fixture() -> (Harness, PathBuf) {
             .set_len(len)
             .unwrap();
     }
-    env.load_folder(folder.clone());
+    env.load_folder_and_finish_for_test(folder.clone());
     let mut h = Harness::new(env);
     h.adopt(&folder, 4);
     for (name, seconds) in [

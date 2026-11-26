@@ -10090,13 +10090,6 @@ impl App {
                 ) {
                     return None;
                 }
-                if !crate::folder_tree::is_virtual_folder(&p) {
-                    self.note_reading_history_open(idx);
-                    self.maybe_suppress_rating_filter_for_opened_container(idx);
-                    if auto_fullscreen {
-                        self.pending_auto_fs_open = true;
-                    }
-                }
                 Some(self.grid_physical_navigation(idx, p, auto_fullscreen))
             }
             Some(GridItem::Image(_))
@@ -12699,7 +12692,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         let folder = app.tmp.path().join("ring-modal-source");
         std::fs::create_dir(&folder).unwrap();
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.active_quick_folder_slot = None;
         let back = app.tmp.path().join("ring-modal-back");
         std::fs::create_dir(&back).unwrap();

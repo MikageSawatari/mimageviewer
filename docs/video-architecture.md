@@ -168,6 +168,15 @@ Remote の音声 decoder は対象3 demuxerの開始時だけ、`InvalidData` �
 
 ## 採用アーキテクチャ: native presenter (独立 HWND + D3D11 swap chain) 必須
 
+§1.853 C5 の対象変更は `NativeVideoTargetAdmission` で新規入力と受付済みの続きに分ける。
+Home/End は `open_native_video_fullscreen_from_input`、HUD の NavigateItem、通常 wheel、前後キー、
+native HWND の wheel、swap 待ちの出力回収は `navigate_native_video_fullscreen` から同じ `NewInput` の受付を通る。
+selection と swap の変更より前に既存の sequence／nav lock を評価するので、全画面の閉じ戻りと Ctrl+↑↓ の待ちの間も断る。
+検証済みの非同期完了と EOF の続きは既存の `open_native_video_fullscreen_from_navigation` 系から
+`AcceptedContinuation` として再審査せず進める。待ちの無い操作と swap 中の後続 delta の保持は従来どおり。
+native の背景フレームも C5 の pane 完了を回収する。[設計 §6.12](ui-sync-853-plan.md#612-c5-全画面から戻る経路-全画面の-ctrl-の待ちと同じ扱い-利用者決定-61r6)。
+この追補のコンパイル・テスト・native 実機動作は未確認。
+
 旧版では「DX12 wgpu backend なら egui_wgpu callback で zero-copy GPU 描画、それ以外
 なら CPU readback + `ctx.load_texture` で egui::Image 描画」の二経路 + 自動フォール
 バック構成だったが、v0.9 系で **native presenter** (`src/video/native_presenter`、

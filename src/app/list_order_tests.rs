@@ -190,7 +190,7 @@ fn list_order_capture_uses_folder_listing_name_and_date_sorts_both_ways() {
         ),
     ] {
         app.settings.sort_order = sort;
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.finish_page_identity_preparation_for_test();
         app.capture_main_folder_list_order(0);
         assert_eq!(
@@ -576,7 +576,7 @@ fn list_order_cancelled_pdf_then_existing_folder_open_still_resolves_frozen_orde
         );
     app.poll_pdf_enumerate();
     assert!(app.cancel_pdf_password_dialog_request());
-    app.load_folder(book);
+    app.load_folder_and_finish_for_test(book);
     app.finish_page_identity_preparation_for_test();
     assert_eq!(app.list_order_position().unwrap().1, 0);
     assert!(Arc::ptr_eq(app.list_order.as_ref().unwrap(), &snapshot));

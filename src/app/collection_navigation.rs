@@ -4404,7 +4404,7 @@ impl App {
                     restore_intent.clone(),
                     request.navigation.take(),
                     super::MainListRequestStage::Continuation,
-                    super::DirectoryScanRoute::UiThread,
+                    super::DirectoryScanRoute::MainWorker,
                 );
             match action {
                 CollectionNavigationAction::OuterFullscreen {
@@ -5464,7 +5464,7 @@ mod tests {
                 app.poll_collection_ui(&ctx);
                 std::thread::sleep(Duration::from_millis(2));
             }
-            app.load_folder(source.clone());
+            app.load_folder_and_finish_for_test(source.clone());
             app.finish_page_identity_preparation_for_test();
             let saved = CollectionGridPhysicalRestore {
                 root: CollectionGridRestore {
@@ -5622,7 +5622,7 @@ mod tests {
             }
             std::fs::write(source.join("source.jpg"), b"source").unwrap();
             std::fs::write(target.join("target.jpg"), b"target").unwrap();
-            app.load_folder(source.clone());
+            app.load_folder_and_finish_for_test(source.clone());
             app.finish_page_identity_preparation_for_test();
             let generation = app.items_generation;
             let source_items = app

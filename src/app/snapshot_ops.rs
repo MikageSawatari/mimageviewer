@@ -1923,7 +1923,10 @@ impl App {
             }
             SnapshotArchiveCacheDestination::Grid => {
                 self.snapshot_internal_nav = true;
-                self.load_folder(cached);
+                self.load_folder_with_scan_route(
+                    cached,
+                    DirectoryScanRoute::UiThread(UiThreadScanReason::SnapshotLeafOpen),
+                );
                 self.snapshot_internal_nav = false;
                 if self.rating_filter_suppressed_at.is_some() {
                     self.rebuild_visible_indices();
@@ -2132,7 +2135,10 @@ impl App {
         }
         // guard bypass
         self.snapshot_internal_nav = true;
-        self.load_folder(folder_path);
+        self.load_folder_with_scan_route(
+            folder_path,
+            DirectoryScanRoute::UiThread(UiThreadScanReason::SnapshotLeafOpen),
+        );
         self.snapshot_internal_nav = false;
         // ★一時解除中の自動発動は `maybe_restore_rating_filter_if_out_of_scope`
         // (= load_folder 末尾で呼ばれる) が現在 folder の★を見て自動再評価するので、
@@ -2274,6 +2280,9 @@ impl App {
         self.stop_projected_slideshow_playback();
         self.cancel_sidecar_restore_fullscreen_reopen();
         self.cancel_required_fullscreen_folder_open();
+        // Admission of a new close retires only this context's C5 request.
+        // Content-only teardown (including deferred TerminalClose) never calls this.
+        self.cancel_main_fullscreen_close_return_scan();
         self.cancel_inflight_order_dependent_folder_nav();
         if self.fs_nav_after_pdf_enumerate.is_some() || self.pdf_password_request.is_some() {
             self.pdf_enumerate_pending = None;
@@ -2867,7 +2876,10 @@ impl App {
                 _ => return false,
             };
             self.snapshot_internal_nav = true;
-            self.load_folder(target_path);
+            self.load_folder_with_scan_route(
+                target_path,
+                DirectoryScanRoute::UiThread(UiThreadScanReason::SnapshotLeafOpen),
+            );
             self.snapshot_internal_nav = false;
             if self.rating_filter_suppressed_at.is_some() {
                 self.rebuild_visible_indices();

@@ -224,7 +224,7 @@ fn conversion_fixture() -> AppTestEnv {
     let folder = app.tmp.path().join("conversion");
     std::fs::create_dir(&folder).unwrap();
     std::fs::write(folder.join("book.7z"), b"source").unwrap();
-    app.load_folder(folder);
+    app.load_folder_and_finish_for_test(folder);
     app.finish_page_identity_preparation_for_test();
     assert_eq!(names(&app), ["book.7z"]);
     app.checked.insert(0);

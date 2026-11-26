@@ -17,7 +17,7 @@ fn fixture() -> (AppTestEnv, PathBuf) {
     app.settings.auto_fullscreen_zip_pdf = false;
     let origin = app.tmp.path().join("origin");
     std::fs::create_dir(&origin).unwrap();
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     app.finish_page_identity_preparation_for_test();
     (app, origin)
 }

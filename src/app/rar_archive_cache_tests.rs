@@ -108,7 +108,7 @@ fn record_cache(app: &App, first: &Path, cached: &Path) {
 }
 
 fn load_settled_folder(app: &mut App, folder: PathBuf) {
-    app.load_folder(folder);
+    app.load_folder_and_finish_for_test(folder);
     let ctx = egui::Context::default();
     let deadline = Instant::now() + WORKER_TIMEOUT;
     // The ordinary UI finishes identity preparation/first display before exposing the next
@@ -696,7 +696,7 @@ fn rar_archive_cache_completed_probe_cancelled_before_adoption_keeps_new_folder(
     let replacement = app.tmp.path().join("replacement-folder");
     std::fs::create_dir_all(&replacement).unwrap();
     assert!(app.cancel_archive_convert_for_navigation("test_rar_cancel_after_scan"));
-    app.load_folder(replacement.clone());
+    app.load_folder_and_finish_for_test(replacement.clone());
     tick(&mut app, &egui::Context::default());
     assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
     assert!(app.archive_convert.is_none());

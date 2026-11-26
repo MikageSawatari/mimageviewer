@@ -77,7 +77,7 @@ fn media_fixture() -> Harness {
         write_wav(&folder.join(name));
     }
     h.env.settings.sort_order = SortOrder::FileName;
-    h.env.load_folder(folder);
+    h.env.load_folder_and_finish_for_test(folder);
     h.settle();
     assert_eq!(h.names(), ["A.wav", "B.wav", "C.wav"]);
     for (idx, duration) in [(0, 20.0), (1, 30.0), (2, 10.0)] {
@@ -379,7 +379,7 @@ fn direct_replacement_blocks_item_rating(list: bool, session_end: bool) {
         None,
         StartupListIntent::ExplicitList,
         MainListRequestStage::Admission,
-        DirectoryScanRoute::Worker,
+        DirectoryScanRoute::MainWorker,
     );
     let direct = HeldScan::capture(&mut h.env);
     sort.assert_retired();

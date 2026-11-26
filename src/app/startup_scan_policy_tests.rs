@@ -42,7 +42,7 @@ fn fixture() -> (AppTestEnv, PathBuf) {
         unsafe { SetFileAttributesW(windows::core::PCWSTR(wide.as_ptr()), FILE_ATTRIBUTE_HIDDEN) }
             .unwrap();
     }
-    app.load_folder(origin);
+    app.load_folder_and_finish_for_test(origin);
     app.finish_page_identity_preparation_for_test();
     (app, target)
 }
