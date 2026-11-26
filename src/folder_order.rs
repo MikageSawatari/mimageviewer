@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+mod listing;
+pub(crate) use listing::*;
+
 pub(crate) const DB_NAME: &str = "folder_order.db";
 
 /// Folder identities ignore trailing separators, except for rooted drive paths.
@@ -556,6 +559,8 @@ pub(crate) enum FolderOrderOperation {
 
 #[derive(Clone, Debug)]
 pub(crate) struct FolderOrderCompletion {
+    /// Viewer context that submitted this write; readers have no completion.
+    pub owner: Option<u64>,
     pub folder_key: String,
     pub revision: u64,
     pub operation: FolderOrderOperation,
@@ -587,20 +592,34 @@ enum Request {
     },
 }
 
+struct QueuedRequest {
+    request: Request,
+    owner: Option<u64>,
+}
+
 #[derive(Default)]
 struct Queue {
-    requests: VecDeque<Request>,
+    requests: VecDeque<QueuedRequest>,
     closed: bool,
 }
 
 impl Queue {
+    #[cfg(test)]
     fn push(&mut self, request: Request) {
+        self.push_owned(request, None);
+    }
+
+    fn push_owned(&mut self, request: Request, owner: Option<u64>) {
         // Only adjacent saves may replace one another. Every read, reset, rename,
         // active switch and other-folder request is a FIFO barrier.
         if let (
-            Some(Request::Save {
-                folder: old,
-                save: previous,
+            Some(QueuedRequest {
+                request:
+                    Request::Save {
+                        folder: old,
+                        save: previous,
+                    },
+                owner: previous_owner,
             }),
             Request::Save {
                 folder: new,
@@ -611,7 +630,8 @@ impl Queue {
             // A previous save may have first recorded a child that became hidden
             // (or dropped a child absent from that inventory). Such a save is a
             // meaningful transition, even before either request reaches SQLite.
-            let same_projection = old == new
+            let same_projection = *previous_owner == owner
+                && old == new
                 && previous.inventory == latest.inventory
                 && previous.listing_order.len() == latest.listing_order.len()
                 && previous.listing_order.iter().collect::<HashSet<_>>()
@@ -620,7 +640,7 @@ impl Queue {
                 self.requests.pop_back();
             }
         }
-        self.requests.push_back(request);
+        self.requests.push_back(QueuedRequest { request, owner });
     }
 }
 
@@ -640,16 +660,26 @@ impl Drop for Client {
 #[derive(Clone)]
 pub(crate) struct FolderOrderHandle {
     client: Arc<Client>,
+    owner: Option<u64>,
 }
 
 impl FolderOrderHandle {
+    /// Bind only writes submitted through this clone to their owning viewer.
+    /// The token is context identity, independent of folder and order revision.
+    pub(crate) fn for_owner(&self, owner: u64) -> Self {
+        Self {
+            client: self.client.clone(),
+            owner: Some(owner),
+        }
+    }
+
     fn submit(&self, request: Request) -> OrderResult<()> {
         let (lock, wake) = &*self.client.queue;
         let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
         if queue.closed {
             return Err(FolderOrderError::new("folder order actor stopped"));
         }
-        queue.push(request);
+        queue.push_owned(request, self.owner);
         wake.notify_one();
         Ok(())
     }
@@ -702,6 +732,7 @@ impl FolderOrderHandle {
 pub(crate) struct FolderOrderService {
     pub handle: FolderOrderHandle,
     pub completions: mpsc::Receiver<FolderOrderCompletion>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl FolderOrderService {
@@ -713,15 +744,32 @@ impl FolderOrderService {
         let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let (tx, completions) = mpsc::channel();
         let worker_queue = queue.clone();
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("folder-order".into())
             .spawn(move || run_actor(worker_queue, tx, path))?;
         Ok(Self {
             handle: FolderOrderHandle {
                 client: Arc::new(Client { queue }),
+                owner: None,
             },
             completions,
+            worker: Some(worker),
         })
+    }
+
+    /// Final-exit / worker / test boundary only. Ordinary UI drop never joins.
+    /// Close admission, drain already accepted FIFO requests, and release the DB.
+    pub(crate) fn shutdown(mut self) {
+        let (lock, wake) = &*self.handle.client.queue;
+        lock.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .closed = true;
+        wake.notify_one();
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                crate::logger::log("folder_order: worker failed during shutdown".to_owned());
+            }
+        }
     }
 }
 
@@ -744,7 +792,7 @@ fn run_actor(queue: SharedQueue, completions: mpsc::Sender<FolderOrderCompletion
     }
     let mut blocked = HashMap::<String, FolderOrderError>::new();
     loop {
-        let request = {
+        let QueuedRequest { request, owner } = {
             let (lock, wake) = &*queue;
             let mut pending = lock.lock().unwrap_or_else(|e| e.into_inner());
             while pending.requests.is_empty() && !pending.closed {
@@ -845,6 +893,7 @@ fn run_actor(queue: SharedQueue, completions: mpsc::Sender<FolderOrderCompletion
             );
         }
         let _ = completions.send(FolderOrderCompletion {
+            owner,
             folder_key: folder,
             revision,
             operation,
@@ -928,8 +977,10 @@ mod tests {
                 service: Some(FolderOrderService {
                     handle: FolderOrderHandle {
                         client: Arc::new(Client { queue }),
+                        owner: None,
                     },
                     completions,
+                    worker: None,
                 }),
                 worker: Some(worker),
                 temp,
@@ -1227,7 +1278,7 @@ mod tests {
             .unwrap();
         db.save("c:/f%_/sub", &record(2, &["c:/f%_/sub/a"]))
             .unwrap();
-        db.save("c:/fXX", &record(3, &["c:/fXX/a"])).unwrap();
+        db.save("c:/fxx", &record(3, &["c:/fxx/a"])).unwrap();
         db.save("c:/f%_", &record(4, &["c:/f%_/b"])).unwrap();
         assert_eq!(db.read("c:/f%_").unwrap(), Some(record(4, &["c:/f%_/b"])));
         assert_eq!(
@@ -1240,7 +1291,7 @@ mod tests {
             db.read("c:/f%_/sub").unwrap(),
             Some(record(2, &["c:/f%_/sub/a"]))
         );
-        assert_eq!(db.read("c:/fXX").unwrap(), Some(record(3, &["c:/fXX/a"])));
+        assert_eq!(db.read("c:/fxx").unwrap(), Some(record(3, &["c:/fxx/a"])));
     }
 
     #[test]
@@ -1542,6 +1593,7 @@ mod tests {
             Some(record(1, &["c:/f/b", "c:/f/a"]))
         );
         let done = actor.completion();
+        assert_eq!(done.owner, None);
         assert_eq!(
             (done.folder_key.as_str(), done.revision, done.operation),
             ("c:/f", 9, FolderOrderOperation::Save)
@@ -1579,6 +1631,56 @@ mod tests {
                 .try_recv()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn folder_order_owned_handles_preserve_completion_owner_and_do_not_coalesce_sibling_contexts() {
+        let temp = tempfile::tempdir().unwrap();
+        let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
+        let handle = FolderOrderHandle {
+            client: Arc::new(Client {
+                queue: queue.clone(),
+            }),
+            owner: None,
+        };
+        let first = handle.for_owner(11);
+        let sibling = handle.for_owner(22);
+        let folder = Path::new("c:/f");
+        first
+            .save(folder, save_data(1, &["c:/f/a", "c:/f/b"]))
+            .unwrap();
+        first
+            .save(folder, save_data(2, &["c:/f/b", "c:/f/a"]))
+            .unwrap();
+        // Same folder and same per-context revision still belong to another list.
+        sibling
+            .save(folder, save_data(2, &["c:/f/a", "c:/f/b"]))
+            .unwrap();
+        assert_eq!(queue.0.lock().unwrap().requests.len(), 2);
+        first.set_active(folder, false, 3).unwrap();
+        sibling.reset(folder, 3).unwrap();
+        // Run the prefilled FIFO deterministically; no actor scheduling determines
+        // whether adjacent saves were available for coalescing in this test.
+        queue.0.lock().unwrap().closed = true;
+        let (tx, completions) = mpsc::channel();
+        run_actor(queue, tx, temp.path().join(DB_NAME));
+        let done = completions
+            .try_iter()
+            .map(|completion| {
+                assert!(completion.result.is_ok());
+                (completion.owner, completion.revision, completion.operation)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            done,
+            [
+                (Some(11), 2, FolderOrderOperation::Save),
+                (Some(22), 2, FolderOrderOperation::Save),
+                (Some(11), 3, FolderOrderOperation::SetActive),
+                (Some(22), 3, FolderOrderOperation::Reset),
+            ]
+        );
+        assert_eq!(handle.owner, None);
     }
 
     #[test]
@@ -1920,6 +2022,7 @@ mod tests {
             client: Arc::new(Client {
                 queue: queue.clone(),
             }),
+            owner: None,
         };
         let read = handle.read(Path::new("c:/f")).unwrap();
         drop(ActorGuard(queue));
@@ -1948,6 +2051,7 @@ mod tests {
             client: Arc::new(Client {
                 queue: queue.clone(),
             }),
+            owner: None,
         };
         let (tx, completions) = mpsc::channel();
         let worker_path = path.clone();

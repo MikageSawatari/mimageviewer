@@ -180,6 +180,17 @@ impl App {
                     }
                     return;
                 }
+                self.adopt_folder_order_rename(vec![crate::folder_order::FolderOrderRename::new(
+                    &outcome.target,
+                    &outcome.new_path,
+                    if pending.collection_scope
+                        == crate::collection_store::CollectionSourceMigrationScope::Tree
+                    {
+                        crate::folder_order::RenameScope::Tree
+                    } else {
+                        crate::folder_order::RenameScope::Exact
+                    },
+                )]);
                 // Keep all post-rename cleanup unchanged: each path-keyed
                 // subsystem must observe the same old -> new transition.
                 self.release_viewer_surfaces_for_removed_paths(

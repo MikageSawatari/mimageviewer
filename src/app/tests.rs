@@ -1805,8 +1805,12 @@ mod folder_mtime_rescan_tests {
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
         app.current_folder_signature = Some(signature_from_scan(&scan));
         app.seed_folder_observation_for_test(&folder, &scan);
-        let listing =
-            materialize_local_folder_listing(&folder, scan.clone_for_projection(), &app.settings);
+        let listing = materialize_local_folder_listing(
+            &folder,
+            scan.clone_for_projection(),
+            &app.settings,
+            crate::folder_order::FolderOrderListingInput::NotApplicable,
+        );
         app.items = listing.items;
         app.image_metas = listing.metas;
         app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
@@ -1992,6 +1996,7 @@ mod folder_mtime_rescan_tests {
                     Default::default(),
                     std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
                     Default::default(),
+                    scan.folder_order_inventory.clone(),
                 ))
             })
             .unwrap();
@@ -5571,7 +5576,12 @@ fn unconverted_epub_grid_open_routes_to_owned_conversion_dialog() {
     let source = dir.path().join("grid-book.epub");
     std::fs::write(&source, b"not converted yet").unwrap();
     let scan = scan_directory_with_settings(dir.path(), &app.settings).unwrap();
-    let listing = materialize_local_folder_listing(dir.path(), scan, &app.settings);
+    let listing = materialize_local_folder_listing(
+        dir.path(),
+        scan,
+        &app.settings,
+        crate::folder_order::FolderOrderListingInput::NotApplicable,
+    );
     let idx = listing
         .items
         .iter()
@@ -15536,6 +15546,30 @@ pub(crate) mod phase_c_support {
     }
 
     impl AppTestEnv {
+        pub(crate) fn load_folder(&mut self, path: PathBuf) {
+            self.app.load_folder(path);
+            self.app.settle_open_path_classification_for_test();
+        }
+
+        pub(crate) fn load_folder_with_scan(&mut self, path: PathBuf, scan: Option<ScannedDir>) {
+            self.app.load_folder_with_scan(path, scan);
+            self.app.settle_open_path_classification_for_test();
+        }
+
+        pub(crate) fn load_folder_with_scan_owned(
+            &mut self,
+            path: PathBuf,
+            scan: Option<ScannedDir>,
+            owner: OpenRequestOwner,
+            intent: StartupListIntent,
+        ) -> bool {
+            let accepted = self
+                .app
+                .load_folder_with_scan_owned(path, scan, owner, intent);
+            self.app.settle_open_path_classification_for_test();
+            accepted
+        }
+
         pub(crate) fn replace_app_from_settings(
             &mut self,
             settings: crate::settings::Settings,
@@ -22063,6 +22097,8 @@ mod folder_pane_open_nav_tests {
 
     fn empty_scan() -> ScannedDir {
         ScannedDir {
+            folder_order_inventory: Default::default(),
+            folder_order_input: Default::default(),
             duration_facts: None,
             page_count_facts: None,
             precise_stamps: Default::default(),
@@ -26115,6 +26151,8 @@ mod phase_c_folder_nav_history_tests {
                 panic!("fixture expected folder preflight");
             };
             let mut scan = crate::app::folder_scan::ScannedDir {
+                folder_order_inventory: Default::default(),
+                folder_order_input: Default::default(),
                 duration_facts: None,
                 page_count_facts: None,
                 precise_stamps: Default::default(),

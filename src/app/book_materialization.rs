@@ -437,11 +437,13 @@ pub(crate) fn materialize_local_folder_listing(
     path: &std::path::Path,
     scan: ScannedDir,
     settings: &crate::settings::Settings,
+    folder_order: crate::folder_order::FolderOrderListingInput,
 ) -> MaterializedFolderListing {
     materialize_local_folder_listing_with_order(
         path,
         scan,
         settings,
+        folder_order,
         crate::rating_sort::ListingOrderRequest::from_settings(settings),
         |keys| {
             crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path())
@@ -456,6 +458,7 @@ pub(crate) fn materialize_local_folder_listing_with_order(
     path: &std::path::Path,
     scan: ScannedDir,
     settings: &crate::settings::Settings,
+    folder_order: crate::folder_order::FolderOrderListingInput,
     request: crate::rating_sort::ListingOrderRequest,
     read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
 ) -> MaterializedFolderListing {
@@ -463,6 +466,7 @@ pub(crate) fn materialize_local_folder_listing_with_order(
         path,
         scan,
         settings,
+        folder_order,
         request,
         read_rating,
         |_, _| None,
@@ -475,6 +479,7 @@ pub(crate) fn materialize_local_folder_listing_with_order_and_duration(
     path: &std::path::Path,
     scan: ScannedDir,
     settings: &crate::settings::Settings,
+    folder_order: crate::folder_order::FolderOrderListingInput,
     request: crate::rating_sort::ListingOrderRequest,
     read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
     read_duration: impl FnMut(
@@ -490,6 +495,7 @@ pub(crate) fn materialize_local_folder_listing_with_order_and_duration(
         path,
         scan,
         settings,
+        folder_order,
         request,
         read_rating,
         read_duration,
@@ -504,6 +510,7 @@ pub(crate) fn materialize_local_folder_listing_with_order_and_metadata(
     path: &std::path::Path,
     scan: ScannedDir,
     settings: &crate::settings::Settings,
+    folder_order: crate::folder_order::FolderOrderListingInput,
     request: crate::rating_sort::ListingOrderRequest,
     read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
     mut read_duration: impl FnMut(
@@ -514,6 +521,7 @@ pub(crate) fn materialize_local_folder_listing_with_order_and_metadata(
     mut read_page_count: impl FnMut(&GridItem, (i64, i64)) -> Option<crate::settings::ListingPageCount>,
 ) -> MaterializedFolderListing {
     let mut scan = scan;
+    let inventory = std::mem::take(&mut scan.folder_order_inventory);
     let precise_stamps = std::mem::take(&mut scan.precise_stamps);
     project_scanned_directory(&mut scan, &settings.file_type_visibility);
     let duration_facts = scan.duration_facts;
@@ -705,7 +713,7 @@ pub(crate) fn materialize_local_folder_listing_with_order_and_metadata(
     }
     // Candidate exclusion is complete. Rating facts are read once here, before
     // the final arrangement and before any index (including video indices) is derived.
-    let rating_order = if let crate::rating_sort::ListingOrderRequest::Rating(spec) = request {
+    let mut rating_order = if let crate::rating_sort::ListingOrderRequest::Rating(spec) = request {
         if compiled || media_sort != folder_sort {
             crate::grid_item::arrange_grid_items_with_sort_metadata(
                 &mut items,
@@ -786,6 +794,43 @@ pub(crate) fn materialize_local_folder_listing_with_order_and_metadata(
         FolderRatingOrder::Standard
     };
 
+    // Apply one flat permutation only after the legacy base arrangement. Keep all
+    // index-aligned metadata and the prepared rating cache aligned with the rows.
+    let eligible = crate::folder_order::physical_folder_order_eligible(settings, path, &items);
+    if eligible && folder_order.active_record().is_some() {
+        let keys = items
+            .iter()
+            .map(crate::folder_order::physical_item_key)
+            .collect::<Vec<_>>();
+        let permutation =
+            crate::folder_order::resolve_listing_order(&keys, &folder_order, eligible);
+        if !permutation.iter().copied().eq(0..items.len()) {
+            fn permute<T>(rows: &mut Vec<T>, permutation: &[usize]) {
+                let mut old = std::mem::take(rows)
+                    .into_iter()
+                    .map(Some)
+                    .collect::<Vec<_>>();
+                *rows = permutation
+                    .iter()
+                    .map(|index| old[*index].take().unwrap())
+                    .collect();
+            }
+            permute(&mut items, &permutation);
+            permute(&mut metas, &permutation);
+            permute(&mut sort_metas, &permutation);
+            if let FolderRatingOrder::Prepared { cache, .. } = &mut rating_order {
+                let previous = std::mem::take(cache);
+                *cache = permutation
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(new, old)| previous.get(old).map(|value| (new, *value)))
+                    .collect();
+            }
+        }
+    }
+    let folder_order =
+        crate::folder_order::FolderOrderState::from_listing(path, folder_order, inventory);
+
     let row_record = std::sync::Arc::new(FolderRowRecord::from_projection(
         path,
         &items,
@@ -794,6 +839,7 @@ pub(crate) fn materialize_local_folder_listing_with_order_and_metadata(
         &video_thumb_overrides,
     ));
     MaterializedFolderListing {
+        folder_order,
         row_record,
         items,
         metas,

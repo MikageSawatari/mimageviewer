@@ -1795,15 +1795,21 @@ impl App {
                 .clone()
                 .or_else(|| self.subfolder_expansion_root.clone());
             self.cancel_subfolder_expansion_pending();
-            self.clear_subfolder_expansion_view_state();
             if should_return_to_root {
                 if let Some(target) = return_target {
+                    // The installed expansion stays owned until the physical open adopts.
+                    // start_loading_items clears its snapshot and surface at that boundary.
                     self.load_folder(target);
+                } else {
+                    self.clear_subfolder_expansion_view_state();
                 }
-            } else if let Some(current) = self.current_folder.clone() {
-                self.address = self
-                    .book_address_label_for_path(&current)
-                    .unwrap_or_else(|| current.to_string_lossy().to_string());
+            } else {
+                self.clear_subfolder_expansion_view_state();
+                if let Some(current) = self.current_folder.clone() {
+                    self.address = self
+                        .book_address_label_for_path(&current)
+                        .unwrap_or_else(|| current.to_string_lossy().to_string());
+                }
             }
             self.show_feedback_toast("サブ展開をキャンセルしました".into());
             return;
@@ -1981,9 +1987,12 @@ impl App {
             .subfolder_expansion_saved_folder
             .clone()
             .or_else(|| self.subfolder_expansion_root.clone());
-        self.clear_subfolder_expansion_view_state();
         if let Some(target) = target {
+            // Keep the old items and their expansion owner together while the open worker
+            // reads the destination order. Successful installation clears both together.
             self.load_folder(target);
+        } else {
+            self.clear_subfolder_expansion_view_state();
         }
     }
 
@@ -3095,6 +3104,54 @@ fn remove_paths_from_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_order_expansion_exit_keeps_installed_owner_until_read_adoption() {
+        for cancel_rebuild in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            app.settings.auto_fullscreen_image_folders = false;
+            let root = app.tmp.path().join("manual-expansion-return");
+            let child = root.join("child");
+            std::fs::create_dir_all(&child).unwrap();
+            image::RgbImage::new(2, 3)
+                .save(child.join("a.png"))
+                .unwrap();
+            app.load_folder(root.clone());
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            app.start_subfolder_expansion_scan_roots(root.clone(), vec![root.clone()]);
+            let ctx = egui::Context::default();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !app.items_are_subfolder_expansion_view {
+                assert!(Instant::now() < deadline, "expansion did not adopt");
+                app.poll_subfolder_expansion(&ctx);
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            finish_list_hydration_for_test(&mut app);
+            let old_folder = app.current_folder.clone();
+            let old_generation = app.items_generation;
+            let old_items = app.items.clone();
+            if cancel_rebuild {
+                app.start_subfolder_expansion_scan_roots(root.clone(), vec![root.clone()]);
+                app.toggle_subfolder_expansion_view();
+            } else {
+                app.exit_subfolder_expansion_view();
+            }
+            assert!(app.items_are_subfolder_expansion_view);
+            assert!(app.subfolder_expansion_snapshot.is_some());
+            assert_eq!(app.current_folder, old_folder);
+            assert_eq!(app.items_generation, old_generation);
+            assert_eq!(app.items, old_items);
+            app.settle_open_path_classification_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.current_folder.as_deref(), Some(root.as_path()));
+            assert!(!app.items_are_subfolder_expansion_view);
+            assert!(app.subfolder_expansion_snapshot.is_none());
+            assert_eq!(app.items_generation, old_generation + 1);
+        }
+    }
 
     #[test]
     fn section1285_subfolder_scan_handoff_preserves_later_activation() {

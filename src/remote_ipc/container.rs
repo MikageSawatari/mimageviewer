@@ -2352,8 +2352,62 @@ struct RecomputedFolderListing {
     sort_order: crate::settings::SortOrder,
     sort_notice: Option<String>,
     thumb_aspect_height_ratio: f64,
-    sort_locked: bool,
+    sort_lock: RecomputedFolderSortLock,
     auto_fullscreen_image_folders_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecomputedFolderSortLock {
+    Unlocked,
+    PhysicalBook,
+    ManualFolder,
+}
+
+impl RecomputedFolderSortLock {
+    fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Unlocked => None,
+            Self::PhysicalBook => Some(super::BOOK_SORT_LOCK_REASON),
+            Self::ManualFolder => Some(super::MANUAL_FOLDER_SORT_LOCK_REASON),
+        }
+    }
+
+    fn physical_book(self) -> bool {
+        self == Self::PhysicalBook
+    }
+}
+
+impl RecomputedFolderListing {
+    fn sort_state(&self) -> mimageviewer_ipc::RemoteGridSortState {
+        if self.sort_lock == RecomputedFolderSortLock::ManualFolder {
+            super::remote_manual_folder_sort_state()
+        } else {
+            super::remote_grid_sort_state(
+                if self.sort_lock.physical_book() {
+                    crate::app::BOOK_READING_PAGE_ORDER
+                } else {
+                    self.sort_order
+                },
+                self.sort_lock.reason(),
+            )
+        }
+    }
+}
+
+/// The worker observes a missing store as an empty record. Existing stores are
+/// read through the separate-process read-only API; every other failure remains
+/// an explicit Read(Err), so materialization preserves the error and base order.
+fn read_remote_folder_order(
+    database: &Path,
+    folder: &Path,
+) -> Result<Option<crate::folder_order::FolderOrderRecord>, crate::folder_order::FolderOrderError> {
+    match std::fs::metadata(database) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(crate::folder_order::FolderOrderError {
+            message: error.to_string(),
+        }),
+        Ok(_) => crate::folder_order::read_remote_at(database, folder),
+    }
 }
 
 fn read_complete_folder_ratings(
@@ -3255,14 +3309,7 @@ impl ContainerEngine {
             effective_address: request.address,
             root_name: absolute_root_name(&resolved.logical),
             thumb_aspect_height_ratio: listing.thumb_aspect_height_ratio,
-            sort_state: super::remote_grid_sort_state(
-                if listing.sort_locked {
-                    crate::app::BOOK_READING_PAGE_ORDER
-                } else {
-                    listing.sort_order
-                },
-                listing.sort_locked.then_some(super::BOOK_SORT_LOCK_REASON),
-            ),
+            sort_state: listing.sort_state(),
             sort_notice: listing.sort_notice.clone(),
             entries,
             scan_ms: listing.scan_ms,
@@ -3800,14 +3847,10 @@ impl ContainerEngine {
                             ));
                         }
                         let listing = self.recompute_folder_listing(&resolved.logical)?;
-                        if crate::app::physical_page_order_locked(
-                            &self.settings,
-                            &resolved.logical,
-                            &listing.items,
-                        ) {
+                        if let Some(reason) = listing.sort_lock.reason() {
                             return Err(RemoteWriteError::new(
                                 RemoteWriteErrorCode::Unsupported,
-                                super::BOOK_SORT_LOCK_REASON,
+                                reason,
                             ));
                         }
                         Ok(())
@@ -4328,14 +4371,26 @@ impl ContainerEngine {
             )
         };
         let materialize_started = Instant::now();
+        let folder_order = read_remote_folder_order(
+            &crate::data_dir::get().join(crate::folder_order::DB_NAME),
+            folder,
+        );
+        let manual_notice = folder_order.as_ref().err().map(|error| {
+            crate::logger::log(format!(
+                "remote_ipc: folder order unavailable for {}: {error}; using base order",
+                folder.display()
+            ));
+            "手動順を読み込めなかったため通常の並び順で表示しました".to_owned()
+        });
         let materialized = crate::app::folder_scan::materialize_local_folder_listing_with_order(
             folder,
             scan,
             &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(folder_order),
             crate::rating_sort::ListingOrderRequest::from_settings(&settings),
             read_rating,
         );
-        let sort_notice = if matches!(
+        let rating_notice = if matches!(
             materialized.rating_order,
             crate::app::folder_scan::FolderRatingOrder::Failed
         ) {
@@ -4347,10 +4402,24 @@ impl ContainerEngine {
         } else {
             None
         };
+        let sort_notice = match (manual_notice, rating_notice) {
+            (Some(manual), Some(rating)) => Some(format!("{manual}\n{rating}")),
+            (manual, rating) => manual.or(rating),
+        };
         let materialize_ms = materialize_started.elapsed().as_secs_f64() * 1000.0;
         let thumb_aspect_height_ratio = folder_thumb_aspect_height_ratio(&settings, folder);
-        let sort_locked =
-            crate::app::physical_page_order_locked(&settings, folder, &materialized.items);
+        let sort_lock =
+            if crate::app::physical_page_order_locked(&settings, folder, &materialized.items) {
+                RecomputedFolderSortLock::PhysicalBook
+            } else if materialized.folder_order.applies_to_physical_listing(
+                &settings,
+                folder,
+                &materialized.items,
+            ) {
+                RecomputedFolderSortLock::ManualFolder
+            } else {
+                RecomputedFolderSortLock::Unlocked
+            };
         let auto_fullscreen_image_folders_enabled =
             settings.auto_fullscreen_image_folders_enabled();
         Ok(RecomputedFolderListing {
@@ -4365,7 +4434,7 @@ impl ContainerEngine {
             sort_order: settings.sort_order,
             sort_notice,
             thumb_aspect_height_ratio,
-            sort_locked,
+            sort_lock,
             auto_fullscreen_image_folders_enabled,
         })
     }
@@ -6277,7 +6346,8 @@ impl ContainerEngine {
         let complete_book_eligible =
             canonical_image_book && entries.len() == total && !byte_truncated;
         let shift_scope = listing
-            .sort_locked
+            .sort_lock
+            .physical_book()
             .then(|| crate::book_scope::BookScopeKey::folder(&resolved.logical).ok())
             .flatten();
         let spread = self.spread_payload_with_read(
@@ -6287,7 +6357,7 @@ impl ContainerEngine {
             Some(&source_items),
             None,
             SpreadDefaultSource::Directory {
-                book_locked: listing.sort_locked,
+                book_locked: listing.sort_lock.physical_book(),
                 canonical_image_book,
             },
             complete_book_eligible,
@@ -13065,6 +13135,212 @@ pub(super) mod tests {
         assert_eq!(names(&second.items), ["a.png", "b.png"]);
     }
 
+    struct ManualFolderOrderFixture(Option<crate::folder_order::FolderOrderService>);
+
+    impl ManualFolderOrderFixture {
+        fn save(folder: &Path, names: &[&str]) -> Self {
+            let service = crate::folder_order::FolderOrderService::start_at(
+                crate::data_dir::get().join(crate::folder_order::DB_NAME),
+            )
+            .unwrap();
+            let scan = crate::app::folder_scan::scan_directory_with_settings(
+                folder,
+                &crate::settings::Settings::default(),
+            )
+            .unwrap();
+            service
+                .handle
+                .save(
+                    folder,
+                    crate::folder_order::FolderOrderSave {
+                        listing_order: names
+                            .iter()
+                            .map(|name| crate::path_key::normalize_keep_drive(&folder.join(name)))
+                            .collect(),
+                        inventory: scan.folder_order_inventory,
+                        revision: 1,
+                    },
+                )
+                .unwrap();
+            service
+                .handle
+                .read(folder)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            Self(Some(service))
+        }
+    }
+
+    impl Drop for ManualFolderOrderFixture {
+        fn drop(&mut self) {
+            self.0.take().unwrap().shutdown();
+        }
+    }
+
+    #[test]
+    fn remote_manual_folder_order_matches_pc_across_categories_and_locks_sort() {
+        use crate::settings::{GridDisplayOrder, GridItemDisplayKind as Kind};
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("manual-order");
+        std::fs::create_dir_all(folder.join("z-folder")).unwrap();
+        std::fs::create_dir_all(folder.join("a-folder")).unwrap();
+        for name in ["m.zip", "b.png", "a.png", "z.mp4"] {
+            std::fs::write(folder.join(name), b"fixture").unwrap();
+        }
+        let _actor = ManualFolderOrderFixture::save(&folder, &["b.png", "z.mp4", "z-folder"]);
+        for grid_display_order in [
+            GridDisplayOrder::default(),
+            GridDisplayOrder::from_rows([
+                vec![Kind::VideoAudio],
+                vec![Kind::Image],
+                vec![Kind::Archive],
+                vec![Kind::Folder],
+            ]),
+        ] {
+            let settings = crate::settings::Settings {
+                sort_order: crate::settings::SortOrder::FileName,
+                details_sort_key: crate::settings::DetailsSortKey::Size,
+                grid_display_order,
+                favorites: vec![FavoriteEntry::new("Manual".to_owned(), folder.clone())],
+                ..Default::default()
+            };
+            let scan =
+                crate::app::folder_scan::scan_directory_with_settings(&folder, &settings).unwrap();
+            let base = crate::app::materialize_local_folder_listing(
+                &folder,
+                scan.clone_for_projection(),
+                &settings,
+                crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+            );
+            let read = read_remote_folder_order(
+                &data_dir.path().join(crate::folder_order::DB_NAME),
+                &folder,
+            );
+            let local = crate::app::materialize_local_folder_listing(
+                &folder,
+                scan,
+                &settings,
+                crate::folder_order::FolderOrderListingInput::from_read(read),
+            );
+            let expected = local
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(&expected[..3], ["b.png", "z.mp4", "z-folder"]);
+            let unknown_base = base
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .filter(|name| !["b.png", "z.mp4", "z-folder"].contains(&name.as_str()))
+                .collect::<Vec<_>>();
+            assert_eq!(&expected[3..], unknown_base);
+            let engine = ContainerEngine::new(settings);
+            let address = RemoteAddress::file(folder.to_string_lossy().into_owned());
+            let FolderListResponse::Success(payload) = engine.folder_list(FolderListRequest {
+                address: address.clone(),
+            }) else {
+                panic!("manual folder listing failed");
+            };
+            assert_eq!(
+                payload
+                    .entries
+                    .iter()
+                    .map(|entry| &entry.name)
+                    .collect::<Vec<_>>(),
+                expected.iter().collect::<Vec<_>>()
+            );
+            assert_eq!(payload.sort_state.selected, "manual");
+            assert_eq!(payload.sort_state.options.len(), 1);
+            assert_eq!(payload.sort_state.options[0].value, "manual");
+            assert_eq!(
+                payload.sort_state.locked_reason.as_deref(),
+                Some(super::super::MANUAL_FOLDER_SORT_LOCK_REASON)
+            );
+            assert_eq!(payload.sort_notice, None);
+            let mut request = RemoteWriteRequest::SetSortOrder {
+                scope: mimageviewer_ipc::RemoteGridScope::Address { address },
+                sort_order: "FileName".to_owned(),
+            };
+            let error = engine.validate_write_request(&mut request).unwrap_err();
+            assert_eq!(error.code, RemoteWriteErrorCode::Unsupported);
+            assert_eq!(error.message, super::super::MANUAL_FOLDER_SORT_LOCK_REASON);
+        }
+    }
+
+    #[test]
+    fn remote_manual_folder_record_does_not_override_fixed_physical_book_order() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("image-book");
+        std::fs::create_dir(&folder).unwrap();
+        for name in ["001.png", "002.png"] {
+            std::fs::write(folder.join(name), b"fixture").unwrap();
+        }
+        let _actor = ManualFolderOrderFixture::save(&folder, &["002.png", "001.png"]);
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            auto_fullscreen_zip_pdf: true,
+            auto_fullscreen_image_folders: true,
+            favorites: vec![FavoriteEntry::new("Book".to_owned(), folder.clone())],
+            ..Default::default()
+        });
+        let listing = engine.recompute_folder_listing(&folder).unwrap();
+        assert_eq!(listing.sort_lock, RecomputedFolderSortLock::PhysicalBook);
+        assert_eq!(
+            listing
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>(),
+            ["001.png", "002.png"]
+        );
+        assert_ne!(listing.sort_state().selected, "manual");
+    }
+
+    #[test]
+    fn remote_manual_order_missing_store_is_observed_empty_and_corruption_keeps_base_listing() {
+        let data_dir = crate::data_dir::TestDataDirGuard::new();
+        let folder = data_dir.path().join("manual-read-error");
+        std::fs::create_dir(&folder).unwrap();
+        for name in ["b.png", "a.png"] {
+            std::fs::write(folder.join(name), b"fixture").unwrap();
+        }
+        let database = data_dir.path().join(crate::folder_order::DB_NAME);
+        assert_eq!(read_remote_folder_order(&database, &folder).unwrap(), None);
+        assert!(!database.exists());
+        let corrupt = b"unreadable folder order database";
+        std::fs::write(&database, corrupt).unwrap();
+        assert!(read_remote_folder_order(&database, &folder).is_err());
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            sort_order: crate::settings::SortOrder::FileName,
+            favorites: vec![FavoriteEntry::new("Folder".to_owned(), folder.clone())],
+            ..Default::default()
+        });
+        let FolderListResponse::Success(payload) = engine.folder_list(FolderListRequest {
+            address: RemoteAddress::file(folder.to_string_lossy().into_owned()),
+        }) else {
+            panic!("read failure must retain the base listing");
+        };
+        assert_eq!(
+            payload
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a.png", "b.png"]
+        );
+        assert_eq!(payload.sort_state.selected, "FileName");
+        assert!(
+            payload
+                .sort_notice
+                .as_deref()
+                .unwrap()
+                .contains("手動順を読み込めなかった")
+        );
+        assert_eq!(std::fs::read(database).unwrap(), corrupt);
+    }
+
     #[test]
     fn remote_physical_rating_read_failure_returns_name_order_with_visible_notice() {
         let data_dir = crate::data_dir::TestDataDirGuard::new();
@@ -19770,7 +20046,15 @@ pub(super) mod tests {
         let folder = favorite.path.join(relative_folder);
         let scan = crate::app::folder_scan::scan_directory_with_settings(&folder, &engine.settings)
             .unwrap();
-        let local = crate::app::materialize_local_folder_listing(&folder, scan, &engine.settings);
+        let local = crate::app::materialize_local_folder_listing(
+            &folder,
+            scan,
+            &engine.settings,
+            crate::folder_order::FolderOrderListingInput::from_read(read_remote_folder_order(
+                &crate::data_dir::get().join(crate::folder_order::DB_NAME),
+                &folder,
+            )),
+        );
         let response = engine.folder_list(FolderListRequest {
             address: favorite_address(favorite, relative_folder),
         });
@@ -20415,7 +20699,7 @@ pub(super) mod tests {
         });
         engine.spread_db = LateCreatedReadOnlyDb::missing_fixture();
         let listing = engine.recompute_folder_listing(&root).unwrap();
-        assert!(!listing.sort_locked);
+        assert!(!listing.sort_lock.physical_book());
         assert_eq!(
             listing
                 .items

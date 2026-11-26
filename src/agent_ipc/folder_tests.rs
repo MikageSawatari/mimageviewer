@@ -845,6 +845,145 @@ fn favorite_overlay_uses_deepest_stored_ancestor_and_grid_order() {
 }
 
 #[test]
+fn physical_manual_order_reads_registered_actor_and_preserves_preprojection_inventory() {
+    let f = Fixture::new();
+    let folder = f._dir.path().join("manual-folder");
+    std::fs::create_dir_all(folder.join("z-child")).unwrap();
+    std::fs::create_dir_all(folder.join("a-child")).unwrap();
+    for name in [
+        "b.png",
+        "a.png",
+        "clip.png",
+        "clip.mp4",
+        "hidden.txt",
+        "excluded.jpg",
+    ] {
+        std::fs::write(folder.join(name), b"fixture").unwrap();
+    }
+    settings(|settings| {
+        settings.sort_order = crate::settings::SortOrder::FileName;
+        settings.details_sort_key = crate::settings::DetailsSortKey::Size;
+        settings.skip_image_if_video_exists = true;
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("jpg".into());
+    });
+    let settings = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+    let scan = crate::app::folder_scan::scan_directory_with_settings(&folder, &settings).unwrap();
+    let inventory = scan.folder_order_inventory;
+    for name in [
+        "hidden.txt",
+        "excluded.jpg",
+        "clip.png",
+        "clip.mp4",
+        "z-child",
+    ] {
+        assert!(
+            inventory.contains(&crate::path_key::normalize_keep_drive(&folder.join(name))),
+            "inventory lost {name}"
+        );
+    }
+    let handle = f.handlers.readers.folder_order().unwrap();
+    handle
+        .save(
+            &folder,
+            crate::folder_order::FolderOrderSave {
+                listing_order: ["b.png", "clip.png", "hidden.txt", "excluded.jpg", "z-child"]
+                    .into_iter()
+                    .map(|name| crate::path_key::normalize_keep_drive(&folder.join(name)))
+                    .collect(),
+                inventory: inventory.clone(),
+                revision: 1,
+            },
+        )
+        .unwrap();
+    // No intervening client-side DB read or save completion wait: list_folder's
+    // own actor request must observe the accepted Save before materialization.
+    let page = list(&f, &folder, None, None, None).unwrap();
+    assert_eq!(
+        rows(&page)
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        ["b.png", "z-child", "a-child", "a.png", "clip.mp4"]
+    );
+    let record = handle
+        .read(&folder)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    for name in ["clip.png", "hidden.txt"] {
+        assert!(
+            record
+                .items
+                .contains(&crate::path_key::normalize_keep_drive(&folder.join(name)))
+        );
+    }
+    let before = persistent_files(f._dir.path());
+    assert_eq!(list(&f, &folder, None, None, None).unwrap(), page);
+    assert_persistent_files_unchanged(f._dir.path(), &before);
+}
+
+#[test]
+fn physical_manual_order_actor_failure_keeps_base_listing_without_second_database_reader() {
+    let f = Fixture::new();
+    let folder = f._dir.path().join("stopped-order-actor");
+    std::fs::create_dir(&folder).unwrap();
+    for name in ["b.png", "a.png"] {
+        std::fs::write(folder.join(name), b"fixture").unwrap();
+    }
+    let handle = f.handlers.readers.folder_order().unwrap();
+    let keys = ["b.png", "a.png"]
+        .into_iter()
+        .map(|name| crate::path_key::normalize_keep_drive(&folder.join(name)))
+        .collect::<Vec<_>>();
+    handle
+        .save(
+            &folder,
+            crate::folder_order::FolderOrderSave {
+                listing_order: keys.clone(),
+                inventory: keys.into_iter().collect(),
+                revision: 1,
+            },
+        )
+        .unwrap();
+    handle
+        .read(&folder)
+        .unwrap()
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    // The closed registered handle proves the lane cannot bypass FIFO via a
+    // second read-only opener, even though the saved database remains readable.
+    let mut f = f;
+    f.folder_order.take().unwrap().shutdown();
+    let page = list(&f, &folder, None, None, None).unwrap();
+    assert_eq!(
+        rows(&page)
+            .iter()
+            .map(|row| row.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a.png", "b.png"]
+    );
+}
+
+#[test]
+fn physical_folder_without_registered_actor_keeps_base_listing() {
+    let mut f = Fixture::new();
+    let folder = f._dir.path().join("unregistered-order-actor");
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("a.png"), b"fixture").unwrap();
+    let settings = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+    Arc::get_mut(&mut f.handlers).unwrap().readers =
+        crate::remote_ipc::SharedReaders::open(&settings).unwrap();
+    let page = list(&f, &folder, None, None, None).unwrap();
+    assert_eq!(rows(&page)[0].name, "a.png");
+}
+
+#[test]
 fn zip_composition_uses_raw_scope_before_display_collapse_and_keeps_child_placement() {
     let f = Fixture::new();
     let (service, owner) = composition(&f);

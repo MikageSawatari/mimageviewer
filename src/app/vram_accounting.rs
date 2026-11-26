@@ -770,6 +770,7 @@ mod tests {
                 },
                 generation_id: owner.items_generation,
                 saved_items: Vec::new(),
+                saved_folder_order: owner.folder_order.clone(),
                 saved_projection_recipe: owner.projection_recipe.clone(),
                 saved_viewing_state: owner.capture_snapshot_viewing_state(),
                 saved_page_identity_index: owner.page_identity_index.clone(),

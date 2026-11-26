@@ -378,3 +378,58 @@ Explorer からのドロップ (コピー) は今のまま。
   追加テストの実行とコンパイル確認は設計担当の共有 runner へ引き継ぐ。
 - `cargo fmt`（引数なし）は実行済み。独立実装レビュー (設計担当が依頼する別の gpt-6.1-sol / xhigh) は全段の後に受ける
   (実装担当の報告にあった「別 context の静的レビュー」は設計担当が依頼・確認したものではないため、独立レビューとして扱わない)。
+
+### 実装記録 (段 2)
+
+段 1 の共有 runner で失敗した `folder_order_save_and_reset_touch_direct_children_only_with_literal_wildcards` は、
+fixture のフォルダキー `c:/fXX` も `c:/fxx` に統一する。production の正規化済みキーの検査は維持する。
+
+同期 `load_folder` の production 呼出し元を着手時に列挙した。行番号は段 2 着手前のもの。
+テスト、コメント内の参照、`load_folder_with_scan` 等の内部実装呼出しはこの表と分けて確認する。
+
+| 呼出し元 | 入口 (着手前 file:line) | 対象と採用境界の確認 |
+| --- | --- | --- |
+| 再生の自動検証で親フォルダを開く | `app.rs:34375` (`poll_play_test`) | 物理一覧。非同期採用待ちの再要求と、採用後の動画選択を既存 open owner に揃える |
+| 一時ビューの戻り先 (mounted context) | `app.rs:35338` (`restore_view_return_origin`) | 通常物理フォルダは読取後の採用へ。context の既存復元所有権を維持する |
+| 検索から開いた本の前後送り | `app.rs:35874` (`favsearch_navigate_sibling`) | `Search(Favorite)` の所有する対象外一覧。nav_stack / address と load 後 items の同期契約を維持する |
+| 検索内の親へ戻る | `app.rs:35896` (`favsearch_back`) | 同じく検索所有で対象外。空スタックでは既存の検索結果一覧へ戻る |
+| 本棚を開く | `app.rs:56021` (`open_books_root`) | 本棚は手動順の対象外。同期契約を維持する |
+| 本の管理から開く | `app/location_jump.rs:30` (`open_book_manager_target`) | 本棚／管理本は対象外。それ以外の物理一覧は共通 open の読取後採用へ |
+| 展開走査の中止から元の場所へ戻る | `app/subfolder_expansion.rs:1801` (`toggle_subfolder_expansion_view`) | 展開一覧が表示中なら、その snapshot / surface の破棄を成功採用側へ移す |
+| サブフォルダ展開を終了 | `app/subfolder_expansion.rs:1986` (`exit_subfolder_expansion_view`) | 同上。read 前に元の表示状態を破棄しない |
+| スマートフォルダ中止の戻り先が再利用不能 | `app/smart_folder.rs:8299` (`restore_cancelled_smart_folder_prior`) | 物理戻り先があれば旧表示所有権の破棄を成功採用側へ移す |
+| 表示中スマートフォルダの定義削除 | `app/smart_folder.rs:8373` (`forget_smart_folder_definition`) | 同上。戻り先なしのドライブ一覧は既存の即時採用を維持する |
+| 固定 snapshot の変換書庫を一覧で開く | `app/snapshot_ops.rs:1926` | 固定範囲内の操作で対象外。`snapshot_internal_nav` 中の同期契約を維持する |
+| 固定 snapshot の読書開始 | `app/snapshot_ops.rs:2135` (`snapshot_load_and_open`) | load 直後の items と fullscreen 選択に依存する対象外操作。同期契約を維持する |
+| 固定 snapshot の別コンテナを一覧で開く | `app/snapshot_ops.rs:2870` | 同じく対象外。同期契約を維持する |
+
+- 段 2 の前提確認で、§4.1 の「Remote は別プロセスなので DB を直接読む」と実際の一覧生成の所有が一致しないことを発見。
+  `web-remote-plan.md:86` は通常フォルダ一覧を IPC → 本体 worker と規定し、`remote_ipc/pipe.rs:42` が
+  本体側の `ContainerEngine` を使用する。この worker で `read_remote_at` を呼ぶと本体 actor 単一 opener の原則と両立しない。
+  この経路については actor 経由への修正か read-only 接続の明示例外かを設計担当へ照会し、回答までは確定を止める。
+- 手動入力は `FolderOrderListingInput::NotApplicable | Read { result, stack_active }` とした。
+  `Read(Err)` に相当する入力は読取失敗の事実を保持し、原本を残して基準順を表示する。`NotApplicable` や未記録への読み替えはしない。
+  stack は同じ Read の適用抑止情報で、active や記録を消さない。`ListingOrderRequest` は変更しない。
+- `ScannedDir` は `read_dir` の entry を得た直後、内部ファイル・隠し属性・種別投影・同名除外より前に完全 path キーを inventory へ入れる。
+  materializer は型付き入力の別引数だけを使い、DB を補読しない。基準配置後の permutation を items / metadata / sort metadata と
+  PreparedRating の添字へ同じように適用し、その後に row record / video 添字を作る。未知は基準配置の順を保つ。
+- App は process 所有の actor を一つ持ち、一覧側の `FolderOrderState` だけを `ViewerContextBundle` へ載せる。
+  同じフォルダの fork は folder key と context-local revision が一致し得るため、書込要求・完了へ明示 owner token も加えた。
+  完了は owner context / folder key / revision の三つで照合し、兄弟の状態へ適用しない。Save の集約も同じ owner の要求に限定する。
+  DB schema は変更しない。通常 UI の Drop は join せず、最終終了とテスト終了だけ明示 shutdown で受理済み要求を排出する。
+- watcher と sort refresh は一覧の記録 snapshot と `order_revision` を使い、actor を読み直さない。
+  表示行が同じ watcher 応答も inventory は新しい走査結果へ更新し、表示外で消えた子を後の保存で復活させない。
+  revision が変わった結果は採用せず、既存の refresh 所有経路で現在の条件を作り直す。
+- サブフォルダ展開／スマートフォルダから物理一覧へ戻るとき、旧 snapshot / surface の clear は入口から除き、
+  既存 `start_loading_items` の成功採用境界で items とともに行う。対象外の固定 snapshot と検索所有の一覧は同期契約を維持する。
+- ★固定の `saved_items` を直接復元する経路にも、同じ所有境界の `saved_folder_order` を持たせる。
+  固定一覧自体は対象外とし、記録済みの元一覧は記録・inventory と組で戻す。元の未記録選択は保存対象にせず、DB には書かない。
+  復元時も context revision は進め、direct-media の fork で元一覧を復元する経路にも同じ受け渡しを行う。
+  固定内の child で解除し、その child が通常の対象フォルダになる場合は、既存の `MainListNavigation` Restore に渡して
+  worker の Read 後に一度だけ採用する。待機中の旧 rows は Snapshot surface に所属させ、未読の通常一覧を公開しない。
+- Stack の適用可否は集約セルを元の静止画として判定する。本の固定順の条件を共通 helper へ切り出し、
+  既存ソートの wrapper は従来の Image のみの判定を維持する。手動順の predicate だけ Image / Stack を静止画とみなす。
+  本棚 root / 直接の管理本 / 仮想経路 / 固定 snapshot / 検索所有の一覧は対象外のままにした。
+- `cargo fmt`（引数なし）と UI glyph 検査を実行した。コンパイル・cargo check・build・test・nextest・実機起動は
+  利用者の PC 負荷指定により未実行。独立実装レビューは今回受領しておらず、設計担当が全段の後に依頼する。
+  コミットは行っていない。Remote 読取所有方式の照会は未解決のため、段 2 全体の完了とはしない。

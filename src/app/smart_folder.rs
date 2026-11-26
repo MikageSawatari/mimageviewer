@@ -8294,8 +8294,8 @@ impl App {
                     .clone()
                     .or_else(|| self.effective_folder())
                     .filter(|path| !is_synthetic_view_path(path));
-                self.clear_smart_folder_view_state();
                 if let Some(path) = fallback {
+                    // Retain the installed synthetic owner until the physical listing adopts.
                     self.load_folder(path);
                 } else {
                     self.enter_drive_list(None);
@@ -8368,8 +8368,8 @@ impl App {
             return;
         }
         let return_to = self.smart_folder_saved_folder.clone();
-        self.clear_smart_folder_view_state();
         if let Some(path) = return_to {
+            // The destination's successful install retires this synthetic owner with its items.
             self.load_folder(path);
         } else {
             self.enter_drive_list(None);
@@ -10143,6 +10143,55 @@ mod tests {
     // §1.898: 実ドライブのルートは判定だけに渡す。本物の Shell を実パスに呼ばせない。
     // 実行経路のテストは一時フォルダ内の偽パスと差し替えを使う。
     use super::*;
+
+    #[test]
+    fn folder_order_removed_smart_definition_keeps_owner_until_physical_adoption() {
+        let mut app = crate::app::setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_image_folders = false;
+        let root = app.tmp.path().join("manual-smart-return");
+        std::fs::create_dir_all(&root).unwrap();
+        image::RgbImage::new(2, 3).save(root.join("a.png")).unwrap();
+        app.load_folder(root.clone());
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        let mut definition = crate::settings::SmartFolderDefinition::new("manual return");
+        definition.rules.push(crate::settings::SmartFolderRule::new(
+            root.clone(),
+            true,
+            Default::default(),
+        ));
+        let id = definition.id;
+        app.settings.smart_folders.push(definition);
+        app.open_smart_folder(id, false);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.items_are_smart_folder_view || app.smart_folder_busy() {
+            assert!(Instant::now() < deadline, "smart folder did not adopt");
+            app.poll_smart_folder(&ctx);
+            app.poll_sidecar_restore(&ctx);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.finish_page_identity_preparation_for_test();
+        let old_folder = app.current_folder.clone();
+        let old_generation = app.items_generation;
+        let old_items = app.items.clone();
+        app.settings
+            .smart_folders
+            .retain(|definition| definition.id != id);
+        app.forget_smart_folder_definition(id);
+        assert!(app.items_are_smart_folder_view);
+        assert_eq!(app.current_smart_folder_id, Some(id));
+        assert_eq!(app.current_folder, old_folder);
+        assert_eq!(app.items_generation, old_generation);
+        assert_eq!(app.items, old_items);
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.current_folder.as_deref(), Some(root.as_path()));
+        assert!(!app.items_are_smart_folder_view);
+        assert_eq!(app.current_smart_folder_id, None);
+        assert_eq!(app.items_generation, old_generation + 1);
+    }
 
     #[test]
     fn g1_smart_real_handler_reopen_restores_legacy_flow_and_book_return() {

@@ -97,6 +97,17 @@ enum SnapshotArchiveCacheDestination {
 }
 
 impl App {
+    pub(super) fn capture_snapshot_folder_order(&self) -> crate::folder_order::FolderOrderState {
+        let mut saved = self.folder_order.clone();
+        // The fixed list keeps recorded positions with its saved physical rows. The
+        // transient unrecorded selection ends when leaving that physical listing.
+        if saved.mode == crate::folder_order::FolderOrderMode::ManualUnrecorded {
+            saved.mode = crate::folder_order::FolderOrderMode::Normal;
+            saved.input = saved.listing_input();
+        }
+        saved
+    }
+
     #[cfg(windows)]
     fn remap_snapshot_native_pending_indices(&mut self, old_to_new: &HashMap<usize, usize>) {
         let remap = |idx: usize| old_to_new.get(&idx).copied();
@@ -1090,6 +1101,8 @@ impl App {
                 super::book_materialization::ExtractedSurface::Snapshot,
             ),
         );
+        let saved_folder_order = self.capture_snapshot_folder_order();
+        self.retire_folder_order_for_listing();
         let saved_items = std::mem::replace(&mut self.items, captured_items_grid);
         let saved_thumbnails = std::mem::replace(&mut self.thumbnails, captured_thumbnails);
         let saved_image_metas = std::mem::replace(&mut self.image_metas, captured_image_metas);
@@ -1136,6 +1149,7 @@ impl App {
             source_label,
             generation_id,
             saved_items,
+            saved_folder_order,
             saved_page_identity_index,
             saved_projection_recipe,
             saved_viewing_state,
@@ -1488,6 +1502,14 @@ impl App {
                 }
             }
             self.grid_scroll.renew_session();
+            let mut folder_order = snap.saved_folder_order;
+            folder_order.order_revision = self
+                .folder_order
+                .order_revision
+                .max(folder_order.order_revision)
+                .checked_add(1)
+                .expect("folder order revision exhausted");
+            self.folder_order = folder_order;
             self.items = snap.saved_items;
             self.page_identity_index = snap.saved_page_identity_index;
             self.projection_recipe = snap.saved_projection_recipe;
@@ -1508,6 +1530,17 @@ impl App {
             // 新 idx 配置に着地して壊さないよう invalidate。merged_thumbnails は
             // invalidate 後も保持される (= thumbnails 自体は invalidate 対象外)。
             self.bump_items_generation();
+            if let Some(folder) = self.current_folder.clone() {
+                let projection_key = self.current_folder_projection_key(&folder);
+                if let Some(observation) = self
+                    .folder_observation
+                    .as_mut()
+                    .filter(|observation| observation.source == folder)
+                {
+                    observation.generation = self.items_generation;
+                    observation.projection_key = projection_key;
+                }
+            }
             self.invalidate_idx_state_and_queues();
             self.reconcile_restored_cover_thumbnails();
             self.move_grid_cursor(snap.saved_selected, crate::app::GridCursorIntent::Automatic);
@@ -1539,8 +1572,28 @@ impl App {
         } else {
             // child folder の中で解除 → 現在の items はそのまま、snapshot state だけ捨てる
             // visible_indices は filter / current_folder に対して再構築
-            self.mark_color_filter_scope_dirty();
-            self.rebuild_visible_indices();
+            let physical = self.current_folder.clone().filter(|path| {
+                !crate::folder_tree::is_virtual_folder(path)
+                    && !crate::folder_tree::is_paged_document_path(path)
+                    && crate::folder_order::physical_folder_order_eligible(
+                        &self.settings,
+                        path,
+                        &self.items,
+                    )
+            });
+            if let Some(folder) = physical {
+                // The retained fixed rows stay on the Snapshot surface while the existing
+                // restore worker reads the ordinary folder. Only its successful adoption
+                // publishes a normal physical listing with a completed Read input.
+                self.preserve_cursor_hint_for_reload();
+                self.restore_view_return_origin(super::top_level_grid_view::TopLevelGridOrigin {
+                    restore: super::top_level_grid_view::TopLevelGridRestore::Folder(folder),
+                    route: self.facet_navigation.route().clone(),
+                });
+            } else {
+                self.mark_color_filter_scope_dirty();
+                self.rebuild_visible_indices();
+            }
         }
         self.show_feedback_toast("★固定を解除しました".into());
     }
@@ -1630,6 +1683,7 @@ impl App {
         }
         // items 入れ替え (= 保存したサムネ付き state を復帰)
         self.grid_scroll.renew_session();
+        self.retire_folder_order_for_listing();
         self.items = list_items;
         self.page_identity_index = list_identity_index;
         self.projection_recipe = list_recipe;
@@ -2985,6 +3039,136 @@ mod tests {
         app.visible_indices = (0..app.items.len()).collect();
         app.current_folder = Some(PathBuf::from(r"E:\test"));
         app
+    }
+
+    #[test]
+    fn folder_order_snapshot_retains_recorded_basis_and_forgets_unrecorded_selection() {
+        use crate::folder_order::{
+            FolderOrderListingInput, FolderOrderMode, FolderOrderRecord, FolderOrderState,
+            folder_key,
+        };
+        for recorded in [false, true] {
+            let mut app = test_app_with_items(Vec::new());
+            let root = app.tmp.path().join("manual-fixed-basis");
+            std::fs::create_dir_all(&root).unwrap();
+            let a = root.join("a.jpg");
+            let b = root.join("b.jpg");
+            for path in [&a, &b] {
+                image::RgbImage::new(2, 3).save(path).unwrap();
+            }
+            let keys = vec![folder_key(&b), folder_key(&a)];
+            app.items = vec![GridItem::Image(b.clone()), GridItem::Image(a.clone())];
+            app.thumbnails = vec![ThumbnailState::Pending; 2];
+            app.image_metas = vec![None; 2];
+            app.current_folder = Some(root.clone());
+            app.settings.auto_fullscreen_image_folders = false;
+            let record = recorded.then(|| FolderOrderRecord {
+                active: true,
+                revision: 3,
+                items: keys.clone(),
+            });
+            let mut state = FolderOrderState::from_listing(
+                &root,
+                FolderOrderListingInput::from_read(Ok(record)),
+                keys.iter().cloned().collect(),
+            );
+            if !recorded {
+                let _ = state.enter_manual();
+            }
+            state.order_revision = 40;
+            app.folder_order = state.clone();
+            app.visible_indices = vec![0];
+            app.activate_snapshot(SnapshotSourceLabel::Mixed);
+            assert!(app.is_snapshot_active());
+            assert!(matches!(
+                app.folder_order.input,
+                FolderOrderListingInput::NotApplicable
+            ));
+            assert!(!app.folder_order.manual_active());
+            assert!(app.folder_order.order_revision > state.order_revision);
+            let fixed_revision = app.folder_order.order_revision;
+            app.deactivate_snapshot();
+            assert_eq!(
+                app.items,
+                vec![GridItem::Image(b.clone()), GridItem::Image(a.clone())]
+            );
+            assert_eq!(app.folder_order.record, state.record);
+            assert_eq!(app.folder_order.inventory, state.inventory);
+            assert_eq!(
+                app.folder_order.mode,
+                if recorded {
+                    FolderOrderMode::ManualRecorded
+                } else {
+                    FolderOrderMode::Normal
+                }
+            );
+            assert!(app.folder_order.order_revision > fixed_revision);
+        }
+    }
+
+    #[test]
+    fn folder_order_unlocking_snapshot_child_reads_before_normal_listing_adoption() {
+        use crate::folder_order::{FolderOrderListingInput, FolderOrderSave, folder_key};
+        let mut app = setup_app_for_test();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_image_folders = false;
+        let root = app.tmp.path().join("manual-fixed-origin");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        for name in ["a.png", "b.png"] {
+            image::RgbImage::new(2, 3).save(child.join(name)).unwrap();
+        }
+        app.load_folder(root.clone());
+        app.finish_page_identity_preparation_for_test();
+        let a = folder_key(&child.join("a.png"));
+        let b = folder_key(&child.join("b.png"));
+        let actor = app.folder_order_handle().unwrap();
+        actor
+            .save(
+                &child,
+                FolderOrderSave {
+                    listing_order: vec![b.clone(), a.clone()],
+                    inventory: [a.clone(), b.clone()].into_iter().collect(),
+                    revision: 71,
+                },
+            )
+            .unwrap();
+        let _ = actor
+            .read(&child)
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        app.snapshot_internal_nav = true;
+        app.app.load_folder(child.clone());
+        app.snapshot_internal_nav = false;
+        app.finish_page_identity_preparation_for_test();
+        assert!(matches!(
+            app.folder_order.input,
+            FolderOrderListingInput::NotApplicable
+        ));
+        let generation = app.items_generation;
+        app.deactivate_snapshot();
+        assert!(!app.is_snapshot_active());
+        assert_eq!(app.items_generation, generation);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            crate::app::top_level_grid_view::TopLevelGridSurface::Snapshot
+        ));
+        app.finish_history_restore_preparation_for_test();
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.current_folder.as_deref(), Some(child.as_path()));
+        assert!(app.folder_order.input.is_read());
+        assert_eq!(
+            app.items
+                .iter()
+                .filter_map(crate::folder_order::physical_item_key)
+                .collect::<Vec<_>>(),
+            vec![b, a]
+        );
+        assert_eq!(app.items_generation, generation + 1);
     }
 
     #[test]

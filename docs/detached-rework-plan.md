@@ -8274,3 +8274,15 @@ fork 先は空、元 context は cache と proof を保持する。detached の�
 - 変更の内容: 左右のキー・画面の左右半分のクリック・タップ・パッド・割り当てた見開きずらし・ヘルプの行が、左右の前後をページ構成 (`SpreadMode`) だけで決めていたため、1 ページ表示では <kbd>7</kbd> で右→左にしても右が次だった (左右キーは既定のカーソル設定のとき。「シークバー方向に合わせる」では左右キーだけ従来から読み方向に従っていた)。判定を `App::input_advances_right_to_left` の 1 つにまとめた (ページ構成が向きを持てばその向き、持たなければ viewer の読み方向)。紙めくりの束の判定 (`page_turn_reading_rtl`) と `SpreadMode::advances_right_to_left` はこれに統合した。Remote の Web 画面の同じ判定も揃えた。
 - detached に触れる範囲: 別ウィンドウの述語・viewport の選択と配送・窓の寿命・placement・HWND の処理は変えない。判定が読むのは、そのとき載っている viewer context の `spread_mode` と `reading_direction` だけで、どちらも context ごとの束に入っている (別ウィンドウは自分の値を読む。`input_reading_direction_uses_only_the_mounted_viewer_context` で確認)。guard・delay・retry・一括 reset・silent fallback は足していない。
 - 合意: 設計担当 ClaudeCode と独立実装レビュー (実装者とは別の GPT-6.1 Sol / xhigh、1 回目) は、これが症状パッチではなく構造的修正であることに合意。レビュー担当の言葉:「Both direction fields belong to the mounted viewer bundle, so detached/F12 contexts read their own values. I agree this is a structural fix, not a symptom patch.」 2 回目 (Remote の Web 画面を含めた全体、`b65066753`) で ACCEPT、合意は変わらない。レビュー担当の言葉:「I agree that the whole desktop + Remote change is a structural fix, not a symptom patch, under the detached freeze rules.」
+
+### 2026-11-26: フォルダ手動順の一覧所有状態（§1.911 段 2）
+
+- 正本は [フォルダ手動順](folder-manual-order-plan.md) §4.2〜§4.3 と段 2 の指示。
+  手動順の記録・inventory・mode・order_revision は items と同じ viewer context が所有し、
+  `ViewerContextBundle` の capture / swap / fork で items と一緒に移す。process 所有の DB actor は bundle に複製しない。
+  ★固定の saved items と direct-media fork の元一覧の復元にも同じ手動状態を対で持たせ、復元先の revision は巻き戻さない。
+- これは一覧データの所有境界を揃える構造的変更で、窓の種類から状態を推測する症状パッチではない。
+  detached の述語・viewport 配送・HWND 捕捉・placement・窓の寿命へ新しい分岐や保存先を加えない。
+  読み取りや別 context の close で兄弟の手動記録を更新・無効化せず、fork は記録の写しを保持する。
+- 本項は設計担当から指定された実装範囲と実装上の判断理由の記録。独立実装レビューの受領・検収を表さない。
+  コンパイル・テスト実行は利用者指定により行わず、設計担当の共有 runner へ引き継ぐ。

@@ -198,7 +198,7 @@ fn section1375_omitted_equal_rescan_refreshes_names_counts_and_only_sorts_if_ope
             .rx
             .recv_timeout(Duration::from_secs(20))
             .unwrap();
-        let Some(ExternalRescanResult::Equal(_, _, _, _, omitted)) = &response else {
+        let Some(ExternalRescanResult::Equal(_, _, _, _, omitted, _)) = &response else {
             panic!("unsupported-only changes must keep visible rows equal");
         };
         assert!(
@@ -262,6 +262,7 @@ fn section1375_omitted_equal_non_main_context_never_replaces_main_owner() {
             FolderRefreshCause::Operation,
             SystemTime::UNIX_EPOCH,
             omitted,
+            HashSet::new(),
         )))
         .unwrap();
         mounted.external_rescan_pending = Some(ExternalRescanPending {
@@ -1299,7 +1300,12 @@ fn section1375_large_equal_poll_and_repeated_delete_overlay_do_not_clone_history
         let settings = app.settings.clone();
         let worker_folder = folder.clone();
         let listing = std::thread::spawn(move || {
-            folder_scan::materialize_local_folder_listing(&worker_folder, scan, &settings)
+            folder_scan::materialize_local_folder_listing(
+                &worker_folder,
+                scan,
+                &settings,
+                crate::folder_order::FolderOrderListingInput::NotApplicable,
+            )
         })
         .join()
         .unwrap();
@@ -1325,6 +1331,7 @@ fn section1375_large_equal_poll_and_repeated_delete_overlay_do_not_clone_history
             Default::default(),
             SystemTime::UNIX_EPOCH,
             Default::default(),
+            HashSet::new(),
         )))
         .unwrap();
         let baseline = app.folder_observation.clone();
@@ -1332,6 +1339,7 @@ fn section1375_large_equal_poll_and_repeated_delete_overlay_do_not_clone_history
             proof: Some(FolderRescanProof {
                 baseline,
                 projection_key: app.current_folder_projection_key(&folder),
+                order_revision: app.folder_order.order_revision,
                 subscription: None,
             }),
             cause: Default::default(),
@@ -1823,6 +1831,7 @@ fn section1375_queued_different_cancel_and_stale_retire_off_ui_at_large_sizes() 
                     &worker_folder,
                     scan.clone_for_projection(),
                     &settings,
+                    crate::folder_order::FolderOrderListingInput::NotApplicable,
                 );
                 let weak = Arc::downgrade(&materialized.row_record);
                 scan.reconcile = Some(folder_scan::FolderScanReconcile {
