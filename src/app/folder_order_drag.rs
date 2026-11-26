@@ -40,6 +40,13 @@ fn drag_id() -> egui::Id {
     egui::Id::unique("folder_manual_order_drag")
 }
 
+/// `remove_temp` needs `Default`; the gesture has no meaningful empty value.
+fn take_drag(data: &mut egui::util::IdTypeMap) -> Option<FolderOrderDrag> {
+    let drag = data.get_temp::<FolderOrderDrag>(drag_id());
+    data.remove::<FolderOrderDrag>(drag_id());
+    drag
+}
+
 /// Insertion refers to the original visible sequence, before removing the group.
 fn moved_order(keys: &[String], moving: &[usize], insertion: usize) -> Vec<String> {
     let insertion = insertion.min(keys.len());
@@ -284,7 +291,7 @@ impl App {
                 .find(|(button, _)| *button == egui::PointerButton::Primary)
         });
         let (_, release) = release?;
-        let drag = ctx.data_mut(|data| data.remove_temp::<FolderOrderDrag>(drag_id()))?;
+        let drag = ctx.data_mut(take_drag)?;
         Some(FolderOrderDragEnd { drag, release })
     }
 
@@ -331,8 +338,7 @@ impl App {
             });
             self.commit_folder_order_drag_drop(ctx, &ending.drag, target);
         }
-        let Some(mut drag) = ctx.data_mut(|data| data.remove_temp::<FolderOrderDrag>(drag_id()))
-        else {
+        let Some(mut drag) = ctx.data_mut(take_drag) else {
             return;
         };
         if !self.folder_order_drag_matches(ctx, &drag.start) {
