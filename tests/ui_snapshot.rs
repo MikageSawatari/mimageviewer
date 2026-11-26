@@ -29,6 +29,59 @@ use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
 
 #[test]
+fn image_combine_dialog_default_light() {
+    image_combine_snapshot("image_combine_dialog_default_light", false, true, 1.0);
+}
+
+#[test]
+fn image_combine_dialog_band_dark() {
+    image_combine_snapshot("image_combine_dialog_band_dark", true, false, 1.0);
+}
+
+#[test]
+fn image_combine_dialog_small_200() {
+    image_combine_snapshot("image_combine_dialog_small_200", true, false, 2.0);
+}
+
+fn image_combine_snapshot(name: &str, band: bool, light: bool, scale: f32) {
+    let mut ready = false;
+    let mut harness = test_ui::builder()
+        .with_size(egui::vec2(1093.0, 614.0))
+        .build_ui(move |ui| {
+            let ctx = &ui.ctx().clone();
+            mimageviewer::os_theme::apply_resolved(
+                ctx,
+                if light {
+                    mimageviewer::os_theme::ResolvedTheme::Light
+                } else {
+                    mimageviewer::os_theme::ResolvedTheme::Dark
+                },
+            );
+            if !ready {
+                install_app_fonts(ctx);
+                mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
+                ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            test_ui::full_viewport_ui(ui, |ui| {
+                egui::CentralPanel::default().show(ui, |_| {});
+            });
+            mimageviewer::draw_image_combine_snapshot_fixture(ctx, band);
+        });
+    harness.run_steps(12);
+    for label in ["書き出す", "キャンセル", "Close window"] {
+        assert!(
+            harness
+                .ctx
+                .content_rect()
+                .contains_rect(harness.get_by_label(label).rect())
+        );
+    }
+    harness.snapshot(name);
+}
+
+#[test]
 fn cover_crop_small_100_light() {
     cover_crop_snapshot(
         "cover_crop_small_100_light",

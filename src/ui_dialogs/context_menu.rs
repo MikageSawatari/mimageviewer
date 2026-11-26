@@ -1633,6 +1633,9 @@ impl crate::app::App {
             checked_count: target.checked_count,
             checked_file_operation_selection: target.checked_file_operation_selection,
             can_use_folder_commands: target.folder_command_target.is_some(),
+            combine_disabled_reason: if target.surface == ContextMenuSurface::Grid {
+                self.grid_combine_disabled_reason()
+            } else {None},
             caption_creation_disabled_reason: if target.surface == ContextMenuSurface::Grid {
                 self.caption_creation_disabled_reason(target.is_folder_context)
                     .map(str::to_owned)
@@ -1700,6 +1703,7 @@ impl crate::app::App {
                     ),
                 };
                 crate::context_menu_model::ContextMenuShortcutLabels {
+                    combine: self.keymap.first_chord_label(crate::keymap::KeyAction::GridCombineSelection),
                     cut: cut.and_then(|action| self.keymap.first_chord_label(action)),
                     copy: copy.and_then(|action| self.keymap.first_chord_label(action)),
                     organize: (target.surface == ContextMenuSurface::Grid)
@@ -1978,6 +1982,12 @@ impl crate::app::App {
             MenuCommand::DeleteTranscripts => {
                 if target.surface == ContextMenuSurface::Grid {
                     self.request_delete_transcripts(ctx, target.is_folder_context);
+                }
+                None
+            }
+            MenuCommand::CombineSelection => {
+                if target.surface == ContextMenuSurface::Grid {
+                    self.open_image_combine_dialog(ctx);
                 }
                 None
             }

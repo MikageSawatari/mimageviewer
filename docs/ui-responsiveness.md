@@ -675,6 +675,13 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+画像の結合 (§1.904 stage B) はbatchと同じsnapshotの1件関数・6ms予算を使い、準備失敗を対象ごとに保持する。
+既知のsnapshot同期読込 (§1.177) を広げず、decode・合成・縮小・フォント計測・描画・encode・保存は専用workerへ置く。
+プレビューは長辺1600px以内、generation一致の結果を1回だけtextureへ送る。設定・並びの変更はRenderを間引き、素材は読み直さない。
+明示操作のプリセット保存は既存のsave_checkedと同じ扱い。layout / preview_load / preview_render / item / encodeのperfイベントを置く。
+今回の実行測定・コンパイル・自動検証は共有runnerへ引き継ぐ。
+
+
 §1.362 段 A の一括エクスポートは、出力先の作成・正規化・衝突判定、元の日時、
 デコード・編集合成・リサイズ・メタデータ検査・エンコード・書き込みを既存の専用workerに置く。
 UI準備に足した情報はsource_dir/source_extのパス・文字列演算だけ。

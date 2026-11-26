@@ -57097,7 +57097,7 @@ impl App {
         if let Some(action) = self.fs_feedback_toast_action.clone() {
             let resp = action.response(&toast_ui, toast_rect);
             if resp.clicked() {
-                action.activate(ctx);
+                self.activate_feedback_action(&action, ctx);
                 self.fs_feedback_toast = None;
                 self.fs_feedback_toast_action = None;
                 self.fs_feedback_toast_surface = None;
@@ -60124,6 +60124,9 @@ impl App {
     }
 
     pub(crate) fn draw_export_progress_dialog(&mut self, ctx: &egui::Context) {
+        if self.export_pending.is_some() {
+            self.reject_busy_image_combine_shortcut(ctx);
+        }
         let Some(pending) = self.export_pending.as_mut() else {
             return;
         };
@@ -60138,6 +60141,14 @@ impl App {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         if dismiss_finished {
+            if pending.origin == crate::export_dialog::ExportOrigin::Combine
+                && matches!(
+                    self.combine_session,
+                    Some(crate::ui_dialogs::image_combine::CombineSession::Writing { .. })
+                )
+            {
+                self.finish_combine_write();
+            }
             self.export_pending = None;
         }
     }
@@ -60146,6 +60157,7 @@ impl App {
         let Some(pending) = self.export_pending.as_mut() else {
             return;
         };
+        let combine = pending.origin == crate::export_dialog::ExportOrigin::Combine;
         let mut clear_pending = false;
         let mut toast: Option<String> = None;
         let mut reveal_path: Option<std::path::PathBuf> = None;
@@ -60159,6 +60171,10 @@ impl App {
             match pending.rx.try_recv() {
                 Ok(crate::export_dialog::ExportEvent::Started { label }) => {
                     pending.last_message = format!("{label} を保存中");
+                }
+                Ok(crate::export_dialog::ExportEvent::Step { label }) => {
+                    pending.done = pending.done.saturating_add(1);
+                    pending.last_message = format!("処理しました: {label}");
                 }
                 Ok(crate::export_dialog::ExportEvent::Completed(success)) => {
                     pending.done = pending.done.saturating_add(1);
@@ -60199,7 +60215,9 @@ impl App {
                     if !pending.thumbnail_notices.is_empty() || !pending.errors.is_empty() {
                         pending.last_message = export_end_summary(pending);
                     } else {
-                        if pending.skipped.is_empty() && pending.successes.len() == 1 {
+                        if combine {
+                            // The combine finish handler publishes its own mIV-open toast.
+                        } else if pending.skipped.is_empty() && pending.successes.len() == 1 {
                             reveal_path = pending.successes.first().map(|s| s.path.clone());
                         } else {
                             toast = Some(export_done_message(
@@ -60218,6 +60236,7 @@ impl App {
                     // 進捗ダイアログを 1 フレで上書きしてしまう。
                     // 終了状態があればダイアログ表示を維持する。
                     if pending.end.is_none() {
+                        crate::logger::log("export worker disconnected without terminal event");
                         toast = Some("エクスポート worker が中断されました".to_string());
                         clear_pending = true;
                     }
@@ -60246,6 +60265,15 @@ impl App {
             None
         };
 
+        if combine
+            && (refresh_after_done || clear_pending)
+            && matches!(
+                self.combine_session,
+                Some(crate::ui_dialogs::image_combine::CombineSession::Writing { .. })
+            )
+        {
+            self.finish_combine_write();
+        }
         if clear_pending {
             self.export_pending = None;
         } else if self.export_pending.is_some() {

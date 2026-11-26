@@ -51,6 +51,7 @@ pub enum ContextMenuItemId {
     CutFiles,
     CopyFiles,
     OrganizeFiles,
+    CombineSelection,
     CreateAiCaptions,
     DeleteAiCaptions,
     CreateTranscripts,
@@ -96,6 +97,7 @@ impl ContextMenuItemId {
         Self::CutFiles,
         Self::CopyFiles,
         Self::OrganizeFiles,
+        Self::CombineSelection,
         Self::CreateAiCaptions,
         Self::DeleteAiCaptions,
         Self::CreateTranscripts,
@@ -141,6 +143,7 @@ impl ContextMenuItemId {
             Self::CutFiles => "CutFiles",
             Self::CopyFiles => "CopyFiles",
             Self::OrganizeFiles => "OrganizeFiles",
+            Self::CombineSelection => "CombineSelection",
             Self::CreateAiCaptions => "CreateAiCaptions",
             Self::DeleteAiCaptions => "DeleteAiCaptions",
             Self::CreateTranscripts => "CreateTranscripts",
@@ -204,6 +207,7 @@ impl ContextMenuItemId {
             Self::CutFiles => "切り取り",
             Self::CopyFiles => "コピー",
             Self::OrganizeFiles => "ファイル整理先…",
+            Self::CombineSelection => "画像を結合...",
             Self::CreateAiCaptions => "AI 説明文を作る",
             Self::DeleteAiCaptions => "AI 説明文を削除",
             Self::CreateTranscripts => "文字起こしを作る",
@@ -253,6 +257,7 @@ impl ContextMenuItemId {
             MenuCommand::CutFiles => Self::CutFiles,
             MenuCommand::CopyFiles => Self::CopyFiles,
             MenuCommand::OrganizeFiles => Self::OrganizeFiles,
+            MenuCommand::CombineSelection => Self::CombineSelection,
             MenuCommand::CreateAiCaptions => Self::CreateAiCaptions,
             MenuCommand::DeleteAiCaptions => Self::DeleteAiCaptions,
             MenuCommand::CreateTranscripts => Self::CreateTranscripts,
@@ -569,6 +574,14 @@ impl ContextMenuPreviewScenario {
                 CheckedFileOperationSelection::Empty
             },
             can_use_folder_commands: is_folder_context,
+            combine_disabled_reason: (!matches!(
+                kind,
+                ContextMenuItemKind::Image
+                    | ContextMenuItemKind::ZipImage
+                    | ContextMenuItemKind::PdfPage
+                    | ContextMenuItemKind::Stack
+            ))
+            .then(|| "選択の中に結合できる画像・ページがありません".into()),
             caption_creation_disabled_reason: (!matches!(
                 kind,
                 ContextMenuItemKind::Image
@@ -872,6 +885,7 @@ pub enum MenuCommand {
     CutFiles,
     CopyFiles,
     OrganizeFiles,
+    CombineSelection,
     CreateAiCaptions,
     DeleteAiCaptions,
     CreateTranscripts,
@@ -1057,6 +1071,7 @@ pub struct ContextMenuInput {
     pub checked_file_operation_selection: CheckedFileOperationSelection,
     pub can_use_folder_commands: bool,
     /// Computed from the same effective selection/direct-folder targets as admission.
+    pub combine_disabled_reason: Option<String>,
     pub caption_creation_disabled_reason: Option<String>,
     pub caption_deletion_disabled_reason: Option<String>,
     pub transcript_creation_disabled_reason: Option<String>,
@@ -1158,6 +1173,7 @@ pub struct ContextMenuShortcutLabels {
     pub cut: Option<String>,
     pub copy: Option<String>,
     pub organize: Option<String>,
+    pub combine: Option<String>,
     pub rotate_left: Option<String>,
     pub rotate_right: Option<String>,
     pub deselect: Option<String>,
@@ -1551,6 +1567,15 @@ pub(crate) fn item_copy_command(
     }
 }
 
+fn combine_node(input: &ContextMenuInput) -> MenuNode {
+    MenuNode::Item {
+        command: MenuCommand::CombineSelection,
+        label: with_key("画像を結合...", input.shortcuts.combine.as_ref()),
+        enabled: input.combine_disabled_reason.is_none(),
+        disabled_reason: input.combine_disabled_reason.clone(),
+    }
+}
+
 pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
     let mut nodes = Vec::new();
 
@@ -1595,6 +1620,7 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             push_group(
                 &mut nodes,
                 [
+                    combine_node(input),
                     caption_creation_node(input, "AI 説明文を作る"),
                     caption_deletion_node(input),
                     transcript_node(input, false),
@@ -1729,6 +1755,7 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
         push_group(
             &mut nodes,
             [
+                combine_node(input),
                 caption_creation_node(input, "AI 説明文を作る"),
                 caption_deletion_node(input),
                 transcript_node(input, false),
@@ -2048,6 +2075,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_combine_context_entry_is_grid_only_with_shared_disabled_reason() {
+        for (count, reason) in [
+            (0, Some("対象なし")),
+            (1, None),
+            (100, None),
+            (101, Some("100 枚まで")),
+        ] {
+            for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
+                let mut input = input(ContextMenuItemKind::Image, surface);
+                input.combine_disabled_reason = reason.map(str::to_owned);
+                let state =
+                    command_state(&build_context_menu(&input), MenuCommand::CombineSelection);
+                if surface == ContextMenuSurface::Fullscreen {
+                    assert!(state.is_none());
+                } else {
+                    let (label, enabled, actual) = state.unwrap();
+                    assert_eq!(label, "画像を結合...");
+                    assert_eq!(enabled, reason.is_none(), "count={count}");
+                    assert_eq!(actual.as_deref(), reason);
+                }
+            }
+        }
+        let id = ContextMenuItemId::CombineSelection;
+        assert_eq!(
+            ContextMenuItemId::parse_stable_name(id.stable_name()),
+            Some(id)
+        );
+        assert_eq!(id.label(), "画像を結合...");
+    }
+
+    #[test]
     fn context_menu_musicvideo_only_single_real_audio_on_both_surfaces() {
         for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
             for kind in [
@@ -2223,6 +2281,14 @@ mod tests {
             checked_count: 0,
             checked_file_operation_selection: CheckedFileOperationSelection::Empty,
             can_use_folder_commands: false,
+            combine_disabled_reason: (!matches!(
+                kind,
+                ContextMenuItemKind::Image
+                    | ContextMenuItemKind::ZipImage
+                    | ContextMenuItemKind::PdfPage
+                    | ContextMenuItemKind::Stack
+            ))
+            .then(|| "選択の中に結合できる画像・ページがありません".into()),
             caption_creation_disabled_reason: (!matches!(
                 kind,
                 ContextMenuItemKind::Image
@@ -2265,6 +2331,7 @@ mod tests {
             shortcuts: ContextMenuShortcutLabels {
                 cut: (surface == ContextMenuSurface::Grid).then(|| "Ctrl+X".to_string()),
                 copy: (surface == ContextMenuSurface::Grid).then(|| "Ctrl+C".to_string()),
+                combine: None,
                 organize: None,
                 rotate_left: Some("L".to_string()),
                 rotate_right: Some("R".to_string()),
@@ -2752,6 +2819,7 @@ mod tests {
         input.shortcuts = ContextMenuShortcutLabels {
             cut: Some("Alt+X".to_string()),
             copy: Some("Alt+C".to_string()),
+            combine: None,
             organize: None,
             rotate_left: Some("Shift+F1".to_string()),
             rotate_right: Some("Shift+F2".to_string()),
@@ -2826,6 +2894,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "画像を結合...",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
                     "文字起こしを作る",
@@ -2851,6 +2920,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "画像を結合...",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
                     "文字起こしを作る",
@@ -2871,6 +2941,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "画像を結合...",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
                     "文字起こしを作る",
@@ -2892,6 +2963,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "画像を結合...",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
                     "文字起こしを作る",
@@ -2909,6 +2981,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "画像を結合...",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
                     "文字起こしを作る",
@@ -2929,6 +3002,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "画像を結合...",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
                     "文字起こしを作る",
@@ -2949,6 +3023,7 @@ mod tests {
                     "切り取り (Ctrl+X)",
                     "コピー (Ctrl+C)",
                     "ファイル整理先…",
+                    "画像を結合...",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
                     "文字起こしを作る",
@@ -2967,6 +3042,7 @@ mod tests {
                 ContextMenuItemKind::ZipImage,
                 &[
                     "ファイル整理先…",
+                    "画像を結合...",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
                     "文字起こしを作る",
@@ -2988,6 +3064,7 @@ mod tests {
                 ContextMenuItemKind::PdfPage,
                 &[
                     "ファイル整理先…",
+                    "画像を結合...",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
                     "文字起こしを作る",
@@ -3008,6 +3085,7 @@ mod tests {
                 ContextMenuItemKind::Stack,
                 &[
                     "ファイル整理先…",
+                    "画像を結合...",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
                     "文字起こしを作る",
@@ -3021,6 +3099,7 @@ mod tests {
                 ContextMenuItemKind::ZipDir,
                 &[
                     "ファイル整理先…",
+                    "画像を結合...",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
                     "文字起こしを作る",
@@ -3032,6 +3111,7 @@ mod tests {
                 ContextMenuItemKind::SearchContainer,
                 &[
                     "ファイル整理先…",
+                    "画像を結合...",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
                     "文字起こしを作る",
@@ -3160,6 +3240,7 @@ mod tests {
                 "切り取り [5件] (Ctrl+X)",
                 "コピー [5件] (Ctrl+C)",
                 "ファイル整理先…",
+                "画像を結合...",
                 "AI 説明文を作る",
                 "AI 説明文を削除",
                 "文字起こしを作る",
@@ -3362,6 +3443,7 @@ mod tests {
         assert_labels(
             folder,
             &[
+                "画像を結合...",
                 "AI 説明文を作る",
                 "AI 説明文を削除",
                 "文字起こしを作る",
@@ -3573,6 +3655,7 @@ mod tests {
                 "|",
                 "OrganizeFiles",
                 "|",
+                "CombineSelection",
                 "CreateAiCaptions",
                 "DeleteAiCaptions",
                 "CreateTranscripts",
@@ -3621,6 +3704,7 @@ mod tests {
                 "|",
                 "OrganizeFiles",
                 "|",
+                "CombineSelection",
                 "CreateAiCaptions",
                 "DeleteAiCaptions",
                 "CreateTranscripts",
@@ -4115,7 +4199,7 @@ mod tests {
             .iter()
             .position(|candidate| *candidate == id)
             .unwrap();
-        assert_eq!(canonical[slot - 1], ContextMenuItemId::OrganizeFiles);
+        assert_eq!(canonical[slot - 1], ContextMenuItemId::CombineSelection);
         let old_order: Vec<_> = canonical
             .iter()
             .copied()
@@ -4132,7 +4216,8 @@ mod tests {
             .iter()
             .position(|candidate| *candidate == ContextMenuItemId::OrganizeFiles)
             .unwrap();
-        assert_eq!(ids[organize_slot + 1], id);
+        assert_eq!(ids[organize_slot + 1], ContextMenuItemId::CombineSelection);
+        assert_eq!(ids[organize_slot + 2], id);
 
         let mut custom = canonical;
         custom.remove(slot);

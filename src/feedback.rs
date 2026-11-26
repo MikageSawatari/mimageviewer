@@ -49,6 +49,7 @@ impl AiFailureReport {
 #[derive(Clone, Debug)]
 pub(crate) enum FeedbackAction {
     RevealPath(std::path::PathBuf),
+    OpenInViewer(std::path::PathBuf),
     Diagnostic(std::sync::Arc<AiFailureReport>),
 }
 impl FeedbackAction {
@@ -70,6 +71,7 @@ impl FeedbackAction {
             )
             .on_hover_cursor(egui::CursorIcon::PointingHand);
         match self {
+            Self::OpenInViewer(_) => response.hover_tip_dark("クリックで mImageViewer で開く"),
             Self::RevealPath(_) => response.hover_tip_dark("クリックで保存ファイルを表示"),
             Self::Diagnostic(report) => match cursor_extent {
                 Some(extent) => crate::ui_helpers::hover_tip_dark_with_cursor_extent(
@@ -83,6 +85,8 @@ impl FeedbackAction {
     }
     pub(crate) fn activate(&self, ctx: &egui::Context) {
         match self {
+            // App routes this action into its existing explicit-path activation channel.
+            Self::OpenInViewer(_) => {}
             Self::RevealPath(path) => crate::capture::reveal_path_async(path.clone()),
             Self::Diagnostic(report) => ctx.copy_text(report.body().to_owned()),
         }
@@ -91,7 +95,25 @@ impl FeedbackAction {
     pub(crate) fn reveal_path(&self) -> Option<&std::path::PathBuf> {
         match self {
             Self::RevealPath(path) => Some(path),
-            Self::Diagnostic(_) => None,
+            Self::Diagnostic(_) | Self::OpenInViewer(_) => None,
+        }
+    }
+}
+
+impl crate::app::App {
+    pub(crate) fn activate_feedback_action(
+        &mut self,
+        action: &FeedbackAction,
+        ctx: &egui::Context,
+    ) {
+        if let FeedbackAction::OpenInViewer(path) = action {
+            let request = crate::single_instance::ActivationOpenPath::received(
+                path.clone(),
+                self.remote_session_handle(),
+            );
+            let _ = self.activation_open_path_tx.send(request);
+        } else {
+            action.activate(ctx);
         }
     }
 }

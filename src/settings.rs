@@ -5893,6 +5893,11 @@ pub struct Settings {
     /// 一括書き出しの保存形式プリセット (保存順、PC 固有パスを含む)。
     #[serde(default)]
     pub export_batch_presets: Vec<crate::export_batch::BatchExportPreset>,
+    /// Unreleased combine values: names and per-image labels are not remembered.
+    #[serde(default)]
+    pub combine_options: Option<crate::image_combine::CombineOptions>,
+    #[serde(default)]
+    pub combine_presets: Vec<crate::image_combine::CombinePreset>,
 
     // ── SNS 分割 ──────────────────────────────────────────────
     /// 直前に選んだ投稿先 (`"x"` / `"instagram"`)。ページ固有の配置は保存しない。
@@ -8950,6 +8955,8 @@ impl Default for Settings {
             export_batch_scale: crate::export_dialog::ExportScale::default(),
             export_batch_options: None,
             export_batch_presets: Vec::new(),
+            combine_options: None,
+            combine_presets: Vec::new(),
             sns_split_target: default_sns_split_target(),
             sns_split_count: default_sns_split_count(),
             sns_split_seam_permille: default_sns_split_seam_permille(),
@@ -11446,6 +11453,8 @@ impl Settings {
     /// 呼出後は空の既定値になる (呼出元はすぐ `*self = state.settings` で捨てる想定)。
     pub fn overwrite_non_preferences_from(&mut self, src: &mut Settings) {
         self.export_batch_presets = std::mem::take(&mut src.export_batch_presets);
+        self.combine_presets = std::mem::take(&mut src.combine_presets);
+        self.combine_options = src.combine_options.take();
         // 通知を閉じる前の環境設定 draft で既読を巻き戻さない。
         self.whats_new_acknowledged_version
             .clone_from(&src.whats_new_acknowledged_version);

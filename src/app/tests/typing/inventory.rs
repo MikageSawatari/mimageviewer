@@ -43,6 +43,12 @@ const fn exempt(
 // address field. Their separate adapters exercise its callers through App frames.
 const INPUT_TESTS: &[Entry] = &[
     tested(
+        "src/ui_dialogs/image_combine.rs",
+        "show_singleline(ui, text,",
+        1,
+        "typing_image_combine_label_preview_ascii",
+    ),
+    tested(
         "src/ui_history_field.rs",
         "show_singleline(ui, text,",
         1,

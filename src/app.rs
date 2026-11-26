@@ -17301,6 +17301,8 @@ pub struct App {
     pub(crate) export_dialog: Option<Box<crate::export_dialog::ExportDialogState>>,
     /// Ctrl+E / グリッド選択の一括エクスポートのダイアログ状態。
     pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
+    pub(crate) combine_session: Option<crate::ui_dialogs::image_combine::CombineSession>,
+    pub(crate) combine_request_sequence: u64,
     /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。単ページと一括の両方が使う。
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
     /// OS-global clipboard output; intentionally stays outside viewer context bundles.
@@ -21352,6 +21354,8 @@ impl App {
             pipeline_debug_export_pending: None,
             export_dialog: None,
             export_batch_dialog: None,
+            combine_session: None,
+            combine_request_sequence: 0,
             export_pending: None,
             edited_clipboard_copy: None,
             folder_refresh_pending: None,
@@ -24402,6 +24406,7 @@ impl App {
             self.export_dialog.is_some() => "export_dialog",
             self.depth_export_dialog_open() => "depth_export",
             self.export_batch_dialog.is_some() => "export_batch_dialog",
+            self.combine_dialog_modal() => "image_combine",
             self.export_pending.is_some() => "export_pending",
             self.local_adjust_add_layer_dialog_open => "local_adjust_add_layer",
             self.local_adjust_change_mask_dialog_open => "local_adjust_change_mask",
@@ -43898,7 +43903,8 @@ impl App {
     }
 
     pub(crate) fn document_open_modal_admission_blocked(&self) -> bool {
-        self.book_structural_op.is_some()
+        self.combine_dialog_modal()
+            || self.book_structural_op.is_some()
             || self.depth_export_dialog_open()
             || self.depth_independent_addon_modal_owner().is_some()
             || self.book_append_undo_in_progress()

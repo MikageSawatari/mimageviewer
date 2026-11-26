@@ -1,0 +1,1352 @@
+//! Grid-only combine session. UI captures snapshots within the batch 6ms budget.
+use super::export_batch::ExportBatchTarget;
+use crate::app::App;
+use crate::image_combine::{
+    worker::{self, Command, Event, RenderSpec},
+    *,
+};
+use eframe::egui;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+
+#[cfg(test)]
+mod image_combine_tests;
+mod options_ui;
+mod presets;
+
+pub(crate) enum CombineSession {
+    Dialog(Box<CombineDialogState>),
+    Writing { request: u64 },
+}
+
+impl CombineSession {
+    pub(crate) fn modal(&self) -> bool {
+        matches!(self, Self::Dialog(_))
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ItemStatus {
+    Preparing,
+    Loading,
+    Loaded((u32, u32)),
+    Failed(String),
+}
+
+struct DialogItem {
+    id: usize,
+    spec: CombineItemSpec,
+    name: String,
+    status: ItemStatus,
+}
+
+struct Preview {
+    texture: egui::TextureHandle,
+    layout: Layout,
+    ids: Vec<usize>,
+    generation: u64,
+    not_drawn: usize,
+    kind: CombineLayout,
+    direction: CombineDirection,
+}
+
+pub(crate) struct CombineDialogState {
+    request: u64,
+    options: CombineOptions,
+    items: Vec<DialogItem>,
+    pending: VecDeque<(usize, ExportBatchTarget)>,
+    /// Taken on transfer to Writing; Drop otherwise cancels the dialog worker.
+    worker: Option<worker::Connection>,
+    selected: Option<usize>,
+    dragging: Option<usize>,
+    preview: Option<Preview>,
+    generation: u64,
+    requested: Option<RenderSpec>,
+    render_error: Option<String>,
+    error: Option<String>,
+    split_text: String,
+    custom_ratio_text: Option<String>,
+    folder_text: String,
+    name: String,
+    preset: presets::PresetUi,
+}
+
+impl Drop for CombineDialogState {
+    fn drop(&mut self) {
+        if let Some(worker) = &self.worker {
+            worker.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+impl CombineDialogState {
+    fn spec(&self) -> RenderSpec {
+        RenderSpec {
+            options: self.options.normalized(),
+            items: self
+                .items
+                .iter()
+                .map(|item| (item.id, item.spec.clone()))
+                .collect(),
+        }
+    }
+
+    fn ready(&self) -> bool {
+        !self.items.is_empty()
+            && self.pending.is_empty()
+            && self
+                .items
+                .iter()
+                .all(|item| matches!(item.status, ItemStatus::Loaded(_)))
+    }
+
+    fn validation(&self) -> Result<Layout, String> {
+        if let Some(item) = self
+            .items
+            .iter()
+            .find(|item| matches!(item.status, ItemStatus::Failed(_)))
+        {
+            return Err(format!("読めない画像を外してください: {}", item.name));
+        }
+        if !self.ready() {
+            return Err("画像を読み込み中です".into());
+        }
+        if matches!(
+            self.options.layout,
+            CombineLayout::JustifiedRows | CombineLayout::JustifiedColumns
+        ) && matches!(self.options.split, Split::Counts(_))
+        {
+            parse_counts(&self.split_text, self.items.len())?;
+        }
+        if let Some(text) = &self.custom_ratio_text {
+            parse_ratio(text)?;
+        }
+        let dims = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                if let ItemStatus::Loaded(dims) = item.status {
+                    Some(dims)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let result =
+            layout(&self.options, &dims, self.options.labels.band_height()).map_err(|error| {
+                match error {
+                    LayoutError::CanvasPixelLimit
+                    | LayoutError::WebpSideLimit
+                    | LayoutError::JpegSideLimit => {
+                        format!("{error}。サイズを小さくするか、形式を変えてください")
+                    }
+                    _ => error.to_string(),
+                }
+            });
+        crate::perf::event(
+            "image_combine/layout",
+            "complete",
+            None,
+            self.generation,
+            &[
+                ("items", serde_json::json!(dims.len())),
+                (
+                    "ms",
+                    serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
+                ),
+            ],
+        );
+        result
+    }
+
+    fn output_dir(&self) -> PathBuf {
+        match &self.options.destination {
+            Destination::FirstImageFolder => self
+                .items
+                .first()
+                .and_then(|item| source_path(&item.spec.source).parent())
+                .unwrap_or(Path::new(""))
+                .to_path_buf(),
+            Destination::Folder(path) => path.clone(),
+        }
+    }
+
+    fn can_write(&self) -> bool {
+        self.validation().is_ok()
+            && self.render_error.is_none()
+            && self
+                .preview
+                .as_ref()
+                .is_some_and(|p| p.generation == self.generation)
+            && self.output_validation().is_ok()
+    }
+
+    fn output_validation(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("出力の名前を入力してください".into());
+        }
+        if self.output_dir().as_os_str().is_empty() {
+            return Err("保存先フォルダを指定してください".into());
+        }
+        Ok(())
+    }
+
+    fn invalidate_and_request(&mut self, ctx: &egui::Context) {
+        let spec = self.spec();
+        if self.requested.as_ref() == Some(&spec) {
+            return;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.render_error = None;
+        self.requested = Some(spec.clone());
+        if self.validation().is_ok() {
+            if let Some(worker) = &self.worker {
+                #[cfg(test)]
+                crate::ime_focus::typing_probe::job(
+                    "image_combine_label",
+                    self.typing_label(),
+                    crate::ime_focus::typing_probe::Outcome::Started,
+                );
+                if worker
+                    .tx
+                    .send(Command::Render {
+                        generation: self.generation,
+                        spec,
+                    })
+                    .is_err()
+                {
+                    self.render_error = Some("結合 worker が中断されました".into());
+                }
+            }
+        }
+        ctx.request_repaint();
+    }
+
+    fn poll(&mut self, ctx: &egui::Context) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        // Collect event values only; at most the matching generation can upload.
+        let mut rendered = None;
+        loop {
+            match worker.rx.try_recv() {
+                Ok(Event::Loaded { id, dims }) => {
+                    if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+                        item.status = ItemStatus::Loaded(dims);
+                    }
+                    self.requested = None; // All dimensions must be available before rendering.
+                }
+                Ok(Event::Failed { id, message }) => {
+                    if let Some(item) = self.items.iter_mut().find(|item| item.id == id) {
+                        item.status = ItemStatus::Failed(message);
+                    }
+                }
+                Ok(Event::Rendered {
+                    generation,
+                    rgba,
+                    layout,
+                    not_drawn,
+                }) if generation == self.generation => {
+                    rendered = Some((generation, rgba, layout, not_drawn));
+                }
+                Ok(Event::RenderFailed {
+                    generation,
+                    message,
+                }) if generation == self.generation => self.render_error = Some(message),
+                Ok(_) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.render_error = Some("結合 worker が中断されました".into());
+                    break;
+                }
+            }
+        }
+        if let Some((generation, rgba, layout, not_drawn)) = rendered {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [rgba.width() as usize, rgba.height() as usize],
+                rgba.as_raw(),
+            );
+            self.preview = Some(Preview {
+                texture: ctx.load_texture(
+                    "image_combine_preview",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ),
+                layout,
+                ids: self
+                    .requested
+                    .as_ref()
+                    .map(|spec| spec.items.iter().map(|(id, _)| *id).collect())
+                    .unwrap_or_default(),
+                generation,
+                not_drawn,
+                kind: self
+                    .requested
+                    .as_ref()
+                    .map_or(self.options.layout, |spec| spec.options.layout),
+                direction: self
+                    .requested
+                    .as_ref()
+                    .map_or(self.options.direction, |spec| spec.options.direction),
+            });
+            #[cfg(test)]
+            crate::ime_focus::typing_probe::job(
+                "image_combine_label",
+                self.typing_label(),
+                crate::ime_focus::typing_probe::Outcome::Delivered(self.items.len()),
+            );
+        }
+    }
+
+    fn move_item(&mut self, id: usize, before: Option<usize>) {
+        if before == Some(id) {
+            return;
+        }
+        let Some(index) = self.items.iter().position(|item| item.id == id) else {
+            return;
+        };
+        let item = self.items.remove(index);
+        let destination = before
+            .and_then(|id| self.items.iter().position(|item| item.id == id))
+            .unwrap_or(self.items.len());
+        self.items.insert(destination, item);
+    }
+
+    fn remove_failed(&mut self) {
+        let ids = self
+            .items
+            .iter()
+            .filter(|item| matches!(item.status, ItemStatus::Failed(_)))
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        self.items.retain(|item| !ids.contains(&item.id));
+        if let Some(worker) = &self.worker {
+            let _ = worker.tx.send(Command::Remove { ids });
+        }
+        if !self.items.iter().any(|item| Some(item.id) == self.selected) {
+            self.selected = self.items.first().map(|item| item.id);
+        }
+        self.requested = None;
+    }
+
+    #[cfg(test)]
+    fn typing_label(&self) -> &str {
+        self.items
+            .iter()
+            .find(|item| Some(item.id) == self.selected)
+            .and_then(|item| item.spec.label_override.as_deref())
+            .unwrap_or("")
+    }
+}
+
+fn source_path(source: &CombineSourceRef) -> &Path {
+    match source {
+        CombineSourceRef::File { path } => path,
+        CombineSourceRef::ZipEntry { zip_path, .. } => zip_path,
+        CombineSourceRef::PdfPage { pdf_path, .. } => pdf_path,
+    }
+}
+
+fn source_name(source: &CombineSourceRef, stem: bool) -> String {
+    let path = match source {
+        CombineSourceRef::File { path } => path.as_path(),
+        CombineSourceRef::ZipEntry { entry_name, .. } => Path::new(entry_name),
+        CombineSourceRef::PdfPage { pdf_path, page_num } => {
+            return format!(
+                "{} p{}",
+                pdf_path.file_stem().unwrap_or_default().to_string_lossy(),
+                page_num + 1
+            );
+        }
+    };
+    if stem {
+        path.file_stem()
+    } else {
+        path.file_name()
+    }
+    .unwrap_or_default()
+    .to_string_lossy()
+    .into_owned()
+}
+
+fn source_for_target(app: &App, target: &ExportBatchTarget) -> Option<CombineSourceRef> {
+    use crate::grid_item::GridItem;
+    match target {
+        ExportBatchTarget::StackMember(path) => Some(CombineSourceRef::File { path: path.clone() }),
+        ExportBatchTarget::Item { idx, .. } => match app.items.get(*idx)? {
+            GridItem::Image(path) => Some(CombineSourceRef::File { path: path.clone() }),
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => Some(CombineSourceRef::ZipEntry {
+                zip_path: zip_path.clone(),
+                entry_name: entry_name.clone(),
+            }),
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => Some(CombineSourceRef::PdfPage {
+                pdf_path: pdf_path.clone(),
+                page_num: *page_num,
+            }),
+            _ => None,
+        },
+    }
+}
+
+fn parse_counts(text: &str, total: usize) -> Result<Vec<u32>, String> {
+    let counts = text
+        .split('-')
+        .map(|s| {
+            s.trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|n| (1..=100).contains(n))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or("行または列の枚数を 1〜100 の数で指定してください (例 2-2)")?;
+    if counts.iter().map(|n| *n as usize).sum::<usize>() != total {
+        return Err("行または列の枚数が一致しません".into());
+    }
+    Ok(counts)
+}
+
+fn parse_ratio(text: &str) -> Result<(u32, u32), String> {
+    text.split_once(':')
+        .and_then(|(w, h)| Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?)))
+        .filter(|(w, h)| (1..=100).contains(w) && (1..=100).contains(h))
+        .ok_or_else(|| "比率は W:H (各 1〜100) で指定してください".into())
+}
+
+pub(crate) fn entry_disabled_reason(
+    count: usize,
+    session: bool,
+    exporting: bool,
+) -> Option<String> {
+    if session {
+        Some("結合の操作中です".into())
+    } else if exporting {
+        Some("エクスポート中です".into())
+    } else if count == 0 {
+        Some("選択の中に結合できる画像・ページがありません".into())
+    } else if count > 100 {
+        Some(format!("結合できるのは 100 枚までです ({count} 枚選択中)"))
+    } else {
+        None
+    }
+}
+
+impl App {
+    #[cfg(test)]
+    pub(crate) fn prepare_image_combine_typing_for_test(&mut self) {
+        if let Some(CombineSession::Dialog(state)) = &mut self.combine_session {
+            if let Some(item) = state.items.first_mut() {
+                item.spec.label_override = Some(String::new());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn image_combine_typing_state_for_test(&self) -> (&str, bool, usize) {
+        if let Some(CombineSession::Dialog(state)) = &self.combine_session {
+            (
+                state.typing_label(),
+                state
+                    .preview
+                    .as_ref()
+                    .is_some_and(|p| p.generation == state.generation),
+                state.items.len(),
+            )
+        } else {
+            ("", false, 0)
+        }
+    }
+    pub(crate) fn combine_dialog_modal(&self) -> bool {
+        self.combine_session
+            .as_ref()
+            .is_some_and(CombineSession::modal)
+    }
+
+    pub(crate) fn grid_combine_disabled_reason(&self) -> Option<String> {
+        entry_disabled_reason(
+            self.grid_batch_export_targets().0.len(),
+            self.combine_session.is_some(),
+            self.export_pending.is_some(),
+        )
+        .or_else(|| (!self.grid_item_input_allowed()).then(|| "一覧の準備中です".into()))
+    }
+
+    pub(crate) fn open_image_combine_dialog(&mut self, ctx: &egui::Context) {
+        if let Some(reason) = self.grid_combine_disabled_reason() {
+            self.show_feedback_warning(reason);
+            return;
+        }
+        let (targets, _) = self.grid_batch_export_targets();
+        let items = targets
+            .iter()
+            .enumerate()
+            .map(|(id, target)| {
+                let source =
+                    source_for_target(self, target).ok_or("結合する画像を特定できません")?;
+                Ok(DialogItem {
+                    id,
+                    name: source_name(&source, false),
+                    spec: CombineItemSpec {
+                        source,
+                        label_override: None,
+                    },
+                    status: ItemStatus::Preparing,
+                })
+            })
+            .collect::<Result<Vec<_>, &str>>();
+        let items = match items {
+            Ok(items) => items,
+            Err(error) => {
+                self.show_feedback_error(error.into());
+                return;
+            }
+        };
+        let worker = match worker::spawn(
+            items.len(),
+            Some(crate::raw::RawDecodeContext::new(
+                self.raw_develop_executor.clone(),
+                self.settings.raw_brightness,
+            )),
+            self.local_ai_activity_lease(),
+            ctx.clone(),
+        ) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.show_feedback_error(error);
+                return;
+            }
+        };
+        self.combine_request_sequence = self.combine_request_sequence.wrapping_add(1);
+        let options = self
+            .settings
+            .combine_options
+            .clone()
+            .unwrap_or_default()
+            .normalized();
+        let split_text = match &options.split {
+            Split::Auto => String::new(),
+            Split::Counts(counts) => counts
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join("-"),
+        };
+        let folder_text = match &options.destination {
+            Destination::Folder(path) => path.display().to_string(),
+            _ => String::new(),
+        };
+        let name = format!("{}_結合", source_name(&items[0].spec.source, true));
+        let custom_ratio_text = options_ui::custom_ratio_text(&options);
+        self.combine_session = Some(CombineSession::Dialog(Box::new(CombineDialogState {
+            request: self.combine_request_sequence,
+            options,
+            selected: items.first().map(|item| item.id),
+            items,
+            pending: targets.into_iter().enumerate().collect(),
+            worker: Some(worker),
+            dragging: None,
+            preview: None,
+            generation: 0,
+            requested: None,
+            render_error: None,
+            error: None,
+            split_text,
+            custom_ratio_text,
+            folder_text,
+            name,
+            preset: Default::default(),
+        })));
+        ctx.request_repaint();
+    }
+
+    /// Apply the shared grid shortcut gate before consuming any re-entry chord.
+    pub(crate) fn reject_busy_image_combine_shortcut(&mut self, ctx: &egui::Context) {
+        if self.fullscreen_idx.is_none()
+            && ctx.viewport_id() == egui::ViewportId::ROOT
+            && (self.combine_session.is_some() || self.export_pending.is_some())
+            && !self.shortcuts_blocked_by_text_input(ctx)
+            && !self.ime_input_active(ctx)
+            && !egui::Popup::is_any_open(ctx)
+            && self
+                .keymap
+                .consume_action(ctx, crate::keymap::KeyAction::GridCombineSelection)
+        {
+            let reason = if self.combine_session.is_some() {
+                "結合の操作中です"
+            } else {
+                "エクスポート中です"
+            };
+            self.show_feedback_warning(reason.into());
+        }
+    }
+
+    fn advance_image_combine_preparation(&mut self, state: &mut CombineDialogState) {
+        let start = std::time::Instant::now();
+        while let Some((id, target)) = state.pending.pop_front() {
+            let result = self
+                .batch_export_item_for_target(&target)
+                .and_then(|item| item.ok_or_else(|| "この対象は結合できません".into()));
+            let status = match result {
+                Ok(item) => match state.worker.as_ref().unwrap().tx.send(Command::Prepare {
+                    id,
+                    item: Box::new(item),
+                }) {
+                    Ok(()) => ItemStatus::Loading,
+                    Err(_) => ItemStatus::Failed("結合 worker が中断されました".into()),
+                },
+                Err(error) => {
+                    crate::logger::log(format!("image combine prepare {id}: {error}"));
+                    ItemStatus::Failed(error)
+                }
+            };
+            if let Some(item) = state.items.iter_mut().find(|item| item.id == id) {
+                item.status = status;
+            }
+            if start.elapsed() >= std::time::Duration::from_millis(6) {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn draw_image_combine_dialog(&mut self, ctx: &egui::Context) {
+        if self.combine_session.is_some() {
+            self.reject_busy_image_combine_shortcut(ctx);
+        }
+        let Some(session) = self.combine_session.take() else {
+            return;
+        };
+        let CombineSession::Dialog(mut state) = session else {
+            self.combine_session = Some(session);
+            return;
+        };
+        self.advance_image_combine_preparation(&mut state);
+        state.poll(ctx);
+        state.invalidate_and_request(ctx);
+        let escape = self.dialog_escape_pressed(ctx);
+        let enter = self.dialog_enter_pressed(ctx);
+        let action = draw_window_with_enter(ctx, &mut state, &self.settings.combine_presets, enter);
+        if escape || action.cancel {
+            return;
+        }
+        if let Some(action) = action.preset {
+            self.apply_combine_preset(&mut state, action);
+        }
+        if action.pick_folder {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_directory(state.output_dir())
+                .pick_folder()
+            {
+                state.folder_text = path.display().to_string();
+                state.options.destination = Destination::Folder(path);
+            }
+        }
+        state.invalidate_and_request(ctx);
+        if action.write && state.can_write() {
+            let spec = state.spec();
+            match state
+                .worker
+                .as_ref()
+                .unwrap()
+                .write(spec, state.output_dir(), state.name.clone())
+            {
+                Ok(pending) => {
+                    self.settings.combine_options = Some(state.options.clone());
+                    if !self.settings.save_checked() {
+                        self.show_feedback_error("結合の設定を保存できませんでした".into());
+                    }
+                    state.worker.take(); // Writing now owns cancellation through ExportPending.
+                    self.export_pending = Some(pending);
+                    self.combine_session = Some(CombineSession::Writing {
+                        request: state.request,
+                    });
+                    return;
+                }
+                Err(error) => state.error = Some(error),
+            }
+        }
+        if !state.ready() && state.render_error.is_none() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        self.combine_session = Some(CombineSession::Dialog(state));
+    }
+
+    /// Session take is the exactly-once latch, even when completed progress stays open.
+    pub(crate) fn finish_combine_write(&mut self) {
+        if !matches!(self.combine_session, Some(CombineSession::Writing { .. })) {
+            return;
+        }
+        let session = self.combine_session.take();
+        if let Some(CombineSession::Writing { request }) = session {
+            crate::logger::log(format!("image combine finished request={request}"));
+        }
+        let path = self
+            .export_pending
+            .as_ref()
+            .filter(|pending| pending.end == Some(crate::export_dialog::ExportEnd::Done))
+            .and_then(|pending| pending.successes.first())
+            .map(|success| success.path.clone());
+        if let Some(path) = path {
+            if let Some(folder) = self.current_folder.clone().filter(|folder| {
+                path.parent()
+                    .is_some_and(|parent| crate::folder_tree::path_eq(parent, folder))
+            }) {
+                self.request_post_operation_selection(
+                    folder,
+                    crate::post_operation_selection::ExpectedOutputs::Known(vec![path.clone()]),
+                );
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            self.show_saved_output_feedback(format!("結合しました: {name}"));
+            self.fs_feedback_toast_action =
+                Some(crate::feedback::FeedbackAction::OpenInViewer(path));
+            self.fs_feedback_toast_surface = None;
+        }
+    }
+}
+
+#[derive(Default)]
+struct Action {
+    cancel: bool,
+    write: bool,
+    pick_folder: bool,
+    preset: Option<presets::PresetAction>,
+    field_enter: bool,
+}
+
+fn trailing_width(ui: &egui::Ui, labels: &[&str]) -> f32 {
+    labels
+        .iter()
+        .map(|label| {
+            egui::WidgetText::from(*label)
+                .into_galley(
+                    ui,
+                    Some(egui::TextWrapMode::Extend),
+                    f32::INFINITY,
+                    egui::TextStyle::Button,
+                )
+                .size()
+                .x
+                + 2.0 * ui.spacing().button_padding.x
+                + ui.spacing().item_spacing.x
+        })
+        .sum()
+}
+
+fn text(ui: &mut egui::Ui, text: &mut String, salt: &str, width: f32) -> egui::Response {
+    let mut output = crate::ime_focus::show_singleline(ui, text, None, |edit| {
+        edit.id(egui::Id::unique(salt)).desired_width(width)
+    });
+    let label = match salt {
+        "image_combine_label" => "ラベル",
+        "image_combine_name" => "名前",
+        "image_combine_folder" => "保存先フォルダ",
+        "image_combine_split" => "行・列の枚数",
+        "image_combine_ratio" => "指定の比率",
+        "image_combine_preset_name" => "プリセット名",
+        _ => salt,
+    };
+    output.response.response = output.response.response.accessible_name(label);
+    crate::ui_helpers::singleline_text_edit_context_menu(ui, &mut output, text);
+    output.response.response
+}
+
+fn draw_window(
+    ctx: &egui::Context,
+    state: &mut CombineDialogState,
+    presets: &[CombinePreset],
+) -> Action {
+    let enter = !crate::ime_focus::ime_input_active(ctx)
+        && ctx.input(|input| input.key_pressed(egui::Key::Enter));
+    draw_window_with_enter(ctx, state, presets, enter)
+}
+
+fn draw_window_with_enter(
+    ctx: &egui::Context,
+    state: &mut CombineDialogState,
+    presets: &[CombinePreset],
+    enter: bool,
+) -> Action {
+    let mut action = Action {
+        field_enter: enter,
+        ..Default::default()
+    };
+    let mut open = true;
+    let screen = ctx.content_rect();
+    let size = egui::vec2(
+        1000.0_f32.min((screen.width() - 56.0).max(1.0)),
+        680.0_f32.min((screen.height() - 72.0).max(1.0)),
+    );
+    egui::Window::new(format!("画像を結合 ({} 枚)", state.items.len()))
+        .id(egui::Id::unique("image_combine_dialog"))
+        .collapsible(false)
+        .resizable(true)
+        .default_pos(screen.min + egui::vec2(20.0, 20.0))
+        .default_size(size)
+        .min_size(egui::vec2(300.0, 220.0))
+        .max_size(size.max(egui::vec2(screen.width() - 56.0, screen.height() - 72.0)))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            presets::draw(ui, state, presets, &mut action);
+            ui.separator();
+            let footer = footer_height(ui, state);
+            let height = (ui.available_height() - footer).max(1.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), height),
+                egui::Layout::left_to_right(egui::Align::Min),
+                |ui| {
+                    let left_width = (ui.available_width() * 0.57).max(1.0);
+                    let right_width =
+                        (ui.available_width() - left_width - ui.spacing().item_spacing.x).max(1.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(left_width, height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            let controls = 2.0
+                                * (ui.spacing().interact_size.y + ui.spacing().item_spacing.y)
+                                + super::startup_dialog_button_rows_height(
+                                    ui,
+                                    &[
+                                        "ファイル名を入れる",
+                                        "すべて番号に戻す",
+                                        "逆順",
+                                        "前へ",
+                                        "後へ",
+                                    ],
+                                )
+                                + if state
+                                    .items
+                                    .iter()
+                                    .any(|item| matches!(item.status, ItemStatus::Failed(_)))
+                                {
+                                    80.0
+                                } else {
+                                    0.0
+                                };
+                            let controls = controls.min(height * 0.65);
+                            draw_preview(
+                                ui,
+                                state,
+                                (height - controls - ui.spacing().item_spacing.y).max(1.0),
+                            );
+                            egui::ScrollArea::vertical()
+                                .id_salt("image_combine_item_controls")
+                                .max_height(controls)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| draw_item_controls(ui, state));
+                        },
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(right_width, height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.spacing_mut().scroll =
+                                super::non_overlapping_dialog_scroll_style(ui.spacing().scroll);
+                            let output = egui::ScrollArea::vertical()
+                                .id_salt("image_combine_settings")
+                                .max_height(height)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| options_ui::draw(ui, state, &mut action));
+                            #[cfg(test)]
+                            ctx.data_mut(|data| {
+                                data.insert_temp(
+                                    egui::Id::unique("image_combine_scroll_layout"),
+                                    crate::test_ui::scroll_layout::ScrollLayout::from_output(
+                                        &output,
+                                    ),
+                                )
+                            });
+                            #[cfg(not(test))]
+                            let _ = output;
+                        },
+                    );
+                },
+            );
+            draw_footer(ui, state, &mut action);
+            // Popup pickers/combos consume wheel before the parent dialog.
+            if egui::Popup::is_any_open(ctx) {
+                crate::wheel_input::consume_popup_wheel_input(ctx);
+            }
+        });
+    action.cancel |= !open;
+    // Enter only confirms fields/popup widgets; it is never an export trigger.
+    action
+}
+
+fn footer_error(state: &CombineDialogState) -> Option<String> {
+    state
+        .error
+        .clone()
+        .or_else(|| state.render_error.clone())
+        // Loading already has a status row. Treating it as an error adds a
+        // temporary footer row and moves the label's click target on completion.
+        .or_else(|| {
+            (state.ready()
+                || state
+                    .items
+                    .iter()
+                    .any(|item| matches!(item.status, ItemStatus::Failed(_))))
+            .then(|| state.validation().err())
+            .flatten()
+        })
+        .or_else(|| state.output_validation().err())
+}
+
+fn footer_height(ui: &egui::Ui, state: &CombineDialogState) -> f32 {
+    let line = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
+    let error = footer_error(state).map_or(0.0, |s| {
+        egui::WidgetText::from(s)
+            .into_galley(
+                ui,
+                Some(egui::TextWrapMode::Wrap),
+                ui.available_width(),
+                egui::TextStyle::Body,
+            )
+            .size()
+            .y
+            + ui.spacing().item_spacing.y
+    });
+    // Name, dimensions/status, destination and a wrapping button row remain fixed.
+    let warning = if state
+        .preview
+        .as_ref()
+        .is_some_and(|preview| preview.not_drawn > 0)
+    {
+        line
+    } else {
+        0.0
+    };
+    let name_row = ui.spacing().interact_size.y.max(line);
+    let status = egui::WidgetText::from(status_text(state))
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Wrap),
+            ui.available_width(),
+            egui::TextStyle::Body,
+        )
+        .size()
+        .y
+        + ui.spacing().item_spacing.y;
+    name_row
+        + line
+        + status
+        + warning
+        + super::startup_dialog_footer_height(ui, &["書き出す", "キャンセル"], 8.0)
+        + error
+        + 12.0
+}
+
+fn status_text(state: &CombineDialogState) -> String {
+    if let Ok(layout) = state.validation() {
+        format!(
+            "出力 {} × {} px・切り取り 最大 {:.0}%{}",
+            layout.canvas_size.0,
+            layout.canvas_size.1,
+            layout.max_crop_percent,
+            if layout.any_upscaled {
+                "・拡大される画像があります"
+            } else {
+                ""
+            }
+        )
+    } else {
+        let loaded = state
+            .items
+            .iter()
+            .filter(|item| matches!(item.status, ItemStatus::Loaded(_) | ItemStatus::Failed(_)))
+            .count();
+        format!("読み込み中 {loaded}/{}", state.items.len())
+    }
+}
+
+fn draw_footer(ui: &mut egui::Ui, state: &mut CombineDialogState, action: &mut Action) {
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("名前");
+        text(
+            ui,
+            &mut state.name,
+            "image_combine_name",
+            (ui.available_width() - 8.0).max(1.0),
+        );
+    });
+    ui.label(status_text(state));
+    if let Some(preview) = &state.preview {
+        if preview.not_drawn > 0 {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("収まらないラベル: {} 件", preview.not_drawn),
+            );
+        }
+    }
+    let path = state.output_dir().display().to_string();
+    ui.add(egui::Label::new(format!("保存先: {path}")).truncate())
+        .on_hover_text(path);
+    ui.horizontal_wrapped(|ui| {
+        // Disable keyboard activation of this one button, including focused Enter.
+        let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+        let response = ui.add_enabled(state.can_write(), egui::Button::new("書き出す"));
+        action.write |= response.clicked() && !enter;
+        action.cancel |= ui.button("キャンセル").clicked();
+    });
+    if let Some(error) = footer_error(state) {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+    }
+}
+
+fn card_rect(card: Rect, rect: egui::Rect, canvas: (u32, u32)) -> egui::Rect {
+    let scale = egui::vec2(
+        rect.width() / canvas.0 as f32,
+        rect.height() / canvas.1 as f32,
+    );
+    egui::Rect::from_min_max(
+        rect.min + egui::vec2(card.x as f32 * scale.x, card.y as f32 * scale.y),
+        rect.min
+            + egui::vec2(
+                card.right() as f32 * scale.x,
+                card.bottom() as f32 * scale.y,
+            ),
+    )
+}
+
+fn draw_preview(ui: &mut egui::Ui, state: &mut CombineDialogState, height: f32) {
+    let (area, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click_and_drag(),
+    );
+    ui.painter()
+        .rect_filled(area, 0.0, ui.visuals().extreme_bg_color);
+    let Some(preview) = &state.preview else {
+        ui.painter().text(
+            area.center(),
+            egui::Align2::CENTER_CENTER,
+            "プレビューを準備中",
+            egui::FontId::proportional(14.0),
+            ui.visuals().weak_text_color(),
+        );
+        return;
+    };
+    let size = preview.texture.size_vec2();
+    let fit = (area.width() / size.x).min(area.height() / size.y);
+    let image_rect = egui::Rect::from_center_size(area.center(), size * fit);
+    ui.painter().image(
+        preview.texture.id(),
+        image_rect,
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+    let rects = preview
+        .layout
+        .cards
+        .iter()
+        .map(|card| card_rect(card.card, image_rect, preview.layout.canvas_size))
+        .collect::<Vec<_>>();
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            egui::Id::unique("image_combine_preview_cards"),
+            preview
+                .ids
+                .iter()
+                .copied()
+                .zip(rects.iter().copied())
+                .collect::<Vec<_>>(),
+        )
+    });
+    if let Some(index) = preview
+        .ids
+        .iter()
+        .position(|id| Some(*id) == state.selected)
+    {
+        if let Some(rect) = rects.get(index) {
+            ui.painter().rect_stroke(
+                *rect,
+                0.0,
+                egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+    let hit = response
+        .interact_pointer_pos()
+        .and_then(|pos| rects.iter().position(|rect| rect.contains(pos)));
+    if response.clicked() {
+        if let Some(index) = hit {
+            state.selected = Some(preview.ids[index]);
+        }
+    }
+    if response.drag_started() {
+        // The first drag frame can already be over a different card. Capture
+        // the press owner, not that frame's current pointer target.
+        if let Some(index) = ui
+            .input(|input| input.pointer.press_origin())
+            .and_then(|pos| rects.iter().position(|rect| rect.contains(pos)))
+        {
+            state.selected = Some(preview.ids[index]);
+            state.dragging = state.selected;
+        }
+    }
+    let mut insert = None;
+    if state.dragging.is_some() {
+        if let Some(index) = hit {
+            let rect = rects[index];
+            let vertical = matches!(
+                preview.kind,
+                CombineLayout::Column | CombineLayout::JustifiedColumns
+            );
+            let after = response.interact_pointer_pos().is_some_and(|pos| {
+                if vertical {
+                    pos.y > rect.center().y
+                } else if preview.direction == CombineDirection::RightToLeft {
+                    pos.x < rect.center().x
+                } else {
+                    pos.x > rect.center().x
+                }
+            });
+            let slot = index + usize::from(after);
+            insert = Some(preview.ids.get(slot).copied());
+            let line = if vertical {
+                let y = if after { rect.bottom() } else { rect.top() };
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)]
+            } else {
+                let right = after == (preview.direction == CombineDirection::LeftToRight);
+                let x = if right { rect.right() } else { rect.left() };
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())]
+            };
+            ui.painter().line_segment(
+                line,
+                egui::Stroke::new(3.0, ui.visuals().selection.stroke.color),
+            );
+        }
+    }
+    if response.drag_stopped() {
+        if let (Some(id), Some(before)) = (state.dragging.take(), insert) {
+            state.move_item(id, before);
+        }
+    }
+}
+
+fn draw_item_controls(ui: &mut egui::Ui, state: &mut CombineDialogState) {
+    if let Some(index) = state
+        .items
+        .iter()
+        .position(|item| Some(item.id) == state.selected)
+    {
+        ui.add(egui::Label::new(format!("選んだ画像: {}", state.items[index].name)).truncate());
+        ui.horizontal(|ui| {
+            ui.label("ラベル");
+            let mut label = state.items[index]
+                .spec
+                .label_override
+                .clone()
+                .unwrap_or_else(|| {
+                    resolve_label(&state.items[index].spec, index, &state.options.labels)
+                });
+            let response = text(
+                ui,
+                &mut label,
+                "image_combine_label",
+                (ui.available_width() - trailing_width(ui, &["番号に戻す"])).max(1.0),
+            );
+            if response.changed() {
+                state.items[index].spec.label_override = Some(label.chars().take(200).collect());
+            }
+            if ui.button("番号に戻す").clicked() {
+                state.items[index].spec.label_override = None;
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("ファイル名を入れる").clicked() {
+                for item in &mut state.items {
+                    item.spec.label_override = Some(
+                        source_name(&item.spec.source, true)
+                            .chars()
+                            .take(200)
+                            .collect(),
+                    );
+                }
+            }
+            if ui.button("すべて番号に戻す").clicked() {
+                for item in &mut state.items {
+                    item.spec.label_override = None;
+                }
+            }
+            if ui.button("逆順").clicked() {
+                state.items.reverse();
+            }
+            if ui
+                .add_enabled(index > 0, egui::Button::new("前へ"))
+                .clicked()
+            {
+                state.items.swap(index, index - 1);
+            }
+            if ui
+                .add_enabled(index + 1 < state.items.len(), egui::Button::new("後へ"))
+                .clicked()
+            {
+                state.items.swap(index, index + 1);
+            }
+        });
+    }
+    if state
+        .items
+        .iter()
+        .any(|item| matches!(item.status, ItemStatus::Failed(_)))
+    {
+        if ui.button("読めない画像を外す").clicked() {
+            state.remove_failed();
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("image_combine_failures")
+            .max_height(42.0)
+            .show(ui, |ui| {
+                for item in &state.items {
+                    if let ItemStatus::Failed(message) = &item.status {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            format!("{}: {message}", item.name),
+                        );
+                    }
+                }
+            });
+    }
+}
+
+fn fixture_state(ctx: &egui::Context, band: bool) -> CombineDialogState {
+    fixture_state_with_fonts(ctx, band, None)
+}
+
+fn fixture_state_with_fonts(
+    ctx: &egui::Context,
+    band: bool,
+    fonts: Option<&comic_core::FontSet>,
+) -> CombineDialogState {
+    let mut options = CombineOptions::default();
+    if band {
+        options.labels.placement = LabelPlacement::Band;
+    }
+    options.output_size = OutputSize::Width(1600);
+    let items = (0..4)
+        .map(|id| DialogItem {
+            id,
+            spec: CombineItemSpec {
+                source: CombineSourceRef::File {
+                    path: PathBuf::from(format!("C:/Pictures/商品{}.png", id + 1)),
+                },
+                label_override: band.then(|| format!("商品{}", id + 1)),
+            },
+            name: format!("商品{}.png", id + 1),
+            status: ItemStatus::Loaded((600, 800)),
+        })
+        .collect::<Vec<_>>();
+    let layout = layout(&options, &vec![(600, 800); 4], options.labels.band_height()).unwrap();
+    let sources = [
+        [128, 169, 175, 255],
+        [192, 160, 143, 255],
+        [161, 174, 145, 255],
+        [159, 153, 181, 255],
+    ]
+    .map(|color| image::RgbaImage::from_pixel(60, 80, image::Rgba(color)));
+    let labels = fonts
+        .map(|fonts| {
+            label_layout(
+                &layout,
+                &items
+                    .iter()
+                    .map(|item| item.spec.clone())
+                    .collect::<Vec<_>>(),
+                &options,
+                fonts,
+            )
+        })
+        .unwrap_or(LabelLayout {
+            labels: vec![None; 4],
+            not_drawn: 0,
+        });
+    let fallback_fonts = comic_core::FontSet::new();
+    let rgba = render_all(
+        &layout,
+        &sources,
+        &options,
+        &labels,
+        0.3,
+        fonts.unwrap_or(&fallback_fonts),
+    )
+    .unwrap();
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        rgba.as_raw(),
+    );
+    CombineDialogState {
+        request: 0,
+        options,
+        items,
+        pending: VecDeque::new(),
+        worker: None,
+        selected: Some(2),
+        dragging: None,
+        preview: Some(Preview {
+            texture: ctx.load_texture("image_combine_fixture", image, Default::default()),
+            layout,
+            ids: vec![0, 1, 2, 3],
+            generation: 0,
+            not_drawn: 0,
+            kind: CombineLayout::JustifiedRows,
+            direction: CombineDirection::LeftToRight,
+        }),
+        generation: 0,
+        requested: None,
+        render_error: None,
+        error: None,
+        split_text: String::new(),
+        custom_ratio_text: None,
+        folder_text: String::new(),
+        name: "商品1_結合".into(),
+        preset: Default::default(),
+    }
+}
+
+/// Production window fixture without App, file IO or a worker.
+#[doc(hidden)]
+pub fn draw_image_combine_snapshot_fixture(ctx: &egui::Context, band: bool) {
+    let id = egui::Id::unique(("image_combine_fixture", band));
+    let state = ctx
+        .data_mut(|data| data.get_temp::<std::sync::Arc<std::sync::Mutex<CombineDialogState>>>(id));
+    let state = state.unwrap_or_else(|| {
+        // Reuse the harness's already loaded font bytes; fixture rendering does no IO.
+        let font_bytes = ctx.fonts(|fonts| {
+            let definitions = fonts.definitions();
+            definitions
+                .families
+                .get(&egui::FontFamily::Proportional)
+                .and_then(|names| {
+                    names
+                        .iter()
+                        .find_map(|name| definitions.font_data.get(name))
+                })
+                .map(|font| font.bytes().to_vec())
+        });
+        let fonts = font_bytes
+            .and_then(|bytes| {
+                comic_core::LoadedFont::from_bytes(crate::comic_overlay::COMIC_FONT_KEY, bytes).ok()
+            })
+            .map(|font| {
+                let mut fonts = comic_core::FontSet::new();
+                fonts.insert(font);
+                fonts
+            });
+        let state = std::sync::Arc::new(std::sync::Mutex::new(fixture_state_with_fonts(
+            ctx,
+            band,
+            fonts.as_ref(),
+        )));
+        ctx.data_mut(|data| data.insert_temp(id, state.clone()));
+        state
+    });
+    draw_window(ctx, &mut state.lock().unwrap(), &[]);
+}

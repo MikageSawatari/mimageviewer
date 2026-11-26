@@ -873,6 +873,15 @@ detachedは既存の共通パネルを使い、述語・viewport・bundleの交�
 
 ### UI オーバーレイ / ダイアログ
 
+画像の結合 (§1.904 stage B) は `image_combine/` の options / layout / label / render / worker と、
+`ui_dialogs/image_combine.rs` (設定欄・プリセットは子モジュール) を使う。App の `combine_session` が
+Dialog / Writing の単独所有者で、Dialog は共通モーダルと document-open admission の両方へ登録する。
+専用スレッド1本が batch の編集snapshotを下見から出力まで保持し、共通 `ExportPending` へ Step / Completed / 終端を送る。
+`ExportOrigin::Combine` の終端・切断・完了後の閉じるは同じ finish handlerへ入り、sessionのtakeで1回だけ採用する。
+保存通知の OpenInViewer は既存の明示パス activation へ渡す。前回値とプリセットは Settings 内にあり、
+構成のDB・索引・再編集はstage Cの範囲 (stage BはDBを作らず `save_recipe_stage_c_hook` だけを置く)。
+
+
 | モジュール | 役割 |
 | --- | --- |
 | `ui_adjustment_panel.rs` | 画像フルスクリーン左パネル。`画像補正 / 表示トリム / ブックマーク` の 3 タブを持つ。画像補正はプリセット切替・AI 設定・保存スロットを扱い、ヘッダーの 消しゴム / 補正レイヤー / 隠蔽加工 / 切り取り アイコンからそれぞれ `×` 付き独立左パネルを開く。ブックマークは現在の本のサムネイル一覧、ページ移動、DB 行削除を扱う。エクスポートアイコンは `Ctrl+E` と同じダイアログへ合流する。補正レイヤーは `local_adjust_lab` と同じ左パネル + 右ツールパネル構成で、効果 UI、マスク編集、U²-Netp 被写体生成、クラシック領域分割生成を UI thread 外の worker 経由で扱う |

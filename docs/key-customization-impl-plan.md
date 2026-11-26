@@ -765,6 +765,9 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
 - GridColumnCount1..10 `Alt+1`..`Alt+0`、GridColumnCount11..20 は既定キーなし、GridToggleDetailsView `Alt+-` (P)
 
 ### Grid (Ph4)
+- `GridCombineSelection` は Grid / Press、既定未割り当て、ini 名 `grid_combine_selection`。
+  一覧の右クリック・ツールメニューと同じ結合受付を使う。結合ダイアログの Enter は書き出しに使わない。
+
 - GridSearchNameEverything / GridSearchNameMetadata / GridSearchNameLocal は既定なしのPress（§1.690）。
   既存の検索欄へ名前を入れるだけで、検索を始めない。
 - GridCursorRight/Left/Up/Down `矢印` (P)(予約候補) / GridOpenSelected `Enter` (P) / GridOpenExternalPlayer `Shift+Enter` (P) /

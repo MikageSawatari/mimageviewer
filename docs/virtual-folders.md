@@ -1498,3 +1498,9 @@ entry bytes は通常ファイルと同じ `image_decode` 境界を通し、内�
 canonical・thumbnail・本への追加・clipboard・類似検索・Remote で共有する。
 内蔵 AVIF の clap/irot/imir 適用済み情報は `Orientation::Applied` で運び、ZIP の
 EXIF bytes 補正を重ねない。native source_dims も表示変換後の寸法とする。
+
+## 画像の結合 (§1.904)
+
+一覧の画像の結合は ZIP 内画像・PDF ページも対象にする。batch export と同じ対象判定・編集snapshot・
+materialization経路を使い、ZIP/PDF本体の親を「先頭の画像のフォルダ」とする。PDFは4096pxで描画した後に合成する。
+動画・音声・フォルダ・本そのものは対象外で、スタックはメンバーへ展開して100件までとする。

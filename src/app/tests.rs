@@ -51690,6 +51690,7 @@ mod favorite_adjustment_defaults_tests {
                 }
                 crate::export_dialog::ExportEvent::AllDone => break,
                 crate::export_dialog::ExportEvent::Started { .. }
+                | crate::export_dialog::ExportEvent::Step { .. }
                 | crate::export_dialog::ExportEvent::Failed(_)
                 | crate::export_dialog::ExportEvent::Skipped { .. }
                 | crate::export_dialog::ExportEvent::ThumbnailNotice { .. } => {}
@@ -51723,6 +51724,7 @@ mod favorite_adjustment_defaults_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         app.export_pending = Some(crate::export_dialog::ExportPending {
+            origin: crate::export_dialog::ExportOrigin::Single,
             cancel,
             rx,
             total: 1,

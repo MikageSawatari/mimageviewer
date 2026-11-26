@@ -383,6 +383,12 @@ pub struct CombineItemSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CombinePreset {
+    pub name: String,
+    pub options: CombineOptions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CombineRecipe {
     pub v: u32,
     #[serde(default)]

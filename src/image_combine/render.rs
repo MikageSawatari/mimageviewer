@@ -269,6 +269,19 @@ pub fn draw_card(
     options: &CombineOptions,
     scale: f64,
 ) -> Result<(), RenderError> {
+    draw_card_timed(canvas, card, source, options, scale).map(|_| ())
+}
+
+/// Worker measurements use the same primitive; resize and drawing are distinct.
+pub(crate) fn draw_card_timed(
+    canvas: &mut RgbaImage,
+    card: &CardLayout,
+    source: &RgbaImage,
+    options: &CombineOptions,
+    scale: f64,
+) -> Result<(f64, f64), RenderError> {
+    let started = std::time::Instant::now();
+    let mut resize_ms = 0.0;
     check_scale(scale)?;
     let o = options.normalized();
     let outer = scaled_rect(card.card, scale);
@@ -286,7 +299,9 @@ pub fn draw_card(
     }
     let target = scaled_rect(card.image, scale);
     if target.width() > 0.0 && target.height() > 0.0 {
+        let resize_start = std::time::Instant::now();
         let resized = resize_source(source, card, target.width() as u32, target.height() as u32)?;
+        resize_ms = resize_start.elapsed().as_secs_f64() * 1000.0;
         paint(canvas, target, |x, y| {
             (
                 *resized.get_pixel((x - target.x) as u32, (y - target.y) as u32),
@@ -298,7 +313,10 @@ pub fn draw_card(
     if border > 0.0 {
         paint_border(canvas, outer, radius, border, rgba(o.border.color, 255));
     }
-    Ok(())
+    Ok((
+        resize_ms,
+        (started.elapsed().as_secs_f64() * 1000.0 - resize_ms).max(0.0),
+    ))
 }
 
 pub fn draw_label(

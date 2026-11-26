@@ -203,6 +203,7 @@ pub fn spawn_batch_export_worker(request: BatchExportRequest) -> Result<ExportPe
         })
         .map_err(|e| format!("一括エクスポート worker を開始できません: {e}"))?;
     Ok(ExportPending {
+        origin: crate::export_dialog::ExportOrigin::Batch,
         cancel,
         rx,
         total,

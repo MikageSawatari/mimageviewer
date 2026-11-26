@@ -1,11 +1,10 @@
-//! Pure image-combine layout and worker-side rasterization (§1.904, stage A).
-// Stage B removes this allowance when the dialog and worker become callers.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Image-combine values, pure layout, rasterization and session worker (§1.904).
 
 pub mod label;
 pub mod layout;
 pub mod options;
 pub mod render;
+pub(crate) mod worker;
 
 pub use label::{LabelLayout, PlacedLabel, label_layout, resolve_label};
 pub use layout::{CardLayout, Layout, LayoutError, Rect, layout};
