@@ -1468,7 +1468,8 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   App の状態で、open・close・park・新しい窓・passive の採用での初期化も変えない。離し済みの入力から持続する止めを
   作っていた生成の境界を直す構造的修正であり、guard・遅延・再試行・時間切れによる症状パッチではない。
 - 構造的修正であることの合意: Codex 独立設計レビュー r1 (方針に合意、第 1 版は不合意)・r2 (第 2 版全体に合意、
-  GPT-6.1 Sol / xhigh) と ClaudeCode (設計担当)。実装の独立レビューの結果は実装後に追記する。
+  GPT-6.1 Sol / xhigh) と ClaudeCode (設計担当)。実装の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh、
+  r1 REVISE → r2 ACCEPT、`8a6c2f541..be712caf9`) も、最終版全体が構造的修正であることに合意。
 
 ### 2026-11-25: 閉じるモードのフォーカス復帰クリック (§1.899)
 

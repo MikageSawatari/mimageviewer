@@ -265,7 +265,7 @@ viewer の入力ハンドラ (`handle_fs_wheel_and_click_frame`・`advance_viewe
 
 ## 13. §1.906 修正: 押す・離すが同じフレームのクリックで、止めが次のクリックまで残らないようにする
 
-- 状態: 実装済み (コミットは ClaudeCode が記入)。設計第 2 版 (2026-11-26、ブランチ dblclick-906)。独立設計レビュー r1 REVISE → r2 **ACCEPT** (§13.8)。コンパイル・テストは ClaudeCode が別途実行。
+- 状態: 実装済み (d3c2c7bbe・be712caf9、ブランチ dblclick-906)。設計第 2 版 (2026-11-26)。独立設計レビュー r1 REVISE → r2 **ACCEPT**、独立実装レビュー r1 REVISE → r2 **ACCEPT** (§13.8)。利用者の実機確認待ち・master 未統合。
 - 報告: [backlog §1.906](next-release-backlog.md)。観測 (サブ PC のエージェント、§1.899 の確認の手順 5): 従来モード (クリックでページ送り) で前面を外した後、1 回目のクリックは送らない (期待どおり)。約 7 秒後の 2 回目も送らない。別ウィンドウでも同じ。前面を外さなければ毎回送る。
 - 方針: 利用者決定 (2026-11-26)「v5.8.0 で直す」。
 
@@ -397,3 +397,10 @@ F2 と `advance_viewer_primary_pointer_frame` は F12 の別ウィンドウと�
   扱う入力境界の問題として統括へ引き継ぐ。今回のテストでは最初のクリックのページ送りを assert せず、
   scrub が始まらないこと・`Idle` のままであること・次の普通のクリックで送ることを確かめる。
   この差し戻し後のコンパイル・テストは実装担当では未実行。
+
+### 13.10 実装の検証とレビュー記録
+
+- 実装 (2026-11-26): Codex GPT-6.1 Sol / high (d3c2c7bbe)。初回の実行で 5 件が失敗し、テストの組み立てを直した: 従来モードの F2 の pass は `fs_click` を作る前に早期 return するので、egui の当たり判定 (前のフレームのウィジェットを使う) により直後の pass のクリックが当たらない。実際の操作ではクリックの間に何フレームも描かれるので、入力の無い pass を挟む (製品の不具合ではない)。
+- 検証 (ClaudeCode が run-heavy で実行、be712caf9): `cargo fmt --check` 成功。関連 nextest 418 件 (suppression_906・close_mode・double_click_close・primary_suppression・erase_preview_canvas・focus_restore・scrub・drag_zoom・depth ほか) と周辺 2573 件 (ui_fullscreen:: ほか) が成功。変異確認: `arm` を「離し済みでも `PointerStream` を残す」に戻すと 15 件、advance の順序を旧に戻すと 2 件 (離し→押し、右ドラッグ) が落ちる。本体 lib 全件は統括の master 取り込み後。実機は未確認。
+- 実装の独立レビュー r1 (実装者とは別の GPT-6.1 Sol / xhigh、read-only、`8a6c2f541..d3c2c7bbe`): REVISE。P2: 実装中に足した viewer の scrub 開始位置の変更 (この pass の press イベントから取る) が、Depth パネル除外 (`press_origin` のまま) と食い違う。P3: その範囲が detached の §11 に未記録。ClaudeCode の判断で開始位置の変更を範囲から外して戻し (be712caf9)、§13.1 の表と §13.5・§13.9 を直した。
+- 実装の独立レビュー r2 (同じレビュー担当、`d3c2c7bbe..be712caf9`): **ACCEPT**、指摘なし。範囲から外す判断に同意。detached: 最終版全体が「症状パッチではなく構造的修正」であることに合意。
