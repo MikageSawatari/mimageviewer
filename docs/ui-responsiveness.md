@@ -23,6 +23,12 @@ main の走査中だけ旧一覧の項目入力を止め、500 ms 後に既存�
 `nav/startup_resolve_scan` に解決・走査時間と件数・source/outcome を記録する。Rust 検証・実機計測は未実施。
 詳細は [設計書 §1・§3](ui-sync-853-plan.md)。貼り付け (§1.859) の worker 化は本書 §4 と同設計書 §2 を参照。
 
+ヘルプの「AI で調べる」（§1.894）の型付き AI アプリ URL と、AI 連携の窓の Codex 設定も同じ
+`external-open-*` worker に乗せる。Web の AI はその worker 内で、画像コピーと共有する世代照合付きの
+テキスト書き込みを終え、結果を App の共通受信口へ送ってから開く。UI は世代の予約だけで mutex を待たない。
+登録検出はサブメニュー描画から AI 連携の窓と共通の worker を始め、結果の採用も描画時の `try_recv` だけで行う。
+追加部分の自動検証と実行時の挙動は未確認。共有 runner とサブ PC で確認予定。
+
 ## 操作スクリプトの準備（§1.363 段1）
 
 起動時・設定ON時の本文読み込み、コンパイル、`slots()` の評価は `operation-script-load` workerで行う。
@@ -63,14 +69,8 @@ r13の動画9操作（再生/ループ/全シーク）はEOF/次採用を促進�
 構築1.1〜2.2ms（p95最大3.4ms）、保持heap概算約15MB、比較1〜1.5msで、イベント検出へその列を持ち込まない根拠である。
 既存ignored `perf_operation_script_page_identity` に5万件の変更なしevent識別の構築＋比較（μs）の行を追加した。
 ClaudeCodeの791529cf1 release計測では、変更なしevent識別が中央値0.8〜0.9μs・p95最大2.1μs。設計担当共有では初回はテストのimport誤りでコンパイルできず、importのみ修正後に8377e5fb7で関連252テスト成功。
-独立実装レビュー指摘へr13で対応中で、今回差分のRust検証・event_execute費用の実測・実機は未実施。入れ物表、A監査、テスト依頼は
+r13の後、47fdcb264で関連253テスト成功（設計担当がrun-heavyで実行）、独立実装レビューは3回目でACCEPT。event_execute費用の実測・実機は未実施。入れ物表、A監査、テスト依頼は
 [操作スクリプト計画§16](operation-script-plan.md#operation-script-stage4) を参照。
-
-ヘルプの「AI で調べる」（§1.894）の型付き AI アプリ URL と、AI 連携の窓の Codex 設定も同じ
-`external-open-*` worker に乗せる。Web の AI はその worker 内で、画像コピーと共有する世代照合付きの
-テキスト書き込みを終え、結果を App の共通受信口へ送ってから開く。UI は世代の予約だけで mutex を待たない。
-登録検出はサブメニュー描画から AI 連携の窓と共通の worker を始め、結果の採用も描画時の `try_recv` だけで行う。
-追加部分の自動検証と実行時の挙動は未確認。共有 runner とサブ PC で確認予定。
 
 ## スタック用スクリプトのファイル操作（§1.843）
 
