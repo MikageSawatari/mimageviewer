@@ -154,7 +154,7 @@ PRAGMA user_version = 1;
   前後して起き得るのは「古い保存や改名が、削除済みの path の行を書き戻す」ことだけ。その行は resolver が飛ばし、次の保存で消える。
   有効な記録を消す組み合わせは無い (孤児整理は上のとおり対象外)。
 - 本体プロセスで `folder_order.db` を書くのは actor と、削除の purge だけ。
-- Remote は別プロセスなので DB を直接読む (WAL、読むだけ)。PC での保存直後に少し古い順が見えることは許容する。
+- Remote の通常フォルダ一覧は本体プロセスの IPC worker (`ContainerEngine`、web-remote-plan.md §2.1) が作るので、Agent IPC と同じく actor を通して worker で読む (SharedReaders 経由)。DB を直接開く第 2 の読み手は作らない (段 2 の前提確認で訂正、2026-11-26)。
   Agent IPC は本体プロセス内なので actor を通す。
 
 ### 4.2 一覧側の状態
@@ -181,7 +181,7 @@ PRAGMA user_version = 1;
 | 同期の `load_folder` 経路 (サブフォルダ展開を終えて戻る等。UI スレッドの scan fallback を含む) | UI スレッドで actor を待たない。eligible な通常フォルダへ入る経路だけ、既存の非同期 open (Direct / `MainListNavigation`) の成功採用へつなぎ、actor の読み込みが返ってから一覧を**一度だけ**採用する。元の状態の破棄 (サブフォルダ展開の終了なら snapshot の破棄と surface を Folder へ戻すこと、`subfolder_expansion.rs`) は**採用側へ移す** (R4 指摘 4。今は `load_folder` の前に破棄しているため、採用だけを遅らせると旧 items と状態が食い違う)。範囲外の一覧へ入る同期経路の契約は変えない。実装の段 2 の最初に同期の呼び出し元を全部挙げ、通常フォルダへ入るものを表にしてから変える |
 | watcher の再走査・並び順の refresh (同じ一覧の作り直し) | DB を読まず、今の一覧の記録 (と revision) を渡す |
 | Agent IPC | 自分の worker で actor から読む |
-| Remote | 自分のプロセスで DB を直接読む |
+| Remote (本体プロセスの IPC worker) | actor から読む (SharedReaders 経由) |
 
 - listing への入力は「対象外 / 読んだ: 記録なし / 読んだ: 記録あり」の型で渡す。materialize は DB を補読しない。
   eligible な物理フォルダの listing を、記録を読まずに作る経路があれば不具合として扱う (型で作れないようにし、テストでも検出する)。
