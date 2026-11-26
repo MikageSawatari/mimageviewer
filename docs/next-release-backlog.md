@@ -40,6 +40,12 @@
 
 ## 1. 優先候補
 
+### 1.916 一覧から 4K の動画を全画面で開いたとき、画面全体が約 0.4 秒真っ黒になる — §1.111 のサブ PC 確認から (2026-11-27)
+
+- 状態: **未調査、収録版未定**。観測者はサブ PC の Claude (master 6d274aa72、画面録画の 2.5〜2.9 秒)。記録は `C:\home\mimageviewer-subpc\v590b\results\notes.md`。§1.111 の確認の手順外で見えたもので、4K 以外の動画や、キーで入る場合に起きるかは確認していない。
+- 見立て (未検証): §1.111 で観測した、動画の窓を作る間のメインの cloak (`main cloak=true` から `window shown` まで) と同じ区間の可能性がある。ただし、真っ黒になったのが画面全体だったことと、cloak の区間との突き合わせはしていない。
+- 次にすること: 録画に対応するログ (`[native-video]` の window created-hidden / shown、`main cloak` の時刻) と突き合わせ、黒い区間が何の区間かを決める。detached viewer リワーク中の領域なので、症状パッチ (待ち・追加の repaint) を入れない ([detached-rework-plan.md](detached-rework-plan.md) §2)。着手は §1.111 (キー入力所有権の整理待ち) と同じ判断になる見込み。
+
 ### 1.914 マスクを検出で自動作成する (消しゴム・隠蔽加工・補正レイヤー共通、同梱の顔検出 + 利用者が置く検出器) (2026-11-26)
 
 - 状態: **設計中、収録版未定**。正本は [auto-conceal-detection-plan.md](auto-conceal-detection-plan.md)。
