@@ -1327,8 +1327,15 @@ portable zip実物の生成・内容確認、署名あり配布とVirusTotal (�
 - 独立レビュー (gpt-6.1-sol / xhigh): 1 回目 REJECT (P1 lifecycle テストの残った assertion、P2 15Band PEQ の旧プリセット (上の 4 で受け入れ)、
   P3 CSP の置換が replace-once でない)。修正後の 2 回目は派生版の修正と本書・説明書・privacy を対象にし、説明書の目次の版番号の指摘
   (公開文書の規則と §1.737 の既存設計の食い違い、v5.7.0 から出荷済み) を別件に分けて ACCEPT。
-- 承認: 未承認。サブ PC の実機確認 (`C:\home\mimageviewer-subpc\deps903\README.md`) と利用者の採用判断の後に `-Approve` する。
-  本作業ではRust/C++のビルド・テスト、製品起動、コミットは行っていない。
+- サブ PC の実機確認 (サブ PC 担当の観測、`C:\home\mimageviewer-subpc\deps903\results\notes.md`): A〜G は期待どおり。
+  音を耳で聞く確認と一部の表示は未確認。観測のうち次の 2 つは設計担当がコードで仕様と判定した。
+  Headphone EQ の目標名「<測定名> target」は、AutoEQ の CSV の target 列 (同じ測定元・測定機材の目標) を読む上流の作り。
+  p37 を開いてレイテンシが 2 倍になったのは、U.Preset 一覧のダブルクリックがプリセットを置き換えず、Section 付きで
+  末尾に追加するため (上流の `preset-manager.js`、0.17 から無変更)。SoundFont Note Player が 2 段になり、3967→7934 サンプルになった。
+- 承認: 利用者の採用判断 (2026-11-26、統括経由。耳で聞く確認は未実施と明記して確認) を受け、候補 `b903e76a…7334` を
+  `-Approve` した (0.19.0-miv.1、`third_party/miv-sound/0.19.0-miv.1/`、バックアップ `C:\home\mimageviewer_vendor_backup\miv-sound-0.19.0-miv.1\`)。
+  派生版 `miv-0.19` は未 push (公開作業のときに push する)。
+  2 回目の独立レビューまでの作業ではRust/C++のビルド・テスト、製品起動、コミットは行っていない。
 - 文書の検証: `test_gen_effetune_docs.py` **44件成功**、生成器 `--check` **139ファイル＋301一致**、
   sitemap `--check` **220 URL一致**、`check_site_cards.py` **53枚・超過0**、`git diff --check` **成功**。
   既存134 HTMLの650 IDに欠落なし。新snapshotの日本語原文30ファイル・LICENSE・4画像は参照元とバイト一致。

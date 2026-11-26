@@ -11,7 +11,7 @@ backlog §1.903 の記録。v5.7.0 のリリース時の依存物の確認 (リ�
 | --- | --- | --- |
 | 通常 crate | master `c77d48f46` の Cargo.lock | `cargo update` の範囲で 23 件 (下記) |
 | PDFium | `chromium/8165`, `160.0.8165.0` | `chromium/8179`, `160.0.8179.0` (2026-11-23 公開) |
-| mIV Sound の元 (EffeTune Mixwright) | v0.17.0 (mIV Sound 0.17.0-miv.1) | v0.19.0 (mIV Sound 0.19.0-miv.1、候補 `b903e76a…7334`、未承認) |
+| mIV Sound の元 (EffeTune Mixwright) | v0.17.0 (mIV Sound 0.17.0-miv.1) | v0.19.0 (mIV Sound 0.19.0-miv.1、候補 `b903e76a…7334`、2026-11-26 承認) |
 
 手を入れている crate (`vendor/eframe`・`egui`・`egui-wgpu`・`egui-winit`・`epaint`・`libmimalloc-sys`・
 `tantivy`、`crates/unrar-patched`) は、2026-11-25 の確認でどれも最新。Rust 1.100.0・FFmpeg・LibRaw・
@@ -112,11 +112,14 @@ python scripts/generate-pdfium-license.py --check
   mIV 本体と vst3-host は変えない)。Headphone EQ は AutoEQ の取得も含めて出す (CSP の connect-src に
   `https://raw.githubusercontent.com/jaakkopasanen/AutoEq/` だけを足す)。Distortion Correction は追加の一覧から外す (保存済みは読める)。
   Live Audio Send/Receive は従来どおり外す。0.19 → 0.17 へ戻したときの互換は保証しない。
-- 候補 `b903e76a…7334` (未承認)、ctest 139 件すべて成功。独立レビューは 2 回目で ACCEPT。
+- 候補 `b903e76a…7334`、ctest 139 件すべて成功。独立レビューは 2 回目で ACCEPT。
+  サブ PC の実機確認 (サブ PC 担当の観測) は期待どおり (耳で聞く確認は未実施)。利用者の採用判断 (2026-11-26、統括経由) を受けて承認した。
 - mIV 側: `config/miv-sound.rs` を 0.19.0-miv.1 / v0.19.0 にし、説明書 (snapshot `third_party/effetune-docs/0ffa5c70`)・
   privacy.html (日英、Headphone EQ の通信と保存)・マニュアル `effetune.html` を更新した。製品ページのカードは今回も成り立つので変えていない。
-- **承認 (`-Approve`) まで、このブランチは `MIV_SOUND_CANDIDATE` を付けないとビルドできない** (config は 0.19、`vendor/miv-sound` は 0.17 のまま)。
-  承認で `vendor/miv-sound`・`third_party/miv-sound/0.19.0-miv.1/` と `C:\home\mimageviewer_vendor_backup\miv-sound-0.19.0-miv.1\` ができる。
+- 承認 (`-Approve`) で `vendor/miv-sound` (0.19.0-miv.1)・`third_party/miv-sound/0.19.0-miv.1/` と
+  `C:\home\mimageviewer_vendor_backup\miv-sound-0.19.0-miv.1\` ができた。バックアップは vendor・third_party と内容が一致する (diff -r)。
+  **master へ取り込んだ後は、各作業ツリーの `vendor/miv-sound` も 0.19.0-miv.1 に入れ替える必要がある** (config と食い違うとビルドが止まる)。
+  バックアップの `artifact\` を実体コピーすればよい。
 - **公開前の VirusTotal (リリース手順 12.6) が要る**: `mIV Sound.vst3` (DLL と webview の資源) が変わる。vst3-host は変わらない。
 
 ## 検証
