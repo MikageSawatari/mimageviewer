@@ -15550,14 +15550,23 @@ pub(crate) mod phase_c_support {
     }
 
     impl AppTestEnv {
+        // Wait only for the newly asynchronous order read. Suffix paths without
+        // a supplied directory scan keep their existing provisional classifier
+        // observable to the caller, including Remote's retirement boundary.
         pub(crate) fn load_folder(&mut self, path: PathBuf) {
+            let classify_path = App::path_needs_open_classification(&path);
             self.app.load_folder(path);
-            self.app.settle_open_path_classification_for_test();
+            if !classify_path {
+                self.app.settle_open_path_classification_for_test();
+            }
         }
 
         pub(crate) fn load_folder_with_scan(&mut self, path: PathBuf, scan: Option<ScannedDir>) {
+            let classify_path = scan.is_none() && App::path_needs_open_classification(&path);
             self.app.load_folder_with_scan(path, scan);
-            self.app.settle_open_path_classification_for_test();
+            if !classify_path {
+                self.app.settle_open_path_classification_for_test();
+            }
         }
 
         pub(crate) fn load_folder_with_scan_owned(
@@ -15567,10 +15576,13 @@ pub(crate) mod phase_c_support {
             owner: OpenRequestOwner,
             intent: StartupListIntent,
         ) -> bool {
+            let classify_path = scan.is_none() && App::path_needs_open_classification(&path);
             let accepted = self
                 .app
                 .load_folder_with_scan_owned(path, scan, owner, intent);
-            self.app.settle_open_path_classification_for_test();
+            if !classify_path {
+                self.app.settle_open_path_classification_for_test();
+            }
             accepted
         }
 
@@ -79806,6 +79818,66 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             OpenAdmission::Refused(OpenAdmissionRefusal::RemoteControl)
         );
         assert!(app.top_level_grid_view.open_path_classification().is_none());
+    }
+
+    #[test]
+    fn suffix_directory_classification_survives_fixture_loads_until_remote_acquire() {
+        use crate::remote_ipc::session::RemoteControlPhase;
+
+        #[derive(Clone, Copy, Debug)]
+        enum LoadRoute {
+            Folder,
+            Scan,
+            OwnedScan,
+        }
+
+        for route in [LoadRoute::Folder, LoadRoute::Scan, LoadRoute::OwnedScan] {
+            for suffix in ["epub", "7z"] {
+                let mut app = setup_app();
+                let ctx = egui::Context::default();
+                let target = app.tmp.path().join(format!("classified.{suffix}"));
+                std::fs::create_dir(&target).unwrap();
+                // Even a ready negative record index cannot replace suffix classification.
+                assert!(
+                    app.folder_order_handle()
+                        .unwrap()
+                        .record_is_known_absent(&target)
+                );
+                match route {
+                    LoadRoute::Folder => app.load_folder(target.clone()),
+                    LoadRoute::Scan => app.load_folder_with_scan(target.clone(), None),
+                    LoadRoute::OwnedScan => assert!(app.load_folder_with_scan_owned(
+                        target.clone(),
+                        None,
+                        OpenRequestOwner::Navigation,
+                        crate::app::StartupListIntent::ExplicitList,
+                    )),
+                }
+                let candidate = app
+                    .top_level_grid_view
+                    .open_path_classification()
+                    .unwrap_or_else(|| panic!("classifier was consumed: {route:?}, {suffix}"));
+                assert_eq!(candidate.path.to_path_buf(), target);
+                let cancel = Arc::clone(&candidate.cancel);
+                assert!(!cancel.load(Ordering::Acquire));
+                let handle = crate::remote_ipc::session::SessionHandle::new();
+                app.set_remote_session_handle(handle.clone());
+                handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+                    client_id: "phone".to_owned(),
+                    peer: mimageviewer_ipc::SessionPeerInfo {
+                        connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                        device_name: None,
+                    },
+                });
+                app.poll_mounted_document_open_owners(&ctx);
+                app.poll_remote_session(&ctx);
+                assert_eq!(handle.snapshot().phase, RemoteControlPhase::RemoteActive);
+                assert!(app.top_level_grid_view.open_path_classification().is_none());
+                assert!(cancel.load(Ordering::Acquire));
+                app.poll_open_path_classification(&ctx);
+                assert_ne!(app.current_folder.as_deref(), Some(target.as_path()));
+            }
+        }
     }
 
     #[test]

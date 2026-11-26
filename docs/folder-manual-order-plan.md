@@ -535,3 +535,19 @@ Smart root の履歴採用後、定義の範囲外にある新しい通常物理
   前回停止した失敗 5・6 の実装上の衝突はこの改訂で解消し、修正後の実行確認は共有 runner へ引き継ぐ。
 - `cargo fmt`（引数なし）と `git diff --check` は正常終了。変更したテストの import・型・引数をソースで照合した。
   コンパイル・テスト・検証用ビルド・コミットは利用者の指定により実施していない。
+
+段 2 分類状態を観測する既存テストの失敗対応（2026-11-27）:
+
+- 設計担当の報告では `ee9ee88b8` までの関連 1141 件中、Remote 取得前の分類状態を確認する既存テスト 1 件が失敗した。
+  原因は production の slot 変更ではなく、段 2 で追加した `AppTestEnv::load_folder_with_scan_owned` が
+  呼出直後に `settle_open_path_classification_for_test` で分類完了まで進め、最初の assert 前に状態を消費したこと。
+- 同型の test wrapper である `load_folder` / `load_folder_with_scan` も照合し、事前 scan の無い EPUB・書庫名のパスでは
+  必須の分類 owner を呼出元に残す形へ揃えた。事前 scan で directory と確定している場合と、通常名の手動記録 Read による
+  新しい非同期採用だけは、従来どおり fixture の便利メソッドが待つ。既存の失敗テストの body / 期待値は変えない。
+- production の差分も master と比較した。段 2 の `start_open_path_classification_owned_at_stage` への呼出変更と、
+  読取用の `start_open_path_classification_owned_with_navigation` の追加は、いずれも既存の共通実装へ到達し、
+  `top_level_grid_view.set_open_path_classification` に同じ owner を置く。Remote の取得は同じ PathClassification の退役で
+  owner を取り出して cancel し、その後の poll は読込結果を採用しない。本番の分類・Remote 退役処理の変更は不要だった。
+- EPUB・7z 名のディレクトリ × 3 種の fixture load 入口で、準備済みの未記録索引でも分類状態が残り、
+  Remote 取得で cancel され、後から結果を poll しても移動先を開かないことを検証するテストを追加した。
+- `cargo fmt`（引数なし）と `git diff --check` を実施し、コンパイル・テスト・コミットは利用者指定により実施しない。
