@@ -806,6 +806,8 @@ mod startup_list_restore;
 pub(crate) mod top_level_grid_view;
 pub(crate) use startup_list_restore::StartupListIntent;
 mod agent_favorite;
+#[cfg(test)]
+mod agent_operation_script_tests;
 mod agent_operations;
 pub(crate) mod agent_rating_write;
 mod agent_settings;

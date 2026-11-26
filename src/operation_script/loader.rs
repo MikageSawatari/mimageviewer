@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -15,7 +15,35 @@ use super::file_worker::{FileJob, FileResult, FileWorker, FileWorkerOptions};
 use super::{ScriptSlot, build_engine, parse_slots};
 
 /// 操作スクリプト本文の上限。読む量自体もtakeで制限する (§7)。
-const MAX_SOURCE_BYTES: u64 = 256 * 1024;
+pub(super) const MAX_SOURCE_BYTES: u64 = 256 * 1024;
+
+/// App admits and enqueues in the same UI turn; only the FIFO reads or writes.
+#[derive(Clone, Debug)]
+pub(crate) struct AgentScriptRequest {
+    pub source: Option<String>,
+    pub expected_sha256: Option<String>,
+    pub reply: Sender<Result<AgentScriptOutcome, String>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum AgentScriptOutcome {
+    Read(ScriptDocument),
+    Write(ScriptWriteOutcome),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScriptDocument {
+    pub source: String,
+    pub sha256: String,
+    pub builtin: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ScriptWriteOutcome {
+    pub sha256: String,
+    pub before_lines: usize,
+    pub after_lines: usize,
+}
 
 pub struct CompiledOperationScript {
     pub(super) engine: Engine,
@@ -119,18 +147,23 @@ pub fn script_path(data_dir: &Path) -> PathBuf {
 }
 
 pub(super) fn load_script(path: &Path) -> Result<CompiledOperationScript, String> {
+    let file = File::open(path)
+        .map_err(|e| format!("スクリプトの読み込みに失敗 ({}): {e}", path.display()))?;
+    CompiledOperationScript::compile(&read_script_source(file, path)?)
+}
+
+pub(super) fn read_script_source(file: File, path: &Path) -> Result<String, String> {
     let mut source = Vec::new();
-    File::open(path)
-        .and_then(|file| file.take(MAX_SOURCE_BYTES + 1).read_to_end(&mut source))
+    file.take(MAX_SOURCE_BYTES + 1)
+        .read_to_end(&mut source)
         .map_err(|e| format!("スクリプトの読み込みに失敗 ({}): {e}", path.display()))?;
     if source.len() as u64 > MAX_SOURCE_BYTES {
         return Err("スクリプトの本文が256 KiBの上限を超えています".into());
     }
     // Check the byte limit before UTF-8 decoding: take() may cut a multibyte
     // character when the file is too large, which must still report the cap.
-    let source = String::from_utf8(source)
-        .map_err(|e| format!("スクリプトの読み込みに失敗 ({}): {e}", path.display()))?;
-    CompiledOperationScript::compile(&source)
+    String::from_utf8(source)
+        .map_err(|e| format!("スクリプトの読み込みに失敗 ({}): {e}", path.display()))
 }
 
 pub(super) struct LoadResult {
@@ -205,6 +238,26 @@ impl OperationScriptLoader {
         }
     }
 
+    /// Capture adoption eligibility without retiring a usable script or changing
+    /// generation. Rejected jobs never publish a loader result.
+    pub(crate) fn enqueue_agent_script(
+        &mut self,
+        request: AgentScriptRequest,
+        data_dir: &Path,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        let generation =
+            (!matches!(self.state, OperationScriptState::Disabled)).then_some(self.generation);
+        self.enqueue(
+            FileJob::Agent {
+                request,
+                generation,
+            },
+            data_dir,
+            ctx,
+        )
+    }
+
     fn enqueue(
         &mut self,
         job: FileJob,
@@ -250,6 +303,16 @@ impl OperationScriptLoader {
                             OperationScriptState::Failed(error)
                         }
                     };
+                }
+                Ok(FileResult::AiWrite { generation, script }) => {
+                    if generation == Some(self.generation)
+                        && matches!(
+                            self.state,
+                            OperationScriptState::Ready(_) | OperationScriptState::Failed(_)
+                        )
+                    {
+                        self.state = OperationScriptState::Ready(Box::new(script));
+                    }
                 }
                 Ok(FileResult::Open(Err(error))) => {
                     notifications.push(format!("スクリプトを開けません: {error}"));
@@ -441,6 +504,26 @@ mod tests {
                 FileResult::Load(result) => result,
                 _ => panic!("expected load result"),
             }
+        }
+
+        fn agent(
+            &mut self,
+            data_dir: &Path,
+            source: Option<&str>,
+            expected: Option<&str>,
+        ) -> std::sync::mpsc::Receiver<Result<AgentScriptOutcome, String>> {
+            let (reply, receiver) = std::sync::mpsc::channel();
+            self.enqueue_agent_script(
+                AgentScriptRequest {
+                    source: source.map(str::to_owned),
+                    expected_sha256: expected.map(str::to_owned),
+                    reply,
+                },
+                data_dir,
+                &egui::Context::default(),
+            )
+            .unwrap();
+            receiver
         }
 
         fn finish(&mut self) {
@@ -979,6 +1062,482 @@ mod tests {
         old.read_to_string(&mut old_content).unwrap();
         assert_eq!(old_content, "old user script");
         assert_eq!(std::fs::read_to_string(path).unwrap(), DEFAULT_SCRIPT);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    fn agent_hash(source: &str) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(source.as_bytes()))
+    }
+
+    const AI_SOURCE: &str = r#"fn slots() { [#{slot:1,label:"AI",run:"entry"}] }
+fn entry(s) { #{run:[],notice:"AI"} }"#;
+    const OLD_SOURCE: &str = "fn slots() { [] }";
+
+    fn assert_ready_slots(loader: &OperationScriptLoader, count: usize) {
+        assert!(
+            matches!(&loader.state, OperationScriptState::Ready(script) if script.slots.len() == count)
+        );
+    }
+
+    fn agent_write_result(
+        receiver: std::sync::mpsc::Receiver<Result<AgentScriptOutcome, String>>,
+    ) -> ScriptWriteOutcome {
+        match receiver.recv_timeout(TEST_TIMEOUT).unwrap().unwrap() {
+            AgentScriptOutcome::Write(outcome) => outcome,
+            AgentScriptOutcome::Read(_) => panic!("expected write outcome"),
+        }
+    }
+
+    #[test]
+    fn script_363_agent_read_returns_missing_default_without_creating_and_preserves_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("not-created");
+        let mut loader = TestLoader::new(&data_dir);
+        let read = loader.agent(&data_dir, None, None);
+        loader.finish();
+        let AgentScriptOutcome::Read(document) = read.recv_timeout(TEST_TIMEOUT).unwrap().unwrap()
+        else {
+            panic!("expected read document");
+        };
+        assert_eq!(document.source, DEFAULT_SCRIPT);
+        assert_eq!(document.sha256, agent_hash(DEFAULT_SCRIPT));
+        assert!(document.builtin);
+        assert!(!data_dir.exists());
+        assert!(loader.poll().is_empty());
+        assert!(matches!(loader.state, OperationScriptState::Disabled));
+
+        std::fs::write(script_path(temp.path()), "").unwrap();
+        let mut loader = TestLoader::new(temp.path());
+        let read = loader.agent(temp.path(), None, None);
+        loader.finish();
+        let AgentScriptOutcome::Read(document) = read.recv_timeout(TEST_TIMEOUT).unwrap().unwrap()
+        else {
+            panic!("expected read document");
+        };
+        assert_eq!(document.source, "");
+        assert_eq!(document.sha256, agent_hash(""));
+        assert!(!document.builtin);
+    }
+
+    #[test]
+    fn script_363_agent_read_reports_io_utf8_and_bounded_size_errors_without_default() {
+        for case in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let path = script_path(temp.path());
+            match case {
+                0 => std::fs::create_dir(&path).unwrap(),
+                1 => std::fs::write(&path, [0xff]).unwrap(),
+                _ => std::fs::write(&path, vec![b'x'; MAX_SOURCE_BYTES as usize + 1]).unwrap(),
+            }
+            let mut loader = TestLoader::new(temp.path());
+            let read = loader.agent(temp.path(), None, None);
+            loader.finish();
+            let reason = read.recv_timeout(TEST_TIMEOUT).unwrap().unwrap_err();
+            assert!(
+                reason.contains(if case == 2 {
+                    "256 KiB"
+                } else {
+                    "読み込みに失敗"
+                }),
+                "{reason}"
+            );
+            assert!(loader.poll().is_empty());
+        }
+    }
+
+    #[test]
+    fn script_363_agent_acceptance_keeps_ready_generation_and_slots_then_adopts_written_ast() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = script_path(temp.path());
+        std::fs::write(&path, OLD_SOURCE).unwrap();
+        let (mut loader, entered) = TestLoader::blocked(temp.path(), |_| Ok(()));
+        loader.generation = 7;
+        loader.state = OperationScriptState::Ready(Box::new(
+            CompiledOperationScript::compile(DEFAULT_SCRIPT).unwrap(),
+        ));
+        let reply = loader.agent(
+            temp.path(),
+            Some(AI_SOURCE),
+            Some(&agent_hash(OLD_SOURCE).to_uppercase()),
+        );
+        entered.recv_timeout(TEST_TIMEOUT).unwrap();
+        assert_eq!(loader.generation, 7);
+        assert_ready_slots(&loader, 2);
+        let OperationScriptState::Ready(script) = &loader.state else {
+            unreachable!()
+        };
+        assert!(
+            script
+                .evaluate_slot(1, &StateSnapshot::new(ScriptContext::Grid))
+                .is_ok()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OLD_SOURCE);
+        loader.finish();
+        let outcome = agent_write_result(reply);
+        assert_eq!(outcome.sha256, agent_hash(AI_SOURCE));
+        assert_eq!(outcome.before_lines, OLD_SOURCE.lines().count());
+        assert_eq!(outcome.after_lines, AI_SOURCE.lines().count());
+        assert!(loader.poll().is_empty());
+        assert_eq!(loader.generation, 7);
+        assert_ready_slots(&loader, 1);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), AI_SOURCE);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn script_363_agent_rejections_keep_file_ready_script_and_generation_unchanged() {
+        let oversized = "x".repeat(MAX_SOURCE_BYTES as usize + 1);
+        for (source, expected, reason) in [
+            (
+                AI_SOURCE,
+                Some(agent_hash("different")),
+                "読んだあとに変わっています",
+            ),
+            (
+                "fn slots( {",
+                Some(agent_hash("editor content")),
+                "コンパイルに失敗",
+            ),
+            (
+                "fn slots() { missing(); }",
+                Some(agent_hash("editor content")),
+                "slots() の評価に失敗",
+            ),
+            (
+                "fn slots() { [42] }",
+                Some(agent_hash("editor content")),
+                "slots() の指定に失敗",
+            ),
+            (AI_SOURCE, None, "expected_sha256"),
+            (
+                oversized.as_str(),
+                Some(agent_hash("editor content")),
+                "256 KiB",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = script_path(temp.path());
+            std::fs::write(&path, "editor content").unwrap();
+            let (mut loader, entered) = TestLoader::blocked(temp.path(), |_| Ok(()));
+            loader.generation = 9;
+            loader.state = OperationScriptState::Ready(Box::new(
+                CompiledOperationScript::compile(DEFAULT_SCRIPT).unwrap(),
+            ));
+            let reply = loader.agent(temp.path(), Some(source), expected.as_deref());
+            entered.recv_timeout(TEST_TIMEOUT).unwrap();
+            assert_eq!(loader.generation, 9);
+            assert_ready_slots(&loader, 2);
+            loader.finish();
+            let error = reply.recv_timeout(TEST_TIMEOUT).unwrap().unwrap_err();
+            assert!(error.contains(reason), "expected {reason}, got {error}");
+            assert!(loader.poll().is_empty());
+            assert_eq!(loader.generation, 9);
+            assert_ready_slots(&loader, 2);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "editor content");
+            assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn script_363_agent_fifo_reset_then_write_compares_replaced_default() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(script_path(temp.path()), OLD_SOURCE).unwrap();
+        let (mut loader, entered) = TestLoader::blocked(temp.path(), |_| Ok(()));
+        loader.state = OperationScriptState::Ready(Box::new(
+            CompiledOperationScript::compile(OLD_SOURCE).unwrap(),
+        ));
+        loader.enqueue_reset_user_script(temp.path(), &egui::Context::default());
+        entered.recv_timeout(TEST_TIMEOUT).unwrap();
+        let reply = loader.agent(
+            temp.path(),
+            Some(AI_SOURCE),
+            Some(&agent_hash(DEFAULT_SCRIPT)),
+        );
+        loader.finish();
+        let outcome = agent_write_result(reply);
+        assert_eq!(outcome.before_lines, DEFAULT_SCRIPT.lines().count());
+        assert!(loader.poll().is_empty());
+        assert_ready_slots(&loader, 1);
+        assert_eq!(
+            std::fs::read_to_string(script_path(temp.path())).unwrap(),
+            AI_SOURCE
+        );
+    }
+
+    #[test]
+    fn script_363_agent_fifo_write_then_reset_adopts_ai_and_leaves_default_file() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(script_path(temp.path()), OLD_SOURCE).unwrap();
+        let (mut loader, entered) = TestLoader::blocked(temp.path(), |_| Ok(()));
+        loader.state = OperationScriptState::Ready(Box::new(
+            CompiledOperationScript::compile(OLD_SOURCE).unwrap(),
+        ));
+        let reply = loader.agent(temp.path(), Some(AI_SOURCE), Some(&agent_hash(OLD_SOURCE)));
+        entered.recv_timeout(TEST_TIMEOUT).unwrap();
+        loader.enqueue_reset_user_script(temp.path(), &egui::Context::default());
+        loader.finish();
+        agent_write_result(reply);
+        assert!(loader.poll().is_empty());
+        assert_ready_slots(&loader, 1);
+        assert_eq!(
+            std::fs::read_to_string(script_path(temp.path())).unwrap(),
+            DEFAULT_SCRIPT
+        );
+        assert!(loader.poll().is_empty());
+        assert_ready_slots(&loader, 1);
+    }
+
+    #[test]
+    fn script_363_agent_fifo_write_then_reload_or_reenable_retires_ai_result() {
+        for reenable in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            std::fs::write(script_path(temp.path()), OLD_SOURCE).unwrap();
+            let ctx = egui::Context::default();
+            let (mut loader, entered) = TestLoader::blocked(temp.path(), |_| Ok(()));
+            loader.generation = 5;
+            loader.state = OperationScriptState::Ready(Box::new(
+                CompiledOperationScript::compile(OLD_SOURCE).unwrap(),
+            ));
+            let reply = loader.agent(temp.path(), Some(AI_SOURCE), Some(&agent_hash(OLD_SOURCE)));
+            entered.recv_timeout(TEST_TIMEOUT).unwrap();
+            if reenable {
+                loader.sync_enabled(false, temp.path(), &ctx);
+                loader.sync_enabled(true, temp.path(), &ctx);
+            } else {
+                loader.reload(temp.path(), &ctx);
+            }
+            let generation = loader.generation;
+            assert_ne!(generation, 5);
+            loader.finish();
+            agent_write_result(reply);
+            assert!(loader.poll().is_empty());
+            assert_eq!(loader.generation, generation);
+            assert_ready_slots(&loader, 1);
+            assert_eq!(
+                std::fs::read_to_string(script_path(temp.path())).unwrap(),
+                AI_SOURCE
+            );
+        }
+    }
+
+    #[test]
+    fn script_363_agent_write_while_off_is_not_adopted_and_later_enable_reads_it() {
+        for enable_after_enqueue in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut loader, entered) = TestLoader::blocked(temp.path(), |_| Ok(()));
+            let reply = loader.agent(
+                temp.path(),
+                Some(AI_SOURCE),
+                Some(&agent_hash(DEFAULT_SCRIPT)),
+            );
+            entered.recv_timeout(TEST_TIMEOUT).unwrap();
+            if enable_after_enqueue {
+                loader.sync_enabled(true, temp.path(), &egui::Context::default());
+            }
+            loader.finish();
+            agent_write_result(reply);
+            assert!(loader.poll().is_empty());
+            if enable_after_enqueue {
+                assert_ready_slots(&loader, 1);
+            } else {
+                assert!(matches!(loader.state, OperationScriptState::Disabled));
+            }
+            assert_eq!(
+                std::fs::read_to_string(script_path(temp.path())).unwrap(),
+                AI_SOURCE
+            );
+        }
+    }
+
+    #[test]
+    fn script_363_agent_write_in_flight_then_off_does_not_adopt() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut loader, entered) = TestLoader::blocked(temp.path(), |_| Ok(()));
+        loader.state = OperationScriptState::Ready(Box::new(
+            CompiledOperationScript::compile(DEFAULT_SCRIPT).unwrap(),
+        ));
+        let reply = loader.agent(
+            temp.path(),
+            Some(AI_SOURCE),
+            Some(&agent_hash(DEFAULT_SCRIPT)),
+        );
+        entered.recv_timeout(TEST_TIMEOUT).unwrap();
+        loader.sync_enabled(false, temp.path(), &egui::Context::default());
+        loader.finish();
+        agent_write_result(reply);
+        assert!(loader.poll().is_empty());
+        assert!(matches!(loader.state, OperationScriptState::Disabled));
+        assert_eq!(
+            std::fs::read_to_string(script_path(temp.path())).unwrap(),
+            AI_SOURCE
+        );
+    }
+
+    #[test]
+    fn script_363_agent_success_recovers_failed_and_loading_states_after_prior_result() {
+        for case in 0..3 {
+            let loading = case != 0;
+            let temp = tempfile::tempdir().unwrap();
+            let path = script_path(temp.path());
+            let before = if case == 2 {
+                OLD_SOURCE
+            } else {
+                "invalid source"
+            };
+            std::fs::write(&path, before).unwrap();
+            let (mut loader, entered) = TestLoader::blocked(temp.path(), |_| Ok(()));
+            if loading {
+                loader.reload(temp.path(), &egui::Context::default());
+                entered.recv_timeout(TEST_TIMEOUT).unwrap();
+            } else {
+                loader.state = OperationScriptState::Failed("previous error".into());
+            }
+            let reply = loader.agent(temp.path(), Some(AI_SOURCE), Some(&agent_hash(before)));
+            if !loading {
+                entered.recv_timeout(TEST_TIMEOUT).unwrap();
+                assert!(
+                    matches!(&loader.state, OperationScriptState::Failed(reason) if reason == "previous error")
+                );
+            }
+            loader.finish();
+            agent_write_result(reply);
+            let notifications = loader.poll();
+            assert_eq!(notifications.len(), usize::from(case == 1));
+            assert_ready_slots(&loader, 1);
+            assert_eq!(std::fs::read_to_string(path).unwrap(), AI_SOURCE);
+        }
+    }
+
+    #[test]
+    fn script_363_agent_poll_adopts_only_matching_generation_ready_or_failed() {
+        for generation in [None, Some(3), Some(4)] {
+            for state in [
+                OperationScriptState::Disabled,
+                OperationScriptState::Loading(OperationScriptLoad),
+                OperationScriptState::Ready(Box::new(
+                    CompiledOperationScript::compile(DEFAULT_SCRIPT).unwrap(),
+                )),
+                OperationScriptState::Failed("keep failure".into()),
+            ] {
+                let adopts = generation == Some(4)
+                    && matches!(
+                        state,
+                        OperationScriptState::Ready(_) | OperationScriptState::Failed(_)
+                    );
+                let original = std::mem::discriminant(&state);
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let mut loader = OperationScriptLoader {
+                    generation: 4,
+                    state,
+                    results: Some(receiver),
+                    ..OperationScriptLoader::default()
+                };
+                assert!(
+                    sender
+                        .send(FileResult::AiWrite {
+                            generation,
+                            script: CompiledOperationScript::compile(AI_SOURCE).unwrap()
+                        })
+                        .is_ok()
+                );
+                assert!(loader.poll().is_empty());
+                if adopts {
+                    assert_ready_slots(&loader, 1);
+                } else {
+                    assert_eq!(std::mem::discriminant(&loader.state), original);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn script_363_agent_fifo_read_between_writes_sees_preceding_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut loader, entered) = TestLoader::blocked(temp.path(), |_| Ok(()));
+        loader.state = OperationScriptState::Ready(Box::new(
+            CompiledOperationScript::compile(DEFAULT_SCRIPT).unwrap(),
+        ));
+        let first = loader.agent(
+            temp.path(),
+            Some(AI_SOURCE),
+            Some(&agent_hash(DEFAULT_SCRIPT)),
+        );
+        entered.recv_timeout(TEST_TIMEOUT).unwrap();
+        let read = loader.agent(temp.path(), None, None);
+        let last = loader.agent(temp.path(), Some(OLD_SOURCE), Some(&agent_hash(AI_SOURCE)));
+        loader.finish();
+        agent_write_result(first);
+        let AgentScriptOutcome::Read(document) = read.recv_timeout(TEST_TIMEOUT).unwrap().unwrap()
+        else {
+            panic!("expected read document");
+        };
+        assert_eq!(document.source, AI_SOURCE);
+        assert_eq!(document.sha256, agent_hash(AI_SOURCE));
+        assert!(!document.builtin);
+        let final_write = agent_write_result(last);
+        assert_eq!(final_write.before_lines, AI_SOURCE.lines().count());
+        assert_eq!(final_write.sha256, agent_hash(OLD_SOURCE));
+        assert!(loader.poll().is_empty());
+        assert_ready_slots(&loader, 0);
+        assert_eq!(
+            std::fs::read_to_string(script_path(temp.path())).unwrap(),
+            OLD_SOURCE
+        );
+    }
+
+    #[test]
+    fn script_363_agent_write_accepts_256_kib_and_creates_missing_data_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("new-data");
+        let mut source = OLD_SOURCE.to_owned();
+        source.extend(std::iter::repeat_n(
+            ' ',
+            MAX_SOURCE_BYTES as usize - source.len(),
+        ));
+        let mut loader = TestLoader::new(&data_dir);
+        let reply = loader.agent(&data_dir, Some(&source), Some(&agent_hash(DEFAULT_SCRIPT)));
+        loader.finish();
+        let outcome = agent_write_result(reply);
+        assert_eq!(outcome.sha256, agent_hash(&source));
+        assert_eq!(outcome.before_lines, DEFAULT_SCRIPT.lines().count());
+        assert_eq!(outcome.after_lines, 1);
+        assert_eq!(
+            std::fs::read_to_string(script_path(&data_dir)).unwrap(),
+            source
+        );
+        assert_eq!(std::fs::read_dir(&data_dir).unwrap().count(), 1);
+        assert!(loader.poll().is_empty());
+        assert!(matches!(loader.state, OperationScriptState::Disabled));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn script_363_agent_replace_failure_preserves_file_ready_state_and_cleans_temporary() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = script_path(temp.path());
+        std::fs::write(&path, OLD_SOURCE).unwrap();
+        // Permit the worker's read, but deny the rename's delete sharing.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(3)
+            .open(&path)
+            .unwrap();
+        let mut loader = TestLoader::new(temp.path());
+        loader.generation = 8;
+        loader.state = OperationScriptState::Ready(Box::new(
+            CompiledOperationScript::compile(DEFAULT_SCRIPT).unwrap(),
+        ));
+        let reply = loader.agent(temp.path(), Some(AI_SOURCE), Some(&agent_hash(OLD_SOURCE)));
+        loader.finish();
+        let error = reply.recv_timeout(TEST_TIMEOUT).unwrap().unwrap_err();
+        assert!(error.contains("置き換えに失敗"), "{error}");
+        assert!(loader.poll().is_empty());
+        assert_ready_slots(&loader, 2);
+        assert_eq!(loader.generation, 8);
+        drop(lock);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), OLD_SOURCE);
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 

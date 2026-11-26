@@ -240,7 +240,8 @@ impl App {
             | UiRequestKind::GetSettings { .. }
             | UiRequestKind::SetSettings { .. }
             | UiRequestKind::SetFavorite(_)
-            | UiRequestKind::StackScriptAdmission => {
+            | UiRequestKind::StackScriptAdmission
+            | UiRequestKind::OperationScript(_) => {
                 unreachable!("non-write requests have their own UI handler")
             }
         };

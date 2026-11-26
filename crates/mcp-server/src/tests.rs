@@ -1190,7 +1190,7 @@ fn stage1b_all_protocols_transport_folder_pages_and_webp_blocks() {
             assert_eq!(response["id"], id);
             let result = &response["result"];
             match id {
-                1 => assert_eq!(result["tools"].as_array().unwrap().len(), 29),
+                1 => assert_eq!(result["tools"].as_array().unwrap().len(), 30),
                 2 => assert_eq!(
                     result["structuredContent"]["book_composition_applied"],
                     true
@@ -2368,7 +2368,7 @@ fn tools_list_all_protocols_send_full_discovery_through_the_writer() {
 #[test]
 fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
     // All stage-1 tools are now registered; measure the real discovery envelope.
-    assert_eq!(schema::tools().len(), 29);
+    assert_eq!(schema::tools().len(), 30);
     assert!(
         schema::tools()
             .iter()
@@ -2522,7 +2522,7 @@ fn stage2_all_protocols_refresh_organize_permission_and_return_collection_writes
             let response = h.receive();
             assert_eq!(response["id"], id);
             let listed = response["result"]["tools"].as_array().unwrap();
-            assert_eq!(listed.len(), 29);
+            assert_eq!(listed.len(), 30);
             for name in [
                 "create_collection",
                 "rename_collection",
@@ -2656,7 +2656,7 @@ fn stage1c_all_protocols_refresh_open_permission_and_transport_accepted_result()
                 tools.iter().any(|tool| tool["name"] == "open_in_viewer"),
                 true
             );
-            assert_eq!(tools.len(), 29);
+            assert_eq!(tools.len(), 30);
         }
         backend.permitted.store(true, Ordering::Release);
         h.send(request(
@@ -2727,7 +2727,7 @@ fn legacy_versions_require_handshake_and_keep_legacy_results() {
         h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         h.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}));
         let r = h.receive();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 29);
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 30);
         assert!(r["result"].get("resultType").is_none());
         h.close();
     }
@@ -4718,3 +4718,6 @@ mod operations_tests;
 mod settings_tests;
 #[path = "stack_script_tests.rs"]
 mod stack_script_tests;
+
+#[path = "operation_script_tests.rs"]
+mod operation_script_tests;

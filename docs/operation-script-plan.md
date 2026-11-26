@@ -1260,15 +1260,16 @@ native 動画の右クリックメニューからのスクリプトの実行は�
 
 ### 6.2 AI (MCP) に書かせる (利用者決定 Q5)
 
-- AI 連携で許可した利用者だけ、MCP からスクリプトのファイルを読み書きできるようにする。§1.843 の後の段で入れる
-  (本機能の実装後)。許可の段と tool の形は §1.843 の設計 (`docs/mcp-guide-settings-plan.md`) に合わせて、そのとき決める。
-- AI が書いたスクリプトも、できることは §5.1・§6 の範囲に限られる。外からの指示が混ざっても被害はその範囲
-  (レーティング・ピン留めタグの変更と、押したときのキャプチャ保存・クリップボードまで)。
-- 書き込みの後は「再読み込み」と同じ処理で読み直す (ファイルの監視はしない)。
-  `operation_script_enabled` と `operation_script_notice_confirmed` は AI に変えさせない案
-  (§1.843 の「AI 連携の許可そのもの」と同じ扱いにするかは §1.843 側で決める)。
+- AI 連携で「設定の確認と変更を AI に任せる」を許可した利用者だけ、MCP の `operation_script` から
+  スクリプトのファイルを読み書きできる。許可と受付は §1.843 の設定の組に合わせる。詳細は §17.5。
+- AI が書いたスクリプトも、できることは §5.1・§6 の範囲に限られる。有効なときはイベントで自動に動く表示の操作と、
+  利用者の 1 回の入力で行う複数の操作の組み合わせ・条件も AI が変えられる。レーティング・ピン留めタグの変更と
+  キャプチャ保存・クリップボードへのコピーは、利用者がスロットを呼んだときだけ (§17.5 の範囲の説明)。
+- 書き込みの成功時に、同じ FIFO の仕事で検査した本文だけを採用する。通常の読み込みとは結果を区別し、
+  受付時の世代が同じで Ready / Failed のときに Ready へ移す (§17.5 の r3)。追加の再読み込みや監視は行わない。
+  `operation_script_enabled` と `operation_script_notice_confirmed` は AI に変えさせない。
 - **2026-11-26 利用者決定で v5.9.0 に入れる。形は §17.5** (`operation_script` tool、許可は「設定の確認と変更を AI に任せる」、
-  有効化と初回の確認は AI に変えさせない、書いた後は ON なら読み直す)。
+  有効化と初回の確認は AI に変えさせない、書いた後は ON なら検査済みの本文を採用する)。
 
 ---
 
@@ -2403,3 +2404,185 @@ GPU fixtureを使う新規テストは`gpu_tests`内に置き、既存nextest gr
 
 実装担当への明示指示によりcargo build/test/check・検証binary作成・アプリ起動・commitは未実施。
 Rustの実行結果や独立実装レビューの結果はまだ無い。軽量確認の結果は最終引継ぎに記す。
+
+### 17.11 後半の実装引継ぎ (2026-11-26、実装担当。Rust 自動検証前)
+
+対象 HEAD は `23d73f026349cadd258f295cd8ecf366194d1f3f`、ブランチは `script-363-impl`。
+開始時の作業ツリーはクリーン。§17.5、§17.7 の MCP 項目、§17.8 の後半を実装した。
+指示に従い cargo build / test / check、検証バイナリ作成、アプリ起動、コミットは実行していない。
+実装はファイル所有を分け、子担当は明示指定の GPT-6.1 Sol / high を使用した。
+
+#### 実装と所有の境界
+
+- IPC8 の Command / Payload と `operation_script` tool を追加。設定の組の許可を使い、既存の tool の許可・挙動は維持する。
+- UI は `admit_agent_settings_write` と同じ表で受付し、同じ処理で loader の FIFO へ投入する。
+  agent worker が用意した返信先を仕事に入れる。loader の sender は渡さず、UI は I/O・検査・結果待ちをしない。
+- 応答の `enabled_at_admission` / `load_state_at_admission` / `failure_reason_at_admission` は受付時点の写し。
+  理由は 500 Unicode scalar まで。分割では最大 JSON エスケープと text 複製を予約し、状態や理由に依存しない。
+- 読み取りは NotFound だけ雛形を返し、作らない。書き込みは同一の FIFO 仕事で SHA-256 → compile / slots → Reset 共用の置換。
+  成功だけを `AiWrite` として通常の `Load` と同じ受け口へ返す。受付では状態・世代を変えず、同世代の Ready / Failed だけ採用する。
+- 通知・変更記録は指定の 1 行。本文や compiler の診断断片をログ・記録に入れない。
+  有効化と初回確認は対象外を維持し、既存の set_settings 拒否テストにも両キーを追加した。
+- detached の述語・viewport・寿命・context の取り付け・bundle は変更していない。
+
+#### 変更ファイルと場所 (file:line)
+
+IPC / MCP:
+
+- `crates/agent-ipc/src/lib.rs:45` — IPC8、上限定数、Command / Payload。
+- `crates/agent-ipc/src/operation_script_types.rs:7` — 読む・書く結果と受付時の読み込み状態。
+- `crates/mcp-server/src/schema.rs:33` — 一覧・定義・設定許可の説明。
+- `crates/mcp-server/src/lib.rs:725` — strict 引数・振り分け・型付き出力。stack_script の既存エラー文は維持。
+- `crates/agent-ipc/tests/v7_wire/README.md:1` — 元 HEAD と凍結範囲。mod / read_types / folder_types / settings_types /
+  favorite_types / operations_types / stack_script_types / unique_json / page_budget / schema / schema_check / output の各 `.rs`、
+  settings_tools.json / operations_tools.json / favorite_tool.json、固定 hello.frame を同ディレクトリへ追加した。
+- `crates/agent-ipc/tests/favorite_wire.rs:1`、`operations_wire.rs:1`、`settings_wire.rs:1`、`stack_script_wire.rs:1`、
+  `v3_compatibility.rs:1`、`v5_compatibility.rs:1` — 現在版の assertion を 8 に更新。既存凍結 fixture は変更なし。
+- `crates/mcp-server/src/always_list_tests.rs:1`、`crates/mcp-server/src/tests.rs:1` — 一覧件数30、上限は維持。
+
+受付・応答・記録、FIFO:
+
+- `src/agent_ipc/mod.rs:24` — 許可・振り分け・件数だけのログ。
+- `src/agent_ipc/open.rs:335` — agent worker の要求・返信待ち。
+- `src/agent_ipc/metadata_response.rs:25` — 専用の振り分け、読む応答の許可再照合。
+- `src/agent_ipc/operation_script.rs:17` — 受付状態の写し、分割予算、読む応答、行数だけの書く応答・記録。
+- `src/app/startup_ops.rs:260` — UI の受付と FIFO 投入を同じ処理で行う。
+- `src/app.rs:810` — App 受付テストの登録だけ。
+- `src/operation_script/file_worker.rs:17` — AI の仕事、雛形の読み取り、照合・検査・共通の置換。
+- `src/operation_script/loader.rs:22` — 要求・応答型。`:243` で世代捕捉と投入、`:307` で AiWrite の別採用条件。
+- `src/app/agent_settings_tests.rs:460` — 有効化・初回確認の両キーを既存の全体拒否テストへ追加。
+
+公開・内部文書:
+
+- `htdocs/mimageviewer/manual/operation-script.html:466` — AI テンプレート、本文の保持、有効時の自動反映、利用者だけの有効化。
+- `htdocs/mimageviewer/manual/ai-integration.html:1` — 依頼できることの表と設定節に tool を追加。
+- `htdocs/mimageviewer/privacy.html:1` — 日英の提供元送信対象・保存・本文非記録。
+- `htdocs/mimageviewer/index.html:1281` — 提供元送信対象に操作スクリプトの本文を追加。
+- `docs/mcp-guide-settings-plan.md:1` — tool の表、例外の表と §6.9.1。
+- `docs/mcp-integration-plan.md:1` — IPC8・版7凍結、tool の受付・採用と非記録。
+- `docs/spec.md:1`、`docs/architecture-overview.md:3`、`docs/async-architecture.md:3` — FIFO の仕事・Load/AiWrite の別採用条件。
+- 本書 §6.2 — 旧記述を §17.5 r3 と整合した。本節に全テスト名・検証依頼を記す。
+
+#### ClaudeCode の run-heavy へ渡す filter
+
+以下は実行依頼であり、成功した証拠ではない。`run-heavy.ps1` は本作業ツリー内には無く、設計担当の共有 runner を使う。
+本体の `operation_script` filter は loader の `script_363_agent*` もモジュールパスで選ぶ。
+
+```text
+本体 lib:
+  operation_script
+  frozen_v7_adapter_reaches_v8_settings_ui_and_projects_old_response
+  agent_settings_invalid_and_excluded_keys_refuse_the_whole_request
+  all_settings_fields_are_classified
+  stack_script
+  agent_settings
+  agent_operations
+agent-ipc:
+  --test operation_script_wire
+  --test v7_compatibility
+  --test stack_script_wire
+  --test operations_wire
+  --test settings_wire
+  --test favorite_wire
+  --test v6_compatibility
+  --test v5_compatibility
+  --test v3_compatibility
+  --lib
+mcp-server:
+  operation_script
+  stack_script
+  always_list_tests
+  help_tests
+  discovery
+```
+
+agent-ipc の全 integration test、MCP server の全 lib テストも共有回帰として推奨する。
+共有 Command / Payload と UI dispatch を変更したため、最終 gate は build/test policy に従って設計担当が集約する。
+本体の無 filter lib は `scripts/test-lib-full.ps1`、最終全体 gate は `scripts/test-full.ps1` を使う。
+
+#### tools/list の見込みと実施済みの軽量確認
+
+- tool の説明本文 479 字、許可・共通注意を含む description は 550 字。追加定義の compact JSON は 1,186 字、配列 comma 込み +1,187 字。
+- `mcp-guide-settings-plan.md` の `4e24c1155` に対する既存最大実測 50,010 字を基準に **51,197 字**、
+  512 字予約込み **51,709 / 52,000 字**（残り291字）の静的見込み。
+  実測元から開始 HEAD までは schema.rs / lib.rs / 既存3 tool JSON / MCP Cargo.toml / workspace版が同じことを照合した。
+  Rust の実測は未実施で、既存 discovery / always_list の予算テストへ引き継ぐ。
+- `cargo fmt`（引数なし）成功。
+- `python scripts/check_ui_glyphs.py` 成功、危険な UI glyph なし。
+- `python scripts/check_site_cards.py` 成功、53 cards / 0 over the limit。
+- `git diff --check` 成功。
+
+#### 設計書との食い違い・未確認
+
+§17.5 r3 との実装上の食い違い・新しい設計判断はない。
+旧 §6.2 の「後で決める」「書いた後に再読み込み」は §17.5 r3 の成功本文の採用へ整合させた。
+FIFO の簡素化と、まれな起動・置換・channel失敗を再試行しない方針を維持する。
+コンパイル、Rust 回帰、実測 tools/list、Windows 置換失敗・実機挙動、検証バイナリは未確認。
+
+実装担当は作業の中で、自分が起こした別の担当 (GPT-6.1 Sol / xhigh、read-only) に最終の差分の静的な確認を頼み、指摘なしの返答を得たと報告した。
+これは設計担当が依頼する独立実装レビューではない (設計担当 ClaudeCode の注記、2026-11-26)。独立実装レビューは設計担当が別に依頼し、§15 に記録する。
+
+#### 追加テストの全名 (未実行)
+
+追加は計36件。下記の各ファイルに列挙する。worker の実体を使う新規テストは保存先を明示した使い捨ての loader を使う。
+停止注入は RAII で解除し、worker を join してから tempdir を破棄する。製品用 worker の初期化や利用者データの操作は行わない。
+
+`src/operation_script/loader.rs:1093`
+
+- `script_363_agent_read_returns_missing_default_without_creating_and_preserves_empty`
+- `script_363_agent_read_reports_io_utf8_and_bounded_size_errors_without_default`
+- `script_363_agent_acceptance_keeps_ready_generation_and_slots_then_adopts_written_ast`
+- `script_363_agent_rejections_keep_file_ready_script_and_generation_unchanged`
+- `script_363_agent_fifo_reset_then_write_compares_replaced_default`
+- `script_363_agent_fifo_write_then_reset_adopts_ai_and_leaves_default_file`
+- `script_363_agent_fifo_write_then_reload_or_reenable_retires_ai_result`
+- `script_363_agent_write_while_off_is_not_adopted_and_later_enable_reads_it`
+- `script_363_agent_write_in_flight_then_off_does_not_adopt`
+- `script_363_agent_success_recovers_failed_and_loading_states_after_prior_result`
+- `script_363_agent_poll_adopts_only_matching_generation_ready_or_failed`
+- `script_363_agent_fifo_read_between_writes_sees_preceding_write`
+- `script_363_agent_write_accepts_256_kib_and_creates_missing_data_directory`
+- `script_363_agent_replace_failure_preserves_file_ready_state_and_cleans_temporary`
+
+`src/agent_ipc/operation_script_tests.rs:32`
+
+- `operation_script_parts_preserve_source_and_boundaries_across_admission_states_and_reasons`
+- `operation_script_snapshot_truncates_failure_reason_by_scalars`
+- `operation_script_requires_hash_and_valid_part_and_checks_changed_document`
+- `operation_script_ai_cap_refuses_utf8_bytes_before_ui_admission`
+- `operation_script_records_once_and_logs_neither_source_nor_diagnostics`
+- `operation_script_permission_off_refuses_before_ui_or_file_work`
+- `operation_script_read_response_rechecks_permission_epoch`
+- `operation_script_claimed_pipeline_preserves_admission_snapshot_and_completes_after_cancel`
+
+`src/app/agent_operation_script_tests.rs:11`
+
+- `operation_script_ui_admission_rechecks_live_permission_modal_preferences_and_remote`
+
+`src/agent_ipc/compatibility_tests.rs:15`
+
+- `frozen_v7_adapter_reaches_v8_settings_ui_and_projects_old_response`
+
+`crates/agent-ipc/tests/operation_script_wire.rs:5`
+
+- `operation_script_admission_state_preserves_each_loader_state`
+- `operation_script_v8_command_defaults_and_frames_are_additive`
+- `operation_script_response_projection_discards_unknown_fields_and_old_write_source`
+
+`crates/agent-ipc/tests/v7_compatibility.rs:6`
+
+- `frozen_v7_hello_and_response_projection_remain_compatible_with_v8`
+- `frozen_v7_adapter_has_no_operation_script_and_keeps_old_budgets`
+
+`crates/mcp-server/src/operation_script_tests.rs:12`
+
+- `operation_script_arguments_are_strict_and_guard_hashes_before_ipc`
+- `operation_script_source_cap_counts_utf8_bytes_and_fits_existing_transport_caps`
+- `operation_script_heavily_escaped_source_keeps_existing_stdio_input_bound`
+- `operation_script_typed_responses_match_schema_and_final_envelope_budget`
+- `operation_script_admission_snapshot_preserves_states_and_bounded_failure_reason`
+- `operation_script_all_mcp_versions_discover_and_transport_reads_writes_and_refusals`
+
+`crates/mcp-server/src/help_tests.rs:22`
+
+- `operation_script_help_is_searchable_and_retrievable_offline`

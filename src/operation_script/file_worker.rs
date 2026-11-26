@@ -6,19 +6,34 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
+use sha2::{Digest, Sha256};
+
 use super::DEFAULT_SCRIPT;
-use super::loader::{LoadResult, load_script};
+use super::loader::{
+    AgentScriptOutcome, AgentScriptRequest, CompiledOperationScript, LoadResult, MAX_SOURCE_BYTES,
+    ScriptDocument, ScriptWriteOutcome, load_script, read_script_source,
+};
 
 pub(super) enum FileJob {
-    Load { generation: u64 },
+    Load {
+        generation: u64,
+    },
     Open,
     Reset,
+    Agent {
+        request: AgentScriptRequest,
+        generation: Option<u64>,
+    },
 }
 
 pub(super) enum FileResult {
     Load(LoadResult),
     Open(Result<(), String>),
     Reset(Result<(), String>),
+    AiWrite {
+        generation: Option<u64>,
+        script: CompiledOperationScript,
+    },
 }
 
 pub(super) struct FileWorkerOptions {
@@ -73,20 +88,35 @@ impl FileWorker {
                     #[cfg(test)]
                     (options.before_job)();
                     let result = match job {
-                        FileJob::Load { generation } => FileResult::Load(LoadResult {
+                        FileJob::Load { generation } => Some(FileResult::Load(LoadResult {
                             generation,
                             script: ensure_user_script(&options.path)
                                 .and_then(|()| load_script(&options.path)),
-                        }),
-                        FileJob::Open => FileResult::Open(
+                        })),
+                        FileJob::Open => Some(FileResult::Open(
                             ensure_user_script(&options.path)
                                 .and_then(|()| (options.open_editor)(&options.path)),
-                        ),
-                        FileJob::Reset => FileResult::Reset(reset_user_script(&options.path)),
+                        )),
+                        FileJob::Reset => Some(FileResult::Reset(replace_user_script(
+                            &options.path,
+                            DEFAULT_SCRIPT,
+                        ))),
+                        FileJob::Agent {
+                            request,
+                            generation,
+                        } => {
+                            let (outcome, compiled) = execute_agent_script(&options.path, &request);
+                            // The agent owns its reply receiver. Disconnecting it
+                            // does not cancel accepted FIFO work or adoption.
+                            let _ = request.reply.send(outcome);
+                            compiled.map(|script| FileResult::AiWrite { generation, script })
+                        }
                     };
                     // Even after the loader drops its receiver, finish queued jobs.
-                    if results.send(result).is_ok() {
-                        ctx.request_repaint();
+                    if let Some(result) = result {
+                        if results.send(result).is_ok() {
+                            ctx.request_repaint();
+                        }
                     }
                 }
             })
@@ -131,17 +161,80 @@ fn ensure_user_script(path: &Path) -> Result<(), String> {
     }
 }
 
-fn reset_user_script(path: &Path) -> Result<(), String> {
+fn read_document(path: &Path) -> Result<ScriptDocument, String> {
+    let (source, builtin) = match std::fs::File::open(path) {
+        Ok(file) => (read_script_source(file, path)?, false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            (DEFAULT_SCRIPT.to_owned(), true)
+        }
+        Err(error) => {
+            return Err(format!(
+                "スクリプトの読み込みに失敗 ({}): {error}",
+                path.display()
+            ));
+        }
+    };
+    Ok(ScriptDocument {
+        sha256: source_sha256(&source),
+        source,
+        builtin,
+    })
+}
+
+fn source_sha256(source: &str) -> String {
+    format!("{:x}", Sha256::digest(source.as_bytes()))
+}
+
+fn execute_agent_script(
+    path: &Path,
+    request: &AgentScriptRequest,
+) -> (
+    Result<AgentScriptOutcome, String>,
+    Option<CompiledOperationScript>,
+) {
+    let execute = || {
+        let Some(source) = &request.source else {
+            return read_document(path).map(|document| (AgentScriptOutcome::Read(document), None));
+        };
+        if source.len() as u64 > MAX_SOURCE_BYTES {
+            return Err("スクリプトの本文が256 KiBの上限を超えています".into());
+        }
+        let expected = request
+            .expected_sha256
+            .as_deref()
+            .ok_or("書き込みには expected_sha256 が必要です。最初から読み直してください")?;
+        let before = read_document(path)?;
+        if !expected.eq_ignore_ascii_case(&before.sha256) {
+            return Err("読んだあとに変わっています。読み直してください".into());
+        }
+        let compiled = CompiledOperationScript::compile(source)?;
+        replace_user_script(path, source)?;
+        Ok((
+            AgentScriptOutcome::Write(ScriptWriteOutcome {
+                sha256: source_sha256(source),
+                before_lines: before.source.lines().count(),
+                after_lines: source.lines().count(),
+            }),
+            Some(compiled),
+        ))
+    };
+    match execute() {
+        Ok((outcome, compiled)) => (Ok(outcome), compiled),
+        Err(error) => (Err(error), None),
+    }
+}
+
+fn replace_user_script(path: &Path, source: &str) -> Result<(), String> {
     let parent = path.parent().ok_or("スクリプトの保存先を確認できません")?;
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("データフォルダの作成に失敗: {error}"))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| format!("スクリプトの一時ファイルの作成に失敗: {error}"))?;
     temporary
-        .write_all(DEFAULT_SCRIPT.as_bytes())
+        .write_all(source.as_bytes())
         .and_then(|()| temporary.flush())
         .and_then(|()| temporary.as_file().sync_all())
-        .map_err(|error| format!("既定のスクリプトの保存に失敗: {error}"))?;
+        .map_err(|error| format!("スクリプトの保存に失敗: {error}"))?;
     crate::filename_stack_script::rename_script_temporary(
         temporary.as_file(),
         temporary.path(),
