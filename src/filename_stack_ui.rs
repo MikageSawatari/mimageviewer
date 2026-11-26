@@ -2999,6 +2999,8 @@ mod tests {
         app.stack_reconcile_after_fullscreen_close(&ctx);
         app.exit_subfolder_expansion_view();
         app.settle_open_path_classification_for_test();
+        // §1.853 D3: the original Book returns only when its directory scan is adopted.
+        app.finish_direct_navigation_scan_for_test();
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
         assert!(app.extracted_result_surface().is_none());

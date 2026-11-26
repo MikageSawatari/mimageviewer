@@ -467,7 +467,7 @@ impl App {
             )
         {
             self.finish_fullscreen_navigation_for_true_close();
-            self.load_folder_or_convert_archive_with_auto_fullscreen_owned_at_scan_route(
+            let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned_at_scan_route(
                 path,
                 false,
                 OpenRequestOwner::Navigation,

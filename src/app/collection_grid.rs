@@ -4139,6 +4139,8 @@ mod tests {
             let folder = app.tmp.path().join("history-folder");
             std::fs::create_dir(&folder).unwrap();
             app.settings.detached_viewer_open_images_in_window = false;
+            // Image-folder auto-open also requires the master container auto-open setting.
+            app.settings.auto_fullscreen_zip_pdf = true;
             app.settings.auto_fullscreen_image_folders = true;
             app.install_new_items(vec![GridItem::Folder(folder.clone())], vec![None]);
             app.visible_indices = vec![0];

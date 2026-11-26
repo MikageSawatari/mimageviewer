@@ -959,15 +959,19 @@ fn section1473_zip_inner_parent_then_history() {
 
 #[test]
 fn section1473_v490_folder_enter_producer_boundary() {
-    // The v4.9.0 handle_keyboard Folder arm ended in grid_physical_navigation without
-    // note_reading_history_open. That function is byte-identical in v4.9.0 and master.
-    // This tests that unchanged boundary, not a complete v4.9.0 build.
+    // The v4.9.0 Folder producer emitted Direct without note_reading_history_open.
+    // §1.853 §6.3(8) changed grid_physical_navigation to capture current grid effects,
+    // so it is no longer byte-identical to that historical producer. Spell out the
+    // historical payload to retain this boundary regression, not a complete v4.9.0 build.
     let mut app = setup(true);
     configure(&mut app);
     let (path, kind) = fixture(&mut app, "folder");
     add_history(&app, &path, kind);
     enter(&mut app, Entrance::Menu);
-    let nav = app.grid_physical_navigation(0, path.clone(), false);
+    let nav = crate::ui_main::AddressBarNav::Direct(
+        path.clone(),
+        StartupListIntent::container_open(false),
+    );
     apply(&mut app, Some(nav));
     trace(&app, "v490-enter-boundary");
     assert!(app.reading_history_return_from.is_none());

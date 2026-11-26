@@ -4353,7 +4353,8 @@ mod tests {
                 ),
             )
             .unwrap();
-        app.load_folder(book.clone());
+        // §1.853: the source Book must be adopted before snapshot captures its presentation.
+        app.load_folder_and_finish_for_test(book.clone());
         app.settle_open_path_classification_for_test();
         app.finish_page_identity_preparation_for_test();
         let original_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(book));

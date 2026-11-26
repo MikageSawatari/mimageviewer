@@ -4820,6 +4820,9 @@ mod tests {
         assert!(!cancel.load(Ordering::Relaxed));
         tx.send(section1285_result(&target)).unwrap();
         app.poll_startup_open_path_resolve(&egui::Context::default());
+        // This resolver fixture supplies no scan; finish the directory worker
+        // admitted by its continuation before checking the adopted destination.
+        app.finish_direct_navigation_scan_for_test();
         assert_eq!(app.current_folder.as_ref(), Some(&target));
     }
 
@@ -5223,6 +5226,7 @@ mod tests {
         );
         tx.send(section1285_result(&target)).unwrap();
         app.poll_startup_open_path_resolve(&egui::Context::default());
+        app.finish_direct_navigation_scan_for_test();
         assert_eq!(app.current_folder.as_ref(), Some(&target));
         assert!(
             cancel.load(Ordering::Relaxed),

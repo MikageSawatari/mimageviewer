@@ -3376,7 +3376,8 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .get_state_with_fallback(&synthetic, None);
-            app.load_folder(book.clone());
+            // §1.853: adopt the source directory before reading its stored Book presentation.
+            app.load_folder_and_finish_for_test(book.clone());
             app.settle_open_path_classification_for_test();
             app.finish_page_identity_preparation_for_test();
             assert_eq!(app.spread_mode, SpreadMode::RtlCover);

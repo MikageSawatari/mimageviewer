@@ -419,6 +419,19 @@ fn section1853_collection_descendant_close_keeps_physical_owner_through_parent_w
         CollectionStoreRuntime::start_at(app.tmp.path().join("collection-close.db")).unwrap();
     let client = runtime.client();
     app.install_collection_runtime(runtime);
+    let ctx = egui::Context::default();
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // start_at only spawns the actor. Wait for its real Ready event through
+    // App's normal consumer before submitting fixture mutations; create itself
+    // rejects Starting, so its later reply timeout cannot wait for startup.
+    while !matches!(app.collection_store_client_for_read(), Ok(Some(_))) {
+        assert!(
+            std::time::Instant::now() < ready_deadline,
+            "collection fixture runtime did not become ready"
+        );
+        app.poll_collection_ui(&ctx);
+        std::thread::yield_now();
+    }
     let created = client
         .create_collection("Close return".into())
         .unwrap()
@@ -440,7 +453,6 @@ fn section1853_collection_descendant_close_keeps_physical_owner_through_parent_w
         .unwrap()
         .snapshot;
     let id = collection.collection_id();
-    let ctx = egui::Context::default();
     app.poll_collection_ui(&ctx);
     app.open_collection_grid(id, None);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

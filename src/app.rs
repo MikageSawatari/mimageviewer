@@ -30053,7 +30053,7 @@ impl App {
     }
 
     pub(crate) fn load_folder_with_scan_route(&mut self, path: PathBuf, route: DirectoryScanRoute) {
-        self.load_folder_or_convert_archive_with_auto_fullscreen_owned_at_scan_route(
+        let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned_at_scan_route(
             path,
             false,
             OpenRequestOwner::Navigation,
@@ -30071,7 +30071,7 @@ impl App {
                 self.copied_destination_source_proof(),
             )
         });
-        self.load_folder_with_scan_owned_outcome_and_effects_at_stage_with_navigation(
+        let _ = self.load_folder_with_scan_owned_outcome_and_effects_at_stage_with_navigation(
             path,
             None,
             OpenRequestOwner::Navigation,
@@ -39174,10 +39174,20 @@ impl App {
                 auto_fullscreen, ..
             } => *auto_fullscreen,
             _ => false,
-        } || request
+        } || (request
             .grid_open_effects
             .as_ref()
-            .is_some_and(|effects| effects.auto_fullscreen);
+            .is_some_and(|effects| effects.auto_fullscreen)
+            // Rating Folder opens have always settled as a physical list. The
+            // captured UI reservation does not change that owner's Folder policy;
+            // Rating books and other owners still consume their reservation.
+            && !matches!(
+                (&request.intent, &payload),
+                (
+                    PhysicalHistoryIntent::Rating { .. },
+                    collection_navigation::PhysicalHistoryPreflightPayload::Folder(_)
+                )
+            ));
         let owner = match &request.intent {
             PhysicalHistoryIntent::Bookmark { owner, .. } => {
                 OpenRequestOwner::Bookmark(owner.clone())

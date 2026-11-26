@@ -53,6 +53,7 @@ fn settle(app: &mut App) {
         app.poll_direct_navigation_scan_for_test(&ctx);
         app.poll_collection_history_transition(&ctx);
         app.poll_zip_enumerate();
+        app.poll_pdf_enumerate();
         app.poll_sidecar_restore(&ctx);
         app.poll_book_composition_service_for_test(&ctx);
         if !app.direct_navigation_scan_pending()
@@ -62,6 +63,7 @@ fn settle(app: &mut App) {
                 .history_navigation_transition()
                 .is_none()
             && app.zip_enumerate_pending.is_none()
+            && app.pdf_enumerate_pending.is_none()
             && !app.sidecar_restore_active()
             && !app.book_composition.is_pending()
             && !app.book_composition_permission.pending()
@@ -237,14 +239,16 @@ fn section1853_tag_back_survives_classification_and_staged_zip_adoption() {
     source(&mut app, &child, &original, true);
     let scans = folder_scan::caller_scan_count_for_test();
     app.tag_view_back();
-    let candidate = app.top_level_grid_view.open_path_classification().unwrap();
+    // ZIP never enters path classification: its existing metadata preflight owns
+    // both the source proof and the Back effect until prepared archive adoption.
+    let Some(HistoryNavigationTransition::Physical(candidate)) =
+        app.top_level_grid_view.history_navigation_transition()
+    else {
+        panic!("ZIP Back must retain its staged physical owner");
+    };
+    assert_eq!(candidate.tag_view_origin, Some(TagViewNavAdmission::Back));
     assert_eq!(
-        candidate
-            .navigation
-            .as_ref()
-            .unwrap()
-            .search_admission
-            .tag_view,
+        candidate.navigation.search_admission.tag_view,
         Some(TagViewNavAdmission::Back)
     );
     assert_eq!(app.tag_view.nav_stack, original);
@@ -262,20 +266,51 @@ fn section1853_tag_back_intent_is_owned_by_pdf_and_conversion_classification() {
         let child = directory(&app, "typed-child");
         let target = app.tmp.path().join(format!("typed-return.{suffix}"));
         std::fs::write(&target, b"classification fixture").unwrap();
-        let original = vec![target, child.clone()];
+        let original = vec![target.clone(), child.clone()];
         source(&mut app, &child, &original, true);
         app.tag_view_back();
-        let candidate = app.top_level_grid_view.open_path_classification().unwrap();
-        assert_eq!(
-            candidate
+        // Direct PDF keeps its native cold/warm frontend; only conversion
+        // suffixes enter OpenPathClassification. Back belongs to that real owner.
+        let navigation = if suffix == "pdf" {
+            assert!(app.top_level_grid_view.open_path_classification().is_none());
+            &app.pdf_enumerate_pending
+                .as_ref()
+                .unwrap()
+                .4
+                .as_ref()
+                .unwrap()
+                .adoption
+                .as_ref()
+                .unwrap()
+                .navigation
+        } else {
+            app.top_level_grid_view
+                .open_path_classification()
+                .unwrap()
                 .navigation
                 .as_ref()
                 .unwrap()
-                .search_admission
-                .tag_view,
+        };
+        assert_eq!(
+            navigation.search_admission.tag_view,
             Some(TagViewNavAdmission::Back)
         );
         assert_eq!(app.tag_view.nav_stack, original);
+        if suffix == "pdf" {
+            app.pdf_enumerate_pending.as_mut().unwrap().2 =
+                crate::pdf_loader::completed_enumerate_handle_for_test(
+                    &target,
+                    Ok(vec![crate::pdf_loader::PdfPageEntry {
+                        page_num: 0,
+                        mtime: 0,
+                        file_size: 0,
+                    }]),
+                );
+            settle(&mut app);
+            assert_eq!(app.current_folder.as_ref(), Some(&target));
+            assert_eq!(app.tag_view.nav_stack, vec![target]);
+            assert!(matches!(app.items.as_slice(), [GridItem::PdfPage { .. }]));
+        }
         app.retire_main_list_requests_for_surface_switch();
     }
 }
@@ -360,7 +395,10 @@ fn section1853_conversion_phase_uses_captured_search_back_instead_of_new_descend
 #[test]
 fn section1853_search_back_classifies_suffix_directories_before_virtual_dispatch() {
     for tag in [false, true] {
-        for suffix in ["zip", "pdf", "epub", "7z"] {
+        // A proof-less PDF-named directory already used direct PDF dispatch in
+        // base 30cdc0774, to preserve immediate warm placeholders. D2 does not
+        // add PDF-directory recognition; the PDF Back owner is covered above.
+        for suffix in ["zip", "epub", "7z"] {
             let mut app = setup_app();
             let root = directory(&app, &format!("directory.{suffix}"));
             let child = directory(&app, &format!("directory.{suffix}/child"));
@@ -370,8 +408,22 @@ fn section1853_search_back_classifies_suffix_directories_before_virtual_dispatch
             #[cfg(feature = "test-script")]
             let requests = app.test_script_folder_load_requests;
             back(&mut app, tag);
-            let candidate = app.top_level_grid_view.open_path_classification().unwrap();
-            let admitted = &candidate.navigation.as_ref().unwrap().search_admission;
+            let navigation = if suffix == "zip" {
+                let Some(HistoryNavigationTransition::Physical(candidate)) =
+                    app.top_level_grid_view.history_navigation_transition()
+                else {
+                    panic!("archive-named directory must start ZIP metadata preflight");
+                };
+                &candidate.navigation
+            } else {
+                app.top_level_grid_view
+                    .open_path_classification()
+                    .unwrap()
+                    .navigation
+                    .as_ref()
+                    .unwrap()
+            };
+            let admitted = &navigation.search_admission;
             if tag {
                 assert_eq!(admitted.tag_view, Some(TagViewNavAdmission::Back));
             } else {
@@ -410,7 +462,19 @@ fn section1853_favorite_sibling_keeps_suffix_directory_classification_and_single
     #[cfg(feature = "test-script")]
     let requests = app.test_script_folder_load_requests;
     assert!(app.favsearch_navigate_sibling(1));
-    assert!(app.top_level_grid_view.open_path_classification().is_some());
+    let Some(HistoryNavigationTransition::Physical(candidate)) =
+        app.top_level_grid_view.history_navigation_transition()
+    else {
+        panic!("favorite .zip directory must use its real metadata-preflight owner");
+    };
+    assert_eq!(
+        candidate.favsearch_origin,
+        Some(FavsearchNavAdmission::Sibling)
+    );
+    assert_eq!(
+        candidate.navigation.search_admission.favsearch,
+        Some(FavsearchNavAdmission::Sibling)
+    );
     settle(&mut app);
     assert_eq!(app.current_folder.as_ref(), Some(&target));
     assert_eq!(app.favsearch.nav_stack, vec![target.clone(), target]);
@@ -450,9 +514,13 @@ fn section1853_temporary_view_exit_shares_folder_preflight_and_keeps_exit_author
     source(&mut app, &child, &[child.clone()], false);
     let scans = folder_scan::caller_scan_count_for_test();
     app.load_folder_after_temporary_view_exit(target.clone());
-    let candidate = app.top_level_grid_view.open_path_classification().unwrap();
+    let Some(HistoryNavigationTransition::Physical(candidate)) =
+        app.top_level_grid_view.history_navigation_transition()
+    else {
+        panic!("temporary .zip exit must keep its real metadata-preflight owner");
+    };
     assert!(matches!(
-        candidate.navigation.as_ref().unwrap().history,
+        candidate.navigation.history,
         MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
     ));
     assert!(app.favsearch.active);

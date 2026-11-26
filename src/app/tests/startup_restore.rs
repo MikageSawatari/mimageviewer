@@ -2965,6 +2965,23 @@ fn section1335_rating_folder_auto_request_records_the_actual_settled_physical_li
                     == StartupListIntent::ClassifyFolder
     ));
     assert!(env.apply_fullscreen_close_nav_immediate(nav));
+    let Some(HistoryNavigationTransition::Physical(request)) =
+        env.top_level_grid_view.history_navigation_transition()
+    else {
+        panic!("Rating Folder keeps its staged physical landing");
+    };
+    assert!(matches!(
+        request.intent,
+        PhysicalHistoryIntent::Rating { .. }
+    ));
+    assert_eq!(request.restore_intent, StartupListIntent::ClassifyFolder);
+    assert!(
+        request
+            .grid_open_effects
+            .as_ref()
+            .is_some_and(|effects| effects.auto_fullscreen),
+        "capture preserves the requested auto-open intent; the Rating Folder adoption keeps its released list policy"
+    );
     assert_eq!(env.settings.startup_list_restore, before);
     assert_physical(&env, &parent, None);
     settle_book(&mut env);
@@ -2973,6 +2990,7 @@ fn section1335_rating_folder_auto_request_records_the_actual_settled_physical_li
         env.fullscreen_idx.is_none(),
         "released Rating Folder execution settles as a list"
     );
+    assert!(!env.pending_auto_fs_open);
     assert_physical(&env, &child, None);
     let adopted = env.settings.startup_list_restore.clone();
     env.on_exit_inner();

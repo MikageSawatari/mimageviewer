@@ -1591,6 +1591,51 @@ native 実機・snapshot 生成と確認・perf 計測・検証用 binary のビ
 今回変更した Rust 10 ファイルは単体ごとの `rustfmt --edition 2024 --check --config skip_children=true` に成功。
 `git diff --check` も成功した。これらはコンパイル・テストの結果ではない。
 
+#### テスト実行後の修正 (r1)
+
+設計担当が `616f04b35`（型修正＋cargo fmt）で関連 nextest を実行し、既定構成は
+1,046 件中 1,030 成功・16 失敗、`--features test-script` は 1,051 件中 1,035 成功・同じ 16 失敗だった。
+両構成のコンパイル成功も設計担当の結果である。提供された `test-both-2.log` の両構成の失敗と
+入力・採用経路を照合して、以下を修正した。実装担当自身はコンパイル・テストを実行していない。
+
+| ファイル・失敗テスト | 根因と修正 |
+| --- | --- |
+| `smart_folder.rs` / `g1_smart_real_handler_reopen_restores_legacy_flow_and_book_return` | 最初の実フォルダの走査を採用せず Book recipe を検査していた。初期読込を既存の worker 完了＋post-render＋hydration helper へ変更。Book と帰路の期待値は維持 |
+| `snapshot_ops.rs` / `g1_snapshot_a2_deactivation_preserves_source_book_presentation` | 同じ初期採用待ち不足。元 Book を採用してから snapshot を作る。元の表示状態を保存・復元する期待値は維持 |
+| `subfolder_expansion.rs` / `g1_subfolder_real_handler_reopen_restores_legacy_flow_and_book_return` | 同じ初期採用待ち不足で初期 Single を検査していた。元 Book の採用を待つ。RtlCover・flow・帰路の期待値は維持 |
+| `filename_stack_ui.rs` / `g1_subfolder_stack_book_reopen_preserves_vertical_flow_and_original_book` | 展開終了の D3 帰還だけ採用前だった。終了後に同じ worker 完了 helper を追加。元 Book・Vertical の期待値は維持 |
+| `startup_ops.rs` / `section1285_reload_keeps_unresolved_initial_request_without_user_navigation` | resolver の模擬結果が `folder_scan=None` のため、その続きが走査待ちになった。resolver poll 後に worker 採用を待つ。reload が resolver を取り消さない検査と最終行き先は維持 |
+| `startup_ops.rs` / `section1285_untouched_initial_resolver_still_opens_its_target` | 同じ模擬結果の採用待ち不足。worker 完了を待ち、行き先と完了 receiver の退役の期待値を維持 |
+| `tag_view_list_order_tests.rs` / `tag_list_order_folder_then_archive_returns_through_folder_before_results` | 共通 settle が DirectNavigation を poll せず idle と判定し、Back の積み上げ確定前に検査していた。通常 post-render の poll と pending の終了条件を追加。2 段の戻り先・積み上げ・run の期待値は維持 |
+| `tests/history_parent_1473.rs` / `section1473_v490_folder_enter_producer_boundary` | 「現行 helper は v4.9.0 と同一」という歴史的 fixture の前提が、§6.3(8) の効果捕捉で失効した。当時の `Direct(path, container_open(false))` payload を明示する。歴史的 producer の最終帰路の期待値は維持し、現行 Enter の効果は現行テストで検査 |
+| `tests/startup_restore.rs` / `section1335_rating_folder_auto_request_records_the_actual_settled_physical_list` | 製品側の退行。新しい Folder effects の auto 予約を staged 採用で一律適用し、従来の Rating Folder の一覧採用を全画面へ変えていた。`commit_physical_history_transition` で Rating owner＋Folder payload の既存方針を保つ。要求内の予約の保持を追加検査し、最終一覧と起動復元先の期待値は維持 |
+| `collection_grid.rs` / `grid_folder_enter_and_gamepad_defer_visible_effects_until_adoption` | fixture が画像フォルダ用の子設定だけを有効化し、必須の親設定を無効のままにしていた。`auto_fullscreen_zip_pdf=true` も設定。効果と旧表示不変の期待値は維持 |
+| `tests/search_scan_853_tests.rs` / `section1853_tag_back_survives_classification_and_staged_zip_adoption` | ZIP は分類 owner ではなく staged PhysicalHistory owner が戻り意図を持つ。その要求を検査する。最終 ZIP と積み上げの期待値は維持 |
+| 同 / `section1853_tag_back_intent_is_owned_by_pdf_and_conversion_classification` | PDF は直接の列挙 owner、RAR/7z は分類 owner。各実 owner の Back を検査する。積み上げの先行変更なしの期待値は維持 |
+| 同 / `section1853_search_back_classifies_suffix_directories_before_virtual_dispatch` | ZIP の staged preflight と EPUB/7z の分類を同一 owner と誤認していたため、各要求を検査する。また未分類・表示済み Folder 証明の無い PDF 名の実フォルダは基点 `30cdc0774` でも直接 PDF 経路に入る未対応ケースだった。この新規テストの成功対象から PDF 名の実フォルダだけを除外し、ZIP/EPUB/7z の一覧・選択・積み上げ・要求数の期待値を維持。PDF ファイルの Back 所有と準備済み PDF 採用は別の既存追加テストで検査する |
+| 同 / `section1853_favorite_sibling_keeps_suffix_directory_classification_and_single_count` | ZIP 名の実フォルダは分類ではなく staged preflight。実際の要求を検査する。最終一覧・重複を含む既存積み上げ・test-script の要求数は維持 |
+| 同 / `section1853_temporary_view_exit_shares_folder_preflight_and_keeps_exit_authority` | ZIP 名の帰還先は staged preflight が ExitTemporaryView を所有する。その要求を検査する。採用までの session 保持と採用後の終了の期待値は維持 |
+| `tests/ui_scan_853_tests.rs` / `section1853_collection_descendant_close_keeps_physical_owner_through_parent_wait` | fixture が collection actor の非同期起動直後に mutation を出し、C5 に到達する前に `Starting` で失敗していた。通常の App consumer で Ready を待ってから fixture を作る。C5 の owner・選択・全画面・帰還先の期待値は維持 |
+
+今回、既存テストの最終一覧・選択・履歴・表示の期待値は変更していない。新規テストの誤った
+中間 owner の検査と PDF 名の実フォルダの対象範囲を上記のとおり是正した。
+新しい設計返却事項はない。D2 のお気に入り検索の重複 stack に関する前記の返却は、既存動作を維持したまま継続する。
+
+このログで確認できた本変更由来の `unused_must_use` 3 件も修正した。
+`app.rs` の理由付き読込／D3 の void wrapper と `startup_list_restore.rs` の TrayClose は、
+結果の通知・失敗処理を loader に委ね、戻った直後の状態確定をしない呼び出しなので `let _ =` を明示する。
+既存警告を消すための lint 抑制は追加していない。
+今回変更した Rust 13 ファイルは単体ごとの `rustfmt --edition 2024 --check --config skip_children=true` に成功し、
+`git diff --check` も成功した。修正後の両構成のコンパイル・テスト成功は未確認である。
+
+設計担当へ渡す r1 focused filter（両構成で未実行、従前の関連／全件 gate も引き続き必要）:
+
+```powershell
+$scan853R1Filter = 'test(g1_) | test(section1285_) | test(tag_list_order_) | test(section1473_v490_folder_enter_producer_boundary) | test(section1335_rating_folder_auto_request_records_the_actual_settled_physical_list) | test(grid_folder_enter_and_gamepad_defer_visible_effects_until_adoption) | test(search_scan_853_tests) | test(section1853_collection_descendant_close_keeps_physical_owner_through_parent_wait)'
+cargo nextest run -p mimageviewer --lib -E $scan853R1Filter
+cargo nextest run -p mimageviewer --lib --features test-script -E $scan853R1Filter
+```
+
 <!-- scan853-test-inventory -->
 
 #### `src/app/native_video.rs`
