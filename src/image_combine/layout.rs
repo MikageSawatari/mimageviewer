@@ -609,9 +609,9 @@ fn solve(
         if image.width() < 1.0 || image.height() < 1.0 {
             return Err(LayoutError::ImageTooSmall { index });
         }
-        // Derive sampling from the final pixel rectangle, including the small
-        // aspect change from quantization. Keep the requested source anchor.
-        let crop = fill_crop(full, image, o.anchor);
+        // Sampling belongs to the fractional geometry, not the raster bounds.
+        // Resampling accepts the sub-pixel aspect difference of quantization.
+        let crop = geometry_crop(full, o, k, r);
         let mut card = Rect::from_edges(cell.x, cell.y, cell.right(), placement.card_bottom);
         let mut band = (t > 0.0)
             .then(|| Rect::from_edges(cell.x, cell.bottom(), cell.right(), placement.card_bottom));
@@ -704,5 +704,39 @@ fn fill_crop(source: Rect, target: Rect, anchor: Anchor9) -> Rect {
         (source.height() - ch) * ay,
         cw,
         ch,
+    )
+}
+
+/// Source retention is independent of partition rounding. Grid Fill uses the
+/// solved fractional cell ratio; a fixed non-grid layout uses the same k for
+/// every source, regardless of its final integer width/height allocation.
+fn geometry_crop(source: Rect, options: &CombineOptions, k: f64, cell_ratio: f64) -> Rect {
+    if options.layout == CombineLayout::Grid {
+        return match options.cell_fit {
+            CellFit::Fit => source,
+            CellFit::Fill => {
+                fill_crop(source, Rect::new(0.0, 0.0, cell_ratio, 1.0), options.anchor)
+            }
+        };
+    }
+    if options.canvas_ratio.is_none() {
+        return source;
+    }
+    let horizontal = matches!(
+        options.layout,
+        CombineLayout::Row | CombineLayout::JustifiedRows
+    );
+    let (retain_x, retain_y) = if horizontal {
+        ((1.0 / k).min(1.0), k.min(1.0))
+    } else {
+        (k.min(1.0), (1.0 / k).min(1.0))
+    };
+    let (width, height) = (source.width() * retain_x, source.height() * retain_y);
+    let (ax, ay) = options.anchor.fractions();
+    Rect::new(
+        (source.width() - width) * ax,
+        (source.height() - height) * ay,
+        width,
+        height,
     )
 }

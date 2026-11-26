@@ -1707,45 +1707,204 @@ fn rendered_fixed_gaps_margins_and_bands_are_exact_in_all_layouts_and_directions
 }
 
 #[test]
-fn quantized_image_rectangles_recompute_crops_with_the_selected_anchor() {
+fn fit_preserves_full_thin_source_when_height_rounds_from_one_point_five_to_two() {
+    let dims = [(100, 100), (100, 3)];
+    let mut o = options(CombineLayout::Grid);
+    o.grid_columns = Some(2);
+    o.cell_fit = CellFit::Fit;
+    o.output_size = OutputSize::Width(100);
+    for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
+        o.direction = direction;
+        for anchor in Anchor9::ALL {
+            o.anchor = anchor;
+            let l = calculate(&o, &dims);
+            assert_eq!(
+                (l.cards[1].image.width(), l.cards[1].image.height()),
+                (50.0, 2.0)
+            );
+            for card in &l.cards {
+                assert_eq!(
+                    card.source_crop,
+                    Rect::new(
+                        0.0,
+                        0.0,
+                        card.source_size.0 as f64,
+                        card.source_size.1 as f64
+                    )
+                );
+            }
+            close(l.max_crop_percent, 0.0);
+        }
+    }
+    // A fixed canvas ratio still changes only the Fit cell, not source retention.
+    o.canvas_ratio = Some((1, 1));
+    let l = calculate(&o, &dims);
+    assert!(l.cards.iter().all(|card| card.source_crop
+        == Rect::new(
+            0.0,
+            0.0,
+            card.source_size.0 as f64,
+            card.source_size.1 as f64
+        )));
+    close(l.max_crop_percent, 0.0);
+}
+
+#[test]
+fn unfixed_layouts_and_unmatched_lines_never_crop_for_quantization() {
+    let mut thin = options(CombineLayout::Row);
+    thin.output_size = OutputSize::Width(50);
+    let l = calculate(&thin, &[(100, 3)]);
+    assert_eq!(
+        (l.cards[0].image.width(), l.cards[0].image.height()),
+        (50.0, 2.0)
+    );
+    assert_eq!(l.cards[0].source_crop, Rect::new(0.0, 0.0, 100.0, 3.0));
+    close(l.max_crop_percent, 0.0);
+
     let dims = [(100, 80), (99, 130), (175, 100)];
     for kind in [
         CombineLayout::Row,
         CombineLayout::Column,
-        CombineLayout::Grid,
         CombineLayout::JustifiedRows,
         CombineLayout::JustifiedColumns,
     ] {
         let mut o = options(kind);
-        o.grid_columns = Some(2);
         o.output_size = OutputSize::Width(317);
         o.split = Split::Counts(vec![1, 2]);
         o.gap_x = 7;
         o.gap_y = 11;
         o.margin = 3;
-        o.canvas_ratio = Some((5, 4));
-        for fit in [CellFit::Fit, CellFit::Fill] {
-            o.cell_fit = fit;
+        for line_size in [LineSize::Largest, LineSize::Smallest, LineSize::None] {
+            o.line_size = line_size;
+            for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
+                o.direction = direction;
+                let l = layout(&o, &dims, Some(13)).unwrap();
+                for card in &l.cards {
+                    assert_eq!(
+                        card.source_crop,
+                        Rect::new(
+                            0.0,
+                            0.0,
+                            card.source_size.0 as f64,
+                            card.source_size.1 as f64
+                        )
+                    );
+                }
+                close(l.max_crop_percent, 0.0);
+            }
+        }
+    }
+}
+
+#[test]
+fn fixed_ratio_common_k_keeps_identical_retention_despite_five_six_five_widths() {
+    let mut o = options(CombineLayout::Row);
+    o.output_size = OutputSize::Width(16);
+    o.canvas_ratio = Some((16, 9));
+    let l = calculate(&o, &[(100, 100); 3]);
+    assert_eq!(l.canvas_size, (16, 9));
+    assert_eq!(
+        l.cards
+            .iter()
+            .map(|card| card.image.width())
+            .collect::<Vec<_>>(),
+        vec![5.0, 6.0, 5.0]
+    );
+    close(l.thickness, 27.0 / 16.0);
+    let expected = 100.0 * 16.0 / 27.0;
+    for card in &l.cards {
+        close(card.source_crop.width(), expected);
+        close(card.source_crop.height(), 100.0);
+        close(card.source_crop.x, (100.0 - expected) * 0.5);
+    }
+    assert!(
+        l.cards
+            .iter()
+            .all(|card| card.source_crop == l.cards[0].source_crop)
+    );
+    close(l.max_crop_percent, 100.0 * 11.0 / 27.0);
+
+    let dims = [(100, 80), (99, 130), (175, 100)];
+    for kind in [
+        CombineLayout::Row,
+        CombineLayout::Column,
+        CombineLayout::JustifiedRows,
+        CombineLayout::JustifiedColumns,
+    ] {
+        let horizontal = matches!(kind, CombineLayout::Row | CombineLayout::JustifiedRows);
+        let mut o = options(kind);
+        o.output_size = OutputSize::Width(777);
+        o.split = Split::Counts(vec![1, 2]);
+        o.gap_x = 7;
+        o.gap_y = 11;
+        o.margin = 3;
+        for ratio in [(5, 1), (1, 3)] {
+            o.canvas_ratio = Some(ratio);
+            for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
+                o.direction = direction;
+                for anchor in Anchor9::ALL {
+                    o.anchor = anchor;
+                    let l = layout(&o, &dims, Some(13)).unwrap();
+                    let (rx, ry) = if horizontal {
+                        ((1.0 / l.thickness).min(1.0), l.thickness.min(1.0))
+                    } else {
+                        (l.thickness.min(1.0), (1.0 / l.thickness).min(1.0))
+                    };
+                    let (ax, ay) = anchor.fractions();
+                    for card in &l.cards {
+                        let (w, h) = (card.source_size.0 as f64, card.source_size.1 as f64);
+                        close(card.source_crop.width() / w, rx);
+                        close(card.source_crop.height() / h, ry);
+                        close(card.source_crop.x, (1.0 - rx) * w * ax);
+                        close(card.source_crop.y, (1.0 - ry) * h * ay);
+                    }
+                    close(l.max_crop_percent, 100.0 * (1.0 - rx.min(ry)));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn grid_fill_uses_fractional_cell_ratio_and_anchor_before_quantization() {
+    let dims = [(100, 100), (100, 3)];
+    let mut o = options(CombineLayout::Grid);
+    o.grid_columns = Some(2);
+    o.cell_fit = CellFit::Fill;
+    o.cell_ratio = CellRatio::Ratio(2, 1);
+    o.output_size = OutputSize::Width(100);
+    o.gap_x = 7;
+    o.margin = 3;
+    for ratio in [None, Some((5, 4))] {
+        o.canvas_ratio = ratio;
+        // Before raster quantization the cells are 43.5px wide. Their image
+        // height is 21.75px naturally, or 61px for a fixed 100x80 canvas.
+        let r = if ratio.is_none() { 2.0 } else { 43.5 / 61.0 };
+        for direction in [CombineDirection::LeftToRight, CombineDirection::RightToLeft] {
+            o.direction = direction;
             for anchor in Anchor9::ALL {
                 o.anchor = anchor;
-                let left = layout(&o, &dims, Some(13)).unwrap();
-                o.direction = CombineDirection::RightToLeft;
-                let right = layout(&o, &dims, Some(13)).unwrap();
-                o.direction = CombineDirection::LeftToRight;
+                let l = layout(&o, &dims, Some(13)).unwrap();
+                assert_eq!(
+                    l.cards
+                        .iter()
+                        .map(|card| card.image.width())
+                        .collect::<Vec<_>>(),
+                    vec![44.0, 43.0]
+                );
+                close(l.cell_ratio.unwrap(), r);
                 let (ax, ay) = anchor.fractions();
-                for (a, b) in left.cards.iter().zip(&right.cards) {
-                    assert_eq!(a.source_crop, b.source_crop);
-                    let crop = a.source_crop;
-                    close(
-                        crop.width() * a.image.height(),
-                        crop.height() * a.image.width(),
-                    );
-                    close(crop.x, (a.source_size.0 as f64 - crop.width()) * ax);
-                    close(crop.y, (a.source_size.1 as f64 - crop.height()) * ay);
-                    assert!(crop.x >= -1e-9 && crop.y >= -1e-9);
-                    assert!(crop.right() <= a.source_size.0 as f64 + 1e-9);
-                    assert!(crop.bottom() <= a.source_size.1 as f64 + 1e-9);
+                for card in &l.cards {
+                    let (w, h) = (card.source_size.0 as f64, card.source_size.1 as f64);
+                    let (cw, ch) = if w / h >= r { (h * r, h) } else { (w, w / r) };
+                    close(card.source_crop.width(), cw);
+                    close(card.source_crop.height(), ch);
+                    close(card.source_crop.x, (w - cw) * ax);
+                    close(card.source_crop.y, (h - ch) * ay);
                 }
+                // The thin source determines the maximum; integer cell widths
+                // 44 and 43 must not change its geometry-defined retention.
+                close(l.max_crop_percent, 100.0 * (1.0 - 3.0 * r / 100.0));
             }
         }
     }
