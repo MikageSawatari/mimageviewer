@@ -5748,7 +5748,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                                 ui.visuals().widgets.noninteractive.fg_stroke,
                                             );
                                         }
-                                        ui.vertical(|ui| {
+                                        ui.horizontal_wrapped(|ui| {
                                             ui.set_width(
                                                 (item_column_width
                                                     - ITEM_PREVIEW_WIDTH

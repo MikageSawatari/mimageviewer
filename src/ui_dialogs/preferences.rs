@@ -7528,6 +7528,29 @@ mod tests {
                         ))
                     })
                     .unwrap();
+                // At the default width these short names and statuses fit on
+                // one row. The checks below also cover wrapping at minimum width.
+                let inline_statuses: &[(ContextMenuItemId, &str)] = match (width == 720.0, scenario)
+                {
+                    (true, ContextMenuPreviewScenario::GridImageWithDynamicApps) => &[
+                        (ContextMenuItemId::CutFiles, "切り取りはこの場面で先頭"),
+                        (ContextMenuItemId::CopyFiles, "コピーは項目非表示中"),
+                    ],
+                    (true, ContextMenuPreviewScenario::FullscreenVideo) => {
+                        &[(ContextMenuItemId::RotateLeft, "左に回転はこの場面で対象外")]
+                    }
+                    _ => &[],
+                };
+                for &(item, status_label) in inline_statuses {
+                    let checkbox = harness.get_by_label(item.label()).rect();
+                    let status = harness.get_by_label(status_label).rect();
+                    assert!(
+                        checkbox.y_range().contains(status.center().y)
+                            && status.left() >= checkbox.right(),
+                        "width={width}, scenario={scenario:?}, item={item:?}: \
+                         short item and status should share a row: {checkbox:?}, {status:?}"
+                    );
+                }
                 for step in 0..128 {
                     let (_, layout) = harness
                         .ctx
