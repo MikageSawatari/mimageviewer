@@ -1005,7 +1005,7 @@ P2-2 `InvokeCommand` の戻りは Shell の画面の役目が終わった証拠�
 
 ## 6. §1.853 の残り C・D・E (v5.9.0 予定、ブランチ `ui-scan-853b`)
 
-状態: 設計 r7 (2026-11-26、設計レビュー r1〜r6 の指摘と、全画面の経路の利用者決定 (§6.1) を反映。§6.9〜§6.15)。担当: 設計・検収 = ClaudeCode Opus 5.5 (uiscan-853b)、実装 = Codex GPT-6.1 Sol / high、
+状態: 設計 r7 確定 (2026-11-26、設計レビュー r7 で ACCEPT。r1〜r6 の指摘と、全画面の経路の利用者決定 (§6.1) を反映。§6.9〜§6.16)。担当: 設計・検収 = ClaudeCode Opus 5.5 (uiscan-853b)、実装 = Codex GPT-6.1 Sol / high、
 独立レビュー = GPT-6.1 Sol / xhigh。作業ツリー `G:\home\mimageviewer-uiscan853b`。コードの記述は master `451ad09db` の読み取り。
 本担当は実行時の挙動を観測していない。時間の数字はサブ PC 担当の perf ログ (§1.853、3004 件のネットワークフォルダで約 7.6 秒)。
 
@@ -1374,6 +1374,9 @@ r2 の 3 件のうち D5 の限定と設定変更の分割は解消と判定。�
    今のページに効く。そこで `CloseReturn` の目的のときは、**今のページが描ける (準備済み) なら通常の描画で描き** (拡大・回転・位置の
    変更が見える)、描けないときだけ捕捉した表示単位を代わりに描く。対象を変える入力の止め (lock・`blocks_new_target`) は sequence の
    まま効かせる。描画の選び方は目的で分け、Ctrl+↑↓ の描画は変えない。
+   実装の注意 (設計レビュー r7 P3): 今の描画の選択 (`ui_fullscreen.rs` 14849 付近) は、選んだ結果に応じて holdover・sequence を
+   変える。`CloseReturn` では、通常の描画へ切り替えても sequence と lock は終えない (終えるのは 4・4a の終端だけ)。「準備済み」は
+   見開き全体を描ける条件で判定する (既存の表示単位の規則 `ui_fullscreen.rs` 30263)。切り替えた後もページ送りが断られることをテストする。
    ページ送り・ジャンプ・スクロールは、既存の `fs_nav_is_locked()`・`fs_navigation_sequence_blocks_new_target()` の判定
    (全画面・専用 viewport・page overview・in-page scroll・動画の側にある) でそのまま止まる。新しい入力の止めは作らない。
    閉じる操作は Ctrl+↑↓ の待ちと同じく止めない。
@@ -1400,9 +1403,9 @@ r2 の 3 件のうち D5 の限定と設定変更の分割は解消と判定。�
 4a. 待ちの間に全画面が別の経路で閉じたとき (r6、設計レビュー r5 P2-3): Backspace はページ一覧への close
    (`close_fullscreen_to_page_list`、`startup_list_restore.rs` 423)、focus guard は `close_fullscreen` (`app.rs` 65591) を呼ぶ。今の
    true-close の後始末が取り消す pane の走査は `RequiredFullscreenTarget` だけ (`snapshot_ops.rs` 2276、`app.rs` 62519) なので、
-   放っておくと L2 を出した後に残った走査が親へ移してしまう。**全画面を閉じる既存の境界 (true-close の後始末と、content の close
-   の共通の入口) で、その context の C5 の要求も退役させる** (`RequiredFullscreenTarget` と同じ扱い)。採用のときは pending を
-   取り出した後に install が全画面を閉じるので、この退役は空振りになる (自分の採用を消さない)。二度目の「閉じる」は、この退役の
+   放っておくと L2 を出した後に残った走査が親へ移してしまう。**新しい close を受け付ける境界で、その context の C5 の要求も
+   退役させる** (`RequiredFullscreenTarget` と同じ扱い。置き場所は下の r7 の段落のとおり)。採用のときは pending を取り出した後に
+   install が全画面を閉じるので、この退役に当たらない (自分の採用を消さない)。二度目の「閉じる」は、この退役の
    後に新しい要求として受け付けられる (5)。
    r7 (設計レビュー r6 P2-1): 退役を置くのは**新しい close の受付**の境界 (true-close の後始末、Backspace のページ一覧への close の
    受付、focus guard の close の受付) だけにする。**受付済みの close の teardown では繰り返さない**: native の presentation 切替中の
@@ -1464,3 +1467,10 @@ r5 の 4 件への方針は反映済みと判定。新たに P2×2・P3×1。設
 | P2-1 4a の退役を共通の content-close に置くと、遅れた `TerminalClose` の再入が新しく受け付けた C5 の要求を退役させる | 退役は新しい close の受付の境界だけに置き、受付済みの teardown では繰り返さない (§6.12 の 4a) |
 | P2-2 `FolderItems` は `previous` を捕捉時の変換で描き続け、待ちの間の拡大・回転が見えない | `CloseReturn` では今のページを通常の描画で描き、描けないときだけ捕捉を代わりに描く (§6.12 の 2) |
 | P3 native の共通受付が受付済みの続き (非同期の結果・EOF) まで審査し直すおそれ | 新しい入力の受付だけに置き、待ちの無いときの挙動の維持テストを追加 (§6.12 の 2、テスト d6) |
+
+### 6.16 設計レビュー r7 (同じ担当の継続、f0963a999、2026-11-26): ACCEPT
+
+r6 の P2×2・P3×1 は設計上解消、追加の P1/P2 は無しと判定。detached の境界は「構造的修正であって症状パッチではない」に
+**AGREE** (走査の判断・close の新しい受付・採用済みの teardown・描画資源の所有を、それぞれの境界へまとめている)。
+P3×2 は実装の注意として反映した: 4a に残っていた古い置き場所の記述を置き換えた。通常の描画への切り替えと sequence の終わりを
+分ける注意を §6.12 の 2 に足した。
