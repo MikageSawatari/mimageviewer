@@ -539,8 +539,9 @@ struct CombineRecipe {
     v: u32,
     options: CombineOptions,          // 出力の名前を除く全部
     format: CombineFormat,            // 書いた形式 (置き換えで固定に使う、§10.3)
-    items: Vec<CombineItemSpec>,      // 並びの順。source + label_override
+    items: Vec<CombineItemSpec>,      // 並びの順。source + label_override + annotation_space
 }
+// CombineItemSpec に annotation_space: Option<[u32; 2]> を持つ (下の「注釈の基準の寸法」)
 enum CombineSourceRef {
     File { path: PathBuf },
     ZipEntry { zip_path: PathBuf, entry_name: String },
@@ -570,6 +571,12 @@ enum CombineSourceRef {
 4. 構成の設定・並び・ラベルでダイアログを開く (プリセットの選択は空)。出力の名前・場所は元の出力のもの。
 
 - 元の画像の今の保存済み編集で合成する (最初の書き出しの後に元の画像の補正を変えていれば、変えた後の絵になる)。
+- **注釈の基準の寸法** (段 C の実装中に実装担当が報告、設計担当の決定 2026-11-26): テキスト注釈の座標は元の画像の基準の寸法
+  (`comic_source_dims`) に対して持つが、一覧の項目はこの寸法を表示用に読み込んだ画像やメモリ上の寸法の記録から得ていて、
+  `comic.db` にもベクターの PDF の解析にも残っていない。一覧に無い元の画像では同じ値を得られない。そこで、書き出しのときに
+  各元の画像の snapshot の `comic_source_dims` を構成の `annotation_space` に記録し、やり直しの resolver はその値を使う。
+  記録が無く注釈がある元の画像 (ラスター画像は合成した絵の寸法と同じなので、実際に問題になるのはベクターの PDF のページ) は、
+  ずれた合成をせず、その対象を「注釈の位置を再現できません。一覧から結合し直してください」の失敗にする (§8.1 の失敗の扱い)。
 - 構成の JSON が読めない (`v` が未知・壊れている) ときは開かずに理由を出し、ログに残す (行は消さない)。
 
 ### 10.3 置き換え
