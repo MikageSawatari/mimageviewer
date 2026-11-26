@@ -1467,10 +1467,6 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 - detached の述語・viewport の経路・窓の所有は変更しない。`fs_primary_suppression` は今どおり前面 viewer に 1 つの
   App の状態で、open・close・park・新しい窓・passive の採用での初期化も変えない。離し済みの入力から持続する止めを
   作っていた生成の境界を直す構造的修正であり、guard・遅延・再試行・時間切れによる症状パッチではない。
-- テスト修正時の範囲追加: viewer の scrub 開始位置を、同じ pass の離しで消える `pointer.press_origin()` だけに
-  依存せず、この pass の最後の primary press イベントから取る (イベントがなければ従来の取得元)。開始条件・
-  パネル除外・前面所有の条件は維持する。押下イベントが持つ位置を離し後にも使う入力の取得元の修正で、detached の
-  述語・viewport 配送・窓の所有・初期化は変更しない。この追補についての追加レビュー結果は未記録。
 - 構造的修正であることの合意: Codex 独立設計レビュー r1 (方針に合意、第 1 版は不合意)・r2 (第 2 版全体に合意、
   GPT-6.1 Sol / xhigh) と ClaudeCode (設計担当)。実装の独立レビューの結果は実装後に追記する。
 

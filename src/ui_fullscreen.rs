@@ -41766,26 +41766,12 @@ impl App {
             });
         if scrub_active || (scrub_canvas && scrub_held) {
             let (pressed, down, released, pos, press_origin) = ctx.input(|i| {
-                // egui clears press_origin on release, including a complete
-                // click in this pass. Admission belongs to the primary press,
-                // whose position remains in the ordered button events.
-                let primary_press_origin =
-                    i.pointer
-                        .button_events()
-                        .rev()
-                        .find_map(|event| match event {
-                            egui::PointerButtonEvent::Pressed {
-                                button: egui::PointerButton::Primary,
-                                pos,
-                            } => Some(pos),
-                            _ => None,
-                        });
                 (
                     i.pointer.primary_pressed(),
                     i.pointer.primary_down(),
                     i.pointer.primary_released(),
                     i.pointer.interact_pos(),
-                    primary_press_origin.or_else(|| i.pointer.press_origin()),
+                    i.pointer.press_origin(),
                 )
             });
             let owner = self.fs_zoom_owner();
