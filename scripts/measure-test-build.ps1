@@ -97,6 +97,8 @@ try {
     Write-Host ("[measure] {0}: cargo {1} (CARGO_BUILD_JOBS={2})" -f $Label, ($CargoArgs -join ' '), $jobsText)
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $proc = Start-Process -FilePath 'cargo' -ArgumentList $CargoArgs -NoNewWindow -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+    # Windows PowerShell 5.1 leaves ExitCode empty unless the handle is opened before the process exits.
+    $null = $proc.Handle
     $peakCommit = [uint64]0; $peakTools = [uint64]0; $peakRustc = [uint64]0; $peakLink = [uint64]0
     $maxRustcN = 0; $maxLinkN = 0; $peakAt = 0.0; $aborted = $false; $limit = $start0[1]
     while (-not $proc.HasExited) {
