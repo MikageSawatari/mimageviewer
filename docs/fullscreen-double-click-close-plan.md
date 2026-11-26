@@ -407,7 +407,8 @@ F2 と `advance_viewer_primary_pointer_frame` は F12 の別ウィンドウと�
 
 ## 14. §1.900 修正: 表示を戻したダブルクリックの直後のダブルクリックで閉じる
 
-- 状態: 設計 (2026-11-26、ブランチ small-fixes-590)。v5.9.0 の小さな修正としてまとめて扱う。
+- 状態: 実装済み (2026-11-26、ブランチ small-fixes-590、6ce191c4e)。設計 r3・実装 r2 とも ACCEPT (§15.7)。本体 lib 全件は統括の
+  master 取り込みの後、実機は未確認。v5.9.0 の小さな修正としてまとめて扱う。
 - 報告: [backlog §1.900](next-release-backlog.md) (§12.7 で見つけた件、コード読み・headless の試験。実機での観測はない)。
 
 ### 14.1 原因 (コード)
@@ -481,7 +482,8 @@ F2 と `advance_viewer_primary_pointer_frame` は F12 の別ウィンドウと�
 
 ## 15. §1.907 修正: ドラッグ拡大の和音での速いクリックでページを送らない (この pass の押下位置)
 
-- 状態: 設計 (2026-11-26、ブランチ small-fixes-590)。v5.7.0 からの挙動。
+- 状態: 実装済み (2026-11-26、ブランチ small-fixes-590、6ce191c4e)。設計 r3・実装 r2 とも ACCEPT (§15.7)。本体 lib 全件は統括の
+  master 取り込みの後、実機は未確認。v5.7.0 からの挙動。
 - 報告: [backlog §1.907](next-release-backlog.md) (§13.9 の別件。コード読み、実機での観測はない)。
 
 ### 15.1 原因 (コード)
@@ -602,6 +604,15 @@ guard・遅延・再試行・時間切れを足さない。ClaudeCode と Codex 
 - 設計 r2 (同じレビュー担当、8d95827d5): REVISE。r1 の 5 件のうち 4 件は解消。P2: 前の pass から続く和音のドラッグに同じ pass で
   離す・押すが入ると、この pass の止めの判定が新しい押下の開始を拒む (§15.4 の期待と食い違う)。ClaudeCode の判断で、この場合は
   今の結果を保つ範囲外として §15.2・§15.4 に明記した (第 3 版)。detached: 構造的修正であることに引き続き合意。
+- 設計 r3 (同じレビュー担当、2990a608e): **ACCEPT**、指摘なし。detached: 構造的修正であることに引き続き合意。
+- 実装 (Codex GPT-6.1 Sol / high、995eeba7c〜6ce191c4e)。初回の実行で 3 件が失敗した: 新しい Depth のテスト 2 件の gpu グループへの
+  登録漏れと、別ウィンドウのテストの固定具 (最初の入力を ROOT で処理していたため、子の viewport の入力がすべて拒まれていた。
+  製品の不具合ではない)。9d6b0d775 で直した。
+- 検証: ClaudeCode が run-heavy で実行: 関連 nextest 2512 件 (ui_fullscreen::・ui_dialogs::preferences::・save_with_metadata::・export_dialog::・native_presenter ほか、9d6b0d775) と export_integration 24 件 (995eeba7c)、修正後の save_with_metadata:: 56 件・preferences 271 件がすべて成功。変異確認: §14 の数え方を旧に戻すと close_mode_900 の 3 件と別ウィンドウの 1 件、押下位置を旧の値に戻すと
+  907・suppression_906・native popup・depth_transform の 8 件が落ちる。
+- 実装の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh、`2990a608e..ddff279d7`): REVISE、P1・P2 なし。P3 3 件 (§9 の PNG の比較の
+  基準、detached-rework-plan §11 の記録漏れ、release-operations の版表記の旧手順)。6ce191c4e で直し、r2 (`ddff279d7..6ce191c4e`) で
+  **ACCEPT**。detached: §14・§15 の実装が「症状パッチではなく構造的修正」であることに合意。
 
 ### 15.8 実装記録・引き継ぎ (2026-11-26、small-fixes-590)
 

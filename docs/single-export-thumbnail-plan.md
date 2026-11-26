@@ -222,8 +222,8 @@ pub enum MetadataProfile {
 
 ## 9. §1.902: 1 枚の書き出しでも RGB の色のプロファイル (ICC) を残す
 
-- 状態: コード・回帰テスト・文書の変更済み (2026-11-26、ブランチ small-fixes-590)。コンパイル・自動テスト・独立レビュー・実機確認は未実施。
-  利用者の指定により、この作業では Cargo / fmt・実行ファイルの起動・コミットを行わない。v5.9.0 の小さな修正としてまとめて扱う。
+- 状態: 実装済み (2026-11-26、ブランチ small-fixes-590、6ce191c4e)。独立実装レビュー ACCEPT (§9.6)。本体 lib 全件は統括の
+  master 取り込みの後、実機は未確認。v5.9.0 の小さな修正としてまとめて扱う。
 - 報告: [backlog §1.902](next-release-backlog.md)。観測はサブ PC 担当 (2026-11-26): APP2 に ICC を持つ JPEG を
   Ctrl+E で書き出すと、出力に ICC が無い。コードでは v5.7.0 から同じ (当時の §3.3 の「JPEG に ICC を足さない」)。
 
@@ -278,4 +278,11 @@ pub enum MetadataProfile {
 - 旧コードで失敗する見込み (コード読み、実行による確認なし): Single の JPEG / PNG の RGB、WebP の GRAY / CMYK、
   PNG のテキスト + RGB iCCP、ICC を加味したバイト比較、worker の保持 ON。
 - 未実行の検証候補: nextest の lib フィルタ `test(save_with_metadata::)`、統合フィルタ
-  `binary(export_integration)`。この差分での Rust 検証結果・独立レビュー結果はまだ無い。
+  `binary(export_integration)`。(実装時点の記録。検証とレビューは §9.6)
+
+### 9.6 検証とレビュー記録
+
+- 検証: ClaudeCode が run-heavy で実行: 関連 nextest 2512 件 (ui_fullscreen::・ui_dialogs::preferences::・save_with_metadata::・export_dialog::・native_presenter ほか、9d6b0d775) と export_integration 24 件 (995eeba7c)、修正後の save_with_metadata:: 56 件・preferences 271 件がすべて成功。
+- 独立設計レビュー (GPT-6.1 Sol / xhigh、§1.900・§1.907 と同じ依頼): §9 に指摘なし。
+- 独立実装レビュー (実装者とは別の GPT-6.1 Sol / xhigh、`2990a608e..ddff279d7`): REVISE (P3: PNG の比較の基準を本体のエンコードで
+  作り直していた)。6ce191c4e で独立したエンコーダの出力に戻し、r2 (`ddff279d7..6ce191c4e`) で **ACCEPT**。
