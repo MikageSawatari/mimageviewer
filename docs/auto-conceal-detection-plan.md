@@ -115,6 +115,8 @@
 ### 4.2 設定ダイアログ (3 ツール共通)
 
 `default_pos()` の通常ダイアログ (モーダル)。1093×614 でも [検出] と [閉じる] が見えること (見出しと操作行は ScrollArea の外)。
+設定と検出中の Window は fullscreen の描画経路だけで表示し、`with_dark_context_style` でタイトルバーを含めて常に暗色にする。
+描画後は Context の Light / Dark 両 Style と theme preference を復元する。
 
 | 項目 | 内容 | 既定 |
 |---|---|---|

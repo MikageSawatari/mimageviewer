@@ -534,18 +534,27 @@ impl App {
 
     pub(crate) fn show_mask_detect_dialog(&mut self, ctx: &egui::Context) {
         if self.mask_detect_pending.is_some() {
-            egui::Window::new("顔を検出中")
-                .id(egui::Id::unique("mask_detect_progress"))
-                .order(egui::Order::Foreground)
-                .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
-                .collapsible(false)
-                .resizable(false)
-                .show(ctx, |ui| {
-                    ui.spinner();
-                    if ui.button("キャンセル").clicked() {
-                        self.cancel_mask_detect();
-                    }
-                });
+            crate::os_theme::with_dark_context_style(ctx, || {
+                egui::Window::new("顔を検出中")
+                    .id(egui::Id::unique("mask_detect_progress"))
+                    .order(egui::Order::Foreground)
+                    .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(ctx, |ui| {
+                        #[cfg(test)]
+                        ctx.data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::unique("mask_detect_progress_dark_mode"),
+                                ui.visuals().dark_mode,
+                            );
+                        });
+                        ui.spinner();
+                        if ui.button("キャンセル").clicked() {
+                            self.cancel_mask_detect();
+                        }
+                    });
+            });
             return;
         }
         let Some(tool) = self.mask_detect_dialog else {
@@ -554,99 +563,108 @@ impl App {
         let mut open = true;
         let mut detect = false;
         let mut close = self.dialog_escape_pressed(ctx);
-        let _window = egui::Window::new("自動検出")
-            .id(egui::Id::unique("mask_detect_settings"))
-            .open(&mut open)
-            .order(egui::Order::Foreground)
-            .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
-            .default_width(340.0)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label("顔を検出してマスクを追加します");
-                ui.separator();
-                let spacing = ui.spacing().item_spacing.y;
-                let footer = ui.spacing().interact_size.y
-                    + spacing * 4.0
-                    + egui::Frame::window(ui.style()).total_margin().bottom;
-                let body_height = (ctx.content_rect().bottom() - ui.cursor().top() - footer)
-                    .min(ui.available_height() - footer)
-                    .max(1.0);
-                let _body = egui::ScrollArea::vertical()
-                    .id_salt("mask_detect_body")
-                    .max_height(body_height)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        // 検出器の行は段 2 で増やす。段 1 は同梱の顔だけ。
-                        ui.label("顔 (内蔵)");
-                        ui.horizontal(|ui| {
-                            ui.label("形");
-                            ui.selectable_value(
-                                &mut self.settings.mask_detect.ellipse,
-                                true,
-                                "楕円",
-                            );
-                            ui.selectable_value(
-                                &mut self.settings.mask_detect.ellipse,
-                                false,
-                                "矩形",
-                            );
-                        });
-                        ui.add(
-                            egui::Slider::new(
-                                &mut self.settings.mask_detect.margin_percent,
-                                0.0..=100.0,
-                            )
-                            .text("余白 (%)"),
-                        )
-                        .on_hover_text("幅・高さの指定割合を各辺の外側に足します");
-                        let _details = ui.collapsing("詳細", |ui| {
-                            ui.add(
-                                egui::Slider::new(
-                                    &mut self.settings.mask_detect.threshold,
-                                    0.0..=1.0,
-                                )
-                                .text("閾値"),
-                            );
-                        });
-                        #[cfg(test)]
-                        ctx.data_mut(|data| {
-                            data.insert_temp(
-                                egui::Id::unique("mask_detect_details"),
-                                _details.header_response.rect,
-                            );
-                            data.insert_temp(
-                                egui::Id::unique("mask_detect_details_open"),
-                                _details.body_response.is_some(),
-                            );
-                        });
-                    });
-                #[cfg(test)]
-                ctx.data_mut(|data| {
-                    let mut layout =
-                        crate::test_ui::scroll_layout::ScrollLayout::from_output(&_body);
-                    // ScrollAreaOutput.inner_rect is captured before auto_shrink in
-                    // show_viewport_dyn. The parent is advanced by end() using the
-                    // final allocation. In a vertical-only area this is its bottom.
-                    layout.inner.max.y = ui.min_rect().bottom();
-                    data.insert_temp(egui::Id::unique("mask_detect_body_layout"), layout)
-                });
-                ui.add(egui::Separator::default().spacing(spacing));
-                let enabled = self.mask_detect_can_start(tool);
-                ui.horizontal(|ui| {
-                    let start = ui.add_enabled(enabled, egui::Button::new("検出"));
-                    let dismiss = ui.button("閉じる");
-                    detect = start.clicked();
-                    close |= dismiss.clicked();
+        let _window = crate::os_theme::with_dark_context_style(ctx, || {
+            egui::Window::new("自動検出")
+                .id(egui::Id::unique("mask_detect_settings"))
+                .open(&mut open)
+                .order(egui::Order::Foreground)
+                .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
+                .default_width(340.0)
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
                     #[cfg(test)]
                     ctx.data_mut(|data| {
                         data.insert_temp(
-                            egui::Id::unique("mask_detect_actions"),
-                            vec![start.rect, dismiss.rect],
-                        )
+                            egui::Id::unique("mask_detect_settings_dark_mode"),
+                            ui.visuals().dark_mode,
+                        );
                     });
-                });
-            });
+                    ui.label("顔を検出してマスクを追加します");
+                    ui.separator();
+                    let spacing = ui.spacing().item_spacing.y;
+                    let footer = ui.spacing().interact_size.y
+                        + spacing * 4.0
+                        + egui::Frame::window(ui.style()).total_margin().bottom;
+                    let body_height = (ctx.content_rect().bottom() - ui.cursor().top() - footer)
+                        .min(ui.available_height() - footer)
+                        .max(1.0);
+                    let _body = egui::ScrollArea::vertical()
+                        .id_salt("mask_detect_body")
+                        .max_height(body_height)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            // 検出器の行は段 2 で増やす。段 1 は同梱の顔だけ。
+                            ui.label("顔 (内蔵)");
+                            ui.horizontal(|ui| {
+                                ui.label("形");
+                                ui.selectable_value(
+                                    &mut self.settings.mask_detect.ellipse,
+                                    true,
+                                    "楕円",
+                                );
+                                ui.selectable_value(
+                                    &mut self.settings.mask_detect.ellipse,
+                                    false,
+                                    "矩形",
+                                );
+                            });
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.settings.mask_detect.margin_percent,
+                                    0.0..=100.0,
+                                )
+                                .text("余白 (%)"),
+                            )
+                            .on_hover_text("幅・高さの指定割合を各辺の外側に足します");
+                            let _details = ui.collapsing("詳細", |ui| {
+                                ui.add(
+                                    egui::Slider::new(
+                                        &mut self.settings.mask_detect.threshold,
+                                        0.0..=1.0,
+                                    )
+                                    .text("閾値"),
+                                );
+                            });
+                            #[cfg(test)]
+                            ctx.data_mut(|data| {
+                                data.insert_temp(
+                                    egui::Id::unique("mask_detect_details"),
+                                    _details.header_response.rect,
+                                );
+                                data.insert_temp(
+                                    egui::Id::unique("mask_detect_details_open"),
+                                    _details.body_response.is_some(),
+                                );
+                            });
+                        });
+                    #[cfg(test)]
+                    ctx.data_mut(|data| {
+                        let mut layout =
+                            crate::test_ui::scroll_layout::ScrollLayout::from_output(&_body);
+                        // ScrollAreaOutput.inner_rect is captured before auto_shrink in
+                        // show_viewport_dyn. The parent is advanced by end() using the
+                        // final allocation. In a vertical-only area this is its bottom.
+                        layout.inner.max.y = ui.min_rect().bottom();
+                        data.insert_temp(egui::Id::unique("mask_detect_body_layout"), layout)
+                    });
+                    ui.add(egui::Separator::default().spacing(spacing));
+                    let enabled = self.mask_detect_can_start(tool);
+                    ui.horizontal(|ui| {
+                        let start = ui.add_enabled(enabled, egui::Button::new("検出"));
+                        let dismiss = ui.button("閉じる");
+                        detect = start.clicked();
+                        close |= dismiss.clicked();
+                        #[cfg(test)]
+                        ctx.data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::unique("mask_detect_actions"),
+                                vec![start.rect, dismiss.rect],
+                            )
+                        });
+                    });
+                })
+        });
         #[cfg(test)]
         if let Some(window) = _window {
             ctx.data_mut(|data| {

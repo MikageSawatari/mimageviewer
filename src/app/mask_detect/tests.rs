@@ -562,6 +562,70 @@ fn mask_detect_real_worker_holds_activity_while_waiting_and_cancel_releases_it()
 }
 
 #[test]
+fn mask_detect_dialogs_use_dark_style_and_restore_context_theme() {
+    let _input = crate::key_input::lock_test_input();
+    for theme in [
+        crate::os_theme::ResolvedTheme::Light,
+        crate::os_theme::ResolvedTheme::Dark,
+    ] {
+        for progress in [false, true] {
+            let mut app = mask_detect_fixture(MaskDetectTool::Erase);
+            let marker = if progress {
+                let request = app
+                    .capture_mask_detect_request(MaskDetectTool::Erase)
+                    .expect("ready source and target");
+                mask_detect_queue(&mut app, request, mask_detect_output());
+                "mask_detect_progress_dark_mode"
+            } else {
+                app.open_mask_detect_dialog(MaskDetectTool::Erase);
+                "mask_detect_settings_dark_mode"
+            };
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            crate::os_theme::apply_resolved_with_contrast(
+                &ctx,
+                theme,
+                crate::settings::TextContrast::Strong,
+            );
+            let light_before = ctx.style_of(egui::Theme::Light);
+            let dark_before = ctx.style_of(egui::Theme::Dark);
+            let preference_before = ctx.options(|options| options.theme_preference);
+            for _ in 0..3 {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1093.0, 614.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.show_mask_detect_dialog(ui.ctx());
+                        // Restore immediately, before the next fullscreen UI is drawn.
+                        assert_eq!(
+                            ctx.options(|options| options.theme_preference),
+                            preference_before
+                        );
+                        assert_eq!(ctx.style_of(egui::Theme::Light), light_before);
+                        assert_eq!(ctx.style_of(egui::Theme::Dark), dark_before);
+                        assert_eq!(
+                            ctx.global_style().visuals.dark_mode,
+                            theme == crate::os_theme::ResolvedTheme::Dark
+                        );
+                    },
+                )
+                .drop_without_applying_deltas();
+                assert_eq!(
+                    ctx.data(|data| data.get_temp::<bool>(egui::Id::unique(marker))),
+                    Some(true),
+                    "theme={theme:?}, progress={progress}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn mask_detect_dialog_actions_fit_small_screen_at_100_and_200_percent() {
     let _input = crate::key_input::lock_test_input();
     for scale in [1.0_f32, 2.0] {
