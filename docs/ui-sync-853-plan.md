@@ -1005,7 +1005,7 @@ P2-2 `InvokeCommand` の戻りは Shell の画面の役目が終わった証拠�
 
 ## 6. §1.853 の残り C・D・E (v5.9.0 予定、ブランチ `ui-scan-853b`)
 
-状態: 設計 r6 (2026-11-26、設計レビュー r1〜r5 の指摘と、全画面の経路の利用者決定 (§6.1) を反映。§6.9〜§6.14)。担当: 設計・検収 = ClaudeCode Opus 5.5 (uiscan-853b)、実装 = Codex GPT-6.1 Sol / high、
+状態: 設計 r7 (2026-11-26、設計レビュー r1〜r6 の指摘と、全画面の経路の利用者決定 (§6.1) を反映。§6.9〜§6.15)。担当: 設計・検収 = ClaudeCode Opus 5.5 (uiscan-853b)、実装 = Codex GPT-6.1 Sol / high、
 独立レビュー = GPT-6.1 Sol / xhigh。作業ツリー `G:\home\mimageviewer-uiscan853b`。コードの記述は master `451ad09db` の読み取り。
 本担当は実行時の挙動を観測していない。時間の数字はサブ PC 担当の perf ログ (§1.853、3004 件のネットワークフォルダで約 7.6 秒)。
 
@@ -1369,6 +1369,11 @@ r2 の 3 件のうち D5 の限定と設定変更の分割は解消と判定。�
    その表示単位を `previous` にして `FsNavigationSequenceTarget::FolderItems` の sequence を、この待ち専用の目的
    (例: `FsNavigationPurpose::CloseReturn`) で始める (`begin_fs_folder_navigation_sequence` 14088)。移動先が未準備のまま閉じても
    黒や loading を挟まない。捕捉できる表示単位が無い (まだ描けていない) ときは、既存の gap surface (`draw_fs_navigation_gap_surface`) のとおり。
+   r7 (設計レビュー r6 P2-2): **描画は Ctrl+↑↓ と変える**。Ctrl+↑↓ の `FolderItems` は `previous` を捕捉時の倍率・位置・回転で
+   描き続ける (`ui_fullscreen.rs` 14809・29733・52720・52780) が、C5 の待ちでは items は採用まで変わらず、利用者決定で拡大・回転は
+   今のページに効く。そこで `CloseReturn` の目的のときは、**今のページが描ける (準備済み) なら通常の描画で描き** (拡大・回転・位置の
+   変更が見える)、描けないときだけ捕捉した表示単位を代わりに描く。対象を変える入力の止め (lock・`blocks_new_target`) は sequence の
+   まま効かせる。描画の選び方は目的で分け、Ctrl+↑↓ の描画は変えない。
    ページ送り・ジャンプ・スクロールは、既存の `fs_nav_is_locked()`・`fs_navigation_sequence_blocks_new_target()` の判定
    (全画面・専用 viewport・page overview・in-page scroll・動画の側にある) でそのまま止まる。新しい入力の止めは作らない。
    閉じる操作は Ctrl+↑↓ の待ちと同じく止めない。
@@ -1376,7 +1381,9 @@ r2 の 3 件のうち D5 の限定と設定変更の分割は解消と判定。�
    (`native_video.rs` 13215)、lock の判定を通らずに選択を変えて fast swap を始める (15875)。前後移動は `fs_nav_is_locked()` を
    見ているので、**native の対象を変える入口 (Home/End・HUD からの対象指定) を、既存の sequence/lock を評価する共通の受付へ
    まとめ**、選択と swap を変える前に断る。これは今の Ctrl+↑↓ の待ちの間にも同じ迂回がある (既存の不具合) ので、一緒に直る。
-   実装担当は native の対象を変える入口を列挙する。
+   実装担当は native の対象を変える入口を列挙する。r7 (設計レビュー r6 P3): この共通受付は**新しい入力の受付**だけに置く。
+   同じ helper は受付済みの非同期の結果や EOF の続き (`app.rs` 101922・102079) からも呼ばれるが、それらは受付済みの続きなので
+   審査し直さない (受付の型で区別する)。待ちの無いときの Home/End・HUD の操作と、swap 中の後続入力の既存の保持は変えない。
 3. 完了の poll: 全画面のフレームは通常の navigation の末尾 (`post_render_main_navigation`) に届かない (embedded の
    early-return 103809〜103870、native の背景 `update_phases.rs` 31〜46)。既存の `poll_main_embedded_required_fullscreen_folder_open`
    (`app.rs` 62636) が `RequiredFullscreenTarget` だけを回収している場所で、上の印の `DirectNavigation` も回収し、§6.3 の 3 の
@@ -1397,6 +1404,12 @@ r2 の 3 件のうち D5 の限定と設定変更の分割は解消と判定。�
    の共通の入口) で、その context の C5 の要求も退役させる** (`RequiredFullscreenTarget` と同じ扱い)。採用のときは pending を
    取り出した後に install が全画面を閉じるので、この退役は空振りになる (自分の採用を消さない)。二度目の「閉じる」は、この退役の
    後に新しい要求として受け付けられる (5)。
+   r7 (設計レビュー r6 P2-1): 退役を置くのは**新しい close の受付**の境界 (true-close の後始末、Backspace のページ一覧への close の
+   受付、focus guard の close の受付) だけにする。**受付済みの close の teardown では繰り返さない**: native の presentation 切替中の
+   content の close は `TerminalClose` を積んで戻り (`app.rs` 84684)、後の effect が content の close へ再入する
+   (`native_video.rs` 3166)。その間に agent・起動の転送の受付 (`update_phases.rs` 542、`app.rs` 103125) が新しい C5 の要求を
+   受け付けていると、遅れた close がそれを退役させてしまう。既存コードも、この effect は「予約の退役は済んでいる」としている
+   (`app.rs` 84715)。共通の content-close の入口に退役を置かない。
 5. もう一度「閉じる」: `handle_fullscreen_close_request` は今どおり true-close の後始末 (sequence の終了、4a の退役) から始まり、
    `pending_return_to_parent` の受付 → 合流点の読込が新しい要求になる。予約・選択のヒントは前の要求と
    一緒に消え、新しい要求が受付時のものを持つ (閉じる要求ごとに子の名前を置き直す今の `take_close_return_navigation` のまま)。
@@ -1409,7 +1422,10 @@ r2 の 3 件のうち D5 の限定と設定変更の分割は解消と判定。�
 完了で今と同じ親の一覧・選択になり、その間のフレームで一覧が L2 にならない。(b) 待ちの間の →・PageDown・ジャンプが何も
 起こさず、採用後の一覧にも届かない。(c) 走査失敗・Remote 等による退役で全画面のまま、sequence が終わってページ送りが戻る。
 (d) もう一度「閉じる」で前の待ちが退役し、新しい待ちの完了で同じ親の一覧になる。(d2) 待ちの間の Backspace・focus guard の close の
-後に遅い結果が来ても採用されない。(d3) 採用のフレームで `CloseReturn` の sequence が `ViewerExited` で終わり、固定した情報パネルが
+後に遅い結果が来ても採用されない。(d4) native の presentation 切替中の遅れた `TerminalClose` の effect より前に受け付けた新しい
+C5 の要求が、その effect で退役しない。(d5) 待ちの間の拡大・回転・位置の変更が描画に出る (今のページが準備済みのとき)。今のページが
+未準備で閉じたときは捕捉した表示単位が出て、準備ができたら通常の描画に替わる。(d6) 待ちの無いときの native の Home/End・HUD の対象
+指定と、swap 中の後続入力の保持が今と同じ。(d3) 採用のフレームで `CloseReturn` の sequence が `ViewerExited` で終わり、固定した情報パネルが
 次の全画面へ持ち越されない (通常の close と同じ)。(e) 動画の全画面から戻る経路 (native の背景) の完了と、待ちの間の動画側の
 前後移動・Home/End・HUD の対象指定の止め (handler-level)。Ctrl+↑↓ の待ちの間の native Home/End も止まる。(f) detached を投影している間は main の待ちの影響を受けない。(g) 全画面の Ctrl+↑↓ の
 既存テストが変わらない。
@@ -1438,3 +1454,13 @@ r4 の D3・sidecar の共用・D2 の選択のヒントは解消と判定 (待�
 | P2-2 install の content の close は `ViewerExited` を出さず、`FolderItems` は閉じて開き直すと読まれる (情報パネルの reset 等が飛ぶ) | 採用の確定時に `CloseReturn` の sequence を `ViewerExited` で終えてから teardown (§6.12 の 4) |
 | P2-3 待ちの間の Backspace・focus guard の close で走査が残り、L2 の後に親へ移る | 全画面を閉じる既存の境界で C5 の要求も退役させる (§6.12 の 4a) |
 | P2-4 native の Home/End が lock を迂回する | native の対象を変える入口を、sequence/lock を評価する共通の受付へまとめる (§6.12 の 2。Ctrl+↑↓ の待ちの既存の迂回も直る) |
+
+### 6.15 設計レビュー r6 (同じ担当の継続、05effb7b2、2026-11-26): REJECT
+
+r5 の 4 件への方針は反映済みと判定。新たに P2×2・P3×1。設計担当がコードで照合し、r7 で直した。
+
+| 指摘 | 対応 (r7) |
+| --- | --- |
+| P2-1 4a の退役を共通の content-close に置くと、遅れた `TerminalClose` の再入が新しく受け付けた C5 の要求を退役させる | 退役は新しい close の受付の境界だけに置き、受付済みの teardown では繰り返さない (§6.12 の 4a) |
+| P2-2 `FolderItems` は `previous` を捕捉時の変換で描き続け、待ちの間の拡大・回転が見えない | `CloseReturn` では今のページを通常の描画で描き、描けないときだけ捕捉を代わりに描く (§6.12 の 2) |
+| P3 native の共通受付が受付済みの続き (非同期の結果・EOF) まで審査し直すおそれ | 新しい入力の受付だけに置き、待ちの無いときの挙動の維持テストを追加 (§6.12 の 2、テスト d6) |
