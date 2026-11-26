@@ -18,10 +18,10 @@
 //! ## 実行
 //!
 //! ```
-//! cargo test --test search_name_e2e -- --nocapture
+//! cargo test -p mimageviewer --test integration search_name_e2e:: -- --nocapture
 //! ```
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 use std::sync::Arc;

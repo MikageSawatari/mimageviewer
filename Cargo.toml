@@ -68,6 +68,8 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 autobins = false
+# §1.908: 統合テストを明示した1 crateにまとめ、リンクを1回にする。
+autotests = false
 
 [features]
 manual-e2e = []
@@ -87,6 +89,10 @@ pack-build-tools = []
 # 触らない)。配布は launcher を使わず core を `mimageviewer.exe` にリネームして同梱
 # DLL/モデルと一緒に zip 配布する。詳細: docs/portable-build-plan.md
 portable = []
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 # 本体 exe のバイナリ名は `mimageviewer-core` (= 内部実体)。
 # 配布する `mimageviewer.exe` は別途 `crates/launcher/` のランチャーが生成する。

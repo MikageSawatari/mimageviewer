@@ -26,6 +26,7 @@
 | [native-dependencies.md](native-dependencies.md) | CLAUDE.md から分けたネイティブ依存物の管理。vendor/ の復旧、PDFium・ONNX Runtime・Susie・FFmpeg・LibRaw・VST3 bridge の更新やビルド |
 | [release-checklist.md](release-checklist.md) | **リリース手順チェックリストの正本**と配布形態。リリース作業を始めるときに最初に全部読む |
 | [codex-cli-usage.md](codex-cli-usage.md) | Codex CLI でレビュー・実装を依頼するときの手順 (resume・stdin・出力の受け取り) |
+| [test-build-memory-plan.md](test-build-memory-plan.md) | 全体テストのビルドのメモリ対策 (§1.908 統合テストを `tests/integration.rs` の 1 crate に、§1.910 test-full の同時数上限 8、§1.909 は採らない)。計測の方法と結果、`--test <name>` から `--test integration <name>::` への読み替え |
 | [development-build-and-test-native.md](development-build-and-test-native.md) | Windows ネイティブ挙動の実機確認用バイナリと、検証起動時の設定データ保護 |
 | [git-workflow.md](git-workflow.md) | 整形・コミット・共有作業ツリー・worktree 撤去の運用 |
 | [v5-integration.md](v5-integration.md) | v5 系の統合順、merge 衝突の解消、統合後の検証と引き渡しの記録。master は v4 系に維持 |

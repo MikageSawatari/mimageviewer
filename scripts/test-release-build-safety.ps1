@@ -56,6 +56,30 @@ $buildReleaseAst = Get-ScriptAst $buildReleasePath
 $buildPortableAst = Get-ScriptAst $buildPortablePath
 $testFullAst = Get-ScriptAst $testFullPath
 
+# Import only the pure jobs selector, never the full test gate or its imports.
+$jobsDefinitions = @($testFullAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq 'Get-MivTestBuildJobs'
+}, $true))
+Assert-True ($jobsDefinitions.Count -eq 1) 'full-test jobs selector is missing or ambiguous'
+. ([scriptblock]::Create($jobsDefinitions[0].Extent.Text))
+$buildJobsCases = @(
+    @{ Value = $null; Expected = 8 },
+    @{ Value = '4'; Expected = 4 },
+    @{ Value = '8'; Expected = 8 },
+    @{ Value = '24'; Expected = 8 },
+    @{ Value = '0'; Expected = 8 },
+    @{ Value = '-1'; Expected = 8 },
+    @{ Value = 'abc'; Expected = 8 },
+    @{ Value = ''; Expected = 8 },
+    @{ Value = '999999999999999999999'; Expected = 8 }
+)
+foreach ($case in $buildJobsCases) {
+    $actual = Get-MivTestBuildJobs $case.Value
+    Assert-True ($actual -eq $case.Expected) "wrong build jobs for '$($case.Value)': $actual"
+}
+
 $buildDist = Get-Content -LiteralPath $buildDistPath -Raw -Encoding UTF8
 $buildRelease = Get-Content -LiteralPath $buildReleasePath -Raw -Encoding UTF8
 $buildPortable = Get-Content -LiteralPath $buildPortablePath -Raw -Encoding UTF8
@@ -342,7 +366,7 @@ public static class MivFakeCargo
         string log = Environment.GetEnvironmentVariable("MIV_FAKE_CARGO_LOG");
         int call = File.Exists(log) ? File.ReadAllLines(log).Length + 1 : 1;
         uint mode = GetErrorMode();
-        File.AppendAllText(log, String.Format("call={0};mode=0x{1:X8};args={2}{3}", call, mode, String.Join(" ", args), Environment.NewLine));
+        File.AppendAllText(log, String.Format("call={0};mode=0x{1:X8};jobs={2};args={3}{4}", call, mode, Environment.GetEnvironmentVariable("CARGO_BUILD_JOBS"), String.Join(" ", args), Environment.NewLine));
         int failCall;
         int failCode;
         Int32.TryParse(Environment.GetEnvironmentVariable("MIV_FAKE_CARGO_FAIL_CALL"), out failCall);
@@ -370,6 +394,7 @@ param(
     [string] $CargoLog,
     [int] $FailCall,
     [int] $FailCode,
+    [AllowEmptyString()] [string] $BuildJobs = '',
     [switch] $SuppressCrashDialogs
 )
 
@@ -393,12 +418,20 @@ $env:MIV_FAKE_CARGO_METADATA = @{
 } | ConvertTo-Json -Compress
 $env:MIV_FAKE_CARGO_FAIL_CALL = $FailCall.ToString()
 $env:MIV_FAKE_CARGO_FAIL_CODE = $FailCode.ToString()
+[Environment]::SetEnvironmentVariable('CARGO_BUILD_JOBS', $BuildJobs, 'Process')
+$buildJobsBefore = [Environment]::GetEnvironmentVariable('CARGO_BUILD_JOBS', 'Process')
 if ($SuppressCrashDialogs) {
     & $TestFull -SuppressCrashDialogs
 } else {
     & $TestFull
 }
-exit $LASTEXITCODE
+$gateExit = $LASTEXITCODE
+$buildJobsAfter = [Environment]::GetEnvironmentVariable('CARGO_BUILD_JOBS', 'Process')
+if ($buildJobsAfter -cne $buildJobsBefore) {
+    throw "[stub-runner] CARGO_BUILD_JOBS was not restored: '$buildJobsBefore' -> '$buildJobsAfter'"
+}
+Write-Host '[stub-runner] CARGO_BUILD_JOBS restored after direct invocation'
+exit $gateExit
 '@
     [System.IO.File]::WriteAllText($stubRunner, $stubRunnerSource, (New-Object System.Text.UTF8Encoding($false)))
 
@@ -408,6 +441,7 @@ exit $LASTEXITCODE
     Assert-True ($baselineExit -eq 0) "test-full default success stub returned $baselineExit; output: $($baselineOutput -join ' | ')"
     $baselineCalls = @(Get-Content -LiteralPath $baselineLog -Encoding UTF8)
     Assert-True ($baselineCalls.Count -eq 9) "test-full default path invoked cargo $($baselineCalls.Count) times"
+    Assert-True (($baselineOutput -join "`n").Contains('[stub-runner] CARGO_BUILD_JOBS restored after direct invocation')) 'unset build jobs did not survive direct invocation'
     Assert-True (-not (($baselineOutput -join "`n").Contains('crash-dialog suppression active'))) 'test-full default path enabled crash-dialog suppression'
 
     $successLog = Join-Path $testRootFull 'success.log'
@@ -418,6 +452,33 @@ exit $LASTEXITCODE
     Assert-True ($successCalls.Count -eq 9) "test-full success path invoked cargo $($successCalls.Count) times"
     Assert-True ((@($successCalls | Where-Object { $_ -notmatch 'mode=0x[0-9A-Fa-f]{7}[37BFbf];' })).Count -eq 0) 'a success-path cargo child did not inherit both error-mode bits'
     Assert-True (($successOutput -join "`n").Contains('[test-full] process error mode restored:')) 'test-full success path did not report error-mode restoration'
+
+    # Real gate, fake Cargo only: every stage inherits the bounded value, and
+    # direct & invocation restores the caller's original value after exit.
+    for ($caseIndex = 0; $caseIndex -lt $buildJobsCases.Count; $caseIndex++) {
+        $case = $buildJobsCases[$caseIndex]
+        $jobsLog = Join-Path $testRootFull "jobs-$caseIndex.log"
+        $jobsArguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $stubRunner,
+            '-TestFull', $testFullPath, '-FakeCargo', $fakeCargo, '-CargoLog', $jobsLog,
+            '-FailCall', '0', '-FailCode', '0')
+        # powershell.exe -File cannot reliably pass an empty string; the
+        # runner's empty default models unset/empty environment on Windows 5.1.
+        if (-not [string]::IsNullOrEmpty($case.Value)) { $jobsArguments += @('-BuildJobs', $case.Value) }
+        $jobsOutput = @(& powershell @jobsArguments 2>&1)
+        $jobsExit = $LASTEXITCODE
+        $jobsText = $jobsOutput -join "`n"
+        Assert-True ($jobsExit -eq 0) "build jobs '$($case.Value)' failed: $jobsText"
+        $jobsCalls = @(Get-Content -LiteralPath $jobsLog -Encoding UTF8)
+        Assert-True ($jobsCalls.Count -eq 9) "build jobs '$($case.Value)' omitted a gate stage"
+        foreach ($call in $jobsCalls) {
+            Assert-True ($call.Contains(";jobs=$($case.Expected);")) "wrong child build jobs: $call"
+        }
+        Assert-True ($jobsText.Contains("[test-full] build concurrency: CARGO_BUILD_JOBS=$($case.Expected)")) 'effective jobs were not printed'
+        Assert-True ($jobsText.Contains('[stub-runner] CARGO_BUILD_JOBS restored after direct invocation')) 'success path did not restore build jobs'
+        if ($case.Value -in @('0', '-1', 'abc', '999999999999999999999')) {
+            Assert-True ($jobsText.Contains('is not a positive integer; using')) 'invalid jobs were silently replaced'
+        }
+    }
 
     $expectedStages = @(
         'nextest --version',
@@ -440,13 +501,17 @@ exit $LASTEXITCODE
     # Every stage, including missing nextest and doctests, must stop the gate.
     foreach ($failCall in 1..9) {
         $failureLog = Join-Path $testRootFull "failure-$failCall.log"
-        $failureOutput = @(& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $stubRunner -TestFull $testFullPath -FakeCargo $fakeCargo -CargoLog $failureLog -FailCall $failCall -FailCode 37 -SuppressCrashDialogs 2>&1)
+        $failureOutput = @(& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $stubRunner -TestFull $testFullPath -FakeCargo $fakeCargo -CargoLog $failureLog -FailCall $failCall -FailCode 37 -BuildJobs '24' -SuppressCrashDialogs 2>&1)
         $failureExit = $LASTEXITCODE
         Assert-True ($failureExit -eq 37) "stage $failCall did not preserve failing cargo exit 37 (actual $failureExit); output: $($failureOutput -join ' | ')"
         $failureCalls = @(Get-Content -LiteralPath $failureLog -Encoding UTF8)
         Assert-True ($failureCalls.Count -eq $failCall) "test-full retried or continued after stage $failCall failure (cargo calls: $($failureCalls.Count))"
         Assert-True ((@($failureCalls | Where-Object { $_ -notmatch 'mode=0x[0-9A-Fa-f]{7}[37BFbf];' })).Count -eq 0) 'a failure-path cargo child did not inherit both error-mode bits'
         Assert-True (($failureOutput -join "`n").Contains('[test-full] process error mode restored:')) 'test-full failure path did not report error-mode restoration'
+        Assert-True (($failureOutput -join "`n").Contains('[stub-runner] CARGO_BUILD_JOBS restored after direct invocation')) 'failure path did not restore build jobs'
+        foreach ($call in $failureCalls) {
+            Assert-True ($call.Contains(';jobs=8;')) "failure path child escaped build jobs cap: $call"
+        }
         if ($failCall -eq 1) {
             Assert-True (($failureOutput -join "`n").Contains('cargo install cargo-nextest --locked')) 'missing nextest did not print installation instructions'
         }

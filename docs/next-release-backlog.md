@@ -3217,7 +3217,7 @@ v3.6.0 の `TABLE` はダイアログを短く保つため新機能 3 件に絞�
   - `unrar`
   - `turbojpeg`
 - 更新後に確認するもの:
-  - `cargo test`
+  - `scripts/test-full.ps1` (全体は nextest、doctest は別段)
   - 検索 bench 回帰
   - perf smoke
   - `scripts/check-vcrt-pe-dependencies.ps1` (全配布 PE の import と app-local VC runtime の gate。`build-dist.ps1` が必須実行する)

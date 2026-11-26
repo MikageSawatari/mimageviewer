@@ -146,6 +146,10 @@ Write-Fixture 'Cargo.toml' @'
 name = "mimageviewer"
 version = "0.0.0"
 edition = "2021"
+autotests = false
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 [workspace]
 members = ["helper"]
 [features]
@@ -162,6 +166,7 @@ $foo = @'
 #[test] fn beta() { assert_eq!(3 + 3, 6); }
 '@
 Write-Fixture 'src/foo.rs' $foo
+Write-Fixture 'tests/integration.rs' 'mod sample;'
 Write-Fixture 'tests/sample.rs' '#[test] fn integration() { assert_eq!(4 + 4, 8); }'
 Write-Fixture 'helper/Cargo.toml' "[package]`nname = `"miv-test-helper`"`nversion = `"0.0.0`"`nedition = `"2021`"`n"
 Write-Fixture 'helper/src/lib.rs' '#[test] fn helper() { assert_eq!(5 + 5, 10); }'
@@ -457,7 +462,13 @@ Write-Fixture 'src/foo.rs' $foo
 $focused = Run-Script 'test-focused.ps1' @('-Path', 'src/foo.rs')
 Assert-That ($focused.ExitCode -eq 0 -and $focused.StdOut.Contains('PASS: 2 tests')) "module filter failed: $($focused.StdOut)"
 $integration = Run-Script 'test-focused.ps1' @('-Path', 'tests/sample.rs')
-Assert-That ($integration.ExitCode -eq 0 -and $integration.StdOut.Contains('--test sample') -and $integration.StdOut.Contains('PASS: 1 tests')) 'integration target selection failed'
+Assert-That ($integration.ExitCode -eq 0 -and $integration.StdOut.Contains('--test integration') -and $integration.StdOut.Contains('test(/^sample::/)') -and $integration.StdOut.Contains('PASS: 1 tests')) 'integration module selection failed'
+$integrationPlan = Get-MivFocusedPlan $fixture @('tests/sample.rs')
+Assert-That ($integrationPlan.BroadPaths.Count -eq 0 -and $integrationPlan.Entries.Count -eq 1 -and ($integrationPlan.Entries[0].Selection -join ' ') -eq '-p mimageviewer --test integration' -and $integrationPlan.Entries[0].Filter -eq 'test(/^sample::/)') 'integration module plan mismatch'
+foreach ($sharedIntegrationPath in @('tests/integration.rs', 'tests/common/mod.rs', 'tests/support/ui_harness.rs', 'tests/snapshots/example.png')) {
+    $sharedIntegrationPlan = Get-MivFocusedPlan $fixture @($sharedIntegrationPath)
+    Assert-That ($sharedIntegrationPlan.Entries.Count -eq 0 -and $sharedIntegrationPlan.BroadPaths -contains $sharedIntegrationPath) "shared integration path was not broad: $sharedIntegrationPath"
+}
 $crate = Run-Script 'test-focused.ps1' @('-Path', 'helper/src/lib.rs')
 Assert-That ($crate.ExitCode -eq 0 -and $crate.StdOut.Contains('-p miv-test-helper') -and $crate.StdOut.Contains('PASS: 1 tests')) "workspace crate selection failed: $($crate.StdOut)"
 $manualPlan = Get-MivFocusedPlan $fixture @('htdocs/mimageviewer/manual/index.html', 'htdocs/mimageviewer/manual/sound/index.html')
@@ -518,7 +529,7 @@ Assert-That ($docs.ExitCode -eq 2 -and $docs.StdOut.Contains('docs/example.md'))
 # Use a PS entry script for array arguments (powershell.exe -File does not bind
 # a multi-element string[] reliably). Mix one selectable and one unsupported path.
 $focusedRunsBefore = @(Get-ChildItem (Join-Path $fixture 'target/test-focused/runs') -Directory).Count
-foreach ($unsupported in @('testdata/input.wav', 'scripts/tool.ps1', 'crates/unsupported-patch/src/lib.rs', 'vendor/egui/src/lib.rs', '.config/nextest.toml', 'build.rs', 'Cargo.toml', 'Cargo.lock', 'helper/build.rs', 'helper/Cargo.toml', 'helper/fixture.bin', 'docs/example.md')) {
+foreach ($unsupported in @('testdata/input.wav', 'scripts/tool.ps1', 'crates/unsupported-patch/src/lib.rs', 'vendor/egui/src/lib.rs', '.config/nextest.toml', 'build.rs', 'Cargo.toml', 'Cargo.lock', 'helper/build.rs', 'helper/Cargo.toml', 'helper/fixture.bin', 'docs/example.md', 'tests/integration.rs', 'tests/common/mod.rs')) {
     $mixedPlan = Get-MivFocusedPlan $fixture @('src/foo.rs', $unsupported)
     Assert-That ($mixedPlan.Entries.Count -eq 1 -and $mixedPlan.BroadPaths -contains $unsupported) "mixed plan omitted unsupported path: $unsupported"
     $entryScript = Join-Path $fixture 'target/mixed-focused.ps1'
