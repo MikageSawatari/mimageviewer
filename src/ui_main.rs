@@ -25,6 +25,10 @@ use crate::settings::{
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
 
+#[cfg(test)]
+#[path = "ui_main_folder_order_drag_tests.rs"]
+mod folder_order_drag_tests;
+
 const PHYSICAL_PARENT_BUTTON_WIDTH: f32 = 28.0;
 const PHYSICAL_PARENT_ACTION_LABEL: &str = "実際の親フォルダへ移動";
 
@@ -19974,18 +19978,22 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         // primary (左) ボタンのドラッグだけを起点にする。native drag 直後の
         // 1 フレームは抑止 (幽霊ドラッグ防止の保険、§6.1)。
         if native_drag_started {
-            match decide_drag_payload(&self.items, &self.checked, idx) {
-                DragDecision::Start {
-                    paths,
-                    post_drag_toast,
-                } => {
-                    self.pending_native_drag = Some(crate::app::PendingNativeDrag {
+            if self.folder_manual_order_drag_enabled() {
+                self.begin_folder_order_drag(ctx, idx);
+            } else {
+                match decide_drag_payload(&self.items, &self.checked, idx) {
+                    DragDecision::Start {
                         paths,
                         post_drag_toast,
-                    });
+                    } => {
+                        self.pending_native_drag = Some(crate::app::PendingNativeDrag {
+                            paths,
+                            post_drag_toast,
+                        });
+                    }
+                    DragDecision::ImmediateToast(msg) => self.show_feedback_warning(msg),
+                    DragDecision::None => {}
                 }
-                DragDecision::ImmediateToast(msg) => self.show_feedback_warning(msg),
-                DragDecision::None => {}
             }
         }
         nav
@@ -22490,6 +22498,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     /// サムネイルグリッドを描画し、フォルダナビゲーション先を返す。
     pub(crate) fn render_grid(&mut self, root_ui: &mut egui::Ui) -> Option<AddressBarNav> {
         let ctx = &root_ui.ctx().clone();
+        let folder_drag_end = self.take_folder_order_drag_end(ctx);
         self.begin_grid_click_input_frame(ctx);
         let scroll_to = self.grid_scroll.take_reveal();
         if self.settings.grid_view_mode != GridViewMode::Details
@@ -23064,6 +23073,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     input.pointer.latest_pos(), input.pointer.primary_down(),
                     input.pointer.delta(), input.pointer.velocity())));
                 let mut drop_clip = egui::Rect::NOTHING;
+                let mut folder_drag_origin = egui::Pos2::ZERO;
                 let mut drop_folders = Vec::new();
                 let capture_drop_folders = self.is_physical_folder_listing() && self.grid_item_input_allowed();
                 let scroll_output = egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
@@ -23083,6 +23093,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             egui::vec2(avail_w, total_h),
                             egui::Sense::hover(),
                         );
+                        folder_drag_origin = content_rect.min;
                         #[cfg(test)]
                         ctx.data_mut(|data| data.insert_temp(
                             egui::Id::unique(("grid_scroll_render_origin", grid_context)),
@@ -23567,6 +23578,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     primary_click_hit_cell, primary_press_hit_cell, suppress_primary_pointer,
                     previous_grid_click_pairing, &touch_frame,
                 ));
+                self.finish_folder_order_drag_frame(
+                    ui, scroll_output.inner_rect, folder_drag_origin, geometry, cell_w, folder_drag_end,
+                );
                 self.finish_grid_pointer_trace(ctx);
                 self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
 

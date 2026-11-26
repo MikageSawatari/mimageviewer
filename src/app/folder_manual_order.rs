@@ -774,6 +774,119 @@ mod tests {
     }
 
     #[test]
+    fn folder_manual_order_first_filtered_reorder_preserves_hidden_slots_and_selection() {
+        let (mut app, folder) = fixture();
+        for name in ["c.jpg", "d.jpg"] {
+            std::fs::write(folder.join(name), b"fixture").unwrap();
+        }
+        app.load_folder(folder.clone());
+        app.finish_page_identity_preparation_for_test();
+        app.enter_folder_manual_order();
+        finish_refresh(&mut app);
+        let [a, b, c, d] =
+            ["a.jpg", "b.jpg", "c.jpg", "d.jpg"].map(|name| folder_key(&folder.join(name)));
+        assert_eq!(keys(&app), vec![a.clone(), b.clone(), c.clone(), d.clone()]);
+        assert!(read_record(&app, &folder).is_none());
+        // The filter hides b's row, while hidden.txt never entered the listing.
+        app.visible_indices = vec![0, 2, 3];
+        app.move_grid_cursor(Some(2), GridCursorIntent::Automatic);
+        app.checked = [0, 1, 3].into_iter().collect();
+        let generation = app.items_generation;
+        app.commit_folder_manual_reorder(&[d.clone(), a.clone(), c.clone()]);
+        let expected = vec![d.clone(), b.clone(), a.clone(), c.clone()];
+        let saved = read_record(&app, &folder).unwrap();
+        assert_eq!(saved.items, expected);
+        assert!(saved.active);
+        assert_eq!(app.folder_order.mode, FolderOrderMode::ManualRecorded);
+        assert!(
+            app.folder_order
+                .inventory
+                .contains(&folder_key(&folder.join("hidden.txt")))
+        );
+        // Saving does not permute the live rows and their indexed state in place.
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(keys(&app), vec![a.clone(), b.clone(), c.clone(), d.clone()]);
+        finish_refresh(&mut app);
+        assert!(app.items_generation > generation);
+        assert_eq!(keys(&app), expected);
+        assert_eq!(app.selected, Some(3));
+        assert_eq!(
+            physical_item_key(&app.items[app.selected.unwrap()]),
+            Some(c)
+        );
+        let checked = app
+            .checked
+            .iter()
+            .map(|&index| physical_item_key(&app.items[index]).unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(checked, [a, b, d].into_iter().collect());
+    }
+
+    #[test]
+    fn folder_manual_order_noop_submits_no_write_or_refresh_before_or_after_recording() {
+        let (mut app, folder) = fixture();
+        app.enter_folder_manual_order();
+        finish_refresh(&mut app);
+        for recorded in [false, true] {
+            let order = keys(&app);
+            let before = read_record(&app, &folder);
+            assert_eq!(before.is_some(), recorded);
+            // Read is a FIFO barrier: all previous write completions are available.
+            app.folder_order_service
+                .as_ref()
+                .unwrap()
+                .completions
+                .try_iter()
+                .for_each(drop);
+            let state = app.folder_order.clone();
+            let generation = app.items_generation;
+            app.commit_folder_manual_reorder(&order);
+            assert_eq!(app.folder_order, state);
+            assert_eq!(app.items_generation, generation);
+            assert!(app.folder_pane_open_pending.is_none());
+            assert_eq!(read_record(&app, &folder), before);
+            assert!(
+                app.folder_order_service
+                    .as_ref()
+                    .unwrap()
+                    .completions
+                    .try_iter()
+                    .next()
+                    .is_none(),
+                "a no-op must not submit even an equivalent actor write"
+            );
+            if !recorded {
+                let reversed = order.into_iter().rev().collect::<Vec<_>>();
+                app.commit_folder_manual_reorder(&reversed);
+                finish_refresh(&mut app);
+            }
+        }
+    }
+
+    #[test]
+    fn folder_manual_order_refresh_restores_selection_as_of_adoption() {
+        let (mut app, folder) = fixture();
+        app.enter_folder_manual_order();
+        finish_refresh(&mut app);
+        let a = folder_key(&folder.join("a.jpg"));
+        let b = folder_key(&folder.join("b.jpg"));
+        app.move_grid_cursor(Some(0), GridCursorIntent::Automatic);
+        app.checked = [0].into_iter().collect();
+        app.commit_folder_manual_reorder(&[b.clone(), a.clone()]);
+        // Ordinary selection remains usable while the replacement scan is pending.
+        app.move_grid_cursor(Some(1), GridCursorIntent::Automatic);
+        app.checked = [1].into_iter().collect();
+        finish_refresh(&mut app);
+        assert_eq!(keys(&app), vec![b.clone(), a]);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(
+            physical_item_key(&app.items[app.selected.unwrap()]),
+            Some(b)
+        );
+        assert_eq!(app.checked, [0].into_iter().collect());
+    }
+
+    #[test]
     fn folder_manual_order_sync_entry_preserves_source_and_adopts_read_once() {
         let (mut app, source) = fixture();
         let destination = app.tmp.path().join("destination");

@@ -625,3 +625,44 @@ Smart root の履歴採用後、定義の範囲外にある新しい通常物理
   worker の materialize 結果は従来の値型を保ち、採用時に App が持つ Box の内容へ書き込む。
 - 既存の cold-owner 検査へ 3 field のポインタサイズ検査を追加し、history-transition のサイズ検査へ
   storage / payload の診断出力を追加した。コンパイル・テスト・コミットは利用者指定により実施しない。
+
+### 実装記録 (段 4)
+
+- 段 3 は `51cce6c5a` までの本体 lib 全 20934 件が成功したとの設計担当の報告を引き継いだ。
+  以下は段 4 の実装事実で、コンパイル・実行・検収の結果ではない。
+- `dispatch_grid_cell_input` の既存の開始条件は維持し、その成立後だけ分岐する。
+  `folder_manual_order_drag_enabled` のときは並べ替えを始め、それ以外は従来の native payload を作る。
+  詳細表示・通常順・スタック・対象外でのコピー／移動、右ドラッグ・touch の抑止を変更しない。
+- `app/folder_order_drag.rs` の一時状態は egui Context の temporary data に置く。固定部分は Arc で共有し、
+  毎フレーム一覧のキーを clone しない。App や ViewerContextBundle に inline field を増やさない。
+  開始時の子の identity・見えている選択集合・context・viewport・scroll session・folder・items generation・
+  order_revision・表示 geometry・フィルタの方針と可視集合を照合し、変化したら保存せず捨てる。
+  fork／swap で途中の操作を別 context へ引き継がない。
+- grabbed が checked にあれば見えている checked 全体を、無ければ grabbed だけを移す。
+  固定した順で連続挿入し、開始後の checked の変更で移動対象を入れ替えない。
+  左半分で前、右半分で後、挿入線は窓と同じ選択色の縦棒と両端の短線。
+  viewport 外・空のセル・位置情報のない release は保存しない。
+- 本／コレクションの窓と同じく、cell Response を処理する前に古い操作の terminal を取り出す。
+  同じ input batch の release と新しい press が互いの移動集合を奪わない。
+  旧操作が保存した場合は revision と既存の refresh 中の入力停止が次の操作を退役させる。
+- 自動スクロールは canonical `GridScrollState` の `set_position` から既存の external scroll へ渡す。
+  小さい pixel 移動量はドラッグの端数へ貯め、row_h の整数倍だけ offset を変える。
+  同じ frame の再 pass では二重に貯めず、端にいてまだ進める間だけ次の描画を要求する。
+  touch の描画端数と scroll transport／readback の所有は変更しない。
+- 成功時は既存の `commit_folder_manual_reorder` を呼ぶ。items はその場で置換せず、
+  メモリの記録・revision・actor Save・sort-change refresh の経路で作り直す。
+  同位置の drop は未記録のままで、既に記録している場合も保存／refresh を発行しない。
+  非表示項目と inventory-only の記録済み項目は §3 の合成で保持する。
+- refresh の採用前に selected／checked を identity で取り、採用後に復元する処理は段 2 で実装済みだった。
+  その本体処理を増やさず、初回の filtered reorder と待機中の選択変更を覆う回帰を追加した。
+  サムネイル一覧の「今の項目」は selected のカーソルであり、fullscreen の close／別窓保持の契約は変更しない。
+- **共通化は今回は行わない**。本は page key／編集 metadata、コレクションは entry ID／表示投影を所有し、
+  どちらも窓内の配列を更新する。一覧は物理キーの固定列を保存して非同期 refresh する。
+  挿入線の gap も本は列端を考慮し、コレクションは固定幅、一覧は連続セルで異なる。
+  窓の pixel scroll と一覧の row snap も別の契約のため、3 者の状態まで汎用化する変更は持ち込まない。
+  既存の窓を変更するリファクタは無く、「別コミットに分けるべき範囲」は無い。
+- 既存の窓で共有するカーソル変更の設定は見つからなかったため、カーソル形状を変えない。
+  Esc の操作・設定項目・既定キーは増やさない。設計からの逸脱は無い。
+- 回帰は 25 件追加（Windows の context 検査 1 件を含む）。既存 snapshot の非ドラッグ時の描画は変更せず、
+  PNG を生成・更新していない。コンパイル・テスト・検証用ビルド・コミットは利用者指定により実施しない。
+  `cargo fmt`（引数なし）、`python scripts/check_ui_glyphs.py`、`git diff --check` は正常終了した。

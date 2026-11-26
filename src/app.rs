@@ -661,6 +661,7 @@ use book_preferred_rating::{ContainerRatingTarget, ContainerRatingToast};
 #[cfg(test)]
 mod book_preferred_rating_tests;
 mod folder_manual_order;
+mod folder_order_drag;
 pub(crate) use folder_manual_order::FolderSortChoice;
 mod folder_pane_reclick;
 pub(crate) mod folder_scan;
