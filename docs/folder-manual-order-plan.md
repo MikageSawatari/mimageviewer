@@ -1,6 +1,6 @@
 # フォルダ手動順 (§1.911) 設計
 
-- 状態: 設計中 (2026-11-26)。独立設計レビュー R1〜R4 (gpt-6.1-sol / xhigh) の指摘と利用者の回答を反映した第 6 版。利用者確認 Q1〜Q6 は回答済み (§12、Q2・Q5 は推奨から変更)。
+- 状態: 段 1〜4 の実装と段 5 の文書整備済み (2026-11-27)。停止した操作面・検証範囲は各段の実装記録を参照。設計は独立設計レビュー R1〜R4 (gpt-6.1-sol / xhigh) の指摘と利用者の回答を反映した第 6 版 (2026-11-26) を起点とする。利用者確認 Q1〜Q6 は回答済み (§12、Q2・Q5 は推奨から変更)。
 - ブランチ `folder-order-911` (worktree `G:\home\mimageviewer-folderorder911`)。
 - 収録: v5.9.0 に間に合えば入れ、間に合わなければその後の版 (利用者決定 2026-11-26)。
 - 起点: [next-release-backlog.md §1.911](next-release-backlog.md)。利用者決定 1〜7 はそちらが正本。
@@ -666,3 +666,23 @@ Smart root の履歴採用後、定義の範囲外にある新しい通常物理
 - 回帰は 25 件追加（Windows の context 検査 1 件を含む）。既存 snapshot の非ドラッグ時の描画は変更せず、
   PNG を生成・更新していない。コンパイル・テスト・検証用ビルド・コミットは利用者指定により実施しない。
   `cargo fmt`（引数なし）、`python scripts/check_ui_glyphs.py`、`git diff --check` は正常終了した。
+
+### 実装記録 (段 5)
+
+- 段 4 は `d8e8d7e52` までの関連 952 件が成功したとの設計担当の報告を引き継いだ。
+  take_drag helper と reset dialog の警告のコンパイル修正 2 件は設計担当が実施した。
+- 公開文書の表記ポリシーを確認し、grid の手動順の節を正本として、settings・shortcuts・
+  一覧のチュートリアルから案内した。選択方法、選択全体のドラッグ、最初の成功からの保存、改名／追加、
+  リセット、通常のドラッグへ戻す方法、詳細ヘッダ・スタックとの関係、既定キーなしの操作を記載した。
+  公開する操作説明には actor・revision・inventory 等の実装語や版固有の案内を加えていない。
+- 製品ページは専用カード 1 枚とマニュアルへのリンクを追加した。privacy の保存データを日英とも更新し、
+  folder_order.db が対象パスと順を端末内に保存することを記載した。
+  「安心して使えます」と通信の記述は照合し、新しい通信・外部保存が無いため本文を変更しない。
+- architecture の module map・既存 DB 行、display pipeline の resolver と採用境界、stack の手動抑制、
+  Remote の共有 actor／manual shape／sort-lock 拒否／protocol 74、README の設計索引を更新した。
+- CHANGELOG は版番号・日付を決めず「未リリース」欄へ 1 項目を追加した。公開済みの版の見出しと
+  manual/changelog.html は変更しない。画像や PNG baseline の作成・差替えも行わない。
+  未実装のツールバーの手動個別ボタンは案内せず、実装済みの選択欄・メニュー・キー操作を説明する。
+- 本段は文書だけを変更し、コンパイル・Rust テスト・検証用ビルド・コミットは実施しない。
+  `python scripts/check_site_cards.py` は 54 cards / 違反 0、`python scripts/check_ui_glyphs.py` と
+  `git diff --check` も正常終了した。

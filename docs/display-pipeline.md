@@ -1,5 +1,24 @@
 # 表示パイプライン (サムネイル / フルスクリーン)
 
+## 通常の物理フォルダの手動順（§1.911）
+
+`app/book_materialization.rs::materialize_local_folder_listing_with_order_and_metadata` が、
+種類の投影・重複除外と基準の並びを作った後、`folder_order::resolve_listing_order` を適用する。
+記録済みの子を記録位置順、未知の子を基準の並びのまま末尾へ置き、GridDisplayOrder のカテゴリ行をまたぐ
+一つの列にする。共通の `physical_folder_order_eligible` が偽、またはスタック ON なら適用しない。
+詳細表示の `details_order` はこの基礎の items を変えず、列ヘッダによる表示順だけを重ねる。
+
+物理一覧専用の `FolderOrderListingInput::Read(record or none)` と、投影前の直下名から取った inventory を
+scan と一緒に渡す。新規 open・履歴 preflight・Remote / Agent IPC の worker は単一 actor の handle で読み、
+materialize 自体は folder_order.db を開かない。watcher と sort refresh は現在の context のメモリ上の記録を使う。
+同期 load の記録なしが準備済み索引で確定していれば、明示的な Read(None) で従来の同期採用へ進む。
+
+採用時には単調な `order_revision` を確定し、手動が適用される場合だけ一覧の投影キーへ加える。
+通常順・対象外・スタック時の投影キーは従来値を維持する。再走査／refresh は context・世代に加えて
+order_revision を照合する。ドラッグの成功も items の直接置換ではなく、記録更新・actor Save・
+`apply_sort_change_reload` からの既存 refresh 採用を使い、selected / checked を identity で復元する。
+所有・保存集合・取消条件の正本は [フォルダ手動順の設計](folder-manual-order-plan.md)。
+
 ## 3D 写真の表示レイヤー（2026-11-07、段 B 実装・独立レビュー中）
 
 3D は既存の final / comic / source の優先順位を変更しない。
