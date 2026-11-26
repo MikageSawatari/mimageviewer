@@ -756,6 +756,7 @@ pub(crate) use archive_inner_book::{
     ArchiveBookEntry, ArchiveBookOpenOutcome, ArchiveBookTarget, DetachedZipTarget,
     ZipListReturnRequest,
 };
+pub(crate) mod ask_ai;
 #[cfg(all(test, windows))]
 mod context_state_tests;
 pub(crate) mod external_open;
@@ -6938,6 +6939,8 @@ pub(crate) enum DirectoryScanRoute {
 
 pub(crate) enum FolderOpenScanPurpose {
     PaneNavigation,
+    /// The capture-location menu uses pane navigation, but distinguishes a missing destination.
+    CaptureDestinationNavigation,
     /// Main direct open. Admission is complete; completion reuses the pre-scanned install.
     DirectNavigation,
     /// A grid `Folder` requested while always-new mode is active. The main context
@@ -6976,9 +6979,19 @@ pub(crate) enum FolderOpenScanPurpose {
 }
 
 impl FolderOpenScanPurpose {
+    fn scan_error_message(&self, error: &std::io::Error) -> &'static str {
+        if matches!(self, Self::CaptureDestinationNavigation)
+            && error.kind() == std::io::ErrorKind::NotFound
+        {
+            crate::known_folders::CAPTURE_DESTINATION_NOT_FOUND
+        } else {
+            "フォルダを読み取れませんでした"
+        }
+    }
+
     fn perf_tag(&self) -> &'static str {
         match self {
-            Self::PaneNavigation => "pane-navigation",
+            Self::PaneNavigation | Self::CaptureDestinationNavigation => "pane-navigation",
             Self::DirectNavigation => "direct-navigation",
             Self::GridFolderCandidate { .. } => "grid-folder-candidate",
             Self::DetachedFolder => "detached-folder",
@@ -7003,6 +7016,7 @@ impl FolderOpenScanPurpose {
                 navigation_purpose, ..
             } => navigation_purpose.diagnostic_trace(),
             Self::PaneNavigation
+            | Self::CaptureDestinationNavigation
             | Self::DirectNavigation
             | Self::GridFolderCandidate { .. }
             | Self::DetachedFolder
@@ -7018,6 +7032,7 @@ impl FolderOpenScanPurpose {
                 navigation_purpose, ..
             } => navigation_purpose.take_diagnostic_trace(),
             Self::PaneNavigation
+            | Self::CaptureDestinationNavigation
             | Self::DirectNavigation
             | Self::GridFolderCandidate { .. }
             | Self::DetachedFolder
@@ -13922,13 +13937,39 @@ fn main_window_title(location_label: Option<&str>, indexing_active: bool) -> Str
 /// 検索固有の分岐には使わず、`delete_missing` / `last_folder` 保存 / コンテナ★など
 /// 「実在パスを要求する汎用ガード」で使う。
 pub(crate) fn is_synthetic_view_path(path: &Path) -> bool {
-    crate::folder_tree::path_eq(path, &search_results_synthetic_path())
-        || crate::folder_tree::path_eq(path, &reading_history_synthetic_path())
-        || crate::folder_tree::path_eq(path, &bookmark_view_synthetic_path())
-        || crate::folder_tree::path_eq(path, &rating_view_synthetic_path())
-        || crate::folder_tree::path_eq(path, &subfolder_expansion_synthetic_path())
-        || smart_folder::is_smart_folder_synthetic_path(path)
-        || crate::folder_tree::path_eq(path, &drive_list_synthetic_path())
+    let path = crate::path_key::lexical_normalize(path);
+    is_synthetic_view_path_normalized(&path)
+}
+
+/// The caller has already lexically normalized the input. Normalize data_dir only once,
+/// and compare path components instead of constructing every possible synthetic path.
+pub(crate) fn is_synthetic_view_path_normalized(path: &Path) -> bool {
+    let data_dir = crate::path_key::lexical_normalize(&crate::data_dir::get());
+    let known_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            [
+                "__search_results__",
+                "__reading_history__",
+                "__bookmarks__",
+                "__rating_view__",
+                "__subfolder_expansion__",
+                "__drive_list__",
+            ]
+            .iter()
+            .any(|known| synthetic_view_name_eq(name, known))
+        });
+    (known_name
+        && path
+            .parent()
+            .is_some_and(|parent| crate::path_key::eq_synthetic_path_base(parent, &data_dir)))
+        || smart_folder::smart_folder_id_from_normalized_synthetic_path(path, &data_dir).is_some()
+}
+
+/// Match path_eq's lowercase comparison, without allocating for the usual ASCII names.
+fn synthetic_view_name_eq(name: &str, expected: &str) -> bool {
+    name.eq_ignore_ascii_case(expected) || (!name.is_ascii() && name.to_lowercase() == expected)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18557,6 +18598,7 @@ pub struct App {
     pub(crate) startup_open_path: Option<ExplicitOpenPath>,
     /// 起動引数 / 2 重起動 activation で渡されたパスを UI スレッド外で解決中。
     pub(crate) startup_open_path_resolve_pending: Option<StartupOpenPathResolvePending>,
+    ask_ai_registration: ask_ai::AskAiRegistration,
     external_open_failure_tx: mpsc::Sender<crate::external_links::ExternalOpenFailure>,
     external_open_failures: mpsc::Receiver<crate::external_links::ExternalOpenFailure>,
 
@@ -21946,6 +21988,7 @@ impl App {
             initialized: false,
             startup_open_path: None,
             startup_open_path_resolve_pending: None,
+            ask_ai_registration: Default::default(),
             external_open_failure_tx,
             external_open_failures,
             applied_ui_theme: None,
@@ -53223,6 +53266,28 @@ impl App {
         ctx: &egui::Context,
         targets: Vec<crate::ui_dialogs::context_menu::DeleteTarget>,
     ) {
+        self.start_delete_files_with(ctx, targets, crate::delete_worker::spawn_with_stack);
+    }
+
+    pub(crate) fn start_delete_files_with(
+        &mut self,
+        ctx: &egui::Context,
+        targets: Vec<crate::ui_dialogs::context_menu::DeleteTarget>,
+        spawn: impl FnOnce(
+            Vec<PathBuf>,
+            Vec<crate::delete_worker::DeleteSourceScope>,
+            Option<isize>,
+            Option<crate::filename_stack_ui::StackDeletionSource>,
+        ) -> crate::delete_worker::DeletePending,
+    ) {
+        if let Some(reason) = targets.iter().find_map(|target| {
+            crate::grid_item::structural_file_operation_path_refusal(target.path())
+        }) {
+            let message = reason.message("削除");
+            crate::logger::log(format!("delete: rejected: {message}"));
+            self.show_feedback_error(message);
+            return;
+        }
         if targets.is_empty()
             || self.delete_pending.is_some()
             || self.metadata_cleanup_pending.is_some()
@@ -53255,12 +53320,7 @@ impl App {
         }
         self.global_search.pending = None;
         let stack = self.capture_stack_deletion();
-        self.delete_pending = Some(crate::delete_worker::spawn_with_stack(
-            paths,
-            source_scopes,
-            self.main_hwnd,
-            stack,
-        ));
+        self.delete_pending = Some(spawn(paths, source_scopes, self.main_hwnd, stack));
     }
 
     /// 毎フレーム `delete_pending` の進捗メッセージを受信する。
@@ -62263,6 +62323,10 @@ impl App {
         self.start_folder_open_scan(path, FolderOpenScanPurpose::PaneNavigation);
     }
 
+    pub(crate) fn start_capture_destination_open(&mut self, path: PathBuf) {
+        self.start_folder_open_scan(path, FolderOpenScanPurpose::CaptureDestinationNavigation);
+    }
+
     /// Only explicit user pane commands choose success-only search exit at admission.
     pub(crate) fn start_user_folder_pane_open(&mut self, path: PathBuf) {
         self.replace_ready_folder_pane_open(path, None);
@@ -62381,6 +62445,7 @@ impl App {
             && matches!(
                 purpose,
                 FolderOpenScanPurpose::PaneNavigation
+                    | FolderOpenScanPurpose::CaptureDestinationNavigation
                     | FolderOpenScanPurpose::JumpToPhysicalFolder { .. }
                     | FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
             )
@@ -62408,7 +62473,11 @@ impl App {
         }
         // 旧 pending を破棄 (連打で最後のクリックだけ生かす)。
         let previous = self.cancel_folder_pane_open(
-            if matches!(purpose, FolderOpenScanPurpose::PaneNavigation) {
+            if matches!(
+                purpose,
+                FolderOpenScanPurpose::PaneNavigation
+                    | FolderOpenScanPurpose::CaptureDestinationNavigation
+            ) {
                 PaneOpenRestoreExit::ReplacedByPaneScan
             } else {
                 PaneOpenRestoreExit::Abandoned
@@ -62767,7 +62836,7 @@ impl App {
                     ready.path.display(),
                     ready.purpose.perf_tag()
                 ));
-                self.show_feedback_warning("フォルダを読み取れませんでした".to_string());
+                self.show_feedback_warning(ready.purpose.scan_error_message(&error).to_string());
                 if matches!(
                     &ready.purpose,
                     FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
@@ -62796,7 +62865,8 @@ impl App {
                 epub_restore: None,
                 navigation: ready.navigation,
             }),
-            FolderOpenScanPurpose::PaneNavigation => Some(ResolvedMainFolderOpen {
+            FolderOpenScanPurpose::PaneNavigation
+            | FolderOpenScanPurpose::CaptureDestinationNavigation => Some(ResolvedMainFolderOpen {
                 restore_intent: StartupListIntent::ExplicitList,
                 path: ready.path,
                 scan,
@@ -63104,7 +63174,8 @@ impl App {
                 ));
                 DetachedPhysicalFolderOpenPoll::Failed
             }
-            FolderOpenScanPurpose::PaneNavigation => {
+            FolderOpenScanPurpose::PaneNavigation
+            | FolderOpenScanPurpose::CaptureDestinationNavigation => {
                 // active detached viewport はフォルダペインを持たないため通常は到達しない。
                 // 将来ペインを共有しても結果を捨てず、その bundle の物理ナビとして適用する。
                 self.load_folder_with_scan(ready.path, Some(scan));
@@ -64818,6 +64889,19 @@ impl App {
         );
     }
 
+    /// Pure admission check shared by the clipboard handler and root-path tests.
+    fn shell_clipboard_paths_refusal(
+        paths: &[PathBuf],
+        verb: crate::native_context_menu::ShellClipboardVerb,
+    ) -> Option<crate::grid_item::FileOperationRefusal> {
+        if verb != crate::native_context_menu::ShellClipboardVerb::Cut {
+            return None;
+        }
+        paths
+            .iter()
+            .find_map(|path| crate::grid_item::structural_file_operation_path_refusal(path))
+    }
+
     pub(crate) fn invoke_shell_clipboard_verb_for_paths_with(
         &mut self,
         ctx: &egui::Context,
@@ -64830,6 +64914,10 @@ impl App {
             Option<crate::cut_clipboard::LocalCutDataObject>,
         ) -> Result<u32, String>,
     ) {
+        if let Some(reason) = Self::shell_clipboard_paths_refusal(paths, verb) {
+            self.show_feedback_warning(reason.message("切り取り"));
+            return;
+        }
         if self.shell_paste_request.is_some()
             && matches!(
                 verb,
@@ -107756,6 +107844,10 @@ mod still_seek_thumbnail_ownership;
 #[cfg(test)]
 #[path = "app/clear_history_tests.rs"]
 mod clear_history_tests;
+
+#[cfg(all(test, windows))]
+#[path = "app/drive_root_898_tests.rs"]
+mod drive_root_898_tests;
 
 /// Crate-wide `App` test fixture.
 ///

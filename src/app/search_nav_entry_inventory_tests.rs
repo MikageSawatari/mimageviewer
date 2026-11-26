@@ -702,6 +702,7 @@ fn menu_entry(action: MenuCommandId) -> MenuEntry {
         | SettingsPreferences
         | SettingsRemoteConnection
         | SettingsAgentIntegration
+        | HelpAskAi
         | HelpShowWhatsNew
         | HelpAbout => MenuEntry::NoLocationChange,
     }
@@ -744,6 +745,14 @@ fn script_slot_search_navigation_policy_is_indirect() {
         assert!(scripts.contains(&action));
         assert!(crate::ring_shortcut::RingActionId::for_script_slot_key_action(action).is_some());
     }
+}
+
+#[test]
+fn ask_ai_menu_inventory_does_not_change_location() {
+    assert_eq!(
+        menu_entry(MenuCommandId::HelpAskAi),
+        MenuEntry::NoLocationChange
+    );
 }
 
 // Each partition still starts from the complete registry and each action creates

@@ -1737,7 +1737,7 @@ impl App {
                             pane_epub_restore = epub_restore;
                             Some(path)
                         }
-                        (_, Err(error)) => {
+                        (purpose, Err(error)) => {
                             self.finish_pane_open_restore(
                                 epub_restore,
                                 PaneOpenRestoreExit::Abandoned,
@@ -1747,7 +1747,7 @@ impl App {
                                 path.display()
                             ));
                             self.show_feedback_warning(
-                                "フォルダを読み取れませんでした".to_string(),
+                                purpose.scan_error_message(&error).to_string(),
                             );
                             None
                         }

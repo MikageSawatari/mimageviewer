@@ -8,6 +8,57 @@ use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{Arc, mpsc};
 
+pub(crate) type RegistrationDetectionResult =
+    Result<(backend::RegistrationEnvironment, backend::Detection), String>;
+pub(crate) type RegistrationDetectionReceiver = mpsc::Receiver<RegistrationDetectionResult>;
+
+/// The window and Help submenu share capture, mock injection and completion handling.
+pub(crate) fn spawn_registration_detection(
+    ctx: &egui::Context,
+    #[cfg(test)] mock: Option<&MockBackend>,
+) -> RegistrationDetectionReceiver {
+    let (tx, rx) = mpsc::channel();
+    #[cfg(test)]
+    {
+        let mock = mock.expect(
+            "headless AI registration detection requires an explicitly injected mock backend",
+        );
+        let _ = tx.send(Ok((mock.env.clone(), mock.detection.clone())));
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+        return rx;
+    }
+    #[cfg(not(test))]
+    {
+        let repaint = ctx.clone();
+        if std::thread::Builder::new()
+            .name("agent-registration-detect".into())
+            .spawn(move || {
+                let result = backend::RegistrationEnvironment::capture().map(|env| {
+                    let detection = backend::detect(&env);
+                    (env, detection)
+                });
+                let _ = tx.send(result);
+                repaint.request_repaint_of(egui::ViewportId::ROOT);
+            })
+            .is_err()
+        {
+            crate::logger::log("agent-registration detection worker start failed");
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
+        rx
+    }
+}
+
+pub(crate) fn poll_registration_detection(
+    rx: &RegistrationDetectionReceiver,
+) -> Option<RegistrationDetectionResult> {
+    match rx.try_recv() {
+        Ok(result) => Some(result),
+        Err(mpsc::TryRecvError::Disconnected) => Some(Err("確認に失敗しました".into())),
+        Err(mpsc::TryRecvError::Empty) => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PermissionSelection {
     level: AgentLevel,
@@ -56,11 +107,11 @@ enum RegistrationOperation {
 }
 
 #[cfg(test)]
-struct MockBackend {
-    env: backend::RegistrationEnvironment,
-    detection: backend::Detection,
-    write_result: Result<String, String>,
-    writes: usize,
+pub(crate) struct MockBackend {
+    pub(crate) env: backend::RegistrationEnvironment,
+    pub(crate) detection: backend::Detection,
+    pub(crate) write_result: Result<String, String>,
+    pub(crate) writes: usize,
 }
 
 pub(crate) struct AgentIntegrationState {
@@ -100,44 +151,25 @@ impl AgentIntegrationState {
         if self.operation.is_some() || matches!(self.detection, DetectionState::Checking(_)) {
             return;
         }
-        #[cfg(test)]
-        assert!(
-            self.mock_backend.is_some(),
-            "headless AI registration detection requires an explicitly injected mock backend"
-        );
-        let (tx, rx) = mpsc::channel();
-        self.detection = DetectionState::Checking(rx);
-        #[cfg(test)]
-        if let Some(mock) = &self.mock_backend {
-            let _ = tx.send(Ok((mock.env.clone(), mock.detection.clone())));
-            ctx.request_repaint_of(egui::ViewportId::ROOT);
-            return;
-        }
-        let repaint = ctx.clone();
-        let _ = std::thread::Builder::new()
-            .name("agent-registration-detect".into())
-            .spawn(move || {
-                let result = backend::RegistrationEnvironment::capture().map(|env| {
-                    let detection = backend::detect(&env);
-                    (env, detection)
-                });
-                let _ = tx.send(result);
-                repaint.request_repaint_of(egui::ViewportId::ROOT);
-            });
+        self.detection = DetectionState::Checking(spawn_registration_detection(
+            ctx,
+            #[cfg(test)]
+            self.mock_backend.as_ref(),
+        ));
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
         if let DetectionState::Checking(rx) = &self.detection {
-            match rx.try_recv() {
-                Ok(Ok((env, result))) => self.detection = DetectionState::Ready(env, result),
-                Ok(Err(error)) => self.detection = DetectionState::Failed(error),
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.detection = DetectionState::Failed("確認に失敗しました".into())
-                }
-                Err(mpsc::TryRecvError::Empty) => ctx.request_repaint_after_for(
+            if let Some(result) = poll_registration_detection(rx) {
+                self.detection = match result {
+                    Ok((env, result)) => DetectionState::Ready(env, result),
+                    Err(error) => DetectionState::Failed(error),
+                };
+            } else {
+                ctx.request_repaint_after_for(
                     std::time::Duration::from_millis(100),
                     egui::ViewportId::ROOT,
-                ),
+                );
             }
         }
         if let Some(RegistrationOperation::Writing { target, rx }) = &self.operation {
@@ -574,11 +606,30 @@ fn selectable_copy(ui: &mut egui::Ui, text: &str) {
     }
 }
 
+fn open_codex_settings(
+    state: &mut AgentIntegrationState,
+    open: impl FnOnce(crate::external_links::OpenTarget) -> Result<(), String>,
+) {
+    // The open itself runs on the external-open worker (no Shell call on the UI
+    // thread); a failure there arrives later as the shared external-open notice.
+    // `open` returning Ok means only that the worker was started, so the
+    // guidance is phrased conditionally ("設定が開いたら").
+    let result = open(crate::external_links::OpenTarget::AiApp(
+        crate::external_links::AiAppLink::CodexSettings,
+    ))
+    .map(|()| {
+        "設定が開いたら、左の「連携」→「プラグイン」→「MCP」のタブを選んでください".to_owned()
+    })
+    .map_err(|error| format!("設定を開けませんでした: {error}"));
+    state.feedback = Some((AppTarget::ChatGpt, result));
+}
+
 fn draw_app(
     ui: &mut egui::Ui,
     settings: &PermissionSelection,
     state: &mut AgentIntegrationState,
     target: AppTarget,
+    sink: Option<&crate::external_links::FailureSink>,
 ) {
     ui.scope(|ui| {
     ui.push_id(target.name(), |ui| {
@@ -609,8 +660,7 @@ fn draw_app(
             if ui.add_enabled(!matches!(state.detection, DetectionState::Checking(_)), egui::Button::new("再確認")).clicked() { state.start_detection(ui.ctx()); }
             if ui.button("手順を見る").clicked() { state.instructions = if state.instructions == Some(target) { None } else { Some(target) }; }
             if target == AppTarget::ChatGpt && ui.button("設定を開く").clicked() {
-                // The only non-http URL accepted here is this fixed settings entry.
-                if let Err(error) = opener::open("codex://settings") { state.feedback = Some((target, Err(format!("設定を開けませんでした: {error}")))); }
+                open_codex_settings(state, |target| crate::external_links::spawn_open(target, sink.cloned()));
             }
         });
         if let Some(action) = requested { state.confirm(target, action, ui.ctx().cumulative_frame_nr()); }
@@ -619,8 +669,8 @@ fn draw_app(
         }
         if state.instructions == Some(target) {
             ui.label(match target {
-                AppTarget::ClaudeDesktop => "Claude を終了 → 設定ファイルに追記 → Claude を起動。初回の確認画面で「常に許可」を選んでください。",
-                AppTarget::ChatGpt => "Settings > MCP servers > Add server > STDIO で登録し、再起動してください。",
+                AppTarget::ClaudeDesktop => "Claude を終了 → 設定ファイルに追記 → Claude を起動。Claude が読む設定ファイルは、Claude の 設定 →「デスクトップアプリ」→「拡張機能」の「管理」→「ローカル MCP サーバー」の「設定を編集」で開けます。下のパスと違う場合は、そちらに書いてください。確認の画面が出たら「常に許可」を選んでください。",
+                AppTarget::ChatGpt => "設定 →「連携」→「プラグイン」の「MCP」のタブでサーバーを追加し (STDIO)、再起動してください。",
             });
             if let DetectionState::Ready(_, detection) = &state.detection {
                 if let Some(row) = detection.apps.iter().find(|row| row.target == target) {
@@ -687,7 +737,8 @@ impl App {
         let escape = self.dialog_escape_pressed(ctx);
         let ime_active = self.ime_input_active(ctx);
         let mut selected = PermissionSelection::from(&self.settings);
-        let open = draw_window(ctx, &mut selected, &mut state, escape, false);
+        let sink = self.external_open_sink(ctx);
+        let open = draw_window(ctx, &mut selected, &mut state, escape, false, Some(&sink));
         if selected != PermissionSelection::from(&self.settings) {
             self.commit_agent_permissions(selected);
         }
@@ -733,6 +784,7 @@ fn draw_body(
     settings: &mut PermissionSelection,
     state: &mut AgentIntegrationState,
     expanded: bool,
+    sink: Option<&crate::external_links::FailureSink>,
 ) {
     let label = ui.label(egui::RichText::new("許可の範囲").strong());
     draw_permission(ui, settings).labelled_by(label.id);
@@ -750,7 +802,7 @@ fn draw_body(
     }
     for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
         ui.label(egui::RichText::new(target.name()).strong());
-        draw_app(ui, settings, state, target);
+        draw_app(ui, settings, state, target, sink);
     }
 }
 
@@ -760,6 +812,7 @@ fn draw_window(
     state: &mut AgentIntegrationState,
     escape: bool,
     expanded: bool,
+    sink: Option<&crate::external_links::FailureSink>,
 ) -> bool {
     let blocked = state.operation.is_some();
     if blocked {
@@ -792,7 +845,7 @@ fn draw_window(
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    draw_body(ui, settings, state, expanded);
+                    draw_body(ui, settings, state, expanded, sink);
                 });
             #[cfg(test)]
             {
@@ -1117,7 +1170,7 @@ pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
         });
         state.changes = controller.records().lock().unwrap().entries().to_vec();
     }
-    draw_window(ui.ctx(), &mut settings, &mut state, false, level >= 4);
+    draw_window(ui.ctx(), &mut settings, &mut state, false, level >= 4, None);
 }
 
 #[cfg(test)]

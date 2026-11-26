@@ -40,7 +40,8 @@ impl App {
             if t.elapsed() >= FOCUS_RESTORE_GRACE {
                 self.fs_focus_regained_at = None;
             } else if !self.fs_primary_suppression.is_active() && pointer_primary_down {
-                self.fs_primary_suppression.arm_pointer_stream();
+                self.fs_primary_suppression
+                    .arm_focus_restore_pointer_stream();
                 self.fs_focus_regained_at = None;
             }
         }

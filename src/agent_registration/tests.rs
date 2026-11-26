@@ -320,14 +320,10 @@ fn json_registration_preserves_pretty_indentation_line_endings_and_other_bytes()
                 )
                 .unwrap();
                 assert_eq!(edited, render(&added_parent));
-                let empty_parent = no_parent.replace(
-                    "  \"tail\": true\n}",
-                    "  \"tail\": true,\n  \"mcpServers\": {}\n}",
-                );
                 assert_eq!(
                     config::edit(AppTarget::ClaudeDesktop, &edited, Action::Remove, &command)
                         .unwrap(),
-                    render(&empty_parent)
+                    render(&no_parent)
                 );
             }
         }
@@ -341,6 +337,288 @@ fn json_registration_preserves_pretty_indentation_line_endings_and_other_bytes()
         config::edit(AppTarget::ClaudeDesktop, "{}", Action::Register, &command).unwrap();
     assert!(minified.starts_with("{\n  \"mcpServers\""));
     assert!(!minified.ends_with('\n'));
+}
+
+#[test]
+fn claude_registration_removes_new_empty_parent_and_restores_pretty_bytes() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for indent in ["  ", "    ", "\t"] {
+        for newline in ["\n", "\r\n"] {
+            for trailing in [false, true] {
+                let mut original = format!(
+                    "{{{newline}{indent}\"other\": 1,{newline}{indent}\"tail\": true{newline}}}"
+                );
+                if trailing {
+                    original.push_str(newline);
+                }
+                let registered = config::edit(
+                    AppTarget::ClaudeDesktop,
+                    &original,
+                    Action::Register,
+                    &command,
+                )
+                .unwrap();
+                assert!(registered.contains("\"mcpServers\""));
+                let removed = config::edit(
+                    AppTarget::ClaudeDesktop,
+                    &registered,
+                    Action::Remove,
+                    &command,
+                )
+                .unwrap();
+                assert_eq!(removed.as_bytes(), original.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+fn claude_removal_deletes_preexisting_parent_only_after_removing_registration() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    let empty_parent = "{\n  \"other\": 1,\n  \"mcpServers\": {}\n}\n";
+    assert_eq!(
+        config::edit(
+            AppTarget::ClaudeDesktop,
+            empty_parent,
+            Action::Remove,
+            &command
+        )
+        .unwrap(),
+        empty_parent
+    );
+    assert_eq!(
+        config::change(
+            AppTarget::ClaudeDesktop,
+            empty_parent,
+            Action::Remove,
+            &command
+        )
+        .unwrap(),
+        RegistrationChange::Unchanged
+    );
+    let registered = config::edit(
+        AppTarget::ClaudeDesktop,
+        empty_parent,
+        Action::Register,
+        &command,
+    )
+    .unwrap();
+    assert_eq!(
+        config::edit(
+            AppTarget::ClaudeDesktop,
+            &registered,
+            Action::Remove,
+            &command
+        )
+        .unwrap(),
+        "{\n  \"other\": 1\n}\n"
+    );
+}
+
+#[test]
+fn codex_registration_uses_implicit_new_parent_and_restores_original_bytes() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for original in ["", "model = 'x'\n", "# keep\nmodel = 'x' # model\n\n"] {
+        for newline in ["\n", "\r\n"] {
+            let original = original.replace('\n', newline);
+            let registered =
+                config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+            assert!(!registered.contains("[mcp_servers]"), "{registered}");
+            assert!(
+                registered.contains("[mcp_servers.mimageviewer]"),
+                "{registered}"
+            );
+            let removed =
+                config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+            assert_eq!(removed.as_bytes(), original.as_bytes());
+        }
+    }
+}
+
+#[test]
+fn codex_removal_deletes_empty_explicit_implicit_inline_and_dotted_parents() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for parent in [
+        "[mcp_servers]\n[mcp_servers.mimageviewer]\ncommand = 'old'\nargs = []\n",
+        "[mcp_servers.mimageviewer]\ncommand = 'old'\nargs = []\n",
+        "mcp_servers = { mimageviewer = { command = 'old', args = [] } }\n",
+        "mcp_servers.mimageviewer.command = 'old'\nmcp_servers.mimageviewer.args = []\n",
+    ] {
+        for newline in ["\n", "\r\n"] {
+            let prefix = "# keep\nmodel = 'x' # model\n".replace('\n', newline);
+            let suffix = "[other]\nvalue = 42 # tail\n".replace('\n', newline);
+            let original = format!("{prefix}{}{suffix}", parent.replace('\n', newline));
+            let removed =
+                config::edit(AppTarget::ChatGpt, &original, Action::Remove, &command).unwrap();
+            assert_eq!(removed, format!("{prefix}{suffix}"), "parent={parent:?}");
+            assert_eq!(
+                config::change(AppTarget::ChatGpt, &original, Action::Remove, &command).unwrap(),
+                RegistrationChange::Remove
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_registration_preserves_empty_explicit_parent_comments() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for parent in [
+        "# MCP の運用メモ\n[mcp_servers]\n",
+        "[mcp_servers] # 利用者が残した説明\n",
+        "# MCP の運用メモ\n[mcp_servers] # 利用者が残した説明\n",
+    ] {
+        for newline in ["\n", "\r\n"] {
+            let original = format!("model = 'x'\n{parent}").replace('\n', newline);
+            let registered =
+                config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+            let removed =
+                config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+            assert_eq!(removed.as_bytes(), original.as_bytes(), "parent={parent:?}");
+        }
+    }
+}
+
+fn assert_codex_inline_parent_comments_round_trip(parent: &str) {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for newline in ["\n", "\r\n"] {
+        let original = format!("model = 'x'\n{parent}").replace('\n', newline);
+        let registered =
+            config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+        // Observe the ownership after serialization and parsing, as removal does.
+        // A final byte comparison alone would not locate an ownership regression.
+        let before: toml_edit::DocumentMut = original.replace("\r\n", "\n").parse().unwrap();
+        let after: toml_edit::DocumentMut = registered.replace("\r\n", "\n").parse().unwrap();
+        let before_parent = before["mcp_servers"].as_inline_table().unwrap();
+        let after_parent = after["mcp_servers"].as_inline_table().unwrap();
+        assert_eq!(
+            after_parent.trailing().as_str(),
+            before_parent.trailing().as_str(),
+            "parent={parent:?}"
+        );
+        // Re-registering must preserve the same ownership and output too.
+        assert_eq!(
+            config::edit(AppTarget::ChatGpt, &registered, Action::Register, &command).unwrap(),
+            registered
+        );
+        let removed =
+            config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+        assert_eq!(removed.as_bytes(), original.as_bytes(), "parent={parent:?}");
+    }
+}
+
+#[test]
+fn codex_registration_preserves_empty_inline_parent_comments() {
+    for parent in [
+        "# MCP の運用メモ\nmcp_servers = {}\n",
+        "mcp_servers = {} # 利用者が残した説明\n",
+        "# MCP の運用メモ\nmcp_servers = {} # 利用者が残した説明\n",
+    ] {
+        assert_codex_inline_parent_comments_round_trip(parent);
+    }
+}
+
+#[test]
+fn codex_registration_preserves_multiline_inline_parent_comment_after_reparse() {
+    assert_codex_inline_parent_comments_round_trip("mcp_servers = {\n  # 表の中の運用メモ\n}\n");
+}
+
+#[test]
+fn codex_registration_preserves_inline_parent_opening_line_comment_after_reparse() {
+    assert_codex_inline_parent_comments_round_trip("mcp_servers = { # 表の中の行末の説明\n}\n");
+}
+
+#[test]
+fn codex_registration_keeps_toml10_inline_tables_without_trailing_commas() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    let with_other = "mcp_servers = { other = { command = 'other' } }\n";
+    for (parent, expected_parent) in [
+        ("mcp_servers = { }\n", ""),
+        ("mcp_servers = {}\n", ""),
+        (with_other, with_other),
+    ] {
+        for newline in ["\n", "\r\n"] {
+            let original = format!("model = 'x'\n{parent}").replace('\n', newline);
+            let registered =
+                config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+            let normalized = registered.replace("\r\n", "\n");
+            let parsed: toml_edit::DocumentMut = normalized.parse().unwrap();
+            assert!(
+                !parsed["mcp_servers"]
+                    .as_inline_table()
+                    .unwrap()
+                    .trailing_comma(),
+                "parent={parent:?}, registered={registered}"
+            );
+            for trailing_comma in [", }", ",}", ",\n}"] {
+                assert!(!normalized.contains(trailing_comma), "{registered}");
+            }
+            let removed =
+                config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+            let expected = format!("model = 'x'\n{expected_parent}").replace('\n', newline);
+            assert_eq!(removed.as_bytes(), expected.as_bytes(), "parent={parent:?}");
+        }
+    }
+}
+
+#[test]
+fn codex_registration_removes_uncommented_empty_explicit_parent() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for newline in ["\n", "\r\n"] {
+        // A '#' inside an unrelated string is not a comment on the parent.
+        let prefix = "model = 'x#y'\n".replace('\n', newline);
+        let original = format!("{prefix}[mcp_servers]{newline}");
+        let registered =
+            config::edit(AppTarget::ChatGpt, &original, Action::Register, &command).unwrap();
+        let removed =
+            config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+        assert_eq!(removed.as_bytes(), prefix.as_bytes());
+    }
+}
+
+#[test]
+fn codex_removal_keeps_other_servers_and_existing_parent_forms() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for original in [
+        "# keep\n[mcp_servers.other]\ncommand = 'keep' # other\n",
+        "[mcp_servers]\n# keep\n[mcp_servers.other]\ncommand = 'keep'\n",
+        "mcp_servers = { other = { command = 'keep' } } # keep\n",
+        "mcp_servers.other.command = 'keep' # keep\n",
+    ] {
+        let registered =
+            config::edit(AppTarget::ChatGpt, original, Action::Register, &command).unwrap();
+        let removed =
+            config::edit(AppTarget::ChatGpt, &registered, Action::Remove, &command).unwrap();
+        assert_eq!(removed, original);
+    }
+}
+
+#[test]
+fn codex_removal_without_registration_preserves_empty_parent_and_is_unchanged() {
+    let (_temp, env) = fixture();
+    let command = env.resolve_command().unwrap();
+    for original in [
+        "# keep\nmodel = 'x'\n",
+        "[mcp_servers]\n",
+        "mcp_servers = {} # keep\n",
+    ] {
+        assert_eq!(
+            config::edit(AppTarget::ChatGpt, original, Action::Remove, &command).unwrap(),
+            original
+        );
+        assert_eq!(
+            config::change(AppTarget::ChatGpt, original, Action::Remove, &command).unwrap(),
+            RegistrationChange::Unchanged
+        );
+    }
 }
 
 /// Independent fixture scanner: neither RawValue nor serde_json::Value is used
@@ -619,9 +897,10 @@ fn registration_preservation_deep_large_string_keeps_exact_bytes() {
     );
     let removed =
         config::edit(AppTarget::ClaudeDesktop, &edited, Action::Remove, &command).unwrap();
+    let without_parent = original.replace(",\n  \"mcpServers\": {}", "");
     assert!(
-        removed.as_bytes() == original.as_bytes(),
-        "removing the registration must restore the exact deep input"
+        removed.as_bytes() == without_parent.as_bytes(),
+        "removing the empty parent must preserve all other deep input bytes"
     );
 }
 
@@ -651,6 +930,26 @@ fn fixture() -> (tempfile::TempDir, RegistrationEnvironment) {
 
 fn install_squirrel(env: &RegistrationEnvironment) {
     fs::create_dir_all(env.local_app_data.as_ref().unwrap().join("AnthropicClaude")).unwrap();
+}
+
+fn installed_config_path(env: &RegistrationEnvironment, target: AppTarget) -> PathBuf {
+    match target {
+        AppTarget::ClaudeDesktop => install_squirrel(env),
+        AppTarget::ChatGpt => fs::create_dir_all(
+            env.local_app_data
+                .as_ref()
+                .unwrap()
+                .join("Packages/OpenAI.Codex_one"),
+        )
+        .unwrap(),
+    }
+    app(&detect(env), target).config_paths[0].clone()
+}
+
+fn suffixed_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 fn app(detection: &Detection, target: AppTarget) -> &AppRegistration {
@@ -697,6 +996,7 @@ fn claude_installs_map_to_own_configs_and_ambiguity_is_not_writable() {
     let d = detect(&env);
     let row = app(&d, AppTarget::ClaudeDesktop);
     assert_eq!(row.state, RegistrationState::Unregistered);
+    assert_eq!(row.message, None);
     assert_eq!(
         row.config_paths,
         vec![
@@ -715,12 +1015,26 @@ fn claude_installs_map_to_own_configs_and_ambiguity_is_not_writable() {
     let d = detect(&env);
     let row = app(&d, AppTarget::ClaudeDesktop);
     assert_eq!(row.state, RegistrationState::Ambiguous);
-    assert_eq!(row.config_paths.len(), 2);
+    assert_eq!(
+        row.config_paths,
+        vec![
+            env.app_data
+                .as_ref()
+                .unwrap()
+                .join("Claude/claude_desktop_config.json"),
+            env.local_app_data
+                .as_ref()
+                .unwrap()
+                .join("Claude-Data/Claude_one/claude_desktop_config.json"),
+            package.join("LocalCache/Roaming/Claude/claude_desktop_config.json"),
+        ]
+    );
     assert!(
         row.write_request(Action::Register, d.command.as_ref().unwrap())
             .is_none()
     );
     fs::remove_dir(env.local_app_data.as_ref().unwrap().join("AnthropicClaude")).unwrap();
+    fs::create_dir_all(package.join("LocalCache/Roaming/Claude")).unwrap();
     let d = detect(&env);
     assert_eq!(
         app(&d, AppTarget::ClaudeDesktop).config_paths,
@@ -781,6 +1095,387 @@ fn codex_detection_and_config_home_are_independent() {
         app(&detect(&env), AppTarget::ChatGpt).state,
         RegistrationState::Unregistered
     );
+}
+
+fn claude_package_paths(env: &RegistrationEnvironment) -> (PathBuf, PathBuf, PathBuf) {
+    let local = env.local_app_data.as_ref().unwrap();
+    let package = local.join("Packages/Claude_One");
+    fs::create_dir_all(&package).unwrap();
+    (
+        package.clone(),
+        local.join("Claude-Data/Claude_One/claude_desktop_config.json"),
+        package.join("LocalCache/Roaming/Claude/claude_desktop_config.json"),
+    )
+}
+
+#[test]
+fn claude_package_destination_prefers_data_and_keeps_actual_directory_case() {
+    for (data_exists, cache_exists, different_case) in [
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (true, true, true),
+        (false, false, false),
+    ] {
+        let (_temp, env) = fixture();
+        let (_, mut data, cache) = claude_package_paths(&env);
+        if different_case {
+            data = env
+                .local_app_data
+                .as_ref()
+                .unwrap()
+                .join("Claude-Data/cLaUdE_oNe/claude_desktop_config.json");
+        }
+        if data_exists {
+            fs::create_dir_all(data.parent().unwrap()).unwrap();
+        }
+        if cache_exists {
+            fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        }
+        let detection = detect(&env);
+        let row = app(&detection, AppTarget::ClaudeDesktop);
+        if data_exists || cache_exists {
+            assert_eq!(row.state, RegistrationState::Unregistered);
+            let expected = if data_exists { &data } else { &cache };
+            assert_eq!(row.config_paths, vec![expected.clone()]);
+            // Path equality ignores separators; compare the directory entry's spelling itself.
+            assert_eq!(
+                row.config_paths[0].parent().and_then(Path::file_name),
+                expected.parent().and_then(Path::file_name),
+                "display must retain the actual directory entry's spelling"
+            );
+            assert_eq!(
+                row.message.as_deref(),
+                (!data_exists).then_some(CLAUDE_LOCAL_CACHE_GUIDANCE)
+            );
+            assert!(row.can_write(Action::Register));
+        } else {
+            assert_eq!(row.state, RegistrationState::Ambiguous);
+            assert_eq!(row.config_paths, vec![data.clone(), cache.clone()]);
+            assert_eq!(
+                row.message.as_deref(),
+                Some("Claude Desktop を一度起動して終了してから「再確認」を押してください")
+            );
+            assert!(!row.can_write(Action::Register));
+            assert!(!row.can_write(Action::Remove));
+            assert!(
+                row.write_request(Action::Register, detection.command.as_ref().unwrap())
+                    .is_none()
+            );
+        }
+        assert!(!data.exists());
+        assert!(!cache.exists());
+    }
+}
+
+#[test]
+fn claude_multiple_installs_keep_ambiguity_and_resolve_each_package_candidate() {
+    for squirrel in [false, true] {
+        let (_temp, env) = fixture();
+        let (_, _, cache) = claude_package_paths(&env);
+        let data = env
+            .local_app_data
+            .as_ref()
+            .unwrap()
+            .join("Claude-Data/cLaUdE_oNe/claude_desktop_config.json");
+        fs::create_dir_all(data.parent().unwrap()).unwrap();
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        let expected = if squirrel {
+            install_squirrel(&env);
+            vec![
+                env.app_data
+                    .as_ref()
+                    .unwrap()
+                    .join("Claude/claude_desktop_config.json"),
+                data.clone(),
+            ]
+        } else {
+            let package = env
+                .local_app_data
+                .as_ref()
+                .unwrap()
+                .join("Packages/Claude_Two");
+            let other_cache = package.join("LocalCache/Roaming/Claude/claude_desktop_config.json");
+            fs::create_dir_all(other_cache.parent().unwrap()).unwrap();
+            vec![data.clone(), other_cache]
+        };
+        let detection = detect(&env);
+        let row = app(&detection, AppTarget::ClaudeDesktop);
+        assert_eq!(row.state, RegistrationState::Ambiguous);
+        assert_eq!(row.config_paths, expected);
+        assert!(!row.config_paths.contains(&cache));
+        let data_index = if squirrel { 1 } else { 0 };
+        assert_eq!(
+            row.config_paths[data_index]
+                .parent()
+                .and_then(Path::file_name),
+            data.parent().and_then(Path::file_name),
+            "ambiguous candidates must retain the actual directory entry's spelling"
+        );
+        assert_eq!(
+            row.message.as_deref(),
+            Some(
+                "Claude が複数の形で入っています。手順を見て、お使いの Claude の設定ファイルに書いてください"
+            )
+        );
+        assert!(!row.can_write(Action::Register));
+        assert!(!row.can_write(Action::Remove));
+        assert!(
+            row.write_request(Action::Register, detection.command.as_ref().unwrap())
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn claude_multiple_packages_without_data_keep_cache_and_uninitialized_candidates() {
+    for first_cache_exists in [false, true] {
+        let (_temp, env) = fixture();
+        let (_, data, cache) = claude_package_paths(&env);
+        if first_cache_exists {
+            fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        }
+        let local = env.local_app_data.as_ref().unwrap();
+        let other_package = local.join("Packages/Claude_Two");
+        fs::create_dir_all(&other_package).unwrap();
+        let mut expected = if first_cache_exists {
+            vec![cache]
+        } else {
+            vec![data, cache]
+        };
+        expected.extend([
+            local.join("Claude-Data/Claude_Two/claude_desktop_config.json"),
+            other_package.join("LocalCache/Roaming/Claude/claude_desktop_config.json"),
+        ]);
+        let detection = detect(&env);
+        let row = app(&detection, AppTarget::ClaudeDesktop);
+        assert_eq!(row.state, RegistrationState::Ambiguous);
+        assert_eq!(row.config_paths, expected);
+        assert!(!row.can_write(Action::Register));
+        assert!(!row.can_write(Action::Remove));
+    }
+}
+
+#[test]
+fn claude_local_cache_guidance_survives_every_config_state() {
+    for state in [
+        RegistrationState::Unregistered,
+        RegistrationState::Registered,
+        RegistrationState::DifferentTarget,
+        RegistrationState::Unreadable,
+    ] {
+        let (_temp, env) = fixture();
+        let (_, _, cache) = claude_package_paths(&env);
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        let command = env.resolve_command().unwrap();
+        let text = match state {
+            RegistrationState::Unregistered => String::new(),
+            RegistrationState::Registered => command.snippet(AppTarget::ClaudeDesktop),
+            RegistrationState::DifferentTarget => RegistrationCommand {
+                command: "old".into(),
+                args: vec![],
+            }
+            .snippet(AppTarget::ClaudeDesktop),
+            RegistrationState::Unreadable => "{invalid".into(),
+            _ => unreachable!(),
+        };
+        fs::write(&cache, &text).unwrap();
+        let detection = detect(&env);
+        let row = app(&detection, AppTarget::ClaudeDesktop);
+        assert_eq!(row.state, state);
+        assert_eq!(row.config_paths, vec![cache.clone()]);
+        assert!(
+            row.message
+                .as_deref()
+                .unwrap()
+                .contains(CLAUDE_LOCAL_CACHE_GUIDANCE)
+        );
+        assert_eq!(fs::read_to_string(&cache).unwrap(), text);
+        assert!(!suffixed_path(&cache, ".mimageviewer.bak").exists());
+        assert!(!suffixed_path(&cache, ".mimageviewer.orig.bak").exists());
+    }
+    let (_temp, env) = fixture();
+    let (_, _, cache) = claude_package_paths(&env);
+    fs::create_dir_all(&cache).unwrap();
+    let detection = detect(&env);
+    let row = app(&detection, AppTarget::ClaudeDesktop);
+    assert_eq!(row.state, RegistrationState::Unreadable);
+    assert_eq!(
+        row.message,
+        Some(format!(
+            "設定ファイルを読めません\n{CLAUDE_LOCAL_CACHE_GUIDANCE}"
+        ))
+    );
+}
+
+#[test]
+fn claude_update_redetection_moves_from_registered_cache_to_unregistered_data() {
+    let (_temp, env) = fixture();
+    let (_, data, cache) = claude_package_paths(&env);
+    fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    let detection = detect(&env);
+    let request = app(&detection, AppTarget::ClaudeDesktop)
+        .write_request(Action::Register, detection.command.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(request.path, cache);
+    write_with_processes(&env, &request, || Ok(vec![])).unwrap();
+    let registered = fs::read_to_string(&cache).unwrap();
+    assert_eq!(
+        app(&detect(&env), AppTarget::ClaudeDesktop).state,
+        RegistrationState::Registered
+    );
+    fs::create_dir_all(data.parent().unwrap()).unwrap();
+    let detection = detect(&env);
+    let row = app(&detection, AppTarget::ClaudeDesktop);
+    assert_eq!(row.config_paths, vec![data.clone()]);
+    assert_eq!(row.state, RegistrationState::Unregistered);
+    assert_eq!(row.message, None);
+    let request = row
+        .write_request(Action::Register, detection.command.as_ref().unwrap())
+        .unwrap();
+    write_with_processes(&env, &request, || Ok(vec![])).unwrap();
+    assert_eq!(
+        app(&detect(&env), AppTarget::ClaudeDesktop).state,
+        RegistrationState::Registered
+    );
+    assert!(data.is_file());
+    assert_eq!(fs::read_to_string(&cache).unwrap(), registered);
+}
+
+#[test]
+fn claude_write_rejects_destination_switch_or_ambiguity_without_touching_either_config() {
+    for action in [Action::Register, Action::Remove] {
+        for ambiguous in [false, true] {
+            let (_temp, env) = fixture();
+            let (_, data, cache) = claude_package_paths(&env);
+            fs::create_dir_all(cache.parent().unwrap()).unwrap();
+            let command = env.resolve_command().unwrap();
+            let original = if action == Action::Remove {
+                command.snippet(AppTarget::ClaudeDesktop)
+            } else {
+                "{\"keep\":true}".into()
+            };
+            fs::write(&cache, &original).unwrap();
+            let detection = detect(&env);
+            let request = app(&detection, AppTarget::ClaudeDesktop)
+                .write_request(action, &command)
+                .unwrap();
+            let backup = suffixed_path(&cache, ".mimageviewer.bak");
+            let oldest = suffixed_path(&cache, ".mimageviewer.orig.bak");
+            fs::write(&backup, "previous backup").unwrap();
+            fs::write(&oldest, "oldest backup").unwrap();
+            if ambiguous {
+                fs::create_dir_all(
+                    env.local_app_data
+                        .as_ref()
+                        .unwrap()
+                        .join("Packages/Claude_Two"),
+                )
+                .unwrap();
+            } else {
+                fs::create_dir_all(data.parent().unwrap()).unwrap();
+                fs::write(&data, "{\"new_config\":true}").unwrap();
+            }
+            assert_eq!(
+                write_with_processes(&env, &request, || Ok(vec![])).unwrap_err(),
+                "設定ファイルの場所が確認後に変わりました。もう一度確認してください"
+            );
+            assert_eq!(fs::read_to_string(&cache).unwrap(), original);
+            if ambiguous {
+                assert!(!data.exists());
+            } else {
+                assert_eq!(fs::read_to_string(&data).unwrap(), "{\"new_config\":true}");
+            }
+            assert_eq!(fs::read_to_string(&backup).unwrap(), "previous backup");
+            assert_eq!(fs::read_to_string(&oldest).unwrap(), "oldest backup");
+            assert!(!suffixed_path(&data, ".mimageviewer.bak").exists());
+            assert!(!suffixed_path(&data, ".mimageviewer.orig.bak").exists());
+        }
+    }
+}
+
+#[test]
+fn codex_write_revalidates_injected_home_before_creating_files() {
+    for action in [Action::Register, Action::Remove] {
+        let (_temp, mut env) = fixture();
+        env.codex_home = Some(PathBuf::from("custom/../custom-codex"));
+        let path = installed_config_path(&env, AppTarget::ChatGpt);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let command = env.resolve_command().unwrap();
+        let original = if action == Action::Remove {
+            command.snippet(AppTarget::ChatGpt)
+        } else {
+            "# keep\n".into()
+        };
+        fs::write(&path, &original).unwrap();
+        let detection = detect(&env);
+        let request = app(&detection, AppTarget::ChatGpt)
+            .write_request(action, &command)
+            .unwrap();
+        env.codex_home = Some(PathBuf::from("other-codex"));
+        assert_eq!(
+            write_with_processes(&env, &request, || Ok(vec![])).unwrap_err(),
+            "設定ファイルの場所が確認後に変わりました。もう一度確認してください"
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(!suffixed_path(&path, ".mimageviewer.bak").exists());
+        assert!(!suffixed_path(&path, ".mimageviewer.orig.bak").exists());
+        assert!(!env.working_dir.join("other-codex").exists());
+    }
+}
+
+#[test]
+fn write_rejects_disappeared_installation_before_creating_config_directory() {
+    for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
+        let (_temp, env) = fixture();
+        let path = installed_config_path(&env, target);
+        let detection = detect(&env);
+        let request = app(&detection, target)
+            .write_request(Action::Register, detection.command.as_ref().unwrap())
+            .unwrap();
+        let install = match target {
+            AppTarget::ClaudeDesktop => "AnthropicClaude",
+            AppTarget::ChatGpt => "Packages/OpenAI.Codex_one",
+        };
+        fs::remove_dir(env.local_app_data.as_ref().unwrap().join(install)).unwrap();
+        assert_eq!(
+            write_with_processes(&env, &request, || Ok(vec![])).unwrap_err(),
+            "設定ファイルの場所が確認後に変わりました。もう一度確認してください"
+        );
+        assert!(!path.parent().unwrap().exists());
+    }
+}
+
+#[test]
+fn write_accepts_normalized_confirmed_destination_for_both_apps() {
+    for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
+        let (_temp, env) = fixture();
+        let path = installed_config_path(&env, target);
+        let detection = detect(&env);
+        let mut request = app(&detection, target)
+            .write_request(Action::Register, detection.command.as_ref().unwrap())
+            .unwrap();
+        let parent = path.parent().unwrap();
+        fs::create_dir_all(parent.join("comparison")).unwrap();
+        request.path = parent
+            .join("comparison/../.")
+            .join(path.file_name().unwrap());
+        #[cfg(windows)]
+        {
+            request.path = PathBuf::from(
+                request
+                    .path
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .to_uppercase(),
+            );
+        }
+        write_with_processes(&env, &request, || Ok(vec![])).unwrap();
+        assert_eq!(
+            app(&detect(&env), target).state,
+            RegistrationState::Registered
+        );
+    }
 }
 
 #[test]
@@ -1046,8 +1741,6 @@ fn running_app_classification_and_writer_errors_preserve_config_and_backup() {
         .as_ref()
         .unwrap()
         .join("AnthropicClaude/app-1/resources/chrome-native-host.exe");
-    let path = env.working_dir.join("config");
-    let backup = env.working_dir.join("config.mimageviewer.bak");
     let command = env.resolve_command().unwrap();
     for (target, paths, expected, message) in [
         (
@@ -1144,6 +1837,9 @@ fn running_app_classification_and_writer_errors_preserve_config_and_backup() {
             AppTarget::ChatGpt => "# retained\nmodel = 'keep'\n",
             AppTarget::ClaudeDesktop => r#"{"retained":true}"#,
         };
+        let path = installed_config_path(&env, target);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let backup = suffixed_path(&path, ".mimageviewer.bak");
         fs::write(&path, original).unwrap();
         fs::write(&backup, "previous backup").unwrap();
         let request = WriteRequest {
@@ -1533,6 +2229,163 @@ fn real_file_reread_backup_replace_and_remove_use_only_injected_temporary_paths(
 }
 
 #[test]
+fn registration_and_removal_feedback_describe_the_action_and_claude_recheck() {
+    for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
+        let (_temp, env) = fixture();
+        installed_config_path(&env, target);
+        let detection = detect(&env);
+        let request = app(&detection, target)
+            .write_request(Action::Register, detection.command.as_ref().unwrap())
+            .unwrap();
+        let registered = write_with_processes(&env, &request, || Ok(vec![])).unwrap();
+        let mut expected = format!(
+            "{} を起動して、新しいチャットで mIV の tool が出るか確かめてください",
+            target.name()
+        );
+        if target == AppTarget::ClaudeDesktop {
+            expected.push_str("。出ない場合は Claude を終了して「再確認」を押し、未登録と出たら登録し直してください");
+        }
+        assert_eq!(registered, expected);
+        let remove = app(&detect(&env), target).remove_request().unwrap();
+        let removed = write_with_processes(&env, &remove, || Ok(vec![])).unwrap();
+        assert_eq!(
+            removed,
+            format!(
+                "登録を外しました。{} を起動し直すと mIV の tool は出なくなります",
+                target.name()
+            )
+        );
+        assert_ne!(registered, removed);
+    }
+}
+
+#[test]
+fn backups_preserve_pre_registration_bytes_and_update_previous_on_removal() {
+    for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
+        let (_temp, env) = fixture();
+        let path = installed_config_path(&env, target);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = match target {
+            AppTarget::ClaudeDesktop => "{\r\n\t\"keep\": \"日本語\"\r\n}\r\n",
+            AppTarget::ChatGpt => "# 日本語\r\nmodel = 'keep'\r\n",
+        };
+        fs::write(&path, original).unwrap();
+        let backup = suffixed_path(&path, ".mimageviewer.bak");
+        let oldest = suffixed_path(&path, ".mimageviewer.orig.bak");
+        let detection = detect(&env);
+        let register = app(&detection, target)
+            .write_request(Action::Register, detection.command.as_ref().unwrap())
+            .unwrap();
+        write_with_processes(&env, &register, || Ok(vec![])).unwrap();
+        let registered = fs::read(&path).unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), original.as_bytes());
+        assert_eq!(fs::read(&oldest).unwrap(), original.as_bytes());
+        let remove = app(&detect(&env), target).remove_request().unwrap();
+        write_with_processes(&env, &remove, || Ok(vec![])).unwrap();
+        assert_eq!(fs::read(&oldest).unwrap(), original.as_bytes());
+        assert_eq!(fs::read(&backup).unwrap(), registered);
+        assert_eq!(
+            app(&detect(&env), target).state,
+            RegistrationState::Unregistered
+        );
+    }
+}
+
+#[test]
+fn backups_for_initially_absent_config_keep_empty_oldest_across_register_remove_register() {
+    for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
+        let (_temp, env) = fixture();
+        let path = installed_config_path(&env, target);
+        assert!(!path.exists());
+        let backup = suffixed_path(&path, ".mimageviewer.bak");
+        let oldest = suffixed_path(&path, ".mimageviewer.orig.bak");
+        let mut before = Vec::new();
+        for action in [Action::Register, Action::Remove, Action::Register] {
+            let detection = detect(&env);
+            let request = app(&detection, target)
+                .write_request(action, detection.command.as_ref().unwrap())
+                .unwrap();
+            write_with_processes(&env, &request, || Ok(vec![])).unwrap();
+            assert!(fs::read(&oldest).unwrap().is_empty());
+            assert_eq!(fs::read(&backup).unwrap(), before);
+            before = fs::read(&path).unwrap();
+        }
+    }
+}
+
+#[test]
+fn backups_adopt_legacy_previous_bytes_once_and_never_overwrite_oldest() {
+    for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
+        let (_temp, env) = fixture();
+        let path = installed_config_path(&env, target);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let command = env.resolve_command().unwrap();
+        // A legacy register/remove cycle left the registered text in .bak;
+        // the user subsequently edited their config. It is not the pristine original.
+        let legacy = command.snippet(target);
+        let edited = match target {
+            AppTarget::ClaudeDesktop => "{\"user_edit\":true}",
+            AppTarget::ChatGpt => "# user edit\nmodel = 'changed'\n",
+        };
+        fs::write(&path, edited).unwrap();
+        let backup = suffixed_path(&path, ".mimageviewer.bak");
+        let oldest = suffixed_path(&path, ".mimageviewer.orig.bak");
+        fs::write(&backup, &legacy).unwrap();
+        let detection = detect(&env);
+        let request = app(&detection, target)
+            .write_request(Action::Register, &command)
+            .unwrap();
+        write_with_processes(&env, &request, || Ok(vec![])).unwrap();
+        assert_eq!(fs::read_to_string(&oldest).unwrap(), legacy);
+        assert_eq!(fs::read_to_string(&backup).unwrap(), edited);
+        let registered = fs::read(&path).unwrap();
+        let remove = app(&detect(&env), target).remove_request().unwrap();
+        write_with_processes(&env, &remove, || Ok(vec![])).unwrap();
+        assert_eq!(fs::read_to_string(&oldest).unwrap(), legacy);
+        assert_eq!(fs::read(&backup).unwrap(), registered);
+    }
+}
+
+#[test]
+fn backup_creation_failure_keeps_current_config_unchanged() {
+    for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
+        for fail_oldest in [false, true] {
+            let (_temp, env) = fixture();
+            let path = installed_config_path(&env, target);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = match target {
+                AppTarget::ClaudeDesktop => "{\"keep\":true}",
+                AppTarget::ChatGpt => "# keep\n",
+            };
+            fs::write(&path, original).unwrap();
+            let backup = suffixed_path(&path, ".mimageviewer.bak");
+            let oldest = suffixed_path(&path, ".mimageviewer.orig.bak");
+            if fail_oldest {
+                // A retained legacy backup cannot be read as a file.
+                fs::create_dir(&backup).unwrap();
+            } else {
+                fs::write(&oldest, "oldest backup").unwrap();
+                fs::create_dir(&backup).unwrap();
+            }
+            let detection = detect(&env);
+            let request = app(&detection, target)
+                .write_request(Action::Register, detection.command.as_ref().unwrap())
+                .unwrap();
+            assert_eq!(
+                write_with_processes(&env, &request, || Ok(vec![])).unwrap_err(),
+                "設定のバックアップを作れません"
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            if fail_oldest {
+                assert!(!oldest.exists());
+            } else {
+                assert_eq!(fs::read_to_string(&oldest).unwrap(), "oldest backup");
+            }
+        }
+    }
+}
+
+#[test]
 fn write_rejects_changed_summary_before_touching_config_backup_or_directory() {
     for target in [AppTarget::ClaudeDesktop, AppTarget::ChatGpt] {
         let (_temp, env) = fixture();
@@ -1575,8 +2428,10 @@ fn write_rejects_changed_summary_before_touching_config_backup_or_directory() {
                 RegistrationChange::Replace,
             ),
         ] {
-            let path = env.working_dir.join("config");
-            let backup = env.working_dir.join("config.mimageviewer.bak");
+            let path = installed_config_path(&env, target);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let backup = suffixed_path(&path, ".mimageviewer.bak");
+            let oldest = suffixed_path(&path, ".mimageviewer.orig.bak");
             let change = config::change(target, original, action, &command).unwrap();
             assert_eq!(change, confirmed);
             let request = WriteRequest {
@@ -1588,16 +2443,19 @@ fn write_rejects_changed_summary_before_touching_config_backup_or_directory() {
             };
             fs::write(&path, external).unwrap();
             fs::write(&backup, "existing-backup").unwrap();
+            fs::write(&oldest, "oldest-backup").unwrap();
             assert_eq!(
                 write_with_processes(&env, &request, || Ok(vec![])).unwrap_err(),
                 "設定ファイルが確認後に変わりました。もう一度確認してください",
             );
             assert_eq!(fs::read_to_string(&path).unwrap(), external);
             assert_eq!(fs::read_to_string(&backup).unwrap(), "existing-backup");
+            assert_eq!(fs::read_to_string(&oldest).unwrap(), "oldest-backup");
         }
         // A removed file must not be recreated (or its parent created) for a
         // confirmation whose operation no longer matches the current content.
-        let path = env.working_dir.join("absent-parent/config");
+        let (_absent_temp, env) = fixture();
+        let path = installed_config_path(&env, target);
         let request = WriteRequest {
             target,
             path: path.clone(),
@@ -1631,7 +2489,8 @@ fn write_allows_format_changes_with_the_same_summary_and_backs_up_reread_bytes()
             config::change(target, external, Action::Register, &command).unwrap(),
             change
         );
-        let path = env.working_dir.join("config");
+        let path = installed_config_path(&env, target);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         let request = WriteRequest {
             target,
             path: path.clone(),
@@ -1646,7 +2505,11 @@ fn write_allows_format_changes_with_the_same_summary_and_backs_up_reread_bytes()
             config::edit(target, external, Action::Register, &command).unwrap()
         );
         assert_eq!(
-            fs::read_to_string(env.working_dir.join("config.mimageviewer.bak")).unwrap(),
+            fs::read_to_string(suffixed_path(&path, ".mimageviewer.bak")).unwrap(),
+            external
+        );
+        assert_eq!(
+            fs::read_to_string(suffixed_path(&path, ".mimageviewer.orig.bak")).unwrap(),
             external
         );
         assert_eq!(
@@ -1663,7 +2526,8 @@ fn invalid_files_and_running_processes_never_change_config_or_backup() {
         (AppTarget::ChatGpt, "[SECRET invalid"),
     ] {
         let (_temp, env) = fixture();
-        let path = env.working_dir.join("config");
+        let path = installed_config_path(&env, target);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, invalid).unwrap();
         let request = WriteRequest {
             target,
@@ -1675,7 +2539,8 @@ fn invalid_files_and_running_processes_never_change_config_or_backup() {
         let error = write_with_processes(&env, &request, || Ok(vec![])).unwrap_err();
         assert!(!error.contains("SECRET"));
         assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
-        assert!(!env.working_dir.join("config.mimageviewer.bak").exists());
+        assert!(!suffixed_path(&path, ".mimageviewer.bak").exists());
+        assert!(!suffixed_path(&path, ".mimageviewer.orig.bak").exists());
         fs::write(&path, "").unwrap();
         let image = match target {
             AppTarget::ClaudeDesktop => env
@@ -1687,7 +2552,8 @@ fn invalid_files_and_running_processes_never_change_config_or_backup() {
         };
         assert!(write_with_processes(&env, &request, || Ok(vec![(1, image)])).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "");
-        assert!(!env.working_dir.join("config.mimageviewer.bak").exists());
+        assert!(!suffixed_path(&path, ".mimageviewer.bak").exists());
+        assert!(!suffixed_path(&path, ".mimageviewer.orig.bak").exists());
         assert!(
             write_with_processes(&env, &request, || Err(io::Error::other("injected"))).is_err()
         );

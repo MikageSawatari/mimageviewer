@@ -512,7 +512,7 @@ fn section1840_lock_only_metadata_panel_left_click_does_not_turn_page() {
                         1.0,
                         egui::Vec2::ZERO,
                         None,
-                        false,
+                        FullscreenPrimarySuppressionDecision::Allow,
                     );
                 },
             )

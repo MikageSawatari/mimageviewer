@@ -676,6 +676,117 @@ fn main_drop_internal_request_uses_all_original_paths_without_querying_data_obje
     assert_eq!(data.queries.get(), 0);
 }
 
+// §1.898: 本物の Shell を実パスに呼ばせない。実ドライブのルートはドロップ判定だけに渡す。
+// 実行経路は一時フォルダ内の偽パスと差し替えで確かめる。
+#[cfg(windows)]
+#[test]
+fn drive_root_898_drop_root_decision_and_temporary_transfer_execution() {
+    // 旧コードは別ドライブへの Shift 移動を FolderTransfer にし、拒否通知／非受理の検査が落ちる。
+    let data = Rc::new(FakeData::default());
+    let session = DragSession::new(data.clone(), true, true);
+    let source = internal(&[r"C:\"]);
+    // D: is outside C:, so the pre-existing ancestor guard cannot cause this refusal.
+    let decision = tree(r"D:\destination", Some(&source), SHIFT);
+    let Some(DropRequest::Failed(message)) =
+        session.drop_request(&decision, Some(&source)).unwrap()
+    else {
+        panic!("root must stop at drop admission")
+    };
+    assert!(!decision.accepted());
+    let mut app = crate::app::setup_app_for_test();
+    app.main_hwnd = Some(1);
+    app.indexer_init.mark_unavailable_if_not_ready();
+    let ctx = egui::Context::default();
+    // Only a reconstructed Failed is consumed. A root transfer request is never executed.
+    app.main_drop
+        .borrow_mut()
+        .drops
+        .push(DropRequest::Failed(message));
+    app.consume_main_drops(&ctx);
+    assert_eq!(
+        app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+        Some(
+            crate::grid_item::FileOperationRefusal::VolumeRoot
+                .message("移動")
+                .as_str()
+        )
+    );
+    let copy = tree(r"D:\destination", Some(&source), CONTROL);
+    assert!(copy.accepted());
+    let Some(DropRequest::FolderTransfer(request)) =
+        session.drop_request(&copy, Some(&source)).unwrap()
+    else {
+        panic!("copy must remain available")
+    };
+    assert_eq!(request.operation, ShellTransferOperation::Copy);
+    assert_eq!(request.sources, source.paths);
+    // Root Copy is inspected above, never submitted. Only temporary paths execute below.
+    let scope = app.tmp.path().to_owned();
+    let destination = scope.join("destination");
+    let mut calls = 0;
+    for path in [
+        scope.join("foo"),
+        scope.join(r"foo\..\bar"),
+        scope.join("foo.jpg"),
+    ] {
+        let source = InternalDrag {
+            paths: vec![path.clone()],
+            excluded_virtual: false,
+            failed_paths: 0,
+        };
+        for keys in [SHIFT, CONTROL] {
+            let decision = tree(destination.to_str().unwrap(), Some(&source), keys);
+            assert!(decision.accepted(), "{path:?}");
+            let request = session
+                .drop_request(&decision, Some(&source))
+                .unwrap()
+                .unwrap();
+            let before = calls;
+            drive_root_898_submit_drop_with_fake_transfer(
+                &mut app, &ctx, &scope, request, &mut calls,
+            );
+            assert_eq!(calls, before + 1);
+        }
+    }
+    assert_eq!(data.reads.get(), 0);
+}
+
+#[cfg(windows)]
+fn drive_root_898_submit_drop_with_fake_transfer(
+    app: &mut crate::app::App,
+    ctx: &egui::Context,
+    scope: &Path,
+    request: DropRequest,
+    calls: &mut usize,
+) {
+    match request {
+        DropRequest::Failed(message) => {
+            // Only a reconstructed Failed enters the real consumer, never a transfer request.
+            app.main_drop
+                .borrow_mut()
+                .drops
+                .push(DropRequest::Failed(message));
+            app.consume_main_drops(ctx);
+        }
+        DropRequest::FolderTransfer(request) => {
+            assert!(request.sources.iter().all(|path| path.starts_with(scope)));
+            assert!(request.destination.starts_with(scope));
+            app.file_organize_request =
+                crate::ui_dialogs::file_organize::FileOrganizeRequest::Hidden;
+            app.submit_shell_transfer_with(
+                ctx,
+                request,
+                |_| scope.join("fake-books"),
+                |_, _, _| {
+                    *calls += 1;
+                    std::sync::mpsc::channel().1
+                },
+            );
+        }
+        DropRequest::GridFiles(_) => panic!("unexpected grid file open"),
+    }
+}
+
 #[test]
 fn main_drop_external_requests_copy_or_grid_and_only_description_writes_change() {
     let shared = Rc::new(RefCell::new(MainDropShared::default()));

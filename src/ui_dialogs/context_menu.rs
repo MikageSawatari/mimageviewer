@@ -136,6 +136,10 @@ pub(crate) struct DeleteTarget {
 }
 
 impl DeleteTarget {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn from_grid_item(item: &GridItem) -> Option<Self> {
         Some(Self {
             path: item.drag_source_path()?.to_path_buf(),
@@ -467,6 +471,20 @@ const COLLECTION_JUMP_NO_PARENT_MESSAGE: &str =
     "ドライブまたは共有ルートには親フォルダがありません";
 
 impl NativeGridContextMenuTarget {
+    /// Only the Windows menu request is restricted; clipboard copy retains shell_paths.
+    fn native_menu_paths(&self) -> Vec<PathBuf> {
+        let paths = self.shell_paths.as_deref().unwrap_or_default();
+        if self.is_folder_context
+            || paths.iter().any(|path| {
+                crate::grid_item::structural_file_operation_path_refusal(path).is_some()
+            })
+        {
+            Vec::new()
+        } else {
+            paths.to_vec()
+        }
+    }
+
     fn copy_command(&self, requested: MenuCommand) -> Option<MenuCommand> {
         match &self.copy_subject {
             ItemCopyMenuSubject::BookmarkSource(_) => {
@@ -1378,11 +1396,7 @@ impl crate::app::App {
             hwnd,
             screen_pos: (pos.x.round() as i32, pos.y.round() as i32),
             background_folder,
-            paths: if target.is_folder_context {
-                Vec::new()
-            } else {
-                shell_paths
-            },
+            paths: target.native_menu_paths(),
             miv_items,
             shell_menu_placement: native_grid_shell_menu_placement(
                 &target,
@@ -2624,6 +2638,12 @@ impl crate::app::App {
     }
 
     pub(crate) fn request_delete_confirm(&mut self, targets: Vec<DeleteTarget>) {
+        if let Some(reason) = targets.iter().find_map(|target| {
+            crate::grid_item::structural_file_operation_path_refusal(target.path())
+        }) {
+            self.show_feedback_warning(reason.message("削除"));
+            return;
+        }
         self.delete_targets = targets;
         self.delete_confirm_label = None;
         self.show_delete_confirm = true;
@@ -2819,6 +2839,10 @@ impl crate::app::App {
             let Some(item) = self.items.get(idx) else {
                 return;
             };
+            if let Some(reason) = item.structural_file_operation_refusal() {
+                self.show_feedback_warning(reason.message("削除"));
+                return;
+            }
             let Some(target) = DeleteTarget::from_grid_item(item) else {
                 if let Some(reason) = item.file_operation_refusal() {
                     self.show_feedback_warning(reason.message("削除"));
@@ -3255,58 +3279,75 @@ fn write_image_clipboard_if_latest<A: ClipboardImageApi>(
     dib_format: u32,
     nonce: &[u8],
     baseline: Option<u32>,
+    is_latest: impl FnMut() -> bool,
+) -> ClipboardImageWriteResult {
+    write_clipboard_if_latest(api, dib, dib_format, Some(nonce), baseline, is_latest)
+}
+
+/// Image and text writes share the same ownership and generation boundary.
+#[cfg(any(windows, test))]
+fn write_clipboard_if_latest<A: ClipboardImageApi>(
+    api: &mut A,
+    bytes: &[u8],
+    format: u32,
+    nonce: Option<&[u8]>,
+    baseline: Option<u32>,
     mut is_latest: impl FnMut() -> bool,
 ) -> ClipboardImageWriteResult {
+    let role = if nonce.is_some() { "image" } else { "text" };
     if !is_latest() {
         return ClipboardImageWriteResult::Superseded;
     }
-    let image = match prepare_clipboard_memory(api, dib, "image") {
-        Ok(image) => image,
+    let memory = match prepare_clipboard_memory(api, bytes, role) {
+        Ok(memory) => memory,
         Err(error) => return ClipboardImageWriteResult::Failed(error),
     };
     if let Err(error) = api.open() {
-        let message = format!("OpenClipboard for image failed: {error}");
+        let message = format!("OpenClipboard for {role} failed: {error}");
         api.log(message.clone());
-        free_clipboard_memory(api, image, "image");
+        free_clipboard_memory(api, memory, role);
         return ClipboardImageWriteResult::Failed(message);
     }
     // Both rejection paths retain the previous clipboard and close the open
     // interval below. Existing writers deliberately do not inspect OS sequence.
     let copied = if !is_latest() {
-        free_clipboard_memory(api, image, "image");
+        free_clipboard_memory(api, memory, role);
         ClipboardImageWriteResult::Superseded
     } else if baseline.is_some_and(|expected| api.sequence_number() != expected) {
-        free_clipboard_memory(api, image, "image");
+        free_clipboard_memory(api, memory, role);
         ClipboardImageWriteResult::ClipboardChanged
     } else {
         match api.empty() {
             Err(error) => {
-                let message = format!("EmptyClipboard for image failed: {error}");
+                let message = format!("EmptyClipboard for {role} failed: {error}");
                 api.log(message.clone());
-                free_clipboard_memory(api, image, "image");
+                free_clipboard_memory(api, memory, role);
                 ClipboardImageWriteResult::Failed(message)
             }
-            Ok(()) => match api.set_data(dib_format, image) {
+            Ok(()) => match api.set_data(format, memory) {
                 Err(error) => {
-                    let message = format!("SetClipboardData for image failed: {error}");
+                    let message = format!("SetClipboardData for {role} failed: {error}");
                     api.log(message.clone());
-                    free_clipboard_memory(api, image, "image");
+                    free_clipboard_memory(api, memory, role);
                     ClipboardImageWriteResult::Failed(message)
                 }
                 Ok(()) => {
                     // Marker failures must never undo or prevent the saved CF_DIB.
-                    match api.register_origin() {
-                        Err(error) => api.log(format!(
-                            "Clipboard image origin format registration failed: {error}"
-                        )),
-                        Ok(format) => {
-                            if let Ok(marker) = prepare_clipboard_memory(api, nonce, "image origin")
-                                && let Err(error) = api.set_data(format, marker)
-                            {
-                                api.log(format!(
-                                    "SetClipboardData for image origin failed: {error}"
-                                ));
-                                free_clipboard_memory(api, marker, "image origin");
+                    if let Some(nonce) = nonce {
+                        match api.register_origin() {
+                            Err(error) => api.log(format!(
+                                "Clipboard image origin format registration failed: {error}"
+                            )),
+                            Ok(format) => {
+                                if let Ok(marker) =
+                                    prepare_clipboard_memory(api, nonce, "image origin")
+                                    && let Err(error) = api.set_data(format, marker)
+                                {
+                                    api.log(format!(
+                                        "SetClipboardData for image origin failed: {error}"
+                                    ));
+                                    free_clipboard_memory(api, marker, "image origin");
+                                }
                             }
                         }
                     }
@@ -3316,9 +3357,53 @@ fn write_image_clipboard_if_latest<A: ClipboardImageApi>(
         }
     };
     if let Err(error) = api.close() {
-        api.log(format!("CloseClipboard for image failed: {error}"));
+        api.log(format!("CloseClipboard for {role} failed: {error}"));
     }
     copied
+}
+
+#[cfg(any(windows, test))]
+fn write_text_clipboard_with<A: ClipboardImageApi>(
+    api: &mut A,
+    text: &str,
+    request: EditedClipboardWriteRequest,
+    is_latest: impl FnMut() -> bool,
+) -> ClipboardImageWriteResult {
+    // CF_UNICODETEXT is UTF-16LE, including the terminating NUL.
+    let bytes: Vec<u8> = text
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    const CF_UNICODETEXT: u32 = 13;
+    write_clipboard_if_latest(
+        api,
+        &bytes,
+        CF_UNICODETEXT,
+        None,
+        Some(request.baseline),
+        is_latest,
+    )
+}
+
+pub(crate) fn write_text_clipboard_if_latest(
+    text: &str,
+    request: EditedClipboardWriteRequest,
+) -> ClipboardImageWriteResult {
+    #[cfg(windows)]
+    {
+        let _guard = CLIPBOARD_WRITE_MUTEX
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        write_text_clipboard_with(&mut NativeClipboardImageApi, text, request, || {
+            clipboard_seq_is_latest(request.my_seq)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (text, request);
+        ClipboardImageWriteResult::Failed("Text clipboard requires Windows".into())
+    }
 }
 
 // GlobalUnlock returns zero both when the last lock was released and on
@@ -4860,6 +4945,43 @@ mod operation_script_grid_menu_tests {
 
 #[cfg(test)]
 mod delete_confirm_tests {
+    // §1.898: 実ドライブのルートは判定・実行しない入口だけに渡す。
+    // 本物の Shell を実パスに呼ばせず、実行経路は一時フォルダ内の偽パスと差し替えを使う。
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_native_menu_omits_structural_paths_but_keeps_clipboard_sources() {
+        // 旧コードはルート／合成パスも NativeContextMenuRequest.paths に入れ、空の要求パス検査が落ちる。
+        let app = crate::app::setup_app_for_test();
+        let ordinary = PathBuf::from(r"C:\foo");
+        for path in [
+            PathBuf::from(r"C:\"),
+            crate::app::drive_list_synthetic_path(),
+        ] {
+            for mixed in [false, true] {
+                let mut target = target(
+                    &app,
+                    GridItem::Folder(path.clone()),
+                    ContextMenuSurface::Grid,
+                );
+                if mixed {
+                    target.shell_paths.as_mut().unwrap().push(ordinary.clone());
+                }
+                let original = target.shell_paths.clone();
+                assert!(target.native_menu_paths().is_empty());
+                assert_eq!(
+                    target.shell_paths, original,
+                    "copy retains the complete selection"
+                );
+            }
+        }
+        let target = target(
+            &app,
+            GridItem::Folder(ordinary.clone()),
+            ContextMenuSurface::Grid,
+        );
+        assert_eq!(target.native_menu_paths(), vec![ordinary]);
+    }
+
     fn delete_file_target(path: impl Into<std::path::PathBuf>) -> super::DeleteTarget {
         super::DeleteTarget::from_grid_item(&crate::grid_item::GridItem::Image(path.into()))
             .unwrap()
@@ -7001,6 +7123,180 @@ mod clipboard_image_writer_tests {
     const ORIGIN_FORMAT: u32 = 0xc001;
     const DIB: &[u8] = b"image bytes";
     const NONCE: &[u8] = b"process nonce";
+
+    #[test]
+    fn ask_ai_text_clipboard_uses_utf16_without_image_origin_marker() {
+        let mut api = FakeClipboardImageApi::default();
+        let request = request_edited_clipboard_write_with(&mut api, || 7);
+        let result = write_text_clipboard_with(&mut api, "案内🙂", request, || true);
+        assert_eq!(result, ClipboardImageWriteResult::Written);
+        let expected: Vec<u8> = "案内🙂"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(api.payloads, vec![(1, expected)]);
+        assert_eq!(api.transferred, vec![(13, 1)]);
+        assert!(!api.events.contains(&"register_origin"));
+        assert_eq!(api.events.last(), Some(&"close"));
+    }
+
+    #[test]
+    fn ask_ai_text_clipboard_failures_release_memory_without_retry() {
+        for failure in ["alloc_image", "lock_image", "open", "empty", "set_origin"] {
+            let mut api = FakeClipboardImageApi::with_failures(&[failure]);
+            let request = request_edited_clipboard_write_with(&mut api, || 1);
+            assert!(matches!(
+                write_text_clipboard_with(&mut api, "案内", request, || true),
+                ClipboardImageWriteResult::Failed(_)
+            ));
+            assert!(api.transferred.is_empty());
+            assert_eq!(api.allocated, api.freed);
+            assert!(!api.opened);
+            assert!(!api.logs.is_empty());
+            assert_eq!(
+                api.events.iter().filter(|event| **event == failure).count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn ask_ai_worker_writes_then_notifies_then_opens_for_every_clipboard_result() {
+        use crate::external_links::{
+            AiWebSite, ExternalOpenFailure, FailureSink, OpenTarget, TestClipboardGuard,
+            TestOpenerGuard, spawn_open,
+        };
+        use std::sync::Mutex;
+        use std::time::Duration;
+        // Real shared writer with fake native calls, isolated mIV and OS generations.
+        for scenario in [
+            "written",
+            "superseded_before",
+            "superseded_during_open",
+            "os_changed_before",
+            "os_changed_during_open",
+            "failed",
+        ] {
+            let generation = Arc::new(AtomicU64::new(1));
+            let mut fake = FakeClipboardImageApi::default();
+            let request = request_edited_clipboard_write_with(&mut fake, || 1);
+            fake.events.clear();
+            let os_sequence = fake.os_sequence.clone();
+            if scenario == "failed" {
+                fake.failures.push("open");
+            }
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let resume_rx = Mutex::new(resume_rx);
+            if scenario.ends_with("during_open") {
+                fake.on_open = Some(Box::new(move || {
+                    entered_tx.send(()).unwrap();
+                    resume_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }));
+            }
+            if scenario == "superseded_before" {
+                generation.store(2, Ordering::Relaxed);
+            }
+            if scenario == "os_changed_before" {
+                os_sequence.store(10, Ordering::Relaxed);
+            }
+            let fake = Arc::new(Mutex::new(fake));
+            let writer_fake = fake.clone();
+            let writer_generation = generation.clone();
+            let caller = std::thread::current().id();
+            let _clipboard = TestClipboardGuard::install(move |text, request| {
+                assert_ne!(caller, std::thread::current().id());
+                write_text_clipboard_with(&mut *writer_fake.lock().unwrap(), text, request, || {
+                    writer_generation.load(Ordering::Relaxed) == request.my_seq
+                })
+            });
+            let (notification_tx, notification_rx) = mpsc::channel();
+            let notification_rx = Mutex::new(notification_rx);
+            let (opened_tx, opened_rx) = mpsc::channel();
+            let opener_fake = fake.clone();
+            let _opener = TestOpenerGuard::install(move |target| {
+                assert_ne!(caller, std::thread::current().id());
+                assert!(matches!(
+                    target,
+                    OpenTarget::AiWeb {
+                        site: AiWebSite::Google,
+                        ..
+                    }
+                ));
+                let notification: ExternalOpenFailure = notification_rx
+                    .lock()
+                    .unwrap()
+                    .try_recv()
+                    .expect("notification precedes opener");
+                let fake = opener_fake.lock().unwrap();
+                assert!(!fake.opened, "write and CloseClipboard precede opener");
+                match scenario {
+                    "written" => {
+                        assert_eq!(notification, ExternalOpenFailure::AiWebClipboardWritten);
+                        assert_eq!(fake.transferred, vec![(13, 1)]);
+                        assert!(!notification.is_warning());
+                    }
+                    "failed" => {
+                        assert_eq!(notification, ExternalOpenFailure::AiWebClipboardFailed);
+                        assert!(notification.is_warning());
+                        assert_eq!(
+                            fake.events.iter().filter(|event| **event == "open").count(),
+                            1
+                        );
+                        assert!(!fake.logs.is_empty());
+                    }
+                    _ => {
+                        assert_eq!(notification, ExternalOpenFailure::AiWebClipboardSkipped);
+                        assert!(!notification.is_warning());
+                        assert!(!fake.events.contains(&"empty"));
+                        assert!(fake.transferred.is_empty());
+                        if scenario.starts_with("os_changed") {
+                            assert_eq!(
+                                fake.os_sequence.load(Ordering::Relaxed),
+                                10,
+                                "later text copy remains intact"
+                            );
+                        }
+                    }
+                }
+                opened_tx.send(notification).unwrap();
+                // Web Shell failure never publishes a second warning.
+                Err("failed https://google.com/ai private prompt".into())
+            });
+            spawn_open(
+                OpenTarget::AiWeb {
+                    site: AiWebSite::Google,
+                    text: "案内の文".into(),
+                    clipboard_seq: request,
+                },
+                Some(FailureSink {
+                    tx: notification_tx,
+                    ctx: egui::Context::default(),
+                }),
+            )
+            .unwrap();
+            if scenario.ends_with("during_open") {
+                entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(
+                    opened_rx.try_recv().is_err(),
+                    "opener waits for clipboard completion"
+                );
+                if scenario.starts_with("superseded") {
+                    generation.store(2, Ordering::Relaxed);
+                } else {
+                    os_sequence.store(10, Ordering::Relaxed);
+                }
+                resume_tx.send(()).unwrap();
+            }
+            opened_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(opened_rx.try_recv().is_err());
+        }
+    }
 
     #[derive(Default)]
     struct FakeClipboardImageApi {

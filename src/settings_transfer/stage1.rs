@@ -1235,7 +1235,7 @@ mod tests {
     }
 
     #[test]
-    fn stage1_folder_cell_background_uses_transfer_validation() {
+    fn stage1_folder_cell_background_accepts_low_contrast_and_rejects_bad_shape() {
         let settings = default_settings();
         for (value, valid) in [
             (
@@ -1244,12 +1244,17 @@ mod tests {
             ),
             (
                 json!({"enabled": false, "light": [255,240,179], "dark": [58,52,32]}),
-                false,
+                true,
             ),
             (
                 json!({"enabled": true, "light": [255,244,204], "dark": [220,220,220]}),
+                true,
+            ),
+            (
+                json!({"enabled": true, "light": [256,244,204], "dark": [58,52,32]}),
                 false,
             ),
+            (json!({"enabled": "yes"}), false),
         ] {
             let changes = change("folder_cell_background", value.clone());
             assert_eq!(parse_items(&changes).issues.is_empty(), valid);

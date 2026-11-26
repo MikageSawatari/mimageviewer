@@ -913,3 +913,86 @@ target 指定 Down を通す形へ更新した。設計担当が追加した `ui
   ui-smoke スクリプト (`scripts/ui-smoke.ps1` 等) の実走は未実施 (構文解析のみ)。
 - 独立レビュー (Sol / xhigh) の 2 回目は ACCEPT、P1〜P3 の指摘なし。
 - 実機確認は未実施。
+
+### 5.13 置換の画面を閉じた後の → と、中止の outcome
+
+観測者はサブ PC 担当の Claude。master 38e8e43c5 の build-dev と perf ログによる報告:
+一覧の Ctrl+V → Shell の「ファイルの置換またはスキップ」→「スキップ」の後、0.3 秒後の → が
+2 回とも効かず、約 2 秒後の → は効いた。`native_menu/verb_invoke` (paste) は 167.573 に戻り、
+167.576 の `input/modifier_probe` は `focused:false, permit:false`。
+167.612〜168.503 は 890 ms フレームが無く (2 回目も 896 ms)、その間の → の key event は記録されず、
+次の → (173.7) は `focused:true` で届いて選択が動いた。
+同じ担当から、60 GB の貼り付けを進捗画面の × で中止しても `shell_paste/end` が `outcome:"ok"` だったと報告された。
+
+事実と未特定の理由: source inspection では `src/app/main_drop.rs` が main HWND を service へ渡し、
+`src/native_context_menu.rs` の `CreateViewObject(hwnd)` と `CMINVOKECOMMANDINFO.hwnd` の両方に使っている。
+通常は Shell の画面を閉じると Windows が owner へ activation を返すはずだが、サブ PC 担当の Claude の
+perf ログでは戻り時も `focused:false` で、約 0.9 秒 (2 回とも 890〜897 ms) 戻らなかった。
+**理由は未特定、R3-3 は未修正**。候補は (a) Shell の進捗窓 (置換の画面の owner) が残って前面を持つ、
+(b) main がまだ disabled、(c) その他。エージェントはメイン PC で画面を出して確認していない。
+
+前面の返却は独立レビュー (別担当、GPT-6.1 Sol / xhigh、利用者からの共有) の REJECT を受けて外した。
+P2-1: `GA_ROOTOWNER == main` は操作の由来を識別せず、main を owner にする native 動画の別 thread の
+全画面窓 (`src/video/native_window_pump.rs`) やプロパティ等からも前面を奪い得る。
+P2-2: `InvokeCommand` の戻りは Shell UI の役目の終了や転送完了の証拠ではなく、理由が未特定の強制返却は根本修正ではない。
+P3: 従来のテストは本物の `InvokeCommand` 直前の採取境界を検査していなかった。
+設計担当の判断で診断を先行し、サブ PC の再確認で `shell_paste/foreground_after_invoke` を見て
+(a)(b)(c) を判別してから構造的な直し方を決める。
+
+試して外した案 (現在の実装には残さない):
+
+| コミット | 当時の判定の表の要約 | 外した理由 |
+| --- | --- | --- |
+| `0a065beed` | 前面 NULL または同じ process・別 thread なら main へ復帰。それ以外は保持 | 無関係の窓・前面の無い状態まで対象になる |
+| `e0036a17a` | main で開始し、同じ process・別 thread・root owner が main の前面だけ復帰 | 所有系列は操作の由来を、呼び出しの戻りは Shell UI 終了を証明しない (P2-1・P2-2) |
+
+現在の変更:
+
+- `src/shell_paste.rs`: `SetForegroundWindow`、設定 API、復帰の判定・enum を削除。
+  `ShellPasteCompletion` は呼び出し結果だけを持ち、読み取り専用の `ForegroundApi` で診断する。
+- `src/native_context_menu.rs`: 本物の `invoke_canonical_verb` に対の `before_invoke` / `after_invoke` を置く。
+  前者は `InvokeCommand` 直前、後者は成功・失敗どちらでも戻った直後で、エラーの整形・計測出力・menu 破棄より前。
+  開始時の値は callback の戻り値で後者へ渡す。perf 無効時は前面を問い合わせず、出力もしない。
+  bind/query の失敗で未呼び出しなら両 callback と診断 event は無い。
+- worker の一行の event は `shell_paste/foreground_after_invoke`。値は `started_from_main`・
+  `foreground_class`・`root_owner_class`・`root_owner_is_main`・`foreground_visible`・`main_enabled`・
+  `same_thread`・`same_process`・`foreground_is_null`。前面 NULL の thread/process 比較は null。
+- `shell_paste/end` の `focus_return` は削除。R3-2 の typed outcome は
+  `invoked|failed|start_failed|disconnected` を維持し、選択要求の取り下げ・通知も維持する。
+  `invoked` は呼び出し成功だけで、転送の成否・中止を含まない。Shell の paste 動詞からは中止を取得できず、
+  `IFileOperation` への置換は行わない。
+- ignored の実 Shell テストには前面操作を追加しない。3 入口は共通 service のままで、
+  detached の述語・viewport・動画の処理は変更しない。
+
+P3 の seam: 実処理が使う `with_background_menu` で bind/query 後だけ呼び出しへ進む。
+`invoke_canonical_verb` の `InvokeCommand` 自体を closure 引数で差し替え、製品と同じ
+`CMINVOKECOMMANDINFO` の構築と前後の callback を headless で通す。実 Shell・製品・画面は起動しない。
+MenuGuard と Shell interfaces の破棄順序は popup → interfaces を維持する。
+
+追加・置き換えたテスト (コードの記録であり、実行結果ではない):
+
+```text
+shell_paste_real_invocation_boundary_orders_observers_on_success_and_failure
+shell_paste_real_background_boundary_skips_observers_on_bind_and_query_failure
+shell_paste_has_no_foreground_mutation_path
+shell_paste_handler_records_read_only_diagnostics_once_separately_from_end
+shell_paste_handler_failed_invocation_records_diagnostics_and_failed_outcome
+shell_paste_handler_disabled_diagnostics_do_not_query_foreground
+shell_paste_outcome_perf_tags_describe_invocation
+```
+
+最後の outcome 対応テストは既存のまま維持。復帰の判定表・復帰 handler テストは削除した。
+境界テストは成功・失敗の before → invoke → after の一回ずつの順序、bind/query 失敗時の callback 不在、
+after が計測出力・menu 破棄より先であることを検査する。handler は 3 入口の診断の一回だけの発行、
+値 (前面 NULL・main disabled・main 以外で開始も含む)、別 event と end の分離、outcome を検査する。
+読み取り専用 adapter に設定 API はなく、worker・完了 handler に前面変更 API が無いこともソースで検査する。
+
+検証 (設計担当が run-heavy で実行、544cb085e): 関連 lib (`shell_paste|main_drop|file_operation_selection_tests|native_context_menu|post_operation_selection`) 123 passed、
+`--features test-script` の `shell_paste|clipboard_capture` 175 passed、実 Shell の ignored 2 件はそれぞれ単独で passed。
+旧コードへ戻して落ちる破壊検証、lib 全件、ui-smoke、サブ PC・製品での確認は未実施。
+
+独立レビュー (GPT-6.1 Sol / xhigh、read-only、実装とは別の担当、2026-11-25):
+r1 (e0036a17a) REJECT。P2-1 `GA_ROOTOWNER == main` は操作の由来を識別しない (native 動画の全画面窓など main を owner に持つ別 thread の窓から奪い得る)、
+P2-2 `InvokeCommand` の戻りは Shell の画面の役目が終わった証拠ではない、P3 採取境界のテストが本物の経路を通らない。
+設計担当は前面の返却を外し、診断だけを残した (544cb085e)。r2 (544cb085e) ACCEPT、P1〜P3 なし。
+承認の対象は診断と outcome の変更で、**R3-3 は未修正**。サブ PC の再確認で `shell_paste/foreground_after_invoke` を見て理由を判別してから直し方を決める。

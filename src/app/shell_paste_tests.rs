@@ -4,7 +4,9 @@ use super::*;
 use crate::app::{AppTestEnvForTest, NormalFolderOmittedEntries, setup_app_for_test};
 use crate::post_operation_selection::ExpectedOutputs;
 use crate::shell_file_ops::{ShellTransferOperation, ShellTransferRequest};
-use crate::shell_paste::{ShellPasteError, ShellPasteService};
+use crate::shell_paste::{
+    ForegroundApi, ForegroundSnapshot, ShellPasteError, ShellPasteResult, ShellPasteService,
+};
 use crate::ui_dialogs::file_organize::{
     FileOrganizeRequest, FileOrganizeRunning, FileOrganizeSelection,
 };
@@ -67,6 +69,220 @@ fn finish_paste(app: &mut App, ctx: &egui::Context, worker: &PasteWorker, succee
             "fake paste completion was not consumed"
         );
         std::thread::yield_now();
+    }
+}
+
+type ForegroundTrace =
+    std::sync::Arc<std::sync::Mutex<Vec<(&'static str, isize, std::thread::ThreadId)>>>;
+
+struct HandlerForeground {
+    diagnostics_enabled: bool,
+    started_from_main: bool,
+    foreground_hwnd: isize,
+    main_enabled: bool,
+    trace: ForegroundTrace,
+    events: mpsc::Sender<serde_json::Value>,
+}
+
+impl HandlerForeground {
+    fn record(&self, operation: &'static str, hwnd: isize) {
+        self.trace
+            .lock()
+            .unwrap()
+            .push((operation, hwnd, std::thread::current().id()));
+    }
+}
+
+impl ForegroundApi for HandlerForeground {
+    fn diagnostics_enabled(&self) -> bool {
+        self.diagnostics_enabled
+    }
+
+    fn started_from_main(&self, main_hwnd: isize) -> bool {
+        self.record("start", main_hwnd);
+        self.started_from_main
+    }
+
+    fn snapshot(&self, main_hwnd: isize) -> ForegroundSnapshot {
+        self.record("snapshot", main_hwnd);
+        ForegroundSnapshot {
+            main_thread: 10,
+            current_process: 100,
+            foreground_hwnd: self.foreground_hwnd,
+            foreground_thread: 11,
+            foreground_process: 100,
+            root_owner_hwnd: if self.foreground_hwnd == 0 {
+                0
+            } else {
+                main_hwnd
+            },
+            foreground_visible: self.foreground_hwnd != 0,
+            main_enabled: self.main_enabled,
+        }
+    }
+
+    fn class_name(&self, hwnd: isize) -> String {
+        self.record("class", hwnd);
+        if hwnd == 0 {
+            "<none>".into()
+        } else {
+            format!("fake-{hwnd}")
+        }
+    }
+
+    fn emit_after_invoke(&self, kind: &'static str, fields: &[(&str, serde_json::Value)]) {
+        self.record("emit", 0);
+        let fields = fields
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect::<serde_json::Map<_, _>>();
+        self.events
+            .send(serde_json::json!({"kind": kind, "fields": fields}))
+            .unwrap();
+    }
+}
+
+fn assert_handler_foreground_diagnostics(
+    invocation: ShellPasteResult,
+    diagnostics_enabled: bool,
+    foreground_hwnd: isize,
+    started_from_main: bool,
+    main_enabled: bool,
+) {
+    for origin in [
+        ShellPasteOrigin::Tree,
+        ShellPasteOrigin::CtrlV,
+        ShellPasteOrigin::GridMenu,
+    ] {
+        let mut app = ready();
+        let ctx = egui::Context::default();
+        let trace = ForegroundTrace::default();
+        let invoked_trace = trace.clone();
+        let result = invocation.clone();
+        let (event_tx, event_rx) = mpsc::channel();
+        app.shell_paste_service = ShellPasteService::with_test_invoker_and_foreground(
+            move |hwnd, _| {
+                invoked_trace
+                    .lock()
+                    .unwrap()
+                    .push(("invoke", hwnd, std::thread::current().id()));
+                result.clone()
+            },
+            HandlerForeground {
+                diagnostics_enabled,
+                started_from_main,
+                foreground_hwnd,
+                main_enabled,
+                trace: trace.clone(),
+                events: event_tx,
+            },
+        );
+        SHELL_PASTE_END_FIELDS.with_borrow_mut(Vec::clear);
+        enter(&mut app, &ctx, origin);
+        let deadline = Instant::now() + WAIT;
+        while app.shell_paste_request.is_some() {
+            app.poll_shell_paste(&ctx);
+            assert!(
+                Instant::now() < deadline,
+                "fake paste completion was not consumed"
+            );
+            std::thread::yield_now();
+        }
+        let calls = trace.lock().unwrap().clone();
+        let expected: &[&str] = if diagnostics_enabled {
+            &["start", "invoke", "snapshot", "class", "class", "emit"]
+        } else {
+            &["invoke"]
+        };
+        assert_eq!(
+            calls.iter().map(|call| call.0).collect::<Vec<_>>(),
+            expected
+        );
+        assert!(calls.iter().all(|call| call.2 == calls[0].2));
+        assert_ne!(calls[0].2, std::thread::current().id());
+        if diagnostics_enabled {
+            let is_null = foreground_hwnd == 0;
+            let event = event_rx
+                .try_recv()
+                .expect("one foreground_after_invoke event");
+            assert_eq!(event["kind"], "foreground_after_invoke");
+            assert_eq!(
+                event["fields"],
+                serde_json::json!({
+                    "started_from_main": started_from_main,
+                    "foreground_class": if is_null { "<none>" } else { "fake-2" },
+                    "root_owner_class": if is_null { "<none>" } else { "fake-1" },
+                    "root_owner_is_main": !is_null,
+                    "foreground_visible": !is_null,
+                    "main_enabled": main_enabled,
+                    "foreground_is_null": is_null,
+                    "same_thread": if is_null { None } else { Some(false) },
+                    "same_process": if is_null { None } else { Some(true) },
+                })
+            );
+        }
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        SHELL_PASTE_END_FIELDS.with_borrow(|events| {
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["origin"], origin.perf_tag());
+            assert_eq!(
+                events[0]["outcome"],
+                if invocation.is_ok() {
+                    "invoked"
+                } else {
+                    "failed"
+                }
+            );
+            assert_eq!(events[0].as_object().unwrap().len(), 3);
+            assert!(events[0].get("focus_return").is_none());
+            assert!(events[0].get("started_from_main").is_none());
+        });
+        assert_eq!(app.post_operation_selection.is_some(), invocation.is_ok());
+        app.poll_shell_paste(&ctx);
+        assert_eq!(trace.lock().unwrap().len(), expected.len());
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        SHELL_PASTE_END_FIELDS.with_borrow(|events| assert_eq!(events.len(), 1));
+    }
+}
+
+#[test]
+fn shell_paste_handler_records_read_only_diagnostics_once_separately_from_end() {
+    for (hwnd, started, enabled) in [(2, true, true), (2, false, false), (0, true, false)] {
+        assert_handler_foreground_diagnostics(Ok(()), true, hwnd, started, enabled);
+    }
+}
+
+#[test]
+fn shell_paste_handler_failed_invocation_records_diagnostics_and_failed_outcome() {
+    assert_handler_foreground_diagnostics(
+        Err(ShellPasteError::Invocation("fake failure".into())),
+        true,
+        2,
+        true,
+        true,
+    );
+}
+
+#[test]
+fn shell_paste_handler_disabled_diagnostics_do_not_query_foreground() {
+    assert_handler_foreground_diagnostics(Ok(()), false, 2, true, true);
+}
+
+#[test]
+fn shell_paste_outcome_perf_tags_describe_invocation() {
+    for (outcome, expected) in [
+        (ShellPasteOutcome::Invoked, "invoked"),
+        (ShellPasteOutcome::Failed, "failed"),
+        (ShellPasteOutcome::StartFailed, "start_failed"),
+        (ShellPasteOutcome::Disconnected, "disconnected"),
+    ] {
+        assert_eq!(outcome.perf_tag(), expected);
     }
 }
 
@@ -687,6 +903,7 @@ fn shell_paste_disconnected_completion_warns_and_retires_its_selection() {
     let (_tx, disconnected) = mpsc::channel();
     drop(_tx);
     app.shell_paste_request.as_mut().unwrap().rx = disconnected;
+    SHELL_PASTE_END_FIELDS.with_borrow_mut(Vec::clear);
     super::take_modifier_resync_calls_for_test();
     app.poll_shell_paste(&ctx);
     assert!(app.shell_paste_request.is_none());
@@ -696,6 +913,11 @@ fn shell_paste_disconnected_completion_warns_and_retires_its_selection() {
         "貼り付けを完了できませんでした"
     );
     assert_eq!(super::take_modifier_resync_calls_for_test(), 1);
+    SHELL_PASTE_END_FIELDS.with_borrow(|events| {
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["outcome"], "disconnected");
+        assert!(events[0].get("focus_return").is_none());
+    });
     // Release the detached fake worker; it still never reaches the real Shell.
     worker.finish.send(Ok(())).unwrap();
 }

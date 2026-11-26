@@ -4,7 +4,7 @@
 
 URL・外部プレイヤー・ツイート・Google マップの Shell 呼び出しは、COM STA を初期化した短命の
 `external-open-*` worker に置く。UI は HTTP(S) の検査と投入だけを行い、終了時も join しない。
-マップの失敗だけ App 共通の受信口へ返し、early return 前の root poll で従来の警告を出す。
+マップと AI アプリの失敗、Web の AI のコピー結果を App 共通の受信口へ返し、early return 前の root poll で警告・トーストを出す。
 `ext/open_end` の分類は予約キー `kind` と衝突しない `target_kind` に記録する。
 
 起動引数・activation・agent・main のブックマークと既定の場所は、既存 `startup-open-resolve` が解決から
@@ -65,6 +65,12 @@ r13の動画9操作（再生/ループ/全シーク）はEOF/次採用を促進�
 ClaudeCodeの791529cf1 release計測では、変更なしevent識別が中央値0.8〜0.9μs・p95最大2.1μs。設計担当共有では初回はテストのimport誤りでコンパイルできず、importのみ修正後に8377e5fb7で関連252テスト成功。
 独立実装レビュー指摘へr13で対応中で、今回差分のRust検証・event_execute費用の実測・実機は未実施。入れ物表、A監査、テスト依頼は
 [操作スクリプト計画§16](operation-script-plan.md#operation-script-stage4) を参照。
+
+ヘルプの「AI で調べる」（§1.894）の型付き AI アプリ URL と、AI 連携の窓の Codex 設定も同じ
+`external-open-*` worker に乗せる。Web の AI はその worker 内で、画像コピーと共有する世代照合付きの
+テキスト書き込みを終え、結果を App の共通受信口へ送ってから開く。UI は世代の予約だけで mutex を待たない。
+登録検出はサブメニュー描画から AI 連携の窓と共通の worker を始め、結果の採用も描画時の `try_recv` だけで行う。
+追加部分の自動検証と実行時の挙動は未確認。共有 runner とサブ PC で確認予定。
 
 ## スタック用スクリプトのファイル操作（§1.843）
 
@@ -748,7 +754,19 @@ Ctrl+S空クエリの空列だけは定数サイズの準備を同期実行す�
 
 §1.464 のツリー D&D は ROOT の表示済み pass の形と在メモリの受付情報だけで判定し、callback はファイルシステムに触らない。ボリューム照会・実体パス検証・転送は Shell worker に置く。
 本棚パスの `book_root_path()` は既定で同期の既知フォルダ解決へ到達するため、毎 pass の述語・行の形・「貼り付け」の有効判定には含めない。利用者決定により、転送の投入時とツリーの「貼り付け」を押した時だけ、既存の操作境界と同じ関数を一回呼んで本棚自身・配下を拒否する。起動前 pin・resolver の共有・受付の保留は作らない。Ctrl+V は既存の `current_favorite_target()` で確認済みなので共通貼り付け関数から繰り返さない。
-ツリーの右クリック「貼り付け」・一覧の Ctrl+V・一覧メニューの「貼り付け」は `start_shell_paste` に集約し、Shell の bind・query・`InvokeCommand` を常駐 `shell-paste` STA thread へ投入する。`OleInitialize` とメッセージポンプを保ち、呼び出しが戻った後も Shell の転送 proxy が使う apartment を生かす。UI は初期化・呼び出し・終了を待たない。worker が Shell に渡す時点のクリップボードを使い、読み取り・照合はしない。貼り付け中の追加要求と整理・D&D 転送の受付、mIV 自身のファイルの切り取り・コピーは通知して断る。画像・テキストのコピー、外部アプリのクリップボード変更は止めない。完了は転送完了ではなく動詞の呼び出しの完了で、root poll で修飾キーを同期し、失敗時は自分の番号の選択要求だけを取り下げる。ツリーの形式照会は従来どおりメニューを開いた時だけ行う。[設計 §2](ui-sync-853-plan.md) と [ツリー設計 §7](folder-tree-dnd-plan.md) を参照。コンパイル・Rust テスト・実 Shell 検証は未実施。
+ツリーの右クリック「貼り付け」・一覧の Ctrl+V・一覧メニューの「貼り付け」は `start_shell_paste` に集約し、Shell の bind・query・`InvokeCommand` を常駐 `shell-paste` STA thread へ投入する。`OleInitialize` とメッセージポンプを保ち、呼び出しが戻った後も Shell の転送 proxy が使う apartment を生かす。UI は初期化・呼び出し・終了を待たない。worker が Shell に渡す時点のクリップボードを使い、読み取り・照合はしない。貼り付け中の追加要求と整理・D&D 転送の受付、mIV 自身のファイルの切り取り・コピーは通知して断る。画像・テキストのコピー、外部アプリのクリップボード変更は止めない。完了は転送完了ではなく動詞の呼び出しの完了で、root poll で修飾キーを同期し、失敗時は自分の番号の選択要求だけを取り下げる。ツリーの形式照会は従来どおりメニューを開いた時だけ行う。[設計 §2・§5.13](ui-sync-853-plan.md) と [ツリー設計 §7](folder-tree-dnd-plan.md) を参照。コンパイル・Rust テスト・実 Shell 検証は未実施。
+
+Shell 貼り付け完了時の前面の返却は独立レビューの P2-1・P2-2 を受けて外し、R3-3 は未修正。
+root owner が main でも操作の由来は示せず、`InvokeCommand` の戻りも Shell UI 終了・転送完了の証拠にはならない。
+`0a065beed`・`e0036a17a` の復帰判定は試して外した案で、現在は前面を変えない診断だけを持つ。
+main HWND は bind と invocation の owner に渡すが、サブ PC 担当の Claude の perf ログでは戻り時にも
+`focused:false` で約 0.9 秒戻らなかった。理由は未特定で、(a) 進捗窓が残る、(b) main が disabled、(c) その他を
+サブ PC の再確認で判別してから構造的な直し方を決める。[設計 §5.13](ui-sync-853-plan.md) を参照。
+perf 有効時だけ、本物の `InvokeCommand` 直前と戻り直後 (計測出力・menu 破棄より前) に読み取り、
+`shell_paste/foreground_after_invoke` へ開始時の前面、終了時の前面/root owner のクラス名と根が main か、
+visible/enabled・process/thread 比較・前面 NULL かを一行で出す。未呼び出し時の診断 event は無い。
+`shell_paste/end` の `focus_return` は削除し、R3-2 の `outcome=invoked|failed|start_failed|disconnected` は維持する。
+`invoked` は呼び出し成功のみで転送の成否・中止を含まない。今回のコンパイル・テスト・レビュー・実機確認は未実施。
 
 文字起こし表示（T1区切り3）のDB SELECTと署名取得は単一readerで行い、UI/presenterは不変のsnapshotとArc本文だけを使う。
 再生原点は既存decoderから取得し、描画で再probeしない。nativeとmusicは可変高一覧rendererを共有する。

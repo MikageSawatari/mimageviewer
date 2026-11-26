@@ -257,6 +257,10 @@ pub enum FileOperationRefusal {
     SearchContainer,
     /// A collection reference whose physical source is currently missing or unavailable.
     CollectionSourceUnavailable,
+    /// A volume/share root, or an ambiguous drive-relative root such as `C:`.
+    VolumeRoot,
+    /// An application-generated location without a physical filesystem item.
+    VirtualLocation,
 }
 
 impl FileOperationRefusal {
@@ -275,7 +279,27 @@ impl FileOperationRefusal {
             Self::CollectionSourceUnavailable => {
                 format!("見つからないコレクション項目は{action}できません")
             }
+            Self::VolumeRoot => format!("ドライブや共有のルートは{action}できません"),
+            Self::VirtualLocation => format!("仮想の場所は{action}できません"),
         }
+    }
+}
+
+/// 削除・切り取り・名前の変更・移動の対象にできないパスなら理由を返す。
+/// String/component operations only: junctions and mounted folders remain ordinary items.
+pub(crate) fn structural_file_operation_path_refusal(path: &Path) -> Option<FileOperationRefusal> {
+    let path = crate::path_key::lexical_normalize(path);
+    let rooted_or_prefixed = path.has_root()
+        || matches!(
+            path.components().next(),
+            Some(std::path::Component::Prefix(_))
+        );
+    if rooted_or_prefixed && crate::path_key::is_drive_or_share_root(&path) {
+        Some(FileOperationRefusal::VolumeRoot)
+    } else if crate::app::is_synthetic_view_path_normalized(&path) {
+        Some(FileOperationRefusal::VirtualLocation)
+    } else {
+        None
     }
 }
 
@@ -489,6 +513,14 @@ impl GridItem {
                 Some(FileOperationRefusal::CollectionSourceUnavailable)
             }
         }
+    }
+
+    /// Destructive file operations share kind and structural path refusals. Copy stays separate.
+    pub(crate) fn structural_file_operation_refusal(&self) -> Option<FileOperationRefusal> {
+        self.file_operation_refusal().or_else(|| {
+            self.drag_source_path()
+                .and_then(structural_file_operation_path_refusal)
+        })
     }
 
     /// 項目の種類だけで決まる、フォルダ以外のチェック対象か。
@@ -1065,7 +1097,117 @@ pub(crate) fn grid_item_checkable(item: &GridItem, folders_allowed: bool) -> boo
 
 #[cfg(test)]
 mod tests {
+    // §1.898: 実ドライブのルートは判定だけに渡す。本物の Shell を実パスに呼ばせない。
+    // 実行経路のテストは一時フォルダ内の偽パスと差し替えを使う。
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn structural_file_operation_path_refusal_volume_roots_and_ordinary_paths() {
+        for path in [
+            r"C:\",
+            r"C:",
+            r"\\?\C:\",
+            r"\\server\share",
+            r"\\server\share\",
+            r"\\?\UNC\server\share\",
+            r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\",
+            r"X:\",
+            r"C:\photos\..",
+            r"\\server\share\dir\..",
+            r"C:\..\..",
+        ] {
+            assert_eq!(
+                structural_file_operation_path_refusal(Path::new(path)),
+                Some(FileOperationRefusal::VolumeRoot),
+                "{path}"
+            );
+            let item = GridItem::Folder(path.into());
+            assert_eq!(
+                item.structural_file_operation_refusal(),
+                Some(FileOperationRefusal::VolumeRoot)
+            );
+            assert!(item.drag_source_path().is_some(), "copy retains {path}");
+        }
+        for path in [
+            r"C:\foo",
+            r"C:\foo\..\bar",
+            r"\\server\share\dir",
+            r"C:\foo.jpg",
+            r"C:\mnt\vol",
+            r"\\?\C:\foo\..",
+        ] {
+            assert_eq!(
+                structural_file_operation_path_refusal(Path::new(path)),
+                None,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            GridItem::PdfPage {
+                pdf_path: "book.pdf".into(),
+                page_num: 0,
+                content_type: None,
+            }
+            .structural_file_operation_refusal(),
+            Some(FileOperationRefusal::VirtualPage)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_relative_paths_are_not_volume_roots() {
+        // 911284580 は . と foo\.. を空に正規化し、VolumeRoot と誤判定する。
+        for path in ["", ".", r"foo\..", "foo"] {
+            assert_eq!(
+                structural_file_operation_path_refusal(Path::new(path)),
+                None,
+                "{path}"
+            );
+            assert_eq!(
+                GridItem::Folder(path.into()).structural_file_operation_refusal(),
+                None
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn structural_file_operation_path_refusal_synthetic_normalizes_both_sides() {
+        let _guard = crate::data_dir::TestDataDirGuard::new();
+        for (data_dir, equivalent) in [(r".\data", r"data"), (r"C:\x\..\data", r"C:\data")] {
+            crate::data_dir::set_test_override(Some(data_dir.into()));
+            for name in [
+                "__drive_list__",
+                "__search_results__",
+                "__reading_history__",
+                "__bookmarks__",
+                "__rating_view__",
+                "__subfolder_expansion__",
+                r"__smart_folder__\01234567-89ab-cdef-0123-456789abcdef",
+            ] {
+                for base in [data_dir, equivalent] {
+                    let path = Path::new(base).join(name);
+                    for spelling in [
+                        path.clone(),
+                        PathBuf::from(format!("{}\\", path.display())),
+                        PathBuf::from(path.to_string_lossy().to_uppercase().replace('\\', "/")),
+                        Path::new(base).join("child").join("..").join(name),
+                    ] {
+                        assert_eq!(
+                            structural_file_operation_path_refusal(&spelling),
+                            Some(FileOperationRefusal::VirtualLocation),
+                            "data_dir={data_dir}, path={spelling:?}"
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                structural_file_operation_path_refusal(&Path::new(equivalent).join("ordinary")),
+                None
+            );
+        }
+    }
 
     #[test]
     fn folder_name() {

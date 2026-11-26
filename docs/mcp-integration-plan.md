@@ -1658,15 +1658,20 @@ tool searchで後から読むdescriptionは16,384文字だが、検索時にも�
 - **登録・解除の流れ**:
   1. 押すと確認の窓 (TensorRT の pack の削除と同じ形) に、書き換えるファイルの path と、足す / 消す内容を出す。
   2. 「書き換える」で worker が次を順に行う: (a) 対象のアプリが動いていないことを確かめる。動いていれば書かずに
-     「<アプリ> を終了してから押してください」(終了の待ち合わせ・自動終了はしない)。(b) ファイルを読み直す。(c) 前の内容を
-     `<ファイル>.mimageviewer.bak` に上書きで 1 つ残す。(d) 一時ファイルに書いて既存の `replace_file_atomic` で置き換える。
-  3. 結果を行に出す。成功なら「<アプリ> を起動して、新しいチャットで mIV の tool が出るか確かめてください」。
+     「<アプリ> を終了してから押してください」(終了の待ち合わせ・自動終了はしない)。(b) 登録先を解決し直し、確認の窓の path と違えば書かずに止める。(c) ファイルを読み直す。(d) `<ファイル>.mimageviewer.orig.bak`
+     が無ければ最も古い控えとして先に作り (中身は以前の版の `.mimageviewer.bak` が在ればそれ、無ければ今の内容)、続けて前の内容を
+     `<ファイル>.mimageviewer.bak` に上書きで残す。無いファイルは空の控えになる (§1.895 で 1 つから 2 つへ。規則と、登録先を書き込みの直前に解決し直すことは [agent-registration-895-plan.md](agent-registration-895-plan.md) §3.1・§3.4)。(e) 一時ファイルに書いて既存の `replace_file_atomic` で置き換える。
+  3. 結果を行に出す。登録の成功は「<アプリ> を起動して、新しいチャットで mIV の tool が出るか確かめてください」(Claude Desktop には
+     再確認の案内を続ける)、解除の成功は「登録を外しました。<アプリ> を起動し直すと mIV の tool は出なくなります」(§1.895)。
   - 失敗はまれな失敗の既定の割り切り (ログ + 表示、再試行しない)。ログに設定ファイルの中身は出さない。
+  - 解除で `mimageviewer` を実際に消し、親の `mcpServers` / `mcp_servers` が空になった場合は親ごと消す (対象項目が無い場合は変更しない)。
+    ChatGPT の親に利用者のコメントが付いている場合は、空でも親を残す ([agent-registration-895-plan.md §9](agent-registration-895-plan.md#9-追加修正-解除で空になった親を残さない-2026-11-26))。
 - **Claude Desktop**:
   - **インストール形態と設定ファイルを対応させる** (設計レビュー 12 巡目 P2-4):
     - Squirrel 版 (`%LOCALAPPDATA%\AnthropicClaude` が在る) → `%APPDATA%\Claude\claude_desktop_config.json`。
-    - MSIX 版 (`%LOCALAPPDATA%\Packages\Claude_*` が 1 つだけ在る) → その package の
-      `LocalCache\Roaming\Claude\claude_desktop_config.json`。
+    - MSIX 版 (`%LOCALAPPDATA%\Packages\Claude_*` が 1 つだけ在る) → `%LOCALAPPDATA%\Claude-Data\<package のフォルダ名>\` が在れば
+      その下の `claude_desktop_config.json` (今の版)、無ければ その package の `LocalCache\Roaming\Claude\claude_desktop_config.json`
+      (以前の版)、どちらも無ければ自動で登録しない (§1.895 で変更。[agent-registration-895-plan.md](agent-registration-895-plan.md) §3.1)。
     - 両方が在る・`Claude_*` が複数在る → 自動の登録・解除をせず「Claude が複数の形で入っています。手順を見て、お使いの
       Claude の設定ファイルに書いてください」と出し、候補の path を「手順を見る」に並べる。
     - どちらも無い → 「見つからない」。
@@ -1696,7 +1701,9 @@ tool searchで後から読むdescriptionは16,384文字だが、検索時にも�
   - 「設定を開く」ボタンで `codex://settings` を開く (既存の `open_url` は http(s) だけを通すので、この固定の 1 つだけを
     `opener` で開く)。
 - **手順を見る**: 自動登録を使わない人向けに、設定ファイルの path、足す内容 (JSON / TOML、選択できる表示 + コピー)、
-  各アプリの画面での手順 (Claude: 終了 → 書く → 起動、ChatGPT: Settings > MCP servers > Add server > STDIO → 再起動) を出す。
+  各アプリの画面での手順 (Claude: 終了 → 書く → 起動。Claude が読むファイルは 設定 →「デスクトップアプリ」→「拡張機能」の「管理」→「ローカル MCP サーバー」の
+  「設定を編集」で開ける。ChatGPT: 設定 →「連携」→「プラグイン」の「MCP」のタブで追加 (STDIO) → 再起動) を出す。メニュー名は §1.895 の
+  サブ PC の確認 (2026-11-25) による。
 - 段階 0 の試験で使った `mimageviewer-trial` の項目は扱わない (利用者が手で消し済み)。
 - Grok は対象外で、行も置かない (§11.1 U5)。
 

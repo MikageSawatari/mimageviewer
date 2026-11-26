@@ -390,7 +390,7 @@ preferences_policy! {
         grid_cursor_wrap: bool => ("サムネイルのカーソル折り返し", |_, _| true, plain, plain);
         remember_favorite_view_state: bool => ("お気に入りごとの表示設定", |_, _| true, plain, plain);
         details_name_colors: crate::details_name_colors::DetailsNameColors => ("詳細一覧の名前色", |v, _raw| v.valid_standard_custom(), plain, plain);
-        folder_cell_background: crate::folder_cell_background::FolderCellBackground => ("サムネイルのフォルダ背景", |v, _raw| v.valid(), plain, plain);
+        folder_cell_background: crate::folder_cell_background::FolderCellBackground => ("サムネイルのフォルダ背景", |_v, _raw| true, plain, plain);
         grid_display_order: GridDisplayOrder => ("カテゴリの表示順", |v, _raw| v == &v.normalized(), plain, plain);
         video_thumbnail_indicator: VideoThumbnailIndicator => ("動画サムネイルの表示", |v, _raw| !matches!(v, VideoThumbnailIndicator::Unknown), plain, plain);
         audio_thumbnail_indicator: AudioThumbnailIndicator => ("音声サムネイルの表示", |v, _raw| !matches!(v, AudioThumbnailIndicator::Unknown), plain, plain);
@@ -2188,14 +2188,14 @@ mod tests {
     }
 
     #[test]
-    fn folder_cell_background_transfer_roundtrip_and_invalid_rejection() {
+    fn folder_cell_background_transfer_low_contrast_roundtrip_and_shape_rejection() {
         use crate::folder_cell_background::FolderCellBackground;
         for enabled in [false, true] {
             let mut source = Settings::default();
             source.folder_cell_background = FolderCellBackground {
                 enabled,
-                light: [255, 255, 230],
-                dark: [30, 35, 20],
+                light: [255, 230, 140],
+                dark: [220, 220, 220],
             };
             let exported = export_preferences(&source).unwrap();
             assert!(exported.issues.is_empty());
@@ -2209,8 +2209,6 @@ mod tests {
                 source.folder_cell_background
             );
             for invalid in [
-                json!({"enabled": enabled, "light": [255,240,179], "dark": [58,52,32]}),
-                json!({"enabled": enabled, "light": [255,244,204], "dark": [220,220,220]}),
                 json!({"enabled": enabled, "light": [256,244,204], "dark": [58,52,32]}),
                 json!({"enabled": "yes"}),
             ] {
@@ -2224,15 +2222,6 @@ mod tests {
                     source.folder_cell_background
                 );
             }
-            destination.folder_cell_background.light = [255, 240, 179];
-            let rejected = export_preferences(&destination).unwrap();
-            assert_eq!(rejected.issues.len(), 1);
-            assert!(
-                !serde_json::from_str::<serde_json::Value>(&rejected.json).unwrap()["preferences"]
-                    .as_object()
-                    .unwrap()
-                    .contains_key("folder_cell_background")
-            );
         }
     }
 

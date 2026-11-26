@@ -10930,6 +10930,10 @@ impl App {
                                                 ui.close();
                                             }
                                         }
+                                        MenuCommandId::HelpAskAi => {
+                                            let label = self.keymap.menu_command_label(MenuCommandId::HelpAskAi);
+                                            ui.menu_button(label, |ui| self.draw_ask_ai_menu(ui));
+                                        }
                                         MenuCommandId::HelpOpenLogs => {
                                             ui.separator();
                                             if ui.button(&help_open_logs_menu_label).clicked() {
@@ -14332,7 +14336,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .hover_tip(destination.to_string_lossy().to_string())
             .clicked();
         if clicked {
-            self.start_folder_pane_open(destination);
+            self.start_capture_destination_open(destination);
         }
         clicked
     }

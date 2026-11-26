@@ -1,6 +1,58 @@
 use super::*;
 use egui_kittest::kittest::{NodeT, Queryable};
 
+#[test]
+fn ask_ai_codex_settings_button_opens_once_on_worker_without_waiting() {
+    use crate::external_links::{
+        AiAppLink, ExternalOpenFailure, FailureSink, OpenTarget, TestOpenerGuard,
+    };
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
+    let settings = Settings::default();
+    let selection = PermissionSelection::from(&settings);
+    let state = injected(&settings);
+    let (tx, rx) = mpsc::channel();
+    let sink = FailureSink {
+        tx,
+        ctx: egui::Context::default(),
+    };
+    let (called_tx, called_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Mutex::new(release_rx);
+    let caller = std::thread::current().id();
+    let _opener = TestOpenerGuard::install(move |target| {
+        assert_ne!(caller, std::thread::current().id());
+        assert!(matches!(
+            target,
+            OpenTarget::AiApp(AiAppLink::CodexSettings)
+        ));
+        called_tx.send(()).unwrap();
+        release_rx
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        Err("codex://settings rejected".into())
+    });
+    let mut harness = crate::test_ui::builder()
+        .with_size(egui::vec2(1000.0, 600.0))
+        .with_context_setup(crate::ui_fonts::configure_fonts)
+        .build_ui_state(
+            move |ui, state| draw_app(ui, &selection, state, AppTarget::ChatGpt, Some(&sink)),
+            state,
+        );
+    harness.run();
+    harness.get_by_label("設定を開く").click();
+    harness.run();
+    called_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(called_rx.try_recv().is_err());
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        ExternalOpenFailure::ChatGptApp
+    );
+}
+
 fn painted_text(output: &egui::FullOutput) -> Vec<&egui::epaint::TextShape> {
     fn collect<'a>(shape: &'a egui::Shape, texts: &mut Vec<&'a egui::epaint::TextShape>) {
         match shape {
@@ -522,6 +574,127 @@ fn agent_exposure_all_sixty_four_permission_combinations() {
         }
     }
     assert_eq!(count, 64);
+}
+
+#[test]
+fn agent_registration_instructions_show_confirmed_app_menu_paths() {
+    for (target, instructions) in [
+        (
+            AppTarget::ClaudeDesktop,
+            "Claude を終了 → 設定ファイルに追記 → Claude を起動。Claude が読む設定ファイルは、Claude の 設定 →「デスクトップアプリ」→「拡張機能」の「管理」→「ローカル MCP サーバー」の「設定を編集」で開けます。下のパスと違う場合は、そちらに書いてください。確認の画面が出たら「常に許可」を選んでください。",
+        ),
+        (
+            AppTarget::ChatGpt,
+            "設定 →「連携」→「プラグイン」の「MCP」のタブでサーバーを追加し (STDIO)、再起動してください。",
+        ),
+    ] {
+        let settings = Settings::default();
+        let selection = PermissionSelection::from(&settings);
+        let state = injected(&settings);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(900.0, 1200.0))
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .build_ui_state(
+                move |ui, state| draw_app(ui, &selection, state, target, None),
+                state,
+            );
+        harness.run_steps(5);
+        assert!(harness.query_by_label(instructions).is_none());
+        harness.get_by_label("手順を見る").click();
+        harness.run_steps(5);
+        assert_eq!(harness.state().instructions, Some(target));
+        assert!(
+            harness
+                .ctx
+                .content_rect()
+                .contains_rect(harness.get_by_label(instructions).rect())
+        );
+        assert_eq!(harness.state().mock_backend.as_ref().unwrap().writes, 0);
+        harness.get_by_label("手順を見る").click();
+        harness.run_steps(3);
+        assert!(harness.state().instructions.is_none());
+        assert!(harness.query_by_label(instructions).is_none());
+    }
+}
+
+#[test]
+fn agent_registration_open_settings_feedback_uses_injected_opener() {
+    let guidance = "設定が開いたら、左の「連携」→「プラグイン」→「MCP」のタブを選んでください";
+    for succeeds in [false, true] {
+        let settings = Settings::default();
+        let selection = PermissionSelection::from(&settings);
+        let mut state = injected(&settings);
+        state.feedback = Some((AppTarget::ClaudeDesktop, Ok("previous feedback".into())));
+        let mut calls = 0;
+        open_codex_settings(&mut state, |target| {
+            calls += 1;
+            assert!(matches!(
+                target,
+                crate::external_links::OpenTarget::AiApp(
+                    crate::external_links::AiAppLink::CodexSettings
+                )
+            ));
+            if succeeds {
+                Ok(())
+            } else {
+                Err("injected failure".into())
+            }
+        });
+        assert_eq!(calls, 1);
+        let expected = if succeeds {
+            Ok(guidance.to_owned())
+        } else {
+            Err("設定を開けませんでした: injected failure".to_owned())
+        };
+        assert_eq!(state.feedback, Some((AppTarget::ChatGpt, expected.clone())));
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(900.0, 600.0))
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .build_ui_state(
+                move |ui, state| draw_app(ui, &selection, state, AppTarget::ChatGpt, None),
+                state,
+            );
+        harness.run_steps(5);
+        let message = match &expected {
+            Ok(message) | Err(message) => message,
+        };
+        assert!(
+            harness
+                .ctx
+                .content_rect()
+                .contains_rect(harness.get_by_label(message).rect())
+        );
+        assert!(harness.query_by_label("previous feedback").is_none());
+        assert_eq!(harness.state().mock_backend.as_ref().unwrap().writes, 0);
+    }
+}
+
+#[test]
+fn agent_registration_local_cache_guidance_is_visible_in_the_registered_row_without_writes() {
+    let settings = Settings::default();
+    let selection = PermissionSelection::from(&settings);
+    let mut state = injected(&settings);
+    let guidance = "Claude Desktop を更新した後で mIV の tool が出ない場合は、Claude を一度起動して終了してから「再確認」を押してください";
+    if let DetectionState::Ready(_, detection) = &mut state.detection {
+        detection.apps[0].message = Some(guidance.into());
+    }
+    let mut harness = crate::test_ui::builder()
+        .with_size(egui::vec2(900.0, 600.0))
+        .with_context_setup(crate::ui_fonts::configure_fonts)
+        .build_ui_state(
+            move |ui, state| draw_app(ui, &selection, state, AppTarget::ClaudeDesktop, None),
+            state,
+        );
+    harness.run_steps(5);
+    let registered = harness.get_by_label("登録済み").rect();
+    let notice = harness.get_by_label(guidance).rect();
+    let register = harness.get_by_label("登録する").rect();
+    assert!(registered.bottom() <= notice.top());
+    assert!(notice.bottom() <= register.top());
+    assert!(harness.ctx.content_rect().contains_rect(notice));
+    assert!(harness.state().feedback.is_none());
+    assert!(harness.state().instructions.is_none());
+    assert_eq!(harness.state().mock_backend.as_ref().unwrap().writes, 0);
 }
 
 #[test]

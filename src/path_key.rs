@@ -16,6 +16,34 @@ pub fn is_drive_or_share_root(path: &Path) -> bool {
     path.parent().is_none()
 }
 
+/// Resolve dot components without filesystem I/O. Verbatim Windows paths retain their spelling.
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    if matches!(path.components().next(), Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim())
+    {
+        return path.to_path_buf();
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(Component::Normal(_))
+                ) {
+                    normalized.pop();
+                } else if !path.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
 /// ドライブ文字を除いて小文字化・スラッシュ統一したパス文字列を返す。
 pub fn normalize(path: &Path) -> String {
     let s = path.to_string_lossy();
@@ -39,6 +67,14 @@ pub fn normalize_keep_drive(path: &Path) -> String {
 /// `normalize_keep_drive` と同じ規則で比較する。
 pub fn eq_keep_drive(a: &Path, b: &Path) -> bool {
     normalize_keep_drive(a) == normalize_keep_drive(b)
+}
+
+/// Compare synthetic-location bases without interpreting verbatim dot components.
+/// Keep drive-relative `C:` distinct from rooted `C:\` while ignoring trailing separators.
+pub(crate) fn eq_synthetic_path_base(a: &Path, b: &Path) -> bool {
+    a.has_root() == b.has_root()
+        && normalize_keep_drive(a).trim_end_matches('/')
+            == normalize_keep_drive(b).trim_end_matches('/')
 }
 
 /// Standardize an accepted physical path without I/O or changing its identity.
@@ -268,7 +304,61 @@ fn existing_component_name(path: &Path) -> Option<std::ffi::OsString> {
 
 #[cfg(test)]
 mod tests {
+    // §1.898: 実ドライブのルートは判定だけに渡す。本物の Shell を実パスに呼ばせない。
+    // 実行経路のテストは一時フォルダ内の偽パスと差し替えを使う。
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_synthetic_base_comparison_preserves_verbatim_dots() {
+        for (left, right) in [
+            (r"\\?\C:\data\", r"\\?\C:\data"),
+            (r"C:\data\", r"C:\data"),
+            (r"\\?\C:\data\.\", r"\\?\C:\data\."),
+            (r"\\?\C:\data\..\", r"\\?\C:\data\.."),
+            (r"\\?\UNC\server\share\", r"\\?\UNC\server\share"),
+        ] {
+            assert!(eq_synthetic_path_base(Path::new(left), Path::new(right)));
+        }
+        for (left, right) in [
+            (r"\\?\C:\data\.", r"\\?\C:\data"),
+            (r"\\?\C:\data\..", r"\\?\C:\"),
+            (r"C:", r"C:\"),
+        ] {
+            assert!(!eq_synthetic_path_base(Path::new(left), Path::new(right)));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn drive_root_898_lexical_normalize_dot_components_and_verbatim_paths() {
+        for (input, expected) in [
+            (r"C:\photos\..", r"C:\"),
+            (r"C:\foo\..\bar", r"C:\bar"),
+            (r"C:\..\..\bar", r"C:\bar"),
+            (r"\\server\share\dir\..", r"\\server\share\"),
+            (r".\data\child\..", r"data"),
+            (r"..\..\data\child\..", r"..\..\data"),
+            (r"C:", r"C:"),
+        ] {
+            assert_eq!(
+                lexical_normalize(Path::new(input)),
+                Path::new(expected),
+                "{input}"
+            );
+        }
+        for path in [
+            r"\\?\C:\foo\..",
+            r"\\?\UNC\server\share\dir\..",
+            r"\\?\C:\.\foo",
+        ] {
+            // Verbatim paths must retain even the dot components and separators byte-for-byte.
+            assert_eq!(
+                lexical_normalize(Path::new(path)).as_os_str(),
+                Path::new(path).as_os_str()
+            );
+        }
+    }
 
     #[test]
     #[cfg(windows)]
