@@ -1005,7 +1005,7 @@ P2-2 `InvokeCommand` の戻りは Shell の画面の役目が終わった証拠�
 
 ## 6. §1.853 の残り C・D・E (v5.9.0 予定、ブランチ `ui-scan-853b`)
 
-状態: 設計 r2 (2026-11-26、設計レビュー r1 の指摘を反映。§6.9)。担当: 設計・検収 = ClaudeCode Opus 5.5 (uiscan-853b)、実装 = Codex GPT-6.1 Sol / high、
+状態: 設計 r3 (2026-11-26、設計レビュー r1・r2 の指摘を反映。§6.9・§6.10)。担当: 設計・検収 = ClaudeCode Opus 5.5 (uiscan-853b)、実装 = Codex GPT-6.1 Sol / high、
 独立レビュー = GPT-6.1 Sol / xhigh。作業ツリー `G:\home\mimageviewer-uiscan853b`。コードの記述は master `451ad09db` の読み取り。
 本担当は実行時の挙動を観測していない。時間の数字はサブ PC 担当の perf ログ (§1.853、3004 件のネットワークフォルダで約 7.6 秒)。
 
@@ -1037,13 +1037,13 @@ main の context で同期走査に届く入口 (今回の対象):
 
 | 区分 | 入口 (生成点) | owner / intent / 全画面予約 | 読込後に使う状態 |
 | --- | --- | --- | --- |
-| C1 | 一覧のフォルダを開く: Enter (`accept_grid_container_open` → `grid_physical_navigation`、`collection_grid.rs` 1515・1603)、ダブルクリック (`ui_main.rs` 19510)、ゲームパッド A (`gamepad_input.rs` 10100) → post-render の `Direct` | Navigation / `container_open(auto)` / **`pending_auto_fs_open` を先に立てる** (`collection_grid.rs` 1546、`gamepad_input.rs` 10095) | なし |
+| C1 | 一覧のフォルダを開く: Enter (`accept_grid_container_open` → `grid_physical_navigation`、`collection_grid.rs` 1515・1603)、ダブルクリック (`ui_main.rs` 19510)、ゲームパッド A (`gamepad_input.rs` 10100) → post-render の `Direct` | Navigation / `container_open(auto)` / **`pending_auto_fs_open` を先に立てる** (`collection_grid.rs` 1546、`gamepad_input.rs` 10095) | **読込の前に閲覧履歴の帰路 (`note_reading_history_open`) と★フィルタの一時解除 (`maybe_suppress_rating_filter_for_opened_container`) を変える** (`collection_grid.rs` 1544、`gamepad_input.rs` 10094)。§6.3 の 8 で採用の時点へ移す |
 | C2 | 親へ: BS・⬆・背景・ゲームパッド B (`physical_grid_parent_action`、`grid_parent.rs` 596) → `Direct(parent, ExplicitList)`。サブフォルダ展開の戻り・スマートフォルダの物理の親 (`subfolder_expansion.rs` 1998、`smart_folder.rs` 8843) | Navigation / ExplicitList | `select_after_load` (子の名前) を先に置く |
-| C3 | コレクションの物理元: Enter・BS (`collection_grid.rs` 1592・1367) → `CollectionSource` | **CollectionGridPhysical** / 各 intent | なし |
+| C3 | コレクションの物理元: Enter・BS (`collection_grid.rs` 1592・1367) → `CollectionSource` | **CollectionGridPhysical** / 各 intent | Enter は C1 と同じ先行変更 (同じ `accept_grid_container_open`) |
 | C4 | フォルダを開くダイアログ (`open_folder_nav` → `dispatch_favorite_navigation` → `Direct`、印なし) | Navigation / ExplicitList | なし |
 | D1 | 本棚のルート `open_books_root` (`app.rs` 56021)、本の管理の「開く」(`location_jump.rs` 30) → `load_folder` | Navigation / ExplicitList | なし |
 | D4 | 「ZIP を作成」完了時の親の読み直し (`ui_dialogs/archive_convert.rs` 1185) | Navigation / PreservePresentation | 出力名の `select_after_load` を先に置く |
-| D5 | 読み直しの fallback (`reload_current_physical_list_with_intent`、`app.rs` 29068): main の実フォルダは既に staged の preflight (29049) で非同期。`current_folder_last_mtime` が無いとき (メタデータの取得失敗、スマートフォルダが mtime を消した後 `smart_folder.rs` 8657) だけ同期 | Navigation・CollectionGridPhysical・RatingPhysical / RefreshList | **読込の直後に `address`・`archive_source_override` を書き換える** (29077〜29084) |
+| D5 | 読み直しの fallback (`reload_current_physical_list_with_intent`、`app.rs` 29068): main の実フォルダは既に staged の preflight (29049) で非同期。**採用済みの表示が実フォルダ**で `current_folder_last_mtime` が無いとき (メタデータの取得失敗、スマートフォルダが mtime を消した後 `smart_folder.rs` 8657) だけ同期。ZIP/PDF は正常でも mtime を持たない (`app.rs` 40715) が、走査点の前の早期 return で UI 走査は無い | Navigation・CollectionGridPhysical・RatingPhysical / RefreshList | **読込の直後に `address`・`archive_source_override` を書き換える** (29077〜29084) |
 | E | 「元の場所へ」の ArchiveContainer (`app.rs` 61972〜62012): main で `classified_kind` が無く、`.zip`/`.pdf` 風の名前の実フォルダが今の一覧に Folder として出ているときだけ | Navigation / ExplicitList | なし |
 
 対象外 (理由):
@@ -1120,11 +1120,30 @@ C5・D2・D3・★固定の移動は、どれも「読込の前後に変える�
    行う。`AddressBarNav::WorkerFavorite`・`AddressEnterPhysical`・`RecentFolder` の値は、走査経路以外の意味
    (位置・履歴の扱い) を持つなら残し、走査経路の印としての役目だけを外す。§1.805 の既存テストは期待値を変えずに通ること
    が、このまとめの受け入れ条件。
-6. **D5 (読み直しの fallback) は staged の preflight に寄せる**: main で `current_folder_last_mtime` が無いときも、
-   既存の `start_physical_history_transition_classified_at_stage` (mtime がある場合と同じ経路) へ渡す。読込の直後に
+6. **D5 (読み直しの fallback) は staged の preflight に寄せる**: r3 (設計レビュー r2 P2-2): 対象は**採用済みの表示が
+   実フォルダ** (ZIP/PDF でも変換キャッシュでもない。`archive_source_override` が無い) で `current_folder_last_mtime` が
+   無い main の読み直しだけ。その場合だけ、既存の `start_physical_history_transition_classified_at_stage` (mtime がある
+   場合と同じ経路) へ渡す。ZIP/PDF・変換キャッシュの読み直しは既存の経路のまま変えない (キャッシュのパスを staged へ
+   渡すと論理 source と表紙 pin のキーが変わる、`app.rs` 39079・41001)。変換キャッシュの読み直しが走査点に届くなら
+   (実フォルダのキャッシュ)、理由付きの例外 `ConvertedCacheReload` で同期のままにする。読込の直後に
    `address`・`archive_source_override` を書き換える同期前提 (29077〜29084) は、main ではこの経路を通らなくなる。
    staged の経路が mtime 無しを扱えない理由がコードにあれば、実装担当は設計担当へ返す (同期のまま残さない)。
    main 以外は従来どおり。
+8. **C1・C3 のフォルダを開く操作の先行変更を、ZIP/PDF と同じ採用時の確定へ移す** (r3、設計レビュー r2 P2-1):
+   `accept_grid_container_open` (と同じ処理を持つゲームパッドの入口 `gamepad_input.rs` 10094) は、フォルダのとき読込の前に
+   閲覧履歴の帰路と★フィルタの一時解除を変えている。待ちが拒否される後続で取り消されると、旧一覧に一時解除が残り、
+   閲覧履歴からの帰路が消える。ZIP/PDF は既にこれらを `GridVirtualOpenEffects` に捕捉し、採用 (install) の中の
+   `commit_grid_virtual_open_effects` (`app.rs` 37646、呼び出しは 32783) で確定している。**フォルダも同じ効果を捕捉して
+   nav の値 (`Direct` / `CollectionSource` の型付きの持ち物) に入れ、読込の `grid_effects` として渡す**。先行の
+   `note_reading_history_open`・`maybe_suppress_rating_filter_for_opened_container` の呼び出しはフォルダでは外す。
+   ★の判定は idx 版 (`get_rating(idx)`) と path 版 (`rating_db`) で同じ結果になることを実装担当が確かめる (違えば返す)。
+   全画面の予約も `effects.auto_fullscreen` で運び、読込の中で prepare (予約を消費する `app.rs` 33066) の直前に
+   `pending_auto_fs_open` へ立てる。フォルダの入口で App の flag を先に立てるのはやめる (2 の「予約を要求が持つ」と同じ
+   所有者にまとめる。2 の `take` は、効果を持たない入口が flag を立てていた場合の受け皿として残すか、flag を立てる入口が
+   他に無いことを確かめて外すかを実装担当が判断し、記録する)。同期のまま残る経路 (main 以外・例外) でも、効果は同じ
+   install の中で確定するので挙動は同じ。`capture_main_folder_list_order` は ZIP/PDF でも先行で行っている既存の扱いなので
+   変えない。
+
 7. **呼び出しの外で状態を変える入口の点検**: 実装担当は、既定が worker になる入口 (§6.2 の対象の表) のすべてについて、
    呼び出しの前に App の状態 (表示中の合成一覧の owner・検索の積み上げ・アドレス・選択のヒント・全画面) を変えていないか、
    後に読込の結果を前提にした処理をしていないかを確かめる。D2・D3 と同じ形のものが見つかったら、理由付きの例外にして
@@ -1161,10 +1180,16 @@ C5・D2・D3・★固定の移動は、どれも「読込の前後に変える�
    待機表示を出さない。
 4. modal: main の走査待ちの間に兄弟 context が document modal (PDF パスワード等) に入ったら、完了は今の §1.805 の再入と
    同じ結果になる (採用しない)。
-5. 走査の設定: 走査中に隠しファイル・種類の表示・書庫/EPUB の扱い・Susie の再読み込みを変えると、古い結果を採らず、
+5. 走査の設定 (r3、設計レビュー r2 P3): 2 つに分けて確かめる。(a) 設定の適用が今の一覧の更新を始める変更
+   (種類の表示の変更 `app.rs` 29384・29464 など) では、更新の開始 (`app.rs` 62310) が待ちの要求を退役させ、旧要求は
+   復活しない (§1.805 の規則 2 のまま)。(b) 更新を始めない変更 (隠しファイル・書庫/EPUB の扱い・「プラグインを再読み込み」
+   のうち、実装担当が (a) に当たらないと確かめたもの) では、要求が生きたまま policy が不一致になるので、古い結果を採らず
    同じ要求のまま今の設定で走査し直して採用する (受付・test-script の要求数・履歴は 1 回分)。お気に入りの入口でも同じ。
-6. D5: mtime の無い main の読み直しが staged の経路で採用され、変換書庫のアドレス (`archive_source_override`) が
-   従来どおり保たれる。
+6. D5: mtime の無い main の実フォルダの読み直しが staged の経路で採用される。ZIP/PDF・変換キャッシュの読み直しは
+   経路が変わらない (論理 source・アドレス・`archive_source_override`・表紙 pin のキーが従来どおり)。
+6a. C1・C3: ★付きのフォルダ・閲覧履歴の一覧のフォルダを開いて待つ間に、拒否される後続 (表示対象外の ZIP をアドレス欄で
+   指定する等) で取り消すと、★フィルタの一時解除も閲覧履歴の帰路も変わっていない。採用されたときは今と同じに確定する。
+   ゲームパッド A でも同じ。
 7. E: `.zip` という名前の実フォルダへの「元の場所へ」が worker で走査される。
 8. 例外: C5・D2・D3・★固定の移動・再生試験・ReleaseChecks は同期のまま (計数 1 回)。main 以外の context の各入口も同期のまま。
 9. 兄弟 context・lifecycle: detached を投影している間は main の待ちで入力を止めない (§1.805 と同じ述語)。sidecar 復元中の
@@ -1215,3 +1240,13 @@ P1×1・P2×4・P3×1。設計担当がコードで照合し、すべて妥当�
 | P2-5 走査の設定・Susie の世代の照合が無い | §3.2 の policy 照合と走査だけのやり直しを共有 (§6.3 の 3) |
 | P3-6 「§1.805 の既存テストは期待値を変えない」が新仕様と矛盾 | 意図して変える 2 種を明記 (§6.6 の 11)。兄弟投影・sidecar・Quick Folder・取消/切断のテストを追加 (§6.6 の 2・9) |
 
+
+### 6.10 設計レビュー r2 (同じ担当の継続、06e53e169、2026-11-26): REJECT
+
+r1 の 6 件は方針上解消と判定 (C5 は統括判断まで同期)。新たに P2×2・P3×1。設計担当がコードで照合し、r3 で直した。
+
+| 指摘 | 対応 (r3) |
+| --- | --- |
+| P2-1 C1・C3 のフォルダを開く操作が、閲覧履歴の帰路と★フィルタの一時解除を先に変える (`collection_grid.rs` 1544、`gamepad_input.rs` 10094) | ZIP/PDF と同じ `GridVirtualOpenEffects` に捕捉し、install の中の `commit_grid_virtual_open_effects` で確定する。全画面の予約も同じ効果で運ぶ (§6.3 の 8) |
+| P2-2 D5 の「mtime が無い」には ZIP/PDF・変換キャッシュも入り、staged へ渡すと論理キーが変わる | 採用済みの表示が実フォルダのときだけに限定。変換キャッシュが走査点に届くなら理由付きの例外 (§6.3 の 6) |
+| P3 設定の適用による更新が旧要求を退役させる場合と、要求が生きたまま policy が不一致になる場合が混ざっている | 2 つに分けて記述・テスト (§6.6 の 5) |
