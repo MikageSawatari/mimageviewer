@@ -1191,25 +1191,7 @@ fn event_safe_video_actions_preserve_all_four_identity_components_for_native_and
                     );
                     assert!(!video_player(&app, 0).is_playing());
                     assert!(video_player(&app, 0).user_seek_base_secs_for_test() <= seek_base);
-                    if matches!(
-                        operation.action,
-                        KeyAction::VideoSeekBackSmall
-                            | KeyAction::VideoSeekBackMedium
-                            | KeyAction::VideoSeekBackLarge
-                    ) {
-                        assert!(
-                            video_player(&app, 0).current_seek_serial() > serial,
-                            "every Back case must seek: {:?}, {surface:?}",
-                            operation.action
-                        );
-                        // Backward seeks must remain paused after real readiness
-                        // and output consumption, not merely while seeking.
-                        let target = video_player(&app, 0).position();
-                        video_player(&app, 0).complete_seek_for_test(target);
-                        video_player_mut(&mut app, 0).consume_seek_frame_for_test(ui.ctx(), target);
-                    } else {
-                        assert_eq!(video_player(&app, 0).current_seek_serial(), serial);
-                    }
+                    assert_eq!(video_player(&app, 0).current_seek_serial(), serial);
                     assert!(!video_player(&app, 0).clock_is_seeking_for_test());
                     immediate = Some(identity(&app, ScriptInputSurface::Viewer));
                     app.poll_video(ui.ctx());
@@ -1322,7 +1304,7 @@ fn event_media_resolver(
 
 #[cfg(windows)]
 #[test]
-fn event_r13_rejects_all_six_playback_advancing_actions_atomically_on_short_playing_video() {
+fn event_r13_rejects_all_nine_playback_advancing_actions_atomically_on_short_playing_video() {
     let _serial = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
     let mut app = short_playing_media_app(&ctx, false);
@@ -1331,8 +1313,11 @@ fn event_r13_rejects_all_six_playback_advancing_actions_atomically_on_short_play
         KeyAction::VideoPlayPause,
         KeyAction::VideoLoop,
         KeyAction::VideoSeekStart,
+        KeyAction::VideoSeekBackSmall,
         KeyAction::VideoSeekForwardSmall,
+        KeyAction::VideoSeekBackMedium,
         KeyAction::VideoSeekForwardMedium,
+        KeyAction::VideoSeekBackLarge,
         KeyAction::VideoSeekForwardLarge,
     ] {
         app.operation_script_events = Default::default();
@@ -1376,69 +1361,159 @@ fn event_r13_rejects_all_six_playback_advancing_actions_atomically_on_short_play
 
 #[cfg(windows)]
 #[test]
-fn event_r13_back_seeks_complete_output_before_polling_eof_and_do_not_advance_or_refire() {
+fn event_r13_eof_back_seeks_are_rejected_atomically_without_dispatch_or_restart() {
     let _serial = crate::key_input::lock_test_input();
-    for action in [
-        KeyAction::VideoSeekBackSmall,
-        KeyAction::VideoSeekBackMedium,
-        KeyAction::VideoSeekBackLarge,
+    use crate::app::VideoKeyActionSurface;
+    for surface in [
+        VideoKeyActionSurface::Native,
+        VideoKeyActionSurface::EguiVideo,
+        VideoKeyActionSurface::EguiMusic,
     ] {
         let ctx = egui::Context::default();
-        let mut app = short_playing_media_app(&ctx, false);
+        let mut app = short_playing_media_app(&ctx, surface == VideoKeyActionSurface::EguiMusic);
         let (requests, _responses) = event_media_resolver(&mut app);
-        app.operation_script_events = Default::default();
-        app.operation_script.state = event_script(&format!(
-            r#"#{{run:["{}"],notice:"backward event accepted"}}"#,
-            action.ini_name()
-        ));
-        // Same pending demux/tail/quiet state as the positive EOF control.
-        // The seek must retire that old epoch before tick can dispatch EOF.
-        video_player(&app, 0).notify_demux_exhausted_for_test();
-        video_player_mut(&mut app, 0).backdate_eof_quiet_for_test(Duration::from_millis(49));
-        assert!(video_player(&app, 0).is_playing());
-        assert!(!video_player(&app, 0).is_at_eof());
-        let serial = video_player(&app, 0).current_seek_serial();
-        let mut immediate = None;
-        frame(&ctx, |ctx| {
-            app.detect_operation_script_events(ctx, ScriptInputSurface::Viewer);
-            assert_eq!(toast(&app), "backward event accepted");
-            assert!(video_player(&app, 0).current_seek_serial() > serial);
-            assert!(video_player(&app, 0).clock_is_seeking_for_test());
-            let target = video_player(&app, 0).position();
-            assert!(target < 3.5);
-            video_player(&app, 0).complete_seek_for_test(target);
-            video_player_mut(&mut app, 0).consume_seek_frame_for_test(ctx, target);
-            assert!(!video_player(&app, 0).clock_is_seeking_for_test());
-            assert!(video_player(&app, 0).is_playing());
-            assert!(video_player(&app, 0).intent_playing());
-            immediate = Some(identity(&app, ScriptInputSurface::Viewer));
-            // The native tick and App's real EOF dispatch/resolver/accept phase
-            // now run with a completed seek, rather than a frozen seek guard.
-            app.poll_video(ctx);
-        });
-        assert!(!video_player(&app, 0).is_at_eof());
-        assert!(app.video_continuous_last_eof.is_none());
-        assert!(app.media_navigation_pending.is_none());
-        assert!(requests.try_recv().is_err());
-        assert_eq!(app.fullscreen_idx, Some(0));
-        app.fs_feedback_toast = None;
-        for _ in 0..2 {
-            frame(&ctx, |ctx| app.poll_video(ctx));
-            assert!(video_player(&app, 0).is_playing());
-            assert!(!video_player(&app, 0).clock_is_seeking_for_test());
-            assert!(!video_player(&app, 0).is_at_eof());
+        // Isolate the event from the independent continuous-EOF next adoption.
+        // The continuous-ON positive control below exercises that other producer.
+        app.video_continuous_mode = crate::video::VideoContinuousMode::Off;
+        if surface == VideoKeyActionSurface::EguiVideo {
+            video_player(&app, 0).set_native_presenter_hidden_for_test(true);
+        }
+        video_player(&app, 0).mark_eof_for_test(4.0);
+        assert!(video_player(&app, 0).is_at_eof());
+        assert!(!video_player(&app, 0).is_playing());
+        for action in [
+            KeyAction::VideoSeekBackSmall,
+            KeyAction::VideoSeekBackMedium,
+            KeyAction::VideoSeekBackLarge,
+        ] {
+            video_player(&app, 0).set_muted(false);
+            video_player(&app, 0).set_volume(0.5);
+            let before = (
+                video_player(&app, 0).position(),
+                video_player(&app, 0).current_seek_serial(),
+                video_player(&app, 0).intent_playing(),
+            );
+            app.operation_script_events = Default::default();
+            app.operation_script.state = event_script(&format!(
+                r#"["VideoMute","{}","VideoVolumeUp"]"#,
+                action.ini_name()
+            ));
+            let (_, samples) = capture_event_executions(|| {
+                frame(&ctx, |ctx| {
+                    app.detect_operation_script_events(ctx, ScriptInputSurface::Viewer);
+                    assert!(video_player(&app, 0).is_at_eof());
+                    assert!(!video_player(&app, 0).is_playing());
+                    assert_eq!(
+                        (
+                            video_player(&app, 0).position(),
+                            video_player(&app, 0).current_seek_serial(),
+                            video_player(&app, 0).intent_playing()
+                        ),
+                        before
+                    );
+                    app.poll_video(ctx);
+                })
+            });
+            assert!(toast(&app).contains("EventNotAllowed"));
+            assert!(toast(&app).contains(action.ini_name()));
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].0, 0);
+            assert!(!video_player(&app, 0).is_muted(), "no synchronous prefix");
+            assert_eq!(video_player(&app, 0).volume(), 0.5, "no synchronous suffix");
             assert_eq!(
-                identity(&app, ScriptInputSurface::Viewer),
-                immediate.clone().unwrap()
+                (
+                    video_player(&app, 0).position(),
+                    video_player(&app, 0).current_seek_serial(),
+                    video_player(&app, 0).intent_playing()
+                ),
+                before
             );
-            assert!(
-                app.fs_feedback_toast.is_none(),
-                "no follow-up event: {action:?}"
-            );
+            assert!(video_player(&app, 0).is_at_eof());
+            assert!(!video_player(&app, 0).is_playing());
+            assert!(!video_player(&app, 0).clock_is_seeking_for_test());
+            assert_eq!(app.fullscreen_idx, Some(0));
             assert!(requests.try_recv().is_err());
             assert!(app.media_navigation_pending.is_none());
-            assert_eq!(app.fullscreen_idx, Some(0));
         }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn event_r13_remaining_four_controls_do_not_restart_an_eof_source() {
+    let _serial = crate::key_input::lock_test_input();
+    use crate::app::VideoKeyActionSurface;
+    for surface in [
+        VideoKeyActionSurface::Native,
+        VideoKeyActionSurface::EguiVideo,
+        VideoKeyActionSurface::EguiMusic,
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = short_playing_media_app(&ctx, surface == VideoKeyActionSurface::EguiMusic);
+        let (requests, _responses) = event_media_resolver(&mut app);
+        app.video_continuous_mode = crate::video::VideoContinuousMode::Off;
+        if surface == VideoKeyActionSurface::EguiVideo {
+            video_player(&app, 0).set_native_presenter_hidden_for_test(true);
+        }
+        video_player(&app, 0).mark_eof_for_test(4.0);
+        video_player(&app, 0).set_muted(false);
+        video_player(&app, 0).set_volume(0.5);
+        let before = (
+            video_player(&app, 0).position(),
+            video_player(&app, 0).current_seek_serial(),
+            video_player(&app, 0).intent_playing(),
+        );
+        assert!(video_player(&app, 0).is_at_eof());
+        assert!(!video_player(&app, 0).is_playing());
+        app.operation_script_events = Default::default();
+        app.operation_script.state = event_script(
+            r#"#{run:["VideoMute","VideoVolumeUp","VideoVolumeDown","VideoSeekStripToggle"],notice:"EOF controls accepted"}"#,
+        );
+        let (_, samples) = capture_event_executions(|| {
+            frame(&ctx, |ctx| {
+                app.detect_operation_script_events(ctx, ScriptInputSurface::Viewer);
+                if surface == VideoKeyActionSurface::EguiMusic {
+                    // The first three controls execute; the released music path rejects
+                    // the fourth (strip) at dispatch. No new music-strip support is added.
+                    assert!(toast(&app).contains("VideoSeekStripToggle"));
+                    assert!(!toast(&app).contains("EventNotAllowed"));
+                } else {
+                    assert_eq!(toast(&app), "EOF controls accepted");
+                }
+                // The strip's independent analysis worker may report its own toast.
+                app.poll_video(ctx);
+            })
+        });
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].0, 4);
+        assert!(
+            video_player(&app, 0).is_muted(),
+            "the controls really executed"
+        );
+        assert!(video_player(&app, 0).is_at_eof());
+        assert!(!video_player(&app, 0).is_playing());
+        assert!(!video_player(&app, 0).clock_is_seeking_for_test());
+        assert_eq!(
+            (
+                video_player(&app, 0).position(),
+                video_player(&app, 0).current_seek_serial(),
+                video_player(&app, 0).intent_playing()
+            ),
+            before
+        );
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(requests.try_recv().is_err());
+        assert!(app.media_navigation_pending.is_none());
+        let (_, samples) = capture_event_executions(|| {
+            frame(&ctx, |ctx| {
+                app.detect_operation_script_events(ctx, ScriptInputSurface::Viewer);
+                app.poll_video(ctx);
+            })
+        });
+        assert!(samples.is_empty());
+        assert!(video_player(&app, 0).is_at_eof());
+        assert!(!video_player(&app, 0).is_playing());
+        assert_eq!(video_player(&app, 0).intent_playing(), before.2);
     }
 }
 

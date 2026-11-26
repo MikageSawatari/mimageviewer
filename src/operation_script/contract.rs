@@ -106,7 +106,7 @@ macro_rules! operations {
 }
 
 /// r12: direction/fit may reconcile a slice later, but never create another open.
-/// r13 forbids PlayPause/Loop/forward seeks and SeekStart: each can start
+/// r13 forbids PlayPause/Loop and all seeks: each can start
 /// playback or promote EOF independently of another user navigation input.
 /// Other audited changes are absorbed before the remaining draw/completion.
 /// Grid actions change layout/order, but neither its location nor cursor item.
@@ -127,9 +127,6 @@ const fn event_permission(action: KeyAction) -> EventPermission {
             | VideoMute
             | VideoVolumeUp
             | VideoVolumeDown
-            | VideoSeekBackSmall
-            | VideoSeekBackMedium
-            | VideoSeekBackLarge
             | VideoSeekStripToggle
             | GridColumnCount1
             | GridColumnCount2
@@ -667,11 +664,11 @@ mod tests {
                 .iter()
                 .filter(|op| op.event_permission == EventPermission::Synchronous)
                 .count(),
-            35
+            32
         );
         for (context, count) in [
             (ScriptContext::FsImage, 7),
-            (ScriptContext::FsVideo, 7),
+            (ScriptContext::FsVideo, 4),
             (ScriptContext::Grid, 21),
         ] {
             assert_eq!(
@@ -713,8 +710,11 @@ mod tests {
                 KeyAction::VideoPlayPause,
                 KeyAction::VideoLoop,
                 KeyAction::VideoSeekStart,
+                KeyAction::VideoSeekBackSmall,
                 KeyAction::VideoSeekForwardSmall,
+                KeyAction::VideoSeekBackMedium,
                 KeyAction::VideoSeekForwardMedium,
+                KeyAction::VideoSeekBackLarge,
                 KeyAction::VideoSeekForwardLarge,
             ]
         );
