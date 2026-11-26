@@ -634,18 +634,19 @@ src/app.rs の `poll_video`) が次のファイルを開く → 次の `"page"` 
 判断 (設計担当): 動画では、識別を変えるのは再生という独立に進む処理 (EOF → 連続再生) で、操作はそこへ届く時刻を早めたり、
 止まっていた再生を動かしたりできる。「同期に終わる」の基準 (操作の後、ほかの入力が無い限り識別が後で変わらない) は、
 再生を先へ進めうる操作では示せない。`"open"` の回だけ可にしても、入れ物の違う項目が続く一覧 (コレクション・検索の結果) では
-次の項目ごとに `"open"` が出るので連鎖を止められない。したがって次の 5 つを「不可」に改める:
+次の項目ごとに `"open"` が出るので連鎖を止められない。したがって次の 6 つを「不可」に改める:
 `VideoPlayPause` (一時停止中なら再生を始める)、`VideoLoop` (ループを外すと EOF から次へ進む)、
-`VideoSeekForwardSmall` / `VideoSeekForwardMedium` / `VideoSeekForwardLarge`。
-イベントから使える動画の操作は、`VideoMute`・`VideoVolumeUp`・`VideoVolumeDown`・`VideoSeekStart`・
+`VideoSeekStart`、`VideoSeekForwardSmall` / `VideoSeekForwardMedium` / `VideoSeekForwardLarge`。
+r13 の実装の確認で、`VideoSeekStart` は一時停止中から再生を始める (`SeekPlayback::StartPlayback`) と分かったので、同じ理由で不可に加えた (設計担当の判断。再生中だけ許可する案は検査の条件が増えるので採らない)。
+イベントから使える動画の操作は、`VideoMute`・`VideoVolumeUp`・`VideoVolumeDown`・
 `VideoSeekBackSmall` / `Medium` / `Large`・`VideoSeekStripToggle` (どれも EOF へ近づけない)。
 - 採らなかった案: 連続再生による項目の変化を「イベントの原因」として追って止める (r12 の案 B と同じく、全入力の入口で原因を
   記録する状態が要る)。シークの量を EOF の手前で止める (既存のキーと違う挙動を足すことになり、同じ実行関数の原則に反する)。
   1 秒 10 回の上限で抑える (上限は負荷の保険で、印の根拠にしない)。
-- 根拠のテスト: 再生中の短い動画 (連続再生 ON) で、イベントから前方シーク・再生/一時停止・ループを返すと並び全体が実行されず
-  通知されること (許可リストの棚卸しのテストも合わせる)。後方シーク・先頭へを返したとき、シークの完了の後、EOF・次の項目の
+- 根拠のテスト: 再生中の短い動画 (連続再生 ON) で、イベントから前方シーク・再生/一時停止・ループ・先頭へを返すと並び全体が実行されず
+  通知されること (許可リストの棚卸しのテストも合わせる)。通常停止中の先頭へも前後同期A込みで全件拒否し、通知・0 dispatch・状態維持を確認する。後方シークを返したとき、シークの完了の後、EOF・次の項目の
   採用が起きず、後のフレームでイベントが出ないこと。
-- 雛形・マニュアルの例に、これら 5 つをイベントから使う例を書かない。
+- 雛形・マニュアルの例に、これら 6 つをイベントから使う例を書かない。
 
 #### 段 4 の設計 r13 の続き: イベントからの実行の同期保存は例外として許す (段 4 の実装レビューの P2)
 
@@ -794,9 +795,9 @@ VK と動画リングにも consumer が無い。共通のコピー実行関数�
 - **「イベント可」の印**は3種類: 不可・同期可・OpenOnly (§3.3のr12)。A のうち「同期に終わる」(r11) 操作を同期可とする:
   イベントから実行し、同じフレームで基準を取り直した後、ほかの入力が無ければ後のフレームで識別が変わらない操作。
   (r10 までの基準「識別を変えない」は r11 で置き換えた。)
-  同期可は画像7・動画13・一覧21の計41操作。旧基準で除外した背景・pixel grid・演出切替もr11で再監査した。
+  r13の同期可は画像7・動画7・一覧21の計35操作。旧基準で除外した背景・pixel grid・演出切替もr11で再監査した。
   r12のOpenOnlyは読む向き・合わせ方の2操作。検出側が確定した集合にopenがある回だけ全件事前検査を通す。
-  見開き6操作は不可のまま。操作別の根拠・回帰の全名と未実施の検証は§16に記す。
+  見開き6とr13の動画6操作は不可。SeekStartの追加除外決定、残る動画7操作の監査・回帰・検証状況は§16に記す。
 - **実行関数を共用にできない操作は、最初の版から外す** (§5.2)。外したら設計担当へ報告し、表を直す。
   ズーム・列数・コピー・表示の切り替えは共用が現実的。移動・閉じる・見開き・レーティング (絞った場所での
   採用し直し) は、本体に加えて呼び出し元への結果の共用が要る族 (レビュー r2 の見立て)。
@@ -1484,11 +1485,11 @@ detached の合意を得た (記録と引用は detached-rework-plan.md §11)。
 
 ## 16. 段4の実装記録（2026-11-25）
 
-11月25日の実装にr12を反映した。既存r11のClaudeCode実行結果・nested表記修正と今回r12差分の引継ぎは末尾の11月26日追記を参照。
+11月25日の実装にr12/r13を反映した。既存のClaudeCode検証・nested表記修正・過去のr12引継ぎと今回r13差分は末尾の11月26日追記を参照。
 
-**r11識別＋r12のイベント権限を実装済み。関連テストと release 計測は設計担当 (ClaudeCode) が run-heavy で実行済み (末尾の「設計担当の検証」)。実機・独立実装レビューは未実施。**
+**段4実装済み。関連243テスト・release計測は設計担当 (ClaudeCode) が実行済み。cf856ebbaの独立実装レビューはREVISE（P1無し）を受領し、r13の指摘対応中。SeekStartは設計担当の決定で追加除外済み。今回r13差分のRust検証・再レビューと実機は未実施。**
 利用者の指示によりcargo build/test/check、アプリ起動、コミットを行っていない。確認はbare cargo fmt、
-UI glyph checker、差分の空白確認だけ。新しい受入・review結果やdetachedの実装合意は記録していない。
+UI glyph checker、差分の空白確認だけ。ClaudeCodeの既存検証・受領済みREVISEと今回の未検証差分を区別し、新しい受入・再レビューやdetachedの実装合意は記録していない。
 
 ### 経緯と現在の境界
 
@@ -1515,23 +1516,29 @@ OpenOnlyの判定は全件validateに含め、s変数の再代入や戻り値に
 retained/reply/rotation更新はArc::make_mut経由なので、baseline保持中は別allocationになる（book_composition_runtime.rs:363/372/410/1374）。
 item数に比例する列の複製は検出に入れない。パス/entry文字列の長さと、composition allocationが変わった時の意味比較は別費用。
 `script/event_detect`は識別構築＋比較のms/eventsを記録する。Rhai評価/操作/再snapshotはこの検出区間に含まない。
-既存ignored性能testへN=50,000の変更なしevent識別の構築＋比較（μs）を追加した。新しい計測結果はまだ無い。
+既存ignored性能testのN=50,000の変更なしevent識別は791529cf1のreleaseで中央値0.8〜0.9μs、p95最大2.1μs（末尾のClaudeCode検証記録）。
+追加した`script/event_execute`はsnapshot・Rhai評価・全件検査から最後の操作と同frame取り直しまでを含む。msとactionsを記録し、
+actionsは実dispatcherへ渡した回数（拒否された呼出しを含む・未実行suffixを除く）。評価/validation拒否は0。拒否時も取り直し後に終端を記録する。
+perf無効時は追加timerのInstantを取得しない。検出なし/上限dropには実行区間を出さず、空の戻り値を評価した実行はactions=0となる。
+保存は利用者決定r13により既存キーのsettings.save/spread_db更新をUI同期の例外として共有する。保存先・順序・実行経路は変更せず、
+重い環境ではキーと同じ短い引っかかりが自動イベントでも起き得る。event_executeの費用は今回まだ実測していない。
 
-### イベント可Aの再監査（同期可41＋OpenOnly2、今回r12回帰は未実行）
+### イベント可Aの再監査（r13: 同期可35＋OpenOnly2、今回差分は未検証）
 
-| 操作 | r11/r12の根拠と回帰の範囲 |
+| 操作 | r11〜r13の根拠と回帰の範囲 |
 | --- | --- |
 | 画像: ZoomIn/Out、ToggleMetadata、NavigatorToggle | zoom/pan/factor/panel設定だけ。実on_event→sameframe再snapshot→残り実描画→後2frameで識別と再実行無しを確認するheadless test |
 | 画像: BgCycle、PixelGrid | pairing origin解決が起きても同期に吸収。NotInViewの保存基点がget_nav_indicesでResolvedへ進む状態/analysis branchを実イベントで検証し、残りresolverと次frameで再発火無し。loading cacheの到着も別test |
 | 画像: PageTurnAnimationToggle | idleは上の実描画loop。Completing＋解決済continuationはslide既存fixtureを再利用し、no-toggle対照と同じ元operation/target2のみ1回commit、次のpageは元入力起因、その後新規continuation/イベント無しまで進めるtest |
-| 動画13: PlayPause/Mute/VolumeUp/Down/Loop、SeekStart/Back/Forward Small/Medium/Large、SeekStripToggle | cached player/再生設定/stripだけ。position10秒・pause/mute off・volume0.5・loopOffから実イベントを実行し、sameframe再snapshot→poll_video→egui描画（egui経路）→次frameを操作ごとに比較。musicのstripは既存非対応 |
+| 動画7: Mute/VolumeUp/Down、Back Small/Medium/Large、SeekStripToggle | native/egui/musicの通常停止intent維持・seek base非増加を比較し、Backはシーク完了・実出力消費後も停止/EOF無しを確認。再生中短動画＋連続ONのBack3は旧EOF seedのreset→実シーク完了・出力消費→poll_videoのEOF判定→後frameを通す。EOFの正対照はresolverと次採用まで進める。自然再生がいずれEOFになることを否定しない。musicのstripは既存非対応。監査file:lineは末尾 |
 | 一覧21: ColumnCount1..20、ToggleDetailsView | gridの識別はcontextとtyped cursorのみ。Detailsから実イベントを実行し、visible/detailsの再構成と次frame検出まで確認。段3のdirect/shared parity回帰も引き継ぐ |
 | OpenOnly2: ReadingDirectionToggle / FitModeCycle | r12。自由回転を0にしてSplitを復帰させた後、prepare側でFull→halfが遅れPageを一回起こし得る。ただし入れ物移動/一覧復帰を起こさず、新Openを自作しない。Open無し回では全件事前検査で拒否。実イベント/実描画、寸法待ち/休止/再入場等の回帰は末尾追記 |
 
-| 不可のA（6） | 理由 |
+| 不可のA（12） | 理由 |
 | --- | --- |
 | FsSpreadSingle | Splitのhalf→SingleのFullの再調整が同frame再snapshotより後に残る反例 |
 | FsViewSpread / FsSpreadLtr / FsSpreadLtrCover / FsSpreadRtl / FsSpreadRtlCover | normalize_spread_positionのopenが本の構成の許可へ委譲され得る。既存delegated_book_permission回帰と、各印無しAをイベントで全件拒否する回帰を維持 |
+| VideoPlayPause / VideoLoop / VideoSeekStart / VideoSeekForwardSmall / Medium / Large | r13。再生開始・ループ解除・前方シークからEOF/連続再生の次採用を早め、次のイベントでも許可される連鎖を作り得る。短い再生中動画＋連続ONの6操作と、通常停止中SeekStartのmixedを前後同期A込みで全件拒否する回帰 |
 
 1秒10回は安全根拠にしない。r11ではPNG黒背景を白へ巡回する例だったが、r12でopen＋book.pathの条件で読む向きをRTLへ合わせる雛形に戻した。
 既存の拒否条件や操作順を変更してイベント可へ合わせることはしていない。
@@ -1553,37 +1560,37 @@ main一覧継続の回帰を残す。r11の独立設計合意の履歴は§3.3�
 - `poll_video`：Appの既存resume/marker等の境界回帰。
 - `perf_operation_script_page_identity --release -- --ignored --nocapture`：旧O(N)識別の計測と、新N=50,000 unchanged event構築＋比較。
 
-全fixtureは同時にsetup_appを二重に作らない。Rust実行・build/check・release実測・実機・独立実装reviewは未実施。
+全fixtureは同時にsetup_appを二重に作らない。既存243成功・release計測・独立REVISEは末尾に記録。今回r13差分のRust実行と再レビュー・実機は未実施。
 
 ### 追加・更新・継続した回帰の全名（未実行）
 
 `src/app/operation_script_runtime/tests/events.rs`:
 
-- `event_r11_faces_reentry_and_select_baseline_survive_viewer_in_observe_and_finish` (`src/app/operation_script_runtime/tests/events.rs:88`)
-- `event_initial_empty_grid_has_only_view_and_location_changes_do_not_select` (`src/app/operation_script_runtime/tests/events.rs:142`)
-- `event_view_changes_grid_image_video_and_audio_shares_video_context` (`src/app/operation_script_runtime/tests/events.rs:159`)
-- `event_r11_container_is_item_only_for_folders_pdf_epub_nested_and_converted_zip` (`src/app/operation_script_runtime/tests/events.rs:186`)
-- `event_nonviewer_row_variants_have_no_fabricated_book_container` (`src/app/operation_script_runtime/tests/events.rs:292`)
-- `event_r11_open_ignores_zip_subfolders_and_pending_source_but_follows_item_containers` (`src/app/operation_script_runtime/tests/events.rs:341`)
-- `event_nested_container_appends_literal_entry_without_host_path_replacement` (`src/app/operation_script_runtime/tests/events.rs:390`)
-- `event_and_slot_invocations_publish_the_same_item_container_book_path` (`src/app/operation_script_runtime/tests/events.rs:423`)
-- `event_r11_pdf_pages_halves_and_unit_scalars_fire_but_reader_order_does_not` (`src/app/operation_script_runtime/tests/events.rs:453`)
-- `event_composition_strong_arc_memo_semantics_and_equal_republication` (`src/app/operation_script_runtime/tests/events.rs:506`)
-- `event_runtime_grid_executes_before_keys_once_and_inputs_still_change_next_frame` (`src/app/operation_script_runtime/tests/events.rs:589`)
-- `event_grid_actual_key_slot_navigation_is_observed_only_next_frame` (`src/app/operation_script_runtime/tests/events.rs:619`)
-- `event_runtime_rejects_entire_mixed_batch_and_never_publishes_success_notice` (`src/app/operation_script_runtime/tests/events.rs:667`)
-- `event_runtime_rate_limit_drops_batches_notifies_once_and_does_not_replay` (`src/app/operation_script_runtime/tests/events.rs:688`)
-- `event_detection_cache_misses_do_not_read_rating_or_tag_databases` (`src/app/operation_script_runtime/tests/events.rs:737`)
-- `event_limit_is_rolling_ten_attempts_and_notification_is_lifetime_once` (`src/app/operation_script_runtime/tests/events.rs:750`)
-- `event_rate_drop_advances_baseline_and_never_queues_a_late_replay` (`src/app/operation_script_runtime/tests/events.rs:788`)
-- `event_detection_off_absent_loading_and_failed_do_not_claim_the_frame` (`src/app/operation_script_runtime/tests/events.rs:822`)
-- `event_detection_mounted_context_and_linked_detached_skip_without_touching_main_owner` (`src/app/operation_script_runtime/tests/events.rs:847`)
-- `event_detection_linked_f12_and_transition_skip_viewer_but_main_list_continues` (`src/app/operation_script_runtime/tests/events.rs:881`)
-- `event_detection_edit_and_page_overview_coalesce_after_exit` (`src/app/operation_script_runtime/tests/events.rs:909`)
-- `event_detection_native_overlay_uses_existing_snapshot_and_does_not_claim_blocked_frame` (`src/app/operation_script_runtime/tests/events.rs:963`)
-- `event_native_poll_video_hook_executes_and_overlay_snapshot_blocks_before_evaluation` (`src/app/operation_script_runtime/tests/events.rs:984`)
-- `event_safe_grid_actions_preserve_all_four_identity_components_even_from_details` (`src/app/operation_script_runtime/tests/events.rs:1015`)
-- `event_safe_video_actions_preserve_all_four_identity_components_for_native_and_music` (`src/app/operation_script_runtime/tests/events.rs:1051`)
+- `event_r11_faces_reentry_and_select_baseline_survive_viewer_in_observe_and_finish` (`src/app/operation_script_runtime/tests/events.rs:159`)
+- `event_initial_empty_grid_has_only_view_and_location_changes_do_not_select` (`src/app/operation_script_runtime/tests/events.rs:213`)
+- `event_view_changes_grid_image_video_and_audio_shares_video_context` (`src/app/operation_script_runtime/tests/events.rs:230`)
+- `event_r11_container_is_item_only_for_folders_pdf_epub_nested_and_converted_zip` (`src/app/operation_script_runtime/tests/events.rs:257`)
+- `event_nonviewer_row_variants_have_no_fabricated_book_container` (`src/app/operation_script_runtime/tests/events.rs:363`)
+- `event_r11_open_ignores_zip_subfolders_and_pending_source_but_follows_item_containers` (`src/app/operation_script_runtime/tests/events.rs:412`)
+- `event_nested_container_appends_literal_entry_without_host_path_replacement` (`src/app/operation_script_runtime/tests/events.rs:461`)
+- `event_and_slot_invocations_publish_the_same_item_container_book_path` (`src/app/operation_script_runtime/tests/events.rs:494`)
+- `event_r11_pdf_pages_halves_and_unit_scalars_fire_but_reader_order_does_not` (`src/app/operation_script_runtime/tests/events.rs:524`)
+- `event_composition_strong_arc_memo_semantics_and_equal_republication` (`src/app/operation_script_runtime/tests/events.rs:577`)
+- `event_runtime_grid_executes_before_keys_once_and_inputs_still_change_next_frame` (`src/app/operation_script_runtime/tests/events.rs:660`)
+- `event_grid_actual_key_slot_navigation_is_observed_only_next_frame` (`src/app/operation_script_runtime/tests/events.rs:690`)
+- `event_runtime_rejects_entire_mixed_batch_and_never_publishes_success_notice` (`src/app/operation_script_runtime/tests/events.rs:738`)
+- `event_runtime_rate_limit_drops_batches_notifies_once_and_does_not_replay` (`src/app/operation_script_runtime/tests/events.rs:759`)
+- `event_detection_cache_misses_do_not_read_rating_or_tag_databases` (`src/app/operation_script_runtime/tests/events.rs:808`)
+- `event_limit_is_rolling_ten_attempts_and_notification_is_lifetime_once` (`src/app/operation_script_runtime/tests/events.rs:821`)
+- `event_rate_drop_advances_baseline_and_never_queues_a_late_replay` (`src/app/operation_script_runtime/tests/events.rs:859`)
+- `event_detection_off_absent_loading_and_failed_do_not_claim_the_frame` (`src/app/operation_script_runtime/tests/events.rs:893`)
+- `event_detection_mounted_context_and_linked_detached_skip_without_touching_main_owner` (`src/app/operation_script_runtime/tests/events.rs:918`)
+- `event_detection_linked_f12_and_transition_skip_viewer_but_main_list_continues` (`src/app/operation_script_runtime/tests/events.rs:952`)
+- `event_detection_edit_and_page_overview_coalesce_after_exit` (`src/app/operation_script_runtime/tests/events.rs:980`)
+- `event_detection_native_overlay_uses_existing_snapshot_and_does_not_claim_blocked_frame` (`src/app/operation_script_runtime/tests/events.rs:1034`)
+- `event_native_poll_video_hook_executes_and_overlay_snapshot_blocks_before_evaluation` (`src/app/operation_script_runtime/tests/events.rs:1055`)
+- `event_safe_grid_actions_preserve_all_four_identity_components_even_from_details` (`src/app/operation_script_runtime/tests/events.rs:1086`)
+- `event_safe_video_actions_preserve_all_four_identity_components_for_native_and_music` (`src/app/operation_script_runtime/tests/events.rs:1122`)
 
 `src/ui_fullscreen/operation_script_event_tests.rs`:
 
@@ -1608,23 +1615,23 @@ main一覧継続の回帰を残す。r11の独立設計合意の履歴は§3.3�
 
 | ファイル・行 | 変更内容 |
 | --- | --- |
-| `src/app/operation_script_runtime/events.rs:21` | typed itemだけによる入れ物導出。nested entryはhost pathのjoinを使わずliteralに連結 |
-| `src/app/operation_script_runtime/events.rs:86` | main専用owner。`observe:120` / `finish_event:150`の面別基準更新、rolling上限 |
-| `src/app/operation_script_runtime/events.rs:180` | OFF/受け口無しのcheap gate、`begin_operation_script_event_detection:219`の既存eligibility＋ROOT frame番号 |
-| `src/app/operation_script_runtime/events.rs:238` | 検出・費用記録・全件検証・同期実行・再snapshot |
+| `src/app/operation_script_runtime/events.rs:46` | typed itemだけによる入れ物導出。nested entryはhost pathのjoinを使わずliteralに連結 |
+| `src/app/operation_script_runtime/events.rs:111` | main専用owner。`observe:145` / `finish_event:175`の面別基準更新、rolling上限 |
+| `src/app/operation_script_runtime/events.rs:205` | OFF/受け口無しのcheap gate、`begin_operation_script_event_detection:244`の既存eligibility＋ROOT frame番号 |
+| `src/app/operation_script_runtime/events.rs:263` | 検出・費用記録・全件検証・同期実行・再snapshot。r13のevent_execute区間は`:326` / `:338` |
 | `src/app/operation_script_runtime.rs:273` | 共用scalar型。`operation_script_page_identity:632`は段2b用O(N)列を維持、`operation_script_unit_source:646` / `operation_script_page_scalars:658`を共用 |
 | `src/app/operation_script_runtime.rs:823` | viewerのbook.path/kindをslot/event共通の入れ物へ。`execute_operation_script_action:976`は既存実行分岐を共用 |
 | `src/app/update_phases.rs:918` | 一覧ROOTのキー処理前の入口 |
 | `src/ui_fullscreen.rs:28980` | `render_fullscreen_viewport_with_root_input`内render_fs_bodyの入口1点。既存転送/overview/通常キーの順は保持 |
 | `src/app.rs:102905` | `App::poll_video`のnative入口。既存overlay snapshotによる受付を再利用 |
-| `src/operation_script/contract.rs:71` / `:111` | r12イベント権限enum。同期可41・OpenOnly2・不可の見開き6。検証回帰は`:630` / `:668` / `:747` |
+| `src/operation_script/contract.rs:71` | r13イベント権限enum。同期可35・OpenOnly2・不可A12。変更入口の最新file:lineは末尾追記 |
 | `assets/operation_scripts.default.rhai:20` | open＋book.pathの条件で読む向きをRTLへ合わせる例 |
 | `src/operation_script/loader.rs:342` | 雛形の実評価とイベント出力検証 |
 | `src/app/operation_script_runtime/tests/events.rs:24` | r11識別・実入口・上限・eligibility・detached・同期Aの回帰（各名は上記） |
 | `src/ui_fullscreen/operation_script_event_tests.rs:58` | 新規headless実描画回帰。module登録は`src/ui_fullscreen.rs:105836` |
 | `src/ui_fullscreen/page_turn/slide_tests.rs:23` | 完了待ちと元continuationのexactly-onceをno-toggle対照と比較する回帰 |
 | `src/app/operation_script_runtime/tests/page_identity_perf.rs:249` | 既存ignored性能testへ変更なしevent構築＋比較のμs行を追加 |
-| `docs/operation-script-plan.md:546` / `:1445` | 入れ物の物理/論理対応表と本実装記録。旧`docs/operation-script-stage4-handoff.md`を統合・削除 |
+| `docs/operation-script-plan.md:546` / `:1486` | 入れ物の物理/論理対応表と本実装記録。旧`docs/operation-script-stage4-handoff.md`を統合・削除 |
 | `docs/ui-responsiveness.md:44` | 検出の費用境界・既存計測と今回未計測の区別 |
 | `docs/architecture-overview.md:24` / `docs/README.md:11` | main owner/owned pass/scalar＋strong Arcの構造と段1〜4実装・段5未着手の索引 |
 
@@ -1666,7 +1673,7 @@ raw prefix内部の`/`と大文字小文字は維持し、hostのjoin/pushへraw
 この修正後のbare `cargo fmt`・`git diff --check`はexit 0。UI文字列の変更は無い。
 cargo build/test/check・実機・独立実装reviewは未実施。回帰の実行結果は確認後に追記する。
 
-### 2026-11-26追記: r12のOpenOnly実装（今回のRust検証は未実施）
+### 2026-11-26追記: r12のOpenOnly実装（以下は当時の履歴。後続243成功とr13対応は後掲）
 
 EventPermissionをForbidden / Synchronous / OpenOnlyの3種類へ統一し、従来のoperation_scriptのevent_allowed boolは撤去。
 同期可41操作の範囲は維持。ReadingDirectionToggle / FitModeCycleだけをOpenOnlyへ移し、見開き6はForbiddenのまま。
@@ -1702,7 +1709,7 @@ bare cargo fmt、UI glyph checker、git diff --checkはexit 0。UI文字列の�
 | テスト | file:line |
 | --- | --- |
 | `validation_open_only_uses_detector_events_and_rejects_the_whole_mixed_batch` | `src/operation_script/contract.rs:747` |
-| `event_open_only_cannot_forge_open_or_execute_a_mixed_prefix` | `src/app/operation_script_runtime/tests/events.rs:24` |
+| `event_open_only_cannot_forge_open_or_execute_a_mixed_prefix` | `src/app/operation_script_runtime/tests/events.rs:95` |
 | `operation_script_event_open_only_split_rotation_reconciles_once_then_rejects_page` | `src/ui_fullscreen/operation_script_event_tests.rs:303` |
 | `operation_script_event_open_only_without_split_rotation_has_no_extra_page` | `src/ui_fullscreen/operation_script_event_tests.rs:381` |
 | `operation_script_event_open_only_late_page_can_run_synchronous_a_without_another_event` | `src/ui_fullscreen/operation_script_event_tests.rs:419` |
@@ -1714,7 +1721,7 @@ bare cargo fmt、UI glyph checker、git diff --checkはexit 0。UI文字列の�
 ClaudeCodeへの検証filterは`operation_script`（変更moduleの既存contract/loader/runtime/画像実描画回帰を含む）。
 今回追加分だけを先に絞るなら`open_only`。既存slide/poll_video/ignored性能testの依頼は上の検証節を維持する。
 
-### 2026-11-26追記: r12の新規回帰4失敗への対応
+### 2026-11-26追記: r12の新規回帰4失敗への対応（以下は修正当時の履歴）
 
 利用者から共有された修正前HEAD `9e8180f0f` のrun-heavy結果は5,122件中5,118成功・4失敗。
 失敗はすべて今回追加したテストで、次のテスト土台の誤りだった。修正後のRust再実行は行っていない。
@@ -1758,3 +1765,125 @@ bare `cargo fmt`と`git diff --check`はexit 0。Rustでの修正確認はClaude
   (ZIP・画像、単ページ・見開き、自動・構成済み)。段 2b の識別 (N=50,000 で 1.1〜2.2 ms) と違い N に比例しない。
   毎フレームの検出の費用は O(1) に収まる (§5.2 の段 4 の前の計測と比べた結果)。
 - 製品バイナリの実機確認はしていない。
+
+### 2026-11-26追記: r13の5操作案と残る設計判断（当時の履歴。後掲の追加除外決定で解決）
+
+受領したcf856ebbaの独立実装レビューはAstraのREVISE（P1無し）。今回の変更はそのP2に対するr13の指定範囲であり、
+再レビュー結果や受入を受領したという記録ではない。関連243成功・既存release計測は上のClaudeCode記録を再利用する。
+
+- イベント権限はr13指定の5操作だけを追加でForbiddenへ変更。同期36（画像7・動画8・一覧21）、OpenOnly2、不可A11。
+  Inputの許可・キーの処理・シーク幅/clamp・連続再生/ループの挙動は変更しない。
+- 5操作を再生中の短動画＋連続ONで同期Aの前後に挟み、全件拒否・通知・dispatcher呼出し0を確認する回帰を追加。
+  ミュート/音量/再生意図/seek serial/loop設定が変わらず、次採用の要求も無いことを比較する。
+- 許可するStart/Back3は同じEOF直前のdemux exhausted＋tail完了＋quiet49msのseedからイベントで実行する。
+  実seekの新epochが旧EOFをresetし、actor readinessに加え、同epochのCPUフレームを実tickで消費してclock override解除を確認。
+  その後native poll_videoのEOF/連続再生判定を通し、playing・seek解除・EOF無し・resolver要求無し・idx0・後2frameイベント無しを比較する。
+  正対照は同じEOF seedで無操作なら、実tickのEOF→Appの連続再生resolver request/result→idx1のopen採用→Page検出まで進める。
+  これは制御した完了直後の検査であり、自然再生が後でEOFに届かないという保証には使わない。
+- VideoPlayerの新helperはcfg(test)だけ。無音動画のfake metadataと、native出力threadを持たないfixtureのCPU出力消費を用意する。
+  CPU bookkeepingの間だけfake native outputを外し、実tick後に戻す。既存complete_seek_for_testの意味は変えず、clock overrideを直接clearしない。
+  正対照の次採用は既存with_disconnected_opens_for_testとfake resolver応答を使い、実decoder/presenterを起動しない。
+- `script/event_execute`はadmission後・snapshot/Rhai評価より前に開始し、validation拒否/評価失敗/途中rejectも呼出し元へ戻し、
+  必ず同frameの識別取り直しとfinish_eventの後で終端を記録する。actionsは実dispatcherへの呼出し回数で、
+  validation/評価失敗は0、途中rejectは拒否された呼出しまでを含める。成功2件・拒否0件・途中reject2件/未実行suffixの回帰を追加。
+  観測seamはcfg(test)のthread-localだけでglobal perfを有効化しない。本番でperf無効なら追加Instant取得・JSON構築は無い。
+- 保存は利用者のr13例外決定どおり既存キーと共用したまま。settings.save/spread_dbのUI同期費用をこの実行区間で測れるようにし、
+  新しい保存worker・追跡状態・待ちや既存入力/描画順の変更は行わない。
+
+**当時の設計判断待ち（後掲の追加除外決定で解決）: SeekStartを同期可に残すことと、停止からの再生開始を不可理由にしたr13との整合。**
+
+`VideoSeekStart`は`src/app/native_video.rs:12898`で明示的にSeekPlayback::StartPlaybackを使う。
+`src/ui_music_panels.rs:1122`のmusic_seek_startも同じ。既存`paused_seek_handlers_preserve_pause_and_explicit_commands_start`
+（`src/app/native_video.rs:18180`）は停止→Start→complete_seek後にplaying=trueとなることを確認している。
+これは今回のsource調査で確認した事実であり、実機の再現報告ではない。
+当時の未実行characterizationは、停止→許可されたevent SeekStart→実シーク出力消費→playing/seek解除→実EOF→次採用までを同じ対照helperで通す構成だった。現行は追加除外決定に合わせ、event全件拒否の回帰へ差し替えた。
+したがって、r13のPlayPause除外理由「止まっていた再生を動かす」をそのまま適用するならSeekStartにも該当する。
+
+当時の推奨はSeekStartもForbiddenへ変更（同期35・動画7）。代案は「再生中の回だけ許可」という別条件を設計し、全件事前検査と回帰を足すこと。
+この時点の明示指示は5操作だったので6つ目の印は判断待ちとし、後掲の決定で追加除外した。既存キーのStartPlaybackは変更していない。
+Backは通常停止ではPreserveIntentで停止を維持する一方、`VideoPlayer::seek_play_intent`（`src/video/mod.rs:11325`）はEOFの場合にtrueを返す。
+連続ONのEOFは既存の次送り対象であり、Backはその旧EOFを退けるため、通常停止中SeekStartと同じ「元は進まない状態から」の反例とは断定しない。
+このEOF状態でイベントが実際に検出される入口は未監査であり、条件差の注記・追加確認範囲として分け、追加禁止を推奨する根拠にはしない。
+この判断は後掲の設計担当決定で解決した。今回差分のRust検証・独立フォローアップレビューは残る。
+
+変更file:line（今回）:
+
+- `src/operation_script/contract.rs:113`: 5操作のイベント印と36/2/11 inventory。既存Input回帰も維持。
+- `src/app/operation_script_runtime/events.rs:326` / `:338` / `:364`: event_execute区間、dispatcher呼出し数、拒否時も含む終端。
+- `src/app/operation_script_runtime/tests/events.rs:24`: 実行区間の観測回帰。EOF/動画の新規回帰は下表。
+- `src/video/mod.rs:9274` / `:9478`: cfg(test)の無音動画fixtureと実tick出力消費helper。製品動画処理は変更無し。
+- 本書§5.1/§16、`docs/architecture-overview.md:29`、`docs/README.md:11`、`docs/ui-responsiveness.md:44`: 現況・同期保存例外・計測区間を整合。
+
+detached述語・viewport・context寿命・bundle/swap・cleanupには接触していない。同一data-dir mutexを二重取得するfixtureも作らない。
+この実装担当はcargo build/test/check・実測・アプリ起動・commitを行っておらず、今回の新規回帰は未実行。
+UI文字列は変更していない。軽量確認の結果と新規テスト一覧を以下へ記録する。
+
+今回追加した回帰（未実行）:
+
+| テスト名 | file:line |
+| --- | --- |
+| `event_execute_counts_dispatches_after_snapshot_on_success_validation_and_evaluation_failure` | `src/app/operation_script_runtime/tests/events.rs:24` |
+| `event_execute_records_rejected_dispatch_and_skipped_suffix_after_same_frame_snapshot` | `src/app/operation_script_runtime/tests/events.rs:62` |
+| `event_r13_rejects_all_five_playback_advancing_actions_atomically_on_short_playing_video` | `src/app/operation_script_runtime/tests/events.rs:1274` |
+| `event_r13_start_and_back_seeks_complete_output_before_polling_eof_and_never_advance_or_refire` | `src/app/operation_script_runtime/tests/events.rs:1327` |
+| `event_r13_eof_control_runs_tick_resolver_next_adoption_and_then_page_detection` | `src/app/operation_script_runtime/tests/events.rs:1496` |
+| `event_r13_paused_seek_start_characterizes_playback_start_then_eof_next_adoption` | `src/app/operation_script_runtime/tests/events.rs:1473` |
+
+ClaudeCodeへのfilter: まず`event_r13`と`event_execute`、次に`operation_script`（変更moduleの既存runtime/contractと段1〜4の回帰を含む）および`poll_video`。
+VideoPlayerの既存EOF回帰は`video::tests::native_tick_schedules_eof_quiet_deadline_and_completes_after_it`と`video::tests::eos_tick_waits_for_video_decode_and_output_before_loop_or_stop`。
+旧243成功・release識別計測を再利用し、今回のRust確認結果を先取りしない。event_executeの実保存費用はperfログ付き実機確認待ち。
+
+今回の軽量確認: bare `cargo fmt`はexit 0、`git diff --check`はexit 0。UI文字列の変更無しにつきglyph checkerの再実行は不要。
+Rust build/test/check・アプリ起動・commit・今回差分の独立レビューは実行していない。
+
+### 2026-11-26追記: SeekStart追加除外の決定反映と残る動画7操作の監査
+
+設計担当の決定によりVideoSeekStartもForbiddenへ追加し、「再生中だけ許可」の条件は採らない。
+現行は同期35（画像7・動画7・一覧21）・OpenOnly2・不可A12。§3.3 r13の不可6操作/動画可7操作と§5.1/本節の現況を揃えた。
+上の5操作案・SeekStart判断待ち・当時のcharacterizationは履歴であり、未解決事項としては残さない。
+Input/keyのVideoSeekStartと既存StartPlaybackは維持し、イベント権限だけを変更した。
+
+残る動画7操作のsource監査（本セッションのコード調査。新しい実行・レビュー結果ではない）:
+
+| 操作/経路 | file:lineと通常停止の維持・EOFへの非加速の根拠 |
+| --- | --- |
+| Back Small/Medium/Large: Native | `src/app/native_video.rs:12921`のdirection=-1と`src/settings.rs:9828`の正値step。`:15599`でPreserveIntent。normalize入口`:7975`はintent_playing=falseならreturn |
+| Back3: EguiVideo | `src/app/native_video.rs:12937`で同じ負deltaをplayer.seek_relative(PreserveIntent)へ。`src/video/mod.rs:11543`がuser_seek_baseに足してclampし、`:11325`の通常停止のintent=falseを維持 |
+| Back3: EguiMusic | `src/ui_music_panels.rs:1103`でuser_seek_base＋負deltaをclampし、`:1090` music_seek_to(PreserveIntent)。`src/app.rs:102488` apply_music_loop_modeはloop flags/target/baselineのみ、連続ONではloop無効化してreturn。Playは呼ばない |
+| Back3の共通発行 | `src/video/mod.rs:11206` issue_user_seek_lockedはhandle_seek_request後にapply_internal_continuation(should_play)し、Playを経由しない。通常停止はintent=false。`:10717`のuser PauseはDSP待ちのplay requestもcancelするため、`:11150`のDSP original-play例外を残さない |
+| Mute: Native/EguiVideo/EguiMusic | `src/app/native_video.rs:12968`→`src/app.rs:81925`のsession mute→`src/video/mod.rs:11859`→`src/video/clock.rs:1316`のAtomicBool。保存とHUD更新だけで、再生意図/seek/位置は変更しない |
+| VolumeUp/Down: 全3経路 | `src/app/native_video.rs:12949`→`src/video/mod.rs:11851`→`src/video/clock.rs:1305`のvolume_bits。キーと同じ保存は行うが、Play/seekは無い |
+| SeekStripToggle: Native/EguiVideo | `src/app/native_video.rs:10386` apply→`:10423` view→`:10143` session/`:10317` close→`:11401` sync。表示・axis/layout・別thumbnail/wave workerの資源だけ。主playerのseek/set_playingは無く、`src/video/mod.rs:12602` set_native_seek_stripもoverlay payloadだけ |
+| SeekStripToggle: EguiMusic | `src/app/native_video.rs:12784`の既存拒否。音楽表示では非対応のまま。同期印があることを理由に新しく有効にはしない。途中rejectの既存metric回帰でも停止維持を確認する |
+
+この「停止」は通常のuser pause（intent_playing=false）であり、Loading/Seeking/DSP待ち等で一時的にis_playing=falseになる状態とは区別する。
+Back3の非増加は操作が確定するtargetがuser_seek_base（既存pending/DSP選択を含む）へ負deltaを加えた値という意味で、再生中の実時計が全時間で不増という意味ではない。
+EOFでのBack再開は既存seek_play_intentの別条件。連続ONのEOFは既に次送り対象であり、通常停止からの再生開始と同一の反例には扱わず、既存の注記を保つ。
+監査した7操作に、通常のuser pauseを再生開始へ変える追加対象は見つからず、さらにForbiddenへ移した操作は無い。
+
+回帰の変更:
+
+- 再生中の短動画＋連続ONの全件拒否を5操作から6操作へ拡張。前後同期Aも無実行、通知・0 dispatch・再生/seek/loop状態維持を比較。
+- 停止SeekStartのcharacterizationをイベント全件拒否の回帰へ変更。Native/EguiVideo/EguiMusicで前後同期Aを含め、通知・0 dispatch・position/serial/mute/volume/paused intent維持・EOF要求無しを確認。
+- shared EOF正対照helperのSeekStart許可分岐を撤去し、安全側の実出力完了/EOF陰性はBack3だけへ変更。event_executeと実EOF→resolver→次採用の正対照は維持。
+- 既存event_safe_video_actions回帰を強化し、3経路の通常停止intent・user_seek_base非増加・Back3のserial増加→readiness＋実CPU出力消費後も停止・連続ONでEOF/次採用/後続event無しを比較。
+  各操作のfixtureはpositionとlast_displayed_ptsを10秒へ揃え、前のBackに残る表示PTSを次のケースが使ってAtStartのno-opになることを防ぐ。MusicのStripは既存非対応としてskipし、別の途中reject回帰を維持。
+
+今回も製品のキー・render/EOF処理順・clamp・保存経路・detached境界は変更していない。
+既存の関連243成功・release計測は前のsourceの証拠として再利用し、今回の未検証差分の成功結果とは扱わない。
+
+今回の変更・検証引継ぎ（現行test名、すべて未実行）:
+
+| 変更箇所/test名 | file:line |
+| --- | --- |
+| event_permission: SeekStart追加除外 | `src/operation_script/contract.rs:113` |
+| `validation_event_mark_inventory_and_mixed_batches_are_atomic` | `src/operation_script/contract.rs:664` |
+| `event_safe_video_actions_preserve_all_four_identity_components_for_native_and_music` | `src/app/operation_script_runtime/tests/events.rs:1122` |
+| `event_r13_rejects_all_six_playback_advancing_actions_atomically_on_short_playing_video` | `src/app/operation_script_runtime/tests/events.rs:1320` |
+| `event_r13_back_seeks_complete_output_before_polling_eof_and_do_not_advance_or_refire` | `src/app/operation_script_runtime/tests/events.rs:1374` |
+| `event_r13_eof_control_runs_tick_resolver_next_adoption_and_then_page_detection` | `src/app/operation_script_runtime/tests/events.rs:1496` |
+| `event_r13_paused_seek_start_is_rejected_atomically_without_dispatch_or_resume` | `src/app/operation_script_runtime/tests/events.rs:1503` |
+
+ClaudeCodeのfilterは`event_r13`と`event_safe_video_actions`、まとめて`operation_script`（既存Input/shared execution回帰も含む）と`poll_video`。
+キーからの頭出し再生を維持する既存回帰は`paused_seek_handlers_preserve_pause_and_explicit_commands_start`。event_executeと既存VideoPlayer EOF回帰のfilterは前節を維持する。
+bare `cargo fmt`・`git diff --check`はexit 0。UI文字列変更無しのためglyph checker再実行不要。Rust build/test/check・実測・アプリ起動・commit・新しい独立レビューは実行していない。

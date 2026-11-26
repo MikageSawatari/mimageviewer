@@ -8,7 +8,7 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
-| [operation-script-plan.md](operation-script-plan.md) | §1.363 操作のスクリプト。段1〜4のworker準備・入力・同期実行・main専用イベントを実装。r11入れ物/scalar/strong Arc＋r12 OpenOnly、A監査と今回r12のRust検証未実施は§16。段5の設定UIは未着手 |
+| [operation-script-plan.md](operation-script-plan.md) | §1.363 操作のスクリプト。段1〜4実装、関連243テスト成功・release計測済。独立実装review指摘へr13で対応中（今回差分は未検証）、実機未確認。SeekStartは追加除外決定済み、権限・計測・動画7操作の監査は§16。段5の設定UIは未着手 |
 | [drive-tabs-793-plan.md](drive-tabs-793-plan.md) | §1.793 ツールバーのドライブ欄 (ドライブ別の最後の場所を常設ボタンから開く)。A/B の記録から導くドライブの集合、キー操作と共有するドライブ移動の worker 解決、置き場所・右クリック・利用者判断。設計段階、未実装 |
 | [folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) | §1.464 ツリー行への D&D と右クリック貼り付け、§1.821 一覧ドロップ。表示済み pass の形・ROOT OLE target・既定操作のボリューム確認・共有受付と転送 owner。generic Shell image と target description を使用。実装記録と未実施の検証は §14〜15 |
 | [grid-folder-drop-and-handle-release-plan.md](grid-folder-drop-and-handle-release-plan.md) | §1.858 B・2 / §1.860 (v5.7.0 予定、設計中)。移動・名前の変更・削除の前に mIV が持つ ZIP / PDF の handle を手放す「変更の囲い」、一覧の実フォルダのセルへのドロップ、外部からのドラッグ中の落とし先の強調と説明のバッジ |

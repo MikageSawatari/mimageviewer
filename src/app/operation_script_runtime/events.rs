@@ -8,6 +8,31 @@ use std::{
 use super::*;
 use crate::operation_script::ScriptEvent;
 
+#[cfg(test)]
+std::thread_local! {
+    static EXECUTION_SAMPLES: std::cell::RefCell<Option<Vec<(usize, Option<EventIdentity>)>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn capture_event_executions<T>(
+    f: impl FnOnce() -> T,
+) -> (T, Vec<(usize, Option<EventIdentity>)>) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            EXECUTION_SAMPLES.with(|samples| *samples.borrow_mut() = None);
+        }
+    }
+    EXECUTION_SAMPLES.with(|samples| {
+        assert!(samples.borrow().is_none(), "nested event execution capture");
+        *samples.borrow_mut() = Some(Vec::new());
+    });
+    let _reset = Reset;
+    let result = f();
+    let samples = EXECUTION_SAMPLES.with(|samples| samples.borrow_mut().take().unwrap());
+    (result, samples)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct EventIdentity {
     pub container: Option<ScriptContainer>,
@@ -299,19 +324,49 @@ impl App {
                 }
             }
             EventAdmission::Execute => {
-                self.run_operation_script_event(ctx, surface, events);
+                // Includes evaluation/snapshot as well as validation, all actions
+                // (and their existing saves), and the same-frame rebase below.
+                let started = crate::perf::is_enabled().then(Instant::now);
+                let actions = self.run_operation_script_event(ctx, surface, events);
                 let identity = self.collect_operation_script_event_identity(surface);
                 self.operation_script_events.finish_event(identity);
+                self.finish_operation_script_event_execution(started, actions);
             }
         }
     }
 
+    fn finish_operation_script_event_execution(&self, started: Option<Instant>, actions: usize) {
+        #[cfg(test)]
+        EXECUTION_SAMPLES.with(|samples| {
+            if let Some(samples) = samples.borrow_mut().as_mut() {
+                samples.push((actions, self.operation_script_events.baseline.clone()));
+            }
+        });
+        if let Some(started) = started {
+            crate::perf::event(
+                "script",
+                "event_execute",
+                None,
+                0,
+                &[
+                    (
+                        "ms",
+                        serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("actions", serde_json::json!(actions)),
+                ],
+            );
+        }
+    }
+
+    /// Number of calls actually dispatched, including a rejected call but not
+    /// any unexecuted suffix. Evaluation/validation failures return zero.
     fn run_operation_script_event(
         &mut self,
         ctx: &egui::Context,
         surface: ScriptInputSurface,
         events: Vec<ScriptEvent>,
-    ) {
+    ) -> usize {
         let native_video =
             surface == ScriptInputSurface::Viewer && self.operation_script_uses_native_video();
         let mut snapshot = self.collect_operation_script_snapshot(surface);
@@ -319,7 +374,7 @@ impl App {
         snapshot.events = events.clone();
         let result = match &self.operation_script.state {
             OperationScriptState::Ready(script) => script.evaluate_event(&snapshot),
-            _ => return,
+            _ => return 0,
         }
         .and_then(|output| {
             validate_output(
@@ -336,15 +391,17 @@ impl App {
             Ok(output) => output,
             Err(error) => {
                 self.operation_script_event_failure(error);
-                return;
+                return 0;
             }
         };
+        let mut actions = 0;
         for operation in output.operations() {
             if !matches!(self.operation_script_eligibility(ctx, surface), ScriptEligibility::Available(context) if context == snapshot.context)
             {
                 self.operation_script_event_failure("操作の対象が変わりました");
-                return;
+                return actions;
             }
+            actions += 1;
             let result =
                 self.execute_operation_script_action(ctx, surface, operation.action, native_video);
             if result.rejected() || result.needs_postprocessing() {
@@ -352,12 +409,13 @@ impl App {
                     "『{}』を実行できませんでした",
                     operation.action.ini_name()
                 ));
-                return;
+                return actions;
             }
         }
         if let Some(notice) = output.notice() {
             self.show_feedback_toast(notice.to_owned());
         }
+        actions
     }
 
     fn operation_script_event_failure(&mut self, reason: impl std::fmt::Display) {

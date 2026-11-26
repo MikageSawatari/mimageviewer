@@ -9271,6 +9271,14 @@ impl VideoPlayer {
     }
 
     #[cfg(test)]
+    pub(crate) fn video_only_disconnected_for_test(path: PathBuf) -> Self {
+        let mut player = Self::stream_ready_disconnected_for_test(path);
+        player.audio = None;
+        player.info.as_mut().unwrap().has_audio = false;
+        player
+    }
+
+    #[cfg(test)]
     pub(crate) fn loading_resume_disconnected_for_test(
         path: PathBuf,
         resume: crate::settings::VideoResumePosition,
@@ -9459,6 +9467,43 @@ impl VideoPlayer {
             pts: target_secs,
             wall_now: std::time::Instant::now(),
         });
+    }
+
+    /// Fake decoder delivery through the real CPU-output tick. The native test
+    /// presenter has no output thread, so temporarily route just this frame to
+    /// tick; restore the presenter before App polls native EOF/continuous play.
+    /// Unlike complete_seek_for_test, this retires the clock override by output
+    /// consumption rather than changing the actor readiness alone.
+    #[cfg(all(test, windows))]
+    pub(crate) fn consume_seek_frame_for_test(&mut self, ctx: &egui::Context, target_secs: f64) {
+        assert!(
+            !self.clock.is_demux_exhausted(),
+            "the new seek epoch must reset old EOF"
+        );
+        assert!(
+            !self.clock.is_audio_active(),
+            "CPU fixture requires a wall clock"
+        );
+        let native = self.native_output.take();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        tx.try_send(VideoFrame {
+            width: 1,
+            height: 1,
+            data: VideoFrameData::Cpu(vec![0; 4]),
+            sar_num: 1,
+            sar_den: 1,
+            pts_secs: target_secs,
+            seek_serial: self.current_seek_serial(),
+            orientation: crate::video::display_metadata::VideoOrientation::IDENTITY,
+        })
+        .unwrap();
+        self.decode.video_rx = rx;
+        let _ = self.tick(ctx);
+        self.native_output = native;
+        assert!(
+            !self.clock.is_seeking(),
+            "a real post-seek frame must be consumed"
+        );
     }
 
     #[cfg(all(test, windows))]

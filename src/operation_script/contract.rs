@@ -106,6 +106,8 @@ macro_rules! operations {
 }
 
 /// r12: direction/fit may reconcile a slice later, but never create another open.
+/// r13 forbids PlayPause/Loop/forward seeks and SeekStart: each can start
+/// playback or promote EOF independently of another user navigation input.
 /// Other audited changes are absorbed before the remaining draw/completion.
 /// Grid actions change layout/order, but neither its location nor cursor item.
 const fn event_permission(action: KeyAction) -> EventPermission {
@@ -122,18 +124,12 @@ const fn event_permission(action: KeyAction) -> EventPermission {
             | FsZoomOut
             | FsToggleMetadata
             | FsNavigatorToggle
-            | VideoPlayPause
             | VideoMute
             | VideoVolumeUp
             | VideoVolumeDown
-            | VideoLoop
-            | VideoSeekStart
             | VideoSeekBackSmall
-            | VideoSeekForwardSmall
             | VideoSeekBackMedium
-            | VideoSeekForwardMedium
             | VideoSeekBackLarge
-            | VideoSeekForwardLarge
             | VideoSeekStripToggle
             | GridColumnCount1
             | GridColumnCount2
@@ -671,8 +667,22 @@ mod tests {
                 .iter()
                 .filter(|op| op.event_permission == EventPermission::Synchronous)
                 .count(),
-            41
+            35
         );
+        for (context, count) in [
+            (ScriptContext::FsImage, 7),
+            (ScriptContext::FsVideo, 7),
+            (ScriptContext::Grid, 21),
+        ] {
+            assert_eq!(
+                ALLOWED_OPERATIONS
+                    .iter()
+                    .filter(|op| op.event_permission == EventPermission::Synchronous
+                        && op.contexts.contains(context))
+                    .count(),
+                count
+            );
+        }
         assert_eq!(
             ALLOWED_OPERATIONS
                 .iter()
@@ -700,6 +710,12 @@ mod tests {
                 KeyAction::FsSpreadLtrCover,
                 KeyAction::FsSpreadRtl,
                 KeyAction::FsSpreadRtlCover,
+                KeyAction::VideoPlayPause,
+                KeyAction::VideoLoop,
+                KeyAction::VideoSeekStart,
+                KeyAction::VideoSeekForwardSmall,
+                KeyAction::VideoSeekForwardMedium,
+                KeyAction::VideoSeekForwardLarge,
             ]
         );
         for op in ALLOWED_OPERATIONS

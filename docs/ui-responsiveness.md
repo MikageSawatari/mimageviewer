@@ -41,7 +41,7 @@ AppのROOT passは起動要求と `try_recv`、世代の照合だけを行い、
 snapshotを読む。操作は既存のキー実行関数と保存・シーク・キャプチャworker受付を共有し、
 新しい同期I/O・デコード・GPUアップロード・待ち・常設のpendingを追加しない。
 
-段4のr11/r12イベントは、一覧ROOT・viewer所有pass・native ROOTでキーより前に検出する。
+段4のr11〜r13イベントは、一覧ROOT・viewer所有pass・native ROOTでキーより前に検出する。
 OFF／on_event無しは利用資格・native playerのsnapshot・識別の収集を行わない。main専用baseline・ROOT frame番号・
 直近10実行時刻はbundle外で、別context・利用不可のpassからは更新しない。状態が変わらないframeにも検出済み番号を記録する。
 イベント識別はtyped item由来の入れ物と共用scalar、強いcomposition Arcのみ。reader order列・Search条件・展開rootsを
@@ -50,11 +50,19 @@ OFF／on_event無しは利用資格・native playerのsnapshot・識別の収集
 `script/event_detect` は利用資格通過後の識別構築と比較のms・eventsを記録し、Rhai評価・操作の時間は含まない。
 イベントがある時だけ既存snapshot（navigation列の複製を含む）を作って評価し、全件validate後に共用のAを実行、同frameで
 識別を取り直す。r12のOpenOnly2操作は検出集合のopenを事前検査し、openを含まない遅れPageからの再実行を許さない。新しい識別や追跡状態は足さない。
-rolling 1秒10起動の超過はそのframe分を捨て、後で再生しない。新しいI/O・decode・GPU upload・待ち・timerは無い。
+rolling 1秒10起動の超過はそのframe分を捨て、後で再生しない。検出に新しいI/O・decode・GPU upload・待ちは無い。
+実行はr13の利用者決定により、既存キーと同じsettings.save/spread_db同期更新をUIスレッドのI/O禁止の例外として保つ。
+イベントからもキーと同じ保存の費用を払い、重い保存環境では短い引っかかりが起こり得る。保存経路をworkerへ移す変更は行わない。
+`script/event_execute`はsnapshot・Rhai評価を含め、全件validate前から操作（同期保存を含む）と同frame取り直し完了までのms/actionsを記録する。
+actionsは実dispatcherへの呼出し回数（拒否された呼出しを含む・未実行suffixを除く）で、評価/validation拒否は0。
+途中rejectも取り直し後に終端を記録する。無効時は追加timerのInstantを取得せず、検出無し/上限dropでは区間を出さない。
+r13の動画6操作はEOF/次採用を促進するため不可。SeekStartも通常停止から再生を始めるため追加除外決定済み（計画§16）。
+Backは通常停止では停止を維持するが、EOF時は再開するsourceがあり、イベント入口の追加確認範囲として区別する。
 既存の段2b要求照合は従来のO(N)識別を維持し、scalar生成だけ共用する。旧release計測（指示書共有cf1fce276、5万件）は
 構築1.1〜2.2ms（p95最大3.4ms）、保持heap概算約15MB、比較1〜1.5msで、イベント検出へその列を持ち込まない根拠である。
 既存ignored `perf_operation_script_page_identity` に5万件の変更なしevent識別の構築＋比較（μs）の行を追加した。
-本セッションではRustテスト・release実測・実機を実行していない。入れ物表、A監査、テスト依頼は
+ClaudeCodeの791529cf1 release計測では、変更なしevent識別が中央値0.8〜0.9μs・p95最大2.1μs。関連243テストも成功済み。
+独立実装レビュー指摘へr13で対応中で、今回差分のRust検証・event_execute費用の実測・実機は未実施。入れ物表、A監査、テスト依頼は
 [操作スクリプト計画§16](operation-script-plan.md#operation-script-stage4) を参照。
 
 ## スタック用スクリプトのファイル操作（§1.843）
