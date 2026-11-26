@@ -24,7 +24,7 @@ fn draw_reset_confirmation(ctx: &egui::Context, enter: bool, escape: bool) -> Re
     #[cfg(test)]
     let mut buttons = None;
     let window = egui::Window::new("手動順のリセット")
-        .id(egui::Id::new("folder_order_reset_confirm"))
+        .id(egui::Id::unique("folder_order_reset_confirm"))
         .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
         .default_width(width)
         .max_width(width)
@@ -96,7 +96,7 @@ impl crate::app::App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui_kittest::kittest::{NodeT, Queryable};
+    use egui_kittest::kittest::Queryable;
     use std::{cell::Cell, rc::Rc};
 
     #[test]
