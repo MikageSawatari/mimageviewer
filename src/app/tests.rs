@@ -15809,6 +15809,19 @@ pub(crate) mod phase_c_support {
         // 作るテストが実データを書き換える。テストが実利用のフォルダへ触れないよう、ここで
         // 一緒に temp dir へ向ける。
         app.settings.book_root = Some(tmp.path().join("books"));
+        // Legacy immediate-navigation fixtures start with a prepared record index.
+        // This FIFO fence runs on the test thread; production UI never waits here.
+        // Tests for startup preparation explicitly install a gated actor instead.
+        let folder_order = app
+            .folder_order_handle()
+            .expect("folder order fixture actor");
+        folder_order
+            .read(tmp.path())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("folder order fixture startup")
+            .expect("folder order fixture database");
+        assert!(folder_order.index_ready_for_test());
         let ai_runtime_cleanup = AiRuntimeFixtureCleanup::new(&app, ai_runtime);
         AppTestEnv {
             app,

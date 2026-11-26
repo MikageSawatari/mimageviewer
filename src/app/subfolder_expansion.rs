@@ -3107,6 +3107,8 @@ mod tests {
 
     #[test]
     fn folder_order_expansion_exit_keeps_installed_owner_until_read_adoption() {
+        use crate::folder_order::{FolderOrderSave, physical_item_key};
+
         for cancel_rebuild in [false, true] {
             let mut app = crate::app::setup_app_for_test();
             app.active_quick_folder_slot = None;
@@ -3120,6 +3122,30 @@ mod tests {
             app.load_folder(root.clone());
             app.settle_open_path_classification_for_test();
             app.finish_page_identity_preparation_for_test();
+            // A recorded return target must retain the expansion owner until
+            // its actor read is adopted, even when the record index is ready.
+            let listing_order: Vec<_> = app.items.iter().filter_map(physical_item_key).collect();
+            assert!(!listing_order.is_empty());
+            let actor = app.folder_order_handle().unwrap();
+            actor
+                .save(
+                    &root,
+                    FolderOrderSave {
+                        inventory: listing_order.iter().cloned().collect(),
+                        listing_order,
+                        revision: 71,
+                    },
+                )
+                .unwrap();
+            assert!(
+                actor
+                    .read(&root)
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap()
+                    .is_some()
+            );
             app.start_subfolder_expansion_scan_roots(root.clone(), vec![root.clone()]);
             let ctx = egui::Context::default();
             let deadline = Instant::now() + Duration::from_secs(10);

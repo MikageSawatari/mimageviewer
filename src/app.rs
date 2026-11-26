@@ -31917,7 +31917,8 @@ impl App {
                 && matches!(
                     self.physical_duration_sort_surface(&path, Some(&owner), None),
                     top_level_grid_view::TopLevelGridSurface::Folder
-                ))
+                )
+                && !self.folder_order_record_is_known_absent(&path))
         {
             if self.remote_session_blocks_local_control() {
                 let reason = OpenAdmissionRefusal::RemoteControl;
@@ -32812,7 +32813,7 @@ impl App {
         }
         let sort_surface =
             self.physical_duration_sort_surface(&path, Some(&owner), navigation.as_ref());
-        if !self.snapshot_internal_nav
+        let folder_order_input = if !self.snapshot_internal_nav
             && !self.is_snapshot_active()
             && !crate::folder_tree::path_eq(&path, &self.book_root_path())
             && !crate::books::is_direct_book_folder(&self.book_root_path(), &path)
@@ -32825,36 +32826,48 @@ impl App {
                 .as_ref()
                 .is_none_or(|scan| !scan.folder_order_input.is_read())
         {
-            let candidate = match crate::pdf_loader::LeasedEpubPath::try_new(path) {
-                Ok(candidate) => candidate,
-                Err(reason) => {
-                    return FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(reason.into()));
-                }
-            };
-            return match self.start_open_path_classification_owned_with_navigation(
-                candidate,
-                ClassifiedOpenContinuation::DirectScan {
-                    pre_scan,
-                    owner,
-                    grid_effects,
-                    restore_intent,
-                },
-                navigation,
-                stage,
-            ) {
-                OpenAdmission::Accepted => FolderOpenOutcome::Classifying,
-                OpenAdmission::Refused(reason) => {
-                    self.show_open_admission_refusal(reason);
-                    FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(reason))
-                }
-                OpenAdmission::NotApplicable => {
-                    unreachable!("physical listing read uses owned classification")
-                }
-            };
-        }
+            if self.folder_order_record_is_known_absent(&path) {
+                // The prepared append-only index proves there is no record. Keep
+                // this caller's synchronous installer/history contract without a DB read.
+                Some(crate::folder_order::FolderOrderListingInput::from_read(Ok(
+                    None,
+                )))
+            } else {
+                let candidate = match crate::pdf_loader::LeasedEpubPath::try_new(path) {
+                    Ok(candidate) => candidate,
+                    Err(reason) => {
+                        return FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(
+                            reason.into(),
+                        ));
+                    }
+                };
+                return match self.start_open_path_classification_owned_with_navigation(
+                    candidate,
+                    ClassifiedOpenContinuation::DirectScan {
+                        pre_scan,
+                        owner,
+                        grid_effects,
+                        restore_intent,
+                    },
+                    navigation,
+                    stage,
+                ) {
+                    OpenAdmission::Accepted => FolderOpenOutcome::Classifying,
+                    OpenAdmission::Refused(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(reason))
+                    }
+                    OpenAdmission::NotApplicable => {
+                        unreachable!("physical listing read uses owned classification")
+                    }
+                };
+            }
+        } else {
+            None
+        };
         let scan_started = std::time::Instant::now();
         let pre_scanned = pre_scan.is_some();
-        let scan = {
+        let mut scan = {
             let _span = CloseNavSpan::new(CloseNavStage::ScanDirectory);
             match pre_scan {
                 Some(scan) => scan,
@@ -32875,6 +32888,9 @@ impl App {
                 },
             }
         };
+        if let Some(input) = folder_order_input {
+            scan.folder_order_input = input;
+        }
         let current = {
             let _span = CloseNavSpan::new(CloseNavStage::OwnerCurrent);
             self.open_request_owner_is_current(&path, &owner)

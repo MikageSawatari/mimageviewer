@@ -278,6 +278,19 @@ impl FolderOrderDb {
         Ok(record)
     }
 
+    fn folder_keys(&self) -> OrderResult<HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT folder_key FROM folder_order_folders")?;
+        let keys = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        if keys.iter().any(|key| folder_key(Path::new(key)) != *key) {
+            return Err(FolderOrderError::new("invalid folder order folder key"));
+        }
+        Ok(keys)
+    }
+
     fn read_from(conn: &Connection, folder: &str) -> OrderResult<Option<FolderOrderRecord>> {
         let meta = conn
             .query_row(
@@ -583,10 +596,58 @@ struct QueuedRequest {
     owner: Option<u64>,
 }
 
+/// A conservative, append-only superset of persisted and accepted folder keys.
+/// Admission and startup publication use the queue mutex, so a later accepted
+/// save/rename can never be lost when the actor publishes its initial DB keys.
+#[derive(Default)]
+struct RecordIndex {
+    keys: HashSet<String>,
+    ready: bool,
+    startup_renames: Vec<Vec<FolderOrderRename>>,
+}
+
+impl RecordIndex {
+    fn append_renamed_keys(keys: &mut HashSet<String>, mappings: &[FolderOrderRename]) {
+        // Each batch maps the original snapshot simultaneously, including swaps
+        // and nested source trees. Old keys deliberately remain in the index.
+        let destinations = keys
+            .iter()
+            .filter_map(|key| rewrite_key_with_mappings(key, mappings))
+            .collect::<Vec<_>>();
+        keys.extend(destinations);
+    }
+
+    fn admit(&mut self, request: &Request) {
+        match request {
+            Request::Save { folder, .. } => {
+                self.keys.insert(folder.clone());
+            }
+            Request::Rename { mappings, .. } => {
+                Self::append_renamed_keys(&mut self.keys, mappings);
+                if !self.ready {
+                    self.startup_renames.push(mappings.clone());
+                }
+            }
+            Request::Read { .. } | Request::SetActive { .. } | Request::Reset { .. } => {}
+        }
+    }
+
+    fn publish(&mut self, mut persisted_keys: HashSet<String>) {
+        for mappings in self.startup_renames.drain(..) {
+            Self::append_renamed_keys(&mut persisted_keys, &mappings);
+        }
+        self.keys.extend(persisted_keys);
+        self.ready = true;
+    }
+}
+
 #[derive(Default)]
 struct Queue {
     requests: VecDeque<QueuedRequest>,
     closed: bool,
+    record_index: RecordIndex,
+    #[cfg(test)]
+    read_requests: usize,
 }
 
 impl Queue {
@@ -596,6 +657,11 @@ impl Queue {
     }
 
     fn push_owned(&mut self, request: Request, owner: Option<u64>) {
+        self.record_index.admit(&request);
+        #[cfg(test)]
+        if matches!(&request, Request::Read { .. }) {
+            self.read_requests += 1;
+        }
         // Only adjacent saves may replace one another. Every read, reset, rename,
         // active switch and other-folder request is a FIFO barrier.
         if let (
@@ -650,6 +716,40 @@ pub(crate) struct FolderOrderHandle {
 }
 
 impl FolderOrderHandle {
+    /// The UI may skip an actor read only after startup proved this folder has
+    /// no record. This lookup performs no I/O and never waits for actor work.
+    pub(crate) fn record_is_known_absent(&self, folder: &Path) -> bool {
+        let key = folder_key(folder);
+        let queue = self
+            .client
+            .queue
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        queue.record_index.ready && !queue.record_index.keys.contains(&key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn index_ready_for_test(&self) -> bool {
+        self.client
+            .queue
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .record_index
+            .ready
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_request_count_for_test(&self) -> usize {
+        self.client
+            .queue
+            .0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .read_requests
+    }
+
     /// Bind only writes submitted through this clone to their owning viewer.
     /// The token is context identity, independent of folder and order revision.
     pub(crate) fn for_owner(&self, owner: u64) -> Self {
@@ -727,12 +827,33 @@ impl FolderOrderService {
     }
     /// Opening and schema setup happen inside the actor, never on the caller.
     pub(crate) fn start_at(path: PathBuf) -> std::io::Result<Self> {
+        Self::start_at_before_open(path, || {})
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_at_paused_for_test(
+        path: PathBuf,
+    ) -> std::io::Result<(Self, mpsc::Sender<()>)> {
+        let (release, gate) = mpsc::channel();
+        let service = Self::start_at_before_open(path, move || {
+            let _ = gate.recv();
+        })?;
+        Ok((service, release))
+    }
+
+    fn start_at_before_open(
+        path: PathBuf,
+        before_open: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<Self> {
         let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
         let (tx, completions) = mpsc::channel();
         let worker_queue = queue.clone();
         let worker = std::thread::Builder::new()
             .name("folder-order".into())
-            .spawn(move || run_actor(worker_queue, tx, path))?;
+            .spawn(move || {
+                before_open();
+                run_actor(worker_queue, tx, path);
+            })?;
         Ok(Self {
             handle: FolderOrderHandle {
                 client: Arc::new(Client { queue }),
@@ -775,6 +896,23 @@ fn run_actor(queue: SharedQueue, completions: mpsc::Sender<FolderOrderCompletion
     let mut db = FolderOrderDb::open_at(&path);
     if let Err(error) = &db {
         crate::logger::log(format!("folder_order: open failed: {error}"));
+    }
+    // No request may execute before the complete initial key set is available.
+    // Failure leaves the index unready and all requests receive the same typed
+    // startup error; do not retry, recreate data, or guess that a record is absent.
+    if let Ok(opened) = &db {
+        match opened.folder_keys() {
+            Ok(keys) => queue
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .record_index
+                .publish(keys),
+            Err(error) => {
+                crate::logger::log(format!("folder_order: index read failed: {error}"));
+                db = Err(error);
+            }
+        }
     }
     let mut blocked = HashMap::<String, FolderOrderError>::new();
     loop {
@@ -1799,6 +1937,240 @@ mod tests {
     }
 
     #[test]
+    fn folder_order_record_index_waits_for_startup_and_includes_inactive_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(DB_NAME);
+        let mut db = FolderOrderDb::open_at(&path).unwrap();
+        db.save("c:/active", &record(1, &["c:/active/a"])).unwrap();
+        let mut inactive = record(2, &["c:/inactive/a"]);
+        inactive.active = false;
+        db.save("c:/inactive", &inactive).unwrap();
+        drop(db);
+
+        let (service, release) = FolderOrderService::start_at_paused_for_test(path).unwrap();
+        let handle = &service.handle;
+        assert!(!handle.index_ready_for_test());
+        assert!(!handle.record_is_known_absent(Path::new("c:/missing")));
+        let barrier = handle.read(Path::new("c:/missing")).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            barrier.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Ok(None)
+        );
+        assert!(handle.index_ready_for_test());
+        assert!(!handle.record_is_known_absent(Path::new("C:/Active/")));
+        assert!(!handle.record_is_known_absent(Path::new("C:/Inactive/")));
+        assert!(handle.record_is_known_absent(Path::new("c:/missing")));
+        service.shutdown();
+    }
+
+    #[test]
+    fn folder_order_record_index_reset_retains_key_and_later_save_admission() {
+        let actor = ActorTest::new(vec![]);
+        assert_eq!(actor.read("c:/f").unwrap(), None);
+        let handle = actor.handle();
+        assert!(handle.index_ready_for_test());
+        assert!(handle.record_is_known_absent(Path::new("c:/f")));
+        handle
+            .save(Path::new("c:/f"), save_data(1, &["c:/f/a"]))
+            .unwrap();
+        assert!(!handle.record_is_known_absent(Path::new("C:/F/")));
+        assert!(actor.completion().result.is_ok());
+        handle.reset(Path::new("c:/f"), 2).unwrap();
+        assert_eq!(actor.read("c:/f").unwrap(), None);
+        assert!(actor.completion().result.is_ok());
+        assert!(!handle.record_is_known_absent(Path::new("c:/f")));
+
+        // A later save is indexed at admission. Completing the earlier reset
+        // must never remove that key, regardless of actor scheduling.
+        handle.reset(Path::new("c:/f"), 3).unwrap();
+        handle
+            .save(Path::new("c:/f"), save_data(4, &["c:/f/b"]))
+            .unwrap();
+        assert!(!handle.record_is_known_absent(Path::new("c:/f")));
+        assert_eq!(actor.read("c:/f").unwrap(), Some(record(1, &["c:/f/b"])));
+        assert!(actor.completion().result.is_ok());
+        assert!(actor.completion().result.is_ok());
+        assert!(!handle.record_is_known_absent(Path::new("c:/f")));
+
+        // Prefill both requests before running the actor so reset completion is
+        // deterministically later than the final save's index admission.
+        let temp = tempfile::tempdir().unwrap();
+        let queue = Arc::new((Mutex::new(Queue::default()), Condvar::new()));
+        {
+            let mut pending = queue.0.lock().unwrap();
+            pending.push(save_request("c:/f", 1, &["c:/f/a"]));
+            pending.push(Request::Reset {
+                folder: "c:/f".into(),
+                revision: 2,
+            });
+            pending.push(save_request("c:/f", 3, &["c:/f/b"]));
+            pending.closed = true;
+        }
+        let (tx, _completions) = mpsc::channel();
+        run_actor(queue.clone(), tx, temp.path().join(DB_NAME));
+        let finished = queue.0.lock().unwrap();
+        assert!(finished.record_index.ready);
+        assert!(finished.record_index.keys.contains("c:/f"));
+    }
+
+    #[test]
+    fn folder_order_record_index_rename_admission_adds_exact_and_tree_destinations() {
+        let actor = ActorTest::new(vec![
+            save_request("c:/old", 1, &["c:/old/a"]),
+            save_request("c:/old/sub", 2, &["c:/old/sub/a"]),
+        ]);
+        assert!(actor.read("c:/old").unwrap().is_some());
+        let handle = actor.handle();
+        handle
+            .rename(
+                Path::new("c:/exact"),
+                3,
+                vec![FolderOrderRename::new(
+                    Path::new("c:/old"),
+                    Path::new("c:/exact"),
+                    RenameScope::Exact,
+                )],
+            )
+            .unwrap();
+        assert!(!handle.record_is_known_absent(Path::new("c:/old")));
+        assert!(!handle.record_is_known_absent(Path::new("c:/exact")));
+        assert!(handle.record_is_known_absent(Path::new("c:/exact/sub")));
+        handle
+            .rename(
+                Path::new("c:/tree"),
+                4,
+                vec![FolderOrderRename::new(
+                    Path::new("c:/old"),
+                    Path::new("c:/tree"),
+                    RenameScope::Tree,
+                )],
+            )
+            .unwrap();
+        assert!(!handle.record_is_known_absent(Path::new("c:/tree")));
+        assert!(!handle.record_is_known_absent(Path::new("c:/tree/sub")));
+        assert!(actor.read("c:/tree/sub").unwrap().is_some());
+    }
+
+    #[test]
+    fn folder_order_record_index_startup_replays_rename_chain_and_unions_pending_saves() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(DB_NAME);
+        let mut db = FolderOrderDb::open_at(&path).unwrap();
+        db.save("c:/a/sub", &record(1, &["c:/a/sub/item"])).unwrap();
+        drop(db);
+        let (service, release) = FolderOrderService::start_at_paused_for_test(path).unwrap();
+        let handle = &service.handle;
+        for (old, new, revision) in [("c:/a", "c:/b", 1), ("c:/b", "c:/c", 2)] {
+            handle
+                .rename(
+                    Path::new(new),
+                    revision,
+                    vec![FolderOrderRename::new(
+                        Path::new(old),
+                        Path::new(new),
+                        RenameScope::Tree,
+                    )],
+                )
+                .unwrap();
+        }
+        handle
+            .save(Path::new("c:/saved"), save_data(3, &["c:/saved/item"]))
+            .unwrap();
+        assert!(!handle.index_ready_for_test());
+        let read = handle.read(Path::new("c:/c/sub")).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            read.recv_timeout(Duration::from_secs(10)).unwrap().unwrap(),
+            Some(record(1, &["c:/c/sub/item"]))
+        );
+        assert!(handle.index_ready_for_test());
+        for folder in ["c:/a/sub", "c:/b/sub", "c:/c/sub", "c:/saved"] {
+            assert!(
+                !handle.record_is_known_absent(Path::new(folder)),
+                "{folder}"
+            );
+        }
+        assert!(handle.record_is_known_absent(Path::new("c:/missing")));
+        service.shutdown();
+    }
+
+    #[test]
+    fn folder_order_record_index_rename_batch_uses_simultaneous_source_rules() {
+        let mut index = RecordIndex::default();
+        index.publish(inventory(&["c:/a/sub", "c:/a/sub/deep", "c:/b/sub"]));
+        index.admit(&Request::Rename {
+            folder: "c:/a".into(),
+            revision: 1,
+            mappings: vec![
+                FolderOrderRename::new(Path::new("c:/a"), Path::new("c:/b"), RenameScope::Tree),
+                FolderOrderRename::new(Path::new("c:/b"), Path::new("c:/a"), RenameScope::Tree),
+                FolderOrderRename::new(
+                    Path::new("c:/a/sub"),
+                    Path::new("c:/specific"),
+                    RenameScope::Tree,
+                ),
+            ],
+        });
+        assert_eq!(
+            index.keys,
+            inventory(&[
+                "c:/a/sub",
+                "c:/a/sub/deep",
+                "c:/b/sub",
+                "c:/specific",
+                "c:/specific/deep",
+            ])
+        );
+    }
+
+    #[test]
+    fn folder_order_record_index_startup_read_failure_stays_unready_and_returns_typed_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(DB_NAME);
+        let db = FolderOrderDb::open_at(&path).unwrap();
+        // The schema opens successfully, but a non-text folder key cannot be
+        // loaded into the complete startup index.
+        db.conn
+            .execute(
+                "INSERT INTO folder_order_folders(folder_key,active,revision) VALUES(?1,0,1)",
+                [vec![0xff_u8]],
+            )
+            .unwrap();
+        drop(db);
+        let (service, release) =
+            FolderOrderService::start_at_paused_for_test(path.clone()).unwrap();
+        let handle = &service.handle;
+        handle
+            .save(Path::new("c:/f"), save_data(1, &["c:/f/item"]))
+            .unwrap();
+        let read = handle.read(Path::new("c:/missing")).unwrap();
+        release.send(()).unwrap();
+        let read_error = read
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap_err();
+        let write_error = service
+            .completions
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .result
+            .unwrap_err();
+        assert_eq!(read_error, write_error);
+        assert!(!handle.index_ready_for_test());
+        assert!(!handle.record_is_known_absent(Path::new("c:/missing")));
+        service.shutdown();
+        let conn = Connection::open(path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM folder_order_folders", [], |row| {
+                row.get::<_, usize>(0)
+            })
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn folder_order_actor_set_active_is_fifo_barrier_without_record_creation() {
         let actor = ActorTest::new(vec![
             save_request("c:/f", 1, &["c:/f/a", "c:/f/b"]),
@@ -2050,6 +2422,8 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+        assert!(!handle.index_ready_for_test());
+        assert!(!handle.record_is_known_absent(Path::new("c:/missing")));
         drop(handle);
         worker.join().unwrap();
         let conn = Connection::open(path).unwrap();

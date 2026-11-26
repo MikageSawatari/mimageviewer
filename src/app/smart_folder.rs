@@ -10146,6 +10146,8 @@ mod tests {
 
     #[test]
     fn folder_order_removed_smart_definition_keeps_owner_until_physical_adoption() {
+        use crate::folder_order::{FolderOrderSave, physical_item_key};
+
         let mut app = crate::app::setup_app_for_test();
         app.active_quick_folder_slot = None;
         app.settings.auto_fullscreen_image_folders = false;
@@ -10155,6 +10157,30 @@ mod tests {
         app.load_folder(root.clone());
         app.settle_open_path_classification_for_test();
         app.finish_page_identity_preparation_for_test();
+        // Seed the physical return target so the ready record index still
+        // sends definition removal through asynchronous read/adoption.
+        let listing_order: Vec<_> = app.items.iter().filter_map(physical_item_key).collect();
+        assert!(!listing_order.is_empty());
+        let actor = app.folder_order_handle().unwrap();
+        actor
+            .save(
+                &root,
+                FolderOrderSave {
+                    inventory: listing_order.iter().cloned().collect(),
+                    listing_order,
+                    revision: 71,
+                },
+            )
+            .unwrap();
+        assert!(
+            actor
+                .read(&root)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
         let mut definition = crate::settings::SmartFolderDefinition::new("manual return");
         definition.rules.push(crate::settings::SmartFolderRule::new(
             root.clone(),

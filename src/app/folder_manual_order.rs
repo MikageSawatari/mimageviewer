@@ -69,6 +69,13 @@ impl App {
             .map(|service| service.handle.clone())
     }
 
+    /// Only synchronous callers use this proof; worker producers still issue Read.
+    pub(super) fn folder_order_record_is_known_absent(&self, folder: &Path) -> bool {
+        self.folder_order_service
+            .as_ref()
+            .is_some_and(|service| service.handle.record_is_known_absent(folder))
+    }
+
     pub(super) fn poll_folder_order_completions(&mut self) {
         let completions = self
             .folder_order_service
@@ -354,6 +361,124 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn folder_manual_order_sync_known_absent_adopts_immediately_without_actor_read() {
+        let (mut app, _) = fixture();
+        let destination = app.tmp.path().join("sync-unrecorded");
+        std::fs::create_dir(&destination).unwrap();
+        for name in ["b.jpg", "a.jpg"] {
+            std::fs::write(destination.join(name), b"fixture").unwrap();
+        }
+        let handle = app.folder_order_handle().unwrap();
+        assert!(handle.index_ready_for_test());
+        assert!(handle.record_is_known_absent(&destination));
+        let reads = handle.read_request_count_for_test();
+        let generation = app.items_generation;
+        assert!(matches!(
+            app.app.load_folder_or_convert_archive(destination.clone()),
+            FolderOpenOutcome::Loaded
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(destination.as_path()));
+        assert_eq!(
+            keys(&app),
+            ["a.jpg", "b.jpg"]
+                .into_iter()
+                .map(|name| folder_key(&destination.join(name)))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(app.items_generation, generation + 1);
+        assert_eq!(
+            app.folder_order.input,
+            FolderOrderListingInput::from_read(Ok(None))
+        );
+        assert!(app.top_level_grid_view.open_path_classification().is_none());
+        assert_eq!(handle.read_request_count_for_test(), reads);
+        app.finish_page_identity_preparation_for_test();
+    }
+
+    #[test]
+    fn folder_manual_order_sync_recorded_destination_reads_before_single_adoption() {
+        let (mut app, origin) = fixture();
+        let destination = app.tmp.path().join("sync-recorded");
+        std::fs::create_dir(&destination).unwrap();
+        let order = ["b.jpg", "a.jpg"]
+            .into_iter()
+            .map(|name| {
+                let path = destination.join(name);
+                std::fs::write(&path, b"fixture").unwrap();
+                folder_key(&path)
+            })
+            .collect::<Vec<_>>();
+        let handle = app.folder_order_handle().unwrap();
+        handle
+            .save(
+                &destination,
+                FolderOrderSave {
+                    listing_order: order.clone(),
+                    inventory: order.iter().cloned().collect(),
+                    revision: 71,
+                },
+            )
+            .unwrap();
+        assert!(!handle.record_is_known_absent(&destination));
+        let reads = handle.read_request_count_for_test();
+        let generation = app.items_generation;
+        let items = app.items.clone();
+        assert!(matches!(
+            app.app.load_folder_or_convert_archive(destination.clone()),
+            FolderOpenOutcome::Classifying
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(origin.as_path()));
+        assert_eq!(app.items, items);
+        assert_eq!(app.items_generation, generation);
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.current_folder.as_deref(), Some(destination.as_path()));
+        assert_eq!(keys(&app), order);
+        assert!(app.folder_order.input.is_read());
+        assert_eq!(app.items_generation, generation + 1);
+        assert!(handle.read_request_count_for_test() > reads);
+    }
+
+    #[test]
+    fn folder_manual_order_sync_unprepared_index_defers_unrecorded_destination() {
+        let (mut app, origin) = fixture();
+        app.folder_order_service.take().unwrap().shutdown();
+        let (service, start) = FolderOrderService::start_at_paused_for_test(
+            app.tmp.path().join(crate::folder_order::DB_NAME),
+        )
+        .unwrap();
+        let handle = service.handle.clone();
+        app.folder_order_service = Some(service);
+        let destination = app.tmp.path().join("sync-startup-pending");
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(destination.join("a.jpg"), b"fixture").unwrap();
+        assert!(!handle.index_ready_for_test());
+        assert!(!handle.record_is_known_absent(&destination));
+        let generation = app.items_generation;
+        let items = app.items.clone();
+        assert!(matches!(
+            app.app.load_folder_or_convert_archive(destination.clone()),
+            FolderOpenOutcome::Classifying
+        ));
+        assert_eq!(app.current_folder.as_deref(), Some(origin.as_path()));
+        assert_eq!(app.items, items);
+        assert_eq!(app.items_generation, generation);
+        assert!(!handle.index_ready_for_test());
+        start.send(()).unwrap();
+        app.settle_open_path_classification_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert!(handle.index_ready_for_test());
+        assert!(handle.record_is_known_absent(&destination));
+        assert!(handle.read_request_count_for_test() > 0);
+        assert_eq!(app.current_folder.as_deref(), Some(destination.as_path()));
+        assert_eq!(
+            app.folder_order.input,
+            FolderOrderListingInput::from_read(Ok(None))
+        );
+        assert_eq!(app.items_generation, generation + 1);
     }
 
     #[test]
