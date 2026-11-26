@@ -246,6 +246,15 @@ impl CombineDialogState {
                 .all(|item| matches!(item.status, ItemStatus::Loaded(_)))
     }
 
+    /// All loading work has terminated, including when no images remain.
+    fn loading_finished(&self) -> bool {
+        self.pending.is_empty()
+            && self
+                .items
+                .iter()
+                .all(|item| matches!(item.status, ItemStatus::Loaded(_) | ItemStatus::Failed(_)))
+    }
+
     fn validation(&self) -> Ref<'_, ValidatedDraft> {
         let mut cached = self.validation.borrow_mut();
         if cached
@@ -264,6 +273,9 @@ impl CombineDialogState {
     }
 
     fn compute_validation(&self) -> Result<Layout, String> {
+        if self.items.is_empty() {
+            return Err("結合する画像がありません".into());
+        }
         if let Some(item) = self
             .items
             .iter()
@@ -271,7 +283,7 @@ impl CombineDialogState {
         {
             return Err(format!("読めない画像を外してください: {}", item.name));
         }
-        if !self.ready() {
+        if !self.loading_finished() {
             return Err("画像を読み込み中です".into());
         }
         if matches!(
@@ -1302,7 +1314,7 @@ fn footer_error(state: &CombineDialogState) -> Option<String> {
         // Loading already has a status row. Treating it as an error adds a
         // temporary footer row and moves the label's click target on completion.
         .or_else(|| {
-            (state.ready()
+            (state.loading_finished()
                 || state
                     .items
                     .iter()
@@ -1326,17 +1338,15 @@ fn status_text(state: &CombineDialogState) -> String {
                 ""
             }
         )
+    } else if state.loading_finished() {
+        "出力: 計算できません (下の理由を直してください)".into()
     } else {
         let loaded = state
             .items
             .iter()
             .filter(|item| matches!(item.status, ItemStatus::Loaded(_) | ItemStatus::Failed(_)))
             .count();
-        if state.pending.is_empty() && loaded == state.items.len() {
-            "出力: 計算できません (下の理由を直してください)".into()
-        } else {
-            format!("読み込み中 {loaded}/{}", state.items.len())
-        }
+        format!("読み込み中 {loaded}/{}", state.items.len())
     };
     if let Some(path) = state.replacement_path() {
         let name = path.file_name().unwrap_or_default().to_string_lossy();

@@ -7,6 +7,54 @@ use egui_kittest::{Harness, kittest::Queryable};
 use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
 #[test]
+fn image_combine_remove_all_failed_shows_empty_reason_and_disables_export() {
+    use egui_kittest::kittest::NodeT;
+
+    let ctx = egui::Context::default();
+    let mut state = fixture_state(&ctx, false);
+    for item in &mut state.items {
+        item.status = ItemStatus::Failed("decode failed".into());
+    }
+    let (commands, _events, _) = connection(&mut state);
+    let mut h = crate::test_ui::builder()
+        .with_size(egui::vec2(700.0, 700.0))
+        .with_context_setup(crate::ui_fonts::configure_fonts)
+        .build_ui_state(
+            |ui, state: &mut CombineDialogState| {
+                draw_item_controls(ui, state);
+                draw_footer(ui, state, &mut Action::default());
+            },
+            state,
+        );
+    h.run();
+    assert!(h.state().loading_finished());
+    assert!(
+        footer_error(h.state())
+            .unwrap()
+            .starts_with("読めない画像を外してください:")
+    );
+    h.get_by_label("読めない画像を外す").click();
+    h.run();
+    assert!(
+        matches!(commands.try_recv().unwrap(), Command::Remove { ids } if ids == vec![0, 1, 2, 3])
+    );
+    assert!(h.state().items.is_empty());
+    assert_eq!(h.state().selected_item_id, None);
+    assert!(h.state().loading_finished());
+    assert!(!h.state().ready());
+    assert!(!h.state().can_write());
+    let status = "出力: 計算できません (下の理由を直してください)";
+    let reason = "結合する画像がありません";
+    assert_eq!(status_text(h.state()), status);
+    assert_eq!(footer_error(h.state()).as_deref(), Some(reason));
+    assert_eq!(h.state().validation().result.as_ref().unwrap_err(), reason);
+    h.get_by_label(status);
+    // This is the production footer's error_fg_color label, not a test label.
+    h.get_by_label(reason);
+    assert!(h.get_by_label("書き出す").accesskit_node().is_disabled());
+}
+
+#[test]
 fn image_combine_status_loading_invalid_split_valid_and_failed() {
     let ctx = egui::Context::default();
     let mut state = fixture_state(&ctx, false);
@@ -19,10 +67,16 @@ fn image_combine_status_loading_invalid_split_valid_and_failed() {
         })
         .collect();
     assert_eq!(status_text(&state), "読み込み中 0/8");
+    assert!(!state.loading_finished());
     assert!(footer_error(&state).is_none());
     state.items[0].status = ItemStatus::Loaded((600, 800));
     state.items[1].status = ItemStatus::Failed("decode failed".into());
     assert_eq!(status_text(&state), "読み込み中 2/8");
+    assert!(
+        footer_error(&state)
+            .unwrap()
+            .starts_with("読めない画像を外してください:")
+    );
     for item in &mut state.items {
         item.status = ItemStatus::Loaded((600, 800));
     }
