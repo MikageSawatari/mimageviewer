@@ -1,6 +1,6 @@
 # 全体テストのビルドのメモリ対策 (§1.908・§1.909・§1.910)
 
-状態: 実装中 (ブランチ `test-mem-908`、worktree `G:\home\mimageviewer-testmem908`)。
+状態: 実装・検証済み、master への取り込み待ち (ブランチ `test-mem-908`、worktree `G:\home\mimageviewer-testmem908`)。§1.908・§1.910 は実施、§1.909 は採らない (利用者決定)。
 担当: 設計・指示・検収 = ClaudeCode Opus、実装 = Codex gpt-6.1-sol / high、独立レビュー = 別の gpt-6.1-sol / xhigh。
 正本のバックログ: [next-release-backlog.md](next-release-backlog.md) の §1.908・§1.909・§1.910。
 
@@ -182,7 +182,6 @@ PC の状態の揺れの範囲と見る)。時間は統合テストの 22 回の
 1 秒で +20 GB)、そこへ本体 lib テストのコンパイル (1 本で 10〜21 GB) が重なるところで出る。rlib の 15% の縮小では、この重なりは
 ほとんど変わらない。同時数を 8 にすると一斉に始まる本数が減り、ピークが約 9 GB 下がる。§1.909 は採らない (§2.2、利用者決定)。
 
-(計測の続きは各段の後に追記する)
 
 ## 4. 確認
 
@@ -212,3 +211,12 @@ PC の状態の揺れの範囲と見る)。時間は統合テストの 22 回の
   外れたテストを見抜けない / P1: `tests/<dir>/main.rs` を検知しない / P2: 全体を `cargo test` 1 プロセスで流す現用テンプレート /
   P3: PNG の場所の誤記)。1 つのマクロで `mod` 宣言と一覧を作る形と、ディレクトリ形式の検知に直した (2df2db9a7)。r2 は ACCEPT。
 - 修正後: 冷えた状態から既定の同時数でビルド成功 (§3.5)、integration 455 件成功、`tests/snapshots/` 差分なし、`test-test-tools.ps1` 成功。
+
+### 4.2 §1.910 と全体ゲートの結果 (2026-11-27)
+
+- 独立レビュー (gpt-6.1-sol / xhigh、read-only): §1.910 (1db13fff2) は ACCEPT。補足: rustdoc 内部の doctest のコンパイルまで 8 本以下になる保証は
+  無いが、rlib を読む rustc の一斉開始には当たらない。
+- `scripts/test-release-build-safety.ps1 -PowerShellOnly`: PASS (上限の判定 9 通り、全段への継承、成功・各段失敗時の復元)。
+- `scripts/test-full.ps1 -SuppressCrashDialogs` (run-heavy `-FullTest`、HEAD 0a905e354): **PASS**。全体 2,055 秒、workspace 段のビルドは冷えた状態から
+  12 分 30 秒 (`CARGO_BUILD_JOBS=8`)、nextest 23,038 件成功・112 件 skip (計 23,150 件、§4.1 の一覧と一致)、doctest 成功、vendor 6 graph 成功
+  (gpu group の式がどの graph でも設定エラーにならないことの確認を兼ねる)。全体ゲートの最中のコミットは計測していない。
