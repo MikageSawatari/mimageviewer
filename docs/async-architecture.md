@@ -1,5 +1,16 @@
 # 非同期・並列アーキテクチャ
 
+## 顔の自動検出（§1.914 段 1b、実装、cargo検証待ち）
+
+3 ツール共通の `MaskDetectPending` は viewer context ごとに 1 つで、開始時の対象を固定した要求・取消フラグ・受信口を所有する。
+`launch_mask_detect_worker` は本番とテストの推論注入で共有する。1 回ごとの worker が `local_ai_activity_lease()` を
+ランタイム待ちから thread 終了まで保持し、YuNet の各段の区切りで取消を調べる。
+UI は `try_recv` で受け取り、context・page key・items 世代・ソースの Arc・ツールの編集対象が開始時と同じ場合だけ反映する。
+補正レイヤーは最新受付済み文書とも照合する。ダイアログと待ちの間は同 context の新規入力をモーダルで止める。
+モード終了・フォルダ切替・context の破棄では自身の待ちを捨てて取消し、UI で worker を join しない。
+0 件・取消・不一致ではマスクと Undo を変えず、有効な結果の反映だけを既存の各ツールの 1 操作へ渡す。
+詳細と未実施の検証は [自動検出計画 §7・§19](auto-conceal-detection-plan.md) を参照。
+
 ## 起動 resolver の走査と外部 Shell 起動（§1.853・§1.861、実装・検証待ち）
 
 `startup-open-resolve` は既存 pending 一つで、明示の起動入力と既定の場所の typed input を扱う。

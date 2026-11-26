@@ -12197,6 +12197,7 @@ impl App {
             self.persist_pending_view_trim_state();
             self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
             self.cache_current_edit_preview_if_ready();
+            self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::LocalAdjust);
             self.local_adjust_mode = false;
             self.fold_local_adjust_edit_state();
             self.local_adjust_repair_point_pick_active = None;
@@ -31267,6 +31268,7 @@ impl App {
                 // 編集内容貼り付けの全置換確認は、操作した fullscreen viewport 上に出す。
                 self.show_edit_bundle_paste_confirm_dialog(ctx);
                 self.show_bulk_page_edit_dialog(ctx);
+                self.show_mask_detect_dialog(ctx);
 
                 // `?` ヘルプは押された viewport 上に出す。専用フルスクリーン viewport では
                 // メイン側に描くと背面へ隠れるため、フルスクリーン中はこちらで描く。
@@ -36168,6 +36170,9 @@ impl App {
         }
 
         if self.local_adjust_mode {
+            if self.local_adjust_mask_input_blocked() {
+                return action;
+            }
             if !self.ime_input_active(ctx)
                 && !ctx.egui_wants_keyboard_input()
                 && self.consume_context_shortcuts_help_key(ctx)
@@ -36362,6 +36367,7 @@ impl App {
                     ctx.request_repaint();
                 } else {
                     self.cache_current_edit_preview_if_ready();
+                    self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::LocalAdjust);
                     self.local_adjust_mode = false;
                     self.fold_local_adjust_edit_state();
                     self.local_adjust_repair_point_pick_active = None;
@@ -48026,6 +48032,7 @@ impl App {
         self.sns_split_spread_ctx = None;
         self.reset_sns_split_mode();
         self.cache_current_edit_preview_if_ready();
+        self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::LocalAdjust);
         self.local_adjust_mode = false;
         self.local_adjust_repair_point_pick_active = None;
         self.local_adjust_add_layer_dialog_open = false;

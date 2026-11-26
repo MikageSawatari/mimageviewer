@@ -675,6 +675,14 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+顔の自動検出（§1.914 段 1b、実装、cargo検証待ち）は同梱 YuNet を使い、モデルの準備・前処理・推論・後処理を検出 worker に置く。
+UI が捕捉するソース画素は Arc の clone だけとし、受信は `try_recv`、取消はフラグで行って完了を待たない。
+結果の図形追加、Undo の複製と表示用マスクの更新は既存の手描き 1 操作と同じ経路で、検出 1 回につき 1 回だけ行う。
+再合成・補完・保存も各ツールの既存 worker を使い、消しゴムの検出完了では補完を始めない。
+推論層の計装に加え、`mask_detect/start`・`mask_detect/apply` と共有の `mask/texture_rebuild` を記録する。
+補正レイヤーの既存 `mask_preview_rebuild` も継続する。大画像での反映費用と実機の応答性は未測定。
+詳細と未実施の検証は [自動検出計画 §7.4・§10・§19](auto-conceal-detection-plan.md) を参照。
+
 画像の結合 (§1.904 stage B) はbatchと同じsnapshotの1件関数・6ms予算を使い、準備失敗を対象ごとに保持する。
 既知のsnapshot同期読込 (§1.177) を広げず、decode・合成・縮小・フォント計測・描画・encode・保存は専用workerへ置く。
 プレビューは長辺1600px以内、generation一致の結果を1回だけtextureへ送る。設定・並びの変更はRenderを間引き、素材は読み直さない。

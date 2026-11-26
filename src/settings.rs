@@ -1,4 +1,21 @@
 /// Adopted default (section 1.677, 2026-11-01).
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MaskDetectSettings {
+    pub ellipse: bool,
+    pub margin_percent: f32,
+    pub threshold: f32,
+}
+impl Default for MaskDetectSettings {
+    fn default() -> Self {
+        Self {
+            ellipse: true,
+            margin_percent: 15.0,
+            threshold: 0.6,
+        }
+    }
+}
+
 pub const DEFAULT_THUMB_SHOW_TYPE_ICON: bool = true;
 fn default_thumb_show_type_icon() -> bool {
     DEFAULT_THUMB_SHOW_TYPE_ICON
@@ -5814,6 +5831,9 @@ pub struct Settings {
     // 全フィールド `serde(default)` 付き ⇒ 既存の settings.db / settings.json を
     // 新コードで開いても安全 (= 欠落フィールドは型のデフォルト値で埋まる)。
     //
+    /// 3 ツール共通の顔検出設定 (新規キー、移行不要)。
+    #[serde(default)]
+    pub mask_detect: MaskDetectSettings,
     /// 隠蔽加工の現在の処理タイプ。モード内 `T` キーで切替、終了後も維持。
     #[serde(default)]
     pub conceal_type: crate::conceal::ConcealType,
@@ -8932,6 +8952,7 @@ impl Default for Settings {
             last_seen_version: None,
             whats_new_acknowledged_version: None,
             // ── 隠蔽加工 (Phase 1) ────────────────────────────
+            mask_detect: MaskDetectSettings::default(),
             conceal_type: crate::conceal::ConcealType::default(),
             conceal_mosaic_tile_mode: crate::conceal::TileSizeMode::default(),
             conceal_mosaic_boundary: crate::conceal::MosaicBoundary::default(),

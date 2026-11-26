@@ -1,8 +1,8 @@
 # マスクを検出で自動作成する (消しゴム・隠蔽加工・補正レイヤー共通) — 設計案 (§1.914)
 
-> ステータス: **設計案 / 未着手 (2026-11-26 起票)**。設計担当 = ClaudeCode Opus 5.5。
+> ステータス: **段 1b の実装、cargo 検証待ち (2026-11-26 起票)**。設計担当 = ClaudeCode Opus 5.5。
 > 隠蔽加工だけを対象にした版で Sol の独立レビュー R1〜R3 を受け、R3 で ACCEPT。その後の利用者の判断 (§13) で
-> **3 つのマスクツール共通**に広げ、広げた部分も R4〜R5 で ACCEPT (§16)。段 0 は 2026-11-27 に完了 (§17)。次は段 1 (専用のブランチと worktree で進める)。
+> **3 つのマスクツール共通**に広げ、広げた部分も R4〜R5 で ACCEPT (§16)。段 0 の記録は §17、段 1a の引き継ぎは §18、段 1b の実装範囲と未実施の検証は §19。
 > ファイル名は起票時のまま (`auto-conceal-…`) にしている。
 > 旧案 [archive/ai/auto-mask-detection-plan.md](archive/ai/auto-mask-detection-plan.md) (2026-05、v1.1.0 期、未着手)
 > の方針を引き継ぎ、現在のコードと 2026-11 時点の公開モデルの調査に合わせて作り直したもの。旧案の行番号・型名は古い。
@@ -329,6 +329,10 @@ impl Drop for MaskDetectPending { fn drop(&mut self) { self.cancel.store(true, R
 ```
 
 - 待ちは **viewer context の bundle に 1 つだけ** (既存の `local_adjust_segmentation_pending` と同じ扱い)。
+  消しゴム・隠蔽加工の編集中の mask / shapes / Undo は、既存の foreground 共通 draft のままである。
+  service の一時 mount はその draft を交換しない。実際の foreground 引き渡しでは旧 owner 上で
+  検出を取消・モードを reset してから新しい editor を開始する。この取消境界も検査する
+  (session の照合だけで別 editor への誤適用を防ぐとは考えない)。補正レイヤーの文書は bundle 所有。
   3 ツールで別々の待ちを持たない。根拠は **共通の受付が、待ちがある間は新しい検出を受け付けず (置き換えない)、
   開始時に捕捉した対象 1 つだけを所有する**こと (Sol レビュー R4 P2)。「同じ context で 2 つのツールを同時に
   編集しない」ことは根拠にしない: 今のコードでは、同じ入力のまとまりに Ctrl+G と Ctrl+M があると補正レイヤーと
@@ -750,3 +754,121 @@ Ultralytics の汎用モデルと ultralytics 本体 (AGPL-3.0) は、この作�
 - **段 1a の実装の独立レビュー (2026-11-27、Sol gpt-6.1-sol / xhigh、実装担当とは別、対象 ec0f385f5)**: **ACCEPT**
   (P1・P2 なし)。P3 の 2 件は設計担当が反映した: §6.2 に既存の EP 登録の失敗時の挙動を受け継ぐ例外を明記、
   `detect.rs` に重なりの除去の閾値 (IoU 1/3 の箱で 0.3 と 0.5 を見分ける) と各軸の倍率 (切り詰めの無い箱) のテストを追加。
+
+## 19. 段 1b の実装引き継ぎ (2026-11-27、未コンパイル・未テスト)
+
+### 19.1 接続した範囲
+
+- `app/mask_detect.rs` に 3 ツール共通の受付、ダイアログ、`MaskDetectRequest`、context 所有の
+  `MaskDetectPending`、worker、結果の照合と採用を追加した。同梱 YuNet の顔検出だけを接続し、段 2 は未実装。
+- 入力は §5.1 の各ツールのソースを Arc で捕捉する。context・page key・items 世代・マスク寸法・入力 Arc・
+  編集 session を開始時と照合し、補正レイヤーでは `PageEditOwner` と最新受付済み文書も照合する。
+  0 件・取消・不一致ではマスク・文書・Undo を変えない。
+- `apply_mask_detect_to_erase` / `apply_mask_detect_to_conceal` / `apply_mask_detect_to_local_adjust` が
+  既存の手描き 1 操作と同じ経路で図形を足す。消しゴムは古い補完プレビューを捨てるだけで補完を開始しない。
+  補正レイヤーは既存の Undo 付き保存へ渡し、必要な Raster 変換・未作成 override の作成もその 1 操作へ含める。
+- 設定は `Settings.mask_detect` の 1 キー（楕円 / 矩形・余白・閾値）で共有する。未リリースのため移行は不要。
+  `settings_transfer` では既存のツール設定と同様に除外する。余白は検出した幅・高さの指定 % を
+  **各辺の外側へ追加**する（15% なら全幅・全高は 1.3 倍）。
+- `launch_mask_detect_worker` は本番の YuNet とテストの推論注入で共有する。worker の活動 lease は
+  ランタイム待ちから thread 終了まで保持し、待ちを取消・破棄しただけでは解放しない。
+- ダイアログと進行表示は embedded を含む fullscreen の closure だけで描き、ROOT で重ねて描かない。
+  表示中・検出待ち中のモーダル判定は 3 ツールで共有する。
+- open / capture は本の追加 Undo の busy 検査だけを行う。`admit_book_append_followup_mutation` は
+  照合済み・非 0 件の apply だけで呼び、表示・取消・0 件で追加 Undo の receipt を破棄しない。
+- poll が Empty のときは live context に 100 ms 後の repaint を予約する。parked context の未完了 receiver も
+  all-context poll の対象に残し、ROOT の起床を継続する。
+
+### 19.2 先例の出現箇所との対応
+
+| 箇所 | 段 1b の対応 |
+|---|---|
+| `app.rs` | `LocalAiRemoteBarrierSnapshot` のフィールド・is_quiesced・blocker_summary、App のフィールド・初期値、`local_ai_remote_barrier_snapshot` に追加。破棄は `install_loading_items_inner`、`invalidate_idx_state_and_queues`、`reset_detached_pause_foreground_modes`、`finish_fullscreen_edit_modes`、`close_fs_exclusive_conflicts` の 5 か所へ追加 |
+| `book_append_undo` / `prepared_edit` | 自動検出の待ちを既存の編集・停止判定へ追加 |
+| `update_phases` | 待ちの間の再描画要求へ追加 |
+| `viewer_context_registry` | has 判定、全 context の poll、`cancel_superseded`、bundle の型・初期化・take / swap、async field inventory に追加 |
+| `ui_adjustment_panel` の segmentation start / poll | 既存の別処理として維持し、`mask_detect_available` 側で被写体マスク・LUT の待ちとの競合を排除 |
+| `page_edit_owner` の inventory / reproject | 開始時の照合条件を保持するため追加しない。items 世代を付け直さない |
+| `app/page_edit_owner_tests.rs` の先例初期化 2 か所 | 変更なし。既存の segmentation 検査を維持し、自動検出の所有・破棄は専用テストへ追加 |
+| `app/prepared_edit/tests.rs` の先例初期化・照合 | 変更なし。既存の segmentation の conflict 検査を維持 |
+| `app/tests.rs` の barrier literal・blocker 名 | literal に新 field（false）を追加。従来の blocker 名の期待値は維持 |
+
+### 19.3 入力と計装
+
+- 消しゴムのキャンバス有効フラグより前には `EditPreviewHoldState::read` だけがあり、操作キーの消費はない。
+  その helper は既に Modal を拒否する。新しい操作は disabled の canvas transport で遮断し、Cancel の配送を残す。
+- 補正レイヤーは `LaToolBucket` などの操作キーを消費するより前に blocked を判定し、Cancel を配送して戻る。
+  左右のパネルとキャンバスで同じ入力遮断を使う。
+- 目のプレビューの先読みは新しい開始を抑え、既存の保持と release の後始末を残す。
+  無効化されたパネルの Response だけに依存せず、既存の押下は目の矩形外へ動かしても release まで継続する。
+- perf は `mask_detect/start`（tool・ms）、`mask_detect/apply`（tool・count・width・height・ms）、共有の
+  `mask/texture_rebuild`（tool・width・height・ms）を追加した。補正レイヤーの既存
+  `mask_preview_rebuild` は継続する。大画像での Undo 複製・マスク texture 再作成の実測は未実施。
+
+### 19.4 追加したテストと検証の引き継ぎ
+
+以下は追加したテスト名であり、成功の記録ではない。`src/app/mask_detect/tests.rs`:
+
+```text
+mask_detect_three_tools_add_one_edit_and_undo_once
+mask_detect_zero_and_cancel_do_not_change_masks_documents_or_history
+mask_detect_stale_identity_size_source_and_edit_session_are_discarded
+mask_detect_same_source_arc_is_adopted_through_poll
+mask_detect_local_raster_conversion_and_absent_overrides_are_one_undo
+mask_detect_overlapping_modes_only_change_captured_tool
+mask_detect_cancel_drops_queued_result_and_releases_modal_input_block
+mask_detect_erase_invalidates_preview_without_starting_inpaint
+mask_detect_other_local_ai_mask_and_lut_requests_prevent_detection
+mask_detect_real_worker_holds_activity_while_waiting_and_cancel_releases_it
+mask_detect_dialog_actions_fit_small_screen_at_100_and_200_percent
+```
+
+`src/app/mask_detect/input_tests.rs`:
+
+```text
+mask_detect_modal_blocks_tool_keys_raw_canvas_and_both_local_panels
+mask_detect_eye_preview_rejects_start_but_keeps_existing_hold_until_release
+mask_detect_mode_exit_and_index_invalidation_cancel_only_owned_request
+mask_detect_cancel_keeps_inference_activity_until_worker_really_finishes
+mask_detect_remote_and_append_undo_wait_reject_all_three_tools
+mask_detect_settings_roundtrip_and_missing_key_defaults_are_shared
+mask_detect_margin_geometry_and_paint_operation_are_independent_of_tool_erase_toggle
+mask_detect_addition_invalidates_only_the_target_page_cache
+mask_detect_open_cancel_and_zero_keep_book_append_undo_receipt
+mask_detect_expanded_dialog_keeps_actions_outside_scroll_at_small_screen
+mask_detect_parked_context_poll_and_close_leave_sibling_masks_unchanged
+mask_detect_parked_empty_receiver_keeps_root_poll_awake_until_result
+```
+
+- ONNX を使わない App の結果注入、共有 worker への推論注入、実 egui の小画面レイアウトと入力配送を対象にする。
+  レイアウトには「詳細」を展開した 1093×614・200% の検査も含む。snapshot PNG は変更していない。
+- 共有 runner へ引き継ぐフィルター（未実行）:
+  `cargo nextest run -p mimageviewer --lib -E 'test(/mask_detect/)'`。
+- 親担当の実行結果: `python scripts/check_ui_glyphs.py` は危険 glyph 0、
+  `python scripts/check_site_cards.py` は 55 cards・over 0。
+- `cargo fmt`（引数なし）は終了コード 0。build / test / check / clippy は一切未実行、
+  `git add` / commit も未実行。コンパイル・テスト・実機確認・大画像の性能測定は引き継ぎ先で実施する。
+- この節は実装範囲と検証状況の記録であり、設計との差異や未対応事項の承認を表さない。
+
+## 20. 段 1b の実行検証からの修正 (2026-11-27)
+
+設計担当の run-heavy で本体 `cargo check -p mimageviewer --bin mimageviewer-core` は成功した。
+テストの型推論エラーは設計担当が `input_tests.rs` の待機 channel を `mpsc::channel::<()>()` に修正した。
+その後の `mask_detect|^ai::detect::` は利用者報告で 34 件中 28 件成功・6 件失敗。
+実装担当は失敗ログとコードを調べ、以下を変更した。修正後のコンパイル・テストは設計担当へ引き継ぐ。
+
+| 失敗 | 原因の分類と変更 |
+|---|---|
+| 追加 Undo receipt の保持 / UndoAppend 待ち拒否の 2 件 | fixture の誤り。`AppendReceiptBuilder` は追加ファイルが空なら `finish()` で拒否する。実 PNG を 1 枚作って `record` し、現在の構成の照合も通る receipt を共通 fixture で用意する |
+| parked Empty receiver / parked poll と close の 2 件 | fixture の所有の仮定が誤り。直接 stash しても erase/conceal の foreground draft は交換されないので、owner 上で採用した shapes が復帰後も App に見える。投影 context への誤配を示す失敗ではない。bundle 所有の補正レイヤーで、非空の sibling 文書・cache Arc の不変と Undo の captured page key を検査する |
+| 詳細を開いたダイアログの操作行 | 測定の誤り。`ScrollAreaOutput.inner_rect` は `auto_shrink` 前、親のカーソルは `Prepared::end` の縮小後 `outer_rect` で進む。テスト用の本文 geometry は親が実際に確保した下端で記録し、画面内・Window 内・本文より下という全操作ボタンの検査を維持する |
+| 目プレビューの新規受付 | 消しゴム側の実装の誤り。`Response::is_pointer_button_down_on()` は enabled と独立の capture flag なので、パネルを無効にしても真になり得る。OR でその flag を通さず、blocked 中は既存 active・物理 down・新 press なしだけを既存 merge に渡す。新規開始を拒否し、既存保持・矩形外移動・release は残す |
+
+- `lifecycle_tests.rs` に実際の park と close → retire → 新 context の editor 入場を使う回帰を追加した。
+  3 ツールで旧 cancel と receiver の破棄を確かめ、遅延した旧結果が新しい mask / shapes / 文書 / Undo /
+  cache / pending を変えないことを検査する。隠蔽加工は hydration worker を動かさず、本番の採用入口へ既知の空マスクを渡す。
+- `tests.rs` の共通ソース fixture を抽出し、通常の結果採用と lifecycle 検査で同じ入力を使う。
+  設計担当の `channel::<()>()` の 1 行は維持する。既存の失敗した 6 テスト名は維持し、新規 2 テストも `mask_detect` filter に含める。
+- 実行結果とソースからの判断を区別する。上記 34 件の結果は設計担当の観測であり、今回の修正後の成功を意味しない。
+- 今回の `cargo fmt` と `git diff --check` は終了コード 0。cargo の build / test / check / clippy と
+  git add / commit は実行していない。再検証は同じ `test(/mask_detect|^ai::detect::/)` filter で行う。

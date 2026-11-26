@@ -316,6 +316,16 @@ pub(crate) fn black_flatten_if_transparent(img: &egui::ColorImage) -> Option<egu
 const UNDO_MAX: usize = 20;
 
 impl App {
+    pub(crate) fn apply_mask_detect_to_erase(&mut self, shapes: Vec<Shape>) {
+        self.push_undo_snapshot();
+        self.erase_shapes.extend(shapes);
+        self.erase_selected_shape = None;
+        self.erase_mask_texture = None;
+        if let Some(idx) = self.fullscreen_idx {
+            self.clear_erase_preview(idx);
+        }
+    }
+
     // ── モード開始/終了 ─────────────────────────────────────────────
 
     /// 消しゴムモードに入る。DB にマスクがあればロードする。
@@ -373,6 +383,7 @@ impl App {
         };
         let base = self.capture_erase_base_source(target_idx, Arc::clone(&pixels));
         self.erase_base_cache.insert(target_idx, base);
+        self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::Erase);
         // ピクセル取得成功 → ここから state mutation。
         if let Some(pivot) = pivot {
             self.erase_spread_ctx = Some(pivot);
@@ -380,6 +391,7 @@ impl App {
         }
         let fs_idx = target_idx;
         let [w, h] = self.erase_working_size(fs_idx, pixels.size);
+        self.erase_session = self.erase_session.wrapping_add(1);
         self.erase_mode = true;
         // 通常表示と消しゴムは UI / Ctrl+Z の文脈が異なるので、メタ Undo スタックを破棄。
         // 消しゴム中は erase_undo_stack が Ctrl+Z を担当する。
@@ -446,6 +458,7 @@ impl App {
 
     /// 消しゴムモードをリセットする。
     pub(crate) fn reset_erase_mode(&mut self) {
+        self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::Erase);
         self.cancel_original_material_entry_intents(None);
         let restore_idx = self.fullscreen_idx;
         let was_erase_mode = self.erase_mode;
@@ -720,7 +733,7 @@ impl App {
             KeyAction::ErasePreviewHold,
             drawing_in_progress,
         );
-        if self.book_structural_op.is_some() {
+        if self.erase_input_blocked() {
             return Default::default();
         }
         let action = FsKeyAction {
@@ -1384,6 +1397,7 @@ impl App {
         if self.erase_mask_texture.is_some() {
             return;
         }
+        let rebuild_start = std::time::Instant::now();
         self.erase_mask_texture_dirty_rect = None;
         let Some(composite) = self.composite_mask() else {
             return;
@@ -1400,6 +1414,21 @@ impl App {
         let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
         let tex = ctx.load_texture("erase_mask", ci, egui::TextureOptions::NEAREST);
         self.erase_mask_texture = Some(tex);
+        crate::perf::event(
+            "mask",
+            "texture_rebuild",
+            None,
+            0,
+            &[
+                ("tool", "erase".into()),
+                ("width", w.into()),
+                ("height", h.into()),
+                (
+                    "ms",
+                    (rebuild_start.elapsed().as_secs_f64() * 1000.0).into(),
+                ),
+            ],
+        );
     }
 
     /// ビットマップとベクタ群を合成した最終マスクを返す。
@@ -1697,9 +1726,6 @@ impl App {
         // パネル描画やポインタ入力の可否によらず読む。release 処理が描画状態を
         // 消す前に判定し、描画中の押下をドラッグ終了後へ持ち越さない。
         self.update_erase_preview_hold(ctx);
-        if self.book_structural_op.is_some() {
-            return;
-        }
         let full_rect = transform.viewport_rect;
         // フォーカス復帰クリック中は塗り・選択操作を一切発生させない
         // (handle_fs_wheel_and_click で検出・セットされる)
@@ -1718,7 +1744,7 @@ impl App {
             ctx,
             scope,
             overflow_pointer_input,
-            true,
+            !self.erase_input_blocked(),
             |pos| preview_owns_pointer || !panel.contains(pos),
         );
         for input in inputs {
@@ -2559,7 +2585,9 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
-                if self.book_structural_op.is_some() { ui.disable(); }
+                if self.erase_input_blocked() { ui.disable(); }
+                #[cfg(test)]
+                ctx.data_mut(|data| data.insert_temp(egui::Id::new("mask_detect_erase_panel_enabled"), ui.is_enabled()));
                 // 1. クリック吸収 sink を widget より先に登録 (= egui の hit test
                 //    "同じ rect の Response は後勝ち" ルールで widget の click を
                 //    優先しつつ、widget 外の隙間/Frame 外周は sink が拾う)。
@@ -2629,6 +2657,8 @@ impl App {
                                         egui::vec2(26.0, 22.0),
                                         egui::Sense::click_and_drag(),
                                     );
+                                    #[cfg(test)]
+                                    ctx.data_mut(|data| data.insert_temp(egui::Id::new("mask_detect_erase_eye_rect"), eye_rect));
                                     let eye_bg = if eye_resp.is_pointer_button_down_on() {
                                         egui::Color32::from_rgb(60, 120, 200)
                                     } else if eye_resp.hovered() {
@@ -2777,6 +2807,9 @@ impl App {
                             egui::RichText::new("ビットマップ:")
                                 .color(egui::Color32::from_gray(200)),
                         );
+                        if ui.add_enabled(self.mask_detect_available(crate::app::MaskDetectTool::Erase), egui::Button::new("自動検出…")).clicked() {
+                            self.open_mask_detect_dialog(crate::app::MaskDetectTool::Erase);
+                        }
                         let bitmap_rows: &[&[(&str, EraseTool)]] = &[
                             &[("筆", EraseTool::Brush), ("バケツ", EraseTool::Bucket)],
                             &[("囲み", EraseTool::Lasso), ("多角形", EraseTool::Polygon)],
@@ -3088,6 +3121,18 @@ impl App {
     /// ボタンとキーを合成した一つの押下遷移で、保存なしプレビューを投入する。
     fn update_erase_preview(&mut self, ctx: &egui::Context, pointer_pressed: bool) {
         let drawing_in_progress = self.erase_drawing_in_progress();
+        // Disabling the panel stops new preview starts, but a hold accepted before
+        // the modal still observes its physical release through the existing path.
+        let pointer_pressed = if self.erase_input_blocked() {
+            // Response::is_pointer_button_down_on does not imply enabled(): egui
+            // may still report last pass's capture for this now-disabled widget.
+            // Admit only a hold already accepted by this editor, never that raw flag.
+            self.erase_preview_active
+                && ctx
+                    .input(|input| input.pointer.primary_down() && !input.pointer.primary_pressed())
+        } else {
+            pointer_pressed
+        };
         let preview_pressed = self.erase_preview_hold.merge(
             pointer_pressed,
             self.erase_preview_active,

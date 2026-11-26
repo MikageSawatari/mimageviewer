@@ -727,6 +727,7 @@ preferences_policy! {
         browser_integration_enabled => "ブラウザ連携の登録は PC ごとの状態で、移行先を維持";
         active_book_name => "利用データ・登録先・履歴・検索対象";
         pinned_books => "同上";
+        mask_detect => "環境設定外で管理するマスクツールの検出設定";
         conceal_type => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         conceal_mosaic_tile_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         conceal_mosaic_boundary => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";

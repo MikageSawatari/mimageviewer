@@ -1,5 +1,14 @@
 # アーキテクチャ概観
 
+## 顔の自動検出（§1.914 段 1b、実装、cargo検証待ち）
+
+同梱 YuNet と `ai::detect` の検出層を、消しゴム・隠蔽加工・補正レイヤーの共通ダイアログへ接続する。
+検出の待ちは viewer context の bundle に 1 つだけ置き、`MaskDetectRequest` が開始時の対象・世代・画素を所有する。
+`app/mask_detect.rs` の worker はモデルの準備と推論を行い、UI は対象の一致を確かめて各ツールの既存の Undo・保存・cache 失効経路へ渡す。
+補正レイヤーは `PageEditOwner` と開始時の文書も照合する。表示の合成順とマスクの永続データ形式は変えない。
+ダイアログは embedded を含む fullscreen の closure だけで描き、ROOT との二重描画を避ける。
+詳細と未実施の検証は [自動検出計画 §5.1・§7・§9・§19](auto-conceal-detection-plan.md) を参照。
+
 ## ブラウザ閲覧の保存先のページ構成（§1.870）
 
 `browser_view_policy` は保存先の根と実フォルダの走査元情報だけで対象を判定する。
