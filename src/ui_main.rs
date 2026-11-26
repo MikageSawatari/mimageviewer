@@ -19545,7 +19545,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         // Prevent the second click of the grid double-click from
                         // reaching the newly-opened fullscreen video and toggling
                         // playback back to paused.
-                        self.fs_primary_suppression.arm_pointer_stream();
+                        let _ = self.arm_fs_primary_suppression(
+                            ctx,
+                            crate::ui_fullscreen::FullscreenPrimarySuppressionReason::Other,
+                        );
                         self.fs_focus_regained_at = Some(std::time::Instant::now());
                     }
                     self.fs_open_intent_from_grid = true;

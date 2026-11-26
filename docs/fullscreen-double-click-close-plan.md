@@ -265,7 +265,7 @@ viewer の入力ハンドラ (`handle_fs_wheel_and_click_frame`・`advance_viewe
 
 ## 13. §1.906 修正: 押す・離すが同じフレームのクリックで、止めが次のクリックまで残らないようにする
 
-- 状態: 設計第 2 版 (2026-11-26、ブランチ dblclick-906)。独立設計レビュー r1 REVISE → r2 **ACCEPT** (§13.8)。実装待ち。
+- 状態: 実装済み (コミットは ClaudeCode が記入)。設計第 2 版 (2026-11-26、ブランチ dblclick-906)。独立設計レビュー r1 REVISE → r2 **ACCEPT** (§13.8)。コンパイル・テストは ClaudeCode が別途実行。
 - 報告: [backlog §1.906](next-release-backlog.md)。観測 (サブ PC のエージェント、§1.899 の確認の手順 5): 従来モード (クリックでページ送り) で前面を外した後、1 回目のクリックは送らない (期待どおり)。約 7 秒後の 2 回目も送らない。別ウィンドウでも同じ。前面を外さなければ毎回送る。
 - 方針: 利用者決定 (2026-11-26)「v5.8.0 で直す」。
 
@@ -351,3 +351,45 @@ F2 と `advance_viewer_primary_pointer_frame` は F12 の別ウィンドウと�
 
 - r1 (GPT-6.1 Sol / xhigh、独立設計レビュー、39a44ec42): REVISE。原因の分析と 11 か所の列挙は正しいと確認。P1: 第 1 版では止めたクリックが後段の編集キャンバス (`is_active()` を見る) へ漏れる。P2: 離し→押しが同じフレームのとき、前段で立てた新しい流れの止めを古い離しが消す。P2: overlay の 2 か所は途中の入力サンプルの押下を見ており、「押したまま」に分類できない。P3: §12 の既存テストの 1 か所の確認を改める必要、overlay のテストの条件。提案: `advance_viewer_primary_pointer_frame` の中で `PointerFrame` を先にし、全部を「後」にそろえる。detached: 「離し済みの入力から持続する止めを作らない」方針は構造的修正であることに合意、第 1 版全体には不合意。第 2 版で §13.1〜§13.6 に反映。
 - r2 (同じレビュー担当、3de6acb73): **ACCEPT**、指摘なし。r1 の 4 件は解消。`PointerFrame` の呼び出しを全件確かめ、production では 1 pass に 1 回 (通常の viewer の描画の 1 か所。ページ一覧はその決定を受け取り、単独入口はテスト経路)。`is_active()` を読む production の消費者 (F1 と編集キャンバス 3 か所) はすべて advance の後。advance を通らない経路 (native presenter 等) では編集の消費者も動かない。既存テスト (`double_click_close_tests.rs` のフォーカス往復) の更新では、`is_active()` ではなく状態の種類と次の advance での解除を確かめる。detached: 第 2 版全体が「症状パッチではなく構造的修正」であることに合意 (単一の生成入口と共通の終端順序で、持続する止めと pass 内の止めを分ける。前面 viewer の所有・viewport の経路・兄弟 context の所有境界は変えず、時間切れや guard に頼らない)。
+
+### 13.9 実装時の判断・検証引き継ぎ (2026-11-26)
+
+- `ReleasedThisPass` はタッチ相関による `TouchStream` への昇格条件に加えない。
+  `PointerStream` はまだ押下中の仮の所有なので相関でタッチへ引き渡すが、`ReleasedThisPass` は
+  既に離されたマウスの流れであり、`Idle` 同様、別の active touch だけでは昇格させない。
+  `suppresses_current_frame` が真なら従来どおり昇格し、completed / cancelled の解除も変えない。
+- 全 11 か所は `App::arm_fs_primary_suppression` を使う。`edit_preview_owns_canvas` に `ctx` を渡す
+  引数を追加したが、立てる条件と編集キャンバス 3 か所の `is_active()` 判定は維持した。
+  早期 return の経路では返った決定を明示的に捨て、今までどおりその経路全体で入力を止める。
+- テストは `double_click_close_tests/suppression_906_tests.rs` と
+  `app/tests/primary_suppression_906.rs` に追加。後者は実際の grid double-click → open_fullscreen
+  (スタックでは worker の採用も含む) の初期化を通す。デコードの開始だけを既存の startup gate で
+  保留し、初期化後に disconnected player を与える。動画のクリックは egui の viewer handler ではなく
+  `handle_native_video_output_event` の presenter mouse button 入力経路で確かめる。
+- 既存テストの期待値変更は 2 件:
+  `close_mode_focus_restore_899_context_focus_roundtrip_does_not_reuse_pair` は
+  `ReleasedThisPass(FocusRestore)` と次の advance での `Idle` を確かめ、フォーカス往復による候補解除は残す。
+  `close_mode_focus_restore_899_page_turn_still_suppresses_restoring_click` は、同じフレームの F2 の後に
+  さらに 1 クリックを捨てる旧不具合の期待を外し、直後のクリックで送ることを確かめる。
+  ほかの既存テストの raw arm は明示的なテスト用 constructor / 状態遷移の操作へ置き換えた。
+- detached の述語・viewport 経路・窓の所有・open / close 等の初期化は変更しない。
+  当初実装の範囲は §11 の既存の記録と一致する。下記の scrub 開始位置の追補は、
+  detached-rework-plan.md の同じ項目へ範囲追加を記録する (既存の合意の行は変更しない)。
+- 利用者の負荷管理の指示により cargo コマンド・コンパイル・テスト・製品起動は実行していない。
+  §12 の既存テスト全件、追加テスト、旧コードへ戻した比較実行は ClaudeCode へ引き継ぐ。
+  UI 文言と htdocs の説明は変更していない。
+- テスト固定具の追補: ClaudeCode の run-heavy 実行ではコンパイル成立、関連 82 件中 77 件成功・5 件失敗と報告された。
+  従来モードの F2 と scrub は `fs_click` を登録する前に return するため、次の操作前にボタン入力のない
+  描画 pass を置き、egui の前 pass のウィジェットによる当たり判定を準備する。その pass で `Idle` になることも
+  検査する。離しを追加しないので、旧実装の残った `PointerStream` はこの pass を経ても消えず、回帰の検出を維持する。
+  detached の描画 pass も実際の A の viewport で行い、A の実ページ移動と兄弟・main の不変確認を残す。
+  scrub の固定具は既存の handler テストと同じ Ctrl+Tab の明示設定と合成キー保持にそろえ、fixture の
+  初期化後に入力を arm する。物理 Tab / Ctrl の保持、フォーカス許可、入力所有、製品の `key_held_action` が
+  押下中／解放後をそれぞれ観測することを handler の直前で確かめる。
+  `Keymap::empty()` は上書きが空でも既定の和音へフォールバックするので、既定キーが無効という説明は誤り。
+- scrub の追加の製品コード修正: egui の `PointerState::begin_pass` は primary の離しで `press_origin` を
+  `None` にする。そのため押す・離すが同じ pass のとき、和音が保持されていても viewer の `can_start` が偽となり、
+  §13.5 の想定する同一フレームの和音が開始できなかった。開始時の位置をこの pass の最後の primary press
+  イベントから取り、なければ従来の `press_origin()` を使うようにした。開始条件・パネル除外・前面所有の条件は
+  維持する。これはキー保持が立っていなかったという報告時の仮説とは区別し、ソースから確認した別の欠陥として扱う。
+  製品コードの追加変更はこの位置の取得元だけ。追補後のコンパイル・テスト・旧実装比較は未実行。
