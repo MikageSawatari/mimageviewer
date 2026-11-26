@@ -35,8 +35,8 @@
 
 - 説明書の正規 URL は **`https://mikage.to/mimageviewer/manual/sound/<ページ名>.html`** (画像は `manual/sound/images/`)。
   `manual/sound/index.html` は入口の転送ページではなく、説明書の目次そのものにする (今の版付き `index.html` の中身)。
-- **版を上げても URL は変わらない**。中身だけを書き換える。どの版の説明かは URL ではなく本文 (例: フッターの
-  「mIV Sound v0.15.0-miv.7 の説明」) で示す。表示するかどうか・書き方はお任せ。
+- **版を上げても URL は変わらない**。中身だけを書き換える。後続の §1.905 の決定により、目次を含む公開ページには
+  版を表示しない。版は `SOURCE.md` との照合に使い、版だけの更新では生成物・URL・転送規則は変わらない。
 - 旧 URL は **1 回の 301** で固定 URL の同名ページへ。対象は `manual/effetune/<版>/X`、`manual/effetune/` 入口、
   `manual/sound/<版>/X` (今の `v0.15.0-miv.7` を含むすべての版付き URL)。同名のページが無ければ `manual/sound/index.html` へ。
   - 今の生成ブロックは現行版の名前とファイル一覧を規則に埋め込んでいるので、版を上げるたびに `.htaccess` が書き換わる。

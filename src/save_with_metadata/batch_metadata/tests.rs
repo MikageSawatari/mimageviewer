@@ -241,28 +241,79 @@ fn batch_drops_invalid_exif_without_failing_export() {
 }
 
 #[test]
-fn batch_icc_accepts_rgb_and_drops_gray_cmyk_in_all_formats() {
-    for color in [b"RGB ", b"GRAY", b"CMYK"] {
-        for format in [SrcFormat::Jpeg, SrcFormat::Png, SrcFormat::Webp] {
-            let src = source(format.clone(), &tiff(true), b"none", &profile(color));
-            let result = encode(format.clone(), Some(&src), &options(false));
-            let has_icc = match format {
-                SrcFormat::Jpeg => !extract_jpeg_segments(&result.bytes, 0xE2)
-                    .unwrap()
-                    .is_empty(),
-                SrcFormat::Png => extract_png_metadata_chunks(&result.bytes)
-                    .unwrap()
-                    .iter()
-                    .any(|c| &c[4..8] == b"iCCP"),
-                SrcFormat::Webp => extract_webp_metadata_chunks(&result.bytes)
-                    .unwrap()
-                    .0
-                    .is_some(),
-                _ => unreachable!(),
-            };
-            assert_eq!(has_icc, color == b"RGB ");
+fn both_profiles_icc_accepts_rgb_and_drops_gray_cmyk_in_all_formats() {
+    for metadata_profile in [MetadataProfile::Single, MetadataProfile::Batch] {
+        let opts = SaveOptions {
+            metadata_profile,
+            ..Default::default()
+        };
+        for color in [b"RGB ", b"GRAY", b"CMYK"] {
+            for format in [SrcFormat::Jpeg, SrcFormat::Png, SrcFormat::Webp] {
+                let icc = profile(color);
+                let src = source(format.clone(), &tiff(true), b"none", &icc);
+                let result = encode(format.clone(), Some(&src), &opts);
+                let out_icc = match format {
+                    SrcFormat::Jpeg => {
+                        let segments = extract_jpeg_segments(&result.bytes, 0xE2).unwrap();
+                        if segments.is_empty() {
+                            None
+                        } else {
+                            assert_eq!(segments.len(), 2);
+                            assert_eq!(segments[0][16..18], [1, 2]);
+                            assert_eq!(segments[1][16..18], [2, 2]);
+                            Some(
+                                segments
+                                    .iter()
+                                    .flat_map(|s| s[18..].iter().copied())
+                                    .collect(),
+                            )
+                        }
+                    }
+                    SrcFormat::Png => extract_png_metadata_chunks(&result.bytes)
+                        .unwrap()
+                        .into_iter()
+                        .find(|c| &c[4..8] == b"iCCP")
+                        .map(|c| {
+                            let data = &c[8..c.len() - 4];
+                            let end = data.iter().position(|&b| b == 0).unwrap();
+                            let mut decoded = Vec::new();
+                            flate2::read::ZlibDecoder::new(&data[end + 2..])
+                                .read_to_end(&mut decoded)
+                                .unwrap();
+                            decoded
+                        }),
+                    SrcFormat::Webp => extract_webp_metadata_chunks(&result.bytes).unwrap().0,
+                    _ => unreachable!(),
+                };
+                let expected = (color == b"RGB ").then_some(icc);
+                assert_eq!(
+                    out_icc, expected,
+                    "{metadata_profile:?}, {format:?}, {color:?}"
+                );
+            }
         }
     }
+}
+
+#[test]
+fn single_png_keeps_text_and_rgb_iccp_without_exif_chunk() {
+    let texts = [
+        text(b"tEXt", b"plain prompt", false),
+        text(b"zTXt", b"compressed prompt", false),
+        text(b"iTXt", b"international prompt", true),
+    ];
+    let mut iccp = b"profile\0\0".to_vec();
+    iccp.extend(compressed(&profile(b"RGB ")));
+    let iccp = png_chunk(b"iCCP", &iccp);
+    let mut chunks = vec![png_chunk(b"eXIf", &tiff(true)), iccp.clone()];
+    chunks.extend(texts.clone());
+    let src = splice_png_text_chunks(&bare(SrcFormat::Png), &chunks).unwrap();
+    let result = encode(SrcFormat::Png, Some(&src), &SaveOptions::default());
+    let out = extract_png_metadata_chunks(&result.bytes).unwrap();
+    let mut expected = vec![iccp];
+    expected.extend(texts);
+    assert_eq!(out, expected);
+    assert!(result.thumbnail_notice.is_empty());
 }
 
 #[test]
@@ -718,7 +769,7 @@ fn rgba_entry_rejects_inconsistent_and_zero_dimensions() {
 }
 
 #[test]
-fn single_page_metadata_bytes_match_legacy_except_ifd1() {
+fn single_page_metadata_bytes_match_legacy_except_ifd1_and_icc() {
     assert_eq!(
         SaveOptions::default().metadata_profile,
         MetadataProfile::Single
@@ -767,7 +818,7 @@ fn single_page_metadata_bytes_match_legacy_except_ifd1() {
                 }
                 _ => unreachable!(),
             };
-            // Only IFD1 and its image bytes differ from the released transfer.
+            // IFD1 cleanup and RGB ICC are the only changes to the released transfer.
             match format {
                 SrcFormat::Jpeg => {
                     let mut segments = extract_jpeg_app1_segments(&legacy).unwrap();
@@ -777,7 +828,21 @@ fn single_page_metadata_bytes_match_legacy_except_ifd1() {
                             seg[10 + 86..].fill(0);
                         }
                     }
+                    let mut icc = extract_jpeg_segments(&src, 0xE2).unwrap();
+                    icc.sort_by_key(|seg| seg[16]);
+                    segments.extend(icc);
                     legacy = splice_jpeg_app1_segments(&legacy, &segments).unwrap();
+                }
+                SrcFormat::Png => {
+                    let icc: Vec<_> = extract_png_metadata_chunks(&src)
+                        .unwrap()
+                        .into_iter()
+                        .filter(|chunk| &chunk[4..8] == b"iCCP")
+                        .collect();
+                    assert_eq!(icc.len(), 1);
+                    // Keep the independent PngEncoder output and legacy text
+                    // bytes above. Only prepend the fixture's RGB ICC chunk.
+                    legacy = splice_png_text_chunks(&legacy, &icc).unwrap();
                 }
                 SrcFormat::Webp => {
                     let (icc, mut exif, xmp) = extract_webp_metadata_chunks(&legacy).unwrap();
@@ -874,12 +939,18 @@ fn jpeg_incomplete_or_duplicate_icc_segments_are_dropped() {
     p.extend(profile(b"RGB "));
     for chunks in [vec![app(0xE2, &p)], vec![app(0xE2, &p), app(0xE2, &p)]] {
         let src = splice_jpeg_app1_segments(&bare(SrcFormat::Jpeg), &chunks).unwrap();
-        let result = encode(SrcFormat::Jpeg, Some(&src), &options(false));
-        assert!(
-            extract_jpeg_segments(&result.bytes, 0xE2)
-                .unwrap()
-                .is_empty()
-        );
+        for metadata_profile in [MetadataProfile::Single, MetadataProfile::Batch] {
+            let opts = SaveOptions {
+                metadata_profile,
+                ..Default::default()
+            };
+            let result = encode(SrcFormat::Jpeg, Some(&src), &opts);
+            assert!(
+                extract_jpeg_segments(&result.bytes, 0xE2)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 }
 
@@ -935,10 +1006,7 @@ fn single_thumbnail_cleanup_preserves_format_selection_orientation_and_notices()
                     assert_eq!(t.u32(34), Some(0));
                     assert_eq!(&out[86..], &[0; 8]);
                     if format == SrcFormat::Webp {
-                        assert_eq!(
-                            extract_webp_metadata_chunks(&result.bytes).unwrap().0,
-                            Some(profile(b"GRAY"))
-                        );
+                        assert_eq!(extract_webp_metadata_chunks(&result.bytes).unwrap().0, None);
                     } else {
                         assert!(
                             extract_jpeg_segments(&result.bytes, 0xE2)

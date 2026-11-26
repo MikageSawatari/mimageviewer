@@ -1033,6 +1033,56 @@ fn single_jpeg_request(
 }
 
 #[test]
+fn single_export_worker_preserves_rgb_icc_app2_when_metadata_enabled() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("icc.jpg");
+    let mut icc = vec![0; 128];
+    icc[16..20].copy_from_slice(b"RGB ");
+    let mut segment = b"\xff\xe2\0\0ICC_PROFILE\0\x01\x01".to_vec();
+    segment.extend_from_slice(&icc);
+    let length = (segment.len() - 2) as u16;
+    segment[2..4].copy_from_slice(&length.to_be_bytes());
+    let mut jpeg = jpeg_with_app1(&orientation_exif_payload(1));
+    jpeg.splice(2..2, segment.clone());
+    std::fs::write(&source, jpeg).unwrap();
+
+    for include_metadata in [true, false] {
+        let basename = if include_metadata {
+            "with-icc"
+        } else {
+            "no-icc"
+        };
+        let mut export = single_jpeg_request(&source, temp.path(), basename);
+        export.include_metadata = include_metadata;
+        let events = collect(spawn_export_worker(export).unwrap());
+        assert_eq!(completed(&events), 1, "{events:?}");
+        assert_eq!(failed(&events), 0, "{events:?}");
+        let output = std::fs::read(temp.path().join(format!("{basename}_0.jpg"))).unwrap();
+        let mut app2 = Vec::new();
+        let mut position = 2;
+        while position + 4 <= output.len() {
+            assert_eq!(output[position], 0xff);
+            let marker = output[position + 1];
+            if marker == 0xda || marker == 0xd9 {
+                break;
+            }
+            let length = u16::from_be_bytes([output[position + 2], output[position + 3]]) as usize;
+            assert!(length >= 2 && position + 2 + length <= output.len());
+            if marker == 0xe2 {
+                app2.push(output[position..position + 2 + length].to_vec());
+            }
+            position += 2 + length;
+        }
+        let expected = if include_metadata {
+            vec![segment.clone()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(app2, expected);
+    }
+}
+
+#[test]
 fn single_export_thumbnail_notice_follows_completed_and_removes_ifd1() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source.jpg");

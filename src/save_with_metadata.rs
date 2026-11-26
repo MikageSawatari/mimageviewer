@@ -1,8 +1,9 @@
 //! 元画像のメタデータを保持したまま編集後の画像を保存するモジュール。
 //!
 //! 対応フォーマット (Phase 5):
-//! - **JPEG**: turbojpeg で encode → 元 JPEG の APP1 (EXIF / XMP) を SOI 直後に挿入
-//! - **PNG**: image crate の PngEncoder で encode → 元 PNG の tEXt / iTXt / zTXt
+//! - **JPEG**: turbojpeg で encode → 元 JPEG の APP1 (EXIF / XMP) と RGB ICC の
+//!   APP2 を SOI 直後に挿入
+//! - **PNG**: image crate の PngEncoder で encode → 元 PNG の tEXt / iTXt / zTXt と RGB iCCP
 //!   チャンクを IHDR と IDAT の間に挿入 (Raw profile の EXIF 以外は AI prompt の
 //!   zlib 圧縮も含めてそのまま転記)
 //! - **WebP**: webp crate で encode → 元 WebP の RIFF コンテナを解析して
@@ -12,7 +13,7 @@
 //! 呼び出し側で JPEG / PNG にフォールバックする (この場合メタデータは失われる)。
 //!
 //! Single / Batch とも EXIF の IFD1 を外し、縮小画像の警告を検出する。
-//! Batch だけが RGB ICC (JPEG/PNG も含む)・PNG eXIf 転記を有効にする。
+//! RGB ICC は両方で転記する。PNG eXIf の転記は Batch だけで有効にする。
 //!
 //! 詳細仕様: [docs/conceal-feature-plan.md §10.5-10.7](../../docs/conceal-feature-plan.md)
 
@@ -77,13 +78,13 @@ impl SrcFormat {
     }
 }
 
-/// 元の情報の転記対象と Orientation の扱い。
+/// EXIF の Orientation・読めない EXIF・PNG eXIf の扱い。RGB ICC の転記は共通。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MetadataProfile {
-    /// 1 枚の書き出し。従来の転記対象を保ち、EXIF の IFD1 を外す。
+    /// 1 枚の書き出し。EXIF の IFD1 を外し、従来の Orientation の扱いを保つ。
     #[default]
     Single,
-    /// 一括の書き出し。EXIF の向きを正規化し、RGB ICC も転記する。
+    /// 一括の書き出し。EXIF の向きを正規化し、PNG eXIf も転記する。
     Batch,
 }
 
@@ -660,6 +661,7 @@ fn png_crc32_compute(bytes: &[u8]) -> u32 {
 /// チャンクの **CRC32 を検証**し、不正なものは skip する (Codex P2)。元 PNG が
 /// 壊れた tEXt を含んでいる場合、それを raw で転写すると出力 PNG が strict
 /// デコーダ (libpng 等) で reject される。
+#[cfg(test)]
 fn extract_png_text_chunks_raw(png: &[u8]) -> Result<Vec<Vec<u8>>, SaveError> {
     extract_png_chunks(png, false)
 }

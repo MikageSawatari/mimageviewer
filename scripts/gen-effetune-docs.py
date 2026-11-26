@@ -7,7 +7,7 @@ Selection and post-conversion corrections live in docs/effetune-docs-overrides.
 Unpublished Markdown links become plain text; root-relative links go upstream.
 Plugin lists define category/plugin splits; corrections precede link remapping.
 All pages and images are published directly under manual/sound/ at fixed URLs.
-Only the index body displays the bundle version; it is the actual contents page.
+Bundle versions validate SOURCE.md only; no page displays the bundle version.
 The version-independent .htaccess block redirects legacy and missing URLs.
 --check rejects leftover version directories; remove them explicitly.
 Only the Markdown/HTML subset used by the published snapshot is accepted.
@@ -717,8 +717,6 @@ def generate(snapshot, version, docs_version=None):
     bodies['index.html'] = ('mIV Sound 説明書', '音響調整 mIV Sound のエフェクトと操作の説明。', '<h1 class="page-title">mIV Sound 説明書</h1>\n<p>mImageViewer での開き方、設定の保存先、リモート配信の注意点は<a href="../effetune.html">音響調整</a>をご覧ください。エフェクトごとの設定と画面内の操作を以下にまとめています。</p>\n<p>再生位置を表示する Counter と Counter Gallery は、<a href="visualizer.html#miv-counter">Visualizer の Counter</a>をご覧ください。</p>\n<ul>' + listing + '</ul>')
     license_text = (snapshot / 'LICENSE').read_text(encoding='utf-8')
     bodies['license.html'] = ('mIV Sound — MIT License', '原文 EffeTune の MIT License 全文と派生版のクレジット。', '<h1 class="page-title">MIT License</h1>\n<p>mIV Sound は EffeTune / EffeTune Mixwright (作者: Frieve) を元にした派生版です。以下は説明書の原文 EffeTune のライセンスです。</p>\n<pre class="license">' + html.escape(license_text) + '</pre>')
-    title, description, body = bodies['index.html']
-    bodies['index.html'] = (title, description, body.replace('</h1>', '</h1>\n<p>mIV Sound ' + html.escape(version) + ' の説明です。</p>', 1))
     result = {name: chrome(title, description, body, name, pages, commit, categories, owners.get(name)).encode('utf-8') for name, (title, description, body) in bodies.items()}
     # Check all generated Markdown links after corrections (including fragments).
     ids = {name: set(re.findall(r'\bid="([^"]+)"', content.decode())) for name, content in result.items()}

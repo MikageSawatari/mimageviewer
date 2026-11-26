@@ -625,13 +625,14 @@ impl FsFrontPointerOwnership {
                             boundary = FsBackingClickBoundary::default();
                             continue;
                         }
+                        boundary.current_accepted =
+                            if raw_count == 1 || boundary.current_accepted >= 2 {
+                                1
+                            } else {
+                                boundary.current_accepted + 1
+                            };
                         let previous_candidate =
-                            raw_count != 1 && boundary.previous_close_candidate;
-                        boundary.current_accepted = if raw_count == 1 {
-                            1
-                        } else {
-                            (boundary.current_accepted + 1).min(3)
-                        };
+                            boundary.current_accepted == 2 && boundary.previous_close_candidate;
                         let count = raw_count.min(boundary.current_accepted);
                         let is_candidate = candidate(pos, *modifiers);
                         facts.double_clicked |= count == 2;
@@ -15962,16 +15963,7 @@ impl App {
                 !front.owns_release(egui::PointerButton::Middle)
                     && i.pointer.button_released(egui::PointerButton::Middle),
                 i.pointer.interact_pos(),
-                i.pointer
-                    .button_events()
-                    .rev()
-                    .find_map(|event| match event {
-                        egui::PointerButtonEvent::Pressed {
-                            button: egui::PointerButton::Middle,
-                            pos,
-                        } => Some(pos),
-                        _ => None,
-                    }),
+                crate::ui_helpers::button_press_origin(i, egui::PointerButton::Middle),
             )
         });
         self.retire_changed_drag_zoom(ctx);
@@ -20387,7 +20379,9 @@ impl FsWheelFrameSemanticInput {
     fn capture(app: &App, ctx: &egui::Context, response: &egui::Response) -> Self {
         Self {
             pointer_pos: ctx.input(|input| input.pointer.hover_pos()),
-            primary_press_origin: ctx.input(|input| input.pointer.press_origin()),
+            primary_press_origin: ctx.input(|input| {
+                crate::ui_helpers::button_press_origin(input, egui::PointerButton::Primary)
+            }),
             pointer_navigation_operation: app
                 .page_turn_pointer_navigation_operation(ctx, "pointer"),
             modifiers: ctx.input(|input| input.modifiers),
@@ -41541,16 +41535,15 @@ impl App {
                 });
 
         // Depth controls admit drags by their press, not by the hover position
-        // after later moves in the same pass. Share this boundary with both
-        // scrub and the outer middle-button dispatch; other panel rules stay.
-        let press_in_depth_panel =
-            ctx.input(|input| input.pointer.press_origin())
-                .is_some_and(|pos| {
-                    self.visible_depth_panel_rect(ctx)
-                        .is_some_and(|panel| panel.contains(pos))
-                });
-        let drag_start_in_panel =
-            (cursor_in_panel && !cursor_in_depth_panel) || press_in_depth_panel;
+        // after later moves in the same pass. Each button owns its admission
+        // position; a primary press must not reject a later middle press.
+        let depth_panel = self.visible_depth_panel_rect(ctx);
+        let middle_press_in_depth_panel = ctx.input(|input| {
+            crate::ui_helpers::button_press_origin(input, egui::PointerButton::Middle)
+                .is_some_and(|pos| depth_panel.is_some_and(|panel| panel.contains(pos)))
+        });
+        let middle_drag_start_in_panel =
+            (cursor_in_panel && !cursor_in_depth_panel) || middle_press_in_depth_panel;
 
         // Hover モードでは左端だけが左補正パネルを召喚する。右端は右情報パネル、
         // 上端は上バーの各経路へ委ねる。ClickToShow は呼び出しバーでのみ開閉する。
@@ -41765,47 +41758,86 @@ impl App {
                 )
             });
         if scrub_active || (scrub_canvas && scrub_held) {
-            let (pressed, down, released, pos, press_origin) = ctx.input(|i| {
-                (
-                    i.pointer.primary_pressed(),
-                    i.pointer.primary_down(),
-                    i.pointer.primary_released(),
-                    i.pointer.interact_pos(),
-                    i.pointer.press_origin(),
-                )
+            // Fold physical primary streams, not aggregate pressed/released
+            // flags: a release followed by a new press belongs to two flows.
+            let flows = ctx.input(|input| {
+                let mut edges = input
+                    .pointer
+                    .button_events()
+                    .filter(|edge| match edge {
+                        egui::PointerButtonEvent::Pressed { button, .. }
+                        | egui::PointerButtonEvent::Released { button, .. } => {
+                            *button == egui::PointerButton::Primary
+                        }
+                    })
+                    .peekable();
+                let mut flows = Vec::new();
+                while let Some(edge) = edges.next() {
+                    match edge {
+                        egui::PointerButtonEvent::Pressed { pos, .. } => {
+                            let released = matches!(
+                                edges.peek(),
+                                Some(egui::PointerButtonEvent::Released { .. })
+                            );
+                            if released {
+                                edges.next();
+                            }
+                            flows.push((true, !released, released, Some(pos), Some(pos)));
+                        }
+                        egui::PointerButtonEvent::Released { pos, .. } => {
+                            // This flow started in a previous pass. Service its
+                            // end even when the current chord/admission rejects.
+                            flows.push((false, false, true, pos, None));
+                        }
+                    }
+                }
+                if flows.is_empty() {
+                    flows.push((
+                        false,
+                        input.pointer.primary_down(),
+                        false,
+                        input.pointer.interact_pos(),
+                        crate::ui_helpers::button_press_origin(input, egui::PointerButton::Primary),
+                    ));
+                }
+                flows
             });
             let owner = self.fs_zoom_owner();
             let rect = self.fs_zoom_pivot_rect(full_rect, default_image_rect);
-            let can_start = !modal_input_blocked
-                && !edit_popup_open
-                && self.fs_context_menu_idx.is_none()
-                && press_origin.is_some_and(|pos| {
-                    full_rect.contains(pos)
-                        && !drag_start_in_panel
-                        && !(top_bar_visible && fullscreen_top_bar_rect(full_rect).contains(pos))
-                })
-                && !overflow_pointer_input.primary_owned
-                && !primary_suppression.suppresses_current_frame()
-                && self.fs_pan_drag_start.is_none()
-                && self.fs_rotation_drag_start.is_none();
-            let used = self.handle_drag_zoom(
-                ctx,
-                ZoomDragInput::Scrub,
-                ZoomDragSurface::Viewer,
-                owner,
-                rect.center(),
-                scrub_held && scrub_canvas && !modal_input_blocked,
-                can_start,
-                pressed,
-                down,
-                released,
-                pos,
-            );
-            if used || (scrub_held && can_start && pressed) {
-                if pressed {
-                    let _ = self
-                        .arm_fs_primary_suppression(ctx, FullscreenPrimarySuppressionReason::Other);
-                }
+            let mut used_any = false;
+            for (pressed, down, released, pos, press_origin) in flows {
+                let can_start = !modal_input_blocked
+                    && !edit_popup_open
+                    && self.fs_context_menu_idx.is_none()
+                    && press_origin.is_some_and(|pos| {
+                        full_rect.contains(pos)
+                            && !(cursor_in_panel && !cursor_in_depth_panel)
+                            && !depth_panel.is_some_and(|panel| panel.contains(pos))
+                            && !(top_bar_visible
+                                && fullscreen_top_bar_rect(full_rect).contains(pos))
+                    })
+                    && !overflow_pointer_input.primary_owned
+                    && !primary_suppression.suppresses_current_frame()
+                    && self.fs_pan_drag_start.is_none()
+                    && self.fs_rotation_drag_start.is_none();
+                let used = self.handle_drag_zoom(
+                    ctx,
+                    ZoomDragInput::Scrub,
+                    ZoomDragSurface::Viewer,
+                    owner,
+                    rect.center(),
+                    scrub_held && scrub_canvas && !modal_input_blocked,
+                    can_start,
+                    pressed,
+                    down,
+                    released,
+                    pos,
+                );
+                used_any |= used || (scrub_held && can_start && pressed);
+            }
+            if used_any {
+                let _ =
+                    self.arm_fs_primary_suppression(ctx, FullscreenPrimarySuppressionReason::Other);
                 ctx.set_cursor_icon(egui::CursorIcon::ZoomIn);
                 return FsWheelFrameResult::default();
             }
@@ -42126,7 +42158,7 @@ impl App {
             self.visible_depth_panel_rect(ctx),
         );
         if !overflow_pointer_input.middle_owned
-            && (!drag_start_in_panel || self.fs_middle_zoom_drag.is_some())
+            && (!middle_drag_start_in_panel || self.fs_middle_zoom_drag.is_some())
         {
             self.handle_middle_drag_zoom(ctx, default_image_rect, overflow_pointer_input.clone());
         }

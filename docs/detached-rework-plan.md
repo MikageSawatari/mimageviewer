@@ -1458,6 +1458,21 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-26: 閉じるモードの数え方の区切りと、この pass の押下位置 (§1.900・§1.907)
+
+- 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §14・§15。F12 の別ウィンドウと共有する
+  viewer の入力のうち、閉じるモードの数え方 (`accept_close_mode_clicks`) の受け付け数を 1・2 の繰り返しにする (§14)。
+  押下位置をボタンごとに「この pass のそのボタンの最後の押下、無ければ押下中のときだけ `press_origin`」で読む入口
+  (`ui_helpers::button_press_origin`) を置き、ドラッグ拡大の和音はこの pass の左の流れを順に処理し、Depth パネルの除外を
+  左・中で分ける (§15)。native presenter の popup の外側の押下も同じ入口のボタンを問わない版を使う。
+- detached の述語・viewport の経路・窓の所有・open / close の初期化は変更しない。§14 は列の区切りを egui の頭打ちの回数に
+  任せていた数え方の前提、§15 は離しで消える値を押した pass の判定に使っていた入力の境界を直す構造的修正であり、
+  guard・遅延・再試行・時間切れによる症状パッチではない。前の pass から続く和音のドラッグに同じ pass で離す・押すが入る場合は
+  今の結果のまま (§15.2 の範囲外)。
+- 構造的修正であることの合意: Codex 独立設計レビュー r1・r2・r3 (GPT-6.1 Sol / xhigh、r3 ACCEPT) と ClaudeCode (設計担当)。
+  実装担当 (Codex GPT-6.1 Sol / high) も同じ判断を報告。実装の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh、
+  `2990a608e..ddff279d7`) も、構造的修正であることに合意。
+
 ### 2026-11-26: 押す・離すが同じフレームのクリックの止めの寿命 (§1.906)
 
 - 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §13。共有 viewer 入力の

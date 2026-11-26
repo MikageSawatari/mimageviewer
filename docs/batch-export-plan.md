@@ -244,7 +244,8 @@ keep_file_time: bool,  // 既定 false
     付けない (付けると出力に合わないプロファイルになる)。それらの元画像は ICC なしの出力になり、
     他のソフトでは sRGB として表示される。
   - **単ページとの共通処理**: `SaveOptions::metadata_profile` は `Single` (既定) / `Batch`。
-    単ページも IFD1 を外し、縮小画像を検出するが、転記対象と Orientation の扱いは従来どおり。
+    単ページも IFD1 を外し、縮小画像を検出する。ICC は両方とも RGB だけを転記する (§1.902)。
+    単ページの Orientation の扱いは従来どおりで、PNG の `eXIf` は一括だけが転記する。
     読めない EXIF は単ページでは残して「EXIF (外せませんでした)」と警告し、一括では転記しない。
     PNG のテキスト内の `Raw profile type exif` / `APP1` も両方で処理する。ImageMagick の長さと16進の桁数を
     厳密に照合し、変わった数字だけ元の位置で書き換え、圧縮の有無・iTXt の言語と訳語を保つ。

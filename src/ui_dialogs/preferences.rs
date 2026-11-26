@@ -17,7 +17,7 @@ use crate::ring_shortcut::{
 use crate::settings::{Parallelism, Settings};
 
 // The design owner's 620 px measurement is the narrowest measured baseline;
-// allow another 4 px while keeping the fixed-table exceptions separate.
+// allow another 4 px for the preferences pages.
 const PREFERENCES_MIN_WIDTH: f32 = 624.0;
 
 #[cfg(test)]
@@ -7329,12 +7329,6 @@ mod tests {
     fn preferences_narrow_layout_all_pages_fit_and_actions_visible() {
         use crate::test_ui::scroll_layout::ScrollLayout;
         use egui_kittest::kittest::{NodeT, Queryable};
-        // §1.857, round 4: this editor already exceeds the default 720 px window.
-        // Its item/status, arrow and separator columns need a separate row design.
-        // Only width is excluded; ComboBox height and action visibility still apply.
-        const PREFERENCES_NARROW_WIDTH_EXCLUSIONS: &[PreferencesPage] = &[
-            PreferencesPage::ContextMenuLayout, // Fixed item / ↑ / ↓ / separator controls.
-        ];
         let mut harness =
             preferences_view_harness_with_combo_reference(PreferencesPage::General, true);
         let window_id = preferences_window_id_for_test();
@@ -7386,10 +7380,7 @@ mod tests {
                     );
                 }
                 let tolerance = 1.0 / harness.ctx.pixels_per_point();
-                if !PREFERENCES_NARROW_WIDTH_EXCLUSIONS.contains(&page)
-                    && layout.content.x > layout.inner.width() + tolerance
-                    && !width_reported
-                {
+                if layout.content.x > layout.inner.width() + tolerance && !width_reported {
                     width_reported = true;
                     failures.push(format!("page={page:?} ({}) step={step}: content width {} > viewport {}; layout={layout:?}",
                         page.label(), layout.content.x, layout.inner.width()));
@@ -7466,6 +7457,281 @@ mod tests {
             "narrow preferences at {PREFERENCES_MIN_WIDTH}px:\n{}",
             failures.join("\n")
         );
+    }
+
+    #[test]
+    fn preferences_context_menu_layout_default_and_minimum_width_fit_and_controls_work() {
+        use crate::context_menu_model::{
+            ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuParentId,
+            ContextMenuPreviewScenario, ContextMenuSeparatorBefore,
+        };
+        use crate::test_ui::scroll_layout::ScrollLayout;
+        use egui_kittest::kittest::{NodeT, Queryable};
+
+        for width in [720.0, PREFERENCES_MIN_WIDTH] {
+            // Fix the actual production Window before opening the page. Checking
+            // only content against a Window that already grew would miss this bug.
+            let mut harness =
+                preferences_view_harness_with_combo_reference(PreferencesPage::General, true);
+            let window_id = preferences_window_id_for_test();
+            let before = harness
+                .ctx
+                .memory(|memory| memory.area_rect(window_id))
+                .unwrap();
+            let start = before.right_center();
+            let end = start + egui::vec2(width - before.width(), 0.0);
+            harness.hover_at(start);
+            harness.run_steps(2);
+            harness.drag_at(start);
+            harness.run_steps(2);
+            harness.hover_at(end);
+            harness.run_steps(3);
+            harness.drop_at(end);
+            harness.run_steps(4);
+            let fixed = harness
+                .ctx
+                .memory(|memory| memory.area_rect(window_id))
+                .unwrap();
+            assert!(
+                (fixed.width() - width).abs() <= 1.0,
+                "width={width}: {fixed:?}"
+            );
+
+            for scenario in [
+                ContextMenuPreviewScenario::GridImageWithDynamicApps,
+                ContextMenuPreviewScenario::GridFolderBackground,
+                ContextMenuPreviewScenario::FullscreenVideo,
+            ] {
+                harness
+                    .state_mut()
+                    .open_preferences_page(PreferencesPage::ContextMenuLayout);
+                let state = harness.state_mut().pref_state.as_mut().unwrap();
+                state.context_menu_preview_scenario = scenario;
+                state.settings.context_menu_layout = ContextMenuLayoutSettings::default();
+                state
+                    .settings
+                    .context_menu_layout
+                    .set_visible(ContextMenuItemId::CopyFiles, false);
+                state.settings.context_menu_layout.set_separator_before(
+                    ContextMenuItemId::CopyImageToClipboard,
+                    ContextMenuSeparatorBefore::Present,
+                );
+                for &parent in ContextMenuParentId::ALL {
+                    state.context_menu_expanded.insert(parent, true);
+                }
+                harness.run_steps(6);
+                let row_height = harness
+                    .ctx
+                    .data(|data| {
+                        data.get_temp::<f32>(egui::Id::unique(
+                            "preferences_single_line_combo_height",
+                        ))
+                    })
+                    .unwrap();
+                // At the default width these short names and statuses fit on
+                // one row. The checks below also cover wrapping at minimum width.
+                let inline_statuses: &[(ContextMenuItemId, &str)] = match (width == 720.0, scenario)
+                {
+                    (true, ContextMenuPreviewScenario::GridImageWithDynamicApps) => &[
+                        (ContextMenuItemId::CutFiles, "切り取りはこの場面で先頭"),
+                        (ContextMenuItemId::CopyFiles, "コピーは項目非表示中"),
+                    ],
+                    (true, ContextMenuPreviewScenario::FullscreenVideo) => {
+                        &[(ContextMenuItemId::RotateLeft, "左に回転はこの場面で対象外")]
+                    }
+                    _ => &[],
+                };
+                for &(item, status_label) in inline_statuses {
+                    let checkbox = harness.get_by_label(item.label()).rect();
+                    let status = harness.get_by_label(status_label).rect();
+                    assert!(
+                        checkbox.y_range().contains(status.center().y)
+                            && status.left() >= checkbox.right(),
+                        "width={width}, scenario={scenario:?}, item={item:?}: \
+                         short item and status should share a row: {checkbox:?}, {status:?}"
+                    );
+                }
+                for step in 0..128 {
+                    let (_, layout) = harness
+                        .ctx
+                        .data(|data| {
+                            data.get_temp::<(PreferencesPage, ScrollLayout)>(egui::Id::unique(
+                                "preferences_right_panel_layout",
+                            ))
+                        })
+                        .unwrap();
+                    let tolerance = 1.0 / harness.ctx.pixels_per_point();
+                    let window = harness
+                        .ctx
+                        .memory(|memory| memory.area_rect(window_id))
+                        .unwrap();
+                    assert!(
+                        (window.width() - width).abs() <= tolerance,
+                        "width={width}, scenario={scenario:?}: Window grew to {window:?}"
+                    );
+                    assert!(
+                        layout.content.x <= layout.inner.width() + tolerance,
+                        "width={width}, scenario={scenario:?}, step={step}: {layout:?}"
+                    );
+                    for role in [
+                        egui::accesskit::Role::CheckBox,
+                        egui::accesskit::Role::Label,
+                        egui::accesskit::Role::Button,
+                        egui::accesskit::Role::ComboBox,
+                    ] {
+                        for node in harness.query_all_by_role(role) {
+                            let rect = node.rect();
+                            if rect.left() >= layout.inner.left() - tolerance
+                                && rect.top() >= layout.inner.top() - tolerance
+                                && rect.bottom() <= layout.inner.bottom() + tolerance
+                            {
+                                assert!(
+                                    rect.right() <= layout.inner.right() + tolerance,
+                                    "width={width}, scenario={scenario:?}, {role:?}: {rect:?}, node={:?}",
+                                    node.accesskit_node()
+                                );
+                                if role == egui::accesskit::Role::ComboBox {
+                                    assert!(
+                                        rect.height() <= row_height + tolerance,
+                                        "width={width}, scenario={scenario:?}: multi-line combo {rect:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    for label in ["  OK  ", "キャンセル"] {
+                        let rect = harness.get_by_label(label).rect();
+                        assert!(
+                            rect.is_positive() && harness.ctx.content_rect().contains_rect(rect)
+                        );
+                    }
+                    let max_offset = (layout.content.y - layout.inner.height()).max(0.0);
+                    if layout.offset.y + tolerance >= max_offset {
+                        break;
+                    }
+                    assert!(step < 127, "failed to reach end: {layout:?}");
+                    harness.hover_at(layout.inner.center());
+                    harness.event(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -layout.inner.height() * 0.8),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Unknown,
+                    });
+                    harness.run_steps(6);
+                }
+            }
+
+            let item = ContextMenuItemId::OpenFolderInExplorer;
+            let state = harness.state_mut().pref_state.as_mut().unwrap();
+            state.context_menu_preview_scenario = ContextMenuPreviewScenario::GridImage;
+            state.settings.context_menu_layout = ContextMenuLayoutSettings::default();
+            harness.run_steps(4);
+            let separator_label = format!("{}の前の区切り線", item.label());
+            harness.get_by_label(&separator_label).scroll_to_me();
+            harness.run_steps(4);
+            let checkbox = harness.get_by_label(item.label()).rect();
+            let combo = harness.get_by_label(&separator_label).rect();
+            assert!(
+                checkbox.height() > combo.height(),
+                "width={width}: exercise a wrapped item, checkbox={checkbox:?}, combo={combo:?}"
+            );
+            let (_, layout) = harness
+                .ctx
+                .data(|data| {
+                    data.get_temp::<(PreferencesPage, ScrollLayout)>(egui::Id::unique(
+                        "preferences_right_panel_layout",
+                    ))
+                })
+                .unwrap();
+            for label in [separator_label.clone(), format!("{}を下へ", item.label())] {
+                assert!(
+                    layout
+                        .inner
+                        .contains_rect(harness.get_by_label(&label).rect()),
+                    "{label}"
+                );
+            }
+            harness.get_by_label(&separator_label).click();
+            harness.run_steps(3);
+            harness.get_by_label("表示").click();
+            harness.run_steps(3);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .context_menu_layout
+                    .separator_before(item),
+                ContextMenuSeparatorBefore::Present
+            );
+
+            let order_before = harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .context_menu_layout
+                .resolved_order(ContextMenuParentId::Root);
+            let index = order_before
+                .iter()
+                .position(|&value| value == item)
+                .unwrap();
+            harness
+                .get_by_label(&format!("{}を下へ", item.label()))
+                .click();
+            harness.run_steps(4);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .context_menu_layout
+                    .resolved_order(ContextMenuParentId::Root)[index + 1],
+                item
+            );
+            harness.get_by_label(item.label()).scroll_to_me();
+            harness.run_steps(3);
+            harness.get_by_label(item.label()).click();
+            harness.run_steps(3);
+            assert!(
+                !harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .context_menu_layout
+                    .is_visible(item)
+            );
+            assert!(
+                harness
+                    .get_by_label(&format!("{}は項目非表示中", item.label()))
+                    .rect()
+                    .is_positive()
+            );
+            let reset = format!("{}の区切り線を既定に戻す", item.label());
+            harness.get_by_label(&reset).scroll_to_me();
+            harness.run_steps(3);
+            harness.get_by_label(&reset).click();
+            harness.run_steps(3);
+            assert_eq!(
+                harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .context_menu_layout
+                    .separator_before(item),
+                ContextMenuSeparatorBefore::Inherit
+            );
+        }
     }
 
     #[test]
