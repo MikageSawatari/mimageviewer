@@ -408,6 +408,9 @@ impl Drop for MaskDetectPending { fn drop(&mut self) { self.cancel.store(true, R
 | 後処理 | 表示用テクスチャを無効にし、`clear_erase_preview(fs_idx)` で古い補完のプレビューを捨てる。**補完はここでは始めない** (次のプレビュー押下・確定・終了の既存の操作で走る。`commit_erase_shape` と同じ。R4 P2) | `commit_conceal_shape` と同じ (`conceal_mask_texture = None`・`clear_conceal_caches(idx)`) | `set_local_adjust_layers_for_target_with_undo` が行う (書き込み worker と再計算) |
 | 選択 | 選択中の図形を外す | 同左 | 同左 |
 
+補正レイヤーで 1 件以上を採用したときは、手描き・バケツと同様に `local_adjust_show_mask = true` にする。
+0 件・キャンセル・照合不一致では表示状態も変えない。
+
 - **検出が 0 件のとき・キャンセルしたとき・照合で捨てたときは、どのツールでもマスクも文書も変えず、Undo も積まない**
   (補正レイヤーでも空の書き先を作らない、`Raster` を変換しない)。
 - 「描画 / 消去」の切替 (D / F) は見ない。検出は常に **書き先へ足す** (描画)。補正レイヤーで書き先が
@@ -485,6 +488,21 @@ impl Drop for MaskDetectPending { fn drop(&mut self) { self.cancel.store(true, R
 | 再合成・補完・保存 | 各ツールの既存の worker |
 
 `perf::event` を「検出の開始」「セッション準備」「推論」「後処理」「結果の追加」に入れる (ツール名を付ける)。
+
+段 1b は共通の `trace_label`（App が `erase` / `conceal` / `local_adjust` を渡す）で次の event を追う。
+detect / runtime 層は label の値を解釈せず、ツールの型・UI 状態を参照しない。既存の label なし API は互換 wrapper として残す。
+
+| 区間 | event |
+|---|---|
+| 開始 | `mask_detect/start`（既存の `tool` と `trace_label`） |
+| セッション準備 | `ai/external_session_prepare`（`trace_label`・`cache`・`ms`） |
+| 推論 | `ai/detect_faces_inference`（`trace_label`・段の `w/h`・`ms`） |
+| 後処理 | `ai/detect_faces_postprocess`、全段をまとめる `ai/detect_faces_postprocess_merge_nms`（同上） |
+| 結果の追加 | `mask_detect/apply`（既存の `tool` と `trace_label`・件数・寸法・`ms`） |
+
+前処理と検出全体の event にも同じ label を付ける。セッション準備はファイル identity の照合・独立 Mutex の取得待ち・cache の取得 / load を含み、
+`f(session)` を呼ぶ直前で閉じる。`cache=hit/loaded` を区別し、`key_failed/lock_failed/load_failed` も記録する。
+これは load だけの時間ではなく、取得待ちを含む準備時間である。cache の FIFO と EP 登録・失敗の扱いは変えない。
 
 ## 11. 段階
 
@@ -872,3 +890,22 @@ mask_detect_parked_empty_receiver_keeps_root_poll_awake_until_result
 - 実行結果とソースからの判断を区別する。上記 34 件の結果は設計担当の観測であり、今回の修正後の成功を意味しない。
 - 今回の `cargo fmt` と `git diff --check` は終了コード 0。cargo の build / test / check / clippy と
   git add / commit は実行していない。再検証は同じ `test(/mask_detect|^ai::detect::/)` filter で行う。
+
+## 21. 段 1b の P2・P3 対応 (対象 eb9f86384、修正後の実行検証待ち)
+
+- P2: 補正レイヤーの非 0 件の結果を採用した後に選択マスク表示を ON に戻す。
+  手描き・バケツは共通 helper ではなく直接フィールドを更新しているため、同じ形にした。
+  `apply_mask_detect_output` の 0 件・取消・照合不一致の帰路ではこの更新に到達しない。
+- 新規回帰 `mask_detect_local_adopted_result_enables_mask_display` は OFF → 非 0 件の採用 → ON を検査する。
+  既存の `mask_detect_zero_and_cancel_do_not_change_masks_documents_or_history` と
+  `mask_detect_stale_identity_size_source_and_edit_session_are_discarded` に、OFF の保持を追加した。
+- P3: §10 の 5 区間に共通の `trace_label` を付けた。App だけがツール名を label に変換し、
+  `detect_faces_with_trace` と `with_external_session_traced` は label を解釈せず event に載せる。
+  旧 API は `unspecified` の互換 wrapper として維持する。段間の NMS も後処理として計測する。
+- 外部セッションの準備はファイル照合前から開始し、cache の hit / load を区別して callback 直前に閉じる。
+  新規回帰 `external_model_mask_detect_perf_label_survives_key_failure` は perf publisher を子 process へ隔離し、
+  ONNX をロードせず、前処理 → セッション準備失敗 → 全体の実ログで label が一致することを検査する。
+- 所有・lifecycle・入力の遮断は変更しない。`detached-rework-plan.md` は設計担当の変更を維持し、本対応では触らない。
+  コンパイル・テストの実行は設計担当へ引き継ぐ。
+- `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。cargo の build / test / check / clippy、
+  git add / commit は実行していない。再検証は `test(/mask_detect|^ai::detect::/)` で追加テストを含めて実行できる。

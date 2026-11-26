@@ -13175,6 +13175,9 @@ impl App {
             after,
             "顔の検出".into(),
         );
+        // Like a hand-drawn shape or bucket fill, reveal the adopted mask edit.
+        // The request owner calls this only after validating a nonempty result.
+        self.local_adjust_show_mask = true;
     }
 
     fn finish_local_adjust_canvas_gesture(

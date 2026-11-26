@@ -9,6 +9,8 @@ UI は `try_recv` で受け取り、context・page key・items 世代・ソー�
 補正レイヤーは最新受付済み文書とも照合する。ダイアログと待ちの間は同 context の新規入力をモーダルで止める。
 モード終了・フォルダ切替・context の破棄では自身の待ちを捨てて取消し、UI で worker を join しない。
 0 件・取消・不一致ではマスクと Undo を変えず、有効な結果の反映だけを既存の各ツールの 1 操作へ渡す。
+呼出元が渡す不透明な `trace_label` を開始から結果の追加までの perf event に持たせ、ツール別に区間を追える。
+外部セッションの準備計測はファイル照合・lock 待ち・cache 取得 / load までとし、推論 callback の前で閉じる。
 詳細と未実施の検証は [自動検出計画 §7・§19](auto-conceal-detection-plan.md) を参照。
 
 ## 起動 resolver の走査と外部 Shell 起動（§1.853・§1.861、実装・検証待ち）

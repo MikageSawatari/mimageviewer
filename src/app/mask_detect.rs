@@ -311,11 +311,12 @@ impl App {
         let manager = Arc::clone(&self.ai_model_manager);
         let source = Arc::clone(&request.source);
         let options = self.settings.mask_detect.clone();
+        let trace_label = tool.name();
         self.launch_mask_detect_worker(request, move |worker_cancel| {
             match runtime_init.wait_terminal_while(|| !worker_cancel.load(Ordering::Acquire)) {
                 crate::ai::runtime::AiRuntimeInitWait::Ready(runtime) => {
                     match manager.face_detector_yunet_path() {
-                        Some(path) => crate::ai::detect::detect_faces(
+                        Some(path) => crate::ai::detect::detect_faces_with_trace(
                             &runtime,
                             &path,
                             &source,
@@ -324,6 +325,7 @@ impl App {
                                 ..Default::default()
                             },
                             &worker_cancel,
+                            trace_label,
                         )
                         .map(|detections| mask_detect_boxes(detections, &options))
                         .map_err(MaskDetectError::Detect),
@@ -382,6 +384,7 @@ impl App {
             0,
             &[
                 ("tool", tool.name().into()),
+                ("trace_label", tool.name().into()),
                 ("ms", (start.elapsed().as_secs_f64() * 1000.0).into()),
             ],
         );
@@ -466,6 +469,7 @@ impl App {
             0,
             &[
                 ("tool", tool.name().into()),
+                ("trace_label", tool.name().into()),
                 ("count", count.into()),
                 ("width", request.mask_size[0].into()),
                 ("height", request.mask_size[1].into()),

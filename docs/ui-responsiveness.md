@@ -680,6 +680,9 @@ UI が捕捉するソース画素は Arc の clone だけとし、受信は `try
 結果の図形追加、Undo の複製と表示用マスクの更新は既存の手描き 1 操作と同じ経路で、検出 1 回につき 1 回だけ行う。
 再合成・補完・保存も各ツールの既存 worker を使い、消しゴムの検出完了では補完を始めない。
 推論層の計装に加え、`mask_detect/start`・`mask_detect/apply` と共有の `mask/texture_rebuild` を記録する。
+開始・セッション準備・推論・後処理・追加は共通の `trace_label`（呼出元のツール名）で追う。
+`ai/external_session_prepare` は worker 内のファイル照合・独立 lock 待ち・cache 取得 / load を計り、推論 callback は含めない。
+`cache=hit/loaded` で取得と新規 load を区別し、準備失敗も記録する。検出層は label の値を解釈しない。
 補正レイヤーの既存 `mask_preview_rebuild` も継続する。大画像での反映費用と実機の応答性は未測定。
 詳細と未実施の検証は [自動検出計画 §7.4・§10・§19](auto-conceal-detection-plan.md) を参照。
 

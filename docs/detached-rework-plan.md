@@ -1458,6 +1458,21 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-27: マスクの自動検出の待ちを context の束に置き、一時停止で取り消す (§1.914 段 1b、ブランチ auto-conceal-914)
+
+- 正本は [マスクの自動検出の設計](auto-conceal-detection-plan.md) §7。検出の待ち `MaskDetectPending` を viewer context の束に
+  1 つ置き、先例の被写体マスクの待ち (`local_adjust_segmentation_pending`) と同じ lifecycle に入れた。
+- detached に触れる範囲: (1) detached の一時停止・前面の引き渡しの処理 (`src/app.rs`、既存の
+  `local_adjust_segmentation_pending = None` の隣) で `cancel_mask_detect()` を呼び、旧い持ち主の待ちを取り消す。
+  (2) 全画面 viewport の既存のダイアログ描画の並び (`show_bulk_page_edit_dialog` の隣、`src/ui_fullscreen.rs`) に
+  検出の設定ダイアログの描画を 1 行足した。detached の述語・viewport の選択と配送・窓の寿命・placement・HWND の処理は
+  変えていない。guard・delay・retry・一括 reset・silent fallback は足していない。受け取り時は開始時に確定した request
+  (context・items_generation・page_key・入力画素の Arc ほか) と照合し、合わなければ何も変えずに捨てる。
+- 合意: 設計担当 ClaudeCode と独立実装レビュー (実装者とは別の GPT-6.1 Sol / xhigh、段 1b の 1 回目、`eb9f86384`) は、
+  これが症状パッチではなく構造的修正であることに合意。レビュー担当の言葉:「既存の所有・終了境界への接続なので、
+  本レビューでは症状パッチではなく構造的変更と判断します。」設計担当の確認: 一時停止の処理では先例の待ちと同じ場所で
+  取り消し、ダイアログは既存のダイアログと同じ描画経路に載せているだけで、新しい分岐は無い。実機は未確認。
+
 ### 2026-11-26: 閉じるモードの数え方の区切りと、この pass の押下位置 (§1.900・§1.907)
 
 - 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §14・§15。F12 の別ウィンドウと共有する

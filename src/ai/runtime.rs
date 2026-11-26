@@ -23,7 +23,7 @@ use std::collections::{HashMap, VecDeque};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use ort::session::Session;
 
@@ -569,6 +569,41 @@ impl<T> ExternalModelCache<T> {
     }
 }
 
+/// Ends before the inference callback; early errors still describe preparation.
+struct ExternalSessionPreparePerf {
+    trace_label: &'static str,
+    cache: &'static str,
+    start: Option<Instant>,
+}
+
+impl ExternalSessionPreparePerf {
+    fn new(trace_label: &'static str) -> Self {
+        Self {
+            trace_label,
+            cache: "key_failed",
+            start: crate::perf::is_enabled().then(Instant::now),
+        }
+    }
+}
+
+impl Drop for ExternalSessionPreparePerf {
+    fn drop(&mut self) {
+        if let Some(start) = self.start {
+            crate::perf::event(
+                "ai",
+                "external_session_prepare",
+                None,
+                0,
+                &[
+                    ("trace_label", self.trace_label.into()),
+                    ("cache", self.cache.into()),
+                    ("ms", (start.elapsed().as_secs_f64() * 1000.0).into()),
+                ],
+            );
+        }
+    }
+}
+
 /// ONNX Runtime ラッパー。
 /// アプリ全体で 1 つだけ作成し、`Arc<AiRuntime>` で共有する。
 ///
@@ -790,10 +825,28 @@ impl AiRuntime {
     where
         F: FnOnce(&mut Session) -> Result<R, AiError>,
     {
+        self.with_external_session_traced(path, "unspecified", f)
+    }
+
+    /// Worker-only external session API with an opaque perf correlation label.
+    /// Preparation includes file identity and lock wait, but excludes `f`.
+    pub fn with_external_session_traced<F, R>(
+        &self,
+        path: &Path,
+        trace_label: &'static str,
+        f: F,
+    ) -> Result<R, AiError>
+    where
+        F: FnOnce(&mut Session) -> Result<R, AiError>,
+    {
+        let mut prepare = ExternalSessionPreparePerf::new(trace_label);
         let key = ExternalModelKey::read(path)?;
+        prepare.cache = "lock_failed";
         let mut sessions = self.external_sessions.lock().unwrap();
         let model_path = key.path.clone();
+        prepare.cache = "hit";
         let session = sessions.get_or_load(key, || {
+            prepare.cache = "load_failed";
             let backend = match self.backend.effective {
                 AiBackend::DirectMl | AiBackend::TensorRt => "DirectML",
                 AiBackend::Cpu => "CPU",
@@ -803,8 +856,11 @@ impl AiRuntime {
                 model_path.display(),
                 backend
             ));
-            self.create_session(&model_path, false, None)
+            let session = self.create_session(&model_path, false, None)?;
+            prepare.cache = "loaded";
+            Ok::<_, AiError>(session)
         })?;
+        drop(prepare);
         f(session)
     }
 
@@ -1080,6 +1136,55 @@ mod tests {
         runtime.hold_sessions_for_test(|| {
             assert!(runtime.external_sessions.try_lock().is_ok());
         });
+    }
+
+    #[test]
+    fn external_model_mask_detect_perf_label_survives_key_failure() {
+        const CHILD_ENV: &str = "MIV_EXTERNAL_MODEL_PERF_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // The real perf publisher is process-global, so isolate its fixture.
+            run_isolated_ort_cases(
+                "ai::runtime::tests::external_model_mask_detect_perf_label_survives_key_failure",
+                CHILD_ENV,
+                &["missing"],
+            );
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let writer = crate::log_writer::test_support::writer(temp.path(), 64, 64 * 1024);
+        crate::log_writer::test_support::install_global(&writer);
+        let runtime = fake_runtime();
+        let result = super::super::detect::detect_faces_with_trace(
+            &runtime,
+            &temp.path().join("missing.onnx"),
+            &egui::ColorImage::filled([1, 1], egui::Color32::BLACK),
+            &super::super::detect::FaceDetectParams::default(),
+            &AtomicBool::new(false),
+            "test_tool",
+        );
+        assert!(matches!(
+            result,
+            Err(super::super::detect::DetectError::ModelMissing(_))
+        ));
+        assert!(writer.shutdown());
+        let events: Vec<serde_json::Value> =
+            std::fs::read_to_string(temp.path().join("perf_events.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .filter(|event: &serde_json::Value| event["cat"] == "ai")
+                .collect();
+        assert_eq!(events.len(), 3);
+        assert!(
+            events
+                .iter()
+                .all(|event| event["trace_label"] == "test_tool")
+        );
+        assert_eq!(events[0]["kind"], "detect_faces_preprocess");
+        assert_eq!(events[1]["kind"], "external_session_prepare");
+        assert_eq!(events[1]["cache"], "key_failed");
+        assert_eq!(events[2]["kind"], "detect_faces_total");
     }
 
     fn wait_activity(publisher: &CheckpointPublisher, expected: u64) {

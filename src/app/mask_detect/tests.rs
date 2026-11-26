@@ -186,6 +186,7 @@ fn mask_detect_zero_and_cancel_do_not_change_masks_documents_or_history() {
     for tool in MASK_DETECT_TOOLS {
         for cancel_result in [false, true] {
             let mut app = mask_detect_fixture(tool);
+            app.local_adjust_show_mask = false;
             let before = mask_detect_history(&app);
             let local_before = app.local_adjust_page_layers.get(&0).cloned();
             let request = app.capture_mask_detect_request(tool).unwrap();
@@ -206,6 +207,7 @@ fn mask_detect_zero_and_cancel_do_not_change_masks_documents_or_history() {
             assert_eq!(app.conceal_mask.as_deref(), Some([false; 64].as_slice()));
             assert_eq!(app.local_adjust_page_layers.get(&0), local_before.as_ref());
             assert_eq!(mask_detect_history(&app), before);
+            assert!(!app.local_adjust_show_mask);
         }
     }
 }
@@ -215,6 +217,7 @@ fn mask_detect_stale_identity_size_source_and_edit_session_are_discarded() {
     for tool in MASK_DETECT_TOOLS {
         for mismatch in 0..6 {
             let mut app = mask_detect_fixture(tool);
+            app.local_adjust_show_mask = false;
             let before = mask_detect_history(&app);
             let mut request = app.capture_mask_detect_request(tool).unwrap();
             match mismatch {
@@ -262,8 +265,33 @@ fn mask_detect_stale_identity_size_source_and_edit_session_are_discarded() {
                 before,
                 "tool={tool:?}, mismatch={mismatch}"
             );
+            assert!(
+                !app.local_adjust_show_mask,
+                "tool={tool:?}, mismatch={mismatch}"
+            );
         }
     }
+}
+
+#[test]
+fn mask_detect_local_adopted_result_enables_mask_display() {
+    let mut app = mask_detect_fixture(MaskDetectTool::LocalAdjust);
+    app.local_adjust_show_mask = false;
+    let request = app
+        .capture_mask_detect_request(MaskDetectTool::LocalAdjust)
+        .unwrap();
+    assert!(
+        !app.local_adjust_show_mask,
+        "starting detection must preserve visibility"
+    );
+    mask_detect_queue(&mut app, request, mask_detect_output());
+    app.poll_mask_detect(&egui::Context::default());
+    let LocalMask::RasterVector(mask) = &app.local_adjust_page_layers[&0][0].mask else {
+        panic!("vector target");
+    };
+    assert_eq!(mask.shapes.len(), 1);
+    assert!(app.local_adjust_show_mask);
+    assert_eq!(app.meta_undo.undo_len(), 1);
 }
 
 #[test]

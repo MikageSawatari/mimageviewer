@@ -128,7 +128,19 @@ pub fn detect_faces(
     params: &FaceDetectParams,
     cancel: &AtomicBool,
 ) -> Result<Vec<Detection>, DetectError> {
-    let total = DetectPerf::new("detect_faces_total", image.size);
+    detect_faces_with_trace(runtime, model_path, image, params, cancel, "unspecified")
+}
+
+/// `trace_label` is opaque to detection and only identifies the caller in perf events.
+pub fn detect_faces_with_trace(
+    runtime: &AiRuntime,
+    model_path: &Path,
+    image: &egui::ColorImage,
+    params: &FaceDetectParams,
+    cancel: &AtomicBool,
+    trace_label: &'static str,
+) -> Result<Vec<Detection>, DetectError> {
+    let total = DetectPerf::new("detect_faces_total", image.size, trace_label);
     let result = (|| -> Result<Vec<Detection>, DetectError> {
         check_cancel(cancel)?;
         if !params.score_threshold.is_finite()
@@ -148,7 +160,7 @@ pub fn detect_faces(
         }
         for size in face_detect_stages(image.size) {
             check_cancel(cancel)?;
-            let preprocess = DetectPerf::new("detect_faces_preprocess", size);
+            let preprocess = DetectPerf::new("detect_faces_preprocess", size, trace_label);
             if rgb.is_none() {
                 rgb = Some(source_rgb(image)?);
             }
@@ -165,11 +177,12 @@ pub fn detect_faces(
             let padded = [input.shape()[3], input.shape()[2]];
             drop(preprocess);
             let stage = runtime
-                .with_external_session(model_path, |session| {
+                .with_external_session_traced(model_path, trace_label, |session| {
                     // Keep typed detection errors separate from session creation errors.
                     Ok((|| -> Result<Vec<Detection>, DetectError> {
                         check_cancel(cancel)?;
-                        let inference = DetectPerf::new("detect_faces_inference", size);
+                        let inference =
+                            DetectPerf::new("detect_faces_inference", size, trace_label);
                         let tensor = ort::value::Tensor::from_array(input).map_err(|e| {
                             DetectError::InferenceFailed(AiError::ort_status(
                                 &e,
@@ -185,7 +198,8 @@ pub fn detect_faces(
                             })?;
                         drop(inference);
                         check_cancel(cancel)?;
-                        let _postprocess = DetectPerf::new("detect_faces_postprocess", size);
+                        let _postprocess =
+                            DetectPerf::new("detect_faces_postprocess", size, trace_label);
                         let boxes = decode_yunet(padded, params, |name| {
                             let value = outputs.get(name).ok_or_else(|| {
                                 DetectError::OutputShape(format!("missing {name}"))
@@ -210,7 +224,13 @@ pub fn detect_faces(
             combined.extend(stage);
         }
         check_cancel(cancel)?;
+        let postprocess = DetectPerf::new(
+            "detect_faces_postprocess_merge_nms",
+            image.size,
+            trace_label,
+        );
         let result = detect_nms(combined, params.nms_iou);
+        drop(postprocess);
         check_cancel(cancel)?;
         Ok(result)
     })();
@@ -337,14 +357,16 @@ fn detect_nms(mut boxes: Vec<Detection>, iou: f32) -> Vec<Detection> {
 struct DetectPerf {
     name: &'static str,
     size: [usize; 2],
+    trace_label: &'static str,
     start: Option<Instant>,
 }
 
 impl DetectPerf {
-    fn new(name: &'static str, size: [usize; 2]) -> Self {
+    fn new(name: &'static str, size: [usize; 2], trace_label: &'static str) -> Self {
         Self {
             name,
             size,
+            trace_label,
             start: crate::perf::is_enabled().then(Instant::now),
         }
     }
@@ -359,6 +381,7 @@ impl Drop for DetectPerf {
                 None,
                 0,
                 &[
+                    ("trace_label", self.trace_label.into()),
                     ("w", self.size[0].into()),
                     ("h", self.size[1].into()),
                     ("ms", (start.elapsed().as_secs_f64() * 1000.0).into()),
