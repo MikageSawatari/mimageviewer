@@ -15,31 +15,32 @@
   (一括と同じ規則)。
 - 利用者決定 (2026-11-25、統括経由「5 件で進める」)。統括の指示: リリース済みの挙動の変更なので、
   「メタデータを保持」の**他の中身 (EXIF・ICC・プロンプト等) は変えない**、**既定値は変えない**。
+  ICC の転記規則は後続の §1.902 (§9) で見直す。§1.888 の判断・検証履歴はそのまま残す。
 
 範囲外 (今と同じ): 見開き合成・PDF・形式が変わる書き出し (どれも元の情報を転記しない)、
 `books.rs` の保存 (転記しない)。一括の書き出しは §1.362 のままで、PNG の Raw profile の扱い (§3.2・§3.4) と
 警告の説明文 (§3.4) だけが共通に変わる (一括は未リリース)。
 
-## 2. 今のコード (master `206768a81`、コード読み)
+## 2. 1 枚の転記規則 (§1.888・§1.902 反映)
 
-1 枚の書き出しは `SaveOptions { include_metadata, caller_applied_orientation: true, batch_metadata: false }` で
+1 枚の書き出しは `SaveOptions { include_metadata, caller_applied_orientation: true, metadata_profile: MetadataProfile::Single, .. }` で
 `save_image_with_metadata` を呼ぶ。形式ごとの転記:
 
-| 形式 | 転記するもの (今) | EXIF の処理 (今) |
+| 形式 | 転記するもの | EXIF の処理 |
 | --- | --- | --- |
-| JPEG | すべての APP1 (EXIF・XMP・拡張 XMP)。ICC (APP2) は転記しない | `reset_exif_orientation_in_app1` で Orientation を 1。IFD1 はそのまま |
-| PNG | tEXt / iTXt / zTXt だけ (`eXIf`・`iCCP` は転記しない) | `eXIf` は無し。ただしテキストチャンクの「Raw profile」形式 (下) の EXIF はそのまま転記される |
-| WebP | `ICCP` (色空間を問わず)・`EXIF`・`XMP ` | 何もしない (Orientation も IFD1 もそのまま) |
+| JPEG | すべての APP1 (EXIF・XMP・拡張 XMP)、RGB の ICC (APP2、欠け・重複のないセグメントを順に) | IFD1 を外し、`caller_applied_orientation` なら従来の IFD0 の Orientation を 1 にする |
+| PNG | tEXt / iTXt / zTXt、RGB の `iCCP` (`eXIf` は転記しない) | テキスト内の「Raw profile」の EXIF は IFD1 を外し、Orientation は変えない |
+| WebP | RGB の `ICCP`・`EXIF`・`XMP ` | IFD1 を外し、Orientation は変えない |
 
 PNG のテキストチャンクには、キーワード `Raw profile type exif` / `Raw profile type APP1` / `Raw profile type xmp`
 (大文字小文字を問わない) で EXIF・XMP を 16 進の文字列にして入れる形式がある (ImageMagick などが書く。
-本文は「改行・種類名・改行・10 進の長さ・改行・16 進の数字 (途中に改行)」)。今の転記はこれらもそのまま残し、
-§1.362 の検出 (`inspect_png_xmp`) は `XML:com.adobe.xmp` しか見ないので、一括でも 1 枚でも見落としている
-(独立設計レビュー 1 回目の P1)。
+本文は「改行・種類名・改行・10 進の長さ・改行・16 進の数字 (途中に改行)」)。§1.888 の設計前にはこれらもそのまま残り、
+§1.362 の検出 (`inspect_png_xmp`) は `XML:com.adobe.xmp` しか見なかったため、一括でも 1 枚でも見落としていた
+(独立設計レビュー 1 回目の P1)。現在の共通処理は §3.2・§3.4。
 
 ダイアログの既定は `settings.export_embed_metadata` (既定 ON)。進捗と結果は一括と同じ `ExportPending` と
 `ui_dialogs::export_batch::draw_progress_window`・`App::poll_export_pending` で扱い、警告の画面
-(§1.362 §3.7) は既に共通。1 枚の worker が `ExportEvent::ThumbnailNotice` を送らないだけである。
+(§1.362 §3.7) は共通。1 枚の worker も `ExportEvent::ThumbnailNotice` を送る。
 
 ## 3. 変更
 
@@ -61,7 +62,8 @@ pub enum MetadataProfile {
 - 転記しないとき (`include_metadata == false`) は今と同じで、どちらの値でも何も転記・検出しない。
 - 今 `batch_metadata: false` の呼び出し元は `export_dialog::run_export` と、転記しない `books.rs`、テストだけ。
   したがって「縮小画像を処理しない転記」は製品の経路から無くなる。Single は今の形式ごとの転記
-  (`encode_jpeg_rgba` などの APP1 / テキスト / WebP チャンクの選び方と JPEG の Orientation の書き換え) をそのまま使い、
+  (`encode_jpeg_rgba` などの APP1 / テキスト / WebP チャンクの選び方と JPEG の Orientation の書き換え) を基本に、
+  ICC の選び方は §9 で両 profile 共通の RGB のみに改め、
   そこに §3.2 の IFD1 の処理と §3.4 の検出を足す。
 
 ### 3.2 EXIF (Single)
@@ -101,10 +103,10 @@ pub enum MetadataProfile {
     (実ファイルでの確認はしていない)。
 - EXIF のほかの中身・画素数タグ・MakerNote 本体は変えない (一括と同じ)。
 
-### 3.3 変えないもの (Single)
+### 3.3 転記対象と変えないもの (Single)
 
-- JPEG に ICC (APP2) を足さない。PNG に `eXIf`・`iCCP` を足さない。WebP の `ICCP` は色空間を問わず今どおり残す
-  (RGB 以外を外す一括の規則は使わない)。
+- §1.902 (§9) で ICC は一括と同じ規則にする。JPEG の APP2・PNG の `iCCP`・WebP の `ICCP` は
+  RGB だけを転記する。PNG の `eXIf` は引き続き転記しない。EXIF の向き・読めない EXIF の扱いは §3.2 のまま。
 - XMP・テキストチャンク・AI プロンプトは解釈せずそのまま残す (今と同じ)。XMP の縮小画像は書き直さない (§1.362 §13 Q3)。
 - `export_embed_metadata` の既定値 (ON)・チェックボックスの文言・永続化の規則。設定のスキーマは変えない。
 - アニメーション WebP の拒否、形式が変わるときに転記しない規則。
@@ -150,12 +152,12 @@ pub enum MetadataProfile {
 ## 5. テスト
 
 - `save_with_metadata` の単体 (Single):
-  - JPEG: IFD1 付きの EXIF → 出力の IFD0 の次の IFD が 0、縮小画像の範囲が 0、Orientation が 1。ICC (APP2) は
-    出力に無い (元に RGB の ICC があっても)。XMP の APP1 はバイト列が同じ。
-  - WebP: IFD1 付き・Orientation 6 の EXIF → IFD1 が外れ、Orientation は 6 のまま。GRAY の `ICCP` も残る。
+  - JPEG: IFD1 付きの EXIF → 出力の IFD0 の次の IFD が 0、縮小画像の範囲が 0、Orientation が 1。RGB の ICC (APP2) は
+    残る (§9)。XMP の APP1 はバイト列が同じ。
+  - WebP: IFD1 付き・Orientation 6 の EXIF → IFD1 が外れ、Orientation は 6 のまま。GRAY の `ICCP` は外す (§9)。
   - JPEG: IFD0 と Exif IFD の両方に Orientation がある EXIF → IFD0 だけが 1 になり、Exif IFD の値は元のまま。
     IFD1 の範囲と次の IFD の 4 バイト以外は、今の処理 (`reset_exif_orientation_in_app1` だけ) の出力と同じバイト列。
-  - PNG: テキストチャンクが今と同じ。`eXIf`・`iCCP` が出力に無い。
+  - PNG: テキストチャンクが今と同じ。`eXIf` は出力に無く、RGB の `iCCP` は残る (§9)。
   - PNG の Raw profile (tEXt と zTXt の両方): IFD1 付きの EXIF → 16 進の該当の数字だけが `0` になり、改行・種類名・
     長さの行は同じ。展開すると縮小画像の範囲が 0。Raw profile の XMP に xmpGImg → `xmp`。16 進でない本文 →
     Single は元のまま + `exif_uninspectable`、Batch はそのチャンクが無い。
@@ -220,9 +222,10 @@ pub enum MetadataProfile {
 
 ## 9. §1.902: 1 枚の書き出しでも RGB の色のプロファイル (ICC) を残す
 
-- 状態: 設計 (2026-11-26、ブランチ small-fixes-590)。v5.9.0 の小さな修正としてまとめて扱う。
+- 状態: コード・回帰テスト・文書の変更済み (2026-11-26、ブランチ small-fixes-590)。コンパイル・自動テスト・独立レビュー・実機確認は未実施。
+  利用者の指定により、この作業では Cargo / fmt・実行ファイルの起動・コミットを行わない。v5.9.0 の小さな修正としてまとめて扱う。
 - 報告: [backlog §1.902](next-release-backlog.md)。観測はサブ PC 担当 (2026-11-26): APP2 に ICC を持つ JPEG を
-  Ctrl+E で書き出すと、出力に ICC が無い。コードでは v5.7.0 から同じ (§3.3 の「JPEG に ICC を足さない」)。
+  Ctrl+E で書き出すと、出力に ICC が無い。コードでは v5.7.0 から同じ (当時の §3.3 の「JPEG に ICC を足さない」)。
 
 ### 9.1 原因と判断
 
@@ -261,3 +264,18 @@ pub enum MetadataProfile {
 - 本書 §2・§3.3 の表と文 (1 枚の転記対象)、[一括エクスポートの設計](batch-export-plan.md) §3.6 の「単ページとの共通処理」、
   マニュアル `manual/export.html` の「メタデータ保持」の行 (RGB の色プロファイルも引き継ぐ)。更新履歴は公開時。
 - まれな失敗: 対象外 (転記の規則だけで、失敗の扱いは今と同じ)。
+
+### 9.5 実装記録 (2026-11-26)
+
+- `batch_metadata::transfer` で JPEG APP2 の抽出・WebP ICCP の RGB 判定を両 profile 共通にした。
+  PNG はテキストと `iCCP` を共通抽出し、Single の `eXIf` は処理・転記しない。
+- 回帰: `both_profiles_icc_accepts_rgb_and_drops_gray_cmyk_in_all_formats` (両 profile・3 形式・3 色空間、ICC 本体と JPEG の順序)、
+  `single_png_keeps_text_and_rgb_iccp_without_exif_chunk` (3 種のテキストと RGB iCCP のバイト維持、eXIf 不在)、
+  `single_page_metadata_bytes_match_legacy_except_ifd1_and_icc` (IFD1・ICC 以外の出力バイト維持)、
+  `jpeg_incomplete_or_duplicate_icc_segments_are_dropped` (両 profile) を追加・更新した。
+- Ctrl+E と同じ `spawn_export_worker` → `run_export` の統合回帰
+  `single_export_worker_preserves_rgb_icc_app2_when_metadata_enabled` は、実 JPEG 入力の APP2 が保持 ON で一致し、OFF で付かないことを検査する。
+- 旧コードで失敗する見込み (コード読み、実行による確認なし): Single の JPEG / PNG の RGB、WebP の GRAY / CMYK、
+  PNG のテキスト + RGB iCCP、ICC を加味したバイト比較、worker の保持 ON。
+- 未実行の検証候補: nextest の lib フィルタ `test(save_with_metadata::)`、統合フィルタ
+  `binary(export_integration)`。この差分での Rust 検証結果・独立レビュー結果はまだ無い。

@@ -4692,7 +4692,7 @@ fn draw_native_panorama_projection_popup(
     if let Some(mode) = selected {
         commands.push(NativeOverlayCommand::SetPanoramaProjection(mode));
         *popup_open = false;
-    } else if let Some(pos) = ctx.input(|input| input.pointer.press_origin())
+    } else if let Some(pos) = ctx.input(crate::ui_helpers::any_button_press_origin)
         && !drawn_popup_rect.contains(pos)
         && !button_rect.contains(pos)
         && ctx.input(|input| input.pointer.any_pressed())
@@ -4863,7 +4863,7 @@ fn draw_native_more_popup(
     if let Some(mode) = selected {
         commands.push(NativeOverlayCommand::SetDeinterlaceMode { mode });
         *popup_open = false;
-    } else if let Some(pos) = ctx.input(|input| input.pointer.press_origin())
+    } else if let Some(pos) = ctx.input(crate::ui_helpers::any_button_press_origin)
         && !drawn_popup_rect.contains(pos)
         && !button_rect.contains(pos)
         && ctx.input(|input| input.pointer.any_pressed())
@@ -10070,6 +10070,94 @@ pub(crate) mod tests {
                 screen.contains_rect(row),
                 "row {row_index} escaped screen: {row:?}"
             );
+        }
+    }
+
+    #[test]
+    fn native_top_popups_close_on_outside_press_and_release_in_one_pass() {
+        for projection in [true, false] {
+            for button in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
+                let ctx = egui::Context::default();
+                crate::ui_fonts::configure_fonts(&ctx);
+                let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+                let button_rect =
+                    egui::Rect::from_min_size(egui::pos2(1200.0, 4.0), egui::vec2(28.0, 28.0));
+                let outside = egui::pos2(1.0, 1.0);
+                let mut open = true;
+                let mut popup_rect: Option<egui::Rect> = None;
+                let mut commands = Vec::new();
+                // Let the Area finish its sizing passes before the outside click.
+                for pass in 0..4 {
+                    let events = if pass == 3 {
+                        assert!(!button_rect.contains(outside));
+                        assert!(!popup_rect.unwrap().contains(outside));
+                        vec![
+                            egui::Event::PointerMoved(outside),
+                            egui::Event::PointerButton {
+                                pos: outside,
+                                button,
+                                pressed: true,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                            egui::Event::PointerButton {
+                                pos: outside,
+                                button,
+                                pressed: false,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    } else {
+                        Vec::new()
+                    };
+                    ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(full),
+                            events,
+                            ..Default::default()
+                        },
+                        |_| {
+                            if pass == 3 {
+                                ctx.input(|input| {
+                                    assert!(input.pointer.any_pressed());
+                                    assert!(input.pointer.any_released());
+                                    assert!(input.pointer.press_origin().is_none());
+                                });
+                            }
+                            popup_rect = None;
+                            if projection {
+                                draw_native_panorama_projection_popup(
+                                    &ctx,
+                                    full,
+                                    button_rect,
+                                    crate::panorama::PanoProjection::Perspective,
+                                    &mut open,
+                                    &mut popup_rect,
+                                    &mut commands,
+                                );
+                            } else {
+                                draw_native_more_popup(
+                                    &ctx,
+                                    full,
+                                    button_rect,
+                                    crate::settings::VideoDeinterlaceMode::On,
+                                    false,
+                                    None,
+                                    &mut open,
+                                    &mut popup_rect,
+                                    &mut commands,
+                                );
+                            }
+                        },
+                    )
+                    .drop_without_applying_deltas();
+                    assert_eq!(open, pass < 3, "projection={projection}, button={button:?}");
+                    assert_eq!(popup_rect.is_some(), pass < 3);
+                    assert!(
+                        commands.is_empty(),
+                        "outside input must only dismiss the popup"
+                    );
+                }
+            }
         }
     }
 }

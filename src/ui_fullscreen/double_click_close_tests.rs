@@ -2,6 +2,8 @@
 use super::*;
 use crate::settings::FullscreenPrimaryClickMode;
 
+mod close_900_tests;
+mod scrub_907_tests;
 mod suppression_906_tests;
 
 fn viewport() -> egui::Rect {

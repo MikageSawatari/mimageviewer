@@ -13,6 +13,48 @@ use eframe::egui;
 
 use crate::grid_item::GridItem;
 
+/// Last press of this button in this pass, even if already released. A
+/// previous pass's origin is valid only while this button remains down.
+pub(crate) fn button_press_origin(
+    input: &egui::InputState,
+    button: egui::PointerButton,
+) -> Option<egui::Pos2> {
+    input
+        .pointer
+        .button_events()
+        .rev()
+        .find_map(|event| match event {
+            egui::PointerButtonEvent::Pressed {
+                button: pressed,
+                pos,
+            } if pressed == button => Some(pos),
+            _ => None,
+        })
+        .or_else(|| {
+            input
+                .pointer
+                .button_down(button)
+                .then(|| input.pointer.press_origin())
+                .flatten()
+        })
+}
+
+/// Popup dismissal accepts the last press of any button in this pass.
+pub(crate) fn any_button_press_origin(input: &egui::InputState) -> Option<egui::Pos2> {
+    input
+        .pointer
+        .button_events()
+        .rev()
+        .find_map(|event| match event {
+            egui::PointerButtonEvent::Pressed { pos, .. } => Some(pos),
+            _ => None,
+        })
+        .or_else(|| input.pointer.press_origin())
+}
+
+#[cfg(test)]
+mod pointer_press_tests;
+
 /// Own immutable snapshot assets until their Context is dropped. kittest 0.37
 /// handles texture frees before capture, so draw-local handles cannot own them.
 /// Content and sampling are part of the key: fixture names alone can repeat.

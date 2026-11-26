@@ -5616,9 +5616,8 @@ pub(super) fn draw_context_menu_layout_settings(
     view_generation: u64,
 ) {
     const ITEM_PREVIEW_WIDTH: f32 = 18.0;
-    const ITEM_COLUMN_MIN_WIDTH: f32 = 260.0;
-    const ITEM_STATE_WIDTH: f32 = 62.0;
     const ARROW_COLUMN_WIDTH: f32 = 32.0;
+    const COLUMN_SPACING: f32 = 8.0;
     ui.small(
         "一覧とフルスクリーンで共用する mImageViewer 項目の表示と順序です。\
          その場面で利用できない項目は従来どおり省きます。",
@@ -5626,13 +5625,20 @@ pub(super) fn draw_context_menu_layout_settings(
     ui.small("表示場面は確認用です。項目や区切り線の変更は、一覧とフルスクリーンの全場面へ共通に適用します。");
     ui.add_space(6.0);
 
-    egui::ComboBox::from_label("確認する表示場面")
+    let scenario_label = ui.label("確認する表示場面");
+    let scenario_combo = egui::ComboBox::from_id_salt("context_menu_preview_scenario")
+        .width(ui.available_width())
+        .truncate()
         .selected_text(scenario.label())
         .show_ui(ui, |ui| {
             for value in ContextMenuPreviewScenario::ALL {
                 ui.selectable_value(scenario, *value, value.label());
             }
         });
+    scenario_combo
+        .response
+        .labelled_by(scenario_label.id)
+        .on_hover_text(scenario.label());
     ui.small(scenario.condition_note());
     ui.small(
         "検索結果や閲覧履歴など、場面ごとに使える項目だけが実際の右クリックメニューへ出ます。",
@@ -5642,27 +5648,25 @@ pub(super) fn draw_context_menu_layout_settings(
     let snapshot = layout.clone();
     let preview = context_menu_layout_preview(*scenario, &snapshot);
     let mut edit = None;
-    let item_font = egui::TextStyle::Body.resolve(ui.style());
-    let max_item_label_width = ContextMenuItemId::ALL.iter().fold(0.0_f32, |width, item| {
-        width.max(
+    // Reserve the right-hand controls first. Item names and preview status use
+    // the remaining width, rather than widening the table for the longest name.
+    let button_font = egui::TextStyle::Button.resolve(ui.style());
+    let separator_text_width = ["非表示（既定）", "非表示（先頭）", "項目が非表示", "対象外"]
+        .into_iter()
+        .map(|label| {
             ui.painter()
-                .layout_no_wrap(
-                    item.label().to_owned(),
-                    item_font.clone(),
-                    egui::Color32::WHITE,
-                )
+                .layout_no_wrap(label.to_owned(), button_font.clone(), egui::Color32::WHITE)
                 .size()
-                .x,
-        )
-    });
-    let item_column_width = ITEM_COLUMN_MIN_WIDTH.max(
-        ITEM_PREVIEW_WIDTH
-            + ui.spacing().item_spacing.x
-            + ui.spacing().icon_width
-            + ui.spacing().icon_spacing
-            + max_item_label_width
-            + ITEM_STATE_WIDTH,
-    );
+                .x
+        })
+        .fold(0.0_f32, f32::max);
+    let separator_combo_width = (separator_text_width
+        + 2.0 * ui.spacing().button_padding.x
+        + ui.spacing().icon_width
+        + ui.spacing().icon_spacing)
+        .ceil();
+    let reset_width = ui.spacing().interact_size.x;
+    let separator_column_width = separator_combo_width + ui.spacing().item_spacing.x + reset_width;
     ui.horizontal_wrapped(|ui| {
         if ui.button("右クリック設定をすべて既定に戻す").clicked() {
             edit = Some(ContextMenuLayoutEdit::Reset);
@@ -5687,9 +5691,16 @@ pub(super) fn draw_context_menu_layout_settings(
             .default_open(open)
             .open(Some(open))
             .show(ui, |ui| {
+                let item_column_width = (ui.available_width()
+                    - 2.0 * ARROW_COLUMN_WIDTH
+                    - separator_column_width
+                    - 3.0 * COLUMN_SPACING)
+                    .max(ITEM_PREVIEW_WIDTH + ui.spacing().item_spacing.x + ui.spacing().icon_width);
                 egui::Grid::new(("context_menu_layout_items", parent))
                     .num_columns(4)
-                    .spacing([8.0, 4.0])
+                    .min_col_width(ARROW_COLUMN_WIDTH)
+                    .spacing([COLUMN_SPACING, 4.0])
+                    .max_col_width(item_column_width)
                     .striped(true)
                     .show(ui, |ui| {
                         let row_height = ui.spacing().interact_size.y;
@@ -5720,7 +5731,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                     egui::vec2(item_column_width, row_height),
                                     egui::Layout::left_to_right(egui::Align::Center),
                                     |ui| {
-                                        ui.set_min_width(item_column_width);
+                                        ui.set_width(item_column_width);
                                         let (preview_rect, _) = ui.allocate_exact_size(
                                             egui::vec2(ITEM_PREVIEW_WIDTH, row_height),
                                             egui::Sense::hover(),
@@ -5737,68 +5748,78 @@ pub(super) fn draw_context_menu_layout_settings(
                                                 ui.visuals().widgets.noninteractive.fg_stroke,
                                             );
                                         }
-                                        let changed =
-                                            ui.checkbox(&mut visible, item.label()).changed();
-                                        match preview_state {
-                                            ContextMenuPreviewItemState::Unavailable => {
-                                                let status = ui.label(
-                                                    egui::RichText::new("対象外")
-                                                        .small()
-                                                        .weak(),
-                                                );
-                                                status.widget_info(|| {
-                                                    egui::WidgetInfo::labeled(
-                                                        egui::Role::Label,
-                                                        true,
-                                                        format!(
-                                                            "{}はこの場面で対象外",
-                                                            item.label()
-                                                        ),
-                                                    )
-                                                });
-                                                status.on_hover_text(format!(
-                                                    "「{}」では使わない項目です。順序を変えても、この場面には追加されません。\n表示される確認場面：{}",
-                                                    scenario.label(), available_scenario_labels
-                                                ));
+                                        ui.vertical(|ui| {
+                                            ui.set_width(
+                                                (item_column_width
+                                                    - ITEM_PREVIEW_WIDTH
+                                                    - ui.spacing().item_spacing.x)
+                                                    .max(ui.spacing().icon_width),
+                                            );
+                                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                            let changed =
+                                                ui.checkbox(&mut visible, item.label()).changed();
+                                            match preview_state {
+                                                ContextMenuPreviewItemState::Unavailable => {
+                                                    let status = ui.label(
+                                                        egui::RichText::new("対象外")
+                                                            .small()
+                                                            .weak(),
+                                                    );
+                                                    status.widget_info(|| {
+                                                        egui::WidgetInfo::labeled(
+                                                            egui::Role::Label,
+                                                            true,
+                                                            format!(
+                                                                "{}はこの場面で対象外",
+                                                                item.label()
+                                                            ),
+                                                        )
+                                                    });
+                                                    status.on_hover_text(format!(
+                                                        "「{}」では使わない項目です。順序を変えても、この場面には追加されません。\n表示される確認場面：{}",
+                                                        scenario.label(), available_scenario_labels
+                                                    ));
+                                                }
+                                                ContextMenuPreviewItemState::Hidden => {
+                                                    let status = ui.label(
+                                                        egui::RichText::new("非表示中")
+                                                            .small()
+                                                            .weak(),
+                                                    );
+                                                    status.widget_info(|| {
+                                                        egui::WidgetInfo::labeled(
+                                                            egui::Role::Label,
+                                                            true,
+                                                            format!("{}は項目非表示中", item.label()),
+                                                        )
+                                                    });
+                                                    status.on_hover_text(format!(
+                                                        "項目表示を ON にすると、次の確認場面に表示されます。\n{}",
+                                                        available_scenario_labels
+                                                    ));
+                                                }
+                                                ContextMenuPreviewItemState::First => {
+                                                    let status = ui.label(
+                                                        egui::RichText::new("先頭")
+                                                            .small()
+                                                            .weak(),
+                                                    );
+                                                    status.widget_info(|| {
+                                                        egui::WidgetInfo::labeled(
+                                                            egui::Role::Label,
+                                                            true,
+                                                            format!("{}はこの場面で先頭", item.label()),
+                                                        )
+                                                    });
+                                                    status.on_hover_text(
+                                                        "この場面では同じ階層の先頭にあるため、前に区切り線を表示できません。",
+                                                    );
+                                                }
+                                                ContextMenuPreviewItemState::Available { .. } => {}
                                             }
-                                            ContextMenuPreviewItemState::Hidden => {
-                                                let status = ui.label(
-                                                    egui::RichText::new("非表示中")
-                                                        .small()
-                                                        .weak(),
-                                                );
-                                                status.widget_info(|| {
-                                                    egui::WidgetInfo::labeled(
-                                                        egui::Role::Label,
-                                                        true,
-                                                        format!("{}は項目非表示中", item.label()),
-                                                    )
-                                                });
-                                                status.on_hover_text(format!(
-                                                    "項目表示を ON にすると、次の確認場面に表示されます。\n{}",
-                                                    available_scenario_labels
-                                                ));
-                                            }
-                                            ContextMenuPreviewItemState::First => {
-                                                let status = ui.label(
-                                                    egui::RichText::new("先頭")
-                                                        .small()
-                                                        .weak(),
-                                                );
-                                                status.widget_info(|| {
-                                                    egui::WidgetInfo::labeled(
-                                                        egui::Role::Label,
-                                                        true,
-                                                        format!("{}はこの場面で先頭", item.label()),
-                                                    )
-                                                });
-                                                status.on_hover_text(
-                                                    "この場面では同じ階層の先頭にあるため、前に区切り線を表示できません。",
-                                                );
-                                            }
-                                            ContextMenuPreviewItemState::Available { .. } => {}
-                                        }
-                                        changed
+                                            changed
+                                        })
+                                        .inner
                                     },
                                 )
                                 .inner;
@@ -5849,6 +5870,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                 ui.label("\u{00a0}");
                             }
                             ui.horizontal(|ui| {
+                                ui.set_width(separator_column_width);
                                 let explicit = separator != ContextMenuSeparatorBefore::Inherit;
                                 match preview_state {
                                     ContextMenuPreviewItemState::Available { separator_before } => {
@@ -5867,6 +5889,8 @@ pub(super) fn draw_context_menu_layout_settings(
                                             parent,
                                             item,
                                         ))
+                                        .width(separator_combo_width)
+                                        .wrap_mode(egui::TextWrapMode::Extend)
                                         .selected_text(selected)
                                         .show_ui(ui, |ui| {
                                             if ui
@@ -5959,7 +5983,11 @@ pub(super) fn draw_context_menu_layout_settings(
                                 }
                                 if explicit {
                                     let reset = ui
-                                        .small_button("↶")
+                                        .add(
+                                            egui::Button::new("↶")
+                                                .small()
+                                                .min_size(egui::vec2(reset_width, row_height)),
+                                        )
                                         .on_hover_text("この項目の区切り線を既定に戻す");
                                     reset.widget_info(|| {
                                         egui::WidgetInfo::labeled(

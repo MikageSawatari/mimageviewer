@@ -463,6 +463,17 @@ F2 と `advance_viewer_primary_pointer_frame` は F12 の別ウィンドウと�
   戻る。続けてダブルクリック → 閉じる (**旧コードで落ちる**、独立設計レビュー r1 P2)。
 - F12 の別ウィンドウの viewer context で、上の 1 つ目と同じ操作 → その窓だけが閉じ、兄弟の context を変えない。
 
+### 14.5 実装記録 (2026-11-26、small-fixes-590)
+
+- `accept_close_mode_clicks` の受け付け数を §14.2 どおり 1・2 の繰り返しにした。
+  ナビゲーターから渡る 2・3 も新しい組の 1 とし、直前の候補は受け付け数 2 のときだけ使う。
+  従来モード・ナビゲーターの数え方、作用の優先順位は変更していない。
+- `double_click_close_tests/close_900_tests.rs` に、素早い 2 組目で閉じる、3 回目では閉じない、
+  同一 pass の 4 回は戻すだけ、従来モード、ナビゲーターの 2・3 からの継続を追加した。
+  `scrub_907_tests.rs` の共有検査では実際の child viewport の入力で閉じる処理まで通し、兄弟を保つ。
+- Rust テスト・整形・ビルドは利用者指示により未実行。後続 runner の対象は
+  `-E 'test(/close_mode_900/)'` と既存の `-E 'test(/double_click_close_tests/)'`。
+
 ## 15. §1.907 修正: ドラッグ拡大の和音での速いクリックでページを送らない (この pass の押下位置)
 
 - 状態: 設計 (2026-11-26、ブランチ small-fixes-590)。v5.7.0 からの挙動。
@@ -586,3 +597,30 @@ guard・遅延・再試行・時間切れを足さない。ClaudeCode と Codex 
 - 設計 r2 (同じレビュー担当、8d95827d5): REVISE。r1 の 5 件のうち 4 件は解消。P2: 前の pass から続く和音のドラッグに同じ pass で
   離す・押すが入ると、この pass の止めの判定が新しい押下の開始を拒む (§15.4 の期待と食い違う)。ClaudeCode の判断で、この場合は
   今の結果を保つ範囲外として §15.2・§15.4 に明記した (第 3 版)。detached: 構造的修正であることに引き続き合意。
+
+### 15.8 実装記録・引き継ぎ (2026-11-26、small-fixes-590)
+
+- `ui_helpers::button_press_origin` と `any_button_press_origin` に、この pass の最後の押下と
+  押下継続時の既存 origin の読み分けを集約した。viewer の左ドラッグの semantic input と
+  中ボタンの Depth 除外、native presenter の popup 4 か所が同じ定義を使う。
+- viewer の和音は左ボタンの順序付きの押下・離しを流れごとに `handle_drag_zoom` へ渡す。
+  完了済みの流れと最後の押下中の流れを混ぜず、使った場合は共通入口で止めを立てて早期 return する。
+  前 pass からのドラッグに離し・押しが入るケースは §15.2 の範囲外どおり、前の流れだけを終え、
+  この pass の既存の Suppress 判定により新しい流れは開始しない。
+- 回帰を `scrub_907_tests.rs`・`ui_helpers/pointer_press_tests.rs` に追加し、§1.906 の和音の対照を
+  更新した。Depth の既存境界横断テストには同一 pass の scrub の止めの確認を加え、左・中の
+  異なる位置の押下、左ドラッグの押下位置の保持も追加した。native popup 4 か所の関数単位テストも追加した。
+- 編集面は変更していない。ソースを確認した結果、通常の比率整合済みの書き出し crop は無移動なら
+  見える矩形差を発見していない (別 pass では delta=0 の再計算・保存経路を通る)。新規 crop は 4pt のしきい値で
+  無移動では作成しない。現 tree の表示トリムは `ui_crop` の pointer handler を共有せず、`press_origin` も使わない。
+- **設計 §15.1 の編集面の見込みと異なる点**: SNS 分割は別 pass の無移動の押下でも
+  `drag_sns_split_layout` で比率を再計算し、整数の高さへ合わせる。同一 pass は開始しないため結果が異なり得る。
+  ソースに沿った Python 算術確認では、1000×1000 画像、3:4・2 枚・隙間 0 の
+  group `(0,167)-(1000,833)` は、North の delta=0 で `(1,168)-(1000,833)` となる。
+  Rust/アプリでの観測ではない。分析面 2 か所の既存差とともに、今回は修正範囲外として引き継ぐ。
+- detached の述語・viewport 経路・窓の所有・open/close の初期化は変更していない。
+  実装者として、列の区切りの所有と押下イベントの時間境界を正す構造的修正であり、症状パッチではないと判断する。
+  detached 計画 §11 の記録は ClaudeCode が行う。
+- 利用者指示により Rust テスト・cargo fmt・ビルド・製品起動は未実行。後続 runner は
+  `-E 'test(/907|suppression_906|depth_transform_middle_and_scrub|native_top_popups_close_on_outside|native_bottom_menus_close_on_outside/)'`。
+  UI スナップショットの変更は見込まない。
