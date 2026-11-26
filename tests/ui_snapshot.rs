@@ -18,7 +18,7 @@
 //! UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --test integration ui_snapshot::
 //! ```
 //!
-//! 更新後は `tests/snapshots/ui_snapshot/*.png` の差分を目視確認してからコミットする。
+//! 更新後は `tests/snapshots/*.png` の差分を目視確認してからコミットする。
 //!
 //! ## 参考
 //!

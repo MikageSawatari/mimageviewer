@@ -722,7 +722,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
     `changelog_markdown::tests::the_newest_changelog_entry_only_uses_markup_this_renderer_handles`
     が CHANGELOG.md の最新節を読み、更新通知ダイアログの描画器が解釈できない記法
     (リンク・画像・閉じ忘れた `**` など) が混ざっていないかを機械的に見る。
-    `cargo test` で毎回走るので、**公開前**に落ちる。
+    `scripts/test-full.ps1` の本体 lib テストで毎回走るので、**公開前**に落ちる。
     - 以前はここを「公開後に別マシンで目視」としていたが、目視は体裁しか見られず、
       しかも公開してからでないと試せなかった (2026-08-30 に廃止)。
     - 短縮版を使った場合だけは、目玉の新機能が 8KB で切れていないかを別途見る
