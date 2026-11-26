@@ -2680,3 +2680,35 @@ section292_locked_facet_sort_keeps_refresh_and_subfolder_grouping_usable
 ```text
 section1876_row_two_pinned_tag_secondary_click_keeps_tag_action
 ```
+
+### 6.18 検証と独立実装レビューの記録 (設計担当、2026-11-27)
+
+テストは設計担当が共有の heavy-job runner (`run-heavy.ps1`) で流した。実装担当はコンパイル・テストをしていない。
+
+| 回 | 対象 | 結果 |
+| --- | --- | --- |
+| 関連 filter 1 | `5f0ab660f` | lib のテストのコンパイルで 26 件のエラー (テスト側の型・可視性) |
+| 関連 filter 2 | `616f04b35` | 既定 1046 件中 16 件失敗、test-script 1051 件中 16 件失敗 (同じ 16 件) |
+| 関連 filter 3 | `d2768a9bb` | 既定 1046 件・test-script 1051 件すべて成功 |
+| lib 全件 1 | `d2768a9bb` | 既定 33 件・test-script 35 件失敗 |
+| lib 全件 2 | `de9b6a308` | 既定 20864 件中 3 件・test-script 21026 件中 4 件失敗 |
+| lib 全件 3 | `5c870a954` | **既定 20865 件・test-script 21027 件すべて成功** (`scripts/test-lib-full.ps1`、`-Features test-script`) |
+
+修正の中で見つかった製品側の退行は 3 件 (§6.17 の r1〜r3): ★フォルダを開くときの自動の一覧の扱い、App の大きさの上限超え
+(継続の持ち物を Box に)、★固定の更新中に後続の open を断る判定が走査の後ろへずれていたこと。ほかはテストの採用待ち・fixture・型の追従。
+
+独立実装レビュー (GPT-6.1 Sol / xhigh、read-only、設計・実装とは別の担当):
+
+- r1 (`30cdc0774..d2768a9bb`): **ACCEPT**。P1/P2 なし。P3×2 (native の Home/End・HUD を通常時に確かめるテスト、C5 の待ちの間の変換の
+  描画のテスト)。どちらも `de9b6a308` で追加した。detached の境界は構造的修正に **AGREE**。
+- r2 (同じ担当の継続、`d2768a9bb..5c870a954`): **ACCEPT**、指摘なし。
+
+dev-runtime の検証用バイナリ (`.\scriptsuild-dev.ps1`) は `5c870a954` で作成済み。製品の起動・実機での確認・perf の計測はしていない
+(サブ PC の確認は統括が行う)。
+
+残り・別項目の候補:
+
+- お気に入り検索の BS・Ctrl+↑↓ の積み上げが今も重複する既存の挙動 (`[root, child]` → `[root, root]`、§6.17)。今回は今の結果を保った。
+  直すかは利用者の判断。
+- ★固定の移動の同期の走査 (`SnapshotLeafOpen`、§6.2)。統括が master で番号を取る。
+- `.pdf` という名前の実フォルダへの検索の戻りは、基点でも成功しない (§6.17 r1、新しいテストの対象から外した)。
