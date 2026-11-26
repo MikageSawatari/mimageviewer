@@ -40,6 +40,18 @@ fn image_combine_dialog_default_light() {
 }
 
 #[test]
+fn image_combine_dialog_transparent_light() {
+    image_combine_snapshot_with_background(
+        "image_combine_dialog_transparent_light",
+        false,
+        true,
+        1.0,
+        false,
+        true,
+    );
+}
+
+#[test]
 fn image_combine_dialog_band_dark() {
     image_combine_snapshot("image_combine_dialog_band_dark", true, false, 1.0, false);
 }
@@ -61,6 +73,17 @@ fn image_combine_dialog_reopen_replace_light() {
 }
 
 fn image_combine_snapshot(name: &str, band: bool, light: bool, scale: f32, reopen: bool) {
+    image_combine_snapshot_with_background(name, band, light, scale, reopen, false);
+}
+
+fn image_combine_snapshot_with_background(
+    name: &str,
+    band: bool,
+    light: bool,
+    scale: f32,
+    reopen: bool,
+    transparent: bool,
+) {
     let mut ready = false;
     let mut harness = test_ui::builder()
         .with_size(egui::vec2(1093.0, 614.0))
@@ -86,6 +109,8 @@ fn image_combine_snapshot(name: &str, band: bool, light: bool, scale: f32, reope
             });
             if reopen {
                 mimageviewer::draw_image_combine_reopen_snapshot_fixture(ctx);
+            } else if transparent {
+                mimageviewer::draw_image_combine_transparent_snapshot_fixture(ctx);
             } else {
                 mimageviewer::draw_image_combine_snapshot_fixture(ctx, band);
             }

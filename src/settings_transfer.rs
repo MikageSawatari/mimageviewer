@@ -2768,6 +2768,8 @@ mod tests {
         let mut live = Settings::default();
         live.combine_options = Some(crate::image_combine::CombineOptions {
             margin: 20,
+            background_color: [12, 34, 56],
+            transparent_background: true,
             ..Default::default()
         });
         live.combine_presets
@@ -2777,7 +2779,10 @@ mod tests {
             });
         let mut draft = Settings::default();
         draft.overwrite_non_preferences_from(&mut live);
-        assert_eq!(draft.combine_options.unwrap().margin, 20);
+        let options = draft.combine_options.unwrap();
+        assert_eq!(options.margin, 20);
+        assert_eq!(options.background_color, [12, 34, 56]);
+        assert!(options.transparent_background);
         assert_eq!(draft.combine_presets[0].name, "sample");
     }
 

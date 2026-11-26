@@ -154,7 +154,7 @@ use crate::settings::{
     FullscreenNavigatorCorner, FullscreenOverflowItemId, ReadingDirection, ReadingFlow,
     SlideshowEndAction, SpreadMode,
 };
-use crate::ui_helpers::{HoverTipExt, open_external_player};
+use crate::ui_helpers::{HoverTipExt, checker_quad_uvs, open_external_player};
 
 mod page_overview;
 mod viewer_chrome;
@@ -9562,8 +9562,6 @@ fn parked_live_egui_right_drag_event_kind(
 
 /// チェックマーク円の半径
 const CHECKMARK_RADIUS: f32 = 18.0;
-/// 透過画像背景の市松 1 タイルサイズ (px)
-const CHECKER_TILE_PX: f32 = 16.0;
 /// ピクセル境界グリッドを表示し始める 1 画像ピクセルあたりの画面ピクセル数。
 const PIXEL_GRID_MIN_CELL_PHYSICAL_PX: f32 = 8.0;
 /// safety: 異常な変換で大量線分を積まないための上限。
@@ -11299,19 +11297,6 @@ pub(crate) fn transparent_bg_toast(mode: u8) -> &'static str {
         2 => "[背景: 市松]",
         _ => "[背景: 黒]",
     }
-}
-
-fn checker_quad_uvs(local_size: egui::Vec2) -> [egui::Pos2; 4] {
-    let uv_max = egui::pos2(
-        local_size.x / CHECKER_TILE_PX,
-        local_size.y / CHECKER_TILE_PX,
-    );
-    [
-        egui::pos2(0.0, 0.0),
-        egui::pos2(uv_max.x, 0.0),
-        uv_max,
-        egui::pos2(0.0, uv_max.y),
-    ]
 }
 
 /// 最終画像 quad と同じ頂点に透過下地を描く。画像テクスチャを描く**直前**に呼ぶこと。
@@ -52327,25 +52312,7 @@ impl App {
         if self.fs_checker_texture.is_some() {
             return;
         }
-        // 16×16 の 2 値グレー。タイルは 8×8 の 2 色。
-        // Photoshop / GIMP 標準に近い中間グレーで、目に邪魔にならない配色。
-        let mut rgba = Vec::with_capacity(16 * 16 * 4);
-        for y in 0..16 {
-            for x in 0..16 {
-                let cell = ((x / 8) + (y / 8)) % 2;
-                let v: u8 = if cell == 0 { 224 } else { 176 };
-                rgba.extend_from_slice(&[v, v, v, 255]);
-            }
-        }
-        let ci = egui::ColorImage::from_rgba_unmultiplied([16, 16], &rgba);
-        let options = egui::TextureOptions {
-            magnification: egui::TextureFilter::Nearest,
-            minification: egui::TextureFilter::Nearest,
-            wrap_mode: egui::TextureWrapMode::Repeat,
-            mipmap_mode: None,
-        };
-        let tex = ctx.load_texture("fs_transparent_checker", ci, options);
-        self.fs_checker_texture = Some(tex);
+        self.fs_checker_texture = Some(crate::ui_helpers::checker_texture(ctx));
     }
 
     /// 現在の `fs_transparent_bg_mode` から描画スタイルを返す。

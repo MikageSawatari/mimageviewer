@@ -170,6 +170,8 @@ fn image_combine_reopen_recipe_restores_output_options_labels_and_replace_defaul
     let temp = tempfile::tempdir().unwrap();
     let mut loaded = loaded(temp.path(), 4);
     loaded.recipe.options.margin = 17;
+    loaded.recipe.options.background_color = [12, 34, 56];
+    loaded.recipe.options.transparent_background = true;
     loaded.found[0].0.annotation_space = Some([1600, 2400]);
     let ctx = egui::Context::default();
     let Some(CombineSession::Dialog(state)) = app.image_combine_dialog_from_recipe(&ctx, loaded)
@@ -178,6 +180,12 @@ fn image_combine_reopen_recipe_restores_output_options_labels_and_replace_defaul
     };
     assert_eq!(state.request, 4);
     assert_eq!(state.options.margin, 17);
+    assert_eq!(state.options.background_color, [12, 34, 56]);
+    assert!(state.options.transparent_background);
+    assert_eq!(
+        state.options.effective_background(),
+        EffectiveBackground::Color([12, 34, 56])
+    );
     assert_eq!(state.options.format, CombineFormat::Jpeg { quality: 91 });
     assert_eq!(state.output_dir(), temp.path());
     assert_eq!(state.name, "output");

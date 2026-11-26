@@ -100,16 +100,11 @@ pub enum Split {
     Counts(Vec<u32>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Background {
+/// Resolved drawing value, never persisted in place of the user's choices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectiveBackground {
     Color([u8; 3]),
     Transparent,
-}
-
-impl Default for Background {
-    fn default() -> Self {
-        Self::Color([255; 3])
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,7 +272,8 @@ pub struct CombineOptions {
     pub gap_y: u32,
     pub gaps_linked: bool,
     pub margin: u32,
-    pub background: Background,
+    pub background_color: [u8; 3],
+    pub transparent_background: bool,
     pub corner_radius: u32,
     pub border: Border,
     pub labels: LabelOptions,
@@ -303,7 +299,8 @@ impl Default for CombineOptions {
             gap_y: 0,
             gaps_linked: true,
             margin: 0,
-            background: Background::default(),
+            background_color: [255; 3],
+            transparent_background: false,
             corner_radius: 0,
             border: Border::default(),
             labels: LabelOptions::default(),
@@ -315,6 +312,16 @@ impl Default for CombineOptions {
 }
 
 impl CombineOptions {
+    pub fn effective_background(&self) -> EffectiveBackground {
+        if self.transparent_background
+            && matches!(self.format, CombineFormat::Png | CombineFormat::Webp { .. })
+        {
+            EffectiveBackground::Transparent
+        } else {
+            EffectiveBackground::Color(self.background_color)
+        }
+    }
+
     /// Central range normalization for deserialized settings and future UI callers.
     /// Split counts are validated by layout, never silently repaired.
     pub fn normalized(&self) -> Self {
@@ -352,10 +359,6 @@ impl CombineOptions {
                 lossless,
             },
         };
-        if matches!(o.format, CombineFormat::Jpeg { .. }) && o.background == Background::Transparent
-        {
-            o.background = Background::Color([255; 3]);
-        }
         o
     }
 }

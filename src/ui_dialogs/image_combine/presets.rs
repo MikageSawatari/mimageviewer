@@ -187,11 +187,19 @@ mod image_combine_tests {
         let mut app = crate::app::tests::phase_c_support::setup_app_with_fresh_data_dir();
         let ctx = egui::Context::default();
         let mut state = fixture_state(&ctx, true);
+        state.options.background_color = [12, 34, 56];
+        state.options.transparent_background = true;
+        state.options.format = CombineFormat::Jpeg { quality: 95 };
+        app.settings.combine_options = Some(state.options.clone());
         state.preset.editing = Some(" 商品用 ".into());
         app.apply_combine_preset(&mut state, PresetAction::Save);
         assert_eq!(app.settings.combine_presets.len(), 1);
         assert_eq!(app.settings.combine_presets[0].name, "商品用");
         let db = crate::settings_db::SettingsDb::open(app.tmp.path()).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().combine_options,
+            app.settings.combine_options
+        );
         assert_eq!(
             db.load_into_settings().unwrap().combine_presets,
             app.settings.combine_presets
@@ -208,8 +216,12 @@ mod image_combine_tests {
             .map(|item| item.spec.label_override.clone())
             .collect::<Vec<_>>();
         state.options.margin = 0;
+        state.options.background_color = [255; 3];
+        state.options.transparent_background = false;
         state.recall_combine_preset(&app.settings.combine_presets[0]);
         assert_eq!(state.options.margin, 40);
+        assert_eq!(state.options.background_color, [12, 34, 56]);
+        assert!(state.options.transparent_background);
         assert_eq!(state.name, name);
         assert_eq!(
             state
