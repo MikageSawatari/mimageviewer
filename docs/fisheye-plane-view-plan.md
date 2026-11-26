@@ -5,7 +5,7 @@
 - ブランチ / worktree: `fisheye-917` / `G:\home\mimageviewer-fisheye917` (基点 master `f2e332bb8`)。
 - 役割: 設計・作業指示・検収 = ClaudeCode Opus 5.5、実装 = Codex GPT-6.1 Sol / high、
   独立レビュー = 実装者とは別の GPT-6.1 Sol / xhigh (AGENTS.md)。
-- 状態: 段 1 実装済み (ブランチ `fisheye-917`)。独立実装レビュー I1 の指摘を修正し、再レビュー待ち (§15)。設計は R6 で「実装開始可」(§14)。
+- 状態: 段 1 実装済み (ブランチ `fisheye-917`)。**独立実装レビュー I2 で「取り込み可」** (§15)。master への取り込み・全件テスト・実機確認は統括が行う。設計は R6 で「実装開始可」(§14)。
 
 ## 0. 利用者の決定 (2026-11-27、設計担当のセッションで直接)
 
@@ -1088,3 +1088,12 @@ UI スレッドの I/O・読み戻しの待ち・Context の再帰 lock には�
 ([fullscreen-double-click-close-plan.md §16](fullscreen-double-click-close-plan.md))。再レビューで名指しで確かめる。
 
 関連の nextest (plane_・context_menu・click・double_click・touch・page_turn・depth_・preferences・capture・gamepad ほか) 3630 件が共有 runner で成功。
+
+### I2 (2026-11-27、I1 と同じレビューのセッションの継続、対象 `0f4eeaf34`)
+
+判定: **取り込み可**。I1 の指摘はすべて resolved、新しい指摘なし。
+PageTurn の `accept_backing_click` の変更は、Response 単位の集計を所有情報つきの離し単位へ直す構造的な修正で、症状パッチではない、との判断。
+別 pass の単 / 2 / 3 回のクリック、一覧から持ち越した raw count、前面の所有・layer・focus・touch の置き換えの抑止、3 回での飽和、
+DoubleClickClose の 2 回ごとの区切りに退行は無い。`.expect` は vendored egui が離しごとに必ず 1 件の認定を積むため
+(座標つき / 座標なしの両方、canvas の外も `None` で対応、`PointerGone` は離しを作らない)、製品の入力で panic する経路は無い、との評価。
+通常の全画面・一覧のコピーは従来の経路のまま。
