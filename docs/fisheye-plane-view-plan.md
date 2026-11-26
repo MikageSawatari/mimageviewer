@@ -394,7 +394,10 @@ Z の全画面ズーム (照準・確定)、紙めくりの最中、3D 写真・
     - **使ってよい条件は、sampler を contain する前の配置枠の一致で判定する**: 今の素材で解決した変換と、前の素材で解決した
       変換の **配置枠** (sampler の縦横比に合わせて contain し物理画素へ丸める前の枠。指定倍率では `layout_full_image_rect`、
       legacy の SourceLayout では resolver の中の中間の配置枠。実装担当は resolver からこの 1 つの値を返す口を作り、両方の基準で使う)
-      が一致するとき。contain・丸めの後の `full_image_rect` では比べない (PDF の再ラスタで raster の縦横比の丸めが変わると、
+      が一致するとき。**一致は物理画素で測った各辺の差が 1/64 物理画素以下** とする (配置枠は `reference_size` で正規化した
+      寸法に fit の倍率を掛けて作るので、同じ配置でも `f32` の誤差が残る。例: 下の page-box・canvas・倍率 1 で reference の長辺が
+      `409 → 819` のとき `min.y` が `0 → −0.0000305`。raw な浮動小数点の完全一致にはしない)。この許容は比較だけに使い、
+      需要・描画の値を近似しない。contain・丸めの後の `full_image_rect` では比べない (PDF の再ラスタで raster の縦横比の丸めが変わると、
       配置枠が同じでも描画矩形が 1 物理画素ずれる。例: page-box 比 `613125:791875`、canvas `1200×900`、Page fit・倍率 1 で、
       raster `317×409 → 634×819` のとき描画矩形は `696×899 → 696×900`。display_basis_tests.rs:1943 に同種の素材がある)。
       表示の基準の項目どうしも `==` で比べない。一致すれば前の素材で魚眼のまま描き、描画・配置の確定・`last_drawn`・書き出しには
@@ -406,10 +409,13 @@ Z の全画面ズーム (照準・確定)、紙めくりの最中、3D 写真・
     - **配置の確定**: 共通の `commit_fs_single_page_placement` には、**実際に描いた素材の material kind** と、その素材で解決した
       変換を渡す。PlaneView で描いたことだけを理由に Complete として扱わない (初期配置の要求の消費・保持が material kind で決まるため。
       initial_placement.rs:263)。
-    - **PDF の需要**: 需要は **常に今の素材で解決した変換から作る**。前の素材の変換を需要の経路へ渡さない。需要の経路は 2 つあり、
-      倍率から作る `maybe_rerender_pdf` (ui_fullscreen.rs:16241) と、指定倍率で描画後に返された変換を `fullscreen_page_layout` に入れ
-      `layout_full_image_rect` から作る経路 (同 30032・33322・33347) の両方で、今の素材の変換を使う。再利用の条件で配置枠の一致を
-      要求しているので、両者の値は同じになり、状態の組み合わせは増えない。
+    - **PDF の需要**: 需要は **常に今の素材で解決した変換から作る**。需要の経路は 2 つある: 倍率から作る `maybe_rerender_pdf`
+      (ui_fullscreen.rs:16241) と、指定倍率で描画後に返された変換の `layout_full_image_rect` から作る経路 (同 30032・33322・33347)。
+      - **`fullscreen_page_layout` には実際に描いた素材の変換を記録する** (前の素材で描いた frame では前の素材の変換)。
+        `FullscreenPageLayout` は「実際に描いたページと screen / source の変換」の持ち主で、PDF 専用ではなく、パンの制限なども
+        その描画矩形を使う (displayed_image_transform.rs:1150、ui_fullscreen.rs:4139)。需要の値をここへ混ぜない。
+      - 今の素材で解決した需要用の配置枠は、単ページ描画の戻り値に **描いた変換と並べて** 返し、指定倍率の需要の入口だけへ渡す
+        (frame をまたぐ新しい状態は作らない)。前の素材で描いていない frame では、両者は同じ変換から取る。
   - 素材が `NativeOnly` 等で元の `TextureHandle` が無い場合は 2D で描き、PlaneView は続ける。
   - **描いた結果の記録**: 各 frame の描画の確定時に、PlaneView で描いたなら `last_drawn = Some(snapshot)`、2D で描いたなら
     `last_drawn = None` にする。2D で描いた frame の後に古い魚眼の snapshot を保存しないため (§6.1)。
