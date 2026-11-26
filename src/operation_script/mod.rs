@@ -4,6 +4,7 @@
 
 mod contract;
 mod engine;
+mod file_worker;
 mod loader;
 mod snapshot;
 mod syntax;

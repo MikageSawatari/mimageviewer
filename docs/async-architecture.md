@@ -1,5 +1,27 @@
 # 非同期・並列アーキテクチャ
 
+## 操作スクリプトのファイル処理（§1.363 段1〜5）
+
+App共通の `OperationScriptLoader` が単一FIFO worker・要求sender・結果receiverを所有し、viewer bundleへ入れない。
+最初の要求で起動し、Load（generation付き）/ Open / Resetを受け付け順に処理する。読み込みも同じ列へ入れるため、
+Reset直後のReloadは置換後の本文を読む。旧来の読み込みごとのthreadと雛形作成専用の経路は使わない。
+Loadは無ければcreate_newで雛形作成 → 読む → compile → slots()評価、Openは同じ欠落時作成 → Shellのエディタ起動。
+既存の本文も空ファイルも上書きしない。Resetだけは確認後に既定本文を書き、同じフォルダの一時ファイルから置換して元本文の先行削除を避ける。
+ファイル監視・Reset完了後の自動reload・完了待ち・再試行状態は設けない。UIは要求を投入するだけ。
+
+ROOTのpollはDisabled / Loading / Ready / Failedに関係なく毎frame受け口をdrainする。
+Load結果は現在のLoadingのgenerationと一致する時だけ採用する。古い結果を捨てた後もdrainを続けて最新結果を採る。
+OFFでは世代を進めてLoad採用資格を失わせるが、workerとreceiverは保持する。
+Open / Resetの失敗はOFFや読み込み中でもログと通知にする。まれな失敗は復旧状態を増やさず通知で終える。
+初回の有効化・起動時・Reloadとも、ファイル欠落は雛形を作って読む。雛形のon_eventも実行対象となる。
+
+loaderをdropするとsenderが閉じる。workerは受理済み要求を処理してから終わるが、UIはjoinしない。
+プロセス終了時に未処理の要求が終わることは保証しない。テストは注入したworkerの停止を解除し、終了を確認してから隔離先を片付ける。
+テスト用loaderは使い捨ての保存先と差し替えのeditor起動を受け取り、製品の保存先・実エディタを使わない。
+状態の写し・イベント基準は在メモリのみ。イベントの共用実行が既存のsettings/spread_db同期保存を呼ぶ点は、利用者の例外決定を保つ。
+費用とイベント基準は[UI応答性](ui-responsiveness.md)、[設計§4.1.1](operation-script-plan.md)を参照。
+段5は実装済み。自動検証・独立実装レビュー・設計担当の検収・実機確認は未実施。
+
 ## 起動 resolver の走査と外部 Shell 起動（§1.853・§1.861、実装・検証待ち）
 
 `startup-open-resolve` は既存 pending 一つで、明示の起動入力と既定の場所の typed input を扱う。

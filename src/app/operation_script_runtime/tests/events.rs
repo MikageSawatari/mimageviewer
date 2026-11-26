@@ -903,8 +903,9 @@ fn event_detection_off_absent_loading_and_failed_do_not_claim_the_frame() {
     app.settings.operation_script_enabled = false;
     assert!(!app.begin_operation_script_event_detection(&ctx, ScriptInputSurface::Grid));
     app.settings.operation_script_enabled = true;
-    let data_dir = app.tmp.path().to_path_buf();
-    app.operation_script.reload(&data_dir, &ctx);
+    // This is an event-admission fixture, not a file-worker lifecycle test.
+    app.operation_script.state =
+        OperationScriptState::Loading(crate::operation_script::OperationScriptLoad);
     assert!(matches!(
         app.operation_script.state,
         OperationScriptState::Loading(_)

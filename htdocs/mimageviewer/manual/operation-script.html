@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>操作のスクリプト — mImageViewer マニュアル</title>
+  <meta name="description" content="画面の状態に応じてページ送りや表示切り替えを組み合わせる操作スクリプトの設定、書き方、安全上の制約を説明します。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/operation-script.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/operation-script.html">
+  <meta property="og:title" content="操作のスクリプト｜mImageViewer">
+  <meta property="og:description" content="画面の状態に応じた操作の組み合わせと、自動実行の書き方。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="操作のスクリプト｜mImageViewer">
+  <meta name="twitter:description" content="画面の状態に応じた操作の組み合わせと、自動実行の書き方。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb"><a href="../index.html">ホーム</a><span class="sep">›</span><a href="index.html">マニュアル</a><span class="sep">›</span><span>操作のスクリプト</span></nav>
+</header>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="music-video.html">音楽ビデオの作成</a>
+        <a href="effetune.html">音響調整</a>
+        <a href="sound/index.html" class="sub">エフェクトの説明書</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="clipboard-capture.html">クリップボード取り込み</a>
+        <a href="browser-integration.html">ブラウザ連携</a>
+        <a href="metadata-transfer.html">メタ情報の移行</a>
+        <a href="external-tools.html">外部ツール連携</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="collections.html">コレクション</a>
+        <a href="search.html">検索機能</a>
+        <a href="remote.html">リモート閲覧</a>
+        <a href="ai-integration.html">AI アプリとの連携</a>
+        <a href="operation-script.html" class="active">操作のスクリプト</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="known-issues.html">既知の問題</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+  <main class="content">
+    <h1 class="page-title">操作のスクリプト</h1>
+    <p class="page-desc">画面の状態に応じて、ページ送り・表示切り替えなどの操作を組み合わせられます。</p>
+
+    <h2 id="overview">できること・できないこと</h2>
+    <p>Rhai 言語で書いたスクリプトが現在の画面の状態を読み、許可された mIV の操作を返します。
+    「★3 を付けて次へ」「最後のページなら次の本へ」のような組み合わせを、キーやリングから呼び出せます。
+    本を開いたときやページが変わったときに、表示の切り替えを自動で行うこともできます。
+    ファイル名から画像をまとめる<a href="stack.html">スタック用のスクリプト</a>とは別の機能です。</p>
+    <div class="box warning"><div class="box-body">
+      スクリプトはレーティングやピン留めタグを変更でき、手動で呼び出したときにはキャプチャ保存やクリップボードへのコピーもできます。
+      レーティングの XMP 書き込みを有効にしている場合は、通常の操作と同じくファイルにも書き込みます。
+      人から受け取ったスクリプトは、何をするか確かめてから使ってください。
+      ファイルの削除・移動、ほかのプログラムの起動、インターネットへの接続はできません。
+    </div></div>
+    <p>ファイルの自由な読み書き、クリップボードの読み取り、任意の設定値の読み書きはできません。
+    書き出し・名前の変更・編集の適用・管理画面を開く操作・元に戻す操作も呼べません。
+    キャプチャは mIV で設定した保存先と名前を使います。1 回の起動で保存・コピーを合わせて 1 つまでで、押しっぱなしやイベントでは保存しません。</p>
+    <p>使えるのはメインウィンドウの一覧、画像の全画面表示、動画・音声の全画面表示（音楽表示を含む）です。
+    別ウィンドウの表示、編集モード、ページ一覧、ダイアログ、文字入力中、mIV Remote が表示を取得している間は実行しません。
+    メインの画像を別ウィンドウへ表示していても、メインウィンドウの一覧では使えます。</p>
+
+    <h2 id="setup">有効にする・ファイルを編集する</h2>
+    <ol>
+      <li><strong>環境設定 → 拡張と診断 → 操作のスクリプト</strong>を開きます。</li>
+      <li>「操作のスクリプトを使う」を ON にします。初回の説明を読み、「使う」を選びます。</li>
+      <li>環境設定の「OK」で確定します。有効化と初回確認の記録はここで保存されます。「キャンセル」なら両方とも保存されません。</li>
+      <li>同じページの「スクリプトを開く」で編集し、保存後に「再読み込み」を押します。</li>
+      <li>操作カスタマイズで「スクリプト操作 1」〜「スクリプト操作 20」にキーなどを割り当てます。既定の割り当てはありません。</li>
+    </ol>
+    <p>確認を保存した後は、有効にし直しても初回の説明は出ません。確定した設定が OFF の間は「再読み込み」を押せません。
+    チェックの変更は「OK」で反映しますが、「スクリプトを開く」「再読み込み」「既定に戻す」は押した時点で働きます。</p>
+    <p>保存場所はデータフォルダ内の <code>operation_scripts.rhai</code> です。
+    通常は <code>%APPDATA%\mimageviewer\operation_scripts.rhai</code>、ポータブル版はプログラムと同じ場所の
+    <code>data\operation_scripts.rhai</code>、<code>--data-dir</code> を指定している場合はそのフォルダです。</p>
+    <ul>
+      <li>有効化・起動時の読み込み・再読み込み・「スクリプトを開く」でファイルが無ければ、雛形を作ります。既存の本文や空のファイルは置き換えません。</li>
+      <li>編集内容は自動で反映されません。「再読み込み」、有効にし直す、または再起動で反映します。</li>
+      <li>「既定に戻す」は確認後にファイルを雛形で置き換えます。元に戻せないので必要なら先にコピーしてください。置き換え後も「再読み込み」が必要です。</li>
+      <li><strong>止めるには設定を OFF にして「OK」を押してください。</strong>ファイルを削除しても、次の読み込みで雛形が作られ、雛形の自動実行も動きます。</li>
+      <li>この実行許可と初回確認の記録は、設定のエクスポート・インポートや AI による設定変更の対象外です。</li>
+    </ul>
+    <p>設定ページには確定済みの状態（OFF・読み込み中・使える・失敗とその理由）、使える場合はスロットの番号・名前・関数名と
+    本を開いたときなどに自動で動く処理（<code>on_event</code>）の有無が表示されます。編集中のチェック状態とは区別してください。失敗時は理由を直して再読み込みします。</p>
+
+    <h2 id="slots">スロットと呼び出し方</h2>
+    <p><code>slots()</code> は、番号 <code>slot</code>（1〜20、重複不可）、表示する名前 <code>label</code>、
+    状態を 1 つ受け取る関数名 <code>run</code> の組を配列で返します。使う番号だけ登録できます。</p>
+    <pre><code>fn slots() {
+    [#{ slot: 1, label: "★3 を付けて次へ", run: "rate3_next" }]
+}
+fn rate3_next(s) {
+    if s.context != "fs_image" { return []; }
+    ["RatingItem3", "FsPageNext"]
+}</code></pre>
+    <p>操作カスタマイズの表示名は常に「スクリプト操作 N」です。<code>label</code> は環境設定のスロット一覧と右クリックの
+    「スクリプト」メニューに表示されます。右クリックには名前の付いたスロットだけが並び、該当するスロットが無ければメニューも出ません。
+    動画の全画面表示では右クリックからの実行に対応していません。キー・リングなどの割り当てを使ってください。</p>
+    <p>キーのほか、一覧・画像・動画のリング、マウスジェスチャー、戻る／進む／ホイールクリック、ゲームパッドの X リングへ割り当てられます。
+    ツールバーには追加しません。キーを押し続けた自動繰り返しでは起動しません。マウスのダブルクリックは 2 回の起動になる場合があります。
+    キー入力を書き換える外部ツールの組み合わせでも、1 回の押下が複数回の起動になる場合があります。</p>
+    <p>戻り値は操作名の配列です。<code>#{ run: ["FsPageNext"], notice: "次へ進みました" }</code> のように通知も付けられます。
+    <code>()</code> または <code>[]</code> は何もしません。操作名は次の表の綴りをそのまま使います。</p>
+
+    <h2 id="state">渡される状態 s</h2>
+    <p>その時点で分かっている状態の写しです。未取得・対象なしの値と、8 KiB を超える文字列は <code>()</code> になります。
+    値を使う前に <code>if s.item.rating != () { ... }</code> のように確かめてください。
+    設定・履歴・時刻・EXIF・AI プロンプト・フォルダ内の全項目・タグ一覧などは渡しません。</p>
+    <div class="table-wrap"><table><thead><tr><th>キー（s. に続ける）</th><th>型・値</th><th>内容</th></tr></thead><tbody>
+      <tr><td><code>api</code></td><td>整数（1）</td><td>スクリプトに渡す状態の形式を示す番号</td></tr>
+      <tr><td><code>context</code></td><td>文字列</td><td><code>grid</code>（一覧）、<code>fs_image</code>（画像）、<code>fs_video</code>（動画・音声）</td></tr>
+      <tr><td><code>events</code></td><td>配列</td><td>自動実行の理由。手動起動では空配列</td></tr>
+      <tr><td><code>window.fullscreen</code> / <code>window.mode</code></td><td>真偽値 / 文字列</td><td>全画面か。mode は <code>fullscreen</code> / <code>window</code></td></tr>
+      <tr><td><code>item.name</code> / <code>item.ext</code> / <code>item.path</code></td><td>文字列</td><td>一覧の選択項目または表示中の項目。ext は小文字の拡張子（点なし）。ZIP 内はその中の名前、PDF のページはページ名</td></tr>
+      <tr><td><code>item.kind</code></td><td>文字列</td><td><code>image</code> / <code>video</code> / <code>audio</code> / <code>pdf_page</code> / <code>folder</code> / <code>archive</code> / <code>pdf</code> / <code>stack</code> / <code>search_container</code> / <code>unavailable</code></td></tr>
+      <tr><td><code>item.width</code> / <code>item.height</code></td><td>整数 / ()</td><td>分かっている画像の幅・高さ</td></tr>
+      <tr><td><code>item.rating</code></td><td>整数 / ()</td><td>取得済みのレーティング（0〜5）</td></tr>
+      <tr><td><code>item.pinned_tags</code></td><td>配列 / ()</td><td>付いているピン留めタグの番号（1〜20）。取得済みの場合だけ</td></tr>
+      <tr><td><code>book.path</code> / <code>book.kind</code></td><td>文字列 / ()</td><td>画像・動画表示では項目の入っているフォルダ・ZIP・PDF・EPUB。一覧では一覧の場所。kind は <code>folder</code> / <code>zip</code> / <code>pdf</code> / <code>epub</code></td></tr>
+      <tr><td><code>page.index</code> / <code>page.count</code></td><td>整数 / ()</td><td>現在位置（先頭が 0）と総数。一覧では選択位置と件数</td></tr>
+      <tr><td><code>page.is_first</code> / <code>page.is_last</code></td><td>真偽値 / ()</td><td>先頭・末尾か。見開き・分割では表示するページのまとまりで判断。未確定なら ()</td></tr>
+      <tr><td><code>view.spread</code></td><td>文字列</td><td><code>single</code> / <code>ltr</code> / <code>ltr_cover</code> / <code>rtl</code> / <code>rtl_cover</code> / <code>vertical</code> / <code>split_ltr</code> / <code>split_rtl</code></td></tr>
+      <tr><td><code>view.direction</code> / <code>view.background</code></td><td>文字列</td><td>読み方向 <code>ltr</code> / <code>rtl</code>、透過画像の背景 <code>black</code> / <code>white</code> / <code>checker</code></td></tr>
+      <tr><td><code>video.playing</code></td><td>真偽値 / ()</td><td>動画・音声の再生中か</td></tr>
+      <tr><td><code>video.position_sec</code> / <code>video.duration_sec</code></td><td>小数 / ()</td><td>動画・音声の現在位置・長さ（秒）</td></tr>
+      <tr><td><code>grid.selected_count</code></td><td>整数 / ()</td><td>一覧の選択数。画像・動画表示では ()</td></tr>
+    </tbody></table></div>
+
+    <h2 id="operations">返せる操作と組み合わせの制約</h2>
+    <div class="table-wrap"><table><thead><tr><th>種類</th><th>制約</th><th>イベントから</th></tr></thead><tbody>
+      <tr><td>A：その場で表示・再生を変える</td><td>並びのどこでも</td><td>下表で許される操作だけ</td></tr>
+      <tr><td>B：本の中で移動する</td><td>B と C を合わせて 1 つまで、並びの最後だけ</td><td>不可</td></tr>
+      <tr><td>C：場所を移る・全画面を開閉する</td><td>B と C を合わせて 1 つまで、並びの最後だけ</td><td>不可</td></tr>
+      <tr><td>D：レーティング・ピン留めタグを変える</td><td>並びのどこでも</td><td>不可</td></tr>
+      <tr><td>E：キャプチャ保存・クリップボードへコピー</td><td>並び全体で 1 つまで</td><td>不可</td></tr>
+    </tbody></table></div>
+    <p><code>1..20</code> などは番号の範囲を表します。たとえば <code>GridColumnCount3</code> は 3 列にします。
+    表に無い操作は使えません。全体を実行前に確かめ、操作名・画面・並びの制約が合わなければ、その回は何も実行せず通知します。
+    実行の途中で対象が変わったり操作を受け付けられなくなった場合は、残りを実行せず通知します。先に行った変更は戻しません。</p>
+    <div class="table-wrap"><table><thead><tr><th>種類</th><th>画面</th><th>操作名</th></tr></thead><tbody>
+      <tr><td>A</td><td>画像の全画面</td><td><code>FsSpreadSingle</code>、<code>FsViewSpread</code>、<code>FsSpreadLtr</code>、<code>FsSpreadLtrCover</code>、<code>FsSpreadRtl</code>、<code>FsSpreadRtlCover</code>、<code>FsReadingDirectionToggle</code>、<code>FsBgCycle</code>、<code>FsFitModeCycle</code>、<code>FsZoomIn</code>、<code>FsZoomOut</code>、<code>FsToggleMetadata</code>、<code>FsNavigatorToggle</code>、<code>FsPixelGrid</code>、<code>FsPageTurnAnimationToggle</code></td></tr>
+      <tr><td>A</td><td>動画・音声の全画面</td><td><code>VideoPlayPause</code>、<code>VideoMute</code>、<code>VideoVolumeUp</code>、<code>VideoVolumeDown</code>、<code>VideoLoop</code>、<code>VideoSeekStart</code>、<code>VideoSeekBackSmall</code>、<code>VideoSeekForwardSmall</code>、<code>VideoSeekBackMedium</code>、<code>VideoSeekForwardMedium</code>、<code>VideoSeekBackLarge</code>、<code>VideoSeekForwardLarge</code>、<code>VideoSeekStripToggle</code></td></tr>
+      <tr><td>A</td><td>一覧</td><td><code>GridColumnCount1..20</code>、<code>GridToggleDetailsView</code></td></tr>
+      <tr><td>B</td><td>画像の全画面</td><td><code>FsPagePrev</code>、<code>FsPageNext</code>、<code>FsJumpFirst</code>、<code>FsJumpLast</code>、<code>FsFixedJumpPrev</code>、<code>FsFixedJumpNext</code></td></tr>
+      <tr><td>B</td><td>一覧</td><td><code>GridMoveFirst</code>、<code>GridMoveLast</code></td></tr>
+      <tr><td>C</td><td>画像の全画面</td><td><code>FsSiblingPrev</code>、<code>FsSiblingNext</code>、<code>FsCtrlNavPrev</code>、<code>FsCtrlNavNext</code>、<code>FsClose</code>、<code>FsBackToList</code></td></tr>
+      <tr><td>C</td><td>動画・音声の全画面</td><td><code>VideoPrevFile</code>、<code>VideoNextFile</code>、<code>VideoCloseFullscreen</code></td></tr>
+      <tr><td>C</td><td>一覧</td><td><code>GridOpenSelected</code>、<code>GridParentFolder</code>、<code>GridHistoryBack</code>、<code>GridHistoryForward</code>、<code>GridSiblingFolderPrev</code>、<code>GridSiblingFolderNext</code>、<code>GridBookPrev</code>、<code>GridBookNext</code>、<code>GridOpenFavorite1..20</code>、<code>GridOpenBook1..20</code>、<code>GridOpenCollection1..20</code></td></tr>
+      <tr><td>D</td><td>一覧・画像・動画／音声</td><td><code>RatingItem1..5</code>、<code>RatingItemClear</code>、<code>RatingItemStepUp</code>、<code>RatingItemStepDown</code>、<code>RatingContainer1..5</code>、<code>RatingContainerClear</code>、<code>RatingContainerStepUp</code>、<code>RatingContainerStepDown</code>、<code>RatingBookPreferred1..5</code>、<code>RatingBookPreferredClear</code>、<code>RatingBookPreferredStepUp</code>、<code>RatingBookPreferredStepDown</code></td></tr>
+      <tr><td>D</td><td>一覧</td><td><code>GridTogglePinnedTag1..20</code></td></tr>
+      <tr><td>E</td><td>画像の全画面</td><td><code>FsCapture</code>、<code>FsCopyPath</code>、<code>FsCopyFileName</code>、<code>FsCopyImage</code></td></tr>
+      <tr><td>E</td><td>動画・音声の全画面</td><td><code>VideoCapture</code></td></tr>
+      <tr><td>E</td><td>一覧</td><td><code>GridCopyPath</code>、<code>GridCopyFileName</code>、<code>GridCopyImage</code></td></tr>
+    </tbody></table></div>
+    <p>操作名の <code>Prev</code> / <code>Next</code> は前／次、<code>First</code> / <code>Last</code> は先頭／末尾です。
+    画像の <code>FsSiblingPrev/Next</code> は兄弟フォルダ、<code>FsCtrlNavPrev/Next</code> はフォルダまたは検索結果の移動、
+    <code>GridOpenFavoriteN</code> / <code>GridOpenBookN</code> / <code>GridOpenCollectionN</code> は登録済みの番号の場所を開きます。
+    <code>RatingItem</code> は項目、<code>RatingContainer</code> は現在のフォルダ・書庫など、<code>RatingBookPreferred</code> は本を優先するレーティングです。
+    <code>Clear</code> は解除、<code>StepUp/Down</code> は星を 1 つ増減します。
+    操作は通常のキーと同じ条件で働きます。各機能の説明は<a href="shortcuts.html">キーボードショートカット</a>も参照してください。</p>
+    <p>音楽表示（音声ファイルと動画の音声モード）では <code>VideoCapture</code> と <code>VideoSeekStripToggle</code> は使えません。
+    パス・名前・画像のコピーは一覧と画像表示だけです。動画表示からのコピーはできません。</p>
+
+    <h2 id="events">本を開いたときなどの自動実行（on_event）</h2>
+    <p><code>fn on_event(s)</code> を書くと、状態の変化をまとめた <code>s.events</code> を受け取れます。
+    複数の理由が同時に入ることがあるので、<code>"open" in s.events</code> のように含まれているかを調べます。</p>
+    <div class="table-wrap"><table><thead><tr><th>名前</th><th>発生する変化</th></tr></thead><tbody>
+      <tr><td><code>view</code></td><td>一覧・画像・動画／音声の表示の切り替え</td></tr>
+      <tr><td><code>open</code></td><td>全画面表示で、項目の入れ物（フォルダ・ZIP・PDF・EPUB）が変わったとき。一覧では発生しない</td></tr>
+      <tr><td><code>page</code></td><td>全画面表示で、表示する項目・見開きの形や本のページ構成・分割の左右などが変わったとき</td></tr>
+      <tr><td><code>select</code></td><td>一覧で選択中の項目が変わったとき。全画面から戻ったときの選択の変化も含む</td></tr>
+    </tbody></table></div>
+    <p>検索結果やコレクションでも、<code>open</code> は表示中の項目の入れ物で判断します。
+    違うフォルダの画像を続けて見ると、その都度発生します。ZIP の中のサブフォルダ移動では発生せず、書庫の中の別の書庫へ移ると発生します。
+    変換して読む書庫では、変換後の ZIP が入れ物になります。EPUB は元の EPUB を使います。
+    一覧を挟んで同じ本へ入り直したときも、<code>view</code>・<code>open</code>・<code>page</code> が発生します。</p>
+    <p>変化は画面の更新に合わせて検出するため、短い間の複数の変化や往復は 1 回にまとまることがあります。
+    初回の検出も対象です。同じ項目が選ばれたままの再読み込みでは <code>select</code> は発生しません。
+    全画面の項目・表示の設定・本のページ構成が同じまま、一覧の並べ替えや絞り込みだけで見開きの組が変わった場合は <code>page</code> を出しません。</p>
+    <h3>イベントから実行できる操作</h3>
+    <p>A のうち次の 32 操作だけを使えます。ほかの入力が無ければ、その操作をきっかけに新たなイベントを繰り返し起こしません。</p>
+    <ul>
+      <li>画像の 7 操作：<code>FsBgCycle</code>、<code>FsPixelGrid</code>、<code>FsPageTurnAnimationToggle</code>、<code>FsZoomIn</code>、<code>FsZoomOut</code>、<code>FsToggleMetadata</code>、<code>FsNavigatorToggle</code></li>
+      <li>動画の 4 操作：<code>VideoMute</code>、<code>VideoVolumeUp</code>、<code>VideoVolumeDown</code>、<code>VideoSeekStripToggle</code>（音楽表示を除く）</li>
+      <li>一覧の 21 操作：<code>GridColumnCount1..20</code>、<code>GridToggleDetailsView</code></li>
+    </ul>
+    <p>さらに <code>FsReadingDirectionToggle</code> と <code>FsFitModeCycle</code> の 2 操作は、
+    <strong><code>s.events</code> に <code>open</code> が含まれる回だけ</strong>使えます。
+    横長分割と自由回転を組み合わせた表示でこの 2 操作を使うと、後で <code>page</code> が 1 回余分に発生することがあります。
+    大きさが未取得の場合や検出できない期間があれば、その後の検出にまとまります。
+    <code>page</code> だけの回に同じ 2 操作を返すと、並び全体を実行せず通知します。</p>
+    <p>見開きの形の 6 操作と、動画の再生／一時停止・ループ・先頭へ・前後すべてのシークは、イベントから使えません。
+    動画のこれらの操作は再生や次のファイルへの移動につながり、自動操作が繰り返されるおそれがあるためです。
+    移動・レーティング・タグ・保存・コピーもイベントからは使えません。必要な場合はスロットへ登録し、手動で呼び出してください。</p>
+    <p>イベントの呼び出しは 1 秒に 10 回までです。超えた回は実行せず、後から実行し直しません。
+    イベントで行う表示設定の保存も、通常のキー操作と同じです。保存が重い環境では短く引っかかることがあります。</p>
+
+    <h2 id="limits">言語と上限</h2>
+    <p>四則演算・比較・論理演算、条件分岐、変数、関数の直接呼び出し、配列・マップ、配列と整数の範囲の繰り返しが使えます。
+    文字列の <code>contains</code> / <code>starts_with</code> / <code>ends_with</code> / <code>to_lower</code> / <code>len</code>、
+    配列の <code>contains</code> / <code>len</code>、マップの <code>contains</code>、<code>in</code> が使えます。</p>
+    <p>待機・出力・正規表現・外部ファイルの取り込み・文字列をプログラムとして実行する機能は使えません。
+    関数を値として扱うこと、無名関数、<code>try</code> / <code>catch</code>、値付きの <code>break</code>、
+    添字やプロパティへの代入（<code>a[i] = x</code>、<code>m.key = x</code> など）も使えません。
+    変数そのものへの代入と <code>ops += "FsPageNext"</code> のような追加は使えます。</p>
+    <div class="table-wrap"><table><thead><tr><th>項目</th><th>上限</th></tr></thead><tbody>
+      <tr><td>ファイルの大きさ</td><td>256 KiB</td></tr>
+      <tr><td>1 回の評価での計算量</td><td>2,000（返す mIV の操作数とは別）</td></tr>
+      <tr><td>関数の呼び出し・式の深さ</td><td>32</td></tr>
+      <tr><td>文字列</td><td>8 KiB</td></tr>
+      <tr><td>配列・マップ</td><td>200 要素（入れ子も合算）。配列を直接書く場合は 199 要素まで</td></tr>
+      <tr><td>マップに直接書くキー</td><td>256 バイト</td></tr>
+      <tr><td>返せる mIV の操作</td><td>16 操作</td></tr>
+      <tr><td>スロット</td><td>1〜20</td></tr>
+    </tbody></table></div>
+    <p>構文エラー・実行エラー・上限超過は通知とログに記録され、その回は何も実行しません。
+    操作の途中で受付不能になった場合は、それまでの変更を保ったまま残りを中止します。</p>
+
+    <h2 id="example">雛形の例</h2>
+    <p>ファイルが無いときと「既定に戻す」で、次の内容が用意されます。</p>
+    <pre><code>// 番号・表示名・状態を受け取る関数を指定します。
+// 表示名は右クリックメニューと環境設定の「操作のスクリプト」に表示されます。
+fn slots() {
+    [
+        #{ slot: 1, label: &quot;最後のページなら次の本へ&quot;, run: &quot;next_or_next_book&quot; },
+        #{ slot: 2, label: &quot;★3 を付けて次へ&quot;, run: &quot;rate3_next&quot; },
+    ]
+}
+
+fn next_or_next_book(s) {
+    if s.context != &quot;fs_image&quot; { return []; }
+    if s.page.is_last { [&quot;FsSiblingNext&quot;] } else { [&quot;FsPageNext&quot;] }
+}
+
+fn rate3_next(s) {
+    if s.context != &quot;fs_image&quot; { return []; }
+    [&quot;RatingItem3&quot;, &quot;FsPageNext&quot;]
+}
+
+// 本を開いたとき、パスに \manga\ を含むなら読む向きを右→左にします。
+fn on_event(s) {
+    if s.context != &quot;fs_image&quot; { return []; }
+    if &quot;open&quot; in s.events &amp;&amp; s.book.path.contains(&quot;\\manga\\&quot;) {
+        if s.view.direction != &quot;rtl&quot; { return [&quot;FsReadingDirectionToggle&quot;]; }
+    }
+    []
+}</code></pre>
+    <p><code>\manga\</code> を含む本を開いたとき、右から左へ読む向きに揃えます。
+    自分のフォルダ名に合わせて変えてください。スロットの例は画像表示で使います。</p>
+
+    <h2 id="ai-template">AI に書いてもらうときのテンプレート</h2>
+    <p>次の文章と、このページの状態・操作の表、必要なら現在の本文を AI に貼り付け、「やりたいこと」を書き足してください。
+    パスなどを渡す場合は、AI アプリの提供元へ送られることを考慮してください。
+    生成された本文を「スクリプトを開く」で貼り付け、保存してから「再読み込み」を押します。
+    <a href="ai-integration.html">AI アプリとの連携</a>から操作スクリプトを直接読み書きする機能には対応していません。</p>
+    <pre><code>mImageViewer の操作スクリプト（Rhai 言語）を書いてください。
+マニュアル: https://mikage.to/mimageviewer/manual/operation-script.html
+
+【契約】
+- fn slots() は #{ slot: 1〜20, label: "名前", run: "関数名" } の配列。
+  スロット番号は重複不可。run は fn 関数名(s) に対応します。
+- 関数は読み取り用の状態 s を受け取り、許可された操作名の配列を返します。
+  #{ run: [...], notice: "通知" } も可。() と [] は何もしません。
+- s.context は grid / fs_image / fs_video。分からない値は ()。
+  対象の画面と値の有無を確かめてから使ってください。
+- 最大16操作。移動・画面切り替えは合計1つで末尾だけ。
+  キャプチャ保存・コピーは手動起動だけで合計1つ。
+- fn on_event(s) は任意。s.events は view / open / page / select の配列。
+  イベント可の32操作だけを使用。読む向きと合わせ方の2操作は open を含む回だけ。
+  動画の再生／一時停止・ループ・全シーク、移動、レーティング、タグ、保存、コピーはイベント不可。
+- 操作名・状態はマニュアルの表だけを使い、存在しないものを作らないでください。
+- 使える補助関数: 文字列 contains / starts_with / ends_with / to_lower / len、
+  配列 contains / len、マップ contains、in。配列・整数範囲の for は可。
+  変数への代入・+= は可。添字・プロパティへの代入、try/catch、無名関数、
+  正規表現、print、sleep、eval、import、ファイル・通信操作は不可。
+- 上限: 計算量2000、深さ32、文字列8 KiB、配列・マップ200要素（入れ子合算、
+  配列を直接書く場合は199）、マップのキー256バイト、ファイル256 KiB。
+- 操作カスタマイズでは固定名「スクリプト操作 N」を選びます。
+  label が表示されるのは環境設定と右クリックメニューです。
+- 本文全体と、何を変更するか・どの画面で呼ぶかを説明してください。
+
+【現在の本文】
+（ここに貼り付け）
+
+【やりたいこと】
+（ここに記入）</code></pre>
+  </main>
+</div>
+<footer><p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p></footer>
+</body>
+</html>

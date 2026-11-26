@@ -63,6 +63,8 @@
 # ClearBookResumePositions = none ; 本の読書位置をすべてクリア
 # UndoLastAction = Ctrl+Z ; 直前の操作を元に戻す
 # HelpShowContextShortcuts = ? ; 現在のコンテキストで使えるショートカット一覧を表示する
+# スクリプト操作1〜20の表示名は固定。labelは環境設定と右クリックだけに表示。
+# 有効化: 環境設定 > 拡張と診断 > 操作のスクリプト（既定OFF）。
 # ScriptSlot1 = none ; スクリプト操作 1
 # ScriptSlot2 = none ; スクリプト操作 2
 # ScriptSlot3 = none ; スクリプト操作 3

@@ -587,16 +587,15 @@ fn eligibility_prioritizes_owner_then_input_remote_and_enabled_before_loader_sta
         ScriptEligibility::Silent,
     );
 
-    let temp = tempfile::tempdir().unwrap();
-    let mut loader = crate::operation_script::OperationScriptLoader::default();
-    loader.sync_enabled(true, temp.path(), &egui::Context::default());
-    assert!(matches!(loader.state, OperationScriptState::Loading(_)));
+    // Eligibility only inspects state. Do not start a product file worker to
+    // manufacture this fixture; FIFO lifecycle has its own isolated tests.
+    let loading = OperationScriptState::Loading(crate::operation_script::OperationScriptLoad);
     assert_eq!(
         eligibility_from_facts(
             enabled_facts(),
             ScriptInputSurface::Grid,
             ScriptContext::Grid,
-            &loader.state
+            &loading
         ),
         ScriptEligibility::Notify("スクリプトを読み込み中です".into()),
     );
@@ -607,7 +606,7 @@ fn eligibility_prioritizes_owner_then_input_remote_and_enabled_before_loader_sta
             facts,
             ScriptInputSurface::Grid,
             ScriptContext::Grid,
-            &loader.state
+            &loading
         ),
         ScriptEligibility::Silent,
     );

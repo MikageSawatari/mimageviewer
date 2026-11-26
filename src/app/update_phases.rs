@@ -361,9 +361,11 @@ impl App {
         self.flush_periodic_sidecars();
     }
 
-    pub(super) fn service_startup_notifications(&mut self, ctx: &egui::Context) {
+    /// 設定の確定を次のROOTフレームで照合し、ファイルworkerの結果を常に読み切る。
+    /// 環境設定の下書きには触れず、ここでは投入と非blocking受信だけを行う。
+    pub(crate) fn service_operation_script_files(&mut self, ctx: &egui::Context) {
         // 起動後最初のROOT passと設定ON/OFFを同じ状態遷移に通す。
-        // ここでは投入とtry_recvだけ。スロットやイベントの問い合わせは段2以降。
+        // 設定OFFの間も開く・既定に戻すの失敗を受け取る。
         let script_disabled = matches!(
             self.operation_script.state,
             crate::operation_script::OperationScriptState::Disabled
@@ -375,7 +377,14 @@ impl App {
                 ctx,
             );
         }
-        self.operation_script.poll();
+        for error in self.operation_script.poll() {
+            crate::logger::log(format!("operation script: {error}"));
+            self.show_feedback_error(error);
+        }
+    }
+
+    pub(super) fn service_startup_notifications(&mut self, ctx: &egui::Context) {
+        self.service_operation_script_files(ctx);
         self.poll_indexer_notifications(
             ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
         );
@@ -2554,6 +2563,58 @@ impl App {
         self.spread_shift
             .confirm_retained_readoption_modal_paint(ctx);
         self.poll_sidecar_restore(ctx);
+    }
+}
+
+#[cfg(test)]
+mod operation_script_file_service_tests {
+    use crate::operation_script::{OperationScriptLoader, OperationScriptState};
+
+    #[test]
+    fn operation_script_file_failures_are_notified_while_disabled_and_drained_once() {
+        // setup_app_for_test owns the single data-dir/DB isolation lock. The
+        // injected instance cannot launch an editor or reach a normal profile.
+        let mut app = crate::app::setup_app_for_test();
+        assert!(!app.settings.operation_script_enabled);
+        let data_dir = app.tmp.path().to_path_buf();
+        let path = data_dir.join("operation-script-is-a-directory");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep.txt"), "preserve directory contents").unwrap();
+        app.operation_script = OperationScriptLoader::with_file_worker(
+            path,
+            |_| Err("test editor refused open".into()),
+            || {},
+        );
+        let ctx = egui::Context::default();
+        app.operation_script
+            .enqueue_open_user_script(&data_dir, &ctx);
+        app.operation_script
+            .enqueue_reset_user_script(&data_dir, &ctx);
+        // Release the sender and join before either isolation or data is
+        // cleaned up. The receiver retains both completed failure results.
+        app.operation_script.shutdown_file_worker_for_test();
+        app.feedback_toasts_for_test.clear();
+        app.service_operation_script_files(&ctx);
+        assert!(matches!(
+            app.operation_script.state,
+            OperationScriptState::Disabled
+        ));
+        assert_eq!(app.feedback_toasts_for_test.len(), 2);
+        assert!(
+            app.feedback_toasts_for_test
+                .iter()
+                .any(|(message, _)| { message.contains("スクリプトを開けません") })
+        );
+        assert!(app.feedback_toasts_for_test.iter().any(|(message, _)| {
+            message.contains("スクリプトを既定に戻せません")
+        }));
+        assert!(
+            app.feedback_toasts_for_test
+                .iter()
+                .all(|(_, kind)| { *kind == crate::feedback::FeedbackKind::Error })
+        );
+        app.service_operation_script_files(&ctx);
+        assert_eq!(app.feedback_toasts_for_test.len(), 2);
     }
 }
 

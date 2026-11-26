@@ -9927,6 +9927,14 @@ impl Keymap {
                 .copied()
                 .filter(|action| action.context() == section && action.is_user_facing())
             {
+                if matches!(kind, IniTemplateKind::DefaultReference)
+                    && action == KeyAction::ScriptSlot1
+                {
+                    out.push_str("# スクリプト操作1〜20の表示名は固定。labelは環境設定と右クリックだけに表示。\n");
+                    out.push_str(
+                        "# 有効化: 環境設定 > 拡張と診断 > 操作のスクリプト（既定OFF）。\n",
+                    );
+                }
                 let description = action.description();
                 let defaults: Vec<String> = action
                     .default_chords()

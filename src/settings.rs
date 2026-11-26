@@ -5363,10 +5363,10 @@ pub struct Settings {
     /// (docs/filename-stack-scripting-plan.md)。
     #[serde(default)]
     pub stack_script_enabled: bool,
-    /// 操作スクリプトを読み込むか。入口の配線は後続の段で行う。
+    /// 操作スクリプトを読み込むか。環境設定の下書きからOKで確定するローカル実行許可。
     #[serde(default)]
     pub operation_script_enabled: bool,
-    /// 第三者のスクリプトについての初回説明を確認済みか。
+    /// 第三者のスクリプトについての初回説明を確認済みか。有効化と同じ下書きでOK時に確定。
     #[serde(default)]
     pub operation_script_notice_confirmed: bool,
     /// サムネイルキャッシュの長辺ピクセル数

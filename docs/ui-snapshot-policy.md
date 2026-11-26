@@ -20,6 +20,17 @@ PNG の生成・目視・通常比較は未実施で、ClaudeCode が行う。in
 
 # UI スナップショットテスト運用方針
 
+§1.363 段5は、環境設定の本体rendererへ固定の読み込み結果を渡す
+`ui_dialogs::preferences::operation_script::tests::operation_script_preferences_snapshot_light` /
+`operation_script_preferences_snapshot_dark` の2件（560×690）を追加する。App・実ファイル・workerは使わない。
+libの2件はnextestのgpu groupへ登録する。設計担当が初回の2枚を生成・目視し、レイアウトの崩れがないと報告した。
+自動で動く処理の説明とボタン名の括弧を変更した後も、設計担当が `UPDATE_SNAPSHOTS=1` で再生成し2件成功と報告した。
+今回の同一フレーム入力テストの変更では描画・PNGを変更していない。変更後のテストと更新指定なしの画像比較は実装担当では未実行。
+下書きの確定・子の確認・ファイル操作の順序・狭い画面の到達性は別の回帰テストで検査する。
+同一フレームの入力は `Harness::input_mut().events` にまとめる。kittest 0.37の `.click()` / `key_press()` は
+キューの各イベントを別フレームで処理するため、それらを続けても同一フレームにならない。
+ポインタのhoverとpressを先に成立させ、トリガーを動かすreleaseとキーを同じRawInputへ渡す。
+
 §1.890 / §1.857 の変更は `prefs-890-857-862-plan.md` を参照。低コントラスト確認の PNG は追加せず、文言と遷移を headless テストで検査する。既定色の4枚は変更なしの見込み。狭幅の折り返しとラベル付きコンボの分離は既存 fixture の比較が必要で、PNG の生成・比較・目視は未実施 (コンパイル禁止の委任条件)。変更が出たものだけ設計担当が生成して目視する。
 
 §1.843 の AI 連携は、既存の `agent_integration_window_{disabled,read,open,organize,records}_{light,dark}`

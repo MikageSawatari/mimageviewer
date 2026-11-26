@@ -173,6 +173,7 @@
       <li>検索欄の入力履歴（既定で保存がオン）。コンテナ検索・現在地の絞り込み・アイテム検索・Everything 検索の種類ごとに、最近の検索語を 20 件まで設定と同じ <code>settings.db</code> に保存します。検索を確定したときと、実行済みの語のまま入力欄から通常に離れたときに記録します。環境設定の「ライブラリ → 履歴と復元 → 検索欄の入力履歴」でオフ・全件消去ができます。オフで「OK」を押すと現在の入力履歴も消去しますが、どちらの消去でも設定の自動バックアップにはしばらく残ります。履歴の内容を診断ログ・リモート閲覧・AI 連携には渡しません。リモート閲覧や AI 連携からの検索は、この入力履歴に記録しません</li>
       <li>AI 連携の許可の範囲、縮小画像・撮影位置・AI 説明文・文字起こし・今開いている場所を AI に見せるか、設定の確認と変更を AI に任せるかの設定</li>
       <li>キー・リング・マウスボタン・ジェスチャーなどの操作カスタマイズの割り当て。AI に変更を許可した場合も、既存の設定と同じ場所に保存します</li>
+      <li>操作の組み合わせを記したスクリプト（データフォルダ内の <code>operation_scripts.rhai</code>）。実行の有効・無効と初回説明の確認記録は設定に保存します。スクリプト自身は通信できません</li>
       <li>スタック表示の分け方を変更するカスタムスクリプト（データフォルダ内の <code>stack_rules.rhai</code>）。AI に変更を許可した場合も、このファイルに保存します</li>
       <li>本ごとの見開き1ページずらしの調整（記憶をOFFにしても保存済み調整は保持し、明示的に解除できます。メタ情報の移行で持ち運べます）</li>
       <li>音響調整 (mIV Sound) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像</li>
@@ -498,6 +499,7 @@
       <li>Application settings and view state, video and audio playback positions, and the audio track selected for each file</li>
       <li>Search input history, enabled by default: up to 20 recent queries for each of container search, current-location filtering, item search, and Everything search, saved with settings in <code>settings.db</code>. Queries are recorded when you submit a search, or when you normally leave an input field whose current query has already been run. You can disable or clear this history in Preferences → Library → History and Restore → Search Input History. Turning saving off and selecting OK also clears the current history. After either clearing operation, earlier history may remain in automatic settings backups for a while. History contents are not passed to diagnostic logs, remote viewing, or AI integration. Searches made through remote viewing or AI integration are not recorded in this history</li>
       <li>The permission level for AI integration; settings for showing reduced images, shooting locations, AI captions, transcripts, and the current location to AI; and permission for AI to inspect and change settings</li>
+      <li>A script for combining viewer operations (<code>operation_scripts.rhai</code> in the data folder). Whether scripts are enabled and whether the initial explanation was confirmed are saved in settings. The script itself cannot communicate over a network</li>
       <li>A custom script for grouping images in stack view (<code>stack_rules.rhai</code> in the data folder). Changes made with AI permission are saved to the same file</li>
       <li>Per-book spread-pairing adjustments (saved adjustments remain when remembering is turned off and can be explicitly cleared or moved using metadata transfer)</li>
       <li>mIV Sound adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images</li>

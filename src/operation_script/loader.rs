@@ -1,7 +1,7 @@
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -9,7 +9,10 @@ use std::sync::{
 
 use rhai::{AST, Dynamic, Engine, Scope};
 
-use super::{DEFAULT_SCRIPT, ScriptSlot, build_engine, parse_slots};
+#[cfg(test)]
+use super::DEFAULT_SCRIPT;
+use super::file_worker::{FileJob, FileResult, FileWorker, FileWorkerOptions};
+use super::{ScriptSlot, build_engine, parse_slots};
 
 /// 操作スクリプト本文の上限。読む量自体もtakeで制限する (§7)。
 const MAX_SOURCE_BYTES: u64 = 256 * 1024;
@@ -115,7 +118,7 @@ pub fn script_path(data_dir: &Path) -> PathBuf {
     data_dir.join("operation_scripts.rhai")
 }
 
-fn load_script(path: &Path) -> Result<CompiledOperationScript, String> {
+pub(super) fn load_script(path: &Path) -> Result<CompiledOperationScript, String> {
     let mut source = Vec::new();
     File::open(path)
         .and_then(|file| file.take(MAX_SOURCE_BYTES + 1).read_to_end(&mut source))
@@ -130,9 +133,9 @@ fn load_script(path: &Path) -> Result<CompiledOperationScript, String> {
     CompiledOperationScript::compile(&source)
 }
 
-struct LoadResult {
-    generation: u64,
-    script: Result<CompiledOperationScript, String>,
+pub(super) struct LoadResult {
+    pub(super) generation: u64,
+    pub(super) script: Result<CompiledOperationScript, String>,
 }
 
 /// 無効・読み込み中・使える・失敗を一つの値で所有する。
@@ -146,14 +149,17 @@ pub enum OperationScriptState {
     Failed(String),
 }
 
-pub struct OperationScriptLoad {
-    rx: Receiver<LoadResult>,
-}
+pub struct OperationScriptLoad;
 
 #[derive(Default)]
 pub struct OperationScriptLoader {
     generation: u64,
     pub state: OperationScriptState,
+    worker: Option<FileWorker>,
+    results: Option<Receiver<FileResult>>,
+    notifications: Vec<String>,
+    #[cfg(test)]
+    worker_options: Option<FileWorkerOptions>,
 }
 
 impl OperationScriptLoader {
@@ -171,86 +177,118 @@ impl OperationScriptLoader {
 
     pub fn reload(&mut self, data_dir: &Path, ctx: &egui::Context) {
         self.generation = self.generation.wrapping_add(1);
-        let generation = self.generation;
-        let path = script_path(data_dir);
-        let (tx, rx) = mpsc::channel();
-        let ctx = ctx.clone();
-        // 前のreceiverをここで捨てる。古いworkerはUIへ結果を適用できない。
-        self.state = OperationScriptState::Loading(OperationScriptLoad { rx });
-        if let Err(error) = std::thread::Builder::new()
-            .name("operation-script-load".into())
-            .spawn(move || {
-                let script = load_script(&path);
-                if tx.send(LoadResult { generation, script }).is_ok() {
-                    ctx.request_repaint();
+        self.state = OperationScriptState::Loading(OperationScriptLoad);
+        if let Err(error) = self.enqueue(
+            FileJob::Load {
+                generation: self.generation,
+            },
+            data_dir,
+            ctx,
+        ) {
+            crate::logger::log(format!("operation script: {error}"));
+            self.state = OperationScriptState::Failed(error);
+        }
+    }
+
+    /// UI は投入だけ。エディタ起動も読み込みと同じ FIFO で処理する。
+    pub fn enqueue_open_user_script(&mut self, data_dir: &Path, ctx: &egui::Context) {
+        if let Err(error) = self.enqueue(FileJob::Open, data_dir, ctx) {
+            self.notifications
+                .push(format!("スクリプトを開けません: {error}"));
+        }
+    }
+
+    pub fn enqueue_reset_user_script(&mut self, data_dir: &Path, ctx: &egui::Context) {
+        if let Err(error) = self.enqueue(FileJob::Reset, data_dir, ctx) {
+            self.notifications
+                .push(format!("スクリプトを既定に戻せません: {error}"));
+        }
+    }
+
+    fn enqueue(
+        &mut self,
+        job: FileJob,
+        data_dir: &Path,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
+        if self.worker.is_none() {
+            #[cfg(test)]
+            let options = self
+                .worker_options
+                .take()
+                .unwrap_or_else(|| FileWorkerOptions::new(script_path(data_dir)));
+            #[cfg(not(test))]
+            let options = FileWorkerOptions::new(script_path(data_dir));
+            let (worker, results) = FileWorker::start(options, ctx.clone())?;
+            self.worker = Some(worker);
+            self.results = Some(results);
+        }
+        self.worker.as_ref().expect("worker started").enqueue(job)
+    }
+
+    /// 状態を問わず全結果を非blockingで回収する。通知とログは App が発行する。
+    /// OFF でも受け口は捨てず、古い Load の後のファイル操作の失敗まで読み切る。
+    pub fn poll(&mut self) -> Vec<String> {
+        let mut notifications = std::mem::take(&mut self.notifications);
+        let Some(results) = &self.results else {
+            return notifications;
+        };
+        loop {
+            match results.try_recv() {
+                Ok(FileResult::Load(result)) => {
+                    if result.generation != self.generation
+                        || !matches!(self.state, OperationScriptState::Loading(_))
+                    {
+                        continue;
+                    }
+                    self.state = match result.script {
+                        Ok(script) => OperationScriptState::Ready(Box::new(script)),
+                        Err(error) => {
+                            crate::logger::log(format!("operation script: {error}"));
+                            OperationScriptState::Failed(error)
+                        }
+                    };
                 }
-            })
-        {
-            self.state =
-                OperationScriptState::Failed(format!("読み込みworkerの起動に失敗: {error}"));
+                Ok(FileResult::Open(Err(error))) => {
+                    notifications.push(format!("スクリプトを開けません: {error}"));
+                }
+                Ok(FileResult::Reset(Err(error))) => {
+                    notifications.push(format!("スクリプトを既定に戻せません: {error}"));
+                }
+                Ok(FileResult::Open(Ok(())) | FileResult::Reset(Ok(()))) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if matches!(self.state, OperationScriptState::Loading(_)) {
+                        let error = "読み込みworkerが結果を返さず終了しました".to_owned();
+                        crate::logger::log(format!("operation script: {error}"));
+                        self.state = OperationScriptState::Failed(error);
+                    }
+                    break;
+                }
+            }
+        }
+        notifications
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_file_worker(
+        path: PathBuf,
+        editor: impl Fn(&Path) -> Result<(), String> + Send + 'static,
+        before_job: impl Fn() + Send + 'static,
+    ) -> Self {
+        Self {
+            worker_options: Some(FileWorkerOptions::for_test(path, editor, before_job)),
+            ..Self::default()
         }
     }
 
-    /// 非blocking。結果を採用したときだけtrue。古い世代は採用しない。
-    pub fn poll(&mut self) -> bool {
-        let OperationScriptState::Loading(pending) = &self.state else {
-            return false;
-        };
-        let result = match pending.rx.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return false,
-            Err(TryRecvError::Disconnected) => {
-                self.state =
-                    OperationScriptState::Failed("読み込みworkerが結果を返さず終了しました".into());
-                return true;
-            }
-        };
-        if result.generation != self.generation {
-            return false;
+    /// テストだけの終了待ち。先に before_job の停止を解除し、tempdir より先に呼ぶ。
+    /// 受け口は残すため、join 後も poll で最後の結果を採用できる。
+    #[cfg(test)]
+    pub(crate) fn shutdown_file_worker_for_test(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.shutdown();
         }
-        self.state = match result.script {
-            Ok(script) => OperationScriptState::Ready(Box::new(script)),
-            Err(error) => {
-                crate::logger::log(format!("operation script: {error}"));
-                OperationScriptState::Failed(error)
-            }
-        };
-        true
-    }
-}
-
-/// 段5の「スクリプトを開く」用。呼び出しは投入だけで、存在確認・作成はworker。
-/// 既存ファイルはcreate_newにより上書きしない。外部エディタの起動は呼び出し側が行う。
-pub fn enqueue_ensure_user_script(
-    data_dir: PathBuf,
-    ctx: egui::Context,
-) -> Receiver<Result<PathBuf, String>> {
-    let (tx, rx) = mpsc::channel();
-    let failed_tx = tx.clone();
-    if let Err(error) = std::thread::Builder::new()
-        .name("operation-script-create".into())
-        .spawn(move || {
-            let path = script_path(&data_dir);
-            let result = ensure_user_script(&path).map(|()| path);
-            let _ = tx.send(result);
-            ctx.request_repaint();
-        })
-    {
-        let _ = failed_tx.send(Err(format!("スクリプト作成workerの起動に失敗: {error}")));
-    }
-    rx
-}
-
-fn ensure_user_script(path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("データフォルダの作成に失敗: {e}"))?;
-    }
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => file
-            .write_all(DEFAULT_SCRIPT.as_bytes())
-            .map_err(|e| format!("雛形の保存に失敗: {e}")),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-        Err(error) => Err(format!("雛形の作成に失敗: {error}")),
     }
 }
 
@@ -338,6 +376,98 @@ mod tests {
     use super::*;
     use crate::operation_script::{ScriptContext, ScriptEvent, StateSnapshot, parse_output};
 
+    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Always release an injected block and join, including during assertion unwinding.
+    /// Declare this after the tempdir so cleanup cannot race queued file operations.
+    struct TestLoader {
+        loader: OperationScriptLoader,
+        release: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl TestLoader {
+        fn new(data_dir: &Path) -> Self {
+            Self::with_editor(data_dir, |_| Ok(()))
+        }
+
+        fn with_editor(
+            data_dir: &Path,
+            editor: impl Fn(&Path) -> Result<(), String> + Send + 'static,
+        ) -> Self {
+            Self {
+                loader: OperationScriptLoader::with_file_worker(
+                    script_path(data_dir),
+                    editor,
+                    || {},
+                ),
+                release: None,
+            }
+        }
+
+        fn blocked(
+            data_dir: &Path,
+            editor: impl Fn(&Path) -> Result<(), String> + Send + 'static,
+        ) -> (Self, std::sync::mpsc::Receiver<()>) {
+            let (entered, entered_rx) = std::sync::mpsc::channel();
+            let (release, release_rx) = std::sync::mpsc::channel();
+            let first = std::cell::Cell::new(true);
+            let loader =
+                OperationScriptLoader::with_file_worker(script_path(data_dir), editor, move || {
+                    if first.replace(false) {
+                        let _ = entered.send(());
+                        let _ = release_rx.recv();
+                    }
+                });
+            (
+                Self {
+                    loader,
+                    release: Some(release),
+                },
+                entered_rx,
+            )
+        }
+
+        fn receive_load(&self) -> LoadResult {
+            match self
+                .loader
+                .results
+                .as_ref()
+                .unwrap()
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap()
+            {
+                FileResult::Load(result) => result,
+                _ => panic!("expected load result"),
+            }
+        }
+
+        fn finish(&mut self) {
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+            self.loader.shutdown_file_worker_for_test();
+        }
+    }
+
+    impl std::ops::Deref for TestLoader {
+        type Target = OperationScriptLoader;
+        fn deref(&self) -> &Self::Target {
+            &self.loader
+        }
+    }
+
+    impl std::ops::DerefMut for TestLoader {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.loader
+        }
+    }
+
+    impl Drop for TestLoader {
+        fn drop(&mut self) {
+            self.finish();
+        }
+    }
+
     #[test]
     fn default_script_evaluates_slots_and_every_example() {
         let script = CompiledOperationScript::compile(DEFAULT_SCRIPT).unwrap();
@@ -416,15 +546,9 @@ mod tests {
         assert!(reason.contains("slots() の評価に失敗"), "{reason}");
         assert!(reason.contains("bad_slots_evaluation"), "{reason}");
         std::fs::write(&path, DEFAULT_SCRIPT).unwrap();
-        let mut loader = OperationScriptLoader::default();
+        let mut loader = TestLoader::new(temp.path());
         loader.reload(temp.path(), &egui::Context::default());
-        let OperationScriptState::Loading(pending) = &loader.state else {
-            panic!("not loading")
-        };
-        let result = pending
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
+        let result = loader.receive_load();
         assert_eq!(result.generation, loader.generation);
         assert_eq!(result.script.unwrap().slots.len(), 2);
     }
@@ -448,15 +572,9 @@ mod tests {
         source.truncate(MAX_SOURCE_BYTES as usize - 1);
         source.extend_from_slice("界".as_bytes());
         std::fs::write(&path, &source).unwrap();
-        let mut loader = OperationScriptLoader::default();
+        let mut loader = TestLoader::new(temp.path());
         loader.reload(temp.path(), &egui::Context::default());
-        let OperationScriptState::Loading(pending) = &loader.state else {
-            panic!("not loading");
-        };
-        let result = pending
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
+        let result = loader.receive_load();
         assert!(result.script.err().unwrap().contains("256 KiB"));
     }
 
@@ -468,15 +586,9 @@ mod tests {
             "fn slots() { slots_should_not_execute(); }\nfn unused(s) {\n    s[0] += 1;\n}",
         )
         .unwrap();
-        let mut loader = OperationScriptLoader::default();
+        let mut loader = TestLoader::new(temp.path());
         loader.reload(temp.path(), &egui::Context::default());
-        let OperationScriptState::Loading(pending) = &loader.state else {
-            panic!("not loading");
-        };
-        let result = pending
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
+        let result = loader.receive_load();
         let reason = result.script.err().unwrap();
         assert!(reason.contains("3行5桁"), "{reason}");
         assert!(
@@ -504,15 +616,9 @@ mod tests {
             ("fn slots() { [] } fn unused(s) { throw s; }", "throw"),
         ] {
             std::fs::write(script_path(temp.path()), source).unwrap();
-            let mut loader = OperationScriptLoader::default();
+            let mut loader = TestLoader::new(temp.path());
             loader.reload(temp.path(), &ctx);
-            let OperationScriptState::Loading(pending) = &loader.state else {
-                panic!("not loading");
-            };
-            let result = pending
-                .rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
+            let result = loader.receive_load();
             let reason = result.script.err().unwrap();
             assert!(reason.contains("コンパイルに失敗"), "{reason}");
             assert!(reason.contains(keyword), "{reason}");
@@ -522,44 +628,53 @@ mod tests {
 
     #[test]
     fn loader_discards_stale_generation_and_accepts_latest() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut loader = OperationScriptLoader {
             generation: 2,
-            state: OperationScriptState::Loading(OperationScriptLoad { rx }),
+            state: OperationScriptState::Loading(OperationScriptLoad),
+            results: Some(rx),
+            ..OperationScriptLoader::default()
         };
-        tx.send(LoadResult {
+        tx.send(FileResult::Load(LoadResult {
             generation: 1,
             script: Err("old".into()),
-        })
-        .unwrap();
-        assert!(!loader.poll());
-        assert!(matches!(loader.state, OperationScriptState::Loading(_)));
-        tx.send(LoadResult {
+        }))
+        .unwrap_or_else(|_| panic!("result channel closed"));
+        tx.send(FileResult::Load(LoadResult {
             generation: 2,
             script: Err("latest reason".into()),
-        })
-        .unwrap();
-        assert!(loader.poll());
+        }))
+        .unwrap_or_else(|_| panic!("result channel closed"));
+        assert!(
+            tx.send(FileResult::Open(Err("after latest load".into())))
+                .is_ok()
+        );
+        let notifications = loader.poll();
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0].contains("after latest load"));
         assert!(
             matches!(&loader.state, OperationScriptState::Failed(reason) if reason == "latest reason")
         );
+        assert!(loader.poll().is_empty());
     }
 
     #[test]
     fn loader_publishes_compiled_ast_and_slots_as_one_ready_value() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut loader = OperationScriptLoader {
             generation: 3,
-            state: OperationScriptState::Loading(OperationScriptLoad { rx }),
+            state: OperationScriptState::Loading(OperationScriptLoad),
+            results: Some(rx),
+            ..OperationScriptLoader::default()
         };
         assert!(
-            tx.send(LoadResult {
+            tx.send(FileResult::Load(LoadResult {
                 generation: 3,
                 script: CompiledOperationScript::compile(DEFAULT_SCRIPT),
-            })
+            }))
             .is_ok()
         );
-        assert!(loader.poll());
+        assert!(loader.poll().is_empty());
         let OperationScriptState::Ready(script) = &loader.state else {
             panic!("not ready");
         };
@@ -575,7 +690,7 @@ mod tests {
             )
             .unwrap();
         assert!(parse_output(result).unwrap().actions.is_empty());
-        assert!(!loader.poll());
+        assert!(loader.poll().is_empty());
     }
 
     #[test]
@@ -594,41 +709,290 @@ mod tests {
 
     #[test]
     fn loader_disable_retires_pending_result_and_on_starts_once() {
-        let (tx, rx) = mpsc::channel();
-        let mut loader = OperationScriptLoader {
-            generation: 1,
-            state: OperationScriptState::Loading(OperationScriptLoad { rx }),
-        };
-        let ctx = egui::Context::default();
-        loader.sync_enabled(false, Path::new("unused"), &ctx);
-        assert!(
-            tx.send(LoadResult {
-                generation: 1,
-                script: Err("old".into())
-            })
-            .is_err()
-        );
-        assert!(matches!(loader.state, OperationScriptState::Disabled));
         let temp = tempfile::tempdir().unwrap();
+        let (mut loader, entered) = TestLoader::blocked(temp.path(), |_| Ok(()));
+        let ctx = egui::Context::default();
         loader.sync_enabled(true, temp.path(), &ctx);
-        let generation = loader.generation;
+        entered.recv_timeout(TEST_TIMEOUT).unwrap();
+        let first_generation = loader.generation;
         loader.sync_enabled(true, temp.path(), &ctx);
-        assert_eq!(loader.generation, generation);
+        assert_eq!(loader.generation, first_generation);
+        loader.sync_enabled(false, temp.path(), &ctx);
+        loader.finish();
+        assert!(loader.poll().is_empty());
+        assert!(matches!(loader.state, OperationScriptState::Disabled));
     }
 
     #[test]
     fn create_default_worker_preserves_existing_user_script() {
+        for content in [None, Some("user content"), Some("")] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = script_path(temp.path());
+            if let Some(content) = content {
+                std::fs::write(&path, content).unwrap();
+            }
+            let (opened, received) = std::sync::mpsc::channel();
+            let mut loader = TestLoader::with_editor(temp.path(), move |path| {
+                opened.send(std::fs::read_to_string(path).unwrap()).unwrap();
+                Ok(())
+            });
+            loader.enqueue_open_user_script(temp.path(), &egui::Context::default());
+            loader.finish();
+            let expected = content.unwrap_or(DEFAULT_SCRIPT);
+            assert_eq!(received.recv_timeout(TEST_TIMEOUT).unwrap(), expected);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+            assert!(loader.poll().is_empty());
+            assert!(matches!(loader.state, OperationScriptState::Disabled));
+        }
+    }
+
+    #[test]
+    fn file_worker_starts_lazily_and_missing_enable_creates_ready_default() {
         let temp = tempfile::tempdir().unwrap();
-        let path = enqueue_ensure_user_script(temp.path().into(), egui::Context::default())
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap()
-            .unwrap();
+        let data_dir = temp.path().join("nested-data");
+        let mut loader = TestLoader::new(&data_dir);
+        let ctx = egui::Context::default();
+        assert!(loader.worker.is_none());
+        assert!(loader.results.is_none());
+        loader.sync_enabled(false, &data_dir, &ctx);
+        assert!(loader.worker.is_none());
+        loader.sync_enabled(true, &data_dir, &ctx);
+        assert!(loader.worker.is_some());
+        loader.finish();
+        assert!(loader.poll().is_empty());
+        assert!(
+            matches!(&loader.state, OperationScriptState::Ready(script) if script.slots.len() == 2 && script.has_on_event)
+        );
+        assert_eq!(
+            std::fs::read_to_string(script_path(&data_dir)).unwrap(),
+            DEFAULT_SCRIPT
+        );
+    }
+
+    #[test]
+    fn file_worker_reset_then_reload_reads_replacement_in_fifo_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = script_path(temp.path());
+        let old = "fn slots() { [] }";
+        std::fs::write(&path, old).unwrap();
+        let (mut loader, entered) = TestLoader::blocked(temp.path(), |_| Ok(()));
+        let ctx = egui::Context::default();
+        loader.enqueue_reset_user_script(temp.path(), &ctx);
+        entered.recv_timeout(TEST_TIMEOUT).unwrap();
+        loader.reload(temp.path(), &ctx);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old);
+        assert!(matches!(loader.state, OperationScriptState::Loading(_)));
+        loader.finish();
+        assert!(loader.poll().is_empty());
+        assert!(
+            matches!(&loader.state, OperationScriptState::Ready(script) if script.slots.len() == 2)
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), DEFAULT_SCRIPT);
+    }
+
+    #[test]
+    fn file_worker_open_then_enable_loads_created_default_in_fifo_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = script_path(temp.path());
+        let (opened, received) = std::sync::mpsc::channel();
+        let (mut loader, entered) = TestLoader::blocked(temp.path(), move |path| {
+            opened.send(std::fs::read_to_string(path).unwrap()).unwrap();
+            Ok(())
+        });
+        let ctx = egui::Context::default();
+        loader.enqueue_open_user_script(temp.path(), &ctx);
+        entered.recv_timeout(TEST_TIMEOUT).unwrap();
+        loader.sync_enabled(true, temp.path(), &ctx);
+        assert!(!path.exists());
+        assert!(matches!(loader.state, OperationScriptState::Loading(_)));
+        loader.finish();
+        assert!(loader.poll().is_empty());
+        assert!(
+            matches!(&loader.state, OperationScriptState::Ready(script) if script.slots.len() == 2)
+        );
+        assert_eq!(received.recv_timeout(TEST_TIMEOUT).unwrap(), DEFAULT_SCRIPT);
+    }
+
+    #[test]
+    fn file_worker_reset_does_not_reload_ready_script_automatically() {
+        let temp = tempfile::tempdir().unwrap();
+        let old = "fn slots() { [] }";
+        let mut loader = TestLoader::new(temp.path());
+        loader.state =
+            OperationScriptState::Ready(Box::new(CompiledOperationScript::compile(old).unwrap()));
+        loader.enqueue_reset_user_script(temp.path(), &egui::Context::default());
+        loader.finish();
+        assert!(loader.poll().is_empty());
+        assert!(
+            matches!(&loader.state, OperationScriptState::Ready(script) if script.slots.is_empty())
+        );
+        assert_eq!(
+            std::fs::read_to_string(script_path(temp.path())).unwrap(),
+            DEFAULT_SCRIPT
+        );
+    }
+
+    #[test]
+    fn file_worker_reload_recreates_deleted_file_and_preserves_empty_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = script_path(temp.path());
+        std::fs::write(&path, "fn slots() { [] }").unwrap();
+        let mut loader = TestLoader::new(temp.path());
+        let ctx = egui::Context::default();
+        loader.reload(temp.path(), &ctx);
+        assert!(loader.receive_load().script.unwrap().slots.is_empty());
+        let previous_generation = loader.generation;
+        std::fs::remove_file(&path).unwrap();
+        loader.reload(temp.path(), &ctx);
+        assert_ne!(loader.generation, previous_generation);
+        loader.finish();
+        assert!(loader.poll().is_empty());
+        assert!(
+            matches!(&loader.state, OperationScriptState::Ready(script) if script.slots.len() == 2)
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), DEFAULT_SCRIPT);
-        std::fs::write(&path, "user content").unwrap();
-        enqueue_ensure_user_script(temp.path().into(), egui::Context::default())
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap()
+
+        // An empty file is user content too: fail compilation rather than replace it.
+        std::fs::write(&path, "").unwrap();
+        let mut empty_loader = TestLoader::new(temp.path());
+        empty_loader.sync_enabled(true, temp.path(), &ctx);
+        empty_loader.finish();
+        assert!(empty_loader.poll().is_empty());
+        assert!(matches!(
+            empty_loader.state,
+            OperationScriptState::Failed(_)
+        ));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "");
+    }
+
+    #[test]
+    fn loader_drains_file_errors_in_every_state_without_adopting_stale_load() {
+        let ready = || {
+            OperationScriptState::Ready(Box::new(
+                CompiledOperationScript::compile(DEFAULT_SCRIPT).unwrap(),
+            ))
+        };
+        for state in [
+            OperationScriptState::Disabled,
+            OperationScriptState::Loading(OperationScriptLoad),
+            ready(),
+            OperationScriptState::Failed("existing failure".into()),
+        ] {
+            let expected_state = std::mem::discriminant(&state);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut loader = OperationScriptLoader {
+                generation: 5,
+                state,
+                results: Some(rx),
+                ..OperationScriptLoader::default()
+            };
+            assert!(
+                tx.send(FileResult::Load(LoadResult {
+                    generation: 4,
+                    script: Err("stale failure".into()),
+                }))
+                .is_ok()
+            );
+            assert!(tx.send(FileResult::Open(Err("open error".into()))).is_ok());
+            assert!(
+                tx.send(FileResult::Reset(Err("reset error".into())))
+                    .is_ok()
+            );
+            let notifications = loader.poll();
+            assert_eq!(notifications.len(), 2);
+            assert!(notifications[0].contains("open error"));
+            assert!(notifications[1].contains("reset error"));
+            assert_eq!(std::mem::discriminant(&loader.state), expected_state);
+            assert!(loader.poll().is_empty());
+        }
+    }
+
+    #[test]
+    fn loader_disabled_rejects_even_matching_load_and_keeps_file_notifications() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut loader = OperationScriptLoader {
+            generation: 3,
+            results: Some(rx),
+            ..OperationScriptLoader::default()
+        };
+        assert!(
+            tx.send(FileResult::Load(LoadResult {
+                generation: 3,
+                script: CompiledOperationScript::compile(DEFAULT_SCRIPT),
+            }))
+            .is_ok()
+        );
+        assert!(
+            tx.send(FileResult::Open(Err("still notify".into())))
+                .is_ok()
+        );
+        assert_eq!(loader.poll().len(), 1);
+        assert!(matches!(loader.state, OperationScriptState::Disabled));
+    }
+
+    #[test]
+    fn file_worker_off_open_and_reset_errors_are_reported_and_destination_survives() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = script_path(temp.path());
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("user-content"), "keep me").unwrap();
+        let mut loader =
+            TestLoader::with_editor(temp.path(), |_| Err("fake editor failure".into()));
+        let ctx = egui::Context::default();
+        loader.enqueue_open_user_script(temp.path(), &ctx);
+        loader.enqueue_reset_user_script(temp.path(), &ctx);
+        loader.finish();
+        let notifications = loader.poll();
+        assert_eq!(notifications.len(), 2);
+        // Windows may reject CREATE_NEW on a directory before calling the editor.
+        assert!(notifications[0].starts_with("スクリプトを開けません:"));
+        assert!(notifications[1].contains("置き換えに失敗"));
+        assert!(matches!(loader.state, OperationScriptState::Disabled));
+        assert_eq!(
+            std::fs::read_to_string(path.join("user-content")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        assert!(loader.poll().is_empty());
+    }
+
+    #[test]
+    fn file_worker_reset_atomically_replaces_file_with_sharing_reader_and_cleans_temp() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = script_path(temp.path());
+        std::fs::write(&path, "old user script").unwrap();
+        let mut old = File::open(&path).unwrap();
+        let mut loader = TestLoader::new(temp.path());
+        loader.enqueue_reset_user_script(temp.path(), &egui::Context::default());
+        loader.finish();
+        assert!(loader.poll().is_empty());
+        let mut old_content = String::new();
+        old.read_to_string(&mut old_content).unwrap();
+        assert_eq!(old_content, "old user script");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), DEFAULT_SCRIPT);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn file_worker_failed_atomic_reset_preserves_locked_user_file_and_cleans_temp() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = script_path(temp.path());
+        std::fs::write(&path, "old user script").unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
             .unwrap();
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "user content");
+        let mut loader = TestLoader::new(temp.path());
+        loader.enqueue_reset_user_script(temp.path(), &egui::Context::default());
+        loader.finish();
+        let notifications = loader.poll();
+        assert_eq!(notifications.len(), 1);
+        assert!(notifications[0].contains("置き換えに失敗"));
+        drop(lock);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "old user script");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
 }
