@@ -2442,228 +2442,261 @@ r1 の対象外だった追記 (`823d33328` の §20.14a、`d6b7696f0` の §20.
 
 ## 21. 第 3 段: mIV Sound の処理の並びを組む (2026-11-27 設計、収録の版は未定)
 
-状態: **設計 (独立レビュー前)**。基点は master `a38a3e4a3`、mIV Sound は `0.19.0-miv.1` (派生版リポジトリ `G:\home\miv-sound`、
-ブランチ `miv-0.19`、`801ca2a`)。行番号はこの基点のもの。**実行時の挙動は誰も観測していない**。§21.2 の事実は、
-設計担当が任せた読み取り専用の調査 (派生版のソースの読み) によるもので、ビルド・実行はしていない。
+状態: **設計 第 2 版 (独立設計レビュー r1 REVISE を受けて組み直した。r2 前)**。基点は master `a38a3e4a3`、mIV Sound は
+`0.19.0-miv.1` (派生版リポジトリ `G:\home\miv-sound`、ブランチ `miv-0.19`、`801ca2a`)。行番号はこの基点のもの。
+**実行時の挙動は誰も観測していない**。§21.2 の事実は、設計担当が任せた読み取り専用の調査と、独立設計レビュー r1 の
+ソースの読みによる (どちらもビルド・実行はしていない)。
 
 利用者の言葉 (統括経由、2026-11-27): 「並行で第３段を進められればと思います。こちらも進捗をみて、どのバージョンに
 いれるか決めることとしたいとおもいます」。段の順は §13 の U3 (第 3 段 = mIV Sound)。
 
 ### 21.1 目的と範囲
 
-利用者の例 3 (§1)「レコードのノイズを消したい」で、今は説明書から手順を案内するところまで。第 3 段で、AI が並びを
-組んで mIV Sound に入れ、利用者が A / B で聴き比べられるようにする。
+利用者の例 3 (§1)「レコードのノイズを消したい」は、今は説明書から手順を案内するところまで。第 3 段で、AI が並びを組んで
+mIV Sound に入れ、利用者が A / B で聴き比べ、気に入らなければ戻せるようにする。
 
 含む:
 
 - エフェクトの一覧と、各パラメータの意味・単位・範囲・既定値を AI へ渡す (`sound_effects`)。
-- 今の並び (A・B・どちらを使っているか) を読む、A か B の並びを置き換える、使う側を切り替える (`sound_chain`)。
+- 今の並び (A・B・使う側・全体のオン / オフ・遅延) を読む、A か B の並びを組み直す、使う側と全体のオン / オフを切り替える、
+  AI の直前の変更を取り消す (`sound_chain`)。
 
-含まない:
+含まない (S3・S4 で利用者に確かめる):
 
-- mIV Sound の全体のオン / オフ (`masterBypass`)、オーバーサンプリング、オートメーションの割り当て、プリセットの保存。
-  画面の 1 操作で済み、AI に任せる利点が小さい。外すことで、置き換えで触る範囲を「並びと選択」だけにする。
-- 外部のデータを指す鍵の新規の指定 (IR・SFZ・測定データ、§21.7)。
+- オーバーサンプリング、オートメーションの割り当て、プリセットの保存。
+- 外部のデータ (IR・SFZ・測定データ) の新しい選択 (§21.7)。今の段が選んでいるものは引き継ぐ。
 - ビジュアライザー、歌詞、mIV Sound 自身の設定 (`config.json`)。
-- mIV Sound を AI から起動すること (§21.3 の 3、S2)。
 
-### 21.2 前提の事実 (派生版のソースの読み)
+### 21.2 前提の事実
 
-- 状態は UTF-8 の JSON (`src/bridge/state_codec.cpp:374-395` で書き、`397-491` で読む)。根に `formatVersion` (1 だけを受け付ける)・
-  `appVersion`・`pipelineA`・`pipelineB` (B を作るまでは `null`)・`currentPipeline` (`"A"` / `"B"`)・`masterBypass`・
-  `oversampling`・`ui`・`automation`。未知の根の項目は保たれる。
-- 各段は `type` (例 `"VolumePlugin"`)・`id`・`name` (表示名)・`enabled`・`parameters` (短い内部名の鍵、例 `vl`・`f0`)。
-  Section は `name` が `"Section"` の段で、無効の Section の後ろは次の Section まで処理されない。
+派生版のソース (`G:\home\miv-sound`):
+
+- 状態は UTF-8 の JSON (`src/bridge/state_codec.cpp:374-395` で書き、`397-491` で読む)。根に `formatVersion` (1 だけ)・
+  `appVersion`・`pipelineA`・`pipelineB` (B を作るまでは `null`)・`currentPipeline`・`masterBypass`・`oversampling`・`ui`・
+  `automation`。各段は `type`・`id`・`name`・`enabled`・`parameters`、0 以外のときだけ `inputBus`・`outputBus`、`channel`
+  (`state_codec.cpp:153-180`)。未知の項目は保たれる。
 - **パラメータを DSP 用の数の並びに詰めるのは JS の画面だけ**。プラグインは窓を閉じていても隠れた WebView を持ち続け
-  (`src/plugin/plugin_processor.cpp:730-741`)、並びの変更は必ずこの画面を通る。
-- `setState` (`plugin_processor.cpp:4407-4472`) は文書を検査して `state_` を置き換え、**画面を再読み込みする**
-  (窓を開いていなくても)。新しい画面が今使う側の並びを組み直して送ると、DSP が入れ替わる。入れ替わるまでは古い DSP が
-  鳴り続ける。**完了をホストへ知らせる手段は無い**。再読み込みで、画面で編集中の操作と画面の取り消し履歴は失われる。
-- `setState` が全体を拒否する場合 (何も変わらない): JSON が壊れている、`formatVersion` が 1 でない、並びが無い、
-  1 つの並びが 128 段を超える、`id` が A と B を通して重複する、DSP の実体が 1 つの並びで 96 を超える、4 MiB 以上。
-  パラメータは native では検査せず、JS が範囲に丸め、欠けた鍵は既定値で埋める。知らない `type` は画面が外して
-  「使えないエフェクトがあります」と出し、native は処理しない段として保つ。
-- `getState` は同じ文書なら同じバイト列を返す。ただし画面の折りたたみ (`_uiCollapsed`・`_uiLocked`)、`masterBypass`
-  (今の値)、SoundFont Player の内部状態は、音を変えずに変わり得る。`setState` → `getState` はバイトまで同じにはならない
-  (画面が既定値や丸めた値を足して返す)。
-- 処理されるのは今使う側の並びだけ。A / B の切り替えは DSP の組み直し (残響の尾などは切れる、10 ms のつなぎ)。
-- エフェクトは上流の一覧で 118、mIV 版で読み込めるのが 116、追加の一覧に出すのが 114 (SoundFont Player と
-  Distortion Correction を隠す)。パラメータの定義は同梱物の `webview/js/audio/dsp-params.generated.js` (範囲・既定値・単位)・
-  `webview/js/remote/parameter-hints.js`・`webview/js/remote/effect-describe.js` (上流の Remote 用の、エフェクトごとの
-  鍵・表示名・範囲・単位・選択肢の一覧) にある。`vendor/miv-sound` の同梱物にも入っている。
-- 外部のデータを指す鍵: IR Reverb の `ir` (WebView の保存領域の IR)、SoundFont 系の `sf` (利用者のファイルを指す表)、
-  Room EQ・Distortion Correction の `ms`、Crosstalk Cancellation の `ll`・`lr`・`rl`・`rr` (測定データ)。
-- ホストから並びを渡す専用の経路は無い (`IConnectionPoint::notify` は再生中の曲の情報と再生位置の 2 種だけ)。
-- mIV の側: bridge の `restore_state` (`src/video/dsp/bridge.rs:233`) は音声の thread で `setState` を呼ぶ作りで
-  (`crates/vst3-host/src/main.cpp:1227-1248`・`1867-1878`)、EffeTune には使っていない。状態の取得は GUI の thread で行う
-  `query_state_concurrent` (`main.cpp:1197-1225`、`src/video/dsp/bridge.rs:1163`) を使っている (`effetune-integration-plan.md` §5.2)。
+  (`src/plugin/plugin_processor.cpp:730-741`)、並びの変更は必ずこの画面を通る。**利用者の編集の持ち主も画面**で、編集は
+  描画のフレームか最大 50 ms ためてから native へ送られる (`ui-shim/vst-audio-manager.js:527`・`558`)。取り消し履歴も画面が持つ
+  (同 `1866-1929` 付近)。
+- `setState` (`plugin_processor.cpp:4407-4472`) は文書で `state_` を置き換え、画面を再読み込みする。再読み込みの間に届いた
+  古い画面の更新は捨てられ (`6239-6253`)、画面の取り消し履歴と native の取り消しの情報 (`4443`) も消える。また同梱の
+  `app.js` は再読み込みのたびに `config.json` の `pipelineStartup` を見て、`"preset"` / `"default"` なら保存状態を使わない
+  (`vendor/miv-sound/…/webview/js/app.js:928`・`969`)。
+- A / B: 処理されるのは使う側だけ。B が `null` のまま B へ切り替えると、画面は A を写して B を作る
+  (`external/effetune/js/audio-manager.js:337`)。切り替えは DSP の組み直し。
+- 削除した段の `id` も、`automation.logicalPluginIdWatermark` と割り当てに予約される (`src/engine/automation_binding.cpp:115`)。
+- 外部のデータを指す鍵: IR Reverb の `ir`、SoundFont 系の `sf`、Room EQ の `ms`・`ms0`〜`ms15`、Distortion Correction の `ms`、
+  Crosstalk Cancellation の `ll`・`lr`・`rl`・`rr` (`room_eq.js:1143`・`1243` ほか)。
+- パラメータの範囲は固定とは限らない。Group Delay EQ は `tp` と実際のサンプルレートで許す値が変わり
+  (`group_delay_eq.js:82`)、範囲を関数で作る鍵がある (`js/remote/parameter-hints.js:79`)。配列・構造・文字列の鍵もある。
+- FIR 系は 131,072 taps の線形位相を受け付け、遅延は taps の半分 (`js/fir-asset-eq.js:7`・`44`)。
+- ホストから並びを渡す口は無い。`IConnectionPoint::notify` で受けるのは `EffeTune.NowPlaying` と `EffeTune.PlaybackPosition` の
+  2 種だけ (`plugin_processor.cpp:786-883`)。プラグインからホストへ知らせる口も無い。
+
+mIV の側:
+
+- 音響調整の遅延の合計は 2 秒まで (`src/effetune/composition.rs:3`・`43-45`)。超えると controller は `Failed` になり、経路から外れる
+  (`src/video/audio.rs:2691`、`src/effetune/mod.rs:1712`)。
+- 既存の `restore_state` は、音声の thread の state fence (再生していなくても `wake_input()` で起きる、
+  `crates/vst3-host/src/main.cpp:1248`・`1839`) から `PluginLoader::restore_state` を呼び、loader がそれを GUI の thread へ回して
+  `setState` する (`crates/vst3-host/src/plugin_loader.cpp:2485-2520`、処理を一時停止する)。EffeTune には使っていない。
+- 再生中の曲の情報は、host が plugin の `IConnectionPoint` へ `notify` で送っている (`crates/vst3-host/src/now_playing_notify.cpp`)。
 
 ### 21.3 状態を減らす検討 (CLAUDE.md「設計の簡素化」)
 
-1. **置き換えの単位を「1 つの並び全体」にする**。段の追加・削除・並べ替え・パラメータ 1 つの変更を別々の操作にすると、
-   操作の組み合わせと途中の状態が増える。AI は今の並びを読み、組み直した並び全体を渡す。mIV は 1 回の `setState` で入れる。
-2. **mIV Sound 自身の再読み込みを、そのまま反映の経路にする** (「閉じて作り直す」と同じ考え)。プラグインに「並びを差し替える」
-   専用の口を足す案は、派生版の変更と新しい版の承認が要り、画面の状態との突き合わせも増える。`setState` は既に
-   画面の再読み込みで新しい状態を組み直す作りで、利用者がバックアップから戻すときと同じ経路になる。
-3. **mIV Sound が動いていないときは断る** (S2 の推奨案)。AI から起動すると、音声の経路に入る時点 (「一度起動したら終了まで常に経由」、
-   `effetune-integration-plan.md` §0) が増える。利用者がツールバーの「音響調整」を一度押せばよく、案内で足りる。
-4. **窓で編集中の変更との食い違いは、比べてから置き換える 1 回の操作で扱う** (§21.5)。AI が読んでから書くまでの間に
-   利用者が窓で変えた場合は、書かずに「読み直してください」を返す。窓を閉じていることを条件にする案 (モーダル相当) は、
-   「窓で聴き比べながら AI に直してもらう」という主な使い方を止めるので採らない。
-5. **完了の待ち合わせを作らない**。DSP が入れ替わる時点は知らされないので、応答は「入れました。数秒で切り替わります」までにする。
-   WebView が動かず入れ替わらない場合はまれな失敗の割り切り (CLAUDE.md) で、窓を開けば利用者に見える。
-6. **mIV が新しく持つ状態はない**。正本は mIV Sound の状態 1 か所 (`effetune-integration-plan.md` §0) のまま。
-   取り消しは、応答に入れる変更前の並びを AI が同じ tool で戻す (§9 と同じ考え)。
+第 1 版 (r1 で REVISE) は「mIV が状態の文書を組み立てて `setState` で入れる」形だった。r1 の指摘で、この形では
+(1) 画面がためている利用者の編集を host の比較で捕まえられない、(2) 消した段・外部のデータの選択・取り消し履歴を戻せない、
+(3) 再読み込みで `pipelineStartup` に上書きされ得る、ことが分かった。どれも「並びの持ち主 (画面) の外で並びを作る」ことから来る。
+
+第 2 版の中心の決定: **並びの変更は、mIV Sound の画面に頼み、画面が利用者の操作と同じ経路で行う**。
+
+- 画面は 1 本の JS の実行で動くので、AI の変更と利用者の編集は自然に順番に並ぶ。比べてから置き換える処理は、画面の中で
+  ためている編集を先に送り切ってから行えば、間に割り込まれない。
+- 段の追加は画面の「追加」と同じ作り方なので、`id` の振り方 (watermark・割り当ての予約)・既定値・外部のデータの扱いはプラグインの
+  ものがそのまま効く。mIV は状態の文書を組み立てない。
+- 取り消しは画面の取り消し履歴に 1 件として積む。利用者は窓の「元に戻す」でも戻せ、AI は `undo` で戻せる。消した段も、選んでいた
+  IR も、画面の履歴が持っている。mIV は変更前の状態を持たない。
+- 再読み込みは起きないので、`pipelineStartup` の件と再読み込みの間の取りこぼしは起きない。
+- 値の丸め・条件付きの範囲は、**画面が実際に値を入れてから読み返して比べる** (§21.6)。範囲の表を mIV 側で正確に再現しない。
+
+ほかの決定:
+
+1. **置き換えの単位は 1 つの並び全体** (段ごとの操作を別々に持たない)。AI は読んでから、組み直した並び全体を渡す。
+   今の段は `id` で指して残す (§21.4.2)。
+2. **完了の待ち合わせは「画面が受け付けて並びを入れ替えた」まで**。DSP の入れ替えは画面の通常の編集と同じ経路で、
+   利用者が画面で組み替えたときと同じ時間で起きる。応答は「受け付けた」と言い、音に反映された時刻は約束しない。
+3. **mIV が新しく持つ状態は無い**。正本は mIV Sound の状態 1 か所のまま (`effetune-integration-plan.md` §0)。
+4. mIV Sound が動いていないとき (S2) は、利用者の判断を仰ぐ。
+
+この形は **派生版に変更が要る** (§21.5、新しい版 `0.19.0-miv.2` 以降)。派生版の変更は、ビルド・確認・承認を分ける手順
+(`effetune-fork-plan.md` §7.3) で進める。S5 で利用者に確かめる。
 
 ### 21.4 tool
 
 #### 21.4.1 `sound_effects { query?, type?, page? }` — エフェクトの一覧
 
 - 本体と通信しない (`search_help` と同じく MCP exe だけ)。許可は要らない (同梱の説明と同じ公開の情報)。
-- `query` は名前・分類・説明の語で探し、`type` で 1 つの詳細を返す。一覧では `type`・表示名・分類・説明 1 行。
-  詳細では各パラメータの `key`・表示名・種類 (数・整数・真偽・選択)・`min`・`max`・`step`・単位・既定値・選択肢と、
-  数が多い鍵の並び (例 `f0`〜`f4`) の意味。
-- 中身は、同梱物の `webview/js` から生成した JSON をリポジトリに置き、MCP exe と本体の両方に組み込む (§21.6 の検査も
-  同じ JSON を使う。1 つの意味を 2 か所に書かない)。生成は `vendor/miv-sound` を更新するときに回す script で行い、
-  JSON に mIV Sound の版を入れる。**テストで `vendor/miv-sound/VERSION` と一致することを確かめる** (版を上げて生成を忘れると落ちる)。
-  生成の方法 (node で `effect-describe.js` を評価するか、`dsp-params.generated.js` と `parameter-hints.js` を読むか) は
-  実装の最初に確かめ、プラグインが実際に使う範囲 (JS の `setParameters` の丸めが params.json より狭い場合、例 シェルフの Q) と
-  食い違う鍵は、生成の検査で一覧にして設計担当へ返す。
-- 追加の一覧に出ない 2 つ (SoundFont Player・Distortion Correction) と、mIV 版で外した 2 つは載せない。
-- 意味の説明は mIV Sound の説明書 (`get_help` で引ける、§2) に任せ、ここには 1 行だけ置く。
+- `query` は名前・分類・説明の語で探し、`type` で 1 つの詳細を返す。詳細は各パラメータの `key`・表示名・種類・範囲の目安・
+  単位・既定値・選択肢、数の多い鍵の並び (例 `f0`〜`f4`) の意味、「画面で選ぶ」鍵 (§21.7)、範囲が他の値で変わる鍵の注記。
+- **この一覧は案内用で、正しさの判定には使わない** (判定は画面、§21.6)。だから mIV の本体には組み込まない (1 つの判定を 2 か所に
+  持たない)。
+- 中身は同梱物の `webview/js` から生成した JSON をリポジトリに置く。生成の script は `vendor/miv-sound` を更新するときに回し、
+  JSON に mIV Sound の版と、生成に使った入力のファイルの digest を入れる。テストで `vendor/miv-sound/VERSION` と digest の
+  一致を確かめる (版を上げて生成を忘れる・同じ版で中身が変わる、の両方で落ちる)。
+- 追加の一覧に出ない 2 つ (SoundFont Player・Distortion Correction) と mIV 版で外した 2 つは載せない。
+- 意味の説明は mIV Sound の説明書 (`get_help`、§2) に任せ、ここには 1 行だけ置く。
 
-#### 21.4.2 `sound_chain { action, pipeline?, effects?, use?, revision? }` — 今の並びを読む・置き換える
+#### 21.4.2 `sound_chain { action, … }` — 読む・組み直す・取り消す
 
-- 許可は「設定の確認と変更を AI に任せる」(§3)。mIV Sound の並びは、利用者が mIV の画面 (音響調整の窓) で変えられる
-  設定で、§6.4 の基準に入る。チェック欄は足さない (U2・U4 と同じ)。
-- `action: "get"`: `currentPipeline`・`pipelineA`・`pipelineB` (各段 `type`・`id`・表示名・`enabled`・`parameters`。
-  `_ui` で始まる鍵は除く) と `revision` (取得したバイト列の SHA-256 の先頭 16 桁) を返す。出力の予算 (親文書 §15.4) を超えるときは
-  `pipeline` で片方だけに絞るよう返す。
-- `action: "set"`: `pipeline` (`"A"` / `"B"`) の並びを `effects` で置き換え、`use` があれば使う側を切り替える。
-  `effects` を省いて `use` だけなら切り替えだけ。`revision` は必須で、`get` で受け取った値を渡す。
-  - `effects` の各段は `type`・`enabled`・`parameters`。今の段を残すときは `get` の `id` を付ける (オートメーションの割り当てと、
-    §21.7 の外部のデータの鍵を引き継ぐため)。新しい段は `id` を付けない (mIV が A と B を通して重ならない値を振る)。
-  - パラメータは省いた鍵は既定値になる (プラグインの扱いと同じ)。
-  - 応答: 変更前の並び (取り消し用、`get` と同じ形)・変更後の段の数・使う側・「数秒で切り替わる」旨・新しい `revision`。
-- annotation: `readOnlyHint=false`、`destructiveHint=false`。変更前の並びが応答に入り、同じ tool で戻せる
-  (`stack_script` と同じ考え、§10)。
+許可は「設定の確認と変更を AI に任せる」(§3)。mIV Sound の並びは、利用者が mIV の画面 (音響調整の窓) で変えられる設定で、
+§6.4 の基準に入る。チェック欄は足さない (U2・U4 と同じ)。
 
-S1 (利用者の判断): AI が書ける並びを **A と B の両方** にするか、**B だけ** にするか。§21.8 を参照。
+- `action: "get" { pipeline?, ids? }`: `revision`・`masterBypass`・`currentPipeline`・A と B それぞれの遅延 (秒) と段の一覧
+  (`id`・`type`・表示名・`enabled`・`inputBus`・`outputBus`・`channel`)。`pipeline` と `ids` を渡したときだけ、その段の
+  `parameters` (`_ui` で始まる鍵は除く) を返す。段の一覧は 128 段 × 2 でも出力の予算 (親文書 §15.4) に収まる大きさにし、
+  パラメータは段を指定して引かせる (Headphone EQ の 241 点の並びのような大きな値でも、1 段ずつなら予算に入るかを実装で測る。
+  入らない段は値の代わりに「画面で編集」と返す)。
+- `action: "apply" { revision, pipeline?, effects?, use?, bypass? }`:
+  - `pipeline` (`"A"` / `"B"`) の並びを `effects` で組み直す。`use` で使う側、`bypass` で全体のオン / オフを切り替える。
+    どれか 1 つ以上が要る。`revision` は必須。
+  - `effects` の各段:
+    - `{ "id": n }` だけ → 今の段をそのまま残す (位置だけが変わり得る。追加の一覧に出ない段・知らない段もこれで残せる)。
+    - `{ "id": n, "type": …, "enabled"?, "parameters"?, "inputBus"?, "outputBus"?, "channel"? }` → 今の段 (同じ `id` と `type`) を元に、
+      渡した項目だけを変える。外部のデータの選択・画面の折りたたみ・知らない項目は残る。
+    - `{ "type": …, … }` (`id` なし) → 新しい段。画面の「追加」と同じ作り方で、`id` は画面が振る。
+    - 並びに無い今の段は消える。
+  - B が `null` のときに B を書く・B へ切り替える場合は、画面の切り替えと同じ扱い (A を写して B を作ってから変える)。
+  - 応答: 新しい `revision`・組み直した並びの段の一覧 (`get` と同じ形)・遅延・**画面が値を丸めた鍵があればその一覧**
+    (§21.6 で拒否するので通常は空)・「受け付けた。音への反映は画面で組み替えたときと同じ」旨。変更前の並びは返さない (取り消しは
+    `undo`)。
+- `action: "undo" { revision }`: `revision` が AI の直前の `apply` の応答の値と同じとき (= その後に誰も変えていない) だけ、画面の
+  取り消しを 1 回行う。違えば「その後に変更があるので、窓の『元に戻す』で戻してください」を返す。
+- annotation: `readOnlyHint=false`、`destructiveHint=false` (画面の取り消し履歴で戻せる。ただし窓を閉じて mIV を終了すると
+  履歴は消える。これは利用者が画面で組み替えたときと同じ)。
 
-### 21.5 反映の経路 (host のコマンドを 1 つ足す)
+### 21.5 派生版と host の変更 (経路)
 
-- 新しいコマンド `replace_state_concurrent { slot_id, request_id, expected_sha256, state }` を VST3 host に足す。
-  `query_state_concurrent` と同じく **GUI の thread で** 次を続けて行い、結果を要求 ID 付きで返す:
-  1. `getState` で今のバイト列を取り、SHA-256 を `expected_sha256` と比べる。違えば `Changed` を返して終わる (何も書かない)。
-  2. `setState(state)` を呼ぶ。失敗なら `Rejected` を返す (プラグインは何も変えない、§21.2)。
-  3. 成功なら `Replaced` を返す。
-  画面の操作も GUI の thread で処理されるので、1 と 2 の間に利用者の編集は割り込まない。比べるのは「読んでから書くまでに
-  変わったか」で、変わっていれば AI が読み直す。`masterBypass` を画面で切り替えた・パネルを折りたたんだ、でも `Changed` に
-  なるが、読み直せば通るので害はない。
-- 音声の thread で `setState` する既存の `restore_state` は使わない。再生していないと音声の thread が回らず適用されない
-  (`main.cpp:1867`)、また WebView の再読み込みを音声の thread から呼ぶことになるため (この 2 点は実装の最初にコードで確かめる)。
-- 実行時間の見張りは `query_state_concurrent` と同じ 5 秒の watchdog を使う。
-- host のプロトコル版 (`PROTOCOL_VERSION`、`src/video/dsp/bridge.rs:47` と `crates/vst3-host/include/protocol.h`) を 8 → 9 にし、
-  `vendor/vst3-host` の exe を再ビルドする (古い worktree の exe を流用しない、`native-dependencies.md`)。
-  再ビルドした exe は `C:\home\mimageviewer_vendor_backup\` にも実ファイルで写す。
-- 本体の流れ: UI thread で受け付けて許可と入力の形を検査し、controller が `Running` でなければ断る。それ以外は
-  **worker で** `query_state_concurrent` → 文書の組み立て → `replace_state_concurrent` を行い、結果を IPC の応答で返す
-  (UI thread は待たない、`ui-responsiveness.md` §4)。controller の状態の取得の直列キュー (`effetune-integration-plan.md` §5.2) に
-  載せ、同時に動く要求は 1 本にする。
-- 置き換えに成功したら、同じキューで状態を 1 回取得し、`mixwright-state.json` とランプの判定を更新する (§5.2 の
-  「ロード直後」と同じ扱い。窓を閉じたときを待たずに、AI が入れた並びが次の起動に残る)。
+```
+MCP exe → (agent IPC) → 本体 UI thread: 受付・許可・入力の形
+        → worker: bridge.sound_chain(request) ─(pipe)→ VST3 host: IConnectionPoint::notify("MIV.SoundChain")
+        → plugin native → 画面 (JS): 実行 → native → host の connection point へ notify("MIV.SoundChainResult")
+        → host → (pipe) event { request_id, result } → worker → IPC の応答
+```
 
-### 21.6 検査 (本体、書く前)
+- **派生版**: `notify` で `MIV.SoundChain` (要求 ID と JSON) を受け、画面へ渡す。画面は次を 1 回の実行で行う:
+  1. ためている編集を native へ送り切る (`vst-audio-manager.js` の送りの queue を flush)。
+  2. 今の `revision` (画面の状態から作る。§21.6) と要求の `revision` を比べる。違えば `Changed` で終わる (何も変えない)。
+  3. 新しい並びを、画面の外の作業用の段として作り、値を入れて読み返す (§21.6 の検査)。遅延の合計を計算する。
+  4. 検査を通れば、利用者の操作と同じ関数で並びを入れ替え、取り消し履歴に 1 件積む。`use`・`bypass` も同じ。
+  5. 結果を native へ返し、native はホストの connection point へ `MIV.SoundChainResult` で返す。
+  画面が読み込み中・再読み込み中なら `NotReady` を返す。
+- **host**: 新しいコマンド `sound_chain { slot_id, request_id, payload }` を受けて plugin へ `notify` し、plugin からの結果の
+  message を受けて `sound_chain_result { request_id, payload }` の event で返す。plugin から message を受けるため、host 側の
+  connection point を plugin に `connect` する (`now_playing_notify.cpp` が plugin の connection point を取っている所に並べる)。
+  host のプロトコル版 (`src/video/dsp/bridge.rs:47`、`crates/vst3-host/include/protocol.h`) を 8 → 9 にし、`vendor/vst3-host` の exe を
+  再ビルドして `C:\home\mimageviewer_vendor_backup\` にも実ファイルで写す。既存の `restore_state` と、その処理の一時停止は使わない。
+- **本体**: UI thread は受け付けと許可・入力の形の検査だけ。往復は worker で行い、`query_state_concurrent` と同じく要求 ID ごとの
+  経路で結果を受ける。見張りは 5 秒 (`query_state_concurrent` と同じ)。期限を過ぎたら「mIV Sound が応答しません」を返す
+  (まれな失敗の割り切り)。同時に動く要求は controller の直列キューで 1 本にする (`effetune-integration-plan.md` §5.2)。
+- 成功したら、同じキューで状態を 1 回取得し、`mixwright-state.json` とランプの判定を更新する (§5.2 の「ロード直後」と同じ扱い。
+  AI が入れた並びが、窓を閉じるのを待たずに次の起動に残る)。
 
-- `type` は一覧 (§21.4.1) にあるもの。知らない `type` は拒否し、近い候補を返す。
-- `parameters` の鍵は一覧にあるもの。値の種類・選択肢・範囲を検査し、外れたら鍵と範囲を返して拒否する
-  (プラグインは黙って丸めるので、AI が意図と違う音を聴かせないよう先に返す)。
-- `id` は、指定するなら今の状態の A か B にあるもの。A と B を通して重ならないこと。
-- 段の数は 1 つの並びで 128 まで、DSP の実体は 96 まで (プラグインの上限、§21.2)。組み立てた状態は 4 MiB 未満。
-- `formatVersion` が 1 でない状態 (将来の mIV Sound) なら、置き換えずに「mIV を更新してください」を返す。
-- 組み立ては取得した JSON の該当の並びと `currentPipeline` だけを差し替え、ほかの項目 (未知の項目を含む) は触らない。
-  `pipelineB` が `null` で B を書く場合は新しく作る。
+### 21.6 検査 (画面、入れ替える前)
+
+- `revision`: 画面が持つ並び A・B・使う側・全体のオン / オフから作る値 (画面の折りたたみは含めない)。同じ状態なら同じ値。
+- 段の `type` は、画面の「追加」で作れるもの (知らない `type` は拒否し、近い候補を返す)。`id` は今の A か B にあり、`type` が一致。
+- **値**: 作業用の段に値を入れて読み返し、渡した値と違う鍵 (丸め・範囲外・条件付きの範囲・知らない鍵) があれば、鍵・渡した値・
+  画面の値を返して拒否する。範囲の正しさはプラグインのコード 1 か所で決まる (一覧 §21.4.1 の範囲は目安)。
+- **外部のデータの鍵** (§21.2): AI が値を渡したら拒否する (今の段から引き継ぐ値は触らない)。
+- **遅延**: 入れ替えた後の A と B の遅延の合計が mIV の上限 (要求に入れて渡す。`MAX_PLUGIN_LATENCY_SECS` = 2 秒) を超えるなら拒否する。
+  使っていない側も検査する (後で利用者が切り替えたときに `Failed` にならないように)。
+- 段の数・DSP の実体の数はプラグインの上限 (128 段・96)、割り当て・`id` の振り方はプラグインの「追加」のまま。
+- `formatVersion` 等の状態の形は画面が持つので、mIV は見ない。派生版が新しい要求の形を知らない (古い派生版) ときは、
+  `notify` に応答が無く期限切れになる前に、host が plugin の版を見て「mIV Sound を更新してください」を返す (版は bundle の
+  `moduleinfo.json` か plugin 名で判定。実装で決める)。
 
 ### 21.7 外部のデータを指す鍵
 
-- §21.2 の鍵 (`ir`・`sf`・`ms`・`ll`・`lr`・`rl`・`rr`) は AI から新しい値を受け付けない。一覧では「画面で選ぶ」と示す。
-- 段に `id` が付いていて、今の状態の同じ `id` の段が同じ `type` なら、その鍵の値を引き継ぐ (利用者が選んだ IR を残したまま、
-  前後の並びを組み替えられる)。それ以外は鍵を付けない (プラグインの既定 = 未選択)。AI がこれらの鍵を渡したら、無視せず拒否して
-  理由を返す (黙って捨てない)。
-- これで、AI の指定から利用者のファイルや保存領域の中身を新しく読ませる経路は作らない。
+- AI からは新しい値を受け付けない。今の段が選んでいるものは、その段を `id` で残せば保たれる。一覧では「画面で選ぶ」と示す。
+- 理由: 選べる IR・SFZ・測定データの一覧は WebView の保存領域と利用者のファイルにあり、AI に見せるには新しい読み出しの口が要る。
+  第 3 段の範囲を広げないため外す。S4 で利用者に確かめる (任意のファイルの指定とは別の話として)。
 
 ### 21.8 許可・紛れ込む指示と被害の範囲
 
-§6.4.6 の 3 つ (既定オフの許可・変更の可視化・tool の説明) をそのまま使う。加えて、被害の範囲を次のように見積もる。
+§6.4.6 の 3 つ (既定オフの許可・変更の可視化・tool の説明) をそのまま使う。被害の範囲:
 
-- 届く範囲は、mIV Sound の並び (S1 次第で A と B、または B) と使う側の選択だけ。ファイル・通信・プロセスには届かない
-  (外部のデータの鍵は §21.7)。オーバーサンプリング・オートメーション・プリセット・全体のオン / オフは変えない。
-- 音量: 最悪は不快な音や大きな音を組まれること。mIV Sound の後ろの安全リミッター (`effetune-integration-plan.md` §0 の位置と §13 の
-  ピーク保護) で、出力の上限は今と変わらない。
-- 戻し方: 応答の変更前の並び (AI が戻す)、窓で A / B を切り替える、トーストと「AI による変更」の記録 (§21.9) で気づく。
-- **S1**: B だけにすると、A (利用者がふだん使う並び) は AI から変わらない。A / B の両方にすると、「今の EQ を少し上げて」のような
-  頼み方にそのまま応えられる。利用者は §1 で「AI だから一部の作業ができませんでした、となるのは逆にストレス」と述べているので、
-  **設計担当の推奨は A と B の両方**。tool の説明で「新しく組むときは B に組んで聴き比べてもらう」と案内する。
+- 届く範囲は、mIV Sound の並び (S1 で A と B)・使う側・全体のオン / オフ。ファイル・通信・プロセスへの新しい経路は作らない
+  (外部のデータの鍵は §21.7。r1 のソースの読みでも、パラメータから任意の URL・プロセスへの経路は見つかっていない)。
+- 音量: mIV Sound の後ろの安全リミッターとピーク保護 (`effetune-integration-plan.md` §0・§13) で、出力の上限は今と変わらない。
+- 遅延: 上限を超える並びは画面が拒否する (§21.6)。上限内でも遅延の大きい並びは、音と映像がずれる・操作への反応が遅れる。
+  利用者が気づいて取り消せる。
+- CPU・メモリ: 上限 (96 の DSP の実体、FIR の長い taps など) の範囲で重い並びを組まれると、再生が途切れ得る。利用者が画面で
+  同じものを組んだときと同じで、取り消せば戻る。CPU の量の上限は設けない (利用者が組めるものを AI だけに禁じない、§1)。
+- 戻し方: `undo`、窓の「元に戻す」、窓での A / B の切り替え。トーストと「AI による変更」(§21.9) で気づける。
 
-### 21.9 通知・記録・ログ・取り消し
+### 21.9 通知・記録・ログ
 
-- トースト: 「AI アプリが mIV Sound の B を組み直しました (5 個のエフェクト)」/「… A に切り替えました」。
-- 「AI による変更」: 「mIV Sound の B: 3 個 → 5 個」「mIV Sound の使う側: A → B」。段の中身は行に出さない (長い)。
-- ログ: tool 名・並び・変更前後の段の `type` の列と数。パラメータの値は出さない (長い。必要なら mIV Sound の状態ファイルにある)。
-- 取り消し: 専用の tool は作らない (§9)。応答の変更前の並びを、AI が `set` で戻す。
+- トースト: 「AI アプリが mIV Sound の B を組み直しました (5 個のエフェクト)」「… 使う側を B にしました」「… 取り消しました」。
+- 「AI による変更」: 「mIV Sound の B: 3 個 → 5 個」「mIV Sound の使う側: A → B」「mIV Sound: オン → オフ」。段の中身は出さない。
+- ログ: tool 名・並び・変更前後の段の `type` の列・遅延。パラメータの値は出さない (長い。必要なら mIV Sound の状態ファイルにある)。
 
 ### 21.10 IPC・tool 一覧の予算 (§1.363 の後に合わせる)
 
-- `Command` に `GetSoundChain`・`SetSoundChain` を足す (追加だけ)。`AGENT_PROTOCOL_VERSION` を上げ、直前の版の凍結 fixture を
-  作り、古い adapter が新しい field を無視して動くことを検査する (§10・§20.8 と同じ)。
-- **§1.363 (v5.9.0) が版を 7 → 8 に上げ、tool を足す**。第 3 段は §1.363 が master に入った後の版に合わせ、版は 8 → 9 にする。
-  実装は、IPC と tool 一覧に触れる区切りを §1.363 の取り込みの後に回す (それ以外の区切り: 一覧の生成・host のコマンド・
-  本体の組み立てと検査は先に進められる)。
-- tool 一覧: 今の最大は 50,522 / 52,000 (§20.16 の記録)。§1.363 の後の実測を取り、2 本 (目標 合わせて 2,400 字) が入らなければ
-  上限の改定を設計担当が決める (§20.8 と同じ判断、理由を親文書 §15.4 に書く)。細かい使い方はマニュアルに書き `get_help` で引かせる。
-- `INSTRUCTIONS` に「mIV Sound の並びは sound_effects で鍵を確かめてから sound_chain で組む」を 1 文足す。
-- host のプロトコル版 (§21.5) は agent IPC とは別の版で、§1.363 とは重ならない。
+- `Command` に `SoundChain` を足す (追加だけ)。`AGENT_PROTOCOL_VERSION` を上げ、直前の版の凍結 fixture を、統合後の実際の型から
+  作る (§10・§20.8 と同じ)。
+- **§1.363 (v5.9.0) が版を 7 → 8 に上げ、tool を足す**。IPC と tool 一覧に触れる区切りは §1.363 が master に入った後に回し、
+  版は 8 → 9 にする。それ以外 (一覧の生成・派生版・host・本体の worker) は先に進められる。
+- tool 一覧: 今の最大は 50,522 / 52,000 (§20.16)。§1.363 の後の最終の JSON と 512 字の余裕で測り直し、2 本 (目標 合わせて
+  2,400 字) が入らなければ上限の改定を設計担当が決める (§20.8 と同じ判断。理由を親文書 §15.4 に書く)。
+- `INSTRUCTIONS` に「mIV Sound の並びは sound_effects で鍵を確かめ、sound_chain の get で今の並びを読んでから組む。新しく組むときは
+  B に組んで聴き比べてもらう」を足す。
+- host のプロトコル版 (§21.5) は agent IPC とは別で、§1.363 とは重ならない。
 
 ### 21.11 公開文書・画面
 
-- マニュアル「AI アプリとの連携」(`htdocs/mimageviewer/manual/ai-integration.html`): できることに「mIV Sound の並びを組む」、
-  音響調整を一度開いておくこと、A / B の聴き比べ、外部のデータ (IR 等) は画面で選ぶこと。
-- AI 連携の窓 (`src/ui_dialogs/agent_integration.rs`): 「設定の確認と変更を AI に任せる」の説明に mIV Sound の並びを足す
-  (snapshot の更新が要る)。
-- 製品ページの AI 連携のカード (150 字の検査)、`privacy.html` (送るものに mIV Sound の並びが加わる: 「設定の確認と変更」の
-  許可で AI アプリへ渡る情報の説明を確かめる)。
-- 設計文書: この節、`effetune-integration-plan.md` (状態の正本は変えないことと、新しい host コマンド)、`mcp-integration-plan.md` §15.4 (予算)。
+- マニュアル「AI アプリとの連携」: できること (並びを組む・使う側と全体のオン / オフ・取り消し)、音響調整を一度開いておくこと
+  (S2 次第)、A / B の聴き比べ、外部のデータは画面で選ぶこと。mIV Sound の説明書 (`manual/sound/`) に、AI から組んだ変更は
+  「元に戻す」で戻せることを 1 文。
+- AI 連携の窓の「設定の確認と変更を AI に任せる」の説明に mIV Sound の並びを足す (snapshot の更新)。
+- 製品ページの AI 連携のカード (150 字の検査)、`privacy.html` (「設定の確認と変更」の許可で AI アプリへ渡る情報に mIV Sound の
+  並びを足す)。
+- 設計文書: この節、`effetune-integration-plan.md` (新しい host コマンドと、正本は変えないこと)、`effetune-fork-plan.md`
+  (派生版の新しい受け口)、`mcp-integration-plan.md` §15.4。
 
 ### 21.12 永続データ
 
-新しい永続データは無い。`mixwright-state.json` の形は変えない (中身を AI が変えるだけ)。host のプロトコル版は配布物の中で
-揃うので移行は要らない。
+mIV の新しい永続データは無い。`mixwright-state.json` の形は変えない。派生版の状態の形 (`formatVersion` 1) も変えない
+(画面の受け口を足すだけ)。host のプロトコル版は配布物の中で揃うので移行は要らない。
 
 ### 21.13 実装の区切りとテスト
 
-- **区切り 1 (一覧)**: 生成 script・JSON・`sound_effects`・版の一致のテスト。生成の検査で、一覧の範囲とプラグインの丸めの食い違いを出す。
-- **区切り 2 (host)**: `replace_state_concurrent`。C++ の単体テスト (`crates/vst3-host/tests`) で、比べて違えば書かない・`setState` の
-  失敗・成功の 3 通り。Rust の bridge の要求 ID の経路のテスト (既存の `query_state_concurrent` のテストの形)。
-- **区切り 3 (本体)**: 文書の組み立てと検査 (§21.6・§21.7) の単体テスト。とくに: 片方の並びだけが変わる・未知の項目を保つ・
-  `id` の重複の拒否・外部のデータの鍵の引き継ぎと拒否・`pipelineB` が `null`・`Running` でないときの拒否・`Changed` の応答。
-- **区切り 4 (IPC・tool)**: §1.363 の取り込みの後。凍結 fixture、tool 一覧の実測、応答の形。
-- 実機の確認 (サブ PC): 再生中と停止中の両方で、AI が B を組んで切り替え、数秒で音が変わること。窓を開いて編集しながら
-  AI が書いたときに `Changed` が返ること。外部のデータの鍵を持つ段を残して組み替えたとき、選んだ IR が残ること。
+- **区切り 1 (一覧)**: 生成 script・JSON・`sound_effects`・版と digest の一致のテスト。
+- **区切り 2 (派生版)**: `MIV.SoundChain` の受け口と画面の実行。派生版のテスト (JS と ctest) で: ためた編集を送り切ってから比べる
+  (編集の途中で要求が来たら `Changed`)、`id` だけの段を残す・同じ `id` の段の一部の値だけを変える (外部のデータ・折りたたみ・
+  知らない項目が残る)、新しい段の `id` が watermark を超える、値の丸めで拒否、外部のデータの鍵で拒否、遅延の上限で拒否 (使って
+  いない側も)、B が `null` のとき、取り消し 1 回で元に戻る、読み込み中の `NotReady`。
+- **区切り 3 (host)**: `sound_chain` コマンドと結果の event、host 側の connection point。C++ の単体テストと、Rust の bridge の
+  要求 ID の経路のテスト (既存の `query_state_concurrent` のテストの形)。
+- **区切り 4 (本体)**: worker の往復、許可、`Running` でないとき、期限切れ、通知と記録、成功後の状態の取得。
+- **区切り 5 (IPC・tool)**: §1.363 の取り込みの後。凍結 fixture、tool 一覧の実測、応答の大きさ。
+- 実機の確認 (サブ PC): 再生中と停止中で AI が B を組んで切り替え、音が変わること。窓で値を動かしながら AI が書くと
+  `Changed` になること。IR Reverb の段を残して組み替えたとき、選んだ IR が残ること。窓の「元に戻す」と `undo` で戻ること。
 
 ### 21.14 確かめていない点
 
-- `setState` を GUI の thread から、再生中に呼んで問題ないか (VST3 の取り決めでは UI の thread から呼ばれ得る。プラグインの
-  `getState` は既に同じ形で呼んでいる)。区切り 2 の最初にプラグインのコードで確かめる。
-- 再読み込みから DSP の入れ替えまでの時間 (`effetune-integration-plan.md` の記録では 1〜2 秒)。
-- 一覧の生成で、`effect-describe.js` を node で評価できるか (画面の部品に依存しないか)。
-- 上流の `app.js` が `config.json` の `pipelineStartup` を再読み込みのたびに見る件 (派生版の設定画面では隠れている。値が
-  `"preset"` / `"default"` だと AI の並びが上書きされ得る)。区切り 2 で値の取り得る経路を確かめる。
+- 画面の取り消し履歴に、並びの入れ替え・使う側・全体のオン / オフをまとめて 1 件として積めるか (上流の履歴の作り)。区切り 2 の最初に確かめる。
+- 作業用の段を、並びに入れずに作って値を読み返せるか (上流の plugin の class が DOM や音声の context を要るか)。
+- plugin からホストへの message の経路 (host 側の connection point の `connect` を受け付けるか)。
+- 一覧の生成で、`effect-describe.js` を node で評価できるか。
 - 各 AI アプリが、一覧を引いてから並びを組むか (AI アプリの側の動き)。
 
 ### 21.15 利用者の判断が要る点 (統括経由)
 
 | 番号 | 内容 | 設計担当の推奨 |
 | --- | --- | --- |
-| S1 | AI が書ける並び | **A と B の両方** (新しく組むときは B を案内)。代案: B だけ (A は AI から変わらない) |
-| S2 | mIV Sound が動いていないとき | **断って、ツールバーの「音響調整」を一度押すよう案内する**。代案: AI から起動する (音声の経路に入る時点が増える) |
-| S3 | 範囲から外すもの (全体のオン / オフ・オーバーサンプリング・オートメーション・プリセットの保存) | **外す** (画面の 1 操作で済む)。代案: 全体のオン / オフも AI に任せる |
+| S1 | AI が書ける並び | **A と B の両方** (新しく組むときは B を案内)。代案: B だけ (A は AI から変わらない)。r1 も A と B の両方に同意 |
+| S2 | mIV Sound が動いていないとき | **AI から起動してよい** (ツールバーの「音響調整」を押したときと同じ読み込みで、窓は開かない。起動時の自動の読み込み `start_load(…, None, …)` (`src/effetune/mod.rs:1424-1426`) と同じ形。起動した後は mIV の終了まで音声がいつも mIV Sound を通る)。代案: 断って、利用者に「音響調整」を一度押してもらう |
+| S3 | 全体のオン / オフ | **AI に任せる** (読むだけでは、オフのときに「組み替えても音が変わらない」理由を AI が説明できるだけで、オンにできない)。オーバーサンプリング・オートメーションの割り当て・プリセットの保存は **外す** (それぞれ別の画面の状態で、足すと検査と取り消しの範囲が広がる。要望が出たら個別に足す) |
+| S4 | 外部のデータ (IR・SFZ・測定データ) | **AI からは新しく選ばない** (今の段が選んでいるものは残る)。代案: 選べるものの一覧を AI に見せ、選ばせる (新しい読み出しの口が要る) |
+| S5 | 派生版の変更 | **mIV Sound に「並びを組み直す」受け口を足す新しい版 (0.19.0-miv.2 以降) を作る** (利用者の編集・取り消し履歴を壊さない形にするために要る)。収録する mIV の版は、派生版の承認と合わせて決める |
