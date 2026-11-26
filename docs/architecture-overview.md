@@ -882,6 +882,8 @@ ReopenLoading / ReopenMissing / Dialog / Writing の単独所有者で、書き�
 `ExportOrigin::Combine` の終端・切断・完了後の閉じるは同じ finish handlerへ入り、sessionのtakeで1回だけ採用する。
 保存通知の OpenInViewer は既存の明示パス activation へ渡す。前回値とプリセットは Settings 内にあり、
 構成は worker が `combine.db` へ保存し、画像・フォルダ側サイドカー・設定の持ち運び・メタ情報転送には入れない。
+各元画像の `composition_identity` 欄は必須とし、変換キャッシュのパスとは別に論理的な出力権限の識別子を保持する。
+欄が欠けた構成は読み込まず、理由を通知してログに残し、DB の行は保持する。
 元画像ごとの `annotation_space` は実際に使った snapshot の注釈座標基準を保存し、再読込で同じ基準を使う。
 記録がなく正確に基準を得られない注釈付きベクター PDF は対象ごとの読込失敗にし、推定した寸法で合成しない。
 `image_combine.index` は構成のある出力キーだけを持つ。書き出し完了・構成なしの再確認・STORES の変更確定後に
