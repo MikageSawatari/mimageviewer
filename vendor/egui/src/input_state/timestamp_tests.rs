@@ -1,4 +1,5 @@
 use super::*;
+use crate::emath::pos2;
 
 fn edge(pressed: bool, stamp: Option<f64>) -> Vec<Event> {
     let mut events = Vec::new();

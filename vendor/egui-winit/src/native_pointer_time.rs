@@ -7,7 +7,7 @@ use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, WPARAM},
     System::SystemInformation::GetTickCount,
     UI::{
-        Shell::{DefSubclassProc, GetWindowSubclass, RemoveWindowSubclass, SetWindowSubclass},
+        Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{MSG, WM_NCDESTROY},
     },
 };
@@ -190,17 +190,22 @@ fn subclass_id() -> usize {
     subclass as *const () as usize
 }
 
+/// Our subclass always uses refData 0, so removing it is also the lookup:
+/// `remove_existing` returns false when this window does not carry it yet.
+/// `GetWindowSubclass` is not imported: a test executable without a Common
+/// Controls v6 manifest failed to load with it (0xc0000139, 2026-11-27), while
+/// Set/Remove/DefSubclassProc load from the same comctl32.dll.
 fn restore_outermost_with(
-    lookup: impl FnOnce() -> Option<usize>,
-    remove: impl FnOnce() -> bool,
+    remove_existing: impl FnOnce() -> bool,
     install: impl FnOnce(usize) -> bool,
 ) -> bool {
-    let Some(data) = lookup() else {
+    const DATA: usize = 0;
+    if !remove_existing() {
         return true;
-    };
+    }
     // SetWindowSubclass with an existing proc/id only updates refData; it does
     // not move that invocation boundary ahead of a later listener subclass.
-    remove() && install(data)
+    install(DATA)
 }
 
 /// A replayed application listener may install a subclass above ours on ROOT.
@@ -209,13 +214,8 @@ fn restore_outermost_with(
 pub fn after_listener_install(hwnd: isize) {
     let hwnd = hwnd as HWND;
     let restored = restore_outermost_with(
-        || {
-            let mut data = 0;
-            // SAFETY: a query for our own proc/id; an invalid or headless HWND
-            // simply has no installed subclass and needs no native mutation.
-            (unsafe { GetWindowSubclass(hwnd, Some(subclass), subclass_id(), &mut data) } != 0)
-                .then_some(data)
-        },
+        // SAFETY: removes only our own proc/id; an invalid or headless HWND, or
+        // a child that does not carry it yet, simply reports nothing removed.
         || unsafe { RemoveWindowSubclass(hwnd, Some(subclass), subclass_id()) != 0 },
         |data| unsafe { SetWindowSubclass(hwnd, Some(subclass), subclass_id(), data) != 0 },
     );
@@ -304,18 +304,16 @@ mod tests {
 
     fn restore_chain(chain: &RefCell<Vec<Layer>>) {
         assert!(restore_outermost_with(
-            || chain.borrow().contains(&Layer::Timestamp).then_some(37),
             || {
                 let mut chain = chain.borrow_mut();
-                let index = chain
-                    .iter()
-                    .position(|layer| *layer == Layer::Timestamp)
-                    .unwrap();
+                let Some(index) = chain.iter().position(|layer| *layer == Layer::Timestamp) else {
+                    return false;
+                };
                 chain.remove(index);
                 true
             },
             |data| {
-                assert_eq!(data, 37);
+                assert_eq!(data, 0);
                 chain.borrow_mut().push(Layer::Timestamp);
                 true
             },
