@@ -154,6 +154,91 @@ fn plane_tilt_press_owns_without_entry_and_first_tiny_move_publishes_without_los
 }
 
 #[test]
+fn plane_tilt_fisheye_wheel_and_key_entry_preserve_pressed_owner_until_release() {
+    let _keys = crate::key_input::lock_test_input();
+    let _clear = ClearPhysicalInput;
+    for keyboard in [false, true] {
+        let mut app = crate::app::setup_app_for_test();
+        let mut viewer = viewer(&mut app);
+        let start = egui::pos2(500., 300.);
+        press(&mut viewer, &mut app, start);
+        assert!(!app.fs_exclusive_view.is_plane_view());
+        let pressed_owner = app.fs_canvas_drag;
+        assert!(pressed_owner.is_tilt());
+
+        let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size);
+        let canvas = app.fullscreen_media_rect(full_rect, 0, false);
+        let cover = app.plane_cover_input_for_canvas(&viewer.ctx, canvas);
+        assert!(
+            cover.is_some(),
+            "the ordinary page has already been painted"
+        );
+        let zoom = app.fs_zoom;
+        let pan = app.fs_pan;
+        let input = app
+            .plane_view_wheel_input(
+                canvas,
+                if keyboard { None } else { Some(start) },
+                1.,
+                zoom,
+                pan,
+                None,
+                cover,
+            )
+            .unwrap();
+        let predicted_owner = input.tilt_drag_owned;
+        assert!(
+            predicted_owner,
+            "the prediction sees the pending Tilt owner"
+        );
+        let expected = plane_view_wheel_transition(input);
+        let events = if keyboard {
+            app.keymap =
+                crate::keymap::Keymap::from_ini_str("[FsImage]\nFsFisheyeIn = Ctrl+Shift+F13\n");
+            let mut events = key(egui::Key::F13);
+            for event in &mut events {
+                if let egui::Event::Key { modifiers, .. } = event {
+                    *modifiers = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+                }
+            }
+            events
+        } else {
+            vec![wheel(
+                0.,
+                40.,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )]
+        };
+        viewer.frame(&mut app, events);
+        assert_eq!(
+            app.fs_canvas_drag, pressed_owner,
+            "entry keeps the whole pressed owner, keyboard={keyboard}"
+        );
+        assert_eq!(app.fs_canvas_drag.is_tilt(), predicted_owner);
+        assert_eq!(app.plane_view_pose(), expected.pose);
+        assert!((app.fs_zoom - expected.zoom).abs() < 1.0e-5);
+        assert!((app.fs_pan - expected.pan).length() < 0.01);
+        assert_eq!(tilt(&app), PlaneTilt::default());
+        assert_eq!(mode(&app), PlaneFillMode::Auto);
+
+        // Ownership survives modifier changes after entry too: motion must tilt, not pan/rotate.
+        physical_modifiers(false, false);
+        let geometry = (app.fs_zoom, app.fs_pan, app.fs_free_rotation);
+        let end = start + egui::vec2(70., 35.);
+        move_to(&mut viewer, &mut app, end);
+        assert!(app.fs_canvas_drag.is_tilt());
+        assert!(!tilt(&app).is_identity());
+        assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), geometry);
+        let rotated = tilt(&app);
+        release(&mut viewer, &mut app, end);
+        assert!(app.fs_exclusive_view.is_plane_view());
+        assert_eq!(tilt(&app), rotated);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), geometry);
+    }
+}
+
+#[test]
 fn plane_tilt_same_pass_press_release_claims_the_click_and_publishes_only_nonzero_rotation() {
     let _keys = crate::key_input::lock_test_input();
     let _clear = ClearPhysicalInput;

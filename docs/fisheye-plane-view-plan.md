@@ -1161,6 +1161,20 @@ cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen|in_page_scroll|p
 
 今回の許可された検査は `cargo fmt` 正常終了、UI字形は危険な字形なし、サイトは54カード・超過0、`git diff --check` 正常終了。追加した算術・画素のassertは未実行の検証条件であり、成功を確認した結果ではない。
 
+### 段 2 の実装記録 (魚眼による入場時のTilt所有)
+
+着手時 `c689c8cfb`。入る前のTiltが押下を所有し、まだ移動していない状態で魚眼のホイール/`FsFisheyeIn` により入ると、`apply_plane_view_outcome` → `set_fs_exclusive_view` の一律の `retire_plane_drag` でその所有が消えていた。傾けの初回移動だけが別の専用入口を使っていたためであり、予測時の `tilt_drag_owned=true` と入場後の実所有も食い違った。
+
+今回の補足指示に従い、公開は `set_fs_exclusive_view` の1か所へ統一した。入場先がPlaneViewで、同じanchorのTiltを所有していれば、その所有全体を保持する。それ以外 (別ページ/世代/sliceのanchor、Lens、PlaneView以外への交代/終了) は従来どおり退役させる。傾け専用の `enter_plane_view_from_tilt_drag` とprivateの `publish_fs_exclusive_view` は削除し、傾けの初回移動も同じsetterを使う。Panoramaの後処理、古いprojectionのtake/dropとDepthの取消、通知などの既存の資源退役処理は同じsetterの本体に維持した。所有を退避して戻す処理や新しい入口は追加していない。
+
+回帰は実viewerの `plane_tilt_fisheye_wheel_and_key_entry_preserve_pressed_owner_until_release`。押すだけの状態から、ホイールと割り当てたキーの両方で魚眼へ入る。予測入力の `tilt_drag_owned` と公開後の実所有を照合し、start/previousを含む所有全体の一致、pose/倍率/panの予測との一致を検査する。その後に修飾を離して移動してもパン/自由回転ではなく傾けが続き、解放で所有が解けて傾きが残ることを通す。公開境界の `plane_tilt_publication_preserves_only_the_same_anchor_tilt_and_clears_on_exit` は別ページ・世代・sliceと同じanchorのLensを退役させ、同じanchorのTiltだけを保つことと、終了で必ず解くことを検査する。GPUを使う前者は既存gpu_tests内、後者はGPUを使わない既存app/plane_viewの試験moduleに置いた。
+
+**設計との差分**: 今回の補足により、§18.3の所有を保つ公開の考え方を、傾けの初回移動だけでなく同じanchorの魚眼入場にも適用した。新しい操作仕様の差分はない。改訂1/2の幾何・固定、式、detachedの述語/viewport/配送は変更していない。変更ファイルは `src/app/depth_view.rs`、`src/app/plane_view.rs`、`src/ui_fullscreen/plane_view_tests/gpu_tests/tilt_input_tests.rs`、本書§11。新しいUI PNGは不要。
+
+設計担当は上の2つの試験名をnextestで指定でき、関連回帰は既存 `test(/plane_view|plane_tilt|fisheye|depth/)` で照合できる。コンパイル・試験・GPU画素・実機での確認は実装担当では未実施。コミット・アプリ起動は行っていない。
+
+今回の許可された検査は `cargo fmt` 正常終了、UI字形は危険な字形なし、サイトは54カード・超過0、`git diff --check` 正常終了。Rustの試験・コンパイルの成功は未確認。
+
 ## 12. 文書
 
 - [display-pipeline.md](display-pipeline.md): PlaneView の節 (§5 の要約と §6 の出口)。

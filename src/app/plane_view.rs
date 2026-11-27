@@ -233,7 +233,10 @@ impl App {
                                 };
                                 let mut state = PlaneViewState::new(pose);
                                 state.tilt = tilt;
-                                self.enter_plane_view_from_tilt_drag(state);
+                                self.set_fs_exclusive_view(
+                                    FsExclusiveView::PlaneView(state),
+                                    "plane_tilt_enter",
+                                );
                             }
                         }
                         if let FsCanvasDrag::PlaneTilt { previous, .. } = &mut self.fs_canvas_drag {
@@ -621,6 +624,55 @@ mod tests {
             "plane_owner_fixture",
         );
     }
+    #[test]
+    fn plane_tilt_publication_preserves_only_the_same_anchor_tilt_and_clears_on_exit() {
+        let mut app = setup_app_for_test();
+        install(&mut app);
+        let pose = app.plane_view_pose().unwrap();
+        app.set_fs_exclusive_view(FsExclusiveView::None, "plane_publication_before_entry");
+        let start = egui::pos2(10., 20.);
+        let previous = egui::pos2(30., 40.);
+        for mismatch in 0..5 {
+            let mut anchor = pose.anchor;
+            match mismatch {
+                1 => anchor.fs_idx += 1,
+                2 => anchor.items_generation += 1,
+                3 => anchor.slice = crate::page_split::PageSlice::Left,
+                _ => {}
+            }
+            app.fs_canvas_drag = if mismatch == 4 {
+                FsCanvasDrag::PlaneLens {
+                    anchor,
+                    start,
+                    center: egui::Vec2::splat(0.5),
+                }
+            } else {
+                FsCanvasDrag::PlaneTilt {
+                    anchor,
+                    start,
+                    previous,
+                }
+            };
+            let owner = app.fs_canvas_drag;
+            app.set_fs_exclusive_view(
+                FsExclusiveView::PlaneView(PlaneViewState::new(pose)),
+                "plane_publication_fixture",
+            );
+            assert_eq!(app.plane_view_pose(), Some(pose));
+            assert_eq!(
+                app.fs_canvas_drag,
+                if mismatch == 0 {
+                    owner
+                } else {
+                    FsCanvasDrag::default()
+                },
+                "only the matching Tilt owner survives publication: {mismatch}"
+            );
+            app.set_fs_exclusive_view(FsExclusiveView::None, "plane_publication_exit");
+            assert_eq!(app.fs_canvas_drag, FsCanvasDrag::default());
+        }
+    }
+
     #[test]
     fn plane_actual_presentation_pause_and_terminal_close_leave_sibling_unchanged() {
         let _keys = crate::key_input::lock_test_input();

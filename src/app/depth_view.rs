@@ -918,23 +918,14 @@ impl App {
         self.fs_exclusive_view.panorama_state_mut()
     }
 
-    /// All live transitions retire the old owner before publishing its replacement.
+    /// PlaneView entry preserves its page's Tilt press; every replacement retires old resources.
     pub(crate) fn set_fs_exclusive_view(&mut self, target: FsExclusiveView, _cause: &'static str) {
-        self.fs_canvas_drag.retire_plane_drag();
-        self.publish_fs_exclusive_view(target);
-    }
-
-    /// Tilt already owns the press before its first nonzero move enters PlaneView.
-    pub(crate) fn enter_plane_view_from_tilt_drag(
-        &mut self,
-        state: crate::plane_view::PlaneViewState,
-    ) {
-        debug_assert!(self.fs_canvas_drag.is_tilt());
-        debug_assert_eq!(self.fs_canvas_drag.plane_anchor(), Some(state.pose.anchor));
-        self.publish_fs_exclusive_view(FsExclusiveView::PlaneView(state));
-    }
-
-    fn publish_fs_exclusive_view(&mut self, target: FsExclusiveView) {
+        let keep_tilt = self.fs_canvas_drag.is_tilt()
+            && matches!(&target, FsExclusiveView::PlaneView(state)
+                if self.fs_canvas_drag.plane_anchor() == Some(state.pose.anchor));
+        if !keep_tilt {
+            self.fs_canvas_drag.retire_plane_drag();
+        }
         let leaving_panorama = matches!(self.fs_exclusive_view, FsExclusiveView::Panorama(_));
         if leaving_panorama {
             self.panorama_projection_popup_open = false;
