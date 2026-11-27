@@ -816,3 +816,42 @@ guard・遅延・再試行・時間切れを足さない。ClaudeCode と Codex 
   [detached-rework-plan.md](detached-rework-plan.md) §11 に記録する。
 - まれな失敗 (時計の取り違え等で古さが範囲外): 時刻を付けず pass の時刻で判定する (今と同じ)。ログは出さない
   (CLAUDE.md の既定の割り切り。入力ごとに出すと量が多い)。
+
+### 16.14 独立設計レビュー r1 (Sol xhigh、2026-11-27) と改訂
+
+- r1: **REVISE** (P2 × 3)。「実際の入力時刻を保って egui の 1 か所の判定へ渡す方針は、症状パッチではなく構造的修正」に **AGREE**。
+  3 件ともコードで正しいと確認した (ClaudeCode)。以下で 16.4 の 1〜3 を置き換える。
+- r1 P2-1 (時刻の基準): eframe は入力を取り出した後、`RawInput.time` を自分の `beginning` 基準で上書きする
+  (`vendor/eframe/src/native/epi_integration.rs` の `prepare_raw_input`、`wgpu_integration.rs` の `input.time = ...`)。
+  egui-winit の `State.start_time` とは基準が違い、子窓の作り直しでずれる。また、保留した入力 (`pending_raw_input`) は
+  取り出した時刻と pass の時刻が違うので、「取り出し時点からの古さ」で持つと、保留した組と新しい組の間隔が縮み、
+  遅いクリックが速く見え得る。
+  - 改訂: **プロセスで 1 つの入力用の時計** (egui-winit の `OnceLock<Instant>` を起点にした秒) を作る。egui-winit は edge の時刻を
+    この時計で持つ。eframe は `RawInput.time` を設定する全ての箇所で、同じ瞬間のこの時計の値も `RawInput` の新しい欄
+    (例 `input_clock: Option<f64>`) に入れる。egui は edge の pass 基準の時刻を `time − (input_clock − edge の時計の値)` で出す。
+    `input_clock` が無い (テスト・kittest・他の統合) ときは時刻の注釈を使わない。古さは pass ごとに計算するので、保留・連結しても間隔は変わらない。
+- r1 P2-2 (メッセージとの対応): egui-winit が MouseInput を受けた時点の `GetMessageTime` は、winit が再入中に保留して後で配る
+  イベント (`runner.rs` の `event_buffer`、時刻を持たない) や、送信メッセージでは、そのクリックのメッセージの時刻ではない。
+  保留した複数のクリックが同じ遅い時刻になると間隔が縮み、誤ってダブルクリックになり得る。
+  - 改訂: **winit の msg hook** (eframe (vendor) が Windows で `EventLoopBuilderExtWindows::with_msg_hook` を設定) で、winit 自身の
+    メッセージの取り出しごとに「今から配るメッセージ」をスレッドの 1 か所に記録する (マウスのボタンのメッセージなら
+    hwnd・ボタン・押したか・`MSG.time`、それ以外は空にする)。egui-winit は MouseInput を受けたとき、その記録が
+    自分の窓の hwnd・同じボタン・同じ押したかなら取り出して (1 回だけ使う) 時刻にし、合わなければ時刻を付けない。
+    保留されて後で配られたイベント、入れ子のメッセージループ (DoDragDrop 等、hook を通らない)、送信メッセージは
+    記録と合わないので時刻なし (= 今と同じ pass の時刻)。誤って速く見える方向の時刻は作らない。
+    `MSG.time` の古さ (`GetTickCount` との差) は hook の時点で入力用の時計へ換算する。利用者の `event_loop_builder` が
+    msg hook を上書きした場合は時刻が付かないだけ (mIV は設定していない)。
+- r1 P2-3 (provenance との並び): egui-winit の observer は、主ボタンの押下の直前に `Event::PointerInputProvenance` を挿入し
+  (`pointer_input_observer.rs` の `events.insert(events_before + start, ...)`)、`src/app/detached_activation_gesture.rs` は
+  「押下の直前が provenance」を要求する。
+  - 改訂: 時刻の注釈は PointerButton より前に積み、observer の挿入で **時刻 → provenance → PointerButton** の並びになる形を
+    契約にする。egui は「注釈の後、provenance だけを挟んで来た同じボタン・同じ押したかの PointerButton」に時刻を使い、
+    それ以外のイベントを挟んだら捨てる。detached の「直前が provenance」は変わらない。
+    `Event::PointerButton` に欄を足す案は、src・tests の約 490 か所の構築に及ぶので採らない。
+- 影響の追記: egui のテキスト選択 (ダブル・トリプルクリック)、ツールチップ、長押しも実際の時刻で測るようになる。
+  native presenter の HUD は独自の `RawInput` (時刻なし) を作るので今と同じ。
+- テストの追記 (r1): 保留・連結した入力で間隔が縮まない / 再入で保留されたイベントと送信メッセージに時刻が付かない
+  (hook の記録との照合の単体) / 子窓の作り直し後も時刻の基準が合う / provenance と併存して detached の起動の照合が今どおり /
+  窓 A の入力・取り消し・作り直しが窓 B の edge・クリックの履歴を変えない / 時刻付きの持ち越し防止 (§4.4)・表示リセット (§14) /
+  同じ pass に入った、実際は 0.5 秒以上空いた 2 回のクリックはダブルクリックにならない (handler-level)。
+  `egui_kittest::Harness::step` はイベントを pass ごとに分けるので、注釈の試験は同じ `RawInput.events` にまとめて渡す。
