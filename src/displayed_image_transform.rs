@@ -1169,7 +1169,7 @@ pub(crate) struct FullscreenPageLayout {
     pages: Vec<DisplayedPage>,
     pub(crate) drawn_unit: Option<crate::ui_fullscreen::in_page_scroll::FsDrawnUnitStamp>,
     /// Accepted material geometry, paired with the displayed page rather than viewer state.
-    pub(crate) plane_cover: Option<PlaneCoverRecord>,
+    pub(crate) plane_cover: Option<Box<PlaneCoverRecord>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1201,7 +1201,8 @@ impl FullscreenPageLayout {
         debug_assert!(plane_cover.is_none_or(|record| record.input.page_idx == transform.page_idx));
         self.begin(FullscreenPageLayoutKind::Single);
         self.push(transform);
-        self.plane_cover = plane_cover;
+        // One small allocation per published pass keeps the inline layout small (App size test).
+        self.plane_cover = plane_cover.map(Box::new);
     }
 
     pub(crate) fn push(&mut self, transform: DisplayedImageTransform) {

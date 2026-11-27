@@ -616,7 +616,9 @@ mod gpu_tests {
         app.fs_canvas_drag = owner;
         let context = app.edit_request_owner_context();
         app.set_fs_exclusive_view(
-            FsExclusiveView::Depth(crate::depth_parallax::DepthViewState::new(context)),
+            FsExclusiveView::Depth(Box::new(crate::depth_parallax::DepthViewState::new(
+                context,
+            ))),
             "plane_replace_by_depth_test",
         );
         assert!(!app.fs_canvas_drag.is_lens());
@@ -870,7 +872,12 @@ mod gpu_tests {
         };
         let second = draw(&mut app, &now, egui::vec2(634., 819.));
         assert_eq!(second.transform.source_size, first.transform.source_size);
-        let accepted = app.fullscreen_page_layout.plane_cover.unwrap();
+        let accepted = app
+            .fullscreen_page_layout
+            .plane_cover
+            .as_deref()
+            .copied()
+            .unwrap();
         assert_eq!(accepted.material, first_material.description);
         assert_eq!(accepted.input.source_size, first.transform.source_size);
         assert_eq!(accepted.input.texture_size, first.transform.texture_size);

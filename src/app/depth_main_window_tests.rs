@@ -59,7 +59,9 @@ impl RootDepthViewer {
         crate::app::source_texture_test_support::seed(app, &ctx, 0);
         super::depth_view_tests::install_ready_depth_for_export(app);
         app.set_fs_exclusive_view(
-            FsExclusiveView::Depth(DepthViewState::new(app.edit_request_owner_context())),
+            FsExclusiveView::Depth(Box::new(DepthViewState::new(
+                app.edit_request_owner_context(),
+            ))),
             "root_depth_fixture",
         );
         app.viewer_presentation = ViewerPresentation::MainWindow;
@@ -91,7 +93,9 @@ impl RootDepthViewer {
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert!(!app.detached_viewer_independent_active);
         app.set_fs_exclusive_view(
-            FsExclusiveView::Depth(DepthViewState::new(app.edit_request_owner_context())),
+            FsExclusiveView::Depth(Box::new(DepthViewState::new(
+                app.edit_request_owner_context(),
+            ))),
             "linked_depth_fixture",
         );
         let child = ChildDepthPass {
@@ -874,7 +878,7 @@ fn depth_linked_actual_readback_submits_the_child_viewport_to_the_worker() {
             crate::depth_parallax::DepthSourcePhase::ReadingBack { .. }
         ));
         app.set_fs_exclusive_view(
-            FsExclusiveView::Depth(state),
+            FsExclusiveView::Depth(Box::new(state)),
             "linked_real_worker_submission",
         );
         render
@@ -923,7 +927,7 @@ fn depth_top_button_color_matches_the_context_and_session_entry_matrix() {
                 } else { app.viewer_context_main() };
                 app.with_viewer_context(blocker, |owner| {
                     owner.set_fs_exclusive_view(if occupied {
-                        FsExclusiveView::Depth(DepthViewState::new(owner.edit_request_owner_context()))
+                        FsExclusiveView::Depth(Box::new(DepthViewState::new(owner.edit_request_owner_context())))
                     } else { FsExclusiveView::None }, "button_other_owner");
                 }).unwrap();
                 app.with_viewer_context(context, |owner| {
@@ -1037,7 +1041,10 @@ fn depth_main_window_root_pending_polling_pauses_hidden_and_minimized_then_resum
                 ),
             };
         }
-        app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "root_pending_visibility");
+        app.set_fs_exclusive_view(
+            FsExclusiveView::Depth(Box::new(state)),
+            "root_pending_visibility",
+        );
         render
             .device
             .poll(wgpu::PollType::Wait {

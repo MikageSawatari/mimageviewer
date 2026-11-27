@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 fn install_depth(app: &mut App) {
     app.set_fs_exclusive_view(
-        FsExclusiveView::Depth(DepthViewState::new(app.edit_request_owner_context())),
+        FsExclusiveView::Depth(Box::new(DepthViewState::new(
+            app.edit_request_owner_context(),
+        ))),
         "depth_slideshow_test",
     );
 }

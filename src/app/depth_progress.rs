@@ -235,8 +235,9 @@ mod tests {
         app.fullscreen_idx = Some(0);
         app.reading_flow = crate::settings::ReadingFlow::Paged;
         app.spread_mode = crate::settings::SpreadMode::Single;
-        app.fs_exclusive_view =
-            FsExclusiveView::Depth(DepthViewState::new(app.edit_request_owner_context()));
+        app.fs_exclusive_view = FsExclusiveView::Depth(Box::new(DepthViewState::new(
+            app.edit_request_owner_context(),
+        )));
         app.wgpu_render_state = None;
         for idx in 0..2 {
             let pixels = Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::WHITE));
@@ -1215,7 +1216,7 @@ mod gpu_tests {
             .unwrap();
         assert!(matches!(state.source, DepthSourcePhase::ReadingBack { .. }));
         state.current_material = Some(key);
-        app.fs_exclusive_view = FsExclusiveView::Depth(state);
+        app.fs_exclusive_view = FsExclusiveView::Depth(Box::new(state));
         assert!(app.resident_final_prepare_material(&ctx, 0).is_none());
         assert_eq!(
             app.depth_page_progress(&ctx, 0, DepthPageRole::Current),

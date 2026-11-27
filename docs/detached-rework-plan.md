@@ -1458,6 +1458,10 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-28: master取り込み後のAppのサイズ
+
+`ViewerContextBundle`が持つ`FsExclusiveView::Depth`の中身を`Box<DepthViewState>`へ変更した。型の格納だけを変え、所有・寿命・退避/swap・退役、detached述語とviewport配送は変更しない。
+
 ### 魚眼ズームの既存占有ownerへの追加 (§1.917、2026-11-27)
 
 `FsExclusiveView::PlaneView` を既存のcontext所有variantへ追加した。

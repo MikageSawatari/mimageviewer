@@ -44810,7 +44810,11 @@ impl App {
         canvas: egui::Rect,
     ) -> Option<crate::plane_view::PlaneCoverInput> {
         let idx = self.fullscreen_idx?;
-        let accepted = self.fullscreen_page_layout.plane_cover?;
+        let accepted = self
+            .fullscreen_page_layout
+            .plane_cover
+            .as_deref()
+            .copied()?;
         if accepted.anchor != self.plane_view_anchor(idx) {
             return None;
         }
@@ -106753,9 +106757,9 @@ mod operation_script_fullscreen_tests {
         let _serial = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         let mut app = page_turn_submission_tests::ready_app(&ctx, SpreadMode::Single);
-        app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(
+        app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(Box::new(
             crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context()),
-        );
+        ));
         let fit = app.effective_fullscreen_fit_mode();
         frame(&ctx, vec![], |ctx| {
             let (_, rejected, delegated) =

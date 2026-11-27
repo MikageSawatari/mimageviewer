@@ -123,9 +123,9 @@ fn install_depth(app: &mut App) {
     app.items = vec![GridItem::Image("depth-input.jpg".into())];
     app.fullscreen_idx = Some(0);
     app.set_fs_exclusive_view(
-        FsExclusiveView::Depth(crate::depth_parallax::DepthViewState::new(
+        FsExclusiveView::Depth(Box::new(crate::depth_parallax::DepthViewState::new(
             app.edit_request_owner_context(),
-        )),
+        ))),
         "depth_input_test",
     );
 }
@@ -151,8 +151,8 @@ fn depth_suspends_effective_zoom_consumers_while_2d_and_panorama_keep_their_owne
     );
     for kind in ["2d", "panorama", "depth"] {
         let target = match kind {
-            "depth" => FsExclusiveView::Depth(crate::depth_parallax::DepthViewState::new(
-                app.edit_request_owner_context(),
+            "depth" => FsExclusiveView::Depth(Box::new(
+                crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context()),
             )),
             "panorama" => FsExclusiveView::Panorama(crate::panorama::PanoramaState::new(
                 0.0,

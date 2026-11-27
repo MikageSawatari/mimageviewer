@@ -24,8 +24,8 @@ fn script_363_snapshot_scopes_depth_slideshow_and_grid_to_the_input_face() {
     app.settings.grid_cols = 8;
     app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
     app.fullscreen_idx = Some(0);
-    app.fs_exclusive_view = FsExclusiveView::Depth(crate::depth_parallax::DepthViewState::new(
-        app.edit_request_owner_context(),
+    app.fs_exclusive_view = FsExclusiveView::Depth(Box::new(
+        crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context()),
     ));
     app.slideshow_playing = true;
     let grid = app.collect_operation_script_snapshot(ScriptInputSurface::Grid);
@@ -140,10 +140,11 @@ mod gpu_tests {
                         let ctx = egui::Context::default();
                         let mut app = fixture(&ctx);
                         if initial_depth {
-                            app.fs_exclusive_view =
-                                FsExclusiveView::Depth(crate::depth_parallax::DepthViewState::new(
+                            app.fs_exclusive_view = FsExclusiveView::Depth(Box::new(
+                                crate::depth_parallax::DepthViewState::new(
                                     app.edit_request_owner_context(),
-                                ));
+                                ),
+                            ));
                         }
                         app.slideshow_playing = initial_slideshow;
                         if from_key {
@@ -222,9 +223,9 @@ mod gpu_tests {
             let ctx = egui::Context::default();
             let mut app = fixture(&ctx);
             if initial_depth {
-                app.fs_exclusive_view = FsExclusiveView::Depth(
+                app.fs_exclusive_view = FsExclusiveView::Depth(Box::new(
                     crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context()),
-                );
+                ));
             }
             app.fs_pixel_grid_enabled = false;
             keys(&mut app, &ctx, &[egui::Key::D, egui::Key::S, egui::Key::G]);

@@ -768,9 +768,9 @@ fn realmachine50_forwarded_warm_pdf_keeps_main_origin_without_delaying_cached_ro
             viewer.viewer_presentation = ViewerPresentation::DetachedWindow;
             viewer.detached_viewer_independent_active = true;
             viewer.set_fs_exclusive_view(
-                crate::fs_exclusive_view::FsExclusiveView::Depth(
+                crate::fs_exclusive_view::FsExclusiveView::Depth(Box::new(
                     crate::depth_parallax::DepthViewState::new(viewer.edit_request_owner_context()),
-                ),
+                )),
                 "realmachine50_warm_pdf_before_verification",
             );
         });

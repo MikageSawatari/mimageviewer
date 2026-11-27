@@ -67,8 +67,8 @@ fn depth_transform_click_classification_focus_and_double_reset_use_the_shared_vi
         let mut app = crate::app::setup_app_for_test();
         app.items = vec![GridItem::Image("transformed-focus.jpg".into())];
         app.fullscreen_idx = Some(0);
-        app.fs_exclusive_view = FsExclusiveView::Depth(crate::depth_parallax::DepthViewState::new(
-            app.edit_request_owner_context(),
+        app.fs_exclusive_view = FsExclusiveView::Depth(Box::new(
+            crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context()),
         ));
         app.fs_zoom = 2.;
         app.fs_pan = egui::vec2(12., -8.);
@@ -205,8 +205,8 @@ fn depth_transform_pdf_suppression_keeps_comparisons_until_the_first_2d_draw() {
     }];
     app.fullscreen_idx = Some(0);
     assert!(app.fs_pdf_rerender_demand.note_legacy(0, 1.5));
-    app.fs_exclusive_view = FsExclusiveView::Depth(crate::depth_parallax::DepthViewState::new(
-        app.edit_request_owner_context(),
+    app.fs_exclusive_view = FsExclusiveView::Depth(Box::new(
+        crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context()),
     ));
     app.maybe_rerender_pdf(3.);
     app.settings.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
@@ -258,7 +258,9 @@ fn depth_transform_pdf_first_single_draw_consumes_suppression_after_d_f12_and_z(
                 app.fs_pending.clear();
                 let owner = app.edit_request_owner_context();
                 app.set_fs_exclusive_view(
-                    FsExclusiveView::Depth(crate::depth_parallax::DepthViewState::new(owner)),
+                    FsExclusiveView::Depth(Box::new(crate::depth_parallax::DepthViewState::new(
+                        owner,
+                    ))),
                     "pdf_suppression_enter",
                 );
                 app.fs_zoom = 2.;

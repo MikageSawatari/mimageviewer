@@ -522,7 +522,7 @@ fn multiwindow_depth_paused_last_active_resume_close_does_not_register_passive_a
                     if depth {
                         app.set_fs_exclusive_view(
                             crate::fs_exclusive_view::FsExclusiveView::Depth(
-                                crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context())),
+                                Box::new(crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context()))),
                             "paused_resume_fixture",
                         );
                     }
@@ -989,7 +989,7 @@ fn realmachine50_parked_click_case_with_touch_policy(
             if depth {
                 viewer.set_fs_exclusive_view(
                     crate::fs_exclusive_view::FsExclusiveView::Depth(
-                        crate::depth_parallax::DepthViewState::new(viewer.edit_request_owner_context())),
+                        Box::new(crate::depth_parallax::DepthViewState::new(viewer.edit_request_owner_context()))),
                     "realmachine50_depth_before_pause",
                 );
             }

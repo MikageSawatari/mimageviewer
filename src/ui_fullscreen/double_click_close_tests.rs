@@ -585,7 +585,7 @@ fn close_mode_popup_and_chrome_clicks_cannot_start_a_close_pair() {
                 );
                 depth.panel_visible = true;
                 canvas.app.fs_exclusive_view =
-                    crate::fs_exclusive_view::FsExclusiveView::Depth(depth);
+                    crate::fs_exclusive_view::FsExclusiveView::Depth(Box::new(depth));
                 let panel = egui::Rect::from_center_size(canvas_pos(), egui::vec2(60.0, 60.0));
                 let id = canvas.app.depth_panel_rect_id();
                 canvas.ctx.data_mut(|data| data.insert_temp(id, panel));
@@ -675,9 +675,9 @@ fn close_mode_continuous_reading_closes_only_outside_popup_and_chrome() {
 fn close_mode_depth_uses_release_modifiers_and_preserves_ctrl_focus() {
     for batched in [false, true] {
         let mut canvas = Canvas::new();
-        canvas.app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(
+        canvas.app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(Box::new(
             crate::depth_parallax::DepthViewState::new(canvas.app.edit_request_owner_context()),
-        );
+        ));
         let pos = canvas_pos();
         if batched {
             let mut events = click(pos, egui::Modifiers::CTRL);
@@ -706,9 +706,9 @@ fn close_mode_depth_uses_release_modifiers_and_preserves_ctrl_focus() {
 fn close_mode_transformed_depth_preserves_ctrl_focus_and_resets_before_closing() {
     for (zoom, rotation) in [(2.0, 0.0), (1.0, 0.25)] {
         let mut canvas = Canvas::new();
-        canvas.app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(
+        canvas.app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(Box::new(
             crate::depth_parallax::DepthViewState::new(canvas.app.edit_request_owner_context()),
-        );
+        ));
         canvas.app.fs_zoom = zoom;
         canvas.app.fs_free_rotation = rotation;
         let pos = canvas_pos();
@@ -1740,9 +1740,9 @@ fn close_mode_focus_restore_899_no_single_click_use_and_reset_keeps_priority() {
     }
     // Planner observes last_click directly: Ctrl focus must not be produced.
     let mut canvas = Canvas::for_focus_restore();
-    canvas.app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(
+    canvas.app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(Box::new(
         crate::depth_parallax::DepthViewState::new(canvas.app.edit_request_owner_context()),
-    );
+    ));
     assert_eq!(
         canvas.plan(
             click(canvas_pos(), egui::Modifiers::CTRL),

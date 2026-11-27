@@ -208,9 +208,9 @@ fn independent_media_exchange_navigation_retires_a_preserves_c_and_depth_on_b() 
             assert_eq!(owner.visible_indices, order);
             assert!(!owner.pending_main_foreground_reclaim);
             owner.set_fs_exclusive_view(
-                crate::fs_exclusive_view::FsExclusiveView::Depth(
+                crate::fs_exclusive_view::FsExclusiveView::Depth(Box::new(
                     crate::depth_parallax::DepthViewState::new(owner.edit_request_owner_context()),
-                ),
+                )),
                 "test_depth",
             );
             owner.open_fullscreen_from_fs_navigation(&ctx, 3, HistoryTrigger::UserChosen);
