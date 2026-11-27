@@ -7536,6 +7536,19 @@ mod tests {
 
     #[test]
     fn preferences_context_menu_layout_default_and_minimum_width_fit_and_controls_work() {
+        check_preferences_context_menu_layout_at_pixels_per_point(1.0);
+    }
+
+    #[test]
+    fn preferences_context_menu_layout_fractional_scale_fit_and_controls_work() {
+        // A one-row Galley can round taller than the combo at 1.4; the old
+        // height comparison then moved even these short inline notes below it.
+        // Keep the full scene/width matrix: fractional text rounding affects
+        // inline notes, adjacent rows and control alignment through the same path.
+        check_preferences_context_menu_layout_at_pixels_per_point(1.4);
+    }
+
+    fn check_preferences_context_menu_layout_at_pixels_per_point(pixels_per_point: f32) {
         use crate::context_menu_model::{
             ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuParentId,
             ContextMenuPreviewItemState, ContextMenuPreviewScenario, ContextMenuSeparatorBefore,
@@ -7574,6 +7587,14 @@ mod tests {
             // only content against a Window that already grew would miss this bug.
             let mut harness =
                 preferences_view_harness_with_combo_reference(PreferencesPage::General, true);
+            harness
+                .input_mut()
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .native_pixels_per_point = Some(pixels_per_point);
+            harness.run_steps(3);
+            assert_eq!(harness.ctx.pixels_per_point(), pixels_per_point);
             let window_id = preferences_window_id_for_test();
             let before = harness
                 .ctx
@@ -7595,7 +7616,7 @@ mod tests {
                 .unwrap();
             assert!(
                 (fixed.width() - width).abs() <= 1.0,
-                "width={width}: {fixed:?}"
+                "ppp={pixels_per_point}, width={width}: {fixed:?}"
             );
 
             for &scenario in ContextMenuPreviewScenario::ALL {
@@ -7617,6 +7638,7 @@ mod tests {
                     state.context_menu_expanded.insert(parent, true);
                 }
                 harness.run_steps(6);
+                assert_eq!(harness.ctx.pixels_per_point(), pixels_per_point);
                 let layout_settings = harness
                     .state()
                     .pref_state
@@ -7665,7 +7687,7 @@ mod tests {
                     assert!(
                         checkbox.y_range().contains(status.center().y)
                             && status.left() >= checkbox.right(),
-                        "width={width}, scenario={scenario:?}, item={item:?}: \
+                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, item={item:?}: \
                          short item and status should share a row: {checkbox:?}, {status:?}"
                     );
                 }
@@ -7725,7 +7747,7 @@ mod tests {
                                 assert!(
                                     status.is_positive()
                                         && status.height() <= status_height + tolerance,
-                                    "width={width}, scenario={scenario:?}, item={item:?}: \
+                                    "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, item={item:?}: \
                                      status must stay on one line: {status:?}, height={status_height}"
                                 );
                                 if let Some(text_rows) = painted_rows.get(item.label()) {
@@ -7736,7 +7758,7 @@ mod tests {
                                         let gap = status.top() - text_bottom;
                                         assert!(
                                             (gap - item_spacing_y).abs() <= tolerance,
-                                            "width={width}, scenario={scenario:?}, item={item:?}: \
+                                            "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, item={item:?}: \
                                              wrapped note must follow the last text row directly: \
                                              text_bottom={text_bottom}, status={status:?}, \
                                              gap={gap}, spacing={item_spacing_y}"
@@ -7748,7 +7770,7 @@ mod tests {
                                         assert_eq!(
                                             text_rows.len(),
                                             1,
-                                            "width={width}, scenario={scenario:?}, item={item:?}: \
+                                            "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, item={item:?}: \
                                              a note following multi-line text must start below it"
                                         );
                                     }
@@ -7796,7 +7818,7 @@ mod tests {
                                         control.is_positive()
                                             && (control.center().y - first_line_center).abs()
                                                 <= tolerance,
-                                        "width={width}, scenario={scenario:?}, item={item:?}: \
+                                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, item={item:?}: \
                                          controls must align with the checkbox's first line: \
                                          checkbox={checkbox:?}, center={first_line_center}, {control:?}"
                                     );
@@ -7812,7 +7834,7 @@ mod tests {
                                 for next_part in &pair[1].2 {
                                     assert!(
                                         part.bottom() <= next_part.top() + tolerance,
-                                        "width={width}, scenario={scenario:?}, step={step}: \
+                                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, step={step}: \
                                          {:?} {part:?} overlaps next row {:?} {next_part:?}",
                                         pair[0].0,
                                         pair[1].0
@@ -7827,11 +7849,11 @@ mod tests {
                         .unwrap();
                     assert!(
                         (window.width() - width).abs() <= tolerance,
-                        "width={width}, scenario={scenario:?}: Window grew to {window:?}"
+                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}: Window grew to {window:?}"
                     );
                     assert!(
                         layout.content.x <= layout.inner.width() + tolerance,
-                        "width={width}, scenario={scenario:?}, step={step}: {layout:?}"
+                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, step={step}: {layout:?}"
                     );
                     for role in [
                         egui::accesskit::Role::CheckBox,
@@ -7847,13 +7869,13 @@ mod tests {
                             {
                                 assert!(
                                     rect.right() <= layout.inner.right() + tolerance,
-                                    "width={width}, scenario={scenario:?}, {role:?}: {rect:?}, node={:?}",
+                                    "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, {role:?}: {rect:?}, node={:?}",
                                     node.accesskit_node()
                                 );
                                 if role == egui::accesskit::Role::ComboBox {
                                     assert!(
                                         rect.height() <= row_height + tolerance,
-                                        "width={width}, scenario={scenario:?}: multi-line combo {rect:?}"
+                                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}: multi-line combo {rect:?}"
                                     );
                                 }
                             }
@@ -7883,7 +7905,7 @@ mod tests {
                 for &item in orders.iter().flatten() {
                     assert!(
                         first_line_checked.contains(&item),
-                        "width={width}, scenario={scenario:?}: text row was never painted: {item:?}"
+                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}: text row was never painted: {item:?}"
                     );
                 }
                 if width == PREFERENCES_MIN_WIDTH
@@ -7913,7 +7935,7 @@ mod tests {
             let combo = harness.get_by_label(&separator_label).rect();
             assert!(
                 checkbox.height() > combo.height(),
-                "width={width}: exercise a wrapped item, checkbox={checkbox:?}, combo={combo:?}"
+                "ppp={pixels_per_point}, width={width}: exercise a wrapped item, checkbox={checkbox:?}, combo={combo:?}"
             );
             let (_, layout) = harness
                 .ctx

@@ -5618,6 +5618,8 @@ pub(super) fn draw_context_menu_layout_settings(
     expanded: &mut HashMap<ContextMenuParentId, bool>,
     view_generation: u64,
 ) {
+    use egui::widget_style::CheckboxStyle;
+
     const ITEM_PREVIEW_WIDTH: f32 = 18.0;
     const ARROW_COLUMN_WIDTH: f32 = 32.0;
     const COLUMN_SPACING: f32 = 8.0;
@@ -5783,7 +5785,37 @@ pub(super) fn draw_context_menu_layout_settings(
                                                 .as_ref()
                                                 .clone();
                                             item_text.first_row_min_height = first_line_height;
-                                            let checkbox = ui.checkbox(&mut visible, item_text);
+                                            // Measure the same icon/text layout as Checkbox, then
+                                            // give it that Galley so wrapping and row count agree.
+                                            let checkbox_id = ui.next_auto_id();
+                                            let checkbox_style: CheckboxStyle =
+                                                ui.widget_style(checkbox_id, &Default::default());
+                                            let min_size = checkbox_style.atom_layout.min_size.max(
+                                                egui::vec2(0.0, checkbox_style.checkbox_size),
+                                            );
+                                            let icon_size = egui::vec2(
+                                                checkbox_style.checkbox_size,
+                                                checkbox_style.checkbox_size.max(min_size.y),
+                                            );
+                                            let measured = checkbox_style
+                                                .atom_layout
+                                                .apply(egui::WidgetAtom::new((
+                                                    egui::Atom::custom(
+                                                        egui::IdSalt::new("checkbox_icon"),
+                                                        icon_size,
+                                                    ),
+                                                    item_text,
+                                                )))
+                                                .min_size(min_size)
+                                                .measure(ui, ui.available_size());
+                                            let item_galley = measured
+                                                .container
+                                                .iter_texts()
+                                                .next()
+                                                .expect("the item Checkbox contains one text atom")
+                                                .clone();
+                                            let item_is_multiline = item_galley.rows.len() > 1;
+                                            let checkbox = ui.checkbox(&mut visible, item_galley);
                                             let status = match preview_state {
                                                 ContextMenuPreviewItemState::Unavailable => Some((
                                                     "対象外",
@@ -5818,7 +5850,7 @@ pub(super) fn draw_context_menu_layout_settings(
                                                     f32::INFINITY,
                                                     egui::TextStyle::Small,
                                                 );
-                                                if checkbox.rect.height() > first_line_height
+                                                if item_is_multiline
                                                     || galley.size().x
                                                         > ui.available_size_before_wrap().x
                                                 {
