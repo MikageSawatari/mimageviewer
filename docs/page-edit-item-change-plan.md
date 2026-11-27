@@ -1,6 +1,6 @@
 # 編集ツールの途中で表示中の画像が外から替わるときの扱い (§1.920)
 
-作成: 2026-11-27 / ClaudeCode (設計担当)。状態: 設計 r4 (案 A'、独立設計レビュー r3 の指摘を反映)。
+作成: 2026-11-27 / ClaudeCode (設計担当)。状態: 設計 r5 (案 A'、r4 ACCEPT の後に実装担当の指摘で所有者の経路を追記)。
 
 関連: [next-release-backlog.md §1.920](next-release-backlog.md)、[conceal-feature-plan.md](conceal-feature-plan.md)、
 [detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) と §11 (リワーク外からの変更記録)。
@@ -165,6 +165,19 @@ active の編集に触れず、終えもしない (sibling の書き換えは ac
 `projected_viewer_context_id()` がどちらも投影先を返す (`viewer_context_registry.rs:501`・`:509`・`:869`) ので、
 この 2 つの一致は所有の証明にならない。一時投影の前の正当な所有者 (投影の仕組みが退避している元の context) と
 照合する (r3)。
+
+**元の所有者を読む経路 (実装担当の指摘で追記)**: 今の `with_viewer_context_state` は元の id をローカル変数
+`original` にだけ持ち、callback から読めない。そこで、一時投影の元の id を **registry の投影の表 (`ContextTable`)
+が持つ** ようにする。`with_viewer_context_state` が一時の mount に入るときに元の id を表へ記録し、戻すときに消す
+(入れ子なら最も外の元の id を保つ。callback が panic しても既存の catch_unwind の後で必ず消す)。表は
+「前面の context」(`foreground_viewer_context_id()` など、一時投影中は記録した元の id、そうでなければ mounted の id)
+を返す。これは投影の所有者 (registry) の状態で、App に足す detached 用の印ではない。
+
+- App 共通の編集の下書き・編集ツールのモードは、前面の context のもの。今の投影先が前面の context と一致する
+  ときだけ、終了 helper は作用し、§3.3 の一覧の門の新しい理由・§3.5 の入場の判定も、前面の context の
+  ことして評価する (一時投影中の sibling の処理から見て「編集中」と判定しない)。
+- 一時投影中に sibling の処理が `is_overlay_edit_mode_active()` を読むと前面の編集の値が見える問題は今もある。
+  本件で足す判定は上の一致を条件にする。既存の読み手の監査は範囲外とし、見つけたものは報告する。
 
 呼ぶ場所 (どれも「旧項目がまだ有効」な時点):
 
