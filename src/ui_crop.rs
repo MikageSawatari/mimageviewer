@@ -1550,7 +1550,7 @@ mod tests {
             true,
             true,
         );
-        assert!(app.fs_pan_drag_start.is_some());
+        assert!(app.fs_canvas_drag.pan_start().is_some());
         assert!(app.export_crop_drag.is_none());
         assert!(app.export_crop_create_drag.is_none());
 
@@ -1565,7 +1565,7 @@ mod tests {
             false,
             true,
         );
-        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_canvas_drag.pan_start().is_none());
         assert!(app.export_crop_drag.is_none());
         assert!(
             app.export_crop_create_drag.is_none(),
@@ -1583,7 +1583,7 @@ mod tests {
             false,
             true,
         );
-        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_canvas_drag.pan_start().is_none());
         assert!(app.export_crop_drag.is_none());
         assert!(app.export_crop_create_drag.is_none());
     }

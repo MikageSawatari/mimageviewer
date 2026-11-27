@@ -1,5 +1,10 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.917: `FsFisheyeIn` / `FsFisheyeOut` を FsImage / Press・既定なしで追加する。
+ini名、説明、ALL_ACTIONS、context / trigger / default、利用側と `docs/keymap.ini.default` を揃える。
+リング・マウスボタンの候補には追加しない。Ctrl+Shift+ホイールと魚眼中のShift+左ドラッグは
+ポインター位置と連続量を使うため固定入力。詳細は [キー仕様](keymap-spec.md#魚眼ズーム)。
+
 §1.363 段1〜5実装: `ScriptSlot1..20` はGlobal / Press / 既定キーなし。
 操作カスタマイズの表示名は固定の「スクリプト操作 N」とし、同じ番号の `RingActionId` とキー行を共用する。
 キー・リング等から共通の利用資格と実行経路へ接続する。キーの自動繰り返しでは起動しない。

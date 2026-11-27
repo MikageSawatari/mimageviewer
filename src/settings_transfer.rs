@@ -498,6 +498,7 @@ preferences_policy! {
         fullscreen_up_down_key_action: FullscreenUpDownKeyAction => ("閲覧表示の上下キー操作", |v, _raw| FullscreenUpDownKeyAction::all().contains(v), plain, plain);
         fullscreen_wheel_action: FullscreenWheelAction => ("閲覧表示の通常ホイール操作", |v, _raw| FullscreenWheelAction::all().contains(v), plain, plain);
         fullscreen_wheel_zoom_step: FullscreenWheelZoomStep => ("ホイールでの拡大・縮小の刻み", |v, _raw| FullscreenWheelZoomStep::all().contains(v), plain, plain);
+        plane_view_lens: crate::plane_view::PlaneLensKind => ("魚眼のレンズ", |v, _raw| crate::plane_view::PlaneLensKind::ALL.contains(v), plain, plain);
         fullscreen_n_scroll_order: FullscreenNScrollOrder => ("ページ内スクロールの読み順", |v, _raw| FullscreenNScrollOrder::all().contains(v), plain, plain);
         fullscreen_n_scroll_step_percent: u32 => ("N 字 / Z 字の移動量", |v, _raw| (10..=100).contains(v), plain, plain);
         fullscreen_n_scroll_wrap_step_percent: Option<u32> => ("N 字 / Z 字の列・段替えの移動量", |v, _raw| v.is_none_or(|v| (10..=100).contains(&v)), plain, plain);
@@ -1573,6 +1574,10 @@ mod tests {
             &settings.fullscreen_wheel_zoom_step,
             FullscreenWheelZoomStep::all(),
         );
+        settings.plane_view_lens = different_enum(
+            &settings.plane_view_lens,
+            &crate::plane_view::PlaneLensKind::ALL,
+        );
         settings.fullscreen_n_scroll_order = different_enum(
             &settings.fullscreen_n_scroll_order,
             FullscreenNScrollOrder::all(),
@@ -2634,6 +2639,55 @@ mod tests {
     }
 
     #[test]
+    fn plane_view_lens_transfer_roundtrip_missing_and_invalid_preserve_values() {
+        for &lens in &crate::plane_view::PlaneLensKind::ALL {
+            let source = Settings {
+                plane_view_lens: lens,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings {
+                plane_view_lens: different_enum(&lens, &crate::plane_view::PlaneLensKind::ALL),
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert!(
+                report
+                    .changed_fields
+                    .iter()
+                    .any(|label| label == "魚眼のレンズ")
+            );
+            assert_eq!(destination.plane_view_lens, lens);
+            let report = parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.accepted_count, 0);
+            assert_eq!(destination.plane_view_lens, lens);
+            // Transfer follows the existing enum policy: invalid imports leave the destination intact.
+            for invalid in [
+                json!("FutureLens"),
+                json!("Unknown"),
+                json!(true),
+                json!(50),
+                Value::Null,
+            ] {
+                let report = parse_preferences(&document(json!({
+                    "plane_view_lens": invalid
+                })))
+                .unwrap()
+                .apply_to(&mut destination);
+                assert_eq!(report.accepted_count, 0);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.plane_view_lens, lens);
+            }
+        }
+    }
+
+    #[test]
     fn fullscreen_bound_drag_pan_transfer_roundtrip_missing_and_invalid_preserve_values() {
         for enabled in [false, true] {
             let source = Settings {
@@ -2670,13 +2724,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 526);
+        assert_eq!(entries.len(), 527);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            174
+            175
         );
         assert_eq!(
             entries
@@ -2743,7 +2797,7 @@ mod tests {
                 "AI permissions must not become writable: {key}"
             );
         }
-        assert_eq!(wire.len(), 172);
+        assert_eq!(wire.len(), 173);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

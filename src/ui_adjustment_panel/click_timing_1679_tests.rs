@@ -909,7 +909,7 @@ fn section1679_cancel_retires_drawing_pan_and_scrub_then_accepts_fresh_gestures(
                 match gesture {
                     CancelledGesture::Drawing => assert!(shapes(&app, canvas).is_empty()),
                     CancelledGesture::Pan => {
-                        assert!(app.fs_pan_drag_start.is_some(), "{canvas:?}");
+                        assert!(app.fs_canvas_drag.pan_start().is_some(), "{canvas:?}");
                         assert_eq!(app.fs_pan, b - a, "{canvas:?}: pan must actually move");
                     }
                     CancelledGesture::Scrub | CancelledGesture::ScrubAwaitRelease => {
@@ -939,7 +939,10 @@ fn section1679_cancel_retires_drawing_pan_and_scrub_then_accepts_fresh_gestures(
                     1.2,
                     terminal.into_iter().collect(),
                 );
-                assert!(app.fs_pan_drag_start.is_none(), "{canvas:?} {gesture:?}");
+                assert!(
+                    app.fs_canvas_drag.pan_start().is_none(),
+                    "{canvas:?} {gesture:?}"
+                );
                 assert!(app.fs_middle_zoom_drag.is_none(), "{canvas:?} {gesture:?}");
                 assert_eq!(
                     (app.fs_zoom, app.fs_pan),
@@ -974,7 +977,7 @@ fn section1679_cancel_retires_drawing_pan_and_scrub_then_accepts_fresh_gestures(
                     app.fs_pan, view.1,
                     "{canvas:?} {gesture:?}: new press jumped"
                 );
-                assert_eq!(app.fs_pan_drag_start, Some((c, view.1)));
+                assert_eq!(app.fs_canvas_drag.pan_start(), Some((c, view.1)));
                 frame(
                     &mut app,
                     &ctx,
@@ -988,7 +991,7 @@ fn section1679_cancel_retires_drawing_pan_and_scrub_then_accepts_fresh_gestures(
                     view.1 + (d - c),
                     "{canvas:?} {gesture:?}: stale pan origin"
                 );
-                assert!(app.fs_pan_drag_start.is_none());
+                assert!(app.fs_canvas_drag.pan_start().is_none());
                 assert!(app.fs_middle_zoom_drag.is_none());
                 assert!(shapes(&app, canvas).is_empty(), "pan must not draw");
 

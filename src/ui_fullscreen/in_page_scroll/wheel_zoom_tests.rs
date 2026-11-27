@@ -176,6 +176,7 @@ fn action(app: &App, input: crate::wheel_input::WheelInput) -> FsWheelAction {
     FsWheelAction {
         input,
         segment: crate::wheel_input::WheelSegment {
+            vertical_before_axis_mapping: 0.,
             input,
             first_raw_ordinal: Some(1),
             last_raw_ordinal: Some(1),

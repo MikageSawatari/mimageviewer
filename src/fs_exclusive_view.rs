@@ -5,12 +5,14 @@ pub(crate) enum FsExclusiveView {
     None,
     Panorama(crate::panorama::PanoramaState),
     Depth(crate::depth_parallax::DepthViewState),
+    PlaneView(crate::plane_view::PlaneViewState),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExclusiveViewKind {
     Panorama,
     Depth,
+    PlaneView,
 }
 
 impl FsExclusiveView {
@@ -30,5 +32,14 @@ impl FsExclusiveView {
 
     pub(crate) fn is_depth(&self) -> bool {
         matches!(self, Self::Depth(_))
+    }
+
+    pub(crate) fn is_plane_view(&self) -> bool {
+        matches!(self, Self::PlaneView(_))
+    }
+
+    /// These projections own live GPU state; panorama retains its existing intent lifecycle.
+    pub(crate) fn retires_for_owner_change(&self) -> bool {
+        matches!(self, Self::Depth(_) | Self::PlaneView(_))
     }
 }

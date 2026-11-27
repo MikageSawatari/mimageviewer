@@ -1,5 +1,11 @@
 # GPU device / session テストの並列数制限
 
+§1.917の新規GPUテストは `plane_view_wgpu::gpu_tests`、`ui_fullscreen::plane_view_tests::gpu_tests`、
+`ui_dialogs::preferences::pages::plane_view_lens_tests::gpu_tests` に置く。
+既存 `.config/nextest.toml` の `test(/(^|::)gpu_tests::/)` がすべてをgpu groupへ登録する。
+CPU式・遷移・resolver・naga検証・PDF配置枠の比較はこの子moduleへ入れない。
+新規PNGの生成・目視・通常比較とGPUテストの実行は設計担当へ引き継ぐ。実装担当では未実行。
+
 ## 対象と境界
 
 `.config/nextest.toml` の `gpu` group は `max-threads = 2` とする。

@@ -80,7 +80,8 @@ fn paint_single(
             selected_current,
             false,
         )
-        .expect("ready single page paints");
+        .expect("ready single page paints")
+        .transform;
     app.fullscreen_page_layout
         .begin(FullscreenPageLayoutKind::Single);
     app.fullscreen_page_layout.push(transform);
@@ -238,7 +239,8 @@ fn paint_prepared_single_in_viewport(
             true,
             false,
         )
-        .expect("selected page paints");
+        .expect("selected page paints")
+        .transform;
     app.fullscreen_page_layout
         .begin(FullscreenPageLayoutKind::Single);
     app.fullscreen_page_layout.push(transform);
@@ -1420,7 +1422,8 @@ fn initial_placement_r4_actual_passthrough_producer_keeps_request_until_full_arr
                 true,
                 false,
             )
-            .expect("actual rendition paints");
+            .expect("actual rendition paints")
+            .transform;
         close_to(t.paint_rect.top(), 0.0);
         assert!(app.fs_initial_placement_request.is_some());
     });
@@ -1495,7 +1498,8 @@ fn initial_placement_rejected_native_uses_fitting_thumbnail_without_committing_c
                 true,
                 false,
             )
-            .expect("rejected Native falls back to thumbnail");
+            .expect("rejected Native falls back to thumbnail")
+            .transform;
         close_to(transform.paint_rect.width(), 150.0);
         close_to(transform.paint_rect.height(), 200.0);
         close_to(
@@ -2385,7 +2389,8 @@ fn paint_submitted_single(
             true,
             false,
         )
-        .expect("selected single page submits");
+        .expect("selected single page submits")
+        .transform;
     app.fullscreen_page_layout
         .begin(FullscreenPageLayoutKind::Single);
     app.fullscreen_page_layout.push(transform);

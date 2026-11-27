@@ -1,5 +1,83 @@
 # 表示パイプライン (サムネイル / フルスクリーン)
 
+## 魚眼と写真の板の傾けの表示レイヤー (PlaneView)
+
+正本: [魚眼と板の傾け設計](fisheye-plane-view-plan.md) §3〜§6・§16〜§19。単ページの静止画を対象とし、
+`FsExclusiveView::PlaneView` が context ごとの強さ・レンズ中心・素材・直近の描画 snapshot を所有する。
+2D の selector、zoom / pan / 回転 / trim / fit と `commit_fs_single_page_placement` を共用する。
+resampler の準備より前に採用を決め、元の TextureHandle から `gpu_color_copy` (Depth と共用) で mip を作る。
+PlaneView は拡大方式の resampler を通らず、最終の補正・AI・元画像ホールドの選択をそのまま描く。
+
+魚眼の係数は `k = strength × k_fill`。`PlaneViewState` の `PlaneFillMode` が `Auto` のとき、`k_fill` はその pass に描く素材の paint 四角形と
+`coverage ∩ material_source` の交わりから作る有効四角形 `Q` により、canvas 全体で余白を出さない最大値を求める。
+canvas の4隅と `Q` の4辺の16条件と、最遠点の入射角80°の上限を使い、画面寸法に比例する標本走査は行わない。
+`Auto` で画像の端を画面に入れたときは `k_fill = 0` となるが、PlaneView の占有と終了条件は変えない。
+
+通常のズームで倍率が実際に変わると、最後に画面へ描いた snapshot の `k_fill` をそのまま採用し、
+`Locked(k_lock)` へ切り替える。snapshot は `k` と `k_fill` を別々に保持し、strength から割り戻さない。
+`Locked` は余白なしの16条件を使わず、`k_fill = min(k_lock, k_cap(c))` とする。
+中心やcanvasの変更後も80°の上限だけは毎pass適用する。縮小による余白を許し、ドラッグ・自由回転・resizeで固定を解かない。
+通常ズームの倍率が変わらない入力やsnapshotの無い入力では固定せず、既に固定中なら値を更新しない。
+
+Ctrl+Shiftの寄るsegmentと `FsFisheyeIn` でも `Locked` を維持し、strengthに比例して歪みを強める。
+固定中は余白が出得る。`Auto` へ戻すには、PlaneViewを終了してから入り直す。
+strengthが0でも傾きが恒等でない、または傾けドラッグを所有していれば終了せず、固定を保つ。
+離れる入力はモードを変えず、入力のzoom・panをそのまま返し、最小の重なりの補正もかけない。
+strengthだけを1ノッチ1/4ずつ下げ、0かつ傾き恒等かつ傾け所有なしで終了する。終了時も倍率・panは変えない。
+固定の状態は描画側が所有し、pose・純粋な覆う遷移・クリックの分類へ入れない。
+ホイールの固定候補は予測前にsnapshotからproposalへ写し、context・anchorを照合して遅延適用でも同じ値を使う。
+入力列の途中の終了・所有者交代で候補を捨て、同じpassで入り直した状態へ引き継がない。
+即時入力は描画前のsnapshotを読み、そのpassに反映する。遅延適用のpassは旧状態で描き、適用後の状態は次passで描く。
+固定状態は既存の `fs_exclusive_view` 全体の退避・引き継ぎに含め、contextをまたいで共有しない。
+
+寄る操作は、連続配置の `Q` が余裕を加えた canvas を覆う目標の倍率・panへ、数ノッチに分けて近づける。
+目標はレンズ中心の下のsource点を固定した拡大と、覆うpanの許容区間への射影で求める。
+覆う処理の1ノッチの上限は倍率1.5倍、移動量はcanvasの対角の1/4 (論理座標へ換算)。
+倍率の対数と移動量の両方から必要ノッチ数を決め、§19.2の連続経路に沿って進める。進み具合は状態に持たない。
+覆う途中は通常の拡大を重ねず、覆い終わったsegmentの残りだけ、既存のホイール倍率設定で通常の拡大を行う。
+覆う途中もstrengthは1ノッチ1/4ずつ上がる。`Auto`の係数は描画の配置から求めるため、
+余裕を含む目標に着く前でも、実際のcanvasを覆った時点から連続に増え始めることがある。
+連続配置と描画の量子化配置は、単ページ描画と同じ SourceLayout・sampler contain の resolver を使う。
+素材の情報は実際に描いた素材の記録から、canvas・DPI・回転・trim・fit・配置は現在の pass から取り、
+予測前に確定した `PlaneCoverInput` を即時適用と描画後の遅延適用で共用する。
+最小の重なりの pan 制約は寄る遷移の最後に同じ入力で1回だけ適用し、layout による再クランプはしない。
+まだ描画記録のないページでは、その frame の魚眼操作の量を使わない。
+量子化との差への余裕は4物理画素。覆いを保証する範囲の候補は、表示の縦横比32以下・遷移後の連続配置の
+座標の絶対値が2²¹物理画素以下であり、倍率の再計算と平均・trim・自由回転を通る実経路の総誤差の試験で確定する。
+範囲の外でも同じ覆う計算を使い、誤差に応じた余裕の再計算や追加の補正経路は設けない。
+`Auto` ではズーム上限や範囲の外で描画の `Q` が canvas を覆わなければ、`k_fill = 0` で魚眼の写像が恒等となる。
+傾きも恒等なら2Dと同じ余白が残る。`Auto` で描画の `Q` が覆う場合は、その `Q` から求めた係数により魚眼による余白を作らない。
+これらの覆い・係数・固定は傾き0の2Dの枠から求める。傾け自体は `PlaneFillMode` も倍率も変えず、傾きによる余白を許す。
+
+描画は魚眼の放射状写像と、傾けた平面への遠近の逆写像を順に合成する。
+魚眼の結果を `v₁` とし、canvasの半対角 `ρ_d` と対角画角50°から焦点距離 `f_p = ρ_d / tan(25°)` を求める。
+`d = (v₁.x, v₁.y, f_p)`、`P₀ = (0, 0, f_p)`、`n = Rot·ẑ` とし、
+`t = (n·P₀)/(n·d)`、`L = (Rotᵀ·(t·d − P₀)).xy`、`q = c + L` を既存の2D/source写像へ渡す。
+傾き恒等では従来の魚眼と同じ演算順を保ち、魚眼の係数0では純粋な遠近になる。
+負の `den = n·d` は裏側の有効な交点を含むため潰さない。平行判定と `t ≤ 0` は無効にし、
+除算前の有限な代用値と微分後のマスクで扱う。真横の姿勢ではcanvas全体が下地となり、裏側は反転した絵を描く。
+
+`PlaneViewState::tilt` は正規化した四元数 `[w,x,y,z]` で、恒等は `[1,0,0,0]`。
+Ctrl+Shift+左ドラッグの物理移動から `ω = ((π/2)/R)·(dy,−dx,0)` を作り、1つの増分回転を画面の軸で左から掛ける。
+恒等の判定はベクトル成分の長さと0.01°の閾値で共通化し、Defaultへの寄せは解放とresetでだけ行う。
+最初の0でない移動から傾けだけのPlaneViewへ入れる。押下で決めたTilt所有は入場と恒等を通る移動でも保ち、
+解放後にstrength 0かつ恒等なら終了する。予測と実適用へは恒等と所有の情報を写し、poseへ傾きを入れない。
+`FsPlaneTiltReset` は所有に関係なく傾きを戻し、strengthが正なら魚眼を残す。
+
+`PlaneGpuCopy` は TextureId、`PlaneMaterial` は幾何の記述全体で照合する。登録待ちは所有 viewport の次passを要求し、
+配置枠の各辺が1/64物理画素以内で一致すれば前の不変素材をその素材自身の変換で描く。
+`DisplayedImageGeometry::placement_frame` は sampler を contain / 丸めする前の枠で、旧来の SourceLayout もこれを返す。
+`fullscreen_page_layout` / last_drawn は実際に描いた変換を記録する。PDF の需要は止めず、指定倍率の需要用矩形は
+単ページ描画の戻り値 `FsSinglePageDraw` で現在素材の変換から並べて返す。
+
+画面と書き出しは `PLANE_SHADER` 1本。group0 は不変素材、group1 は callback / 出力ごとの uniform、pipeline は target format ごと。
+傾きは回転行列を末尾の3つのvec4へ渡し、従来の13個のuniformのindexを維持する。CPU参照式は `plane_view::{camera_point,texture_point}`。
+2Dで描いたpassは last_drawn を消す。キャプチャ・画像コピー・Ctrl+E は一致する last_drawn の Arc だけを要求へ渡し、
+既存workerで `PlaneFrameRenderer` の描画・読み戻しを行う。出力座標と市松の座標はcanvas基準。
+傾きと裏側も最後のsnapshotのuniformで出力し、出力時に姿勢や魚眼の係数を計算し直さない。
+寸法の上限は行padding込みbufferとtextureの両方を resolver で守り、Ctrl+Eの追加縮小は通さない。
+写しのVRAMは allocation lifetime のRAII会計で、終了後にcallback / 出力要求だけが持つ世代も重複なく数える。
+
 ## 通常の物理フォルダの手動順（§1.911）
 
 `app/book_materialization.rs::materialize_local_folder_listing_with_order_and_metadata` が、

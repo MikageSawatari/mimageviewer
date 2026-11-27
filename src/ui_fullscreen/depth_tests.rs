@@ -253,6 +253,7 @@ fn depth_wheel_navigates_and_ctrl_wheel_uses_image_zoom_without_panorama_fov() {
         let action = FsWheelAction {
             input,
             segment: crate::wheel_input::WheelSegment {
+                vertical_before_axis_mapping: 0.,
                 input,
                 first_raw_ordinal: None,
                 last_raw_ordinal: None,

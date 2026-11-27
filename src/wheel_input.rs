@@ -21,6 +21,7 @@ pub(crate) struct WheelInput {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WheelSegment {
     pub(crate) input: WheelInput,
+    pub(crate) vertical_before_axis_mapping: f32,
     pub(crate) first_raw_ordinal: Option<u32>,
     pub(crate) last_raw_ordinal: Option<u32>,
 }
@@ -106,6 +107,19 @@ pub(crate) fn remaining_wheel_segments(
         else {
             continue;
         };
+        let vertical_before_axis_mapping = match event {
+            egui::Event::MouseWheel {
+                unit,
+                delta,
+                phase: egui::TouchPhase::Move,
+                ..
+            } => match unit {
+                egui::MouseWheelUnit::Point => delta.y,
+                egui::MouseWheelUnit::Line => options.line_scroll_speed * delta.y,
+                egui::MouseWheelUnit::Page => input.viewport_rect().height() * delta.y,
+            },
+            _ => 0.,
+        };
         let WheelInput {
             delta,
             modifiers,
@@ -119,9 +133,11 @@ pub(crate) fn remaining_wheel_segments(
             && phase == egui::TouchPhase::Move
         {
             previous.input.delta += delta;
+            previous.vertical_before_axis_mapping += vertical_before_axis_mapping;
             previous.last_raw_ordinal = ordinals[index];
         } else {
             segments.push(WheelSegment {
+                vertical_before_axis_mapping,
                 input: WheelInput {
                     delta,
                     modifiers,
@@ -294,6 +310,43 @@ pub(crate) mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[test]
+    fn plane_segments_retain_only_unconsumed_pre_axis_vertical_in_each_unit() {
+        let mods = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
+        for (unit, scale) in [
+            (egui::MouseWheelUnit::Point, 1.),
+            (egui::MouseWheelUnit::Line, 13.),
+            (egui::MouseWheelUnit::Page, 300.),
+        ] {
+            let state = input(
+                vec![
+                    wheel(unit, egui::vec2(7., 0.125), mods),
+                    wheel(unit, egui::vec2(3., 0.375), mods),
+                ],
+                mods,
+            );
+            let segment = remaining_wheel_segments(&state, options())[0];
+            assert_eq!(segment.vertical_before_axis_mapping, 0.5 * scale);
+            assert_eq!(segment.input.delta.y, 0.);
+            assert_eq!(segment.input.delta.x, 10.5 * scale);
+        }
+        let mut state = input(
+            vec![wheel(
+                egui::MouseWheelUnit::Point,
+                egui::vec2(0., 40.),
+                mods,
+            )],
+            mods,
+        );
+        state
+            .events
+            .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+        assert!(
+            remaining_wheel_segments(&state, options()).is_empty(),
+            "an earlier popup's consumed raw event is not revived"
+        );
     }
 
     #[test]

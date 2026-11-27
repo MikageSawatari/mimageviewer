@@ -483,6 +483,10 @@ impl App {
                 });
             }
         }
+        accountant.add_native_bytes(
+            VramSubsystem::PlaneView,
+            crate::plane_view_wgpu::resident_bytes(),
+        );
         accountant.finish()
     }
 

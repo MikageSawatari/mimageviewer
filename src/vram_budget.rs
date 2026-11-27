@@ -134,13 +134,14 @@ pub(crate) enum VramSubsystem {
     LanczosOutputs,
     PageTurnPresentation,
     DepthParallax,
+    PlaneView,
     Thumbnails,
     ThumbTextures,
     ThumbAdjustTex,
 }
 
 impl VramSubsystem {
-    pub(crate) const ALL: [Self; 16] = [
+    pub(crate) const ALL: [Self; 17] = [
         Self::FsCache,
         Self::FinalCompositeCache,
         Self::AdjustmentCache,
@@ -154,6 +155,7 @@ impl VramSubsystem {
         Self::LanczosOutputs,
         Self::PageTurnPresentation,
         Self::DepthParallax,
+        Self::PlaneView,
         Self::Thumbnails,
         Self::ThumbTextures,
         Self::ThumbAdjustTex,
@@ -174,6 +176,7 @@ impl VramSubsystem {
             Self::LanczosOutputs => "lanczos_outputs",
             Self::PageTurnPresentation => "page_turn_presentation",
             Self::DepthParallax => "depth_parallax",
+            Self::PlaneView => "plane_view",
             Self::Thumbnails => "thumbnails",
             Self::ThumbTextures => "thumb_textures",
             Self::ThumbAdjustTex => "thumb_adjust_tex",

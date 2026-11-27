@@ -1,5 +1,14 @@
 # UI スレッドの応答性 (Ctrl+↑↓ 連打が引っかからないために)
 
+## 魚眼ズームの写しと出力 (§1.917)
+
+画面素材の写しは共有 `ColorMipCopier` のGPU blit/mip生成だけで、UIではreadback/poll(Wait)を行わない。
+写しの確保・encode・submitを含むCPU時間を `plane_view/color_copy` へ記録する。
+キャプチャ・コピー・Ctrl+Eの既存workerが描画・readbackを行い、`plane_view/export_draw` / `readback` を記録する。
+perf extrasは有効時だけ作る。UIに新しいファイル読込・走査・CPUデコード・GPU待機は追加しない。
+通常のrenderer登録待ちは所有viewportの次pass要求だけで進める。snapshotが素材をArcで保持し、workerはlive Appを参照しない。
+実行時間・VRAMの実測と実機の受入は未実施。
+
 ## 外部リンクと起動先・場所のフォルダ走査（§1.861・§1.853、実装・検証待ち）
 
 URL・外部プレイヤー・ツイート・Google マップの Shell 呼び出しは、COM STA を初期化した短命の

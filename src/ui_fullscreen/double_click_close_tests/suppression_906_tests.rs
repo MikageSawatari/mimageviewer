@@ -76,7 +76,7 @@ fn suppression_906_drag_after_same_frame_restore_moves_zoomed_image() {
         false,
         egui::Modifiers::NONE,
     )]);
-    assert!(canvas.app.fs_pan_drag_start.is_none());
+    assert!(canvas.app.fs_canvas_drag.pan_start().is_none());
 }
 
 fn brush_transform() -> DisplayedImageTransform {
@@ -460,14 +460,14 @@ fn suppression_906_overlay_ctrl_added_to_space_pan_uses_final_release_level() {
         None,
         run,
     );
-    assert!(canvas.app.fs_pan_drag_start.is_some());
+    assert!(canvas.app.fs_canvas_drag.pan_start().is_some());
     canvas.merge_using(
         vec![button(canvas_pos(), false, egui::Modifiers::CTRL)],
         true,
         None,
         run,
     );
-    assert!(canvas.app.fs_pan_drag_start.is_none());
+    assert!(canvas.app.fs_canvas_drag.pan_start().is_none());
     assert_eq!(canvas.app.fs_primary_suppression, ReleasedThisPass(Other));
     canvas.merge_using(
         click(canvas_pos(), egui::Modifiers::NONE),
