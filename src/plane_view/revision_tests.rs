@@ -705,12 +705,50 @@ fn plane_revision_r9_resize_keeps_pure_result_and_terminal_overlap_uses_same_inp
         -1.,
     );
     let transformed = cover.continuous(leaving.zoom, leaving.pan).unwrap();
+    let painted_bounds = Rect::from_points(&transformed.paint_quad().positions);
     assert_eq!(
-        crate::ui_fullscreen::pan_correction_for_minimum_overlap(transformed.hit_rect, canvas),
+        crate::ui_fullscreen::pan_correction_for_minimum_overlap(painted_bounds, canvas),
         Vec2::ZERO
     );
-    let overlap = transformed.hit_rect.intersect(canvas);
+    let overlap = painted_bounds.intersect(canvas);
     assert!(overlap.width() >= 47.99 && overlap.height() >= 47.99);
+}
+
+#[test]
+fn plane_revision_terminal_overlap_uses_unclipped_paint_for_each_offscreen_direction() {
+    let canvas = rect(vec2(1600., 900.));
+    let center = canvas.center();
+    for rotation in [Rotation::None, Rotation::Cw90] {
+        for degrees in [0_f32, 17.] {
+            let mut cover = fixture(canvas, vec2(1600., 900.));
+            cover.transform.rotation = rotation;
+            cover.transform.free_rotation_rad = degrees.to_radians();
+            cover.transform.content_bbox = Some(Rect::from_min_max(pos2(0.2, 0.1), pos2(0.8, 0.9)));
+            let pose = PlaneViewPose {
+                anchor: anchor(),
+                strength: 0.5,
+                lens_center: Vec2::splat(0.5),
+            };
+            for pan in [
+                vec2(10000., 0.),
+                vec2(-10000., 0.),
+                vec2(0., 10000.),
+                vec2(0., -10000.),
+                vec2(10000., -10000.),
+            ] {
+                let before = cover.continuous(4., pan).unwrap();
+                assert!(!before.hit_rect.is_positive(), "fixture must be offscreen");
+                let out = wheel(cover, Some(pose), 4., pan, center, -1.);
+                let after = cover.continuous(out.zoom, out.pan).unwrap();
+                let painted_bounds = Rect::from_points(&after.paint_quad().positions);
+                let overlap = painted_bounds.intersect(canvas);
+                assert!(
+                    overlap.width() >= 47.99 && overlap.height() >= 47.99,
+                    "pan {pan:?}, rotation {rotation:?}, degrees {degrees}: {overlap:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

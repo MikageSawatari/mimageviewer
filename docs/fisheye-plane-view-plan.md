@@ -1027,6 +1027,34 @@ cargo nextest run -p mimageviewer --lib -E 'test(/depth_/) | test(/displayed_ima
 
 新しい統合試験ファイルやUI PNGの更新は不要。今回の `cargo fmt` は正常終了、`python scripts/check_ui_glyphs.py` は危険な字形なし、`python scripts/check_site_cards.py` は54カード・超過0。ビルド・test・check・clippy・アプリ起動・コミット、算術用スクリプトは実装担当では実行していない。保証範囲の確定、Rustのコンパイルと試験、GPUの画素結果・性能・実機での見た目は未確認。
 
+### 改訂 1 の実装記録 (最初の関連試験で判明した不具合の修正)
+
+着手時 `8a96647ed`。設計担当の `test(/plane_view|fisheye|displayed_image_transform/)` のログ (124件中100件成功、24件失敗) とソースを照合した。今回の実装担当は Rust のビルド・試験を実行していない。
+
+**受理済み素材の寿命の不具合 (製品、22件)**: メインの単ページ経路は描画前に layout を clear し、描画後にも begin(Single) する。従来の `record_plane_cover_material` は前者で Empty になった kind を条件にし、仮に記録できても後者で消していた。このため次の入力の producer が常に None となり、キーもホイールも入場しなかった。`FsSinglePageDraw` に実際に描いた素材の `PlaneCoverRecord` を載せ、呼び出し元が `publish_single` で begin・push の後にページと同時に公開する形へ修正した。記録を作る helper は layout を変更しない。PlaneView は old_input/old_layout、通常表示は実際に採用した payload を引き続き使う。
+
+- `plane_view_tests.rs:43` で停止した15件 (touch、ModifierHold、PDF両需要、登録待ち、入口条件、出力snapshot、レンズ所有2件、素材待ち、占有、終了、PDF前素材、縦ホイール、遅延クリック、同passの入場/終了クリック) は、入力検査の前に共通の `enter` が素材記録を得られず停止していた。これらの期待値は変更しない。
+- `plane_key_stage_precedes_wheel_regardless_of_raw_order`、`plane_real_fractional_segments_match_and_downward_key_only_spends_strength` は、記録欠落でキー/ホイールの入場が起きず pose が None だった。同じ修正で入口を接続し、期待値は維持する。
+- `plane_same_pass_prediction_and_application_use_the_same_pose_and_click_classification` の `expected.3` も、予測に渡す cover が None のため false だった。予測/適用やクリック分類の期待値は維持する。
+- `plane_revision_unpainted_page_discards_wheel_and_assigned_key_until_material_record_exists` と `plane_revision_cover_producer_rebinds_current_canvas_dpi_rotation_and_fit` は、実描画後も記録が残らなかった。同じ公開境界の修正で扱い、未描画入力の破棄と現在条件への組み替えの検査を維持する。
+- `plane_key_noop_and_rejection_preserve_pending_initial_placement_and_pan` と `plane_wheel_noop_and_rejection_preserve_pending_initial_placement_and_pan` は、記録なしの入力を使わない §16.3 の経路で、Trim の入口拒否まで届かなかった。実描画の記録を残す修正で入口拒否に届くようにし、理由の通知と初期配置/panの保持を引き続き検査する。
+
+ほかの単ページ経路も確認した。Z/照準の描画は独自の入力所有、book mode surface と display unit holdover は Captured の記述であり、現在素材の記録を採用しない。比較用の代替 transform も記録なしで公開する。これらや erase、page turn、連結読みの layout 再構築は begin/clear の消去を維持する。in_page_scroll 内の layout 代入はテストの新規 layout への置換で、古い記録を引き継がない。push/push_occurrence/push_spread_occurrence でも既存の記録を消し、追加のページへ古い記録を付け替えない。同じページの occurrence のみを束縛し直す rebind_occurrences は記録を保つ。実描画の普通/PlaneViewの公開と、これらの再構築境界を回帰試験へ追加する。
+
+**最小重なりの不具合 (製品、1件)**: `plane_revision_r9_resize_keeps_pure_result_and_terminal_overlap_uses_same_input` の失敗は、終端補正へ viewport と交差済みの `hit_rect` を渡したため。完全に画面外の配置では補正に必要な元の寸法が失われる。既存の通常 pan は UV の四隅を変換した未clip AABBを使っている。§16.3 の「同じ最小重なりの規則」に合わせ、同じ `PlaneCoverInput` の連続配置の paint quad の未clip AABB を終端で一度だけ使う。試験の重なり対象もこの未clip矩形に直し、47.99以上の重なりと追加補正ゼロの期待値を維持した。画面外の各方向・保存回転・自由回転・trimの回帰も追加する。
+
+**範囲外の反例の前提の誤り (テスト、1件)**: `plane_outside_precision_preserves_known_large_coordinate_counterexamples` の4096×1の例は、論理座標差8 pointsにppp1.75を掛けた値を、そのまま実描画のQの差と見なしていた。§16.2 のQは画面用の物理座標化まで含む。同じ順序で両Qをf32で物理座標にすると16画素の格子へ丸まり、差が相殺される。停止記録の「14物理画素」はその中間値についての算術であり、この例の実描画Qの差としては訂正する。この例は論理差と物理相殺の両方を検査する独立試験に分け、別に倍率の再計算・両軸の平均まで含めて本当に覆いを失う範囲外の例を加える。覆わない場合の `k_fill = 0` と2Dと同じ写像の検査は維持する。新しい例の算術もRust試験として設計担当に渡し、未実行の結果を確認済みとはしない。
+
+**設計との差分**: 仕様の変更はない。変更した試験の根拠は上記の §16.2 の実描画Qと §16.3 の既存と同じ最小重なりの規則である。δ=4と保証範囲の候補は変えていない。前回ログにある成功は再実行の成功とは扱わず、修正後の試験と保証範囲の確定は設計担当の実行で確認する。
+
+変更ファイル: `src/displayed_image_transform.rs`、`src/ui_fullscreen.rs`、`src/plane_view.rs`、`src/plane_view/revision_tests.rs`、`src/plane_view/precision_tests.rs`、`src/ui_fullscreen/plane_view_tests.rs`、同 `gpu_tests/revision_input_tests.rs`、本書。実装担当でのビルド・test・check・clippy・実アプリ・GPU画素の確認、コミットは未実施。再実行のfilterは上と同じ `test(/plane_view|fisheye|displayed_image_transform/)` を用いる。
+
+新しい範囲外の例は画像8192×1、canvas1600×900、Height fit、zoom50、ppp1、自由回転90度、pan=(-21632, 67108864)。短辺の座標差から再計算した倍率と長辺側の倍率の平均により、量子化後の長辺が縮み、回転中心も移る経路を通す。連続Qがcanvas⁺を覆うことと、実Qは覆わないことを同じ例で検査する。数値は試験のassertに置き、実行結果で確認する。
+
+追加した回帰は `plane_revision_real_paint_publishes_material_and_transform_together`、`plane_revision_layout_replacements_retire_accepted_material_before_the_next_input`、`plane_revision_record_creation_is_independent_of_layout_and_publication_is_explicit` (既存gpu_tests内)、`plane_revision_terminal_overlap_uses_unclipped_paint_for_each_offscreen_direction`、`plane_outside_precision_distinguishes_logical_shift_from_physical_q_error`、`plane_outside_precision_scale_reconstruction_can_lose_actual_cover`。設計担当は前回と同じ `cargo nextest run -p mimageviewer --lib -E 'test(/plane_view|fisheye|displayed_image_transform/)'` で再検証できる。PNG更新や新しい統合試験は不要。
+
+変更ファイル: `src/displayed_image_transform.rs`、`src/ui_fullscreen.rs`、`src/plane_view.rs`、`src/plane_view/precision_tests.rs`、`src/plane_view/revision_tests.rs`、`src/ui_fullscreen/plane_view_tests.rs`、同 `gpu_tests/revision_input_tests.rs`、本書§11。`cargo fmt` は正常終了、UI字形検査は危険な字形なし、サイト検査は54カード・超過0、`git diff --check` も正常終了。修正後のコンパイル・試験、新しい数値例、GPU画素と実機の見た目は未確認。アプリ起動・コミットは行っていない。
+
 ## 12. 文書
 
 - [display-pipeline.md](display-pipeline.md): PlaneView の節 (§5 の要約と §6 の出口)。

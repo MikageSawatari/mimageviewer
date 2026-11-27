@@ -352,23 +352,87 @@ fn assert_outside_draw_semantics(input: PlaneCoverInput, zoom: f32, pan: Vec2, c
 }
 
 #[test]
+fn plane_outside_precision_distinguishes_logical_shift_from_physical_q_error() {
+    let input = cover_input(egui::vec2(4096., 1.), egui::vec2(1600., 900.), 1.75);
+    let (continuous, actual) = resolve_pair(input, 49., Vec2::ZERO);
+    let reference = quad(&continuous, input);
+    let drawn = quad(&actual, input);
+    // The earlier arithmetic stopped at the logical displacement (8 points * 1.75 = 14).
+    // screen() subsequently multiplies BOTH Qs by ppp in f32. At this magnitude their
+    // physical endpoints round to the same 16-pixel grid, so this is not a >4px Q error.
+    assert_eq!(normal_edge_error(reference, drawn, 1.) * 1.75, 14.);
+    assert_eq!(reference.map(|p| p * 1.75), drawn.map(|p| p * 1.75));
+    assert_eq!(normal_edge_error(reference, drawn, 1.75), 0.);
+    assert_outside_draw_semantics(input, 49., Vec2::ZERO, true);
+    assert_outside_draw_semantics(
+        input,
+        49.,
+        egui::vec2(actual.full_image_rect.width(), 0.),
+        false,
+    );
+}
+
+#[test]
 fn plane_outside_precision_preserves_known_large_coordinate_counterexamples() {
-    for (texture, canvas, zoom, ppp) in [
-        (egui::vec2(4096., 1.), egui::vec2(1600., 900.), 49., 1.75),
-        (
-            egui::vec2(8192., 3.),
-            egui::vec2(1600., 6301.53857421875),
-            50.,
-            1.3,
-        ),
+    let input = cover_input(
+        egui::vec2(8192., 3.),
+        egui::vec2(1600., 6301.53857421875),
+        1.3,
+    );
+    let (continuous, actual) = resolve_pair(input, 50., Vec2::ZERO);
+    assert!(normal_edge_error(quad(&continuous, input), quad(&actual, input), 1.3) > 4.);
+    assert_outside_draw_semantics(input, 50., Vec2::ZERO, true);
+    assert_outside_draw_semantics(
+        input,
+        50.,
+        egui::vec2(actual.full_image_rect.width(), 0.),
+        false,
+    );
+}
+
+#[test]
+fn plane_outside_precision_scale_reconstruction_can_lose_actual_cover() {
+    let mut input = cover_input(egui::vec2(8192., 1.), egui::vec2(1600., 900.), 1.);
+    input.transform.free_rotation_rad = std::f32::consts::FRAC_PI_2;
+    let pan = egui::vec2(-21_632., 67_108_864.);
+    let (continuous, actual) = resolve_pair(input, 50., pan);
+    // Keep the real f32 operation order visible: the unrotated short-axis endpoints
+    // straddle 2^26, whose two sides have different spacings. Their difference is 44996,
+    // not the requested 45000. Averaging this reconstructed scale with the long-axis
+    // scale shrinks the quantized long edge by 16384 and shifts its rotation center.
+    assert_eq!(continuous.full_image_rect.width() / 8192., 45_000.);
+    assert_eq!(continuous.full_image_rect.height(), 44_996.);
+    assert_eq!(continuous.total_scale, (45_000. + 44_996.) * 0.5);
+    assert_eq!(continuous.total_scale, 44_998.);
+    assert_eq!(
+        continuous.full_image_rect.width() - actual.full_image_rect.width(),
+        16_384.,
+    );
+    assert_eq!(
+        continuous.full_image_rect.center().x - actual.full_image_rect.center().x,
+        8_192.,
+    );
+    let reference = quad(&continuous, input);
+    let drawn = quad(&actual, input);
+    assert!(normal_edge_error(reference, drawn, 1.) > 4.);
+    let target = input
+        .transform
+        .viewport_rect
+        .expand(PLANE_COVER_MARGIN_PHYSICAL);
+    for corner in [
+        target.left_top(),
+        target.right_top(),
+        target.right_bottom(),
+        target.left_bottom(),
     ] {
-        let input = cover_input(texture, canvas, ppp);
-        let (continuous, actual) = resolve_pair(input, zoom, Vec2::ZERO);
-        assert!(normal_edge_error(quad(&continuous, input), quad(&actual, input), ppp) > 4.);
-        assert_outside_draw_semantics(input, zoom, Vec2::ZERO, true);
-        let width = actual.full_image_rect.width();
-        assert_outside_draw_semantics(input, zoom, egui::vec2(width, 0.), false);
+        assert!(
+            contains(reference, corner, 0.),
+            "continuous Q must cover canvas+"
+        );
     }
+    // Unlike a displacement-only example, this exercises the actual unsupported-range
+    // outcome: the continuous cover is lost, and the screen uniform must select identity.
+    assert_outside_draw_semantics(input, 50., pan, false);
 }
 
 #[test]

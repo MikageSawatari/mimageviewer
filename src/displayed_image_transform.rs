@@ -1192,7 +1192,20 @@ impl FullscreenPageLayout {
         self.begin(FullscreenPageLayoutKind::Empty);
     }
 
+    /// Publish one completed paint and its accepted material at the same boundary.
+    pub(crate) fn publish_single(
+        &mut self,
+        transform: DisplayedImageTransform,
+        plane_cover: Option<PlaneCoverRecord>,
+    ) {
+        debug_assert!(plane_cover.is_none_or(|record| record.input.page_idx == transform.page_idx));
+        self.begin(FullscreenPageLayoutKind::Single);
+        self.push(transform);
+        self.plane_cover = plane_cover;
+    }
+
     pub(crate) fn push(&mut self, transform: DisplayedImageTransform) {
+        self.plane_cover = None;
         self.pages.push(DisplayedPage::new(transform));
     }
 
@@ -1201,6 +1214,7 @@ impl FullscreenPageLayout {
         transform: DisplayedImageTransform,
         occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
     ) {
+        self.plane_cover = None;
         self.pages
             .push(DisplayedPage::with_occurrence(transform, occurrence));
     }
@@ -1212,6 +1226,7 @@ impl FullscreenPageLayout {
         side: SingletonSpreadPlacement,
         gap: f32,
     ) {
+        self.plane_cover = None;
         let mut page = DisplayedPage::with_occurrence(transform, occurrence);
         page.spread_gap = Some((side, gap));
         self.pages.push(page);

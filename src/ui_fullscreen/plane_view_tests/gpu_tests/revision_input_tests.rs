@@ -33,10 +33,8 @@ fn r9_record(app: &mut App, viewport: egui::Rect) {
         pixel_fit: RectPixelFit::Texels,
     };
     let drawn = resolve_fs_image_transform(input, Some(size)).unwrap();
-    app.fullscreen_page_layout
-        .begin(FullscreenPageLayoutKind::Single);
-    app.fullscreen_page_layout.push(drawn);
-    app.record_plane_cover_material(0, input, Some(size), material);
+    let record = app.plane_cover_record(0, input, Some(size), material);
+    app.fullscreen_page_layout.publish_single(drawn, record);
     app.fs_zoom = 4.;
     app.fs_pan = egui::vec2(2202., 0.);
     app.set_fs_exclusive_view(
@@ -249,5 +247,242 @@ fn plane_revision_cover_producer_rebinds_current_canvas_dpi_rotation_and_fit() {
         app.plane_cover_input_for_canvas(&viewer.ctx, canvas)
             .is_none(),
         "a new display unit cannot borrow the previous slice's material"
+    );
+}
+
+#[test]
+fn plane_revision_real_paint_publishes_material_and_transform_together() {
+    let _keys = crate::key_input::lock_test_input();
+    let mut app = crate::app::setup_app_for_test();
+    let mut viewer = viewer(&mut app);
+    for plane in [false, true] {
+        if plane {
+            enter(&mut app, &mut viewer);
+        }
+        assert_eq!(
+            app.fullscreen_page_layout.kind(),
+            FullscreenPageLayoutKind::Single
+        );
+        let accepted = app
+            .fullscreen_page_layout
+            .plane_cover
+            .expect("a completed real single-page paint publishes its accepted material");
+        let drawn = {
+            let pages = app
+                .fullscreen_page_layout
+                .displayed_pages()
+                .collect::<Vec<_>>();
+            assert_eq!(pages.len(), 1);
+            pages[0].transform
+        };
+        assert_eq!(accepted.anchor, app.plane_view_anchor(drawn.page_idx));
+        assert_eq!(accepted.input.source_size, drawn.source_size);
+        assert_eq!(accepted.input.texture_size, drawn.texture_size);
+        assert_eq!(accepted.input.viewport_rect, drawn.viewport_rect);
+        assert_eq!(
+            resolve_fs_image_transform(accepted.input, accepted.layout_source_size).unwrap(),
+            drawn,
+            "the record describes the actual accepted paint, not an earlier layout"
+        );
+        if plane {
+            let FsExclusiveView::PlaneView(state) = &app.fs_exclusive_view else {
+                panic!("entered PlaneView")
+            };
+            let snapshot = state
+                .last_drawn
+                .as_ref()
+                .expect("the real pass painted PlaneView");
+            assert_eq!(snapshot.material.description, accepted.material);
+            assert_eq!(snapshot.anchor, accepted.anchor);
+        }
+        let produced = app
+            .plane_cover_input_for_canvas(&viewer.ctx, drawn.viewport_rect)
+            .unwrap();
+        assert_eq!(produced.material, accepted.material);
+        assert_eq!(produced.transform.source_size, accepted.input.source_size);
+        assert_eq!(produced.transform.texture_size, accepted.input.texture_size);
+    }
+}
+
+#[test]
+fn plane_revision_layout_replacements_retire_accepted_material_before_the_next_input() {
+    let _keys = crate::key_input::lock_test_input();
+    let mut app = crate::app::setup_app_for_test();
+    let viewer = viewer(&mut app);
+    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size);
+    r9_record(&mut app, viewport);
+    let original = app.fullscreen_page_layout.clone();
+    let old = original.plane_cover.unwrap();
+    let transform = resolve_fs_image_transform(old.input, old.layout_source_size).unwrap();
+    let occurrence = SpreadPageOccurrence::navigation(transform.page_idx, transform.page_idx);
+    for boundary in 0..10 {
+        app.fullscreen_page_layout = original.clone();
+        assert!(
+            app.plane_cover_input_for_canvas(&viewer.ctx, viewport)
+                .is_some()
+        );
+        match boundary {
+            0 => app
+                .fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Empty),
+            1 => app
+                .fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Single),
+            2 => app
+                .fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Spread),
+            3 => app
+                .fullscreen_page_layout
+                .begin(FullscreenPageLayoutKind::Continuous),
+            4 => app.fullscreen_page_layout.clear(),
+            5 => app.fullscreen_page_layout.push(transform),
+            6 => app
+                .fullscreen_page_layout
+                .push_occurrence(transform, occurrence),
+            7 => app.fullscreen_page_layout.push_spread_occurrence(
+                transform,
+                occurrence,
+                SingletonSpreadPlacement::Left,
+                12.,
+            ),
+            8 => app.fullscreen_page_layout = FullscreenPageLayout::default(),
+            9 => {
+                let mut replacement = FullscreenPageLayout::default();
+                replacement.begin(FullscreenPageLayoutKind::Single);
+                replacement.push(transform);
+                app.fullscreen_page_layout = replacement;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            app.fullscreen_page_layout.plane_cover.is_none(),
+            "boundary {boundary}"
+        );
+        assert!(
+            app.plane_cover_input_for_canvas(&viewer.ctx, viewport)
+                .is_none(),
+            "boundary {boundary} cannot feed the retired material into prediction"
+        );
+    }
+
+    // A completed single paint without accepted material also replaces a previous record.
+    app.fullscreen_page_layout = original.clone();
+    app.fullscreen_page_layout.publish_single(transform, None);
+    assert_eq!(app.fullscreen_page_layout.displayed_pages().count(), 1);
+    assert!(app.fullscreen_page_layout.plane_cover.is_none());
+    assert!(
+        app.plane_cover_input_for_canvas(&viewer.ctx, viewport)
+            .is_none()
+    );
+
+    // Role rebinding preserves the same page and geometry, including its accepted material.
+    app.fullscreen_page_layout = original;
+    assert!(app.fullscreen_page_layout.rebind_occurrences(&[occurrence]));
+    assert_eq!(
+        app.fullscreen_page_layout.plane_cover.unwrap().material,
+        old.material
+    );
+    assert!(
+        app.plane_cover_input_for_canvas(&viewer.ctx, viewport)
+            .is_some()
+    );
+}
+
+#[test]
+fn plane_revision_record_creation_is_independent_of_layout_and_publication_is_explicit() {
+    let _keys = crate::key_input::lock_test_input();
+    let mut app = crate::app::setup_app_for_test();
+    let viewer = viewer(&mut app);
+    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size);
+    r9_record(&mut app, viewport);
+    let old = app.fullscreen_page_layout.plane_cover.unwrap();
+    let mut material = old.material;
+    material.coverage = egui::Rect::from_min_max(egui::pos2(0.2, 0.1), egui::pos2(0.8, 0.9));
+    let input = DisplayedImageTransformInput {
+        viewport_rect: viewport.translate(egui::vec2(13., 17.)),
+        ..old.input
+    };
+    let transform = resolve_fs_image_transform(input, old.layout_source_size).unwrap();
+    let next = app
+        .plane_cover_record(0, input, old.layout_source_size, material)
+        .unwrap();
+    assert_eq!(
+        app.fullscreen_page_layout.plane_cover.unwrap().material,
+        old.material
+    );
+    app.fullscreen_page_layout
+        .publish_single(transform, Some(next));
+    assert_eq!(app.fullscreen_page_layout.displayed_pages().count(), 1);
+    assert_eq!(
+        app.fullscreen_page_layout.plane_cover.unwrap().material,
+        material
+    );
+    let replacement = app.fullscreen_page_layout.clone();
+    app.fullscreen_page_layout.clear();
+    app.fullscreen_page_layout = replacement;
+    assert_eq!(
+        app.fullscreen_page_layout.plane_cover.unwrap().material,
+        material
+    );
+    assert_eq!(
+        app.fullscreen_page_layout
+            .displayed_pages()
+            .next()
+            .unwrap()
+            .transform,
+        transform
+    );
+    for kind in [
+        FullscreenPageLayoutKind::Empty,
+        FullscreenPageLayoutKind::Single,
+        FullscreenPageLayoutKind::Spread,
+        FullscreenPageLayoutKind::Continuous,
+    ] {
+        app.fullscreen_page_layout.begin(kind);
+        let record = app
+            .plane_cover_record(0, input, old.layout_source_size, material)
+            .expect("record creation depends on the painted page, not a previous layout kind");
+        assert_eq!(app.fullscreen_page_layout.kind(), kind);
+        assert_eq!(app.fullscreen_page_layout.displayed_pages().count(), 0);
+        assert!(
+            app.fullscreen_page_layout.plane_cover.is_none(),
+            "creation does not publish"
+        );
+        app.fullscreen_page_layout
+            .publish_single(transform, Some(record));
+        assert_eq!(
+            app.fullscreen_page_layout.kind(),
+            FullscreenPageLayoutKind::Single
+        );
+        assert_eq!(app.fullscreen_page_layout.displayed_pages().count(), 1);
+        let accepted = app.fullscreen_page_layout.plane_cover.unwrap();
+        assert_eq!(accepted.material, material);
+        assert_ne!(accepted.material, old.material);
+        assert_eq!(accepted.input.viewport_rect, input.viewport_rect);
+        assert_eq!(
+            app.fullscreen_page_layout
+                .displayed_pages()
+                .next()
+                .unwrap()
+                .transform,
+            transform
+        );
+        let produced = app
+            .plane_cover_input_for_canvas(&viewer.ctx, viewport)
+            .unwrap();
+        assert_eq!(produced.material, material);
+    }
+    assert!(
+        app.plane_cover_record(
+            1,
+            DisplayedImageTransformInput {
+                page_idx: 1,
+                ..input
+            },
+            old.layout_source_size,
+            material
+        )
+        .is_none(),
+        "another page cannot publish this page's material"
     );
 }

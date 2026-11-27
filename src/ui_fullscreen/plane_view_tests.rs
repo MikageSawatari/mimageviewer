@@ -814,7 +814,8 @@ mod gpu_tests {
                                 false,
                             );
                             if let Some(d) = &result {
-                                app.fullscreen_page_layout.push(d.transform);
+                                app.fullscreen_page_layout
+                                    .publish_single(d.transform, d.plane_cover);
                             }
                         })
                     },

@@ -20384,6 +20384,8 @@ struct FsWheelFrameResult {
 struct FsSinglePageDraw {
     transform: DisplayedImageTransform,
     pdf_demand_rect: egui::Rect,
+    // Publish only with this completed paint, after the caller rebuilds its layout.
+    plane_cover: Option<crate::displayed_image_transform::PlaneCoverRecord>,
 }
 
 struct FsWheelFrameProposal {
@@ -29774,6 +29776,7 @@ impl App {
                         let media_t0 = std::time::Instant::now();
                         self.fullscreen_page_layout.clear();
                         let mut single_transform: Option<DisplayedImageTransform> = None;
+                        let mut single_plane_cover = None;
                         let mut single_pdf_demand_rect = None;
                         let mut flat_crop = page_turn::FlatCrop::None;
                         let mut primary_draw = CompareFramePrimaryDraw::OrdinaryOnly;
@@ -30051,6 +30054,7 @@ impl App {
                                                             });
                                                 }
                                                 single_pdf_demand_rect = painted.as_ref().map(|draw| (paint_idx,draw.pdf_demand_rect));
+                                                single_plane_cover = painted.as_ref().and_then(|draw| draw.plane_cover);
                                                 single_transform = painted.map(|draw| draw.transform);
                                             }
                                         }
@@ -30119,8 +30123,7 @@ impl App {
                         }
                         if let Some(transform) = single_transform {
                             self.fullscreen_page_layout
-                                .begin(FullscreenPageLayoutKind::Single);
-                            self.fullscreen_page_layout.push(transform);
+                                .publish_single(transform, single_plane_cover);
                         }
                         if similar_preview_presentation.is_none()
                             && !self.continuous_reading_active_for_idx(paint_idx)
@@ -43446,24 +43449,21 @@ impl App {
         })
     }
 
-    fn record_plane_cover_material(
-        &mut self,
+    fn plane_cover_record(
+        &self,
         page_idx: usize,
         input: DisplayedImageTransformInput,
         layout_source_size: Option<egui::Vec2>,
         material: crate::plane_view_wgpu::PlaneMaterialDescription,
-    ) {
-        if self.fullscreen_idx == Some(page_idx)
-            && self.fullscreen_page_layout.kind() == FullscreenPageLayoutKind::Single
-        {
-            self.fullscreen_page_layout.plane_cover =
-                Some(crate::displayed_image_transform::PlaneCoverRecord {
-                    anchor: self.plane_view_anchor(page_idx),
-                    input,
-                    layout_source_size,
-                    material,
-                });
-        }
+    ) -> Option<crate::displayed_image_transform::PlaneCoverRecord> {
+        (self.fullscreen_idx == Some(page_idx)).then(|| {
+            crate::displayed_image_transform::PlaneCoverRecord {
+                anchor: self.plane_view_anchor(page_idx),
+                input,
+                layout_source_size,
+                material,
+            }
+        })
     }
 
     #[cfg(test)]
@@ -47628,7 +47628,8 @@ impl App {
             if let Some((material, _, old_input, old_layout)) = plane_selected {
                 let description = material.description;
                 assert!(self.paint_plane_view(&painter, material, &transform, full_rect, bg_style));
-                self.record_plane_cover_material(page_idx, old_input, old_layout, description);
+                let plane_cover =
+                    self.plane_cover_record(page_idx, old_input, old_layout, description);
                 if let Some(submitted) = submitted {
                     submitted.pages.clear();
                     submitted.pages.push(FsNavigatorTextureSource {
@@ -47641,6 +47642,7 @@ impl App {
                 return Some(FsSinglePageDraw {
                     transform,
                     pdf_demand_rect,
+                    plane_cover,
                 });
             }
             if depth_selected {
@@ -47692,6 +47694,7 @@ impl App {
                 return Some(FsSinglePageDraw {
                     transform,
                     pdf_demand_rect,
+                    plane_cover: None,
                 });
             }
             if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
@@ -47702,22 +47705,18 @@ impl App {
             } else {
                 page
             };
-            if selected_current
+            let plane_cover = if selected_current
                 && matches!(layout_source, FsPageLayoutSource::CurrentItem)
                 && page.transform == transform
                 && let Some(description) = Self::plane_material_description(
                     &page.resource,
                     transform_input.source_size,
                     transform_input.texture_size,
-                )
-            {
-                self.record_plane_cover_material(
-                    page_idx,
-                    transform_input,
-                    layout_source_size,
-                    description,
-                );
-            }
+                ) {
+                self.plane_cover_record(page_idx, transform_input, layout_source_size, description)
+            } else {
+                None
+            };
             let transform = page.transform;
             let img_rect = transform.full_image_rect;
             let total_scale = transform.total_scale;
@@ -47781,6 +47780,7 @@ impl App {
             return Some(FsSinglePageDraw {
                 transform,
                 pdf_demand_rect,
+                plane_cover,
             });
         }
         if let Some(submitted) = submitted {

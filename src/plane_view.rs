@@ -562,8 +562,11 @@ pub(crate) fn plane_view_wheel_transition(input: PlaneViewWheelInput) -> PlaneVi
     let Some(final_transform) = cover.continuous(next_zoom, next_pan) else {
         return out;
     };
+    // hit_rect is already clipped to the viewport. The minimum-overlap rule needs the
+    // whole painted page, including when it is completely outside that viewport.
+    let painted_bounds = Rect::from_points(&final_transform.paint_quad().positions);
     next_pan += crate::ui_fullscreen::pan_correction_for_minimum_overlap(
-        final_transform.hit_rect,
+        painted_bounds,
         cover.transform.viewport_rect,
     );
     out.zoom = next_zoom;
