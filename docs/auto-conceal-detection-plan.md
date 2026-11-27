@@ -1606,3 +1606,15 @@ mask_detect_front_layer_invariant_repairs_after_upper_modal_closes_for_settings_
   修正後の cargo 検証・実機確認は未実行。共有 runner での検証は設計担当へ引き継ぐ。
 - 実行: `cargo fmt`（引数なし）・`git diff --check` は終了コード 0。UI 文字列・マニュアルの変更は無い。
   cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動、git add / commit は未実行。
+
+### 23.11 b-2 の直しの独立レビュー (2026-11-27、設計担当)
+
+- 対象 e8653c246。同じ独立レビュー担当 (Sol gpt-6.1-sol / xhigh、実装担当とは別) の R7 は **ACCEPT** (P1〜P3 なし)。
+- 統括から頼まれた比較について、レビューの判断: 「表示開始の次の pass に 1 回だけ」(A) は修復を見送ると逆転が残る。
+  今の「開いている間は毎 pass 確かめて修復する」(B) は追加の状態を持たず、違反が残れば後の pass でも直すので、B の採用が妥当。
+  同点になった pass の中で即座に直る保証は無いが、逆転が固定されない。popup・前面の別のモーダル・上に見えている未知の
+  Foreground の層があるときは上げず、Foreground の段の中の移動なので Tooltip の段 (通知・説明) も追い越さない。
+- egui::Modal は modal の登録と Area の通常の最前面化だけに頼り、安定ソートの同点を解く処理を持たない。実際に観測された
+  ツールパネルとの逆転に限って補う理由がある、とレビューは判断した。4 つのパネルの Id は、実ボタンの所属の層とクリックの到達を
+  照合するテストで、Id が変わったら検出できる。
+- 設計担当の run-heavy (e8653c246): cargo check 成功、filter 182 件成功、実モデル照合成功。
