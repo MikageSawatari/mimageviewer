@@ -1069,6 +1069,9 @@ vendor/egui/src/lib.rs
 - 実窓の probe (メイン PC、ClaudeCode が実行、自分の窓へのメッセージだけ。出力 `target/investigation/forum-919-real-window/run-output-after-fix.txt`):
   修正後の vendor で、(a) 1 回目の後の 700ms の止まり → 回数 2 (修正前 1)、(b) 押下の後の 900ms の止まり → クリック 1 回 (修正前はクリックにならない)、
   対照・(c)・(d) は修正前と同じ。本物のマウスでの確認はまだ (サブ PC、16.19)。
+- 本体 lib 全件 (`test-lib-full.ps1`、run-heavy、654fe611e と同じソース): **21389 成功・111 skip** (868.9 秒)。
+  build-dev (`target/dev-runtime`) 成功。core exe の comctl32 の import は `SetWindowSubclass`・`RemoveWindowSubclass`・`DefSubclassProc`・`InitCommonControlsEx` のみ。
+  製品の実機での操作は未確認 (16.19)。
 
 ### 16.19 サブ PC での確認 (案、統括が依頼する)
 
