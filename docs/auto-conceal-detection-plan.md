@@ -118,8 +118,11 @@
 `default_pos()` の通常ダイアログ (モーダル)。1093×614 でも [検出] と [閉じる] が見えること (見出しと操作行は ScrollArea の外)。
 設定と検出中の Window は fullscreen の描画経路だけで表示し、`with_dark_context_style` でタイトルバーを含めて常に暗色にする。
 描画後は Context の Light / Dark 両 Style と theme preference を復元する。
-両 Window は補正レイヤーの選択ダイアログと同じ `Order::Debug` に置き、`Foreground` のツールパネルより上に固定する。
-同一 Order 内の記憶や毎フレームの `move_to_top` による後追いには依存しない。
+両 Window は `Order::Foreground` とし、表示中は毎フレーム、その Window の Area と同じ LayerId を
+`set_modal_layer` に登録する（egui の Modal と同じ方式）。背面のツールパネルへの入力を egui の層でも止め、
+既存の `mask_detect_active` による入力遮断も維持する。初回／再表示時の最前面化は Area 自身の処理を使い、
+アプリから毎フレーム／開く時点の `move_to_top` は追加しない。tooltip と発火面付きトーストは Tooltip 段で窓より上に描く。
+ダイアログから開いた menu / combo の popup は Foreground 内で親より上になり、モーダルの入力制限を通る。
 
 | 項目 | 内容 | 既定 |
 |---|---|---|
@@ -1247,10 +1250,11 @@ App の 0 件テストは 3 ツールと補正レイヤーの Raster／未作成
   vendored egui の Area は押下や再表示で同じ Order の中の前後を変え、Memory の層順序がその記憶を使うことをソースで確認した。
   初回だけでなく「前フレームに無かった Area」も最前へ移すため、初回／2 回目だけによる原因の断定はしない。
   同一 Order の履歴依存を除くため、設計担当が示した補正レイヤーの「追加」「マスク種類変更」「加工内容を選択」の先例へ揃え、
-  自動検出の設定と進行の両 Window を `Order::Debug` にした。毎フレームの最前面化・再描画要求・Window Id の変更は追加していない。
+  r8 では自動検出の設定と進行の両 Window を `Order::Debug` にした（後述の独立レビュー R3 の指摘で撤回）。
+  毎フレームの最前面化・再描画要求・Window Id の変更は追加していない。
 - 他の fullscreen の面はソースを確認し、通常のメニュー／popup は `Foreground`、tooltip と feedback toast は `Tooltip` のまま維持する。
-  重なる場合は新しい自動検出 Window が上になる。既存の補正レイヤーの Debug ダイアログと同じ関係で、既存のモーダル入力停止も維持する。
-  回帰では同じ Order を使う代表 Area を重ねて層順序と hit test を検査するが、実アプリでの tooltip・メニュー等の見え方は未確認。
+  r8 では重なる場合に自動検出 Window が上になる関係まで正解としたが、この判断と回帰の期待は R3 で撤回した。
+  Tooltip を覆う根拠はなく、現在は後述の Foreground と modal layer でパネルだけを下に保つ。実機での修正後の見え方は未確認。
 - 余白の表示条件を在メモリの一覧・選択・形から解決する。輪郭は選択済みで読める輪郭検出器が 1 つ以上ある場合だけ、
   箱は顔または選択済みで読める箱検出器がある場合に表示する。輪郭検出器で楕円／矩形を選んだ場合も箱の余白を使うため表示する。
   不在・読めない・未選択・一覧の未完了からは検出器の種類を推測しない。余白の保存形式・値・既定は変更しない。
@@ -1277,7 +1281,6 @@ mask_detect_margin_sliders_do_not_infer_detector_kinds_before_catalog_ready
 mask_detect_catalog_report_includes_counts_typed_reasons_and_error_details_on_single_lines
 mask_detect_catalog_report_empty_missing_and_failed_reads_each_have_one_summary
 mask_detect_settings_and_progress_layers_stay_above_real_panels_after_reopen_and_tool_switch
-mask_detect_debug_windows_stay_above_menu_tooltip_and_toast_orders
 ```
 
 層の回帰は、同じ egui Context と両 Window Id の記憶を保持したまま、隠蔽加工 → 消しゴム → 補正レイヤーを繰り返し、
@@ -1314,7 +1317,7 @@ mask_detect_debug_windows_stay_above_menu_tooltip_and_toast_orders
   ボタンを押さず直ちに開く場合と、実際の「選択」ボタンを press / release して変更を確認した次フレームに開く場合を検査する。
   続いて進行窓が出ている間に露出したパネルのボタン位置を押し、press / release の各フレームで
   `memory.layer_ids()` と重なり点の hit test が進行窓を上とすること、パネルのツールは変更されないことを検査する。
-  設定・進行 Window の `Order::Debug` は r8 のままで、毎フレームの最前面化は追加していない。
+  r10 時点では設定・進行 Window の `Order::Debug` は r8 のままとしたが、後述の R3 の修正で Foreground に戻した。
 - 追加したテスト（未実行、すべて `test(/mask_detect|^ai::detect/)` に含まれる）:
 
 ```text
@@ -1330,6 +1333,56 @@ mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_during
   既存の太らせテスト 2 件は上記リストの `circle` 名へ置き換え、半径 0・1・2・4・20、種なし・全面・隅・中央・複数の種を
   素朴な円形近傍と比較する。箱での切抜き・画像端の切詰め・太らせ時のパッチ位置と大きさの不変も検査する。
 
+- 設計担当からの報告: r7〜r10 のコミットは `a9a1c6e50`。独立レビュー R3 は REJECT、P2 1 件で、
+  Debug 指定が必要なトーストと tooltip を窓の下に隠す点を設計担当も妥当と判断した。
+  175 件と実モデル照合の成功は設計担当の報告であり、今回の修正後の実行結果ではない。
+  補正レイヤーの Debug の先例の目的はパネルの裏に潜らないことで、Tooltip 段を覆う根拠はないため撤回した。
+- 2 Window を Foreground に戻し、egui の `Modal::show` と同じく、描くたびに `set_modal_layer` へ登録する。
+  `Window::id` は `self.area.id(id)` へ直接渡されるため、LayerId はそれぞれ
+  `Foreground + mask_detect_settings` / `Foreground + mask_detect_progress`。別の派生 Id は作らない。
+  `is_above_modal_layer` / `allows_interaction` と `layer_id_at` が背面への押下・focus を遮断し、パネルがクリックで上がるのを防ぐ。
+  段 1 のパネル・キー・キャンバスの入力遮断も残し、egui の層による遮断で置き換えていない。
+- 初回／再表示の順序は `Area::begin` が `!visible_last_frame` のとき自動で最前面化し、`Areas::end_pass` が描画順へ反映する。
+  このソース上の仕組みを採用し、開く操作時の追加の最前面化も毎フレームの後追いも不要と判断した。
+  r8・r10 の回帰を、パネル押下直後・別ツールからの再表示・検出中の押下について、開いた最初のフレームから各フレームの
+  層順序を検査するよう拡張した（修正後は未実行なので、最初のフレームの合格を確認した記録ではない）。
+  egui の modal layer は次の pass へ引き継がれる標準の仕組みで、定常時の modal id・背面の interaction 拒否も検査する。
+- `mask_detect_debug_windows_stay_above_menu_tooltip_and_toast_orders` は撤回・削除した。代わりに実際の Viewer 宛ての
+  エラートーストと実際の余白スライダーの hover 説明を窓に重ね、出力 shapes の描画順で窓より後になることを検査する。
+  通知ボタンは製品の `FeedbackAction::response` に press / release を渡してクリックできることを検査し、Explorer の起動はしない。
+  menu / combo は実際の親モーダル層に属する egui の代表 widget をテストだけで置き、開いた popup の項目のクリックを検査する。
+  popup は Foreground の新しい Area として上に上がり、Tooltip の通知・説明は段が上なので modal の入力制限を通る。
+  数値入力は実際の［詳細］の閾値スライダーを開き、DragValue → TextEdit の入力・focus・IMEOutput、
+  IME Preedit 中の Escape でダイアログを閉じないことを検査する。実 OS の IME 候補窓の実機確認は未実施。
+- R3 修正で追加したテスト（未実行、すべて `test(/mask_detect/)` に含まれる）:
+
+```text
+mask_detect_foreground_windows_keep_real_viewer_toast_above_and_action_clickable
+mask_detect_foreground_modal_keeps_real_margin_hover_tooltip_above_window
+mask_detect_foreground_modal_allows_menu_and_combo_popup_selection
+mask_detect_foreground_modal_keeps_details_numeric_input_and_ime_active
+```
+
+  既存の `mask_detect_settings_and_progress_layers_stay_above_real_panels_after_reopen_and_tool_switch` と
+  `mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_during_progress` も上記の最初のフレームと modal 判定へ拡張した。
+
+- r11 の共有 runner の結果は設計担当からの報告: core の `cargo check` は成功、filter は 178 件中 177 件成功。
+  数値入力・IME の回帰だけ、Preedit と生の Escape を同じフレームに注入した後の `platform_output.ime.is_some()` で失敗した。
+  その前の数値 0.42 の入力と、同フレームの `app.ime_input_active` は成功したとの報告。
+- 原因はテストの前提。vendored egui の `Focus::begin_pass` は生の Escape で widget focus を解除し、DragValue は
+  focus が無ければ TextEdit ではなく数値ボタンを構築する。TextEdit の IMEOutput は可視・編集可能かつ IME 所有時にだけ出る。
+  共有 `egui-ime::track_drag_value_focus` も、自由入力と異なり数値編集の Escape キャンセルでは focus を復帰しないと明記している。
+  `ime_input_active` は viewport の変換状態なので、同じフレームで true でも IMEOutput や数値欄の focus 維持を保証しない。
+  modal layer が入力を拒否した結果ではなく、この回の製品コードの変更はない。
+- `mask_detect_foreground_modal_keeps_details_numeric_input_and_ime_active` を、数値編集の IME Preedit → Commit で
+  0.73 が入り、focus・IMEOutput・モーダル層内の入力許可を保つ検査と、生の Escape を注入しても変換中のダイアログが閉じない
+  検査に分けた。後者では IMEOutput と元の focus の維持を要求しない。変換終了後に数値欄へ入り直して 0.58 を入力できること、
+  通常の Escape では閉じることも検査する。修正後は未実行、既存の `test(/mask_detect/)` に含まれる。
+  自動検出は本の構成・AI 連携の確認画面等と同じ `dialog_escape_pressed` を使い、未確定中は false、Commit / Disabled 後は通常キーを
+  通すという既存規則を維持する。他画面の回帰も変換中の Enter / Escape で画面を閉じないことを検査しており、数値欄の focus 維持は要求していない。
+
 - cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動、git add / commit は依頼に従い未実行。
   修正後の自動検証と実機での表示・ログ／perf の観測は設計担当へ引き継ぐ。
-- 今回の `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。glyph 検査は危険 glyph 0、card 検査は 55 件・超過 0。
+- r7〜r10 時点の `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。glyph 検査は危険 glyph 0、card 検査は 55 件・超過 0。
+  R3 の修正でも `cargo fmt`（引数なし）・`git diff --check` は終了コード 0、glyph 検査は危険 glyph 0。
+  R3 ではマニュアル・製品ページは変更していないため、card 検査は再実行していない。

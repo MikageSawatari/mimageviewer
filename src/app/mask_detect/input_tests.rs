@@ -69,16 +69,18 @@ fn draw_mask_detect_layer_frame(
     .drop_without_applying_deltas();
 }
 
-fn assert_mask_detect_layer_above(ctx: &egui::Context, dialog_id: &str, lower_ids: &[&str]) {
+fn assert_mask_detect_layer_order_above(
+    ctx: &egui::Context,
+    dialog_id: &str,
+    lower_ids: &[&str],
+) -> egui::LayerId {
     let layers: Vec<_> = ctx.memory(|memory| memory.layer_ids().collect());
     let dialog_index = layers
         .iter()
         .position(|layer| layer.id == egui::Id::unique(dialog_id))
         .expect("dialog layer exists");
     let dialog = layers[dialog_index];
-    assert_eq!(dialog.order, egui::Order::Debug);
-    let rect = ctx.memory(|memory| memory.area_rect(dialog.id)).unwrap();
-    let mut checked_overlap = false;
+    assert_eq!(dialog.order, egui::Order::Foreground);
     for id in lower_ids {
         let index = layers
             .iter()
@@ -88,9 +90,23 @@ fn assert_mask_detect_layer_above(ctx: &egui::Context, dialog_id: &str, lower_id
             index < dialog_index,
             "{id} must be below {dialog_id}: {layers:?}"
         );
-        let lower_rect = ctx
-            .memory(|memory| memory.area_rect(layers[index].id))
-            .unwrap();
+    }
+    dialog
+}
+
+fn assert_mask_detect_layer_above(ctx: &egui::Context, dialog_id: &str, lower_ids: &[&str]) {
+    let dialog = assert_mask_detect_layer_order_above(ctx, dialog_id, lower_ids);
+    assert_eq!(ctx.memory(|memory| memory.top_modal_layer()), Some(dialog));
+    assert!(ctx.memory(|memory| memory.allows_interaction(dialog)));
+    let rect = ctx.memory(|memory| memory.area_rect(dialog.id)).unwrap();
+    let mut checked_overlap = false;
+    for id in lower_ids {
+        let lower = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique(id));
+        assert!(
+            !ctx.memory(|memory| memory.allows_interaction(lower)),
+            "{id} must be blocked by the modal"
+        );
+        let lower_rect = ctx.memory(|memory| memory.area_rect(lower.id)).unwrap();
         let overlap = rect.intersect(lower_rect);
         if overlap.is_positive() {
             assert_eq!(
@@ -166,6 +182,7 @@ fn mask_detect_settings_and_progress_layers_stay_above_real_panels_after_reopen_
             assert_eq!(app.mask_detect_dialog, Some(tool));
             for _ in 0..4 {
                 draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
+                assert_mask_detect_layer_order_above(&ctx, "mask_detect_settings", panels);
             }
             assert_mask_detect_layer_above(&ctx, "mask_detect_settings", panels);
             let request = app.capture_mask_detect_request(tool).unwrap();
@@ -173,6 +190,7 @@ fn mask_detect_settings_and_progress_layers_stay_above_real_panels_after_reopen_
             app.mask_detect_dialog = None;
             for _ in 0..4 {
                 draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
+                assert_mask_detect_layer_order_above(&ctx, "mask_detect_progress", panels);
             }
             assert_mask_detect_layer_above(&ctx, "mask_detect_progress", panels);
         }
@@ -234,6 +252,7 @@ fn mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_dur
         assert_eq!(app.mask_detect_dialog, Some(tool));
         for _ in 0..4 {
             draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
+            assert_mask_detect_layer_order_above(&ctx, "mask_detect_settings", &["conceal_panel"]);
         }
         assert_mask_detect_layer_above(&ctx, "mask_detect_settings", &["conceal_panel"]);
         let request = app.capture_mask_detect_request(tool).unwrap();
@@ -242,11 +261,22 @@ fn mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_dur
         app.conceal_tool = crate::conceal::ConcealTool::Brush;
         for _ in 0..4 {
             draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
+            assert_mask_detect_layer_order_above(&ctx, "mask_detect_progress", &["conceal_panel"]);
         }
         // This exposed panel button lies outside the smaller progress window.
-        // Area-level interactions must not raise it above the Debug window,
+        // Area-level interactions must not raise it above the modal window,
         // and the modal gate must keep the underlying tool button disabled.
-        assert_eq!(ctx.layer_id_at(point), Some(panel));
+        let progress = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("mask_detect_progress"),
+        );
+        assert!(
+            !ctx.memory(|memory| memory.area_rect(progress.id))
+                .unwrap()
+                .contains(point)
+        );
+        // egui reroutes hits below the modal, even outside the window's rect.
+        assert_eq!(ctx.layer_id_at(point), Some(progress));
         for pressed in [true, false] {
             draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, pointer(pressed));
             assert_mask_detect_layer_above(&ctx, "mask_detect_progress", &["conceal_panel"]);
@@ -259,60 +289,436 @@ fn mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_dur
     }
 }
 
+fn mask_detect_text_paint(output: &egui::FullOutput, text: &str) -> (usize, egui::Rect) {
+    output
+        .shapes
+        .iter()
+        .enumerate()
+        .find_map(|(index, clipped)| {
+            if let egui::Shape::Text(shape) = &clipped.shape {
+                if shape.galley.text() == text {
+                    return Some((index, shape.galley.rect.translate(shape.pos.to_vec2())));
+                }
+            }
+            None
+        })
+        .unwrap_or_else(|| panic!("missing painted text: {text}"))
+}
+
+fn mask_detect_pointer(point: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+    vec![
+        egui::Event::PointerMoved(point),
+        egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        },
+    ]
+}
+
 #[test]
-fn mask_detect_debug_windows_stay_above_menu_tooltip_and_toast_orders() {
+fn mask_detect_foreground_windows_keep_real_viewer_toast_above_and_action_clickable() {
     let _input = crate::key_input::lock_test_input();
     for progress in [false, true] {
         let mut app = mask_detect_fixture(MaskDetectTool::Erase);
-        let id = if progress {
+        let (id, title) = if progress {
             let request = app
                 .capture_mask_detect_request(MaskDetectTool::Erase)
                 .unwrap();
             mask_detect_queue(&mut app, request, mask_detect_output());
-            "mask_detect_progress"
+            ("mask_detect_progress", "検出中")
         } else {
             app.mask_detect_dialog = Some(MaskDetectTool::Erase);
-            "mask_detect_settings"
+            ("mask_detect_settings", "自動検出")
         };
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let rect = transform().viewport_rect;
         for _ in 0..4 {
-            ctx.run_ui(
+            draw_mask_detect_layer_frame(
+                &mut app,
+                &ctx,
+                MaskDetectTool::Erase,
+                &transform(),
+                Vec::new(),
+            );
+        }
+        let dialog = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique(id));
+        // Move the real Window underneath the real toast (which is at top-right).
+        let mut state = egui::AreaState::load(&ctx, dialog.id).unwrap();
+        state.set_left_top_pos(egui::pos2(rect.right() - state.rect().width() - 20.0, 40.0));
+        ctx.memory_mut(|memory| memory.areas_mut().set_state(dialog, state));
+        let message = "検出器フォルダを開けませんでした";
+        app.show_mask_detect_error(message.into());
+        let mut toast_text_rect = egui::Rect::NOTHING;
+        for _ in 0..4 {
+            app.fs_feedback_toast.as_mut().unwrap().1 = std::time::Instant::now();
+            let output = ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     ..Default::default()
                 },
-                |_| {
+                |ui| {
+                    // Calling toast first must still paint it on top of the Window.
+                    app.draw_feedback_toast(ui, rect, &ctx, ActionSurface::Viewer);
                     app.show_mask_detect_dialog(&ctx);
-                    // These overlapping Areas use the production PopupKind orders
-                    // and the fullscreen feedback toast's Tooltip order.
-                    for (name, order) in [
-                        ("mask_detect_test_menu", egui::PopupKind::Menu.order()),
-                        ("mask_detect_test_tooltip", egui::PopupKind::Tooltip.order()),
-                        ("mask_detect_test_toast", egui::Order::Tooltip),
-                    ] {
-                        egui::Area::new(egui::Id::unique(name))
-                            .fixed_pos(rect.min)
-                            .order(order)
-                            .show(&ctx, |ui| {
-                                ui.allocate_exact_size(rect.size(), egui::Sense::hover());
-                            });
-                    }
+                },
+            );
+            let (toast_index, text_rect) = mask_detect_text_paint(&output, message);
+            let (window_index, _) = mask_detect_text_paint(&output, title);
+            assert!(
+                toast_index > window_index,
+                "toast must paint after the overlapping Window"
+            );
+            toast_text_rect = text_rect;
+            output.drop_without_applying_deltas();
+        }
+        let window = ctx.memory(|memory| memory.area_rect(dialog.id)).unwrap();
+        assert!(window.intersect(toast_text_rect).is_positive());
+        let toast_layer = egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::unique("feedback_toast_viewer"),
+        );
+        assert!(ctx.memory(|memory| memory.allows_interaction(toast_layer)));
+        // Use the production action Response on the real toast's text rectangle.
+        // Do not activate the action: that would start Explorer in a unit test.
+        let action = crate::feedback::FeedbackAction::RevealPath(app.tmp.path().join("result.png"));
+        let mut clicked = false;
+        for pressed in [None, Some(true), Some(false)] {
+            app.fs_feedback_toast.as_mut().unwrap().1 = std::time::Instant::now();
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    events: pressed
+                        .map(|p| mask_detect_pointer(toast_text_rect.center(), p))
+                        .unwrap_or_default(),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.show_mask_detect_dialog(&ctx);
+                    app.draw_feedback_toast(ui, rect, &ctx, ActionSurface::Viewer);
+                    let toast_ui =
+                        ui.new_child(egui::UiBuilder::new().layer_id(toast_layer).max_rect(rect));
+                    clicked |= action.response(&toast_ui, toast_text_rect).clicked();
                 },
             )
             .drop_without_applying_deltas();
         }
-        assert_mask_detect_layer_above(
-            &ctx,
-            id,
-            &[
-                "mask_detect_test_menu",
-                "mask_detect_test_tooltip",
-                "mask_detect_test_toast",
-            ],
+        assert!(
+            clicked,
+            "a Tooltip-layer toast action must remain clickable above the modal"
         );
     }
+}
+
+#[test]
+fn mask_detect_foreground_modal_keeps_real_margin_hover_tooltip_above_window() {
+    let _input = crate::key_input::lock_test_input();
+    let mut app = mask_detect_fixture(MaskDetectTool::Erase);
+    app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    ctx.all_styles_mut(|style| {
+        style.interaction.tooltip_delay = 0.0;
+        style.interaction.show_tooltips_only_when_still = false;
+    });
+    let transform = transform();
+    for _ in 0..4 {
+        draw_mask_detect_layer_frame(
+            &mut app,
+            &ctx,
+            MaskDetectTool::Erase,
+            &transform,
+            Vec::new(),
+        );
+    }
+    let margin = ctx
+        .data(|d| d.get_temp::<egui::Rect>(egui::Id::unique("mask_detect_box_margin_rect")))
+        .unwrap();
+    let point = egui::pos2(margin.left() + 8.0, margin.center().y);
+    let tooltip = "幅・高さの指定割合を各辺の外側に足します";
+    let mut output: Option<egui::FullOutput> = None;
+    for _ in 0..6 {
+        let next = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(transform.viewport_rect),
+                events: vec![egui::Event::PointerMoved(point)],
+                ..Default::default()
+            },
+            |_| app.show_mask_detect_dialog(&ctx),
+        );
+        if let Some(old) = output.replace(next) {
+            old.drop_without_applying_deltas();
+        }
+    }
+    let output = output.unwrap();
+    let (tooltip_index, tooltip_rect) = mask_detect_text_paint(&output, tooltip);
+    let (window_index, _) = mask_detect_text_paint(&output, "自動検出");
+    assert!(tooltip_index > window_index);
+    let window = ctx
+        .memory(|memory| memory.area_rect(egui::Id::unique("mask_detect_settings")))
+        .unwrap();
+    assert!(
+        window.intersect(tooltip_rect).is_positive(),
+        "hover tooltip must actually overlap the Window"
+    );
+    assert!(ctx.memory(|memory| {
+        memory
+            .layer_ids()
+            .any(|layer| layer.order == egui::Order::Tooltip && memory.allows_interaction(layer))
+    }));
+    output.drop_without_applying_deltas();
+}
+
+#[test]
+fn mask_detect_foreground_modal_allows_menu_and_combo_popup_selection() {
+    let _input = crate::key_input::lock_test_input();
+    for menu in [true, false] {
+        let mut app = mask_detect_fixture(MaskDetectTool::Erase);
+        app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let screen = transform().viewport_rect;
+        let dialog = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("mask_detect_settings"),
+        );
+        let mut anchor = egui::Rect::NOTHING;
+        let mut item = None;
+        let mut selected = false;
+        let mut frame = |app: &mut App, events| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.show_mask_detect_dialog(&ctx);
+                    // Representative egui controls use the actual dialog's layer.
+                    // No new menu or combo is added to the product dialog.
+                    let mut child = ui.new_child(egui::UiBuilder::new().layer_id(dialog).max_rect(
+                        egui::Rect::from_min_size(
+                            egui::pos2(100.0, 100.0),
+                            egui::vec2(240.0, 60.0),
+                        ),
+                    ));
+                    if menu {
+                        anchor = child
+                            .menu_button("Test menu", |ui| {
+                                let response = ui.button("Choose");
+                                item = Some((response.rect, ui.layer_id()));
+                                selected |= response.clicked();
+                            })
+                            .response
+                            .rect;
+                    } else {
+                        anchor = egui::ComboBox::from_id_salt("mask_detect_test_combo")
+                            .selected_text("Choose")
+                            .show_ui(&mut child, |ui| {
+                                let response = ui.selectable_label(selected, "Item");
+                                item = Some((response.rect, ui.layer_id()));
+                                selected |= response.clicked();
+                            })
+                            .response
+                            .rect;
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
+            (anchor, item, selected)
+        };
+        let mut button = egui::Rect::NOTHING;
+        for _ in 0..4 {
+            button = frame(&mut app, Vec::new()).0;
+        }
+        for pressed in [true, false] {
+            frame(&mut app, mask_detect_pointer(button.center(), pressed));
+        }
+        let mut popup = None;
+        for _ in 0..4 {
+            popup = frame(&mut app, Vec::new()).1;
+        }
+        let (item_rect, layer) = popup.expect("real egui popup must open");
+        assert_ne!(layer, dialog);
+        assert_eq!(layer.order, egui::Order::Foreground);
+        assert!(ctx.memory(|memory| memory.allows_interaction(layer)));
+        assert_eq!(ctx.layer_id_at(item_rect.center()), Some(layer));
+        let mut accepted = false;
+        for pressed in [true, false] {
+            accepted = frame(&mut app, mask_detect_pointer(item_rect.center(), pressed)).2;
+        }
+        assert!(
+            accepted,
+            "menu={menu}: popup item must receive the click above the modal"
+        );
+    }
+}
+
+#[test]
+fn mask_detect_foreground_modal_keeps_details_numeric_input_and_ime_active() {
+    let _input = crate::key_input::lock_test_input();
+    let mut app = mask_detect_fixture(MaskDetectTool::Erase);
+    app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    crate::ime_focus::install_ime_input_policy(&ctx);
+    let frame = |app: &mut App, events| {
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(transform().viewport_rect),
+                events,
+                ..Default::default()
+            },
+            |_| {
+                app.update_ime_state(&ctx);
+                app.show_mask_detect_dialog(&ctx);
+            },
+        )
+    };
+    for _ in 0..4 {
+        frame(&mut app, Vec::new()).drop_without_applying_deltas();
+    }
+    let header = ctx
+        .data(|d| d.get_temp::<egui::Rect>(egui::Id::unique("mask_detect_details")))
+        .unwrap();
+    for pressed in [true, false] {
+        frame(&mut app, mask_detect_pointer(header.center(), pressed))
+            .drop_without_applying_deltas();
+    }
+    for _ in 0..12 {
+        frame(&mut app, Vec::new()).drop_without_applying_deltas();
+    }
+    let threshold = ctx
+        .data(|d| d.get_temp::<egui::Rect>(egui::Id::unique("mask_detect_threshold_rect")))
+        .unwrap();
+    // Slider places its DragValue directly after the slider rail, with the
+    // current style's item spacing. Clicking that number opens its TextEdit.
+    let point = egui::pos2(
+        threshold.left()
+            + ctx.style_of(egui::Theme::Dark).spacing.slider_width
+            + ctx.style_of(egui::Theme::Dark).spacing.item_spacing.x
+            + 5.0,
+        threshold.center().y,
+    );
+    for pressed in [true, false] {
+        frame(&mut app, mask_detect_pointer(point, pressed)).drop_without_applying_deltas();
+    }
+    let output = frame(&mut app, Vec::new());
+    assert!(
+        output.platform_output.ime.is_some(),
+        "the real threshold DragValue must be editing text"
+    );
+    output.drop_without_applying_deltas();
+    let focused = ctx
+        .memory(|memory| memory.focused())
+        .expect("numeric input focus");
+    let dialog = egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::unique("mask_detect_settings"),
+    );
+    assert_eq!(ctx.read_response(focused).unwrap().layer_id, dialog);
+    frame(&mut app, vec![egui::Event::Text("0.42".into())]).drop_without_applying_deltas();
+    assert!((app.settings.mask_detect.threshold - 0.42).abs() < 0.001);
+    // Verify IME composition/commit while the actual numeric editor owns focus.
+    // Select the previous number so the committed text replaces the whole value.
+    frame(
+        &mut app,
+        vec![egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: Some(egui::Key::A),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+        }],
+    )
+    .drop_without_applying_deltas();
+    let output = frame(
+        &mut app,
+        vec![
+            egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: Some(egui::Key::A),
+                pressed: false,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "0.73".into(),
+                active_range_chars: None,
+            }),
+        ],
+    );
+    assert!(app.ime_input_active(&ctx));
+    assert!(output.platform_output.ime.is_some());
+    assert_eq!(ctx.memory(|memory| memory.focused()), Some(focused));
+    assert!(ctx.memory(|memory| memory.allows_interaction(dialog)));
+    output.drop_without_applying_deltas();
+    let output = frame(
+        &mut app,
+        vec![egui::Event::Ime(egui::ImeEvent::Commit("0.73".into()))],
+    );
+    assert!(!app.ime_input_active(&ctx));
+    assert!((app.settings.mask_detect.threshold - 0.73).abs() < 0.001);
+    assert!(output.platform_output.ime.is_some());
+    assert_eq!(ctx.memory(|memory| memory.focused()), Some(focused));
+    output.drop_without_applying_deltas();
+    // A deliberately injected raw Escape is a separate app-dialog guard test.
+    // egui Focus::begin_pass clears focus before building the DragValue; its
+    // numeric editor intentionally does not restore focus (egui-ime's contract).
+    // Do not require IMEOutput or the old field focus after numeric cancellation.
+    let output = frame(
+        &mut app,
+        vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "未確定".into(),
+                active_range_chars: None,
+            }),
+            key(egui::Key::Escape),
+        ],
+    );
+    assert!(app.ime_input_active(&ctx));
+    assert!(!app.dialog_escape_pressed(&ctx));
+    assert_eq!(app.mask_detect_dialog, Some(MaskDetectTool::Erase));
+    output.drop_without_applying_deltas();
+    frame(
+        &mut app,
+        vec![
+            egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: Some(egui::Key::Escape),
+                pressed: false,
+                repeat: false,
+                modifiers: Default::default(),
+            },
+            egui::Event::Ime(egui::ImeEvent::Commit("".into())),
+        ],
+    )
+    .drop_without_applying_deltas();
+    assert!(!app.ime_input_active(&ctx));
+    assert_eq!(app.mask_detect_dialog, Some(MaskDetectTool::Erase));
+    assert!((app.settings.mask_detect.threshold - 0.73).abs() < 0.001);
+    // Re-enter through the real number button after Escape, ensuring the modal
+    // still permits editing rather than just allowing an earlier focus claim.
+    for pressed in [true, false] {
+        frame(&mut app, mask_detect_pointer(point, pressed)).drop_without_applying_deltas();
+    }
+    let output = frame(&mut app, Vec::new());
+    assert!(output.platform_output.ime.is_some());
+    output.drop_without_applying_deltas();
+    frame(&mut app, vec![egui::Event::Text("0.58".into())]).drop_without_applying_deltas();
+    assert!((app.settings.mask_detect.threshold - 0.58).abs() < 0.001);
+    // Like other dialogs using dialog_escape_pressed, normal Escape is admitted
+    // again after the composition has ended.
+    frame(&mut app, vec![key(egui::Key::Escape)]).drop_without_applying_deltas();
+    assert!(app.mask_detect_dialog.is_none());
 }
 
 fn mask_detect_append_receipt(

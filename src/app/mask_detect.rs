@@ -1088,12 +1088,16 @@ impl App {
     pub(crate) fn show_mask_detect_dialog(&mut self, ctx: &egui::Context) {
         self.poll_mask_detect_catalog(ctx);
         if self.mask_detect_pending.is_some() {
+            let id = egui::Id::unique("mask_detect_progress");
+            // Like egui::Modal: block lower layers without covering Tooltip.
+            // Window::id is also its Area id; Area raises itself on reappearance.
+            ctx.memory_mut(|memory| {
+                memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, id))
+            });
             crate::os_theme::with_dark_context_style(ctx, || {
                 egui::Window::new("検出中")
-                    .id(egui::Id::unique("mask_detect_progress"))
-                    // Match the local-adjust dialogs: stay above the Foreground
-                    // tool panels even after their last click raised them.
-                    .order(egui::Order::Debug)
+                    .id(id)
+                    .order(egui::Order::Foreground)
                     .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
                     .collapsible(false)
                     .resizable(false)
@@ -1121,11 +1125,15 @@ impl App {
         let mut close = self.dialog_escape_pressed(ctx);
         let mut reload = false;
         let mut folder = false;
+        let id = egui::Id::unique("mask_detect_settings");
+        ctx.memory_mut(|memory| {
+            memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, id))
+        });
         let _window = crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("自動検出")
-                .id(egui::Id::unique("mask_detect_settings"))
+                .id(id)
                 .open(&mut open)
-                .order(egui::Order::Debug)
+                .order(egui::Order::Foreground)
                 .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
                 .default_width(380.0)
                 .collapsible(false)
@@ -1171,23 +1179,28 @@ impl App {
                                 );
                             });
                             }
-                            if show_box_margin { ui.add(
+                            if show_box_margin { let _margin = ui.add(
                                 egui::Slider::new(
                                     &mut self.settings.mask_detect.margin_percent,
                                     0.0..=100.0,
                                 )
                                 .text("箱の余白 (%)"),
                             )
-                            .on_hover_text("幅・高さの指定割合を各辺の外側に足します"); }
+                            .on_hover_text("幅・高さの指定割合を各辺の外側に足します");
+                            #[cfg(test)]
+                            ctx.data_mut(|data| data.insert_temp(egui::Id::unique("mask_detect_box_margin_rect"), _margin.rect));
+                            }
                             if self.settings.mask_detect.face_selected {
                             let _details = ui.collapsing("詳細", |ui| {
-                                ui.add(
+                                let _threshold = ui.add(
                                     egui::Slider::new(
                                         &mut self.settings.mask_detect.threshold,
                                         0.0..=1.0,
                                     )
                                     .text("閾値"),
                                 );
+                                #[cfg(test)]
+                                ctx.data_mut(|data| data.insert_temp(egui::Id::unique("mask_detect_threshold_rect"), _threshold.rect));
                             });
                             #[cfg(test)]
                             ctx.data_mut(|data| {
