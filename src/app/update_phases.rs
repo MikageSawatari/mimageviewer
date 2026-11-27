@@ -2591,7 +2591,7 @@ mod operation_script_file_service_tests {
         let path = crate::operation_script::script_path(app.tmp.path());
         std::fs::write(&path, source).unwrap();
         app.settings.operation_script_enabled = true;
-        app.operation_script = OperationScriptLoader::with_file_worker(path, |_| Ok(()), || {});
+        *app.operation_script = OperationScriptLoader::with_file_worker(path, |_| Ok(()), || {});
         app
     }
 
@@ -2630,7 +2630,7 @@ mod operation_script_file_service_tests {
         let path = crate::operation_script::script_path(&data_dir);
         let replacement_path = path.clone();
         let requests = std::cell::Cell::new(0);
-        app.operation_script = OperationScriptLoader::with_file_worker(
+        *app.operation_script = OperationScriptLoader::with_file_worker(
             path,
             |_| Ok(()),
             move || {
@@ -2706,7 +2706,7 @@ mod operation_script_file_service_tests {
         let path = data_dir.join("operation-script-is-a-directory");
         std::fs::create_dir(&path).unwrap();
         std::fs::write(path.join("keep.txt"), "preserve directory contents").unwrap();
-        app.operation_script = OperationScriptLoader::with_file_worker(
+        *app.operation_script = OperationScriptLoader::with_file_worker(
             path,
             |_| Err("test editor refused open".into()),
             || {},

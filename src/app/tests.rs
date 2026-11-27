@@ -3766,6 +3766,19 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         size_of::<crate::ui_dialogs::image_combine::ImageCombineState>(),
     );
     assert_eq!(storage(|app| &app.image_combine), size_of::<usize>());
+    println!(
+        "operation script storage loader={} events={}; payload OperationScriptLoader={} OperationScriptEvents={}",
+        storage(|app| &app.operation_script),
+        storage(|app| &app.operation_script_events),
+        size_of::<crate::operation_script::OperationScriptLoader>(),
+        size_of::<operation_script_runtime::OperationScriptEvents>(),
+    );
+    // Main-only operation-script state lives on the heap (about 700 bytes inline).
+    assert_eq!(storage(|app| &app.operation_script), size_of::<usize>());
+    assert_eq!(
+        storage(|app| &app.operation_script_events),
+        size_of::<usize>()
+    );
     // A staged history request is rarely active and must not be stored inline in every App.
     // The capture/fullscreen input test creates several App values on a default test stack.
     assert_eq!(
