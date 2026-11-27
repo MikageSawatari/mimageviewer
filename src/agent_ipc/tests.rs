@@ -10,6 +10,7 @@ fn row<T>(value: &PageRow<T>) -> &T {
 pub(super) struct Fixture {
     pub(super) handlers: Arc<Handlers>,
     pub(super) runtime: Option<crate::collection_store::CollectionStoreRuntime>,
+    pub(super) folder_order: Option<crate::folder_order::FolderOrderService>,
     pub(super) _dir: crate::settings_db::DataDirOverrideGuard,
 }
 impl Fixture {
@@ -49,9 +50,25 @@ impl Fixture {
             write_hooks: None,
         });
         handlers.readers.install_collection_store(runtime.client());
+        let folder_order = crate::folder_order::FolderOrderService::start_at(
+            dir.path().join(crate::folder_order::DB_NAME),
+        )
+        .unwrap();
+        handlers
+            .readers
+            .install_folder_order(folder_order.handle.clone());
+        // Establish actor startup/schema before read-only persistence snapshots.
+        folder_order
+            .handle
+            .read(dir.path())
+            .unwrap()
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
         Self {
             _dir: dir,
             runtime: Some(runtime),
+            folder_order: Some(folder_order),
             handlers,
         }
     }
@@ -132,6 +149,9 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if let Some(folder_order) = self.folder_order.take() {
+            folder_order.shutdown();
+        }
         self.handlers.producer.as_ref().unwrap().close_and_drain();
         self.runtime.take().unwrap().shutdown_and_join();
     }

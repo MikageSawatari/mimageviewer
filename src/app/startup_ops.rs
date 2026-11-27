@@ -846,6 +846,7 @@ impl App {
         let cancel_w = Arc::clone(&cancel);
         let phase_w = Arc::clone(&scan_phase);
         let policy = self.folder_scan_policy();
+        let folder_order_handle = self.folder_order_handle();
         let scan_main = unresolved_open_owner_is_main(&owner);
         let repaint_ctx = ctx.clone();
         let perf_seq = self.input_seq;
@@ -898,6 +899,7 @@ impl App {
             scan_startup_resolved_target(
                 &mut result,
                 policy,
+                folder_order_handle.as_ref(),
                 scan_main,
                 &cancel_w,
                 &phase_w,
@@ -1155,6 +1157,7 @@ impl App {
         ctx: &egui::Context,
     ) {
         let policy = self.folder_scan_policy();
+        let folder_order_handle = self.folder_order_handle();
         let pending = self.startup_open_path_resolve_pending.as_mut().unwrap();
         let cancel = Arc::clone(&pending.cancel);
         let phase = Arc::clone(&pending.scan_phase);
@@ -1184,6 +1187,7 @@ impl App {
             scan_startup_resolved_target(
                 &mut result,
                 policy,
+                folder_order_handle.as_ref(),
                 true,
                 &cancel,
                 &phase,
@@ -2729,6 +2733,7 @@ impl App {
         let basis_generation = self.items_generation;
         let saved_projection_recipe = self.projection_recipe.clone();
         let saved_viewing_state = self.capture_snapshot_viewing_state();
+        let saved_folder_order = self.capture_snapshot_folder_order();
         let saved_items = self.items.clone();
         let saved_thumbnails = self.thumbnails.clone();
         let saved_image_metas = self.image_metas.clone();
@@ -2780,6 +2785,7 @@ impl App {
             crate::rating_sort::RatingSortKey::Supported(stars) => Some(stars as u8),
             crate::rating_sort::RatingSortKey::Unsupported => None,
         };
+        self.retire_folder_order_for_listing();
         self.items = reader_items;
         // A direct audio/video exception makes the reader a mixed ordinary list. The saved
         // grid recipe is restored by the existing DirectMedia snapshot on return.
@@ -2826,6 +2832,7 @@ impl App {
             },
             generation_id,
             saved_items: saved_items.clone(),
+            saved_folder_order,
             saved_page_identity_index: saved_page_identity_index.clone(),
             saved_projection_recipe: saved_projection_recipe.clone(),
             saved_viewing_state,
@@ -3321,6 +3328,7 @@ fn resolve_default_startup_target(
 fn scan_startup_resolved_target(
     result: &mut StartupOpenPathResolveResult,
     policy: folder_scan::FolderScanPolicy,
+    folder_order_handle: Option<&crate::folder_order::FolderOrderHandle>,
     scan_main: bool,
     cancel: &AtomicBool,
     phase: &StartupScanPhase,
@@ -3345,8 +3353,15 @@ fn scan_startup_resolved_target(
         let span = correlation.map(|id| {
             event_span(Lane::Navigation, Stage::InitialTargetScan, id).watched_optional(watch)
         });
-        let (scan, mixed) =
-            policy.scan_checked(&result.resolved.as_ref().unwrap().path, Some(cancel));
+        let path = &result.resolved.as_ref().unwrap().path;
+        let (scan, mixed) = policy.scan_checked(path, Some(cancel));
+        let scan = scan.map(|mut scan| {
+            scan.folder_order_input = crate::folder_order::FolderOrderListingInput::read_worker(
+                folder_order_handle,
+                path,
+            );
+            scan
+        });
         result.scan_policy_mixed = mixed;
         if let Some(span) = span {
             span.finish(if cancel.load(Ordering::Relaxed) {
@@ -3437,9 +3452,11 @@ mod tests {
     ) -> StartupOpenPathResolveResult {
         let mut result = resolve_startup_open_path(requested, source, None, true);
         let resolve_ms = result.elapsed_ms;
+        let folder_order_handle = app.folder_order_handle();
         scan_startup_resolved_target(
             &mut result,
             app.folder_scan_policy(),
+            folder_order_handle.as_ref(),
             scan_main,
             &AtomicBool::new(false),
             &StartupScanPhase::new(),

@@ -845,6 +845,7 @@ fn install_virtual(app: &mut App, source: &Path, pdf: bool) {
         VisibleInstallAuthority::Ordinary,
         token,
         None,
+        crate::app::MainListFilterPolicy::Clear,
     );
     hydration.as_mut().unwrap().0.restore_intent = StartupListIntent::ExplicitList;
     app.hydrate_installed_main_list(hydration);
@@ -908,6 +909,7 @@ fn section1795_off_extracted_directory_retains_existing_history_policy() {
         },
         token,
         None,
+        crate::app::MainListFilterPolicy::Clear,
     );
     hydration.as_mut().unwrap().0.restore_intent = StartupListIntent::ExplicitList;
     env.hydrate_installed_main_list(hydration);

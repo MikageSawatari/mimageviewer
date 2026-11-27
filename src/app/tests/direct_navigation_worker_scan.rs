@@ -1358,7 +1358,7 @@ fn direct_navigation_worker_busy_install_refuses_before_scan_admission() {
     image::RgbaImage::new(2, 2)
         .save(source.join("page.png"))
         .unwrap();
-    app.load_folder(source.clone());
+    app.app.load_folder(source.clone());
     assert!(app.direct_navigation_scan_pending());
     app.finish_direct_navigation_scan_before_hydration_for_test();
     assert!(app.sidecar_restore_active());

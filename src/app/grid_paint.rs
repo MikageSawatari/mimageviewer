@@ -2,6 +2,7 @@
 
 use eframe::egui;
 
+use super::thumbnail_standin::ThumbnailDisplayImage;
 use super::{draw_rotated_image_uv_ex, drive_display_label, is_miv_upscaled_derivative};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::settings::{AudioThumbnailIndicator, VideoThumbnailIndicator};
@@ -20,7 +21,22 @@ fn draw_thumb_texture(
     thumb: &ThumbnailState,
     rotation: crate::rotation_db::Rotation,
 ) -> egui::Rect {
-    let view = thumb.tile_view_for_texture(tex, rotation);
+    draw_thumb_view(
+        painter,
+        inner,
+        tex,
+        thumb.tile_view_for_texture(tex, rotation),
+        rotation,
+    )
+}
+
+fn draw_thumb_view(
+    painter: &egui::Painter,
+    inner: egui::Rect,
+    tex: &egui::TextureHandle,
+    view: crate::cover_auto_material::AutoCropView,
+    rotation: crate::rotation_db::Rotation,
+) -> egui::Rect {
     let display_size = view.displayed_size;
     let scale = (inner.width() / display_size.x).min(inner.height() / display_size.y);
     let img_rect = egui::Rect::from_center_size(inner.center(), display_size * scale);
@@ -105,7 +121,18 @@ fn draw_thumb(
     adjusted_tex: Option<&egui::TextureHandle>,
     record: &mut impl FnMut(egui::Rect),
     protected: &[egui::Rect],
+    display_image: Option<&ThumbnailDisplayImage>,
 ) {
+    if let Some(image) = display_image {
+        record(draw_thumb_view(
+            painter,
+            inner,
+            &image.tex,
+            image.view,
+            image.rotation,
+        ));
+        return;
+    }
     match thumb {
         ThumbnailState::Loaded { tex, .. } => {
             let use_tex = adjusted_tex.unwrap_or(tex);
@@ -937,6 +964,7 @@ pub(crate) fn draw_cell(
         resume_meter,
         false,
         folder_background,
+        None,
     );
 }
 
@@ -978,6 +1006,93 @@ pub(crate) fn draw_cell_with_hit_areas(
         resume_meter,
         true,
         folder_background,
+        None,
+    )
+}
+
+pub(crate) fn draw_cell_with_display_image(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    is_selected: bool,
+    is_checked: bool,
+    is_spread_pair_cursor: bool,
+    overlay_layout: &ThumbnailOverlayLayout,
+    item: &GridItem,
+    thumb: &ThumbnailState,
+    rotation: crate::rotation_db::Rotation,
+    // Some(tex) なら `ThumbnailState::Loaded.tex` の代わりにこちらを描画する
+    // (色調補正済みサムネイルテクスチャ)。None または Loaded 以外なら生サムネ。
+    adjusted_tex: Option<&egui::TextureHandle>,
+    is_drive_list: bool,
+    video_indicator: VideoThumbnailIndicator,
+    audio_indicator: AudioThumbnailIndicator,
+    is_cut: bool,
+    resume_meter: Option<f32>,
+    folder_background: &crate::folder_cell_background::FolderCellBackground,
+    display_image: Option<&ThumbnailDisplayImage>,
+) {
+    let _ = paint_cell(
+        ui,
+        rect,
+        is_selected,
+        is_checked,
+        is_spread_pair_cursor,
+        overlay_layout,
+        item,
+        thumb,
+        rotation,
+        adjusted_tex,
+        is_drive_list,
+        video_indicator,
+        audio_indicator,
+        is_cut,
+        resume_meter,
+        false,
+        folder_background,
+        display_image,
+    );
+}
+
+pub(crate) fn draw_cell_with_hit_areas_and_display_image(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    is_selected: bool,
+    is_checked: bool,
+    is_spread_pair_cursor: bool,
+    overlay_layout: &ThumbnailOverlayLayout,
+    item: &GridItem,
+    thumb: &ThumbnailState,
+    rotation: crate::rotation_db::Rotation,
+    // Some(tex) なら `ThumbnailState::Loaded.tex` の代わりにこちらを描画する
+    // (色調補正済みサムネイルテクスチャ)。None または Loaded 以外なら生サムネ。
+    adjusted_tex: Option<&egui::TextureHandle>,
+    is_drive_list: bool,
+    video_indicator: VideoThumbnailIndicator,
+    audio_indicator: AudioThumbnailIndicator,
+    is_cut: bool,
+    resume_meter: Option<f32>,
+    folder_background: &crate::folder_cell_background::FolderCellBackground,
+    display_image: Option<&ThumbnailDisplayImage>,
+) -> ThumbnailHitAreas {
+    paint_cell(
+        ui,
+        rect,
+        is_selected,
+        is_checked,
+        is_spread_pair_cursor,
+        overlay_layout,
+        item,
+        thumb,
+        rotation,
+        adjusted_tex,
+        is_drive_list,
+        video_indicator,
+        audio_indicator,
+        is_cut,
+        resume_meter,
+        true,
+        folder_background,
+        display_image,
     )
 }
 
@@ -1001,7 +1116,11 @@ fn paint_cell(
     resume_meter: Option<f32>,
     collect_hit_areas: bool,
     folder_background: &crate::folder_cell_background::FolderCellBackground,
+    display_image: Option<&ThumbnailDisplayImage>,
 ) -> ThumbnailHitAreas {
+    // Only the image is borrowed from the prior list. Every overlay still reads
+    // the new item's real thumbnail state.
+    let display_image = display_image.filter(|_| matches!(thumb, ThumbnailState::Pending));
     let mut hit_areas = ThumbnailHitAreas::default();
     if !ui.is_rect_visible(rect) {
         return hit_areas;
@@ -1080,6 +1199,16 @@ fn paint_cell(
 
     match item {
         GridItem::Folder(_) => match thumb {
+            ThumbnailState::Pending if display_image.is_some() => {
+                let image = display_image.unwrap();
+                record(draw_thumb_view(
+                    painter,
+                    inner,
+                    &image.tex,
+                    image.view,
+                    image.rotation,
+                ));
+            }
             ThumbnailState::Loaded { tex, .. } => {
                 let use_tex = adjusted_tex.unwrap_or(tex);
                 record(draw_thumb_texture(painter, inner, use_tex, thumb, rotation));
@@ -1121,10 +1250,21 @@ fn paint_cell(
                 adjusted_tex,
                 &mut record,
                 protected,
+                display_image,
             );
         }
         GridItem::Video(_) => {
             match thumb {
+                ThumbnailState::Pending if display_image.is_some() => {
+                    let image = display_image.unwrap();
+                    record(draw_thumb_view(
+                        painter,
+                        inner,
+                        &image.tex,
+                        image.view,
+                        image.rotation,
+                    ));
+                }
                 ThumbnailState::Loaded { tex, .. } => {
                     // 動画サムネは補正対象外 (adjusted_tex は常に None)
                     record(draw_thumb_texture(painter, inner, tex, thumb, rotation));
@@ -1163,7 +1303,15 @@ fn paint_cell(
             }
         }
         GridItem::Audio(_) => {
-            if let ThumbnailState::Loaded { tex, .. } = thumb {
+            if let Some(image) = display_image {
+                record(draw_thumb_view(
+                    painter,
+                    inner,
+                    &image.tex,
+                    image.view,
+                    image.rotation,
+                ));
+            } else if let ThumbnailState::Loaded { tex, .. } = thumb {
                 record(draw_thumb_texture(painter, inner, tex, thumb, rotation));
             } else {
                 painter.rect_filled(inner, 2.0, pending_placeholder_bg);
@@ -1199,6 +1347,7 @@ fn paint_cell(
                 adjusted_tex,
                 &mut record,
                 protected,
+                display_image,
             );
         }
         GridItem::ZipFile(_) | GridItem::PdfFile(_) => {
@@ -1208,6 +1357,16 @@ fn paint_cell(
                 "📄"
             };
             match thumb {
+                ThumbnailState::Pending if display_image.is_some() => {
+                    let image = display_image.unwrap();
+                    record(draw_thumb_view(
+                        painter,
+                        inner,
+                        &image.tex,
+                        image.view,
+                        image.rotation,
+                    ));
+                }
                 ThumbnailState::Loaded { tex, .. } => {
                     // ZipFile/PdfFile の代表サムネは補正対象外 (adjusted_tex は常に None)
                     record(draw_thumb_texture(painter, inner, tex, thumb, rotation));
@@ -1235,6 +1394,16 @@ fn paint_cell(
             // RAR / 7z / LZH: 有効な変換キャッシュ ZIP があれば、その先頭画像 / ピン画像を
             // 表示する。未変換・キャッシュ失効時は汎用アーカイブアイコンへフォールバック。
             match thumb {
+                ThumbnailState::Pending if display_image.is_some() => {
+                    let image = display_image.unwrap();
+                    record(draw_thumb_view(
+                        painter,
+                        inner,
+                        &image.tex,
+                        image.view,
+                        image.rotation,
+                    ));
+                }
                 ThumbnailState::Loaded { tex, .. } => {
                     record(draw_thumb_texture(painter, inner, tex, thumb, rotation));
                 }
@@ -1263,6 +1432,16 @@ fn paint_cell(
             // (📁 + フォルダ名バッジ) に描く。代表サムネがロード済みならそれを使う。
             if *is_archive {
                 match thumb {
+                    ThumbnailState::Pending if display_image.is_some() => {
+                        let image = display_image.unwrap();
+                        record(draw_thumb_view(
+                            painter,
+                            inner,
+                            &image.tex,
+                            image.view,
+                            image.rotation,
+                        ));
+                    }
                     ThumbnailState::Loaded { tex, .. } => {
                         record(draw_thumb_texture(painter, inner, tex, thumb, rotation));
                     }
@@ -1286,6 +1465,16 @@ fn paint_cell(
                 }
             } else {
                 match thumb {
+                    ThumbnailState::Pending if display_image.is_some() => {
+                        let image = display_image.unwrap();
+                        record(draw_thumb_view(
+                            painter,
+                            inner,
+                            &image.tex,
+                            image.view,
+                            image.rotation,
+                        ));
+                    }
                     ThumbnailState::Loaded { tex, .. } => {
                         record(draw_thumb_texture(painter, inner, tex, thumb, rotation));
                     }
@@ -1465,6 +1654,7 @@ fn paint_cell(
                 adjusted_tex,
                 &mut record,
                 protected,
+                display_image,
             );
         }
         GridItem::CollectionPlaceholder { path, reason, .. } => {
@@ -4847,6 +5037,288 @@ mod auto_cover_paint_tests {
             assert_eq!(mesh.vertices[0].uv, first_uv);
             assert_eq!(mesh.calc_bounds(), hit);
             assert_eq!(texture.id(), texture_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod thumbnail_standin_paint_tests {
+    use super::*;
+    use crate::rotation_db::Rotation;
+
+    #[derive(Clone, Copy)]
+    enum PaintPass {
+        Normal,
+        SelectedRepaint,
+        HitAreas,
+    }
+
+    fn cell() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(208.0, 208.0))
+    }
+
+    fn standin(ctx: &egui::Context) -> ThumbnailDisplayImage {
+        ThumbnailDisplayImage {
+            tex: ctx.load_texture(
+                "old-adjusted-cover",
+                egui::ColorImage::filled([400, 200], egui::Color32::WHITE),
+                Default::default(),
+            ),
+            view: crate::cover_auto_material::AutoCropView {
+                uv: egui::Rect::from_min_max(egui::pos2(0.25, 0.25), egui::pos2(0.75, 0.75)),
+                displayed_size: egui::vec2(100.0, 200.0),
+                source_dims: (200, 100),
+                layout_dims: None,
+            },
+            rotation: Rotation::Cw90,
+        }
+    }
+
+    fn paint(
+        ctx: &egui::Context,
+        item: &GridItem,
+        thumb: &ThumbnailState,
+        image: Option<&ThumbnailDisplayImage>,
+        pass: PaintPass,
+        layout: &ThumbnailOverlayLayout,
+    ) -> (Vec<egui::Shape>, ThumbnailHitAreas) {
+        let mut areas = ThumbnailHitAreas::default();
+        let selected = matches!(pass, PaintPass::SelectedRepaint);
+        let output = crate::test_ui::headless_paint_output(ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(260.0, 260.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        // The new Pending cell deliberately has a different angle.
+                        if matches!(pass, PaintPass::HitAreas) {
+                            areas = draw_cell_with_hit_areas_and_display_image(
+                                ui,
+                                cell(),
+                                selected,
+                                layout.check.is_some(),
+                                false,
+                                layout,
+                                item,
+                                thumb,
+                                Rotation::Cw180,
+                                None,
+                                false,
+                                VideoThumbnailIndicator::PlayIcon,
+                                AudioThumbnailIndicator::Hidden,
+                                false,
+                                None,
+                                &crate::folder_cell_background::FolderCellBackground::default(),
+                                image,
+                            );
+                        } else {
+                            draw_cell_with_display_image(
+                                ui,
+                                cell(),
+                                selected,
+                                layout.check.is_some(),
+                                false,
+                                layout,
+                                item,
+                                thumb,
+                                Rotation::Cw180,
+                                None,
+                                false,
+                                VideoThumbnailIndicator::PlayIcon,
+                                AudioThumbnailIndicator::Hidden,
+                                false,
+                                None,
+                                &crate::folder_cell_background::FolderCellBackground::default(),
+                                image,
+                            );
+                        }
+                    });
+            },
+        ));
+        (
+            output.shapes.into_iter().map(|shape| shape.shape).collect(),
+            areas,
+        )
+    }
+
+    fn image_mesh(shapes: &[egui::Shape], id: egui::TextureId) -> Option<&egui::epaint::Mesh> {
+        for shape in shapes {
+            match shape {
+                egui::Shape::Mesh(mesh) if mesh.texture_id == id => return Some(mesh),
+                egui::Shape::Vec(children) => {
+                    if let Some(mesh) = image_mesh(children, id) {
+                        return Some(mesh);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn pending_standin_normal_repaint_and_hit_areas_share_old_cover_geometry() {
+        let ctx = egui::Context::default();
+        let image = standin(&ctx);
+        let expected = egui::Rect::from_center_size(cell().center(), egui::vec2(100.0, 200.0));
+        for item in [
+            GridItem::Image("new.png".into()),
+            GridItem::Folder("new-folder".into()),
+            GridItem::ZipFile("new.zip".into()),
+            GridItem::PdfFile("new.pdf".into()),
+            GridItem::ConvertibleArchive {
+                path: "new.rar".into(),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+            GridItem::Video("new.mp4".into()),
+            GridItem::Audio("new.mp3".into()),
+        ] {
+            let thumb = ThumbnailState::Pending;
+            for pass in [
+                PaintPass::Normal,
+                PaintPass::SelectedRepaint,
+                PaintPass::HitAreas,
+            ] {
+                let (shapes, hits) =
+                    paint(&ctx, &item, &thumb, Some(&image), pass, &Default::default());
+                let mesh = image_mesh(&shapes, image.tex.id()).expect("old cover must be drawn");
+                assert_eq!(mesh.calc_bounds(), expected, "{item:?}");
+                assert_eq!(
+                    mesh.vertices[0].uv,
+                    egui::pos2(0.25, 0.75),
+                    "old crop and angle"
+                );
+                if matches!(pass, PaintPass::HitAreas) {
+                    assert!(
+                        hits.rects().contains(&expected),
+                        "image hit area must match paint"
+                    );
+                }
+                assert!(matches!(thumb, ThumbnailState::Pending));
+            }
+        }
+    }
+
+    #[test]
+    fn standin_keeps_new_selection_check_filename_and_pending_audio_mark() {
+        let ctx = egui::Context::default();
+        let image = standin(&ctx);
+        let item = GridItem::Audio("new-song.mp3".into());
+        let mut layout = ThumbnailOverlayLayout::default();
+        let output = crate::test_ui::headless_paint_output(ctx.run_ui(Default::default(), |ui| {
+            layout = layout_cell_overlays(
+                ui.painter(),
+                cell(),
+                EditBadgeFlags::default(),
+                0,
+                &item,
+                &ThumbnailState::Pending,
+                &[],
+                None,
+                None,
+                false,
+                VideoThumbnailIndicator::PlayIcon,
+                AudioThumbnailIndicator::Hidden,
+                true,
+                None,
+                None,
+                None,
+                false,
+                Default::default(),
+                false,
+                false,
+            );
+        }));
+        drop(output);
+        assert_eq!(
+            layout.bottom_left.filename.as_ref().unwrap().text,
+            "new-song.mp3"
+        );
+        let (shapes, _) = paint(
+            &ctx,
+            &item,
+            &ThumbnailState::Pending,
+            Some(&image),
+            PaintPass::SelectedRepaint,
+            &layout,
+        );
+        assert!(image_mesh(&shapes, image.tex.id()).is_some());
+        assert!(
+            shapes.iter().any(|shape| matches!(shape,
+                egui::Shape::Rect(rect) if rect.rect == cell() && rect.stroke.width == 2.0
+            )),
+            "selection border still belongs to the new cell"
+        );
+        assert!(
+            shapes.iter().any(|shape| matches!(shape,
+                egui::Shape::Circle(circle) if circle.fill == egui::Color32::from_rgb(40, 140, 40)
+            )),
+            "new check overlay remains visible"
+        );
+        // Hidden only hides the marker for Loaded art. Pending must retain its
+        // fallback music icon even when a stand-in supplies the image.
+        let note_bounds = crate::ui_helpers::music_icon_shapes(
+            cell().shrink(4.0),
+            ctx.global_style().visuals.dark_mode,
+        )[3]
+        .visual_bounding_rect();
+        assert!(
+            shapes
+                .iter()
+                .any(|shape| shape.visual_bounding_rect() == note_bounds),
+            "Pending audio must keep its full-size music icon"
+        );
+    }
+
+    #[test]
+    fn non_pending_cells_ignore_display_standin_and_loaded_uses_real_texture() {
+        let ctx = egui::Context::default();
+        let image = standin(&ctx);
+        let real = ctx.load_texture(
+            "new-real",
+            egui::ColorImage::filled([40, 20], egui::Color32::RED),
+            Default::default(),
+        );
+        let loaded = ThumbnailState::loaded_raster(
+            real.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            false,
+            40,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((40, 20)),
+            None,
+        );
+        for thumb in [
+            loaded,
+            ThumbnailState::Evicted,
+            ThumbnailState::Failed,
+            ThumbnailState::NoArt,
+        ] {
+            for pass in [
+                PaintPass::Normal,
+                PaintPass::SelectedRepaint,
+                PaintPass::HitAreas,
+            ] {
+                let (shapes, _) = paint(
+                    &ctx,
+                    &GridItem::Image("new.png".into()),
+                    &thumb,
+                    Some(&image),
+                    pass,
+                    &Default::default(),
+                );
+                assert!(image_mesh(&shapes, image.tex.id()).is_none());
+                assert_eq!(
+                    image_mesh(&shapes, real.id()).is_some(),
+                    matches!(thumb, ThumbnailState::Loaded { .. })
+                );
+            }
         }
     }
 }

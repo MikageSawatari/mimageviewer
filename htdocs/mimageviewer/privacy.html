@@ -120,7 +120,7 @@
       本アプリは利用者の PC 上で動作するデスクトップアプリケーションです。
       <strong>開発者が利用者の個人情報を収集・送信・販売することはありません。</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月26日</p>
+    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月27日</p>
   </section>
 
   <section>
@@ -186,6 +186,7 @@
       <li>タグ・レーティング・回転情報・読み込み履歴</li>
       <li>フォルダや本の代表サムネイルに固定した画像と、手動で指定した表紙の範囲</li>
       <li>製本したページ画像と本棚の本の並び順（並び順は本棚ルートの <code>mimageviewer.book-order.json</code> に保存）</li>
+      <li>フォルダごとの手動の並び順と、対象のフォルダ・ファイルの保存場所（<code>folder_order.db</code>）。順番は mIV のデータフォルダに保存し、閲覧するフォルダには書き込みません</li>
 
       <li>画像や本の表紙について作成・取り込み済みの AI 説明文、画像内の文字の書き写し、検索語（<code>ai_caption.db</code>）。写っている氏名や連絡先なども含むことがあります。アイテム索引を有効にしたお気に入りでは、画像・PDF・EPUB と説明文がある書庫・フォルダの本の保存済み説明文を、PC 内の全文索引にも保存します。メタ情報の移行で書き出した分は、対象フォルダにも保存されます。保存済みの説明文は、一覧の右クリックの「AI 説明文を削除」で消せます</li>
       <li>追加取得した AI 説明文のモデル（<code>addons\vlm\</code>）と、通常版で利用時に展開する実行用ファイル（<code>vlm\workers\</code>）。モデルを削除しても保存済みの説明文は残ります</li>
@@ -506,6 +507,7 @@
     <p>The App stores the following data on your PC. When you enable remote viewing, playback progress and related information travel from your device to your PC. They are not sent to the developer's server. Encrypted traffic may pass through a Tailscale relay server when you connect from outside your home.</p>
     <ul class="pink-list">
       <li>Application settings and view state, video and audio playback positions, and the audio track selected for each file</li>
+      <li>Per-folder manual ordering and the paths of the folders and files it refers to (<code>folder_order.db</code>). The order is saved in the App's data folder, not in the folders being viewed</li>
       <li>Search input history, enabled by default: up to 20 recent queries for each of container search, current-location filtering, item search, and Everything search, saved with settings in <code>settings.db</code>. Queries are recorded when you submit a search, or when you normally leave an input field whose current query has already been run. You can disable or clear this history in Preferences → Library → History and Restore → Search Input History. Turning saving off and selecting OK also clears the current history. After either clearing operation, earlier history may remain in automatic settings backups for a while. History contents are not passed to diagnostic logs, remote viewing, or AI integration. Searches made through remote viewing or AI integration are not recorded in this history</li>
       <li>The permission level for AI integration; settings for showing reduced images, shooting locations, AI captions, transcripts, and the current location to AI; and permission for AI to inspect and change settings</li>
       <li>A script for combining viewer operations (<code>operation_scripts.rhai</code> in the data folder). Changes made with AI permission are saved to the same file. Whether scripts are enabled and whether the initial explanation was confirmed are saved in settings and can be changed only by the user. The script itself cannot communicate over a network</li>

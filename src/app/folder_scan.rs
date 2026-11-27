@@ -463,6 +463,7 @@ mod omitted_entries_tests {
             temp.path(),
             scan,
             &crate::settings::Settings::default(),
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
         );
         assert!(!listing.omitted.sorted);
         assert_eq!(
@@ -589,7 +590,12 @@ mod omitted_entries_tests {
             // The final materializer historically assigns same_name, rather than adding.
             scan.omitted
                 .record(OmittedReason::ImagePriority, "old.jpg".into());
-            let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+            let listing = materialize_local_folder_listing(
+                temp.path(),
+                scan,
+                &settings,
+                crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+            );
             listing.omitted.assert_consistent();
             assert!(!listing.omitted.sorted);
             let mut expected = vec![
@@ -681,6 +687,7 @@ mod omitted_entries_tests {
             temp.path(),
             scan_directory_with_settings(temp.path(), &settings).unwrap(),
             &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
         );
         listing.omitted.assert_consistent();
         assert_eq!(
@@ -710,6 +717,7 @@ mod omitted_entries_tests {
             &book,
             scan_directory_with_settings(&book, &settings).unwrap(),
             &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
         );
         listing.omitted.assert_consistent();
         assert!(listing.omitted.entries.is_empty());
@@ -735,6 +743,10 @@ pub(crate) fn is_system_metadata_name(name: &str) -> bool {
 /// 複数ウィンドウの grid Folder 候補は worker で生成し、画像本と確定した結果だけを
 /// detached context へ移譲する。
 pub(crate) struct ScannedDir {
+    /// Full normalized direct-child inventory, captured before any projection.
+    pub(crate) folder_order_inventory: std::collections::HashSet<String>,
+    /// Worker transport only; materialization receives an explicit input argument.
+    pub(crate) folder_order_input: crate::folder_order::FolderOrderListingInput,
     /// Worker-only, read-only catalog snapshot. Synchronous UI scans leave this absent.
     pub(crate) duration_facts: Option<FolderDurationFacts>,
     pub(crate) page_count_facts: Option<FolderPageCountFacts>,
@@ -1013,6 +1025,8 @@ mod duration_tests {
 
     fn scan() -> ScannedDir {
         ScannedDir {
+            folder_order_inventory: Default::default(),
+            folder_order_input: Default::default(),
             duration_facts: None,
             page_count_facts: None,
             precise_stamps: Default::default(),
@@ -1140,6 +1154,7 @@ mod duration_tests {
                 Path::new(r"C:\duration"),
                 input,
                 &settings,
+                crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
                 crate::rating_sort::ListingOrderRequest::Standard(SortOrder::DurationAsc),
                 |_| panic!("duration order must not read ratings"),
                 |path, stamp| {
@@ -1199,6 +1214,7 @@ mod duration_tests {
             Path::new(r"C:\duration"),
             scan(),
             &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
             crate::rating_sort::ListingOrderRequest::Standard(SortOrder::DurationAsc),
             |_| panic!("duration order must not read ratings"),
             |path, _| {
@@ -1211,6 +1227,7 @@ mod duration_tests {
             Path::new(r"C:\duration"),
             scan(),
             &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
             crate::rating_sort::ListingOrderRequest::Standard(SortOrder::FileName),
             |_| panic!("name order must not read ratings"),
             |_, _| panic!("name order must not read duration"),
@@ -1297,6 +1314,7 @@ impl AuxiliaryMediaCandidates {
 /// この同じ pure helper を使う。表示対象・sort・重複除外を変える場合はここだけを変更し、
 /// remote 側に別のオーケストレーションを増やさない。
 pub(crate) struct MaterializedFolderListing {
+    pub(crate) folder_order: crate::folder_order::FolderOrderState,
     pub(crate) row_record: std::sync::Arc<FolderRowRecord>,
     pub(crate) items: Vec<GridItem>,
     pub(crate) metas: Vec<Option<(i64, i64)>>,
@@ -1585,6 +1603,8 @@ pub(crate) fn is_image_only_book_contents(
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     scan_directory_with_convertible_archives(path, true, true, false).unwrap_or_else(|_| {
         ScannedDir {
+            folder_order_inventory: Default::default(),
+            folder_order_input: Default::default(),
             duration_facts: None,
             page_count_facts: None,
             precise_stamps: Default::default(),
@@ -1773,6 +1793,7 @@ where
     I: IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
 {
     let mut precise_stamps = std::collections::HashMap::new();
+    let mut folder_order_inventory = std::collections::HashSet::new();
     let mut folders: Vec<ScannedFolderEntry> = Vec::new();
     let mut all_media: Vec<ScannedMediaEntry> = Vec::new();
     let mut omitted = OmittedFolderEntries::default();
@@ -1791,6 +1812,7 @@ where
         // catalog delete_missing remove rows for every unseen tail entry, so discard the whole
         // scan instead.
         let entry = entry?;
+        folder_order_inventory.insert(crate::folder_order::folder_key(&entry.path()));
         if crate::fs_entry::is_internal_app_entry_name(&entry.file_name()) {
             continue;
         }
@@ -1937,6 +1959,8 @@ where
     let auxiliary_media =
         AuxiliaryMediaCandidates::capture(&all_media, policy, &entry_file_names_ci);
     let mut scan = ScannedDir {
+        folder_order_inventory,
+        folder_order_input: Default::default(),
         duration_facts: None,
         page_count_facts: None,
         precise_stamps,
@@ -2535,6 +2559,8 @@ impl ScannedDir {
     /// The rescan worker duplicates raw scan input; UI never clones the listing.
     pub(crate) fn clone_for_projection(&self) -> Self {
         Self {
+            folder_order_inventory: self.folder_order_inventory.clone(),
+            folder_order_input: self.folder_order_input.clone(),
             duration_facts: self.duration_facts.clone(),
             page_count_facts: self.page_count_facts.clone(),
             precise_stamps: self.precise_stamps.clone(),
@@ -2699,6 +2725,8 @@ pub(crate) mod signature_tests {
         })
         .collect();
         ScannedDir {
+            folder_order_inventory: Default::default(),
+            folder_order_input: Default::default(),
             duration_facts: None,
             page_count_facts: None,
             precise_stamps: Default::default(),
@@ -2904,7 +2932,12 @@ mod page_count_tests {
         let mut settings = crate::settings::Settings::default();
         let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
         assert!(scan.folders.iter().any(|entry| matches!(&entry.item, GridItem::PdfFile(path) if path.file_name().unwrap() == "Book.EPUB")));
-        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan,
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        );
         assert_eq!(listing.omitted.counts.same_name, 1);
         assert!(!listing.items.iter().any(|item| matches!(item, GridItem::PdfFile(path) if path.file_name().unwrap() == "Book.EPUB")));
         assert!(listing.items.iter().any(|item| matches!(item, GridItem::PdfFile(path) if path.file_name().unwrap() == "book.PDF")));
@@ -2924,7 +2957,12 @@ mod page_count_tests {
 
         settings.skip_epub_if_pdf_exists = false;
         let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
-        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan,
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        );
         assert!(listing.items.iter().any(|item| matches!(item, GridItem::PdfFile(path) if path.file_name().unwrap() == "Book.EPUB")));
         assert!(listing.items.iter().any(|item| matches!(item, GridItem::PdfFile(path) if path.file_name().unwrap() == "book.PDF")));
     }
@@ -3139,7 +3177,12 @@ mod page_count_tests {
         settings.skip_duplicate_images = true;
         settings.image_ext_priority = vec!["png".to_owned(), "jpg".to_owned()];
 
-        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan,
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        );
 
         assert_eq!(
             listing.omitted.counts.same_name, 1,
@@ -3164,6 +3207,8 @@ mod page_count_tests {
         db.set_user_rating(&key("z.jpg"), 5, None).unwrap();
         db.set_user_rating(&key("a.jpg"), 4, None).unwrap();
         let scan = || ScannedDir {
+            folder_order_inventory: Default::default(),
+            folder_order_input: Default::default(),
             duration_facts: None,
             page_count_facts: None,
             precise_stamps: Default::default(),
@@ -3195,6 +3240,7 @@ mod page_count_tests {
             temp.path(),
             scan(),
             &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
             request,
             |keys| {
                 reads += 1;
@@ -3228,6 +3274,7 @@ mod page_count_tests {
             temp.path(),
             scan(),
             &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
             request,
             |_| Err("injected".into()),
         );
@@ -3285,6 +3332,8 @@ mod page_count_tests {
             sort_meta: crate::settings::ListingSortMetadata::new(7, known.then_some(file_size)),
         };
         let scan = || ScannedDir {
+            folder_order_inventory: Default::default(),
+            folder_order_input: Default::default(),
             duration_facts: None,
             page_count_facts: None,
             precise_stamps: Default::default(),
@@ -3305,8 +3354,12 @@ mod page_count_tests {
         };
         let mut settings = crate::settings::Settings::default();
         settings.sort_order = crate::settings::SortOrder::SizeAsc;
-        let listing =
-            materialize_local_folder_listing(std::path::Path::new(r"C:\sizes"), scan(), &settings);
+        let listing = materialize_local_folder_listing(
+            std::path::Path::new(r"C:\sizes"),
+            scan(),
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        );
         let image_names = listing
             .items
             .iter()
@@ -3324,8 +3377,12 @@ mod page_count_tests {
         assert_eq!(listing.metas[unknown_index], Some((7, 0)));
 
         settings.sort_order = crate::settings::SortOrder::SizeDesc;
-        let listing =
-            materialize_local_folder_listing(std::path::Path::new(r"C:\sizes"), scan(), &settings);
+        let listing = materialize_local_folder_listing(
+            std::path::Path::new(r"C:\sizes"),
+            scan(),
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        );
         let image_names = listing
             .items
             .iter()
@@ -3615,7 +3672,12 @@ mod page_count_tests {
                 settings.skip_duplicate_images = false;
                 settings.sort_order = crate::settings::SortOrder::FileName;
                 let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
-                let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+                let listing = materialize_local_folder_listing(
+                    temp.path(),
+                    scan,
+                    &settings,
+                    crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+                );
                 assert_eq!(
                     listing
                         .items
@@ -3843,7 +3905,12 @@ mod page_count_tests {
                             .insert(adopted.extension().unwrap().to_str().unwrap().to_owned());
                     }
                     let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
-                    let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+                    let listing = materialize_local_folder_listing(
+                        temp.path(),
+                        scan,
+                        &settings,
+                        crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+                    );
                     let selected = listing
                         .video_thumb_overrides
                         .into_iter()
@@ -3889,7 +3956,12 @@ mod page_count_tests {
                 .count(),
             1
         );
-        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan,
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        );
         assert_eq!(listing.items, vec![GridItem::Audio(audio.clone())]);
         assert_eq!(listing.video_thumb_overrides, vec![(audio.clone(), image)]);
         assert_eq!(listing.omitted.counts.file_type, 1);
@@ -3902,7 +3974,12 @@ mod page_count_tests {
             scan.complete_audio_inventory.as_ref().unwrap(),
             &std::collections::HashSet::from(["song.mp3".into()])
         );
-        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan,
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        );
         assert!(listing.items.is_empty());
         assert!(listing.video_thumb_overrides.is_empty());
         assert_eq!(listing.omitted.counts.file_type, 2);
@@ -3952,7 +4029,12 @@ mod page_count_tests {
                 .any(|entry| entry.path.file_name().unwrap() == ".hidden.mp3")
         );
         let inventory = scan.complete_audio_inventory.clone();
-        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan,
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        );
         assert!(listing.items.iter().any(
             |item| matches!(item, GridItem::Audio(path) if path.file_name().unwrap() == "Shown.MP3")
         ));
@@ -4047,7 +4129,12 @@ mod file_type_visibility_tests {
         let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
         assert_eq!(scan.omitted.counts.file_type, 3);
         assert_eq!(scan.omitted.counts.system, 1);
-        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan,
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        );
         let names = listing
             .items
             .iter()
@@ -4082,7 +4169,12 @@ mod file_type_visibility_tests {
             .excluded_categories
             .insert(FileTypeCategory::Image);
         let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
-        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan,
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        );
         assert_eq!(listing.items.len(), 1);
         assert!(matches!(listing.items[0], GridItem::Video(_)));
         assert_eq!(listing.omitted.counts.file_type, 1);
@@ -4165,7 +4257,12 @@ mod file_type_visibility_tests {
                 .iter()
                 .any(|entry| entry.path == temp.path().join("movie.mp4"))
         );
-        let listing = materialize_local_folder_listing(temp.path(), scan, &settings);
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan,
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        );
         assert_eq!(
             listing.items,
             vec![GridItem::Video(temp.path().join("movie.mp4"))]
@@ -4200,11 +4297,13 @@ mod section1375_row_tests {
             &folder,
             scan_directory_with_settings(&slash_folder, &settings).unwrap(),
             &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
         );
         let current = materialize_local_folder_listing(
             &folder,
             scan_directory_with_settings(&folder, &settings).unwrap(),
             &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
         );
         assert!(current.row_record.same_remaining_rows(
             &previous.row_record,
@@ -4217,6 +4316,7 @@ mod section1375_row_tests {
             &folder,
             scan_directory_with_settings(&folder, &settings).unwrap(),
             &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
         );
         assert!(empty.row_record.same_remaining_rows(
             &previous.row_record,
@@ -4250,7 +4350,12 @@ mod section1375_row_tests {
                 std::fs::write(folder.join(file), b"same-content").unwrap();
             }
             let scan = scan_directory_with_settings(&folder, &settings).unwrap();
-            let listing = materialize_local_folder_listing(&folder, scan, &settings);
+            let listing = materialize_local_folder_listing(
+                &folder,
+                scan,
+                &settings,
+                crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+            );
             assert_eq!(listing.omitted.counts.same_name, 1);
             assert_eq!(listing.row_record.rows.len(), 5);
             assert!(listing.row_record.known);
@@ -4284,9 +4389,13 @@ mod section1375_row_tests {
         old.precise_stamps
             .insert(folder_scan_path_key(&path), Some((t, 20)));
         let settings = crate::settings::Settings::default();
-        let previous =
-            materialize_local_folder_listing(root, old.clone_for_projection(), &settings)
-                .row_record;
+        let previous = materialize_local_folder_listing(
+            root,
+            old.clone_for_projection(),
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        )
+        .row_record;
         let mut new = old.clone_for_projection();
         new.precise_stamps.insert(
             folder_scan_path_key(&path),
@@ -4297,7 +4406,13 @@ mod section1375_row_tests {
             signature_from_scan(&new),
             "the legacy seconds signature stays unchanged; row records own precise comparison"
         );
-        let current = materialize_local_folder_listing(root, new, &settings).row_record;
+        let current = materialize_local_folder_listing(
+            root,
+            new,
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        )
+        .row_record;
         assert!(!current.same_remaining_rows(&previous, std::iter::empty(), root));
         let mut rows = previous.rows.clone();
         rows.reverse();
@@ -4307,7 +4422,13 @@ mod section1375_row_tests {
         unknown
             .precise_stamps
             .insert(folder_scan_path_key(&path), None);
-        let current = materialize_local_folder_listing(root, unknown, &settings).row_record;
+        let current = materialize_local_folder_listing(
+            root,
+            unknown,
+            &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+        )
+        .row_record;
         assert!(!current.known);
         assert!(!current.same_remaining_rows(&current, std::iter::empty(), root));
     }
@@ -4337,8 +4458,12 @@ mod section1375_row_tests {
             let worker = std::thread::spawn(move || {
                 let settings = crate::settings::Settings::default();
                 let start = Instant::now();
-                let projected =
-                    materialize_local_folder_listing(root, scan.clone_for_projection(), &settings);
+                let projected = materialize_local_folder_listing(
+                    root,
+                    scan.clone_for_projection(),
+                    &settings,
+                    crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+                );
                 let projection_ms = start.elapsed().as_secs_f64() * 1000.0;
                 let mut initial_record_samples = Vec::with_capacity(5);
                 for _ in 0..5 {
@@ -4384,7 +4509,13 @@ mod section1375_row_tests {
 
                 let removed = scan.all_media.last().unwrap().path.clone();
                 scan.all_media.pop();
-                let current = materialize_local_folder_listing(root, scan, &settings).row_record;
+                let current = materialize_local_folder_listing(
+                    root,
+                    scan,
+                    &settings,
+                    crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+                )
+                .row_record;
                 assert!(!current.same_remaining_rows(&previous, std::iter::empty(), root));
                 assert!(current.same_remaining_rows(&previous, std::iter::once(&removed), root));
                 eprintln!(
@@ -4428,8 +4559,12 @@ mod section1375_scan_perf_tests {
                 .unwrap();
                 let scan_ms = start.elapsed().as_secs_f64() * 1000.0;
                 let start = std::time::Instant::now();
-                let listing =
-                    materialize_local_folder_listing(temp.path(), scan, &Default::default());
+                let listing = materialize_local_folder_listing(
+                    temp.path(),
+                    scan,
+                    &Default::default(),
+                    crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
+                );
                 let projection_ms = start.elapsed().as_secs_f64() * 1000.0;
                 assert_eq!(listing.items.len(), count);
                 assert!(listing.row_record.known);
@@ -4471,6 +4606,8 @@ mod page_count_listing_883_tests {
 
     fn scan() -> ScannedDir {
         ScannedDir {
+            folder_order_inventory: Default::default(),
+            folder_order_input: Default::default(),
             duration_facts: None,
             page_count_facts: None,
             precise_stamps: Default::default(),
@@ -4570,6 +4707,7 @@ mod page_count_listing_883_tests {
             Path::new(ROOT),
             input,
             &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
             crate::rating_sort::ListingOrderRequest::Standard(SortOrder::PageCountAsc),
             |_| panic!("page count must not read ratings"),
             |_, _| panic!("page count must not read duration"),
@@ -4809,6 +4947,7 @@ mod page_count_listing_883_tests {
                 &root,
                 input,
                 &settings,
+                crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
                 crate::rating_sort::ListingOrderRequest::Standard(SortOrder::PageCountAsc),
                 |_| panic!("page order must not read ratings"),
                 |_, _| panic!("page order must not read duration"),
@@ -4840,6 +4979,7 @@ mod page_count_listing_883_tests {
                 Path::new(ROOT),
                 input,
                 &Default::default(),
+                crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
                 crate::rating_sort::ListingOrderRequest::Standard(sort),
                 |_| panic!("these sorts must not read ratings"),
                 |_, _| None,
@@ -4954,5 +5094,303 @@ mod page_count_listing_883_tests {
             facts.page_count_for(&item("book.pdf"), (7, 10)),
             Some(ListingPageCount::Known(6))
         );
+    }
+}
+
+#[cfg(test)]
+mod folder_manual_order_tests {
+    use super::*;
+    use crate::folder_order::{FolderOrderListingInput, FolderOrderRecord};
+    use crate::settings::{GridDisplayOrder, GridItemDisplayKind, ListingSortMetadata, SortOrder};
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    fn read(active: bool, items: Vec<String>) -> FolderOrderListingInput {
+        FolderOrderListingInput::from_read(Ok(Some(FolderOrderRecord {
+            active,
+            revision: 7,
+            items,
+        })))
+    }
+    fn names(listing: &MaterializedFolderListing) -> Vec<String> {
+        listing
+            .items
+            .iter()
+            .map(|item| item.name().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn section1911_inventory_precedes_internal_hidden_kind_and_duplicate_projection() {
+        let temp = tempfile::tempdir().unwrap();
+        let token = "a".repeat(64);
+        let internal = format!(".miv-part-{token}.tmp");
+        let files = [
+            "same.jpg",
+            "same.png",
+            "notes.txt",
+            "Thumbs.db",
+            "._metadata.jpg",
+            &internal,
+        ];
+        for name in files {
+            std::fs::write(temp.path().join(name), b"fixture").unwrap();
+        }
+        std::fs::create_dir(temp.path().join("child")).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.skip_duplicate_images = true;
+        settings.image_ext_priority = vec!["png".into(), "jpg".into()];
+        settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        let scan = scan_directory_with_settings(temp.path(), &settings).unwrap();
+        let expected = files
+            .into_iter()
+            .chain(["child"])
+            .map(|name| crate::folder_order::folder_key(&temp.path().join(name)))
+            .collect::<HashSet<_>>();
+        assert_eq!(scan.folder_order_inventory, expected);
+        let clone = scan.clone_for_projection();
+        assert_eq!(clone.folder_order_inventory, expected);
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan,
+            &settings,
+            FolderOrderListingInput::from_read(Ok(None)),
+        );
+        assert_eq!(listing.folder_order.inventory, expected);
+        assert!(!listing.items.iter().any(|item| item.name() == internal));
+        assert!(!listing.items.iter().any(|item| item.name() == "same.png"));
+    }
+
+    #[test]
+    fn section1911_materialization_flat_order_crosses_default_four_and_unassigned_rows() {
+        use GridItemDisplayKind::{Archive, Folder, Image, VideoAudio};
+        let root = Path::new(r"C:\manual");
+        let key = |name: &str| crate::folder_order::folder_key(&root.join(name));
+        let scan = || ScannedDir {
+            folder_order_inventory: [
+                "a-folder",
+                "b.zip",
+                "c.jpg",
+                "d.mp4",
+                "unknown-folder",
+                "unknown.jpg",
+            ]
+            .into_iter()
+            .map(key)
+            .collect(),
+            folder_order_input: Default::default(),
+            duration_facts: None,
+            page_count_facts: None,
+            precise_stamps: Default::default(),
+            reconcile: None,
+            complete_audio_inventory: None,
+            folders: [
+                GridItem::Folder(root.join("a-folder")),
+                GridItem::ZipFile(root.join("b.zip")),
+                GridItem::Folder(root.join("unknown-folder")),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| ScannedFolderEntry {
+                item,
+                display_meta: Some((index as i64, index as i64 + 1)),
+                sort_meta: ListingSortMetadata::new(index as i64, Some(index as i64 + 1)),
+            })
+            .collect(),
+            all_media: [
+                ("c.jpg", ScanMediaKind::Image),
+                ("d.mp4", ScanMediaKind::Video),
+                ("unknown.jpg", ScanMediaKind::Image),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, kind))| ScannedMediaEntry {
+                path: root.join(name),
+                kind,
+                mtime: index as i64 + 10,
+                file_size: index as i64 + 20,
+                sort_meta: ListingSortMetadata::new(index as i64 + 10, Some(index as i64 + 20)),
+            })
+            .collect(),
+            omitted: Default::default(),
+            auxiliary_media: Default::default(),
+        };
+        for display in [
+            GridDisplayOrder::default(),
+            GridDisplayOrder::from_rows([
+                vec![VideoAudio],
+                vec![Image],
+                vec![Archive],
+                vec![Folder],
+            ]),
+            GridDisplayOrder::from_rows([vec![Folder], vec![], vec![], vec![]]),
+        ] {
+            let mut settings = crate::settings::Settings::default();
+            settings.sort_order = SortOrder::FileName;
+            settings.grid_display_order = display;
+            settings.skip_image_if_video_exists = false;
+            let baseline = materialize_local_folder_listing(
+                root,
+                scan(),
+                &settings,
+                FolderOrderListingInput::from_read(Ok(None)),
+            );
+            let expected_meta = baseline
+                .items
+                .iter()
+                .zip(&baseline.metas)
+                .zip(&baseline.sort_metas)
+                .map(|((item, meta), sort_meta)| (item.name().into_owned(), (*meta, *sort_meta)))
+                .collect::<std::collections::HashMap<_, _>>();
+            // Display/cache stamps and typed sort metadata have separate contracts:
+            // real folders retain their display stamp, but never have a sortable size.
+            assert_eq!(
+                expected_meta["a-folder"],
+                (Some((0, 1)), ListingSortMetadata::new(0, None))
+            );
+            let base_unknown = names(&baseline)
+                .into_iter()
+                .filter(|name| name.starts_with("unknown"))
+                .collect::<Vec<_>>();
+            let listing = materialize_local_folder_listing(
+                root,
+                scan(),
+                &settings,
+                read(
+                    true,
+                    ["d.mp4", "a-folder", "c.jpg", "gone.jpg", "b.zip"]
+                        .into_iter()
+                        .map(key)
+                        .collect(),
+                ),
+            );
+            let mut expected = vec![
+                "d.mp4".to_string(),
+                "a-folder".into(),
+                "c.jpg".into(),
+                "b.zip".into(),
+            ];
+            expected.extend(base_unknown);
+            assert_eq!(names(&listing), expected);
+            settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+            let with_details_header = materialize_local_folder_listing(
+                root,
+                scan(),
+                &settings,
+                read(
+                    true,
+                    ["d.mp4", "a-folder", "c.jpg", "gone.jpg", "b.zip"]
+                        .into_iter()
+                        .map(key)
+                        .collect(),
+                ),
+            );
+            assert_eq!(names(&with_details_header), expected);
+            assert_eq!(
+                settings.details_sort_key,
+                crate::settings::DetailsSortKey::Name
+            );
+            for projected in [&baseline, &listing, &with_details_header] {
+                assert_eq!(projected.items.len(), expected_meta.len());
+                assert_eq!(projected.items.len(), projected.metas.len());
+                assert_eq!(projected.items.len(), projected.sort_metas.len());
+                for ((item, meta), sort_meta) in projected
+                    .items
+                    .iter()
+                    .zip(&projected.metas)
+                    .zip(&projected.sort_metas)
+                {
+                    assert_eq!((*meta, *sort_meta), expected_meta[item.name().as_ref()]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section1911_manual_permutation_keeps_prepared_rating_cache_aligned() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("folder");
+        std::fs::create_dir(&root).unwrap();
+        for name in ["a.jpg", "b.jpg"] {
+            std::fs::write(root.join(name), b"fixture").unwrap();
+        }
+        let db = crate::rating_db::RatingDb::open_at(temp.path().join("ratings.db")).unwrap();
+        let key = |name: &str| crate::adjustment_db::normalize_path(&root.join(name));
+        db.set_user_rating(&key("a.jpg"), 1, None).unwrap();
+        db.set_user_rating(&key("b.jpg"), 5, None).unwrap();
+        let mut settings = crate::settings::Settings::default();
+        settings.sort_order = SortOrder::RatingDesc;
+        let input = read(
+            true,
+            ["a.jpg", "b.jpg"]
+                .into_iter()
+                .map(|name| crate::folder_order::folder_key(&root.join(name)))
+                .collect(),
+        );
+        let listing = materialize_local_folder_listing_with_order(
+            &root,
+            scan_directory_with_settings(&root, &settings).unwrap(),
+            &settings,
+            input,
+            crate::rating_sort::ListingOrderRequest::from_settings(&settings),
+            |keys| {
+                db.get_many_complete(keys, 7)
+                    .map_err(|error| error.to_string())
+            },
+        );
+        assert_eq!(names(&listing), ["a.jpg", "b.jpg"]);
+        let FolderRatingOrder::Prepared { cache, .. } = listing.rating_order else {
+            panic!("prepared ratings expected")
+        };
+        assert_eq!(cache, [(0, 1), (1, 5)].into());
+    }
+
+    #[test]
+    fn section1911_book_policy_and_stack_suppress_manual_without_losing_active_record() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["a.jpg", "b.jpg"] {
+            std::fs::write(temp.path().join(name), b"fixture").unwrap();
+        }
+        let mut settings = crate::settings::Settings::default();
+        settings.sort_order = SortOrder::FileName;
+        let input = read(
+            true,
+            ["b.jpg", "a.jpg"]
+                .into_iter()
+                .map(|name| crate::folder_order::folder_key(&temp.path().join(name)))
+                .collect(),
+        );
+        let scan = || scan_directory_with_settings(temp.path(), &settings).unwrap();
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan(),
+            &settings,
+            input.clone().with_stack(true),
+        );
+        assert_eq!(names(&listing), ["a.jpg", "b.jpg"]);
+        assert!(listing.folder_order.manual_active());
+        assert!(!listing.folder_order.applies_to_physical_listing(
+            &settings,
+            temp.path(),
+            &listing.items
+        ));
+        settings.auto_fullscreen_zip_pdf = true;
+        settings.auto_fullscreen_image_folders = true;
+        let listing = materialize_local_folder_listing(
+            temp.path(),
+            scan_directory_with_settings(temp.path(), &settings).unwrap(),
+            &settings,
+            input,
+        );
+        assert_eq!(names(&listing), ["a.jpg", "b.jpg"]);
+        assert!(listing.folder_order.manual_active());
+        assert!(!listing.folder_order.applies_to_physical_listing(
+            &settings,
+            temp.path(),
+            &listing.items
+        ));
     }
 }

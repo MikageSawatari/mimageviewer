@@ -561,7 +561,7 @@ fn row_anchor_after_list_adoption(route: &str) {
                     env.poll_external_rescan(&driver.ctx);
                 }
                 "resume" => {
-                    assert!(env.load_folder_with_scan_owned(
+                    assert!(env.app.load_folder_with_scan_owned(
                         source.clone(),
                         None,
                         OpenRequestOwner::Navigation,

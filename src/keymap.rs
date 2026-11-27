@@ -1679,6 +1679,7 @@ pub enum KeyAction {
     GridToggleMaximize,
     GridToggleFolderTreePane,
     GridToggleStackMode,
+    GridEnterFolderManualOrder,
     GridConvertEpubToPdf,
     GridTagApply,
     GridTagView,
@@ -2328,6 +2329,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridToggleMaximize,
     KeyAction::GridToggleFolderTreePane,
     KeyAction::GridToggleStackMode,
+    KeyAction::GridEnterFolderManualOrder,
     KeyAction::GridConvertEpubToPdf,
     KeyAction::GridTagApply,
     KeyAction::GridTagView,
@@ -4656,6 +4658,7 @@ impl KeyAction {
             GridToggleMaximize => "GridToggleMaximize",
             GridToggleFolderTreePane => "GridToggleFolderTreePane",
             GridToggleStackMode => "GridToggleStackMode",
+            GridEnterFolderManualOrder => "GridEnterFolderManualOrder",
             GridConvertEpubToPdf => "GridConvertEpubToPdf",
             GridTagApply => "GridTagApply",
             GridTagView => "GridTagView",
@@ -5468,6 +5471,7 @@ impl KeyAction {
             GridToggleMaximize => "メインウィンドウを最大化/復元する",
             GridToggleFolderTreePane => "フォルダツリーペインの表示を切り替える",
             GridToggleStackMode => "スタック表示を切り替える",
+            GridEnterFolderManualOrder => "手動順に切り替え",
             GridConvertEpubToPdf => "選択中の EPUB を PDF ファイルに変換する",
             GridTagApply => "タグを付ける/外すダイアログを開く",
             GridTagView => "タグビューを開く",
@@ -6108,6 +6112,7 @@ impl KeyAction {
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
+            | GridEnterFolderManualOrder
             | GridConvertEpubToPdf
             | GridTagApply
             | GridTagView
@@ -6699,6 +6704,7 @@ impl KeyAction {
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
+            | GridEnterFolderManualOrder
             | GridConvertEpubToPdf
             | GridTagApply
             | GridTagView
@@ -7318,6 +7324,7 @@ impl KeyAction {
             GridToggleMaximize => ChordList::one(Chord::key(F11)),
             GridToggleFolderTreePane => ChordList::one(Chord::key(F)),
             GridToggleStackMode => ChordList::EMPTY,
+            GridEnterFolderManualOrder => ChordList::EMPTY,
             GridConvertEpubToPdf => ChordList::EMPTY,
             GridTagApply => ChordList::one(Chord::key(T)),
             GridTagView => ChordList::one(Chord::ctrl(T)),
@@ -12742,23 +12749,25 @@ mod tests {
     }
 
     #[test]
-    fn search_name_actions_are_unassigned_grid_press_and_roundtrip_ini_and_settings() {
+    fn unassigned_grid_actions_roundtrip_ini_and_settings() {
         let actions = [
             KeyAction::GridSearchNameEverything,
             KeyAction::GridSearchNameMetadata,
             KeyAction::GridSearchNameLocal,
+            KeyAction::GridEnterFolderManualOrder,
         ];
         let keymap = Keymap::from_ini_str(
-            "[Grid]\nGridSearchNameEverything = F16\nGridSearchNameMetadata = F17\nGridSearchNameLocal = F18\n",
+            "[Grid]\nGridSearchNameEverything = F16\nGridSearchNameMetadata = F17\nGridSearchNameLocal = F18\nGridEnterFolderManualOrder = F19\n",
         );
         assert!(keymap.warnings().is_empty(), "{:?}", keymap.warnings());
         let settings = KeymapSettings::from_keymap(&keymap);
         let settings: KeymapSettings =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         let restored = Keymap::from_settings(&settings);
-        for (action, key) in actions
-            .into_iter()
-            .zip([KeyName::F16, KeyName::F17, KeyName::F18])
+        for (action, key) in
+            actions
+                .into_iter()
+                .zip([KeyName::F16, KeyName::F17, KeyName::F18, KeyName::F19])
         {
             assert_eq!(
                 KeyAction::all()
@@ -12796,7 +12805,7 @@ mod tests {
             )));
         }
         let disabled = Keymap::from_ini_str(
-            "[Grid]\nGridSearchNameEverything = none\nGridSearchNameMetadata = none\nGridSearchNameLocal = none\n",
+            "[Grid]\nGridSearchNameEverything = none\nGridSearchNameMetadata = none\nGridSearchNameLocal = none\nGridEnterFolderManualOrder = none\n",
         );
         assert!(disabled.warnings().is_empty());
         for action in actions {

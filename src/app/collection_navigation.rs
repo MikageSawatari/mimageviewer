@@ -1251,6 +1251,7 @@ impl App {
         kind: Option<CollectionResolvedKind>,
         password: Option<String>,
     ) -> Result<PhysicalHistoryPreflight, String> {
+        let folder_order_handle = self.folder_order_handle();
         let duration_wanted = self.listing_may_sort_by_duration();
         let page_count_fingerprint = self.listing_page_count_facts_fingerprint();
         let duration_cache_dir = crate::catalog::default_cache_dir();
@@ -1316,6 +1317,7 @@ impl App {
                             )
                             .map(|mut scan| {
                                 super::folder_scan::collect_folder_listing_metadata_facts(&path, &mut scan, &duration_cache_dir, duration_wanted, page_count_fingerprint);
+                                scan.folder_order_input = crate::folder_order::FolderOrderListingInput::read_worker(folder_order_handle.as_ref(), &path);
                                 PhysicalHistoryPreflightPayload::Folder(scan)
                             })
                             .map_err(|error| format!("フォルダを読み込めません: {error}"))

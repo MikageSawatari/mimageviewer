@@ -33,6 +33,7 @@ fn listed_output(new_folder: bool) -> (crate::app::AppTestEnvForTest, PathBuf, P
         &folder,
         scan.clone_for_projection(),
         &app.settings,
+        crate::folder_order::FolderOrderListingInput::NotApplicable,
     );
     app.current_folder = Some(folder.clone());
     app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);

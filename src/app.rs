@@ -660,6 +660,11 @@ pub(crate) mod book_preferred_rating;
 use book_preferred_rating::{ContainerRatingTarget, ContainerRatingToast};
 #[cfg(test)]
 mod book_preferred_rating_tests;
+#[cfg(test)]
+mod folder_manual_filter_tests;
+mod folder_manual_order;
+mod folder_order_drag;
+pub(crate) use folder_manual_order::FolderSortChoice;
 mod folder_pane_reclick;
 pub(crate) mod folder_scan;
 #[cfg(test)]
@@ -677,6 +682,7 @@ mod folder_background_fixture;
 pub use folder_background_fixture::draw_folder_cell_background_snapshot_fixture;
 pub(crate) use folder_background_fixture::draw_samples as draw_folder_background_samples;
 mod grid_paint;
+pub(crate) mod thumbnail_standin;
 #[doc(hidden)]
 pub use container_type_icon_fixture::draw_container_type_icon_snapshot_fixture;
 mod duration_metadata;
@@ -915,9 +921,10 @@ pub use grid_paint::draw_thumbnail_name_style_snapshot_fixture;
 #[doc(hidden)]
 pub use grid_paint::draw_video_thumbnail_indicator_snapshot_fixture;
 pub(crate) use grid_paint::{
-    ThumbnailHitAreas, draw_cell, draw_cell_with_hit_areas, draw_cut_badge,
-    draw_drop_hover_snapshot_cells, draw_grid_drop_target, draw_spread_pair_cursor,
-    grid_tag_badge_hit_rect, layout_cell_overlays, primary_grid_tag_for_badge, tq_draw_preview,
+    ThumbnailHitAreas, draw_cell, draw_cell_with_display_image, draw_cell_with_hit_areas,
+    draw_cell_with_hit_areas_and_display_image, draw_cut_badge, draw_drop_hover_snapshot_cells,
+    draw_grid_drop_target, draw_spread_pair_cursor, grid_tag_badge_hit_rect, layout_cell_overlays,
+    primary_grid_tag_for_badge, tq_draw_preview,
 };
 pub(crate) use grid_paint::{audio_thumbnail_indicator_parts, paint_audio_thumbnail_indicator};
 use metadata_ops::{
@@ -1771,6 +1778,14 @@ pub(crate) enum MainListInstallBoundary {
     AlreadyHandled(MainListBoundaryReceipt),
 }
 
+/// An accepted same-folder manual refresh retains the user's color query, but
+/// retires workers and scope proofs belonging to the replaced item generation.
+#[derive(Clone, Copy)]
+enum MainListFilterPolicy {
+    Clear,
+    RetainCurrentPhysicalFolder,
+}
+
 impl MainListInstallBoundary {
     pub(crate) fn uses_installer_boundary(self) -> bool {
         matches!(self, Self::UseInstallerBoundary)
@@ -2229,10 +2244,12 @@ pub(crate) struct DetachedToggleRowState {
 #[cfg(windows)]
 const DETACHED_TOGGLE_DISABLED_REASON: &str = "毎回新しいウィンドウで開く設定ではF12切替は無効です";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum VisibleSelectionPolicy {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VisibleSelectionPolicy {
     General,
     RatingMembership,
+    /// 同じ一覧の再適用では未選択も維持し、先頭への移動・reveal を発行しない。
+    RetainCurrentCursor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4991,6 +5008,7 @@ pub(crate) struct PreparedScannedFolderListing {
     folder_signature: folder_scan::FolderScanSignature,
     row_record: Arc<folder_scan::FolderRowRecord>,
     projection_key: u64,
+    folder_order: crate::folder_order::FolderOrderState,
     prepared_folder_rating: Option<(HashMap<usize, u8>, u64, f64)>,
     video_thumb_overrides: Vec<(PathBuf, PathBuf)>,
     audio_inventory: Option<HashSet<String>>,
@@ -5459,6 +5477,7 @@ pub(crate) enum ExternalRescanResult {
         book_append_refresh::FolderRefreshCause,
         std::time::SystemTime,
         folder_scan::OmittedFolderEntries,
+        HashSet<String>,
     ),
     Different(
         folder_scan::ScannedDir,
@@ -5470,6 +5489,7 @@ pub(crate) enum ExternalRescanResult {
 pub(crate) struct FolderRescanProof {
     baseline: Option<FolderObservation>,
     projection_key: u64,
+    order_revision: u64,
     subscription: Option<(u64, u64)>,
 }
 
@@ -7017,6 +7037,7 @@ impl FolderPaneOpenPending {
 pub(crate) struct CurrentViewOrderSnapshot {
     sort_order: crate::settings::SortOrder,
     grid_display_order: crate::settings::GridDisplayOrder,
+    order_revision: u64,
 }
 
 impl CurrentViewOrderSnapshot {
@@ -7024,6 +7045,7 @@ impl CurrentViewOrderSnapshot {
         Self {
             sort_order: settings.sort_order,
             grid_display_order: settings.grid_display_order.clone(),
+            order_revision: 0,
         }
     }
 
@@ -8383,9 +8405,25 @@ struct LocalSearchListIdentity {
     items_generation: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalSearchCursorPolicy {
+    Reset,
+    Retain,
+}
+
+impl LocalSearchCursorPolicy {
+    fn visible_selection(self) -> VisibleSelectionPolicy {
+        match self {
+            Self::Reset => VisibleSelectionPolicy::General,
+            Self::Retain => VisibleSelectionPolicy::RetainCurrentCursor,
+        }
+    }
+}
+
 struct LocalSearchRequest {
     submitted: Arc<LocalSearchSubmission>,
     list_identity: LocalSearchListIdentity,
+    cursor_policy: LocalSearchCursorPolicy,
 }
 
 struct LocalSearchCompletion {
@@ -14232,11 +14270,25 @@ pub(crate) fn physical_page_order_locked(
     source_path: &Path,
     items: &[GridItem],
 ) -> bool {
+    physical_page_order_locked_with_still_images(
+        settings,
+        source_path,
+        !items.is_empty() && items.iter().all(|item| matches!(item, GridItem::Image(_))),
+    )
+}
+
+/// `still_images_only` describes a nonempty physical listing before any still
+/// images are folded into Stack cells. The ordinary wrapper keeps its exact
+/// existing image-only rule; manual-order eligibility can use the same policy
+/// with that lossless Stack representation.
+pub(crate) fn physical_page_order_locked_with_still_images(
+    settings: &crate::settings::Settings,
+    source_path: &Path,
+    still_images_only: bool,
+) -> bool {
     crate::books::is_direct_book_folder(&settings.books_root_path(), source_path)
         || crate::folder_tree::is_open_as_container(source_path)
-        || settings.auto_fullscreen_image_folders_enabled()
-            && !items.is_empty()
-            && items.iter().all(|item| matches!(item, GridItem::Image(_)))
+        || settings.auto_fullscreen_image_folders_enabled() && still_images_only
 }
 
 /// Accepted listing provenance, owned and transferred with its viewer context.
@@ -16819,6 +16871,8 @@ pub struct App {
     /// `RefCell` for the same reason as the ledger above.
     pub(crate) display_identity_error: std::cell::RefCell<Option<String>>,
     pub(crate) thumbnails: Vec<ThumbnailState>,
+    /// 同じ物理一覧の並び替え中だけ使う、context 所有の表示素材。
+    pub(crate) thumbnail_standins: Box<thumbnail_standin::ThumbnailStandins>,
     pub(crate) selected: Option<usize>,
     pub(crate) grid_click_pairing: GridClickPairingState,
     /// Shift+クリックの起点。index と items 世代を一体で保持し、別一覧の同じ index を
@@ -16989,6 +17043,11 @@ pub struct App {
     folder_nav_pending: Option<FolderNavPending>,
     /// Context-owned frozen book rows; no stored current position.
     pub(crate) list_order: Option<Arc<ListOrderSnapshot>>,
+    // Keep folder-order payloads off the App stack, including saved snapshot copies.
+    pub(crate) folder_order: Box<crate::folder_order::FolderOrderState>,
+    pub(crate) folder_order_service: Option<Box<crate::folder_order::FolderOrderService>>,
+    pub(crate) folder_order_reset_confirmation:
+        Option<Box<folder_manual_order::FolderOrderResetConfirmation>>,
     /// 実フォルダ open の worker scan 待ち ([`FolderPaneOpenPending`])。
     /// folder pane と detached image open のどちらも bundle ownership で保持する。
     folder_pane_open_pending: Option<FolderPaneOpenPending>,
@@ -18065,8 +18124,8 @@ pub struct App {
     /// 色フィルタの一時状態。Settings へ保存しないオンデマンド絞り込み。
     pub(crate) color_filter: crate::color_search::ColorFilterState,
     /// `egui::Context` を持たない軽量 items 差し替え経路で、次フレームに色スキャンを
-    /// 起動するための one-shot フラグ。
-    pub(crate) color_filter_scope_refresh_pending: bool,
+    /// 起動し、その可視集合の公開まで選択方針を運ぶ one-shot 要求。
+    pub(crate) color_filter_scope_refresh_pending: Option<VisibleSelectionPolicy>,
 
     // ── スクロール体感ロギング (--log 時) ──────────────────────────
     /// 直近のフレームで計算した可視範囲 (raw idx)。
@@ -20472,6 +20531,12 @@ impl Drop for App {
         // LibRaw may be inside an uncancellable native interval. Cancel work and
         // let its worker thread finish; never join it on the UI thread.
         self.raw_develop_executor.shutdown();
+        // Test Apps can be dropped without eframe::on_exit. Finish the captured
+        // actor DB before AppTestEnv releases its disposable directory override.
+        #[cfg(test)]
+        if let Some(service) = self.folder_order_service.take() {
+            (*service).shutdown();
+        }
     }
 }
 
@@ -21398,6 +21463,7 @@ impl App {
             upload_deferral_streak: 0,
             display_identity_error: std::cell::RefCell::new(None),
             thumbnails: Vec::new(),
+            thumbnail_standins: Default::default(),
             selected: None,
             grid_click_pairing: GridClickPairingState::default(),
             grid_click_selection_anchor: None,
@@ -21455,6 +21521,9 @@ impl App {
             keep_end_shared: Arc::new(AtomicUsize::new(0)),
             folder_nav_pending: None,
             list_order: None,
+            folder_order: Default::default(),
+            folder_order_service: folder_manual_order::start_service(),
+            folder_order_reset_confirmation: None,
             folder_pane_open_pending: None,
             drive_jump_pending: None,
             #[cfg(test)]
@@ -21888,7 +21957,7 @@ impl App {
             facet_name_cache_failed_generation: None,
             facet_tag_search_query: String::new(),
             color_filter: crate::color_search::ColorFilterState::default(),
-            color_filter_scope_refresh_pending: false,
+            color_filter_scope_refresh_pending: None,
             last_vis_range: (0, 0),
             vis_settle_at: None,
             vis_first_logged: false,
@@ -24775,6 +24844,7 @@ impl App {
             self.edit_bundle_apply_pending.is_some() => "edit_bundle_apply_pending",
             self.edit_bundle_bulk_pending.is_some() => "edit_bundle_bulk_pending",
             self.show_rotation_reset_confirm => "rotation_reset_confirm",
+            self.folder_order_reset_dialog_visible() => "folder_order_reset",
             self.reading_history_clear_dialog_visible() => "reading_history_clear_confirm",
             self.pdf_password_dialog_path().is_some() => "pdf_password",
             self.show_about_dialog => "about",
@@ -28324,10 +28394,16 @@ impl App {
     fn current_folder_projection_key(&self, folder: &Path) -> u64 {
         let presentation = (!self.navigation_scope.is_detached_physical())
             .then(|| self.favorite_view_state_for_path(folder));
-        folder_projection_key_with_presentation(
-            &self.settings,
-            self.stack_mode_requested,
-            presentation.as_ref(),
+        folder_manual_order::projection_key(
+            folder_projection_key_with_presentation(
+                &self.settings,
+                self.stack_mode_requested,
+                presentation.as_ref(),
+            ),
+            &self.folder_order,
+            self.folder_order.manual_active()
+                && !self.stack_mode_requested
+                && self.folder_manual_order_eligible(),
         )
     }
 
@@ -28710,7 +28786,13 @@ impl App {
                 .apply_to_settings(&mut listing_settings);
         }
         // Retain the requested presentation as the observation identity, even for a fixed/fallback order.
-        let projection_key = folder_projection_key(&listing_settings, self.stack_mode_requested);
+        let projection_key = folder_manual_order::projection_key(
+            folder_projection_key(&listing_settings, self.stack_mode_requested),
+            &self.folder_order,
+            self.folder_order.manual_active()
+                && !self.stack_mode_requested
+                && self.folder_manual_order_eligible(),
+        );
         listing_settings.sort_order =
             self.effective_listing_sort_order(listing_settings.sort_order);
         let duration_wanted = self.listing_may_sort_by_duration();
@@ -28774,6 +28856,9 @@ impl App {
         // poll に間に合わないと、次の入力まで取り込まれない (v3.5.0 レビュー N04)。
         let repaint = ctx.clone();
         let worker_cause = cause.clone();
+        let folder_order_input = self
+            .folder_order
+            .listing_input_for_stack(self.stack_mode_requested);
         let (tx, rx) = mpsc::channel();
         if std::thread::Builder::new()
             .name("external-folder-rescan".to_string())
@@ -28803,6 +28888,7 @@ impl App {
                 )
                 .ok()
                 .map(|mut scan| {
+                    scan.folder_order_input = folder_order_input.clone();
                     folder_scan::collect_folder_listing_metadata_facts(
                         &worker_folder,
                         &mut scan,
@@ -28822,6 +28908,7 @@ impl App {
                             &worker_folder,
                             projection_scan,
                             &listing_settings,
+                            folder_order_input,
                             crate::rating_sort::ListingOrderRequest::from_settings(
                                 &listing_settings,
                             ),
@@ -28868,6 +28955,7 @@ impl App {
                             cause,
                             parent_mtime,
                             materialized.omitted,
+                            materialized.folder_order.inventory,
                         )
                     } else {
                         scan.reconcile = Some(folder_scan::FolderScanReconcile {
@@ -28890,6 +28978,7 @@ impl App {
             proof: Some(FolderRescanProof {
                 baseline,
                 projection_key,
+                order_revision: self.folder_order.order_revision,
                 subscription,
             }),
             cause,
@@ -28969,6 +29058,7 @@ impl App {
         // - 削除の最中: 削除結果の世代を壊す。要求側の判定だけでは非同期化で外れている (R03)。
         let proof_valid = proof.as_ref().is_none_or(|proof| {
             proof.projection_key == self.current_folder_projection_key(&folder)
+                && proof.order_revision == self.folder_order.order_revision
                 && proof.baseline.as_ref().is_none_or(|old| {
                     self.folder_observation.as_ref().is_some_and(|current| {
                         current.source == old.source
@@ -28983,6 +29073,19 @@ impl App {
                         .is_some_and(|watch| watch.epoch == epoch)
                 })
         });
+        let order_changed = proof
+            .as_ref()
+            .is_some_and(|proof| proof.order_revision != self.folder_order.order_revision);
+        if order_changed
+            && self.current_folder.as_ref() == Some(&folder)
+            && self.edit_request_owner_context() == owner_context_id
+            && self.current_listing_accepts_folder_scan()
+        {
+            self.retain_folder_refresh(book_append_refresh::FolderRefreshRequest {
+                folder: folder.clone(),
+                cause: requested_cause.clone(),
+            });
+        }
         let dropped_reason = if !proof_valid {
             Some("observation_changed")
         } else if self.edit_request_owner_context() != owner_context_id {
@@ -29045,7 +29148,7 @@ impl App {
         let _ = scan_options;
         let result = scan.expect("checked above");
         let mut cause = match &result {
-            ExternalRescanResult::Equal(_, _, cause, _, _)
+            ExternalRescanResult::Equal(_, _, cause, _, _, _)
             | ExternalRescanResult::Different(_, _, cause) => cause.clone(),
         };
         if matches!(
@@ -29090,7 +29193,8 @@ impl App {
         }
         let main_context_id = self.viewer_context_main();
         let accepted_now = match result {
-            ExternalRescanResult::Equal(signature, rows, _, parent_mtime, omitted) => {
+            ExternalRescanResult::Equal(signature, rows, _, parent_mtime, omitted, inventory) => {
+                self.folder_order.inventory = inventory;
                 self.adopt_normal_folder_omitted_entries(&folder, omitted);
                 self.current_folder_signature = Some(signature);
                 self.current_folder_last_mtime = Some(parent_mtime);
@@ -29175,11 +29279,13 @@ impl App {
             folder,
             scan.clone_for_projection(),
             &self.settings,
+            self.folder_order
+                .listing_input_for_stack(self.stack_mode_requested),
         );
         self.folder_observation = Some(FolderObservation {
             source: folder.to_path_buf(),
             generation: self.items_generation,
-            projection_key: folder_projection_key(&self.settings, self.stack_mode_requested),
+            projection_key: self.current_folder_projection_key(folder),
             rows: materialized.row_record,
             removed: Arc::new(FolderRemovedRows::default()),
             revision: 0,
@@ -29206,12 +29312,13 @@ impl App {
                 &folder,
                 projection_scan,
                 &self.settings,
+                self.folder_order
+                    .listing_input_for_stack(self.stack_mode_requested),
             );
             let equal = self.folder_observation.as_ref().is_some_and(|previous| {
                 previous.source == folder
                     && previous.generation == self.items_generation
-                    && previous.projection_key
-                        == folder_projection_key(&self.settings, self.stack_mode_requested)
+                    && previous.projection_key == self.current_folder_projection_key(&folder)
                     && materialized.row_record.same_remaining_rows(
                         &previous.rows,
                         previous.removed.paths(),
@@ -29923,7 +30030,8 @@ impl App {
         }
         if let Some(path) = self.current_folder.clone() {
             self.folder_history.remove(&path);
-            let order = CurrentViewOrderSnapshot::from_settings(&self.settings);
+            let mut order = CurrentViewOrderSnapshot::from_settings(&self.settings);
+            order.order_revision = self.folder_order.order_revision;
             let reload_owner = Box::new(self.current_folder_reload_owner(&path));
             self.start_folder_open_scan(
                 path,
@@ -30406,10 +30514,27 @@ impl App {
         }
     }
 
-    /// 通常の (事前スキャンなしの) フォルダロード。`scan_directory` を UI スレッドで
-    /// 同期実行する。初期化 / 履歴復元 / 直接パス指定など、Ctrl+↑↓ 連打以外の
-    /// すべての呼び出しが通る。
+    /// Load a folder through its existing typed adoption owner. Ordinary physical
+    /// lists scan and read their order on a worker before their single adoption;
+    /// fixed/synthetic and virtual-folder callers retain their existing contracts.
     pub fn load_folder(&mut self, path: PathBuf) {
+        if self
+            .top_level_grid_view
+            .open_path_classification()
+            .is_some_and(|candidate| {
+                candidate.context == self.projected_viewer_context_id()
+                    && crate::folder_tree::path_eq(&candidate.path, &path)
+                    && matches!(
+                        candidate.continuation.as_deref(),
+                        Some(ClassifiedOpenContinuation::DirectScan {
+                            owner: OpenRequestOwner::Navigation,
+                            ..
+                        })
+                    )
+            })
+        {
+            return;
+        }
         self.load_folder_with_scan(path, None);
     }
 
@@ -30480,6 +30605,7 @@ impl App {
         if boundary.uses_installer_boundary() {
             self.change_main_context_for_visible_grid(false);
         }
+        self.retire_folder_order_for_listing();
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
@@ -30813,7 +30939,7 @@ impl App {
     fn start_open_path_classification_owned_with_navigation(
         &mut self,
         candidate_source: crate::pdf_loader::LeasedEpubPath,
-        continuation: ClassifiedOpenContinuation,
+        mut continuation: ClassifiedOpenContinuation,
         navigation: Option<MainListNavigation>,
         stage: MainListRequestStage,
     ) -> OpenAdmission {
@@ -30830,6 +30956,14 @@ impl App {
         let duration_wanted = self.listing_may_sort_by_duration();
         let page_count_fingerprint = self.listing_page_count_facts_fingerprint();
         let duration_cache_dir = crate::catalog::default_cache_dir();
+        let folder_order_handle = self.folder_order_handle();
+        // A completed directory scan already proves its kind. Preserve its metadata
+        // and inventory while this existing worker supplies the missing actor read.
+        let prepared_folder_scan = match &mut continuation {
+            ClassifiedOpenContinuation::DirectScan { pre_scan, .. } => pre_scan.take(),
+            _ => None,
+        };
+
         let (tx, rx) = mpsc::sync_channel(1);
         if std::thread::Builder::new()
             .name("open-path-classify".into())
@@ -30837,46 +30971,64 @@ impl App {
                 if worker_cancel.load(Ordering::Acquire) {
                     return;
                 }
-                let result = std::fs::metadata(&worker_path).and_then(|metadata| {
-                    if metadata.is_dir() {
-                        let mut scan = folder_scan::scan_directory_with_visibility_cancel(
+                let result = if let Some(mut scan) = prepared_folder_scan {
+                    scan.folder_order_input =
+                        crate::folder_order::FolderOrderListingInput::read_worker(
+                            folder_order_handle.as_ref(),
                             &worker_path,
-                            include_convertible,
-                            include_epub,
-                            show_hidden,
-                            &file_type_visibility,
-                            Some(&worker_cancel),
-                        )?;
-                        folder_scan::collect_folder_listing_metadata_facts(
-                            &worker_path,
-                            &mut scan,
-                            &duration_cache_dir,
-                            duration_wanted,
-                            page_count_fingerprint,
                         );
-                        Ok(ClassifiedOpenPath {
-                            rar_volume_proof: None,
-                            kind: OpenPathKind::Directory,
-                            folder_scan: Some(scan),
-                        })
-                    } else {
-                        Ok(ClassifiedOpenPath {
-                            rar_volume_proof: if metadata.is_file()
-                                && crate::rar_loader::is_rar_path(&worker_path)
-                            {
-                                crate::rar_loader::volume_proof(&worker_path).ok()
-                            } else {
-                                None
-                            },
-                            kind: if metadata.is_file() {
-                                OpenPathKind::File
-                            } else {
-                                OpenPathKind::Other
-                            },
-                            folder_scan: None,
-                        })
-                    }
-                });
+                    Ok(ClassifiedOpenPath {
+                        rar_volume_proof: None,
+                        kind: OpenPathKind::Directory,
+                        folder_scan: Some(scan),
+                    })
+                } else {
+                    std::fs::metadata(&worker_path).and_then(|metadata| {
+                        if metadata.is_dir() {
+                            let mut scan = folder_scan::scan_directory_with_visibility_cancel(
+                                &worker_path,
+                                include_convertible,
+                                include_epub,
+                                show_hidden,
+                                &file_type_visibility,
+                                Some(&worker_cancel),
+                            )?;
+                            folder_scan::collect_folder_listing_metadata_facts(
+                                &worker_path,
+                                &mut scan,
+                                &duration_cache_dir,
+                                duration_wanted,
+                                page_count_fingerprint,
+                            );
+                            scan.folder_order_input =
+                                crate::folder_order::FolderOrderListingInput::read_worker(
+                                    folder_order_handle.as_ref(),
+                                    &worker_path,
+                                );
+                            Ok(ClassifiedOpenPath {
+                                rar_volume_proof: None,
+                                kind: OpenPathKind::Directory,
+                                folder_scan: Some(scan),
+                            })
+                        } else {
+                            Ok(ClassifiedOpenPath {
+                                rar_volume_proof: if metadata.is_file()
+                                    && crate::rar_loader::is_rar_path(&worker_path)
+                                {
+                                    crate::rar_loader::volume_proof(&worker_path).ok()
+                                } else {
+                                    None
+                                },
+                                kind: if metadata.is_file() {
+                                    OpenPathKind::File
+                                } else {
+                                    OpenPathKind::Other
+                                },
+                                folder_scan: None,
+                            })
+                        }
+                    })
+                };
                 if !worker_cancel.load(Ordering::Acquire) {
                     let _ = tx.send(result);
                 }
@@ -31926,13 +32078,13 @@ impl App {
                 })
     }
 
-    pub(crate) fn direct_navigation_scan_elapsed(&self) -> Option<std::time::Duration> {
+    pub(crate) fn direct_navigation_scan_elapsed_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
         self.direct_navigation_scan_pending().then(|| {
-            self.folder_pane_open_pending
-                .as_ref()
-                .unwrap()
-                .started_at
-                .elapsed()
+            let started_at = self.folder_pane_open_pending.as_ref().unwrap().started_at;
+            now.saturating_duration_since(started_at)
         })
     }
 
@@ -31949,13 +32101,13 @@ impl App {
                 })
     }
 
-    pub(crate) fn view_order_refresh_scan_elapsed(&self) -> Option<std::time::Duration> {
+    pub(crate) fn view_order_refresh_scan_elapsed_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<std::time::Duration> {
         self.view_order_refresh_scan_pending().then(|| {
-            self.folder_pane_open_pending
-                .as_ref()
-                .unwrap()
-                .started_at
-                .elapsed()
+            let started_at = self.folder_pane_open_pending.as_ref().unwrap().started_at;
+            now.saturating_duration_since(started_at)
         })
     }
 
@@ -33308,6 +33460,8 @@ impl App {
             self.load_zip_as_folder(path, restore_intent);
             return FolderOpenOutcome::Loaded;
         }
+        let sort_surface =
+            self.physical_duration_sort_surface(&path, Some(&owner), navigation.as_ref());
         // All format-specific returns and the original admission have completed. Main
         // directory loads suspend this exact call; exceptions explicitly retain a synchronous tail.
         if pre_scan.is_none()
@@ -33367,9 +33521,61 @@ impl App {
             self.begin_pending_close_return_navigation_sequence();
             return FolderOpenOutcome::Classifying;
         }
+        let folder_order_input = if !self.snapshot_internal_nav
+            && !self.is_snapshot_active()
+            && !crate::folder_tree::path_eq(&path, &self.book_root_path())
+            && !crate::books::is_direct_book_folder(&self.book_root_path(), &path)
+            && matches!(authority, VisibleInstallAuthority::Ordinary)
+            && matches!(
+                sort_surface,
+                top_level_grid_view::TopLevelGridSurface::Folder
+            )
+            && pre_scan
+                .as_ref()
+                .is_none_or(|scan| !scan.folder_order_input.is_read())
+        {
+            if self.folder_order_record_is_known_absent(&path) {
+                // The prepared append-only index proves there is no record. Keep
+                // this caller's synchronous installer/history contract without a DB read.
+                Some(crate::folder_order::FolderOrderListingInput::from_read(Ok(
+                    None,
+                )))
+            } else {
+                let candidate = match crate::pdf_loader::LeasedEpubPath::try_new(path) {
+                    Ok(candidate) => candidate,
+                    Err(reason) => {
+                        return FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(
+                            reason.into(),
+                        ));
+                    }
+                };
+                return match self.start_open_path_classification_owned_with_navigation(
+                    candidate,
+                    ClassifiedOpenContinuation::DirectScan {
+                        pre_scan,
+                        owner,
+                        grid_effects,
+                        restore_intent,
+                    },
+                    navigation,
+                    stage,
+                ) {
+                    OpenAdmission::Accepted => FolderOpenOutcome::Classifying,
+                    OpenAdmission::Refused(reason) => {
+                        self.show_open_admission_refusal(reason);
+                        FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(reason))
+                    }
+                    OpenAdmission::NotApplicable => {
+                        unreachable!("physical listing read uses owned classification")
+                    }
+                };
+            }
+        } else {
+            None
+        };
         let scan_started = std::time::Instant::now();
         let pre_scanned = pre_scan.is_some();
-        let scan = {
+        let mut scan = {
             let _span = CloseNavSpan::new(CloseNavStage::ScanDirectory);
             match pre_scan {
                 Some(scan) => scan,
@@ -33390,6 +33596,9 @@ impl App {
                 },
             }
         };
+        if let Some(input) = folder_order_input {
+            scan.folder_order_input = input;
+        }
         let current = {
             let _span = CloseNavSpan::new(CloseNavStage::OwnerCurrent);
             self.open_request_owner_is_current(&path, &owner)
@@ -33399,8 +33608,6 @@ impl App {
             return FolderOpenOutcome::Ignored;
         }
         let full_keys = use_full_path_cache_keys_for_folder(&path);
-        let sort_surface =
-            self.physical_duration_sort_surface(&path, Some(&owner), navigation.as_ref());
         if grid_effects
             .as_ref()
             .is_some_and(|effects| effects.auto_fullscreen)
@@ -33634,6 +33841,20 @@ impl App {
         let order_request =
             crate::rating_sort::ListingOrderRequest::from_settings(&listing_settings);
         let rating_generation_before_read = self.rating_session_write_generation;
+        let folder_order_input = if self.snapshot_internal_nav
+            || self.is_snapshot_active()
+            || (crate::folder_tree::path_eq(&path, &self.book_root_path())
+                || crate::books::is_direct_book_folder(&self.book_root_path(), &path))
+            || !matches!(
+                sort_surface,
+                top_level_grid_view::TopLevelGridSurface::Folder
+            ) {
+            crate::folder_order::FolderOrderListingInput::NotApplicable
+        } else {
+            scan.folder_order_input
+                .clone()
+                .with_stack(self.stack_mode_requested)
+        };
         let worker_prepared = scan.reconcile.take().map(|result| result.materialized);
         let materialized = match worker_prepared {
             Some(listing) => {
@@ -33650,6 +33871,7 @@ impl App {
                     &path,
                     scan,
                     &listing_settings,
+                    folder_order_input,
                     order_request,
                     |keys| {
                         let _span = CloseNavSpan::new(CloseNavStage::RatingRead);
@@ -33715,6 +33937,14 @@ impl App {
         // 除外件数は走査と重複フィルタの両方から出るので、両方を持つ
         // `materialize_local_folder_listing` が唯一の集計者。ここで数え直すと
         // remote 一覧と本体一覧で違う数が出る。
+        let mut folder_order = materialized.folder_order.clone();
+        if !restore_intent.enters_folder_list()
+            && folder_order.folder_key == self.folder_order.folder_key
+            && self.folder_order.mode == crate::folder_order::FolderOrderMode::ManualUnrecorded
+            && folder_order.record.is_none()
+        {
+            folder_order.mode = crate::folder_order::FolderOrderMode::ManualUnrecorded;
+        }
         let omitted_entries = materialized.omitted;
         if omitted_entries.counts != folder_scan::OmittedFolderEntryCounts::default() {
             // チップが出ない / 数が合わないという報告を、推測でなくログで切り分けるための 1 行。
@@ -33896,6 +34126,7 @@ impl App {
             folder_signature,
             row_record,
             projection_key,
+            folder_order,
             prepared_folder_rating,
             video_thumb_overrides,
             audio_inventory,
@@ -33933,6 +34164,7 @@ impl App {
             folder_signature,
             row_record,
             projection_key,
+            mut folder_order,
             prepared_folder_rating,
             video_thumb_overrides,
             audio_inventory,
@@ -33960,6 +34192,23 @@ impl App {
         self.stack_active_rule = None;
         self.stack_script_error = None;
         let items_len = items.len();
+        // The common installer retires the old stack presentation. The accepted
+        // request's stack policy still owns this new physical projection's key.
+        let requested_stack = self.stack_mode_requested;
+        let filter_policy = if !requested_stack
+            && folder_order.applies_to_physical_listing(&self.settings, &path, &items)
+            && self
+                .current_folder
+                .as_deref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &path))
+            && matches!(restore_intent.materialization_intent(), StartupListIntent::RefreshList {
+                target: crate::settings::StartupListTarget::PhysicalList { logical_path, zip_prefix: None }, ..
+            } if crate::folder_tree::path_eq(logical_path, &path))
+        {
+            MainListFilterPolicy::RetainCurrentPhysicalFolder
+        } else {
+            MainListFilterPolicy::Clear
+        };
         let mut hydration = self.install_loading_items_inner(
             path,
             items,
@@ -33975,7 +34224,23 @@ impl App {
             authority,
             prepared_visible,
             None,
+            filter_policy,
         );
+        folder_order.order_revision = self
+            .folder_order
+            .order_revision
+            .checked_add(1)
+            .expect("folder order revision exhausted");
+        let manual_applied = !requested_stack
+            && folder_order.applies_to_physical_listing(
+                &self.settings,
+                &audio_inventory_parent,
+                &self.items,
+            );
+        let projection_key =
+            folder_manual_order::projection_key(projection_key, &folder_order, manual_applied);
+        *self.folder_order = folder_order;
+        self.notify_folder_order_read_failure();
         // The shared write predicate can now validate the adopted folder itself,
         // before hydration starts any content-identity detection.
         self.adopt_normal_folder_omitted_entries(&audio_inventory_parent, omitted);
@@ -37386,6 +37651,7 @@ impl App {
             VisibleInstallAuthority::Ordinary,
             token,
             None,
+            MainListFilterPolicy::Clear,
         );
         self.items_are_reading_history_view = true;
         self.top_level_grid_view.replace_surface(
@@ -39970,6 +40236,7 @@ impl App {
                     authority,
                     token,
                     None,
+                    MainListFilterPolicy::Clear,
                 );
                 if let Some((continuation, _)) = hydration.as_mut() {
                     continuation.restore_intent = restore_intent.clone();
@@ -41209,6 +41476,7 @@ impl App {
                 },
                 token,
                 None,
+                MainListFilterPolicy::Clear,
             );
             self.hydrate_installed_main_list(hydration);
         }
@@ -42276,6 +42544,7 @@ impl App {
             authority,
             prepared_visible,
             Some(nav),
+            MainListFilterPolicy::Clear,
         );
         let archive_key = crate::path_key::normalize_keep_drive(&zip_path);
         if let Some(trace) = self.archive_auto_fs_paint_trace.as_mut()
@@ -42707,7 +42976,7 @@ impl App {
             self.color_filter.applied_scope_signature = None;
             self.color_filter.confirmation = None;
             self.color_filter.confirmed_large_scan_scope = None;
-            self.color_filter_scope_refresh_pending = true;
+            self.color_filter_scope_refresh_pending = Some(VisibleSelectionPolicy::General);
         }
         // ZIP 内の階層ごとに Shift+F のコンテナ★キーが変わるため、アドレスバー★の
         // メモ化値も階層切替ごとに捨てる。
@@ -43526,6 +43795,7 @@ impl App {
                 VisibleInstallAuthority::Ordinary,
                 token.with_install_boundary(boundary),
                 None,
+                MainListFilterPolicy::Clear,
             );
             if let Some((continuation, _)) = hydration.as_mut() {
                 continuation.restore_intent = intent;
@@ -45414,6 +45684,7 @@ impl App {
             VisibleInstallAuthority::Projection { recipe },
             prepared_visible,
             None,
+            MainListFilterPolicy::Clear,
         );
         if let Some((continuation, _)) = hydration.as_mut() {
             continuation.restore_intent = hydration_intent;
@@ -45509,6 +45780,7 @@ impl App {
             },
             prepared_visible,
             None,
+            MainListFilterPolicy::Clear,
         )
     }
 
@@ -45709,6 +45981,7 @@ impl App {
             authority,
             prepared_visible,
             None,
+            MainListFilterPolicy::Clear,
         );
         self.hydrate_installed_main_list_with_search_index(hydration, prepared_search_index);
     }
@@ -45737,6 +46010,7 @@ impl App {
         authority: VisibleInstallAuthority<'_>,
         prepared_visible: PreparedVisibleInstall,
         prepared_zip_nav: Option<crate::zip_tree::ZipNavState>,
+        filter_policy: MainListFilterPolicy,
     ) -> MainListHydration {
         let detached_physical = self.navigation_scope.is_detached_physical();
         // Capture the departing logical position before cleanup can replace its
@@ -45789,8 +46063,15 @@ impl App {
         }
         self.cancel_media_navigation_pending_for_current_context("start_loading_items");
         if !detached_physical {
-            self.clear_color_filter_for_new_items();
-            self.color_filter_scope_refresh_pending = false;
+            match filter_policy {
+                MainListFilterPolicy::Clear => self.clear_color_filter_for_new_items(),
+                MainListFilterPolicy::RetainCurrentPhysicalFolder => {
+                    self.color_filter.cancel_pending();
+                    self.mark_color_filter_scope_dirty_with_selection(
+                        VisibleSelectionPolicy::RetainCurrentCursor,
+                    );
+                }
+            }
         }
         self.current_color_cache_map = None;
         self.current_color_catalog = None;
@@ -46129,6 +46410,23 @@ impl App {
                 &items,
             ),
         };
+        // A downstream physical Stack projection still belongs to the same
+        // scanned folder. It suppresses manual application without retiring its
+        // record/inventory owner. Other source/projection installs leave it.
+        let retained_physical_order = matches!(
+            &authority,
+            VisibleInstallAuthority::Projection {
+                recipe: book_materialization::ProjectionRecipe::OrdinaryList
+            }
+        ) && self.folder_order.folder_key.as_deref()
+            == Some(crate::folder_order::folder_key(&source_path).as_str())
+            && matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Folder
+            );
+        if !retained_physical_order {
+            self.retire_folder_order_for_listing();
+        }
         self.install_new_items_inner(items, image_metas, !has_prepared_aggregate);
         self.spread_presentation_source = spread_presentation_source;
         // Downstream Stack installs retain the physical scan record. Bind it only after
@@ -47266,6 +47564,7 @@ impl App {
     }
 
     fn set_items_generation(&mut self, items_generation: u64) {
+        self.thumbnail_standins.set_generation(items_generation);
         if self.items_generation != items_generation {
             self.virtual_folder_parent = None;
             retire_spread_step(&mut self.spread_step);
@@ -47363,6 +47662,7 @@ impl App {
         items: Vec<GridItem>,
         image_metas: Vec<Option<(i64, i64)>>,
     ) {
+        self.retire_folder_order_for_listing();
         self.install_new_items_inner(items, image_metas, true);
     }
 
@@ -47375,6 +47675,14 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
         page_identity_index: Arc<file_type_resume::PreparedPageIdentityIndex>,
     ) {
+        if !matches!(recipe, book_materialization::ProjectionRecipe::OrdinaryList)
+            || !matches!(
+                self.top_level_grid_view.surface(),
+                top_level_grid_view::TopLevelGridSurface::Folder
+            )
+        {
+            self.retire_folder_order_for_listing();
+        }
         self.install_new_items_inner(items, image_metas, false);
         self.projection_recipe = recipe;
         let previous = std::mem::replace(&mut self.page_identity_index, page_identity_index);
@@ -47898,6 +48206,7 @@ impl App {
                     }
                 }
                 crate::logger::log(format!("archive_cache_peek spawn failed: {e}"));
+                self.reconcile_thumbnail_standins();
             }
         }
     }
@@ -54194,6 +54503,29 @@ impl App {
         // items が途中で入れ替わっても (Ctrl+G 結果差し替え等) 現 items に残っている分だけ
         // 引き当てられる。items_generation の一致チェックは不要 (空振り最適化のためだけの
         // 早期 return を入れると、Ctrl+G 結果に削除済み path が含まれていたとき反映漏れになる)。
+        // Only a current observation can be advanced by this successful removal.
+        // A pending sort/mode change must still rebuild from its own new policy.
+        let retained_order_observation = self
+            .folder_observation
+            .as_ref()
+            .filter(|record| {
+                record.generation == self.items_generation
+                    && self.current_folder.as_ref() == Some(&record.source)
+                    && record.projection_key == self.current_folder_projection_key(&record.source)
+            })
+            .map(|record| {
+                (
+                    record.source.clone(),
+                    Arc::clone(&record.rows),
+                    self.folder_manual_order_applied(),
+                )
+            });
+        self.folder_order.delete(
+            &succeeded
+                .iter()
+                .map(|path| crate::folder_order::folder_key(path))
+                .collect::<Vec<_>>(),
+        );
         let success_set: std::collections::HashSet<&std::path::Path> =
             succeeded.iter().map(|p| p.as_path()).collect();
         let mut idxs: Vec<usize> = self
@@ -54215,6 +54547,24 @@ impl App {
             self.remove_items_batch(&idxs);
             if let Some(restart) = restart {
                 self.resume_initial_stack_after_deletion(restart);
+            }
+        }
+        // The removed-path proof and its surviving rows now describe the new
+        // record/inventory revision, including deletions of unlisted children.
+        // Do not relabel a replaced or retired observation from another install.
+        if let Some((source, rows, manual_applied)) = retained_order_observation {
+            let projection_key = self.current_folder_projection_key(&source);
+            // Removing the last non-image child can lock page order. Those old
+            // manual rows do not prove the newly selected fixed-order policy.
+            let same_order_policy = manual_applied == self.folder_manual_order_applied();
+            let generation = self.items_generation;
+            if let Some(record) = self.folder_observation.as_mut().filter(|record| {
+                same_order_policy
+                    && record.source == source
+                    && record.generation == generation
+                    && Arc::ptr_eq(&record.rows, &rows)
+            }) {
+                record.projection_key = projection_key;
             }
         }
         // Successful physical removals always request reconciliation, even with no visible row
@@ -55872,6 +56222,7 @@ impl App {
             VisibleInstallAuthority::Ordinary,
             token,
             None,
+            MainListFilterPolicy::Clear,
         );
         self.items_are_bookmark_view = true;
         self.top_level_grid_view
@@ -56037,6 +56388,7 @@ impl App {
             VisibleInstallAuthority::Ordinary,
             token,
             None,
+            MainListFilterPolicy::Clear,
         );
         self.hydrate_installed_main_list(hydration);
         self.items_are_bookmark_view = true;
@@ -58896,6 +59248,7 @@ impl App {
     }
 
     fn poll_thumbnails(&mut self, ctx: &egui::Context, consumption: ThumbnailConsumptionPolicy) {
+        self.reconcile_thumbnail_standins();
         // Reservation + CPU image lifetime belongs to requested, independent of display state.
         const MAX_TEXTURES_PER_FRAME: u32 = 8;
         let mut textures_created = 0u32;
@@ -58954,6 +59307,9 @@ impl App {
                     self.thumbnails[i] = ThumbnailState::Failed;
                 }
                 ThumbnailReceipt::Terminal(_) => unreachable!("image payload handled by owner"),
+            }
+            if !matches!(self.thumbnails[i], ThumbnailState::Pending) {
+                self.thumbnail_standins.remove(i);
             }
             received += 1;
         }
@@ -59183,6 +59539,7 @@ impl App {
                 self.thumbnails[i] = ThumbnailState::Evicted;
             }
             self.requested.settle_image(i, request_id);
+            self.thumbnail_standins.remove(i);
             received += 1;
         }
         if received > 0 || self.requested.images_len() > 0 {
@@ -59426,6 +59783,12 @@ impl App {
             interactive_pages,
         } = projection;
         let previous_keep_set = std::mem::replace(&mut self.keep_set, pages);
+        // 通常更新は hydration 中ここへ来ない。詳細 hover などの別 owner から呼ばれても、
+        // その期間の集合では採用直後の表示素材を退役させない。
+        if !self.sidecar_restore_active() {
+            self.thumbnail_standins.retain_keep_set(&self.keep_set);
+        }
+        self.reconcile_thumbnail_standins();
         self.keep_range = bounded_range;
         self.keep_start_shared
             .store(bounded_range.0, Ordering::Relaxed);
@@ -59512,6 +59875,7 @@ impl App {
         ) && let Some(thumb) = self.thumbnails.get_mut(idx)
         {
             *thumb = ThumbnailState::Evicted;
+            self.thumbnail_standins.remove(idx);
         }
         self.idle_upgrade_cache_bypass_ineligible.remove(&idx);
         self.thumb_pixels.remove(&idx);
@@ -60005,6 +60369,10 @@ impl App {
                 if !navigation_active {
                     self.passthrough_rendition_cache.clear();
                 }
+            } else {
+                // Hydration 中の hover が同じ集合を先に計算していた場合も、
+                // この確定済み投影で表示専用の素材を解放する。
+                self.thumbnail_standins.retain_keep_set(&self.keep_set);
             }
             self.details_thumb_suppression_applied = self.keep_set.is_empty();
             return;
@@ -60017,6 +60385,7 @@ impl App {
             // 古い enqueue 済みリクエストが in-range 判定で処理されてしまう。
             self.keep_range = (0, 0);
             self.keep_set.clear();
+            self.thumbnail_standins.clear();
             self.clear_still_seek_thumbnail_requests();
             self.keep_start_shared.store(0, Ordering::Relaxed);
             self.keep_end_shared.store(0, Ordering::Relaxed);
@@ -60232,6 +60601,7 @@ impl App {
                     )
                 {
                     self.thumbnails[i] = ThumbnailState::NoArt;
+                    self.thumbnail_standins.remove(i);
                 }
                 continue;
             }
@@ -60303,6 +60673,7 @@ impl App {
             let Some(mut req) = req_opt else {
                 if self.items_are_drive_list {
                     self.thumbnails[i] = ThumbnailState::Failed;
+                    self.thumbnail_standins.remove(i);
                 }
                 continue;
             };
@@ -61201,6 +61572,17 @@ impl App {
             self.toggle_stack_mode();
             return None;
         }
+        if !matches!(
+            block,
+            crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan
+                | crate::filename_stack_ui::GridItemInputBlock::ViewOrderRefreshScan
+        ) && self
+            .keymap
+            .consume_action_no_repeat(ctx, KeyAction::GridEnterFolderManualOrder)
+        {
+            self.select_folder_sort(FolderSortChoice::Manual);
+            return None;
+        }
         if !self.ime_input_active(ctx) && self.consume_context_shortcuts_help_key(ctx) {
             self.show_context_shortcuts_help = true;
             return None;
@@ -61541,6 +61923,14 @@ impl App {
             .consume_action(ctx, KeyAction::GridToggleStackMode)
         {
             self.toggle_stack_mode();
+            return None;
+        }
+
+        if self
+            .keymap
+            .consume_action_no_repeat(ctx, KeyAction::GridEnterFolderManualOrder)
+        {
+            self.select_folder_sort(FolderSortChoice::Manual);
             return None;
         }
 
@@ -62387,6 +62777,7 @@ impl App {
         let duration_wanted = self.listing_may_sort_by_duration();
         let page_count_fingerprint = self.listing_page_count_facts_fingerprint();
         let duration_cache_dir = crate::catalog::default_cache_dir();
+        let folder_order_handle = self.folder_order_handle();
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
@@ -62628,6 +63019,11 @@ impl App {
                                 duration_wanted,
                                 page_count_fingerprint,
                             );
+                            scan.folder_order_input =
+                                crate::folder_order::FolderOrderListingInput::read_worker(
+                                    folder_order_handle.as_ref(),
+                                    &o.path,
+                                );
                             FolderNavScanResult::Ready(scan)
                         }
                         Err(error) => FolderNavScanResult::Failed(error.to_string()),
@@ -63418,6 +63814,15 @@ impl App {
         let cancel = Arc::clone(cancel);
         let path = path.to_path_buf();
         let policy = self.folder_scan_policy();
+        let folder_order_handle = self.folder_order_handle();
+        let folder_order_snapshot = matches!(
+            purpose,
+            FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+        )
+        .then(|| {
+            self.folder_order
+                .listing_input_for_stack(self.stack_mode_requested)
+        });
         let (tx, rx) = mpsc::channel();
         let seq = self.input_seq;
         let perf_purpose = purpose.perf_tag();
@@ -63454,6 +63859,15 @@ impl App {
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
             let (scan, policy_mixed) = policy.scan_checked(&path, Some(&cancel));
+            let scan = scan.map(|mut scan| {
+                scan.folder_order_input = folder_order_snapshot.unwrap_or_else(|| {
+                    crate::folder_order::FolderOrderListingInput::read_worker(
+                        folder_order_handle.as_ref(),
+                        &path,
+                    )
+                });
+                scan
+            });
             if crate::perf::is_enabled() {
                 let (folders, media, failed) = match &scan {
                     Ok(scan) => (scan.folders.len(), scan.all_media.len(), false),
@@ -63992,20 +64406,50 @@ impl App {
         order: CurrentViewOrderSnapshot,
         owner: OpenRequestOwner,
     ) -> bool {
+        if order.order_revision != self.folder_order.order_revision
+            && self
+                .current_folder
+                .as_deref()
+                .is_some_and(|current| crate::folder_tree::path_eq(current, &path))
+            && self.open_request_owner_is_current(&path, &owner)
+        {
+            self.apply_sort_change_reload();
+            return false;
+        }
         if !self
             .current_folder
             .as_deref()
             .is_some_and(|current| crate::folder_tree::path_eq(current, &path))
             || !order.matches(&self.settings)
+            || order.order_revision != self.folder_order.order_revision
             || !self.open_request_owner_is_current(&path, &owner)
         {
             return false;
         }
+        let thumbnail_standins = self.capture_thumbnail_standins();
         self.preserve_cursor_hint_for_reload();
-        if self.epub_batch_convert.is_some() {
+        let checked = self
+            .checked
+            .iter()
+            .filter_map(|&index| self.items.get(index))
+            .filter_map(crate::folder_order::physical_item_key)
+            .collect::<HashSet<_>>();
+        let selected = self
+            .selected
+            .and_then(|index| self.items.get(index))
+            .and_then(folder_manual_order::selection_key);
+        // A manual permutation is still the same filtered physical list. Use
+        // the existing typed search replay; ordinary sort changes keep their
+        // released PreservePresentation behavior.
+        let intent = if self.folder_manual_order_applied() {
+            self.current_list_refresh_intent()
+        } else {
+            StartupListIntent::PreservePresentation
+        };
+        let accepted = if self.epub_batch_convert.is_some() {
             // The batch modal owns this same-location listing refresh. It is a completion of
             // accepted work, not a new open, so it must bypass the new-open admission gate.
-            return matches!(
+            matches!(
                 self.load_folder_with_scan_claimed(
                     path,
                     Some(scan),
@@ -64013,19 +64457,42 @@ impl App {
                     VisibleInstallAuthority::Ordinary,
                     None,
                     Some(OpenPathKind::Directory),
-                    crate::app::StartupListIntent::PreservePresentation,
+                    intent,
                     None,
                     MainListRequestStage::Continuation,
                 ),
                 FolderOpenOutcome::Loaded
-            );
+            )
+        } else {
+            self.load_folder_with_scan_owned(path, Some(scan), owner, intent)
+        };
+        if accepted {
+            let mut restored_checked = HashSet::new();
+            let mut restored_selected = None;
+            for (index, item) in self.items.iter().enumerate() {
+                let Some(key) = crate::folder_order::physical_item_key(item) else {
+                    continue;
+                };
+                if checked.contains(&key) {
+                    restored_checked.insert(index);
+                }
+                if restored_selected.is_none() && selected.as_ref() == Some(&key) {
+                    restored_selected = Some(index);
+                }
+                if matches!(self.thumbnails.get(index), Some(ThumbnailState::Pending)) {
+                    self.thumbnail_standins.attach(
+                        index,
+                        &key,
+                        self.image_metas.get(index).copied().flatten(),
+                        &thumbnail_standins,
+                    );
+                }
+            }
+            self.reconcile_thumbnail_standins();
+            self.checked = restored_checked;
+            self.move_grid_cursor(restored_selected, GridCursorIntent::Automatic);
         }
-        self.load_folder_with_scan_owned(
-            path,
-            Some(scan),
-            owner,
-            crate::app::StartupListIntent::PreservePresentation,
-        )
+        accepted
     }
 
     /// detached の通常画像 open 用 folder scan を、その detached bundle 内だけで完了する。
@@ -78130,6 +78597,13 @@ impl App {
     /// ページ単位 (Image / ZipImage / PdfPage) + コンテナ (Folder / ZipFile / PdfFile) の両方。
     /// 動画 / セパレータ / ConvertibleArchive などは常に通す。
     pub(crate) fn rebuild_visible_indices(&mut self) {
+        self.rebuild_visible_indices_with_selection(VisibleSelectionPolicy::General);
+    }
+
+    pub(crate) fn rebuild_visible_indices_with_selection(
+        &mut self,
+        policy: VisibleSelectionPolicy,
+    ) {
         let reader_open = self
             .sidecar_restore_rating_deferred_target()
             .or(self.fullscreen_idx)
@@ -78145,7 +78619,7 @@ impl App {
             if reader_open {
                 VisibleSelectionPolicy::RatingMembership
             } else {
-                VisibleSelectionPolicy::General
+                policy
             },
         );
         if reader_open {
@@ -78153,6 +78627,22 @@ impl App {
                 old,
                 crate::rating_membership::RatingAdoptionIntent::Reconcile,
             );
+        }
+    }
+
+    fn finish_visible_selection(&mut self, policy: VisibleSelectionPolicy) {
+        match policy {
+            VisibleSelectionPolicy::General => self.ensure_selected_visible_or_first(),
+            VisibleSelectionPolicy::RetainCurrentCursor => {
+                if self
+                    .selected
+                    .is_some_and(|index| self.visible_indices.binary_search(&index).is_err())
+                {
+                    self.move_grid_cursor(None, GridCursorIntent::Automatic);
+                }
+            }
+            // Its caller owns the reader/rating reconciliation after visibility publication.
+            VisibleSelectionPolicy::RatingMembership => {}
         }
     }
 
@@ -78198,9 +78688,7 @@ impl App {
             self.details_order.clear();
             self.close_page_overview_if_reader_order_changed();
             self.viewer_navigation_caches.invalidate();
-            if selection_policy == VisibleSelectionPolicy::General {
-                self.ensure_selected_visible_or_first();
-            }
+            self.finish_visible_selection(selection_policy);
             return;
         }
         if self.navigation_scope.is_detached_physical() {
@@ -78231,9 +78719,7 @@ impl App {
                 let vi = &self.visible_indices;
                 self.checked.retain(|idx| vi.binary_search(idx).is_ok());
             }
-            if selection_policy == VisibleSelectionPolicy::General {
-                self.ensure_selected_visible_or_first();
-            }
+            self.finish_visible_selection(selection_policy);
             return;
         }
         self.ensure_bookmark_presence_loaded();
@@ -78499,9 +78985,7 @@ impl App {
             let vi = &self.visible_indices;
             self.checked.retain(|idx| vi.binary_search(idx).is_ok());
         }
-        if selection_policy == VisibleSelectionPolicy::General {
-            self.ensure_selected_visible_or_first();
-        }
+        self.finish_visible_selection(selection_policy);
     }
 
     pub(crate) fn facet_candidate_indices(&mut self, ignore: FacetField) -> Vec<usize> {
@@ -80224,13 +80708,37 @@ impl App {
         ctx: &egui::Context,
         submitted: Arc<LocalSearchSubmission>,
     ) {
-        self.start_submitted_local_search(submitted);
+        self.execute_submitted_local_search_with_cursor(
+            ctx,
+            submitted,
+            LocalSearchCursorPolicy::Reset,
+        );
+    }
+
+    fn execute_submitted_local_search_with_cursor(
+        &mut self,
+        ctx: &egui::Context,
+        submitted: Arc<LocalSearchSubmission>,
+        cursor_policy: LocalSearchCursorPolicy,
+    ) {
+        self.start_submitted_local_search_with_cursor(submitted, cursor_policy);
         if self.search_pending.is_none() {
-            self.refresh_color_filter_for_scope_change(ctx);
+            self.refresh_color_filter_for_scope_change_with_selection(
+                ctx,
+                cursor_policy.visible_selection(),
+            );
         }
     }
 
     fn start_submitted_local_search(&mut self, submitted: Arc<LocalSearchSubmission>) {
+        self.start_submitted_local_search_with_cursor(submitted, LocalSearchCursorPolicy::Reset);
+    }
+
+    fn start_submitted_local_search_with_cursor(
+        &mut self,
+        submitted: Arc<LocalSearchSubmission>,
+        cursor_policy: LocalSearchCursorPolicy,
+    ) {
         // 既存の in-flight 検索をキャンセル (新クエリ / 再 Enter)。
         if let Some(pending) = self.search_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
@@ -80242,7 +80750,7 @@ impl App {
             self.search_filter = None;
             self.search_filter_origin_folder = None;
             self.search_tag_bridge.clear();
-            self.rebuild_visible_indices();
+            self.rebuild_visible_indices_with_selection(cursor_policy.visible_selection());
             return;
         }
         self.search_filter_origin_folder = self.effective_folder();
@@ -80294,6 +80802,7 @@ impl App {
         let request = Arc::new(LocalSearchRequest {
             submitted: submitted.clone(),
             list_identity: self.local_search_list_identity(),
+            cursor_policy,
         });
         let worker_request = request.clone();
         let (tx, rx) = mpsc::channel();
@@ -80401,6 +80910,7 @@ impl App {
                     matches,
                     xmp_additions,
                 } = completion.result;
+                let cursor_policy = pending.request.cursor_policy;
                 // ワーカーが新規に読み取った XMP をキャッシュにマージする。
                 // 既存キーは上書きしない (並行して別スレッドが先に書き込んだケースを尊重)。
                 for (key, xmp) in xmp_additions {
@@ -80411,12 +80921,15 @@ impl App {
                     submitted: pending.request.submitted.clone(),
                 });
                 self.search_filter_origin_folder = self.effective_folder();
-                self.rebuild_visible_indices();
-                self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
-                self.grid_scroll.set_position(0.0);
-                self.grid_scroll.clear_edge();
+                let selection_policy = cursor_policy.visible_selection();
+                self.rebuild_visible_indices_with_selection(selection_policy);
+                if cursor_policy == LocalSearchCursorPolicy::Reset {
+                    self.move_grid_cursor(None, crate::app::GridCursorIntent::Automatic);
+                    self.grid_scroll.set_position(0.0);
+                    self.grid_scroll.clear_edge();
+                }
                 self.search_pending = None;
-                self.refresh_color_filter_for_scope_change(ctx);
+                self.refresh_color_filter_for_scope_change_with_selection(ctx, selection_policy);
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -88615,6 +89128,7 @@ impl App {
     /// Remove every queued/materialized form of one grid thumbnail and make it
     /// eligible for a fresh LoadRequest on the next keep-range update.
     fn evict_thumbnail_for_reload(&mut self, idx: usize) {
+        self.thumbnail_standins.remove(idx);
         self.invalidate_color_representative(idx);
         for queue in [&self.reload_queue, &self.heavy_io_queue]
             .into_iter()
@@ -105228,6 +105742,7 @@ impl App {
         self.show_stats_dialog_window(ctx);
         self.show_omitted_entries_dialog(ctx);
         self.show_rotation_reset_confirm_dialog(ctx);
+        self.show_folder_order_reset_confirm_dialog(ctx);
         self.show_reading_history_clear_confirm_dialog(ctx);
         self.show_cover_crop_dialog(ctx);
         let context_nav = self.show_context_menu(ctx);
@@ -105830,6 +106345,7 @@ impl eframe::App for App {
         }
         self.speculative_gpu_frame
             .begin(ctx.cumulative_frame_nr_for(egui::ViewportId::ROOT));
+        self.poll_folder_order_completions();
         self.publish_diagnostic_display();
         self.service_app_logic(ctx, frame);
     }
@@ -106007,6 +106523,9 @@ impl eframe::App for App {
         self.shutdown_collection_runtime_for_exit();
         // 後段の本物の on_exit に処理を委譲する (trait impl は 1 つしか書けないため、
         // helper メソッド群は trait impl の外の `impl App` ブロックへ逃がしてある)。
+        if let Some(service) = self.folder_order_service.take() {
+            (*service).shutdown();
+        }
         self.on_exit_inner();
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::release_checks::record_on_exit();

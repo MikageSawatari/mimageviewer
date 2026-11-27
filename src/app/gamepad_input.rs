@@ -373,8 +373,8 @@ use eframe::egui;
 #[cfg(windows)]
 use super::ViewerPresentation;
 use super::{
-    App, ContainerRatingTarget, FolderNavMode, GridContainerOpenMode, GridCursorDirection,
-    GridCursorMove, GridScrollIntent, grid_cursor_nav_target_pos,
+    App, ContainerRatingTarget, FolderNavMode, FolderSortChoice, GridContainerOpenMode,
+    GridCursorDirection, GridCursorMove, GridScrollIntent, grid_cursor_nav_target_pos,
 };
 use crate::adjustment::{POST_FILTER_GROUPS, PostFilter};
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
@@ -4410,7 +4410,15 @@ impl App {
             RingPickerRowId::GridSortOrder => match picker.grid_sort_target {
                 RingPickerGridSortTarget::Locked(reason) => reason.short_label().to_string(),
                 RingPickerGridSortTarget::Global | RingPickerGridSortTarget::Collection(_) => {
-                    picker.sort_order.label().to_string()
+                    match picker.grid_sort_choice {
+                        FolderSortChoice::Manual => "手動順 (このフォルダ)".to_string(),
+                        FolderSortChoice::Standard(order) => self
+                            .listing_sort_capabilities()
+                            .sort_locked_reason
+                            .map(|reason| reason.short_label())
+                            .unwrap_or_else(|| order.label())
+                            .to_string(),
+                    }
                 }
             },
             RingPickerRowId::GridThumbAspect => {
@@ -5604,6 +5612,13 @@ impl App {
                     .map(RingPickerGridSortTarget::Locked)
                     .unwrap_or(RingPickerGridSortTarget::Collection(target)),
                 Some(Err(reason)) => RingPickerGridSortTarget::Locked(reason),
+                None if self
+                    .listing_sort_capabilities()
+                    .manual_order_disabled_reason
+                    .is_none() =>
+                {
+                    RingPickerGridSortTarget::Global
+                }
                 None => self
                     .grid_sort_lock_reason()
                     .map(RingPickerGridSortTarget::Locked)
@@ -5629,6 +5644,14 @@ impl App {
             }
         };
         let sort_order = self.effective_listing_sort_order(sort_order);
+        let grid_sort_choice = if context == RingShortcutContext::Grid
+            && matches!(grid_sort_target, RingPickerGridSortTarget::Global)
+            && self.folder_manual_order_applied()
+        {
+            FolderSortChoice::Manual
+        } else {
+            FolderSortChoice::Standard(sort_order)
+        };
         let thumb_aspect_auto = self.settings.thumb_aspect_auto;
         let thumb_aspect = self.settings.thumb_aspect;
         let spread_mode = self.spread_mode;
@@ -5676,7 +5699,7 @@ impl App {
         );
         let original = RingPickerOriginalState {
             grid_cols,
-            sort_order,
+            grid_sort_choice,
             thumb_aspect_auto,
             thumb_aspect,
             item_rating_records,
@@ -5708,7 +5731,7 @@ impl App {
             x_close_armed: false,
             drill: None,
             grid_cols,
-            sort_order,
+            grid_sort_choice,
             thumb_aspect_auto,
             thumb_aspect,
             item_rating,
@@ -6388,12 +6411,18 @@ impl App {
                 } else {
                     SortOrder::all()
                 };
-                let options = options
+                let mut options = options
                     .iter()
                     .copied()
                     .filter(|order| sort_capabilities.disabled_reason(*order).is_none())
+                    .map(FolderSortChoice::Standard)
                     .collect::<Vec<_>>();
-                picker.sort_order = cycle_value(&options, picker.sort_order, delta);
+                if matches!(picker.grid_sort_target, RingPickerGridSortTarget::Global)
+                    && sort_capabilities.manual_order_disabled_reason.is_none()
+                {
+                    options.push(FolderSortChoice::Manual);
+                }
+                picker.grid_sort_choice = cycle_value(&options, picker.grid_sort_choice, delta);
                 mark_picker_dirty(picker, row);
             }
             RingPickerRowId::GridThumbAspect => {
@@ -6522,9 +6551,9 @@ impl App {
             }
             RingPickerRowId::GridSortOrder
                 if matches!(picker.grid_sort_target, RingPickerGridSortTarget::Global)
-                    && self.settings.sort_order != picker.sort_order =>
+                    && self.grid_picker_sort_choice_changed(picker.grid_sort_choice) =>
             {
-                self.apply_grid_picker_sort_order(picker.sort_order);
+                self.apply_grid_picker_sort_choice(picker.grid_sort_choice);
             }
             RingPickerRowId::GridThumbAspect
                 if self.settings.thumb_aspect_auto != picker.thumb_aspect_auto
@@ -7861,17 +7890,19 @@ impl App {
         if picker.dirty_rows.contains(&RingPickerRowId::GridSortOrder) {
             match picker.grid_sort_target {
                 RingPickerGridSortTarget::Global
-                    if self.settings.sort_order != picker.sort_order =>
+                    if self.grid_picker_sort_choice_changed(picker.grid_sort_choice) =>
                 {
-                    self.apply_grid_picker_sort_order(picker.sort_order);
+                    self.apply_grid_picker_sort_choice(picker.grid_sort_choice);
                 }
                 RingPickerGridSortTarget::Collection(target) => {
-                    self.request_collection_grid_set_order(
-                        target,
-                        crate::collection_store::CollectionOrderMode::Standard,
-                        picker.sort_order,
-                        crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
-                    );
+                    if let FolderSortChoice::Standard(sort_order) = picker.grid_sort_choice {
+                        self.request_collection_grid_set_order(
+                            target,
+                            crate::collection_store::CollectionOrderMode::Standard,
+                            sort_order,
+                            crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
+                        );
+                    }
                 }
                 RingPickerGridSortTarget::Global | RingPickerGridSortTarget::Locked(_) => {}
             }
@@ -7890,21 +7921,38 @@ impl App {
         }
     }
 
-    fn apply_grid_picker_sort_order(&mut self, sort_order: SortOrder) {
-        if self
-            .listing_sort_capabilities()
-            .disabled_reason(sort_order)
-            .is_some()
-            || (self.settings.sort_order == sort_order && sort_order.lazy_metric().is_none())
-        {
+    fn grid_picker_sort_choice_changed(&self, choice: FolderSortChoice) -> bool {
+        match choice {
+            FolderSortChoice::Manual => !self.folder_manual_order_applied(),
+            FolderSortChoice::Standard(order) => {
+                self.settings.sort_order != order || self.folder_order.manual_active()
+            }
+        }
+    }
+
+    fn apply_grid_picker_sort_choice(&mut self, choice: FolderSortChoice) {
+        let capabilities = self.listing_sort_capabilities();
+        let disabled = match choice {
+            FolderSortChoice::Standard(order) => capabilities.disabled_reason(order),
+            FolderSortChoice::Manual => capabilities.manual_order_disabled_reason,
+        };
+        if disabled.is_some() {
             return;
         }
-        if self.settings.sort_order != sort_order {
-            self.settings.sort_order = sort_order;
-            self.settings.save();
+        let retry_lazy = matches!(choice, FolderSortChoice::Standard(order)
+            if order.lazy_metric().is_some());
+        if !self.grid_picker_sort_choice_changed(choice) && !retry_lazy {
+            return;
         }
-        self.apply_sort_change_reload();
-        self.grid_scroll.set_reveal_requested(true);
+        let before_order = self.settings.sort_order;
+        let changed = self.select_folder_sort(choice);
+        if matches!(choice, FolderSortChoice::Standard(_)) && (changed || retry_lazy) {
+            if self.settings.sort_order != before_order {
+                self.settings.save();
+            }
+            self.apply_sort_change_reload();
+            self.grid_scroll.set_reveal_requested(true);
+        }
     }
 
     fn apply_picker_thumb_aspect(&mut self, auto: bool, aspect: ThumbAspect) {
@@ -12866,10 +12914,16 @@ mod tests {
         app.bookmark_view_sort =
             crate::bookmark_browser::BookmarkViewSort::Normal(crate::settings::SortOrder::DateDesc);
         let picker = app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
-        assert_eq!(picker.sort_order, crate::settings::SortOrder::DateDesc);
+        assert_eq!(
+            picker.grid_sort_choice,
+            FolderSortChoice::Standard(crate::settings::SortOrder::DateDesc)
+        );
         app.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::CreatedAtDesc;
         let picker = app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
-        assert_eq!(picker.sort_order, crate::settings::SortOrder::FileName);
+        assert_eq!(
+            picker.grid_sort_choice,
+            FolderSortChoice::Standard(crate::settings::SortOrder::FileName)
+        );
     }
 
     #[test]
@@ -12893,7 +12947,7 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         app.current_folder = Some(folder);
         app.settings.sort_order = SortOrder::DurationAsc;
-        app.apply_grid_picker_sort_order(SortOrder::DurationAsc);
+        app.apply_grid_picker_sort_choice(FolderSortChoice::Standard(SortOrder::DurationAsc));
         let pending = app
             .folder_pane_open_pending
             .as_ref()
@@ -12911,7 +12965,7 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         app.current_folder = Some(folder);
         app.settings.sort_order = SortOrder::PageCountAsc;
-        app.apply_grid_picker_sort_order(SortOrder::PageCountAsc);
+        app.apply_grid_picker_sort_choice(FolderSortChoice::Standard(SortOrder::PageCountAsc));
         let pending = app
             .folder_pane_open_pending
             .as_ref()
@@ -12935,13 +12989,13 @@ mod tests {
         let ctx = egui::Context::default();
         app.change_ring_picker_value(&ctx, RingPickerRowId::GridSortOrder, 1);
         assert_eq!(
-            app.ring_picker.as_ref().unwrap().sort_order,
-            SortOrder::RatingAsc
+            app.ring_picker.as_ref().unwrap().grid_sort_choice,
+            FolderSortChoice::Standard(SortOrder::RatingAsc)
         );
         app.change_ring_picker_value(&ctx, RingPickerRowId::GridSortOrder, -1);
         assert_eq!(
-            app.ring_picker.as_ref().unwrap().sort_order,
-            SortOrder::SizeDesc
+            app.ring_picker.as_ref().unwrap().grid_sort_choice,
+            FolderSortChoice::Standard(SortOrder::SizeDesc)
         );
     }
     use super::{
@@ -12957,6 +13011,7 @@ mod tests {
         update_mouse_middle_click_state, video_seek_ring_action,
     };
     use crate::adjustment::PostFilter;
+    use crate::app::FolderSortChoice;
 
     #[test]
     fn multi_item_ring_rating_publishes_once() {
@@ -13550,8 +13605,11 @@ mod tests {
             RingPickerGridSortTarget::Collection(target) => target,
             target => panic!("collection target was not captured: {target:?}"),
         };
-        assert_eq!(picker.sort_order, captured.standard_sort);
-        picker.sort_order = SortOrder::SizeDesc;
+        assert_eq!(
+            picker.grid_sort_choice,
+            FolderSortChoice::Standard(captured.standard_sort)
+        );
+        picker.grid_sort_choice = FolderSortChoice::Standard(SortOrder::SizeDesc);
         mark_picker_dirty(&mut picker, RingPickerRowId::GridSortOrder);
         app.preview_grid_picker_row(&picker, RingPickerRowId::GridSortOrder);
         assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
@@ -13590,18 +13648,18 @@ mod tests {
             locked.grid_sort_target,
             RingPickerGridSortTarget::Locked(crate::app::GridSortLockReason::DetailsHeaderSort)
         );
-        let locked_sort = locked.sort_order;
+        let locked_sort = locked.grid_sort_choice;
         app.ring_picker = Some(locked);
         app.change_ring_picker_value(&ctx, RingPickerRowId::GridSortOrder, 1);
         let locked = app.ring_picker.as_ref().unwrap();
-        assert_eq!(locked.sort_order, locked_sort);
+        assert_eq!(locked.grid_sort_choice, locked_sort);
         assert!(!locked.dirty_rows.contains(&RingPickerRowId::GridSortOrder));
         app.finish_gamepad_input_for_sidecar_restore(&ctx);
         assert!(app.ring_picker.is_none());
 
         app.settings.details_sort_key = DetailsSortKey::Toolbar;
         let mut stale = app.build_ring_picker_state(RingShortcutContext::Grid);
-        stale.sort_order = SortOrder::FileName;
+        stale.grid_sort_choice = FolderSortChoice::Standard(SortOrder::FileName);
         mark_picker_dirty(&mut stale, RingPickerRowId::GridSortOrder);
         let external = client
             .set_order(
@@ -13644,7 +13702,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         let mut stale = app.build_ring_picker_state(RingShortcutContext::Grid);
-        stale.sort_order = SortOrder::FileName;
+        stale.grid_sort_choice = FolderSortChoice::Standard(SortOrder::FileName);
         mark_picker_dirty(&mut stale, RingPickerRowId::GridSortOrder);
         app.ring_picker = Some(stale);
         let session = app.top_level_grid_view.collection_session_mut().unwrap();
@@ -13671,6 +13729,134 @@ mod tests {
         app.shutdown_collection_runtime_for_exit();
     }
 
+    fn folder_manual_picker_fixture() -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+        app.active_quick_folder_slot = None;
+        let folder = app.tmp.path().join("manual-picker");
+        std::fs::create_dir(&folder).unwrap();
+        for name in ["a.jpg", "b.jpg"] {
+            std::fs::write(folder.join(name), b"fixture").unwrap();
+        }
+        app.load_folder(folder);
+        app.finish_page_identity_preparation_for_test();
+        assert!(app.folder_manual_order_eligible());
+        app
+    }
+
+    #[test]
+    fn folder_manual_ring_cycle_enters_manual_and_commit_does_not_refresh_twice() {
+        let mut app = folder_manual_picker_fixture();
+        let ctx = egui::Context::default();
+        let revision = app.folder_order.order_revision;
+        app.ring_picker = Some(app.build_ring_picker_state(RingShortcutContext::Grid));
+        app.change_ring_picker_value(&ctx, RingPickerRowId::GridSortOrder, -1);
+        let picker = app.ring_picker.take().unwrap();
+        assert_eq!(picker.grid_sort_choice, FolderSortChoice::Manual);
+        assert!(app.folder_manual_order_applied());
+        assert_eq!(
+            app.settings.sort_order,
+            crate::settings::SortOrder::FileName
+        );
+        assert_eq!(app.folder_order.order_revision, revision + 1);
+        assert!(app.folder_order.record.is_none());
+        let cancel = app
+            .folder_pane_open_pending
+            .as_ref()
+            .unwrap()
+            .cancel
+            .clone();
+        app.apply_grid_picker_state(picker);
+        assert_eq!(app.folder_order.order_revision, revision + 1);
+        assert!(std::sync::Arc::ptr_eq(
+            &cancel,
+            &app.folder_pane_open_pending.as_ref().unwrap().cancel,
+        ));
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        let reopened = app.build_ring_picker_state(RingShortcutContext::Grid);
+        assert_eq!(reopened.grid_sort_choice, FolderSortChoice::Manual);
+        assert_eq!(
+            app.picker_value_text(&reopened, RingPickerRowId::GridSortOrder),
+            "手動順 (このフォルダ)",
+        );
+    }
+
+    #[test]
+    fn folder_manual_ring_same_standard_sort_leaves_manual_from_preview_and_commit() {
+        for (preview, stack_active) in [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let mut app = folder_manual_picker_fixture();
+            app.folder_order.enter_manual();
+            app.stack_mode_requested = stack_active;
+            assert_eq!(app.folder_manual_order_applied(), !stack_active);
+            let revision = app.folder_order.order_revision;
+            let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+            picker.grid_sort_choice = FolderSortChoice::Standard(app.settings.sort_order);
+            mark_picker_dirty(&mut picker, RingPickerRowId::GridSortOrder);
+            if preview {
+                app.preview_grid_picker_row(&picker, RingPickerRowId::GridSortOrder);
+            } else {
+                app.apply_grid_picker_state(picker);
+            }
+            assert!(!app.folder_order.manual_active());
+            assert_eq!(app.folder_order.order_revision, revision + 1);
+            assert_eq!(
+                app.settings.sort_order,
+                crate::settings::SortOrder::FileName
+            );
+            assert_eq!(app.stack_mode_requested, stack_active);
+            assert!(app.folder_pane_open_pending.is_some());
+        }
+    }
+
+    #[test]
+    fn folder_manual_ring_remains_selectable_beneath_details_header_order() {
+        let mut app = folder_manual_picker_fixture();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+        let picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        assert_eq!(
+            picker.grid_sort_target,
+            crate::ring_shortcut::RingPickerGridSortTarget::Global
+        );
+        app.ring_picker = Some(picker);
+        app.change_ring_picker_value(&egui::Context::default(), RingPickerRowId::GridSortOrder, 1);
+        assert_eq!(
+            app.ring_picker.as_ref().unwrap().grid_sort_choice,
+            FolderSortChoice::Manual
+        );
+        assert!(app.folder_manual_order_applied());
+        assert_eq!(
+            app.settings.details_sort_key,
+            crate::settings::DetailsSortKey::Name
+        );
+    }
+
+    #[test]
+    fn folder_manual_ring_rejects_ineligible_manual_choice() {
+        let mut app = crate::app::setup_app_for_test();
+        assert!(
+            app.listing_sort_capabilities()
+                .manual_order_disabled_reason
+                .is_some()
+        );
+        let revision = app.folder_order.order_revision;
+        let order = app.settings.sort_order;
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        picker.grid_sort_choice = FolderSortChoice::Manual;
+        mark_picker_dirty(&mut picker, RingPickerRowId::GridSortOrder);
+        app.preview_grid_picker_row(&picker, RingPickerRowId::GridSortOrder);
+        app.apply_grid_picker_state(picker);
+        assert!(!app.folder_order.manual_active());
+        assert_eq!(app.folder_order.order_revision, revision);
+        assert_eq!(app.settings.sort_order, order);
+        assert!(app.folder_pane_open_pending.is_none());
+    }
+
     #[test]
     fn global_ring_sort_keeps_live_preview() {
         use crate::ring_shortcut::RingPickerGridSortTarget;
@@ -13680,7 +13866,7 @@ mod tests {
         app.settings.sort_order = SortOrder::FileName;
         let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
         assert_eq!(picker.grid_sort_target, RingPickerGridSortTarget::Global);
-        picker.sort_order = SortOrder::DateDesc;
+        picker.grid_sort_choice = FolderSortChoice::Standard(SortOrder::DateDesc);
         mark_picker_dirty(&mut picker, RingPickerRowId::GridSortOrder);
 
         app.preview_grid_picker_row(&picker, RingPickerRowId::GridSortOrder);

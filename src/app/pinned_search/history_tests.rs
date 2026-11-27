@@ -632,6 +632,7 @@ fn section1756_search_input_history_local_departure_uses_current_pending_request
         let (_stream, rx) = std::sync::mpsc::channel();
         app.search_pending = Some(SearchPending {
             request: Arc::new(LocalSearchRequest {
+                cursor_policy: crate::app::LocalSearchCursorPolicy::Reset,
                 submitted: submitted.clone(),
                 list_identity: app.local_search_list_identity(),
             }),

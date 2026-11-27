@@ -497,7 +497,15 @@ impl App {
             }
             if let Some(submitted) = local_search {
                 let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
-                self.execute_submitted_local_search(&ctx, submitted.clone());
+                if self.folder_manual_order_applied() {
+                    self.execute_submitted_local_search_with_cursor(
+                        &ctx,
+                        submitted.clone(),
+                        LocalSearchCursorPolicy::Retain,
+                    );
+                } else {
+                    self.execute_submitted_local_search(&ctx, submitted.clone());
+                }
             }
         }
     }

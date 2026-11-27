@@ -36,6 +36,7 @@ pub(crate) use fav_add::FavoriteAddFlags;
 pub(crate) mod favorites_editor;
 pub mod file_organize;
 mod first_setup;
+mod folder_order_reset;
 #[doc(hidden)]
 pub use first_setup::draw_first_setup_dialog;
 #[cfg(windows)]

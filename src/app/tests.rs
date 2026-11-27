@@ -734,11 +734,13 @@ fn review_a_search_completion_requires_current_list_and_request_identity() {
             or_mode: false,
         });
         let request = Arc::new(LocalSearchRequest {
+            cursor_policy: crate::app::LocalSearchCursorPolicy::Reset,
             submitted: submitted.clone(),
             list_identity: identity,
         });
         let result_request = if case == "request" {
             Arc::new(LocalSearchRequest {
+                cursor_policy: crate::app::LocalSearchCursorPolicy::Reset,
                 submitted,
                 list_identity: identity,
             })
@@ -1811,8 +1813,12 @@ mod folder_mtime_rescan_tests {
         app.current_folder_last_mtime = Some(std::time::SystemTime::UNIX_EPOCH);
         app.current_folder_signature = Some(signature_from_scan(&scan));
         app.seed_folder_observation_for_test(&folder, &scan);
-        let listing =
-            materialize_local_folder_listing(&folder, scan.clone_for_projection(), &app.settings);
+        let listing = materialize_local_folder_listing(
+            &folder,
+            scan.clone_for_projection(),
+            &app.settings,
+            crate::folder_order::FolderOrderListingInput::NotApplicable,
+        );
         app.items = listing.items;
         app.image_metas = listing.metas;
         app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
@@ -1998,6 +2004,7 @@ mod folder_mtime_rescan_tests {
                     Default::default(),
                     std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2),
                     Default::default(),
+                    scan.folder_order_inventory.clone(),
                 ))
             })
             .unwrap();
@@ -3715,6 +3722,15 @@ fn cold_dialog_owners_keep_app_stack_footprint_bounded() {
             field_size(|app| &app.settings_restore_state),
         ),
         ("book_reorder", field_size(|app| &app.book_reorder)),
+        ("folder_order", field_size(|app| &app.folder_order)),
+        (
+            "folder_order_service",
+            field_size(|app| &app.folder_order_service),
+        ),
+        (
+            "folder_order_reset_confirmation",
+            field_size(|app| &app.folder_order_reset_confirmation),
+        ),
     ] {
         println!("cold owner {name}={bytes}");
         assert_eq!(
@@ -3765,6 +3781,16 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         storage(|app| &app.settings.thumb_cover_auto_crop_folders),
         storage(|app| &app.settings.video_resume_positions),
         size_of::<HashMap<String, f64>>(),
+    );
+    println!(
+        "folder-order storage folder_order={} folder_order_service={} folder_order_reset_confirmation={}; payload FolderOrderState={} FolderOrderService={} FolderOrderResetConfirmation={} SnapshotState={}",
+        storage(|app| &app.folder_order),
+        storage(|app| &app.folder_order_service),
+        storage(|app| &app.folder_order_reset_confirmation),
+        size_of::<crate::folder_order::FolderOrderState>(),
+        size_of::<crate::folder_order::FolderOrderService>(),
+        size_of::<folder_manual_order::FolderOrderResetConfirmation>(),
+        size_of::<crate::snapshot::SnapshotState>(),
     );
     println!(
         "image combine storage={} payload={}",
@@ -5630,7 +5656,12 @@ fn unconverted_epub_grid_open_routes_to_owned_conversion_dialog() {
     let source = dir.path().join("grid-book.epub");
     std::fs::write(&source, b"not converted yet").unwrap();
     let scan = scan_directory_with_settings(dir.path(), &app.settings).unwrap();
-    let listing = materialize_local_folder_listing(dir.path(), scan, &app.settings);
+    let listing = materialize_local_folder_listing(
+        dir.path(),
+        scan,
+        &app.settings,
+        crate::folder_order::FolderOrderListingInput::NotApplicable,
+    );
     let idx = listing
         .items
         .iter()
@@ -14860,6 +14891,7 @@ fn omitted_entries_are_exposed_only_for_the_normal_folder_surface() {
     let (_tx, rx) = mpsc::channel();
     app.search_pending = Some(SearchPending {
         request: Arc::new(LocalSearchRequest {
+            cursor_policy: crate::app::LocalSearchCursorPolicy::Reset,
             submitted: Arc::new(LocalSearchSubmission {
                 query: "test".into(),
                 target: Default::default(),
@@ -15509,7 +15541,11 @@ fn clamp_color_image_for_gpu_preserves_premultiplied_alpha() {
 /// 使用者が単一の Mutex で直列化される。
 #[cfg(test)]
 pub(crate) mod phase_c_support {
-    use super::{AiRuntimeFixture, AiRuntimeFixtureCleanup, App, AppDataDirFixture, AppTestConfig};
+    use super::{
+        AiRuntimeFixture, AiRuntimeFixtureCleanup, App, AppDataDirFixture, AppTestConfig,
+        OpenRequestOwner, ScannedDir, StartupListIntent,
+    };
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     /// Prove that the last admitted position write has committed before a test
@@ -15595,6 +15631,48 @@ pub(crate) mod phase_c_support {
     }
 
     impl AppTestEnv {
+        // Settle ordinary directory adoption, leaving identity hydration observable.
+        // Suffix paths without a supplied scan keep the provisional classifier
+        // observable to the caller, including Remote's retirement boundary.
+        pub(crate) fn load_folder(&mut self, path: PathBuf) {
+            let classify_path = App::path_needs_open_classification(&path);
+            self.app.load_folder(path);
+            if !classify_path {
+                self.app.settle_open_path_classification_for_test();
+                self.app
+                    .finish_direct_navigation_scan_before_hydration_for_test();
+            }
+        }
+
+        pub(crate) fn load_folder_with_scan(&mut self, path: PathBuf, scan: Option<ScannedDir>) {
+            let classify_path = scan.is_none() && App::path_needs_open_classification(&path);
+            self.app.load_folder_with_scan(path, scan);
+            if !classify_path {
+                self.app.settle_open_path_classification_for_test();
+                self.app
+                    .finish_direct_navigation_scan_before_hydration_for_test();
+            }
+        }
+
+        pub(crate) fn load_folder_with_scan_owned(
+            &mut self,
+            path: PathBuf,
+            scan: Option<ScannedDir>,
+            owner: OpenRequestOwner,
+            intent: StartupListIntent,
+        ) -> bool {
+            let classify_path = scan.is_none() && App::path_needs_open_classification(&path);
+            let accepted = self
+                .app
+                .load_folder_with_scan_owned(path, scan, owner, intent);
+            if !classify_path {
+                self.app.settle_open_path_classification_for_test();
+                self.app
+                    .finish_direct_navigation_scan_before_hydration_for_test();
+            }
+            accepted
+        }
+
         pub(crate) fn replace_app_from_settings(
             &mut self,
             settings: crate::settings::Settings,
@@ -15830,6 +15908,19 @@ pub(crate) mod phase_c_support {
         // 作るテストが実データを書き換える。テストが実利用のフォルダへ触れないよう、ここで
         // 一緒に temp dir へ向ける。
         app.settings.book_root = Some(tmp.path().join("books"));
+        // Legacy immediate-navigation fixtures start with a prepared record index.
+        // This FIFO fence runs on the test thread; production UI never waits here.
+        // Tests for startup preparation explicitly install a gated actor instead.
+        let folder_order = app
+            .folder_order_handle()
+            .expect("folder order fixture actor");
+        folder_order
+            .read(tmp.path())
+            .unwrap()
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("folder order fixture startup")
+            .expect("folder order fixture database");
+        assert!(folder_order.index_ready_for_test());
         let ai_runtime_cleanup = AiRuntimeFixtureCleanup::new(&app, ai_runtime);
         AppTestEnv {
             app,
@@ -22122,6 +22213,8 @@ mod folder_pane_open_nav_tests {
 
     fn empty_scan() -> ScannedDir {
         ScannedDir {
+            folder_order_inventory: Default::default(),
+            folder_order_input: Default::default(),
             duration_facts: None,
             page_count_facts: None,
             precise_stamps: Default::default(),
@@ -22471,7 +22564,7 @@ mod phase_c_folder_nav_history_tests {
                     std::fs::write(target.join(name), []).unwrap();
                     std::fs::write(origin.join(name), []).unwrap();
                 }
-                app.load_folder(origin.clone());
+                app.app.load_folder(origin.clone());
                 app.finish_direct_navigation_scan_before_hydration_for_test();
                 assert_eq!(
                     app.modal_dialog_block_reason(),
@@ -26182,6 +26275,8 @@ mod phase_c_folder_nav_history_tests {
                 panic!("fixture expected folder preflight");
             };
             let mut scan = crate::app::folder_scan::ScannedDir {
+                folder_order_inventory: Default::default(),
+                folder_order_input: Default::default(),
                 duration_facts: None,
                 page_count_facts: None,
                 precise_stamps: Default::default(),
@@ -79852,6 +79947,66 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
     }
 
     #[test]
+    fn suffix_directory_classification_survives_fixture_loads_until_remote_acquire() {
+        use crate::remote_ipc::session::RemoteControlPhase;
+
+        #[derive(Clone, Copy, Debug)]
+        enum LoadRoute {
+            Folder,
+            Scan,
+            OwnedScan,
+        }
+
+        for route in [LoadRoute::Folder, LoadRoute::Scan, LoadRoute::OwnedScan] {
+            for suffix in ["epub", "7z"] {
+                let mut app = setup_app();
+                let ctx = egui::Context::default();
+                let target = app.tmp.path().join(format!("classified.{suffix}"));
+                std::fs::create_dir(&target).unwrap();
+                // Even a ready negative record index cannot replace suffix classification.
+                assert!(
+                    app.folder_order_handle()
+                        .unwrap()
+                        .record_is_known_absent(&target)
+                );
+                match route {
+                    LoadRoute::Folder => app.load_folder(target.clone()),
+                    LoadRoute::Scan => app.load_folder_with_scan(target.clone(), None),
+                    LoadRoute::OwnedScan => assert!(app.load_folder_with_scan_owned(
+                        target.clone(),
+                        None,
+                        OpenRequestOwner::Navigation,
+                        crate::app::StartupListIntent::ExplicitList,
+                    )),
+                }
+                let candidate = app
+                    .top_level_grid_view
+                    .open_path_classification()
+                    .unwrap_or_else(|| panic!("classifier was consumed: {route:?}, {suffix}"));
+                assert_eq!(candidate.path.to_path_buf(), target);
+                let cancel = Arc::clone(&candidate.cancel);
+                assert!(!cancel.load(Ordering::Acquire));
+                let handle = crate::remote_ipc::session::SessionHandle::new();
+                app.set_remote_session_handle(handle.clone());
+                handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
+                    client_id: "phone".to_owned(),
+                    peer: mimageviewer_ipc::SessionPeerInfo {
+                        connection_kind: mimageviewer_ipc::SessionConnectionKind::Direct,
+                        device_name: None,
+                    },
+                });
+                app.poll_mounted_document_open_owners(&ctx);
+                app.poll_remote_session(&ctx);
+                assert_eq!(handle.snapshot().phase, RemoteControlPhase::RemoteActive);
+                assert!(app.top_level_grid_view.open_path_classification().is_none());
+                assert!(cancel.load(Ordering::Acquire));
+                app.poll_open_path_classification(&ctx);
+                assert_ne!(app.current_folder.as_deref(), Some(target.as_path()));
+            }
+        }
+    }
+
+    #[test]
     fn remote_acquire_retires_main_path_classification_before_its_result_can_open() {
         use crate::remote_ipc::session::RemoteControlPhase;
 
@@ -110250,7 +110405,8 @@ mod ring_picker_owner_tests {
 
         let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
         picker.dirty_rows.push(RingPickerRowId::GridSortOrder);
-        picker.sort_order = crate::settings::SortOrder::DateDesc;
+        picker.grid_sort_choice =
+            crate::app::FolderSortChoice::Standard(crate::settings::SortOrder::DateDesc);
         app.ring_picker = Some(picker);
         // 組み直しが所有窓へ届いたかを見るため、いったん空にする。
         app.items.clear();

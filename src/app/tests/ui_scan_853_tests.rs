@@ -313,7 +313,7 @@ fn section1853_fullscreen_close_error_and_replacement_keep_reader_and_release_lo
             assert!(app.fs_feedback_toast.is_some());
         } else {
             let other = directory(&app, "close-replacement");
-            app.load_folder(other);
+            app.app.load_folder(other);
             assert!(token.load(Ordering::Relaxed));
             app.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
         }
@@ -639,7 +639,7 @@ fn section1853_visibility_apply_retires_old_scan_before_current_list_refresh() {
     let page = origin.join("page.png");
     image::RgbImage::new(2, 3).save(&page).unwrap();
     app.load_folder_and_finish_for_test(origin.clone());
-    app.load_folder(target);
+    app.app.load_folder(target);
     let (late_tx, result, token) = hold_scan_reply(&mut app);
     app.settings
         .file_type_visibility
@@ -670,7 +670,7 @@ fn section1853_sidecar_restore_keeps_ready_scan_owned_until_restore_terminal() {
     let origin = directory(&app, "sidecar-origin");
     let target = directory(&app, "sidecar-target");
     app.load_folder_and_finish_for_test(origin.clone());
-    app.load_folder(target.clone());
+    app.app.load_folder(target.clone());
     let (tx, result, token) = hold_scan_reply(&mut app);
     tx.send(result).unwrap();
     let generation = app.items_generation;
@@ -732,7 +732,7 @@ fn section1853_retired_context_bundle_drops_request_owned_fullscreen_and_selecti
     app.load_folder_and_finish_for_test(origin);
     app.select_after_load = Some(AfterLoadSelection::Name("must-not-leak".into()));
     app.pending_auto_fs_open = true;
-    app.load_folder(target);
+    app.app.load_folder(target);
     let (late_tx, result, token) = hold_scan_reply(&mut app);
     // Promote through the production registry boundary: the former main's real
     // bundle retains its accepted directory request until that context is retired.

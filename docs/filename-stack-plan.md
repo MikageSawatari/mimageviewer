@@ -7,6 +7,13 @@
 
 ## 実装サマリ (v2.0.0 で実装された最終形)
 
+- **フォルダ手動順との排他（§1.911）**: スタック ON の間は物理フォルダの手動順を適用しない。
+  記録・active・inventory は同じ物理一覧の owner に保持し、初回グループ化の install でも退役させない。
+  手動順を選ぶと既存の stack toggle 準備処理で OFF にし、共通 sort refresh で再表示する。
+  スタックの ON/OFF だけでは手動記録を DB へ書かない。サムネイルの並べ替えドラッグも抑制し、
+  スタック中のドラッグは既存の native drag の受付と制限に従う。対象判定は
+  [フォルダ手動順の設計](folder-manual-order-plan.md) §5〜§7 と共有する。
+
 - **長さ順 (§1.762)**: 物理フォルダの `StackMember` は materialize 済みの完全な
   `ListingSortMetadata` を保持し、group 比較・集約・flat の各経路へ渡す。mtime / size だけから
   組み立て直して長さを落とさない。単独の動画・音声は長さ順に並び、集約スタックセル自身と

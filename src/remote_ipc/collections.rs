@@ -768,7 +768,10 @@ impl CollectionEngine {
                             internal_error("本のページ数を読み込めませんでした", error)
                         })?;
                 let listing = crate::app::folder_scan::materialize_local_folder_listing(
-                    &book.path, scan, settings,
+                    &book.path,
+                    scan,
+                    settings,
+                    crate::folder_order::FolderOrderListingInput::NotApplicable,
                 );
                 let page_count = listing
                     .items

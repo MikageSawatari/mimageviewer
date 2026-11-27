@@ -143,27 +143,45 @@ impl App {
 
     pub(crate) fn clear_color_filter_for_new_items(&mut self) {
         self.color_filter.clear_for_new_items();
-        self.color_filter_scope_refresh_pending = false;
+        self.color_filter_scope_refresh_pending = None;
     }
 
     pub(crate) fn refresh_color_filter_for_scope_change(&mut self, ctx: &egui::Context) {
-        self.color_filter_scope_refresh_pending = false;
+        self.refresh_color_filter_for_scope_change_with_selection(
+            ctx,
+            VisibleSelectionPolicy::General,
+        );
+    }
+
+    pub(crate) fn refresh_color_filter_for_scope_change_with_selection(
+        &mut self,
+        ctx: &egui::Context,
+        selection_policy: VisibleSelectionPolicy,
+    ) {
+        self.color_filter_scope_refresh_pending = None;
         if self.color_filter.enabled {
             self.color_filter.applied_scope_signature = None;
             self.color_filter.confirmation = None;
             self.color_filter.confirmed_large_scan_scope = None;
-            self.ensure_color_scan_for_current_scope(ctx);
+            self.ensure_color_scan_for_current_scope_with_selection(ctx, selection_policy);
         }
     }
 
     pub(crate) fn mark_color_filter_scope_dirty(&mut self) {
+        self.mark_color_filter_scope_dirty_with_selection(VisibleSelectionPolicy::General);
+    }
+
+    pub(crate) fn mark_color_filter_scope_dirty_with_selection(
+        &mut self,
+        selection_policy: VisibleSelectionPolicy,
+    ) {
         if !self.color_filter.enabled {
             return;
         }
         self.color_filter.applied_scope_signature = None;
         self.color_filter.confirmation = None;
         self.color_filter.confirmed_large_scan_scope = None;
-        self.color_filter_scope_refresh_pending = true;
+        self.color_filter_scope_refresh_pending = Some(selection_policy);
     }
 
     pub(crate) fn confirm_large_color_scan(&mut self, ctx: &egui::Context) {
@@ -171,7 +189,7 @@ impl App {
             return;
         };
         self.color_filter.confirmed_large_scan_scope = Some(confirmation.scope_signature);
-        self.ensure_color_scan_for_current_scope(ctx);
+        self.ensure_color_scan_for_current_scope_with_selection(ctx, confirmation.selection_policy);
     }
 
     pub(crate) fn cancel_large_color_scan_confirmation(&mut self) {
@@ -179,7 +197,7 @@ impl App {
         self.color_filter.confirmed_large_scan_scope = None;
         self.color_filter.enabled = false;
         self.color_filter.applied_scope_signature = None;
-        self.color_filter_scope_refresh_pending = false;
+        self.color_filter_scope_refresh_pending = None;
         self.rebuild_visible_indices();
     }
 
@@ -202,7 +220,7 @@ impl App {
         self.color_filter.set_query_rgb(rgb);
         self.color_filter.enabled = true;
         self.color_filter.applied_scope_signature = None;
-        self.color_filter_scope_refresh_pending = false;
+        self.color_filter_scope_refresh_pending = None;
         self.ensure_color_scan_for_current_scope(ctx);
         self.show_feedback_toast(format!("[画像色 {}]", crate::color_search::hex_rgb(rgb)));
     }
@@ -260,16 +278,16 @@ impl App {
     }
 
     pub(crate) fn poll_color_scan(&mut self, ctx: &egui::Context) {
-        if self.color_filter_scope_refresh_pending {
-            self.color_filter_scope_refresh_pending = false;
+        if let Some(selection_policy) = self.color_filter_scope_refresh_pending.take() {
             if self.color_filter.enabled {
-                self.ensure_color_scan_for_current_scope(ctx);
+                self.ensure_color_scan_for_current_scope_with_selection(ctx, selection_policy);
             }
         }
 
         let Some(mut pending) = self.color_filter.pending.take() else {
             return;
         };
+        let selection_policy = pending.selection_policy;
 
         let mut finished = None;
         let mut disconnected = false;
@@ -326,7 +344,7 @@ impl App {
             match disposition {
                 crate::color_search::ScanDisposition::Drop => {
                     self.color_filter.applied_scope_signature = None;
-                    self.rebuild_visible_indices();
+                    self.rebuild_visible_indices_with_selection(selection_policy);
                     if crate::perf::is_enabled() {
                         crate::perf::event(
                             "color",
@@ -346,7 +364,7 @@ impl App {
                 crate::color_search::ScanDisposition::Apply => {
                     self.color_filter.applied_scope_signature = Some(scope_signature);
                     self.color_filter.palettes.last_scope_signature = Some(scope_signature);
-                    self.rebuild_visible_indices();
+                    self.rebuild_visible_indices_with_selection(selection_policy);
                     if crate::perf::is_enabled() {
                         crate::perf::event(
                             "color",
@@ -377,13 +395,13 @@ impl App {
                             ],
                         );
                     }
-                    self.ensure_color_scan_for_current_scope(ctx);
+                    self.ensure_color_scan_for_current_scope_with_selection(ctx, selection_policy);
                 }
             }
             ctx.request_repaint();
         } else if disconnected {
             self.color_filter.applied_scope_signature = None;
-            self.rebuild_visible_indices();
+            self.rebuild_visible_indices_with_selection(selection_policy);
             if crate::perf::is_enabled() {
                 crate::perf::event(
                     "color",
@@ -412,6 +430,17 @@ impl App {
     }
 
     pub(crate) fn ensure_color_scan_for_current_scope(&mut self, ctx: &egui::Context) {
+        self.ensure_color_scan_for_current_scope_with_selection(
+            ctx,
+            VisibleSelectionPolicy::General,
+        );
+    }
+
+    pub(crate) fn ensure_color_scan_for_current_scope_with_selection(
+        &mut self,
+        ctx: &egui::Context,
+        selection_policy: VisibleSelectionPolicy,
+    ) {
         if !self.color_filter.enabled {
             return;
         }
@@ -420,23 +449,23 @@ impl App {
             self.color_filter.confirmation = None;
             self.color_filter.confirmed_large_scan_scope = None;
             self.color_filter.applied_scope_signature = None;
-            self.rebuild_visible_indices();
+            self.rebuild_visible_indices_with_selection(selection_policy);
             return;
         }
         let Some(scope_signature) = self.color_current_scope_signature() else {
             self.color_filter.confirmation = None;
             self.color_filter.confirmed_large_scan_scope = None;
             self.color_filter.applied_scope_signature = None;
-            self.rebuild_visible_indices();
+            self.rebuild_visible_indices_with_selection(selection_policy);
             return;
         };
 
-        if self
-            .color_filter
-            .pending
-            .as_ref()
-            .is_some_and(|pending| pending.scope_signature == scope_signature)
+        if let Some(pending) = self.color_filter.pending.as_mut()
+            && pending.scope_signature == scope_signature
         {
+            // Palette extraction is query-independent. A newer request for the
+            // same scope owns how its eventual visibility publication selects.
+            pending.selection_policy = selection_policy;
             return;
         }
 
@@ -456,7 +485,7 @@ impl App {
                     &[("scope", serde_json::Value::from(scope_signature))],
                 );
             }
-            self.rebuild_visible_indices();
+            self.rebuild_visible_indices_with_selection(selection_policy);
             return;
         }
         if work_items.len() >= COLOR_SCAN_CONFIRM_MISSING_THRESHOLD
@@ -473,9 +502,10 @@ impl App {
             self.color_filter.confirmation = Some(crate::color_search::ColorScanConfirmation {
                 scope_signature,
                 missing: work_items.len(),
+                selection_policy,
             });
             self.color_filter.applied_scope_signature = None;
-            self.rebuild_visible_indices();
+            self.rebuild_visible_indices_with_selection(selection_policy);
             if !same_confirmation {
                 self.show_feedback_warning(format!(
                     "画像色: {} 件のスキャン確認が必要です (画像色メニュー)",
@@ -502,7 +532,7 @@ impl App {
 
         let Some(cache_map) = self.current_color_cache_map.as_ref().cloned() else {
             self.color_filter.applied_scope_signature = None;
-            self.rebuild_visible_indices();
+            self.rebuild_visible_indices_with_selection(selection_policy);
             return;
         };
 
@@ -510,7 +540,7 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         let scan_id = self.color_filter.palettes.active_scan_id.wrapping_add(1);
         self.color_filter.palettes.active_scan_id = scan_id;
-        let pending = crate::color_search::ColorScanPending {
+        let pending = Box::new(crate::color_search::ColorScanPending {
             scan_id,
             scope_signature,
             total: work_items.len(),
@@ -518,7 +548,8 @@ impl App {
             cancel: Arc::clone(&cancel),
             rx,
             started_at: std::time::Instant::now(),
-        };
+            selection_policy,
+        });
         let catalog = self.current_color_catalog.clone();
         let thumb_px = self.settings.thumb_px;
         let thumb_quality = self.settings.thumb_quality;
@@ -572,7 +603,7 @@ impl App {
             Err(e) => {
                 crate::logger::log(format!("color_scan: failed to spawn worker: {e}"));
                 self.color_filter.applied_scope_signature = None;
-                self.rebuild_visible_indices();
+                self.rebuild_visible_indices_with_selection(selection_policy);
                 if crate::perf::is_enabled() {
                     crate::perf::event(
                         "color",
@@ -1239,7 +1270,7 @@ mod tests {
             owner.image_metas = vec![Some((10, 20)); 2];
         });
         env.color_filter.enabled = true;
-        env.color_filter_scope_refresh_pending = false;
+        env.color_filter_scope_refresh_pending = None;
         let scope = env.color_current_scope_signature();
         env.with_viewer_context(sibling, |owner| {
             owner.invalidate_color_representative(0);
@@ -1250,13 +1281,13 @@ mod tests {
                     .representative_revisions
                     .is_empty()
             );
-            assert!(!owner.color_filter_scope_refresh_pending);
+            assert!(owner.color_filter_scope_refresh_pending.is_none());
         })
         .unwrap();
         assert_eq!(env.color_current_scope_signature(), scope);
         env.invalidate_color_representative(0);
         assert_eq!(env.color_filter.palettes.representative_revisions.len(), 1);
-        assert!(env.color_filter_scope_refresh_pending);
+        assert!(env.color_filter_scope_refresh_pending.is_some());
     }
 
     #[test]

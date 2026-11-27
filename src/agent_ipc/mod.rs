@@ -1604,6 +1604,9 @@ impl crate::app::App {
         if let Some(service) = &self.book_composition_service {
             readers.install_book_composition(service.clone());
         }
+        if let Some(handle) = self.folder_order_handle() {
+            readers.install_folder_order(handle);
+        }
         self.agent_readers = Some(readers);
         self.publish_agent_index();
     }

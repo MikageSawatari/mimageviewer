@@ -274,6 +274,7 @@ impl App {
                     state.thumb_adjust_tex.remove(&idx);
                     state.idle_upgrade_cache_bypass_ineligible.remove(&idx);
                     state.auto_aspect.samples.remove(&idx);
+                    state.thumbnail_standins.remove(idx);
                     if let Some(thumbnail) = state.thumbnails.get_mut(idx) {
                         *thumbnail = ThumbnailState::Evicted;
                     }
@@ -1536,6 +1537,7 @@ impl App {
                     state.thumb_edit_preview_layers.remove(&idx);
                     state.thumb_adjust_tex.remove(&idx);
                     state.idle_upgrade_cache_bypass_ineligible.remove(&idx);
+                    state.thumbnail_standins.remove(idx);
                     if let Some(thumbnail) = state.thumbnails.get_mut(idx) {
                         *thumbnail = ThumbnailState::Evicted;
                     }
@@ -1622,6 +1624,7 @@ impl App {
                         state.thumb_edit_preview_layers.remove(&idx);
                         state.thumb_adjust_tex.remove(&idx);
                         state.idle_upgrade_cache_bypass_ineligible.remove(&idx);
+                        state.thumbnail_standins.remove(idx);
                         if let Some(thumbnail) = state.thumbnails.get_mut(idx) {
                             *thumbnail = ThumbnailState::Evicted;
                         }
@@ -1963,6 +1966,7 @@ pub(in crate::app) struct ViewerContextBundle {
     archive_source_override: Option<PathBuf>,
     zip_nav: Option<crate::zip_tree::ZipNavState>,
     pub(in crate::app) list_order: Option<Arc<super::ListOrderSnapshot>>,
+    pub(in crate::app) folder_order: Box<crate::folder_order::FolderOrderState>,
     stack_mode_requested: bool,
     stack_view: Option<std::sync::Arc<crate::filename_stack::StackView>>,
     stack_showing_flat: bool,
@@ -1995,6 +1999,7 @@ pub(in crate::app) struct ViewerContextBundle {
     facet_name_cache_pending: Option<facet_name_filter::FacetNameCachePending>,
     facet_name_cache_failed_generation: Option<u64>,
     thumbnails: Vec<ThumbnailState>,
+    thumbnail_standins: Box<super::thumbnail_standin::ThumbnailStandins>,
     image_metas: Vec<Option<(i64, i64)>>,
     video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
     auto_aspect: crate::auto_aspect::AutoAspectState,
@@ -2806,6 +2811,13 @@ impl ContextAsyncOwner {
 
 #[cfg(windows)]
 impl<'a> ContextRef<'a> {
+    pub(in crate::app) fn folder_order(self) -> &'a crate::folder_order::FolderOrderState {
+        match self.source {
+            ContextRefSource::Mounted(app) => &app.folder_order,
+            ContextRefSource::AtRest(bundle) => &bundle.folder_order,
+        }
+    }
+
     pub(in crate::app) fn collection_grid_request_stamp_is_current(
         self,
         context_id: ViewerContextId,
@@ -3280,6 +3292,7 @@ impl ViewerContextBundle {
             self.fullscreen_page_layout.clear();
         }
         self.items_generation = items_generation;
+        self.thumbnail_standins.set_generation(items_generation);
         self.fs_cache.set_items_generation(items_generation);
         self.fs_pending.set_items_generation(items_generation);
         self.raw_pages.set_items_generation(items_generation);
@@ -3293,7 +3306,7 @@ impl ViewerContextBundle {
         self.normalize_auto_scan_suppressed.clear();
     }
 
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         // per-context ロード複合体: 空コンテキストは「誰も繋がっていない」fresh channel と
         // token を持つ (App::new と同じ初期状態。この tx を掴む worker は存在しないので
         // rx は常に Empty を返す)。
@@ -3308,6 +3321,7 @@ impl ViewerContextBundle {
             archive_source_override: None,
             zip_nav: None,
             list_order: None,
+            folder_order: Default::default(),
             stack_mode_requested: false,
             stack_view: None,
             stack_showing_flat: false,
@@ -3336,6 +3350,7 @@ impl ViewerContextBundle {
             facet_name_cache_pending: None,
             facet_name_cache_failed_generation: None,
             thumbnails: Vec::new(),
+            thumbnail_standins: Default::default(),
             image_metas: Vec::new(),
             video_thumb_overrides: std::collections::HashMap::new(),
             auto_aspect: crate::auto_aspect::AutoAspectState::default(),
@@ -3751,6 +3766,7 @@ impl App {
             archive_source_override,
             zip_nav,
             list_order,
+            folder_order,
             stack_mode_requested,
             stack_view,
             stack_showing_flat,
@@ -3779,6 +3795,7 @@ impl App {
             facet_name_cache_pending,
             facet_name_cache_failed_generation,
             thumbnails,
+            thumbnail_standins,
             image_metas,
             video_thumb_overrides,
             auto_aspect,
@@ -4080,6 +4097,7 @@ impl App {
         swap_field!(archive_source_override);
         swap_field!(zip_nav);
         swap_field!(list_order);
+        swap_field!(folder_order);
         swap_field!(stack_mode_requested);
         swap_field!(stack_view);
         swap_field!(stack_showing_flat);
@@ -4108,6 +4126,7 @@ impl App {
         swap_field!(facet_name_cache_pending);
         swap_field!(facet_name_cache_failed_generation);
         swap_field!(thumbnails);
+        swap_field!(thumbnail_standins);
         swap_field!(image_metas);
         swap_field!(video_thumb_overrides);
         swap_field!(auto_aspect);
@@ -4474,7 +4493,10 @@ impl App {
         });
         self.bump_items_generation();
         if record_matches_basis {
-            self.folder_observation.as_mut().unwrap().generation = self.items_generation;
+            let projection_key = self.current_folder_projection_key(&restore.origin);
+            let record = self.folder_observation.as_mut().unwrap();
+            record.generation = self.items_generation;
+            record.projection_key = projection_key;
         }
         self.bump_render_epoch_only();
         self.reconcile_restored_cover_thumbnails();
@@ -4534,6 +4556,7 @@ impl App {
             archive_source_override,
             zip_nav,
             list_order,
+            folder_order,
             stack_mode_requested,
             stack_view,
             stack_showing_flat,
@@ -4562,6 +4585,7 @@ impl App {
             facet_name_cache_pending,
             facet_name_cache_failed_generation,
             thumbnails,
+            thumbnail_standins,
             image_metas,
             video_thumb_overrides,
             auto_aspect,
@@ -4837,6 +4861,7 @@ impl App {
             display_epub_source,
             fullscreen_epub_source,
             favorite_view_context,
+            folder_order,
             archive_source_override,
             zip_nav,
             stack_mode_requested,
@@ -4856,6 +4881,7 @@ impl App {
             facet_name_cache_generation,
             facet_name_cache_failed_generation,
             thumbnails,
+            thumbnail_standins,
             image_metas,
             auto_aspect,
             selected,
@@ -5157,6 +5183,14 @@ impl App {
             ai_classify_cache,
         );
         if let Some((mut snapshot, surface)) = direct_owner {
+            let mut restored_order = snapshot.saved_folder_order.clone();
+            restored_order.order_revision = self
+                .folder_order
+                .order_revision
+                .max(restored_order.order_revision)
+                .checked_add(1)
+                .expect("folder order revision exhausted");
+            self.folder_order = restored_order;
             self.items = std::mem::take(&mut snapshot.saved_items);
             self.thumbnails = std::mem::take(&mut snapshot.saved_thumbnails);
             self.converted_archive_cache_paths =
@@ -7720,6 +7754,7 @@ mod tests {
             proof: Some(FolderRescanProof {
                 baseline: None,
                 projection_key: 0,
+                order_revision: app.folder_order.order_revision,
                 subscription: Some((epoch, 0)),
             }),
             cause,
@@ -8291,6 +8326,7 @@ mod tests {
                 },
                 generation_id: app.items_generation,
                 saved_items: vec![basis.clone()],
+                saved_folder_order: app.folder_order.clone(),
                 saved_projection_recipe: app.projection_recipe.clone(),
                 saved_viewing_state: app.capture_snapshot_viewing_state(),
                 saved_page_identity_index: app.page_identity_index.clone(),

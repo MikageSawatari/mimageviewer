@@ -43,6 +43,11 @@ fn grid_item_keys(items: &[GridItem]) -> Vec<String> {
 
 fn image_scan(paths: &[PathBuf]) -> ScannedDir {
     ScannedDir {
+        folder_order_inventory: paths
+            .iter()
+            .map(|path| crate::folder_order::folder_key(path))
+            .collect(),
+        folder_order_input: crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
         duration_facts: None,
         page_count_facts: None,
         precise_stamps: Default::default(),

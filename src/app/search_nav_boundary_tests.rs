@@ -696,6 +696,7 @@ fn search_nav_boundary_receipt_prevents_pdf_and_loading_items_from_closing_again
                     VisibleInstallAuthority::Ordinary,
                     token.with_install_boundary(boundary),
                     None,
+                    crate::app::MainListFilterPolicy::Clear,
                 );
                 assert_eq!(
                     app.top_level_grid_view.collection_navigation_sequence(),

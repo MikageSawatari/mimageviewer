@@ -1797,12 +1797,9 @@ impl App {
             self.cancel_subfolder_expansion_pending();
             if should_return_to_root {
                 if let Some(target) = return_target {
+                    // Keep the installed expansion owner until the physical listing adopts.
                     self.load_folder_after_temporary_view_exit(target);
                 }
-            } else if let Some(current) = self.current_folder.clone() {
-                self.address = self
-                    .book_address_label_for_path(&current)
-                    .unwrap_or_else(|| current.to_string_lossy().to_string());
             }
             self.show_feedback_toast("サブ展開をキャンセルしました".into());
             return;
@@ -1982,6 +1979,7 @@ impl App {
             .or_else(|| self.subfolder_expansion_root.clone());
         self.cancel_subfolder_expansion_pending();
         if let Some(target) = target {
+            // The successful install retires the expansion owner with its items.
             self.load_folder_after_temporary_view_exit(target);
         }
     }
@@ -2740,6 +2738,7 @@ impl App {
             },
             token,
             None,
+            crate::app::MainListFilterPolicy::Clear,
         );
         let position_key =
             super::top_level_grid_view::SubfolderExpansionPositionKey::new(&root, &roots);
@@ -3094,6 +3093,80 @@ fn remove_paths_from_snapshot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_order_expansion_exit_keeps_installed_owner_until_read_adoption() {
+        use crate::folder_order::{FolderOrderSave, physical_item_key};
+
+        for cancel_rebuild in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            app.settings.auto_fullscreen_image_folders = false;
+            let root = app.tmp.path().join("manual-expansion-return");
+            let child = root.join("child");
+            std::fs::create_dir_all(&child).unwrap();
+            image::RgbImage::new(2, 3)
+                .save(child.join("a.png"))
+                .unwrap();
+            app.load_folder(root.clone());
+            app.finish_direct_navigation_scan_for_test();
+            app.finish_page_identity_preparation_for_test();
+            // The shared scan worker must read the recorded return target
+            // before the physical listing replaces the expansion owner.
+            let listing_order: Vec<_> = app.items.iter().filter_map(physical_item_key).collect();
+            assert!(!listing_order.is_empty());
+            let actor = app.folder_order_handle().unwrap();
+            actor
+                .save(
+                    &root,
+                    FolderOrderSave {
+                        inventory: listing_order.iter().cloned().collect(),
+                        listing_order,
+                        revision: 71,
+                    },
+                )
+                .unwrap();
+            assert!(
+                actor
+                    .read(&root)
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap()
+                    .is_some()
+            );
+            app.start_subfolder_expansion_scan_roots(root.clone(), vec![root.clone()]);
+            let ctx = egui::Context::default();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !app.items_are_subfolder_expansion_view {
+                assert!(Instant::now() < deadline, "expansion did not adopt");
+                app.poll_subfolder_expansion(&ctx);
+                app.poll_sidecar_restore(&ctx);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            finish_list_hydration_for_test(&mut app);
+            let old_folder = app.current_folder.clone();
+            let old_generation = app.items_generation;
+            let old_items = app.items.clone();
+            if cancel_rebuild {
+                app.start_subfolder_expansion_scan_roots(root.clone(), vec![root.clone()]);
+                app.toggle_subfolder_expansion_view();
+            } else {
+                app.exit_subfolder_expansion_view();
+            }
+            assert!(app.items_are_subfolder_expansion_view);
+            assert!(app.subfolder_expansion_snapshot.is_some());
+            assert_eq!(app.current_folder, old_folder);
+            assert_eq!(app.items_generation, old_generation);
+            assert_eq!(app.items, old_items);
+            app.finish_direct_navigation_scan_for_test();
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.current_folder.as_deref(), Some(root.as_path()));
+            assert!(!app.items_are_subfolder_expansion_view);
+            assert!(app.subfolder_expansion_snapshot.is_none());
+            assert_eq!(app.items_generation, old_generation + 1);
+        }
+    }
 
     #[test]
     fn section1853_subfolder_exit_and_toggle_keep_visible_state_until_return_install() {
