@@ -58,6 +58,159 @@ fn begin_local(app: &mut App) -> LocalAdjustmentLayers {
     layers
 }
 
+fn switched_spread_fixture(
+    ctx: &egui::Context,
+) -> (AppTestEnv, String, String, LocalAdjustmentLayers) {
+    let mut app = fixture();
+    begin_local(&mut app);
+    let a_key = app.page_path_key(1).unwrap();
+    let b_key = app.page_path_key(0).unwrap();
+    let a_draft = app.local_adjust_page_layers[&1].clone();
+    app.local_adjust_spread_ctx = app.capture_local_page_edit_pivot(pivot());
+    for idx in [0, 1] {
+        let pixels = Arc::new(egui::ColorImage::filled([4, 3], egui::Color32::WHITE));
+        let tex = ctx.load_texture(
+            format!("spread-side-{idx}"),
+            pixels.clone(),
+            Default::default(),
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
+                tex,
+                pixels,
+                source_dims: Some([4, 3]),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+    }
+    app.switch_local_adjust_target_in_spread(ctx, 0);
+    assert_eq!(
+        app.fullscreen_idx,
+        Some(0),
+        "the real spread control must switch A to B"
+    );
+    assert!(app.local_adjust_mode);
+    assert!(
+        !app.has_pending_local_adjust_edit(),
+        "A must be committed before the switch"
+    );
+    let retained_owner = match &app.local_page_edit_document {
+        LocalPageEditDocument::Selection { owner, .. }
+        | LocalPageEditDocument::Editing { owner, .. } => owner,
+        LocalPageEditDocument::Idle => panic!("expected the completed A document"),
+    };
+    assert_eq!(
+        retained_owner.target.page_key, a_key,
+        "exercise the retained previous-page owner"
+    );
+    (app, a_key, b_key, a_draft)
+}
+
+fn assert_switched_a_saved(app: &mut App, key: &str, draft: &LocalAdjustmentLayers) {
+    app.finish_local_adjust_writes();
+    assert_eq!(
+        app.local_adjust_db
+            .as_ref()
+            .unwrap()
+            .get_layers(key)
+            .as_deref(),
+        Some(draft.as_slice())
+    );
+}
+
+#[test]
+fn page_edit_920_spread_switch_adoption_keeps_b_when_previous_owner_a_disappears() {
+    let ctx = egui::Context::default();
+    let (mut app, a_key, b_key, draft) = switched_spread_fixture(&ctx);
+    let items = vec![app.items[0].clone(), app.items[2].clone()];
+    app.replace_search_view_items(items, vec![None; 2]);
+    assert!(
+        app.local_adjust_mode,
+        "B remains the same displayed edit target"
+    );
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert_eq!(app.page_path_key(0).as_deref(), Some(b_key.as_str()));
+    assert!(
+        app.local_adjust_spread_ctx.is_some(),
+        "continuation must retain its typed pivot"
+    );
+    assert_switched_a_saved(&mut app, &a_key, &draft);
+    assert!(
+        app.local_adjust_db
+            .as_ref()
+            .unwrap()
+            .get_layers(&b_key)
+            .is_none()
+    );
+}
+
+#[test]
+fn page_edit_920_spread_switch_adoption_ends_b_when_only_previous_owner_a_remains() {
+    let ctx = egui::Context::default();
+    let (mut app, a_key, b_key, draft) = switched_spread_fixture(&ctx);
+    let items = vec![app.items[1].clone(), app.items[2].clone()];
+    app.replace_search_view_items(items, vec![None; 2]);
+    assert!(
+        !app.local_adjust_mode,
+        "retaining A cannot keep the removed B editor alive"
+    );
+    assert!(app.local_adjust_spread_ctx.is_none());
+    assert_switched_a_saved(&mut app, &a_key, &draft);
+    assert!(
+        app.local_adjust_db
+            .as_ref()
+            .unwrap()
+            .get_layers(&b_key)
+            .is_none()
+    );
+}
+
+#[test]
+fn page_edit_920_spread_switch_removal_keeps_b_when_previous_owner_a_is_deleted() {
+    let ctx = egui::Context::default();
+    let (mut app, a_key, b_key, draft) = switched_spread_fixture(&ctx);
+    app.remove_items_batch(&[1]);
+    assert!(
+        app.local_adjust_mode,
+        "deleting A must not end the displayed B editor"
+    );
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert_eq!(app.page_path_key(0).as_deref(), Some(b_key.as_str()));
+    assert!(app.local_adjust_spread_ctx.is_some());
+    assert_switched_a_saved(&mut app, &a_key, &draft);
+    assert!(
+        app.local_adjust_db
+            .as_ref()
+            .unwrap()
+            .get_layers(&b_key)
+            .is_none()
+    );
+}
+
+#[test]
+fn page_edit_920_spread_switch_removal_ends_b_when_previous_owner_a_is_not_deleted() {
+    let ctx = egui::Context::default();
+    let (mut app, a_key, b_key, draft) = switched_spread_fixture(&ctx);
+    app.remove_items_batch(&[0]);
+    assert!(
+        !app.local_adjust_mode,
+        "deleting the actual edit target B must end the editor"
+    );
+    assert!(app.local_adjust_spread_ctx.is_none());
+    assert_switched_a_saved(&mut app, &a_key, &draft);
+    assert!(
+        app.local_adjust_db
+            .as_ref()
+            .unwrap()
+            .get_layers(&b_key)
+            .is_none()
+    );
+}
+
 #[test]
 fn page_edit_920_reindex_preserves_local_gesture_and_occurrence_owned_spread_pivot() {
     let mut app = fixture();

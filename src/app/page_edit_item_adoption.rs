@@ -3,48 +3,40 @@ use super::*;
 
 impl App {
     fn local_page_edit_owner_before_adoption(&self) -> Option<PageEditOwner> {
-        let owner = match &self.local_page_edit_document {
-            LocalPageEditDocument::Selection { owner, .. }
-            | LocalPageEditDocument::Editing { owner, .. } => Some(owner),
-            LocalPageEditDocument::Idle => self
-                .local_adjust_shape_key_edit
-                .as_ref()
-                .map(|session| &session.owner)
-                .or_else(|| {
-                    self.local_adjust_shape_drag
-                        .as_ref()
-                        .map(|session| &session.owner)
-                })
-                .or_else(|| {
-                    self.local_adjust_canvas_drag
-                        .as_ref()
-                        .map(|session| &session.owner)
-                })
-                .or_else(|| {
-                    self.local_adjust_mask_brush_stroke
-                        .as_ref()
-                        .map(|session| &session.owner)
-                })
-                .or_else(|| {
-                    self.adjustment_drag_session
-                        .as_ref()
-                        .map(|session| &session.owner)
-                })
-                .or_else(|| {
-                    self.local_adjust_lut_pending
-                        .as_ref()
-                        .map(|pending| &pending.owner)
-                })
-                .or_else(|| {
-                    self.local_adjust_segmentation_pending
-                        .as_ref()
-                        .map(|pending| &pending.owner)
-                }),
-        };
-        if let Some(owner) = owner {
-            return self
-                .page_edit_owner_is_current(owner)
-                .then(|| owner.clone());
+        // A live gesture owns the current edit even while streaming adoption is
+        // reindexing its reader. Completed selections and async producers do not:
+        // a spread-side switch commits them before displaying the other page.
+        let live_owner = self
+            .local_adjust_shape_key_edit
+            .as_ref()
+            .map(|session| &session.owner)
+            .or_else(|| {
+                self.local_adjust_shape_drag
+                    .as_ref()
+                    .map(|session| &session.owner)
+            })
+            .or_else(|| {
+                self.local_adjust_canvas_drag
+                    .as_ref()
+                    .map(|session| &session.owner)
+            })
+            .or_else(|| {
+                self.local_adjust_mask_brush_stroke
+                    .as_ref()
+                    .map(|session| &session.owner)
+            })
+            .or_else(|| {
+                if !self.local_page_edit_gesture_active() {
+                    return None;
+                }
+                match &self.local_page_edit_document {
+                    LocalPageEditDocument::Editing { owner, .. } => Some(owner),
+                    LocalPageEditDocument::Selection { .. } | LocalPageEditDocument::Idle => None,
+                }
+            })
+            .filter(|owner| self.page_edit_owner_is_current(owner));
+        if let Some(owner) = live_owner {
+            return Some(owner.clone());
         }
         self.fullscreen_idx
             .and_then(|idx| self.capture_page_edit_owner(idx))

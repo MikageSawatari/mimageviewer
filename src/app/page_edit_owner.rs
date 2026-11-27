@@ -274,7 +274,7 @@ impl App {
         }
     }
 
-    fn local_page_edit_gesture_active(&self) -> bool {
+    pub(super) fn local_page_edit_gesture_active(&self) -> bool {
         self.local_adjust_shape_key_edit.is_some()
             || self.local_adjust_shape_drag.is_some()
             || self.local_adjust_canvas_drag.is_some()
