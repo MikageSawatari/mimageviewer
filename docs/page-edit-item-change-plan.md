@@ -222,6 +222,17 @@ active の編集に触れず、終えもしない (sibling の書き換えは ac
      起こす実際の producer を特定し、そこで置き換える前に終える (`sync_detached_viewer_to_selected` の検出では遅い)。
    - 実装担当は、編集中に届くかで採用の境界を列挙し、届くものに入れ、届かない理由 (close / park を先に通る・
      一覧の門・モーダル・所有 context でない) を報告に書く。
+   - **スマートフォルダ (実装担当の指摘で追記)**: 設置済みの smart session は意図的に固定した結果で、
+     「membership / 順序と再利用する metadata (隠蔽・消しゴム・注釈のバッジの集合を含む) は明示の開き直しまで
+     変えない」のが既存の仕様 (`invalidate_smart_folder_resort_metadata` は session があると
+     `smart_folder_metadata_revision` を進めない、`prepare_smart_folder` の `reuse_metadata` は既存の集合を使う)。
+     本件はこの仕様を変えない。終了は、準備済みの結果の検証 (RootReady・install・resident restore) と、
+     ChildReady の旧 root の捕捉 (`take_visible_smart_folder_grid`) より**前**に置く。そうすれば終了の保存は、
+     利用者がその時点で Esc で保存したのとまったく同じ扱いになる: session が無い間は既存の失効 (保存の経路が
+     通る revision) と検証で準備がやり直しになり、session がある間は固定結果の既存の扱い (直接のセルの状態は
+     更新され得るが、再利用する metadata は変わらない) のまま。固定結果のバッジが保存の後に古く見える場合が
+     あるのは今の Esc の保存と同じ既存の挙動で、本件の範囲外 (見つけたら報告する)。テストは、終了が検証・捕捉より
+     前に起きること、旧項目へ保存されること、session が無い間の準備が既存の検証でやり直されることを確かめる。
 3. **閉じる経路**: `close_fullscreen_now_for_destination` で、編集ツールの終了を `fullscreen_idx = None` より前へ
    移す。保つ順序 (r2): 評価の履歴の退避を fold / reset より前 → local pending の fold → edit preview の snapshot →
    編集の保存 → preview の enqueue。`restore_grid_cursor_to_fullscreen_item` が退避先を読む前に、テキスト・
