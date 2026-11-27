@@ -31486,7 +31486,7 @@ impl App {
 
     pub(crate) fn direct_navigation_scan_elapsed_at(
         &self,
-        now: Instant,
+        now: std::time::Instant,
     ) -> Option<std::time::Duration> {
         self.direct_navigation_scan_pending().then(|| {
             let started_at = self.folder_pane_open_pending.as_ref().unwrap().started_at;
@@ -31509,7 +31509,7 @@ impl App {
 
     pub(crate) fn view_order_refresh_scan_elapsed_at(
         &self,
-        now: Instant,
+        now: std::time::Instant,
     ) -> Option<std::time::Duration> {
         self.view_order_refresh_scan_pending().then(|| {
             let started_at = self.folder_pane_open_pending.as_ref().unwrap().started_at;

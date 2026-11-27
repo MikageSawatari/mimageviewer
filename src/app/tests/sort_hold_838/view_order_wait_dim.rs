@@ -159,7 +159,7 @@ fn view_order_wait_dim_after_grace_restores_existing_dimmed_images() {
     let images = seed_images(&mut h);
     let _held = request_sort(&mut h.env, SortOrder::FileName);
     let started = h.env.folder_pane_open_pending.as_ref().unwrap().started_at;
-    let alpha = h.ctx.style().visuals.disabled_alpha;
+    let alpha = h.ctx.global_style().visuals.disabled_alpha;
     assert!(alpha > 0.0 && alpha < 1.0);
     for elapsed in [
         DIRECT_NAVIGATION_WAIT_GRACE,
@@ -200,7 +200,7 @@ fn view_order_wait_dim_direct_navigation_still_dims_during_and_after_grace() {
     );
     let _held = HeldScan::capture(&mut h.env);
     let started = h.env.folder_pane_open_pending.as_ref().unwrap().started_at;
-    let alpha = h.ctx.style().visuals.disabled_alpha;
+    let alpha = h.ctx.global_style().visuals.disabled_alpha;
     assert!(alpha > 0.0 && alpha < 1.0);
     for elapsed in [Duration::ZERO, DIRECT_NAVIGATION_WAIT_GRACE] {
         let now = started + elapsed;
