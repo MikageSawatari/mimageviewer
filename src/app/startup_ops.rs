@@ -2717,6 +2717,7 @@ impl App {
         if startup_file_idx(&self.items, &requested).is_some() {
             return Some(crate::snapshot::SnapshotTarget::Fs(requested));
         }
+        self.end_page_edit_tools_for_viewer_item_change("direct_media_reader");
         let return_origin = self.current_top_level_restore_snapshot().map(|restore| {
             top_level_grid_view::TopLevelGridOrigin {
                 restore,

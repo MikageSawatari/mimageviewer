@@ -1,5 +1,121 @@
 mod physical;
 
+#[cfg(all(test, windows))]
+mod page_edit_920_tests {
+    use super::*;
+
+    fn linked_editing_app() -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().to_owned();
+        app.items = vec![
+            GridItem::Image(root.join("old.png")),
+            GridItem::Image(root.join("new.png")),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.details_order = vec![0, 1];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = super::super::ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = false;
+        app.main_hwnd = Some(1);
+        app.settings.gamepad_enabled = true;
+        app.conceal_mode = true;
+        app
+    }
+
+    fn poll(app: &mut App, ctx: &egui::Context) -> GamepadDispatchOutcome {
+        let mut outcome = None;
+        ctx.run_pass(Default::default(), |ctx| {
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
+            outcome = Some(app.dispatch_gamepad_batch_with_admission(ctx, batch, |_, _| true));
+        })
+        .drop_without_applying_deltas();
+        outcome.unwrap()
+    }
+
+    #[test]
+    fn page_edit_920_gamepad_rejected_holds_never_fire_after_editing_ends() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        for button in [
+            PadButton::South,
+            PadButton::West,
+            PadButton::North,
+            PadButton::DPadRight,
+        ] {
+            let mut app = linked_editing_app();
+            let ctx = egui::Context::default();
+            assert!(!app.gamepad_targets_viewer());
+            app.gamepad.push_for_test(PadEvent::ButtonPressed(button));
+            let rejected = poll(&mut app, &ctx);
+            assert!(!rejected.dispatch_allowed, "{button:?}");
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.feedback_toasts_for_test.len(), 1);
+            poll(&mut app, &ctx);
+            assert_eq!(
+                app.feedback_toasts_for_test.len(),
+                1,
+                "a held poll is not a new refusal"
+            );
+            app.conceal_mode = false;
+            assert!(!app.gamepad.state.due_button_repeat(
+                button,
+                Instant::now() + Duration::from_secs(2),
+                BUTTON_REPEAT_INTERVAL
+            ));
+            poll(&mut app, &ctx);
+            app.gamepad.push_for_test(PadEvent::ButtonReleased(button));
+            poll(&mut app, &ctx);
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(app.ring_picker.is_none());
+            assert!(!app.settings.folder_tree_pane_visible);
+            app.gamepad
+                .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+            poll(&mut app, &ctx);
+            assert_eq!(
+                app.selected,
+                Some(1),
+                "fresh input works after neutral/release: {button:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_edit_920_gamepad_blocked_trigger_waits_for_neutral_and_grid_ring_has_no_exception() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let mut app = linked_editing_app();
+        let ctx = egui::Context::default();
+        app.last_cell_h = 100.;
+        app.gamepad
+            .push_for_test(PadEvent::AxisChanged(PadAxis::RightTrigger, 0.9));
+        assert!(!poll(&mut app, &ctx).dispatch_allowed);
+        let offset = app.grid_scroll.offset();
+        app.conceal_mode = false;
+        poll(&mut app, &ctx);
+        assert_eq!(app.grid_scroll.offset(), offset);
+        assert!(app.gamepad.state.directional_neutral_required());
+        app.gamepad
+            .push_for_test(PadEvent::AxisChanged(PadAxis::RightTrigger, 0.));
+        poll(&mut app, &ctx);
+        assert!(!app.gamepad.state.directional_neutral_required());
+        app.conceal_mode = true;
+        for action in [
+            RingActionId::OpenPreferences,
+            RingActionId::OpenBook1,
+            RingActionId::ScriptSlot1,
+        ] {
+            assert!(
+                app.apply_ring_action(&ctx, RingShortcutContext::Grid, action, "page-edit-920")
+                    .is_none()
+            );
+        }
+        assert!(!app.show_preferences);
+        assert!(app.saved_group_open_request_id_for_test().is_none());
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+}
+
 #[cfg(test)]
 mod positionless_release_tests {
     use super::*;
@@ -4554,6 +4670,26 @@ impl App {
         batch: GamepadFrameBatch,
         admission: impl Fn(&Self, &egui::Context) -> bool,
     ) -> GamepadDispatchOutcome {
+        // The grid barrier is semantic admission, including headless/fake input.
+        // Keep receipt delivery below so rejected holds are retired before editing ends.
+        let base_admission = admission;
+        let admission = |app: &Self, ctx: &egui::Context| {
+            base_admission(app, ctx)
+                && (app.gamepad_targets_viewer()
+                    || !app.detached_viewer_editing_blocks_grid_input())
+        };
+        let editing_blocks_grid =
+            !self.gamepad_targets_viewer() && self.detached_viewer_editing_blocks_grid_input();
+        if editing_blocks_grid
+            && batch.delivery == PadBatchDelivery::Fresh
+            && batch.events.iter().any(|event| match event {
+                PadBatchEvent::Action(action) => action.kind == PadActionKind::Press,
+                PadBatchEvent::AxesChanged(_) => batch.analog_operation,
+                PadBatchEvent::SessionEnded => false,
+            })
+        {
+            self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+        }
         let operations = if self.page_turn_operation_tracking_needed() {
             batch.presentation_operations()
         } else {
@@ -4708,6 +4844,9 @@ impl App {
             self.reset_gamepad_continuous_steps(now);
             // ブロック中に押されたボタンが解除後に遅れて発火しないよう抑止する。
             self.gamepad.state.suppress_pending_actions();
+            if editing_blocks_grid {
+                self.gamepad.state.require_grid_navigation_neutral();
+            }
         }
 
         GamepadDispatchOutcome {
@@ -5147,6 +5286,9 @@ impl App {
     fn gamepad_directional_neutral(&self) -> bool {
         !self.gamepad.state.dpad_direction_down()
             && stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY).length_sq() == 0.0
+            && (!self.gamepad.state.grid_navigation_neutral_required()
+                || (self.gamepad.state.trigger_value(true) <= TRIGGER_THRESHOLD
+                    && self.gamepad.state.trigger_value(false) <= TRIGGER_THRESHOLD))
     }
 
     fn consume_gamepad_directional_neutral_gate(&mut self, now: Instant) -> bool {
@@ -8592,6 +8734,11 @@ impl App {
         source: &'static str,
         phase: RingScriptPhase,
     ) -> Option<AddressBarNav> {
+        if context == RingShortcutContext::Grid && self.detached_viewer_editing_blocks_grid_input()
+        {
+            self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+            return None;
+        }
         if let Some(key) = action.script_slot_key_action() {
             let slot = super::operation_script_runtime::script_slot_number(key)?;
             return self.apply_ring_script_slot(ctx, context, slot, phase);

@@ -37498,13 +37498,9 @@ impl App {
                     self.show_feedback_toast("編集中の図形操作を解除しました".to_string());
                     ctx.request_repaint();
                 } else {
-                    self.cache_current_edit_preview_if_ready();
-                    self.local_adjust_mode = false;
-                    self.fold_local_adjust_edit_state();
-                    self.local_adjust_repair_point_pick_active = None;
-                    self.local_adjust_add_layer_dialog_open = false;
-                    self.local_adjust_change_mask_dialog_open = false;
-                    self.local_adjust_effect_picker_dialog_open = false;
+                    self.exit_local_adjust_mode(
+                        crate::app::page_edit_item_change::LocalAdjustmentExitPreview::CacheCurrent,
+                    );
                 }
             }
             return action;
@@ -45314,6 +45310,9 @@ impl App {
 
     /// HUD・キー/マウス割当・リング/ジェスチャで共有する、active viewer のトグル出口。
     pub(crate) fn toggle_fullscreen_slideshow(&mut self, fs_idx: usize) {
+        if self.page_edit_tools_owned_by_projected_context() && self.is_overlay_edit_mode_active() {
+            return;
+        }
         if self.slideshow_playing {
             self.stop_slideshow_playback();
         } else if matches!(
@@ -46781,11 +46780,14 @@ impl App {
         });
     }
 
-    /// 画素編集系モードの全入口が通る 360° 排他述語。
+    /// 編集の入場と非同期完了が通る、移動待ち・排他表示の共通受付。
     ///
-    /// false の場合は既存の no-op 案内と同じ単一 state を更新するため、キーリピートや
-    /// 非同期 continuation が重なっても通知を積み上げない。
+    /// false の場合は既存の単一の案内を更新するため、キーリピートや非同期
+    /// continuation が重なっても通知を積み上げない。
     pub(crate) fn fullscreen_edit_mode_entry_allowed(&mut self, fs_idx: usize) -> bool {
+        if !self.page_edit_mode_navigation_entry_allowed() {
+            return false;
+        }
         if self.fs_exclusive_view.is_depth() {
             self.show_feedback_toast("3D 写真を終了してから編集してください".to_owned());
             return false;

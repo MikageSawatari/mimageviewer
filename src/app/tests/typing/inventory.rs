@@ -100,6 +100,12 @@ const INPUT_TESTS: &[Entry] = &[
 
 const EXEMPTIONS: &[Entry] = &[
     exempt(
+        "src/app/page_edit_grid_tests.rs",
+        "show_singleline(ui, &mut text,",
+        2,
+        "一覧の拒否通知が文字入力・IME の Esc を奪わないことを検査するテスト用入力欄。入力で検索や候補更新は行わない",
+    ),
+    exempt(
         "src/ui_dialogs/export_batch/watermark.rs",
         "&mut options.text",
         1,

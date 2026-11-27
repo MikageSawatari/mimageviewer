@@ -173,6 +173,7 @@ impl App {
         let fs_idx = target_idx;
         let [w, h] = pixels.size;
 
+        self.stop_projected_slideshow_playback();
         self.conceal_mode = true;
         self.conceal_preview_active = false;
         self.conceal_preview_hold = Default::default();

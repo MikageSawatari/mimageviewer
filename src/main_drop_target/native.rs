@@ -175,6 +175,20 @@ impl MainDropTarget_Impl {
         }
     }
 
+    fn describe_decision(&self, session: &DragSession, decision: &Decision) {
+        if session.describe(decision.description())
+            && let Decision::GridInputBlocked(reason) = decision
+        {
+            // OLE sources may never call Drop after DROPEFFECT_NONE. Publish the
+            // refusal when this drag first enters the blocked list, not per DragOver.
+            self.shared
+                .borrow_mut()
+                .drops
+                .push(DropRequest::GridInputBlocked(reason.clone()));
+            self.ctx.request_repaint();
+        }
+    }
+
     fn session(&self) -> Option<Rc<DragSession>> {
         self.session.borrow().clone()
     }
@@ -227,7 +241,7 @@ impl IDropTarget_Impl for MainDropTarget_Impl {
             y: point.y,
         };
         self.helper.enter(self.hwnd, data, &point, *output);
-        session.describe(decision.description());
+        self.describe_decision(&session, &decision);
         Ok(())
     }
 
@@ -242,7 +256,7 @@ impl IDropTarget_Impl for MainDropTarget_Impl {
         if let Some(session) = self.session() {
             let (decision, _) = self.evaluate(&session, *point, keys.0, false);
             *output = effect(&decision);
-            session.describe(decision.description());
+            self.describe_decision(&session, &decision);
         } else {
             self.set_hover(None);
         }
@@ -276,8 +290,13 @@ impl IDropTarget_Impl for MainDropTarget_Impl {
         let data = data.as_ref().ok_or(E_INVALIDARG)?;
         if let Some(session) = self.session() {
             let (decision, internal) = self.evaluate(&session, *point, keys.0, true);
-            session.describe(decision.description());
-            match session.drop_request(&decision, internal.as_ref()) {
+            self.describe_decision(&session, &decision);
+            let request = if matches!(decision, Decision::GridInputBlocked(_)) {
+                Ok(None)
+            } else {
+                session.drop_request(&decision, internal.as_ref())
+            };
+            match request {
                 Ok(Some(request)) => {
                     self.shared.borrow_mut().drops.push(request);
                     *output = effect(&decision);
@@ -365,7 +384,7 @@ impl DragData for OleData {
         let mut insert = [0u16; 260];
         value.r#type = match description {
             Description::Invalid => DROPIMAGE_INVALID,
-            Description::None => DROPIMAGE_NONE,
+            Description::None | Description::GridInputBlocked(_) => DROPIMAGE_NONE,
             Description::Transfer(operation, path) => {
                 let text = match operation {
                     ShellTransferOperation::Copy => "%1 へコピー",

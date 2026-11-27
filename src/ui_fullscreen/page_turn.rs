@@ -41,6 +41,8 @@ mod merge_master_tests;
 mod merge_tests;
 #[cfg(test)]
 mod nonfinal_tests;
+#[cfg(test)]
+mod page_edit_admission_tests;
 #[cfg(all(test, windows))]
 mod permission_service_regression_tests;
 #[cfg(test)]

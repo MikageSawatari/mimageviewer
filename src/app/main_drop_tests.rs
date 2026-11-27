@@ -284,6 +284,62 @@ fn grid_drop_pass(app: &mut App, ctx: &egui::Context, overlay: Option<egui::Pos2
 }
 
 #[test]
+#[cfg(windows)]
+fn page_edit_920_drop_geometry_preserves_disabled_list_and_refuses_queued_grid_requests() {
+    use crate::settings::GridViewMode::{Details, Thumbnail};
+    for view in [Thumbnail, Details] {
+        let mut app = grid_drop_app(view);
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        app.fullscreen_idx = Some(1);
+        app.viewer_presentation = crate::app::ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = false;
+        app.conceal_mode = true;
+        assert!(
+            app.shell_transfer_admission(&ctx).is_ok(),
+            "the tree is not modal-blocked"
+        );
+        let geometry = grid_drop_pass(&mut app, &ctx, None);
+        assert!(geometry.grid_clip.is_positive(), "{view:?}");
+        assert!(geometry.grid_folders.is_empty());
+        assert_eq!(
+            geometry.grid_input_blocked.as_deref(),
+            Some(crate::filename_stack_ui::DETACHED_VIEWER_EDITING_GRID_NOTICE)
+        );
+        app.main_drop.borrow_mut().drops = vec![
+            DropRequest::GridFiles(vec![app.tmp.path().join("external.txt")]),
+            DropRequest::FolderTransfer(
+                ShellTransferRequest {
+                    operation: ShellTransferOperation::Copy,
+                    sources: vec![app.tmp.path().join("external.txt")],
+                    destination: app.tmp.path().join("folder-a"),
+                    default_move_needs_volume_check: false,
+                },
+                DropPlace::Grid,
+            ),
+        ];
+        app.consume_main_drops_with(&ctx, |_, _| panic!("blocked drop reached background copy"));
+        assert!(matches!(
+            app.file_organize_request,
+            FileOrganizeRequest::Hidden
+        ));
+        assert_eq!(
+            app.fs_feedback_toast_surface,
+            Some(crate::app::ActionSurface::MainWindow)
+        );
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            crate::filename_stack_ui::DETACHED_VIEWER_EDITING_GRID_NOTICE
+        );
+        app.items.clear();
+        app.visible_indices.clear();
+        let empty = grid_drop_pass(&mut app, &ctx, None);
+        assert!(empty.grid_clip.is_positive());
+        assert!(empty.grid_input_blocked.is_some());
+    }
+}
+
+#[test]
 fn grid_drop_858_real_app_pass_records_folder_paths_in_both_views() {
     use crate::settings::GridViewMode::{Details, Thumbnail};
     for view in [Thumbnail, Details] {

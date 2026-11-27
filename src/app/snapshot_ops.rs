@@ -930,6 +930,15 @@ impl App {
             self.show_feedback_warning("固定する items がありません".into());
             return;
         }
+        let continue_local = self.local_page_edit_survives_items_adoption(
+            self.visible_indices
+                .iter()
+                .copied()
+                .filter(|idx| self.direct_media_basis_allows_index(*idx))
+                .filter_map(|idx| self.items.get(idx))
+                .filter(|item| snapshot_key_from_grid_item(item).is_some()),
+        );
+        self.end_page_edit_tools_for_item_adoption("snapshot_activate", continue_local);
         self.normalize_direct_media_basis_for_snapshot();
         let accepted_policy = self.page_identity_index.policy.clone();
         let source_had_exact_page_edits = self.page_edit_snapshot.is_some();
@@ -1340,6 +1349,13 @@ impl App {
     /// origin と一致する場合のみ復元、不一致の場合は current_folder の通常 reload を
     /// 行う (= snapshot state を捨てるだけ)。
     pub(crate) fn deactivate_snapshot(&mut self) {
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            let continue_local = self.current_folder.as_ref().is_some_and(|path| {
+                snapshot_key_from_path(path) == snapshot_key_from_path(&snapshot.origin)
+            }) && snapshot.pre_snapshot_search_origin.is_none()
+                && self.local_page_edit_survives_items_adoption(&snapshot.saved_items);
+            self.end_page_edit_tools_for_item_adoption("snapshot_deactivate", continue_local);
+        }
         let Some(snap) = self.snapshot.take() else {
             return;
         };

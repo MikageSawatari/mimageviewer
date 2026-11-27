@@ -720,6 +720,15 @@ mod image_folder_zip_operation;
 pub(crate) use book_composition_editor::CompositionEditorCloseReason;
 pub(crate) mod canvas_gesture;
 pub(crate) mod normalize;
+pub(crate) mod page_edit_admission;
+#[cfg(test)]
+#[path = "app/page_edit_grid_tests.rs"]
+mod page_edit_grid_tests;
+mod page_edit_item_adoption;
+pub(crate) mod page_edit_item_change;
+#[cfg(test)]
+#[path = "app/page_edit_non_grid_tests.rs"]
+mod page_edit_non_grid_tests;
 mod page_edit_owner;
 mod page_edit_pivot;
 use page_edit_pivot::LocalPageEditSpreadPivot;
@@ -47377,6 +47386,7 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
         refresh_container_metadata: bool,
     ) {
+        self.end_page_edit_tools_before_items_adoption("install_new_items", &items);
         self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
         self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
         debug_assert_eq!(items.len(), image_metas.len());
@@ -50519,6 +50529,7 @@ impl App {
         if sorted_desc_idxs.is_empty() {
             return;
         }
+        self.end_page_edit_tools_before_item_removal(sorted_desc_idxs);
         self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
         self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
         self.remove_smart_folder_rating_masks(sorted_desc_idxs);
@@ -61141,6 +61152,20 @@ impl App {
         browser_forward_count: crate::MouseNavPresses,
         block: crate::filename_stack_ui::GridItemInputBlock,
     ) -> Option<crate::ui_main::AddressBarNav> {
+        if block == crate::filename_stack_ui::GridItemInputBlock::DetachedViewerEditing {
+            self.notify_detached_viewer_editing_grid_key_input(ctx);
+            if main_has_focus
+                && (browser_back_count.count > 0
+                    || browser_forward_count.count > 0
+                    || ctx.input(|input| {
+                        input.pointer.button_pressed(egui::PointerButton::Extra1)
+                            || input.pointer.button_pressed(egui::PointerButton::Extra2)
+                    }))
+            {
+                self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+            }
+            return None;
+        }
         let (mouse_back, mouse_forward) = ctx.input(|input| {
             (
                 main_has_focus && input.pointer.button_pressed(egui::PointerButton::Extra1),
@@ -61341,6 +61366,20 @@ impl App {
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::mark_action_pass_eligible(ctx);
 
+        if self.detached_viewer_editing_blocks_grid_input() {
+            self.notify_detached_viewer_editing_grid_key_input(ctx);
+            if main_has_focus
+                && (browser_back_count.count > 0
+                    || browser_forward_count.count > 0
+                    || ctx.input(|input| {
+                        input.pointer.button_pressed(egui::PointerButton::Extra1)
+                            || input.pointer.button_pressed(egui::PointerButton::Extra2)
+                    }))
+            {
+                self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+            }
+            return None;
+        }
         if let Some(nav) = self.handle_folder_pane_keyboard(ctx) {
             return Some(nav);
         }
@@ -66543,7 +66582,7 @@ impl App {
             && matches!(self.viewer_presentation, ViewerPresentation::DetachedWindow)
     }
 
-    fn current_viewer_session_is_detached_or_switching(&self) -> bool {
+    pub(crate) fn current_viewer_session_is_detached_or_switching(&self) -> bool {
         if self.viewer_session_is_detached() {
             return true;
         }
@@ -75161,8 +75200,13 @@ impl App {
             crate::logger::log("remote_ipc: rejected fullscreen open outside Local phase");
             return ActionAdmission::Rejected;
         }
-        if !self.grid_item_input_allowed() {
+        if self.grid_item_input_block().is_some_and(|block| {
+            block != crate::filename_stack_ui::GridItemInputBlock::DetachedViewerEditing
+        }) {
             return ActionAdmission::Rejected;
+        }
+        if self.fullscreen_idx.is_some_and(|current| current != idx) {
+            self.end_page_edit_tools_for_viewer_item_change("fullscreen_open");
         }
         if boundary == FsMetadataBoundary::Manual {
             self.finish_rating_picker_for_manual_navigation();
@@ -86055,31 +86099,23 @@ impl App {
     /// Existing foreground-editor exit boundary, shared by close and Rating re-adoption.
     /// The caller finishes local gestures and chooses the metadata Undo policy first.
     fn finish_fullscreen_edit_modes(&mut self) {
+        self.finish_fullscreen_edit_modes_with_preview(
+            page_edit_item_change::LocalAdjustmentExitPreview::CacheCurrent,
+        );
+    }
+
+    fn finish_fullscreen_edit_modes_with_preview(
+        &mut self,
+        preview: page_edit_item_change::LocalAdjustmentExitPreview,
+    ) {
         self.fold_local_adjust_edit_state();
-        self.reset_erase_mode();
-        self.reset_conceal_mode();
-        // テキストモードもフルスクリーン解除時に保存して閉じる (Codex P1: 閉じ経路で
-        // text_mode がリークすると次回フルスクリーンで通常ショートカットが効かなくなり、
-        // 編集も保存されない)。reset_conceal_mode と同じくこの時点では fullscreen_idx が
-        // まだ有効なので save_comic_objects が正しいページに効く。export_crop と同じ理由で
-        // spread_ctx は復元せず破棄する (close は fullscreen_idx=None を維持するため)。
-        self.text_spread_ctx = None;
-        self.reset_text_mode();
-        // close は fullscreen_idx=None を維持する。spread_ctx を残すと
-        // reset_export_crop_mode が fullscreen_idx を旧ページへ復元してしまい、
-        // フォルダロード経路 (start_loading_items→close_fullscreen) で stale な
-        // fullscreen idx を引き継ぐため、復元せず破棄する (Codex P1)。
-        self.export_crop_spread_ctx = None;
-        self.reset_export_crop_mode();
-        // SNS 分割も一度きりの foreground editor。close では旧ページを復元せず、
-        // layout / drag と一緒に pivot を破棄する。
-        self.sns_split_spread_ctx = None;
-        self.reset_sns_split_mode();
+        if self.page_edit_tools_owned_by_projected_context() {
+            self.end_page_edit_tools_for_fullscreen_exit(preview);
+        }
         self.persist_pending_view_trim_state();
         self.view_trim_mode = false;
         self.view_trim_page_apply_root_idx = None;
         self.view_trim_page_spread_separate = self.view_trim_book_settings.spread_separate;
-        self.local_adjust_mode = false;
         self.local_adjust_repair_point_pick_active = None;
         self.local_adjust_add_layer_dialog_open = false;
         self.local_adjust_change_mask_dialog_open = false;
@@ -86101,12 +86137,16 @@ impl App {
         self.clear_fs_initial_placement_request();
         self.fs_page_scroll_animation = None;
         self.fs_automatic_initial_view = None;
-        self.cancel_original_material_entry_intents(None);
+        if self.page_edit_tools_owned_by_projected_context() {
+            self.cancel_original_material_entry_intents(None);
+        }
         self.pending_fs_page_turn_ready = None;
         self.page_turn_presentation.deactivate("closed");
         // A pending editor commit may push a discarded entry and clear Redo. Only stable
         // rating history crosses an automatic close, before any fold/reset can touch it.
-        let rating_history = if boundary == FsMetadataBoundary::RatingMembership {
+        let rating_history = if self.page_edit_tools_owned_by_projected_context()
+            && boundary == FsMetadataBoundary::RatingMembership
+        {
             self.meta_undo.retain_rating();
             Some(std::mem::take(&mut self.meta_undo))
         } else {
@@ -86137,6 +86177,12 @@ impl App {
         let edit_preview_close_update = self
             .fullscreen_idx
             .and_then(|idx| self.snapshot_edit_preview_close_update(idx));
+        if boundary == FsMetadataBoundary::Manual {
+            self.restore_grid_cursor_to_fullscreen_item();
+        }
+        self.finish_fullscreen_edit_modes_with_preview(
+            page_edit_item_change::LocalAdjustmentExitPreview::FullscreenCloseOwnsSnapshot,
+        );
         self.cancel_media_navigation_pending_for_current_context("close_fullscreen");
         // 表示モード / フィットのポップアップを開いたまま抜けると、次回フルスクリーンで
         // メニューが残り、カーソル自動非表示やページ送りの抑制が効いたままになるため解除する。
@@ -86203,9 +86249,6 @@ impl App {
             for idx in fs_idxs {
                 self.cleanup_normalize_state_for_fs_idx(idx);
             }
-        }
-        if boundary == FsMetadataBoundary::Manual {
-            self.restore_grid_cursor_to_fullscreen_item();
         }
         #[cfg(windows)]
         self.prepare_viewer_presentation_close();
@@ -86448,12 +86491,14 @@ impl App {
         //   `fs_nav_holdover_for_draw` が別途判定する。
         // PDF pool の Critical 予約は v1.0.0 から常時 ON 方針なので、ここで切替えない。
         // フルスクリーン中の Undo スタックはここで破棄。グリッドに戻ったら新しい操作を積む。
-        if let FsMetadataBoundary::BookAppend(operation_id) = boundary {
-            self.clear_meta_undo_preserving_book_append(operation_id);
-        } else if boundary == FsMetadataBoundary::RatingMembership {
-            self.clear_meta_undo_for_rating_move();
-        } else {
-            self.clear_meta_undo();
+        if self.page_edit_tools_owned_by_projected_context() {
+            if let FsMetadataBoundary::BookAppend(operation_id) = boundary {
+                self.clear_meta_undo_preserving_book_append(operation_id);
+            } else if boundary == FsMetadataBoundary::RatingMembership {
+                self.clear_meta_undo_for_rating_move();
+            } else {
+                self.clear_meta_undo();
+            }
         }
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
@@ -86528,7 +86573,6 @@ impl App {
             // (review-v2.3.0 追補2 BA-7)。
             self.clear_mounted_native_video_pending();
         }
-        self.finish_fullscreen_edit_modes();
         self.enqueue_edit_preview_close_update(edit_preview_close_update);
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
@@ -88534,6 +88578,8 @@ impl App {
                 crop,
             } => {
                 observation.emit(self.input_seq);
+                #[cfg(test)]
+                page_edit_item_change::record_edit_preview_save_for_test();
                 service.save(
                     observation.item_key,
                     source_mtime,
