@@ -6,6 +6,7 @@
 #include "plugin_loader.h"
 #include "now_playing_notify.h"
 #include "utf8_paths.h"
+#include "gui_task_queue.h"
 
 #include <algorithm>
 #include <atomic>
@@ -34,6 +35,7 @@ void send_event_gui_user_hidden(uint64_t slot_id, uint64_t container_hwnd, const
 void send_event_gui_normal_rect(uint64_t slot_id, uint64_t container_hwnd, const NormalScreenRect& normal);
 void send_event_gui_warning(uint64_t slot_id, uint64_t container_hwnd, const std::string& detail);
 void send_event_gui_bypass_toggle(uint64_t slot_id);
+void send_event_sound_lock_released(uint64_t slot_id, const std::string& lock, const char* by);
 }
 
 namespace {
@@ -245,6 +247,18 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         }
     }
     auto* loader = reinterpret_cast<miv::PluginLoader*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (loader && loader->sound_locked()) {
+        if (msg == WM_SETFOCUS) {
+            loader->focus_sound_lock_overlay();
+            return 0;
+        }
+        if (msg == WM_ACTIVATE && LOWORD(wparam) != WA_INACTIVE)
+            loader->focus_sound_lock_overlay();
+        if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) {
+            loader->blink_sound_lock_overlay();
+            loader->focus_sound_lock_overlay();
+        }
+    }
     if (msg == kBridgeResizePluginClientMsg) {
         resize_frame_for_plugin_client(hwnd,
                                        static_cast<int>(wparam),
@@ -277,6 +291,7 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         // Keep the plugin's logical size, then apply its constraints through the
         // same sizing path; the native caption/status band are counted once.
         if (loader) loader->handle_editor_dpi_change(HIWORD(wparam), reinterpret_cast<RECT*>(lparam));
+        if (loader) loader->layout_sound_lock_overlay();
         return 0;
     }
     if (msg == WM_SIZE && wparam != SIZE_MINIMIZED) {
@@ -284,6 +299,7 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
             layout_editor_child(hwnd, reinterpret_cast<HWND>(loader->gui_plugin_host_hwnd()));
             loader->handle_editor_drag_tick(msg);
             loader->handle_editor_window_size();
+            loader->layout_sound_lock_overlay();
         }
         RedrawWindow(hwnd,
                      nullptr,
@@ -759,10 +775,7 @@ private:
     }
 
     void post_task(std::function<void()> fn) {
-        {
-            std::lock_guard<std::mutex> lk(queue_mutex_);
-            tasks_.push_back(std::move(fn));
-        }
+        tasks_.push(std::move(fn));
         DWORD tid = thread_id_.load(std::memory_order_acquire);
         if (tid != 0) {
             PostThreadMessageW(tid, kPluginGuiThreadTaskMsg, 0, 0);
@@ -770,18 +783,7 @@ private:
     }
 
     void drain_tasks() {
-        for (;;) {
-            std::function<void()> task;
-            {
-                std::lock_guard<std::mutex> lk(queue_mutex_);
-                if (tasks_.empty()) {
-                    break;
-                }
-                task = std::move(tasks_.front());
-                tasks_.pop_front();
-            }
-            task();
-        }
+        tasks_.drain();
     }
 
     void thread_main() {
@@ -809,9 +811,13 @@ private:
                 drain_tasks();
                 continue;
             }
-            TranslateMessage(&msg);
             const ULONGLONG dispatch_started = GetTickCount64();
-            DispatchMessageW(&msg);
+            tasks_.dispatch_outer([&msg] {
+                if (!SoundLockOverlay::translate(msg)) {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            });
             const ULONGLONG dispatch_elapsed = GetTickCount64() - dispatch_started;
             if (dispatch_elapsed >= 100 && msg.message != WM_NCLBUTTONDOWN) {
                 blog("slow plugin GUI DispatchMessageW gui_tid=%lu msg=0x%X hwnd=0x%llx elapsed_ms=%llu",
@@ -878,8 +884,7 @@ private:
     std::mutex start_mutex_;
     std::condition_variable start_cv_;
     bool ready_ = false;
-    std::mutex queue_mutex_;
-    std::deque<std::function<void()>> tasks_;
+    GuiTaskQueue tasks_;
 };
 
 struct GuiSizeQueryResult {
@@ -1143,6 +1148,14 @@ bool PluginLoader::load(const std::string& plugin_path,
 
             info_out.plugin_name = info.name();
             plugin_name_ = info_out.plugin_name;
+            if (plugin_name_ == "mIV Sound" && !SoundPresetFile::environment_directory().empty()) {
+                sound_presets_ = std::make_unique<SoundPresetFile>(SoundPresetFile::environment_directory());
+                sound_lock_ = std::make_unique<SoundLock>(static_cast<SoundPlugin&>(*this), *sound_presets_, [] {
+                    static std::atomic<uint64_t> sequence{0};
+                    return std::to_string(GetCurrentProcessId()) + ":" +
+                        std::to_string(GetTickCount64()) + ":" + std::to_string(++sequence);
+                });
+            }
             break;
         }
     }
@@ -1590,6 +1603,7 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
     view_plugin_host_hwnd_ = attach_hwnd;
     editor_slot_id_ = options.slot_id;
     view_container_hwnd_snapshot_.store(frame_hwnd, std::memory_order_release);
+    show_lock(sound_locked());
     if (options.unowned) gui_taskbar_ = std::make_unique<EditorTaskbar>(frame_hwnd, options.show_in_taskbar);
     blog("show_gui: attached ok");
 
@@ -2360,6 +2374,7 @@ void PluginLoader::hide_gui() {
     }
 
     publish_gui_normal_rect();
+    sound_overlay_.reset();
     if (view_attached_ && view_) {
         view_->removed();
         view_->setFrame(nullptr);
@@ -2480,6 +2495,64 @@ void PluginLoader::query_state_concurrent(
         }
         complete(ok, std::move(bytes));
     });
+}
+
+bool PluginLoader::eligible() const {
+    return component_ && plugin_name_ == "mIV Sound" && sound_presets_;
+}
+
+bool PluginLoader::set(const SoundBytes& bytes) {
+    // mIV Sound's state replacement is explicitly GUI-thread safe alongside
+    // process(). Do not route this through generic restore_state's audio pause.
+    if (!is_gui_thread() || !eligible() || bytes.empty() || bytes.size() >= 4 * 1024 * 1024)
+        return false;
+    Steinberg::MemoryStream stream;
+    Steinberg::int32 written = 0;
+    if (stream.write(const_cast<uint8_t*>(bytes.data()), static_cast<Steinberg::int32>(bytes.size()),
+                     &written) != Steinberg::kResultOk || size_t(written) != bytes.size() ||
+        stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr) != Steinberg::kResultOk)
+        return false;
+    if (component_->setState(&stream) != Steinberg::kResultOk) return false;
+    if (controller_ && stream.seek(0, Steinberg::IBStream::kIBSeekSet, nullptr) == Steinberg::kResultOk)
+        controller_->setComponentState(&stream);
+    return true;
+}
+
+void PluginLoader::show_lock(bool locked) {
+    auto frame = static_cast<HWND>(view_container_hwnd_);
+    auto child = static_cast<HWND>(view_plugin_host_hwnd_);
+    if (plugin_name_ != "mIV Sound") return;
+    if (!locked) sound_overlay_.reset();
+    apply_sound_lock_window(frame, child, locked);
+    if (locked && frame && IsWindow(frame)) {
+        if (!sound_overlay_)
+            sound_overlay_ = std::make_unique<SoundLockOverlay>(frame, [this] { sound_user_unlock(); });
+        sound_overlay_->layout();
+        if (GetActiveWindow() == frame || GetFocus() == frame) sound_overlay_->focus();
+    }
+}
+
+void PluginLoader::layout_sound_lock_overlay() { if (sound_overlay_) sound_overlay_->layout(); }
+void PluginLoader::focus_sound_lock_overlay() { if (sound_overlay_) sound_overlay_->focus(); }
+void PluginLoader::blink_sound_lock_overlay() { if (sound_overlay_) sound_overlay_->blink(); }
+
+void PluginLoader::sound_command(SoundRequest request, std::function<void(SoundReply)> complete) {
+    gui_thread().post_async([this, request = std::move(request), complete = std::move(complete)]() mutable {
+        SoundReply result;
+        result.status = "Rejected";
+        try {
+            if (sound_lock_) result = sound_lock_->execute(request);
+        } catch (...) {
+            blog("sound command rejected after plugin exception command=%s", request.command.c_str());
+        }
+        complete(std::move(result)); // request-ID reply only after the GUI transaction.
+    });
+}
+
+void PluginLoader::sound_user_unlock() {
+    if (!is_gui_thread() || !sound_lock_) return;
+    if (auto token = sound_lock_->release())
+        send_event_sound_lock_released(0, *token, "user");
 }
 
 bool PluginLoader::restore_state(const std::vector<uint8_t>& bytes) {
@@ -2625,6 +2698,12 @@ void PluginLoader::unload() {
         return;
     }
 
+    if (sound_lock_) {
+        if (auto token = sound_lock_->release())
+            send_event_sound_lock_released(0, *token, "host_exit");
+        sound_lock_.reset();
+        sound_presets_.reset();
+    }
     // GUI が出ていれば先に外す (順序逆だとプラグインが crash することがある)
     hide_gui();
     if (active_ && processor_) {

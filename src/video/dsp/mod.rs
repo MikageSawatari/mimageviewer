@@ -1641,6 +1641,45 @@ impl DspBridge {
         bridge.query_state_concurrent(slot_id)
     }
 
+    /// Only the controller's serial worker sends sound commands. Copy the host
+    /// handle under the metadata lock, then release it before pipe I/O/waits.
+    pub(crate) fn sound_request(
+        &self,
+        command: bridge::SoundCommand,
+    ) -> Result<
+        crossbeam_channel::Receiver<Result<bridge::SoundReply, bridge::ConcurrentStateError>>,
+        bridge::ConcurrentStateError,
+    > {
+        let (host, slot_id) = {
+            let inner = self.inner.lock().unwrap();
+            let slot = inner
+                .slots
+                .first()
+                .ok_or(bridge::ConcurrentStateError::HostExited)?;
+            (Arc::clone(&slot.bridge), slot.slot_id)
+        };
+        host.sound_request(slot_id, command)
+    }
+
+    pub(crate) fn sound_locked(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .slots
+            .first()
+            .is_some_and(|slot| slot.bridge.sound_locked())
+    }
+
+    pub(crate) fn poll_sound_release(&self) -> Option<bridge::SoundLockRelease> {
+        self.inner
+            .lock()
+            .unwrap()
+            .slots
+            .first()?
+            .bridge
+            .poll_sound_release()
+    }
+
     pub fn host_exit_code_after(&self, timeout: Duration) -> Option<u32> {
         let host = self
             .inner

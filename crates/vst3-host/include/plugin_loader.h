@@ -19,6 +19,7 @@
 #include "gui_visibility.h"
 #include "gui_frame.h"
 #include "now_playing.h"
+#include "sound_lock.h"
 #include "host_app.h"  // PlugFrame, HostApplication, ComponentHandler の完全型
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -70,7 +71,7 @@ struct GuiWindowOptions {
     std::string title;
 };
 
-class PluginLoader {
+class PluginLoader : private SoundPlugin {
 public:
     PluginLoader();
     ~PluginLoader();
@@ -244,6 +245,13 @@ public:
         std::function<bool()> begin,
         std::function<void(bool, std::vector<uint8_t>)> complete);
 
+    void sound_command(SoundRequest request, std::function<void(SoundReply)> complete);
+    bool sound_locked() const { return sound_lock_ && sound_lock_->locked(); }
+    void sound_user_unlock();
+    void layout_sound_lock_overlay();
+    void focus_sound_lock_overlay();
+    void blink_sound_lock_overlay();
+
     void post_now_playing(std::shared_ptr<NowPlayingMailbox> mailbox,
                           std::function<void(std::shared_ptr<NowPlayingMailbox>)> wake);
     void post_playback_position(std::shared_ptr<PlaybackPositionMailbox> mailbox,
@@ -256,6 +264,13 @@ public:
     bool restore_state(const std::vector<uint8_t>& bytes);
 
 private:
+    bool eligible() const override;
+    bool get(SoundBytes& bytes) override { return query_state(bytes); }
+    bool set(const SoundBytes& bytes) override;
+    void show_lock(bool locked) override;
+    std::unique_ptr<SoundPresetFile> sound_presets_;
+    std::unique_ptr<SoundLock> sound_lock_;
+    std::unique_ptr<SoundLockOverlay> sound_overlay_;
     PluginGuiThread& gui_thread();
     bool is_gui_thread() const;
     void quarantine_editor(const char* reason);

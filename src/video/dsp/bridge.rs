@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[path = "forced_termination.rs"]
@@ -44,7 +44,8 @@ use windows::core::{HSTRING, PCWSTR};
 // v6: bounded, fire-and-forget Now Playing snapshots.
 // v7: frame-scoped GUI close/normal geometry and taskbar presentation commands.
 // v8: 試作の歌詞・曲の世代・再生位置通知。
-pub const PROTOCOL_VERSION: u32 = 8;
+// v9: GUI-owned mIV Sound editing lock, state replacement, undo and preset commit.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 pub(crate) fn require_current_protocol(reported: u32) -> Result<(), String> {
     if reported == PROTOCOL_VERSION {
@@ -322,6 +323,13 @@ pub enum Event {
         #[serde(default)]
         resizable: bool,
     },
+    SoundLock(SoundReply),
+    SoundUnlock(SoundReply),
+    SoundGet(SoundReply),
+    SoundReplaceLocked(SoundReply),
+    SoundUndoLocked(SoundReply),
+    SoundPresetCommit(SoundReply),
+    SoundLockReleased(SoundLockRelease),
     /// `Cmd::QueryState` の応答。プラグイン内部状態を base64 文字列で受け取る。
     PluginState {
         state: String,
@@ -332,6 +340,138 @@ pub enum Event {
         #[serde(default)]
         error: Option<String>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum SoundPresetGuard {
+    Epoch { epoch: u64 },
+    Absent(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SoundReply {
+    pub request_id: u64,
+    pub slot_id: u64,
+    pub status: String,
+    #[serde(default)]
+    pub lock: Option<String>,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub guard: Option<SoundPresetGuard>,
+}
+
+impl SoundReply {
+    pub fn revision(&self) -> Option<String> {
+        self.lock
+            .as_ref()
+            .map(|lock| format!("{lock}:{}", self.generation))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct SoundLockRelease {
+    pub slot_id: u64,
+    pub lock: String,
+    pub by: String,
+}
+
+/// All commands are executed by the host GUI owner. No audio fence is used.
+#[derive(Clone, Debug)]
+pub enum SoundCommand {
+    Lock,
+    Unlock {
+        lock: String,
+    },
+    Get,
+    Replace {
+        lock: String,
+        generation: u64,
+        state: String,
+    },
+    Undo {
+        lock: String,
+    },
+    PresetCommit {
+        lock: String,
+        generation: u64,
+        guard: SoundPresetGuard,
+    },
+}
+
+impl SoundCommand {
+    fn wire(&self, slot_id: u64, request_id: u64) -> serde_json::Value {
+        use serde_json::json;
+        let mut value = match self {
+            Self::Lock => json!({"cmd":"sound_lock"}),
+            Self::Unlock { lock } => json!({"cmd":"sound_unlock", "lock":lock}),
+            Self::Get => json!({"cmd":"sound_get"}),
+            Self::Replace {
+                lock,
+                generation,
+                state,
+            } => {
+                json!({"cmd":"sound_replace_locked", "lock":lock,"generation":generation,"state":state})
+            }
+            Self::Undo { lock } => json!({"cmd":"sound_undo_locked", "lock":lock}),
+            Self::PresetCommit {
+                lock,
+                generation,
+                guard,
+            } => {
+                json!({"cmd":"sound_preset_commit", "lock":lock,"generation":generation,"guard":guard})
+            }
+        };
+        value["slot_id"] = json!(slot_id);
+        value["request_id"] = json!(request_id);
+        value
+    }
+}
+
+type PendingSoundRequests =
+    Arc<Mutex<HashMap<u64, crossbeam_channel::Sender<Result<SoundReply, ConcurrentStateError>>>>>;
+
+fn finish_pending_sound(pending: &PendingSoundRequests, error: ConcurrentStateError) {
+    for (_, reply) in pending.lock().unwrap().drain() {
+        let _ = reply.try_send(Err(error.clone()));
+    }
+}
+
+fn route_sound_event(
+    event: &Event,
+    pending: &PendingSoundRequests,
+    released: &crossbeam_channel::Sender<SoundLockRelease>,
+    locked: &AtomicBool,
+    wake: Option<&GuiSignalWake>,
+) -> bool {
+    let reply = match event {
+        Event::SoundLock(reply)
+        | Event::SoundUnlock(reply)
+        | Event::SoundGet(reply)
+        | Event::SoundReplaceLocked(reply)
+        | Event::SoundUndoLocked(reply)
+        | Event::SoundPresetCommit(reply) => reply,
+        Event::SoundLockReleased(release) => {
+            locked.store(false, Ordering::Release);
+            let _ = released.send(release.clone());
+            if let Some(wake) = wake {
+                wake();
+            }
+            return true;
+        }
+        _ => return false,
+    };
+    locked.store(reply.lock.is_some(), Ordering::Release);
+    if let Some(tx) = pending.lock().unwrap().remove(&reply.request_id) {
+        let _ = tx.try_send(Ok(reply.clone()));
+    }
+    if let Some(wake) = wake {
+        wake();
+    }
+    true
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -554,6 +694,10 @@ pub struct Bridge {
     next_request_id: AtomicU64,
     pending_state_queries: PendingStateQueries,
     pending_gui_requests: PendingGuiRequests,
+    pending_sound_requests: PendingSoundRequests,
+    sound_released_rx: crossbeam_channel::Receiver<SoundLockRelease>,
+    sound_locked: Arc<AtomicBool>,
+    sound_transport_closed: Arc<AtomicBool>,
     #[cfg(windows)]
     shm: Option<SharedMemory>,
     #[cfg(windows)]
@@ -645,6 +789,10 @@ fn route_gui_event(
 #[cfg(test)]
 #[path = "fake_transport.rs"]
 mod fake_transport;
+
+#[cfg(test)]
+#[path = "sound_bridge_tests.rs"]
+mod sound_bridge_tests;
 
 #[cfg(windows)]
 struct SharedMemory {
@@ -806,6 +954,13 @@ impl Bridge {
         let pending_state_queries_for_pump = Arc::clone(&pending_state_queries);
         let pending_gui_requests: PendingGuiRequests = Arc::new(Mutex::new(HashMap::new()));
         let pending_gui_for_pump = Arc::clone(&pending_gui_requests);
+        let pending_sound_requests: PendingSoundRequests = Arc::new(Mutex::new(HashMap::new()));
+        let pending_sound_for_pump = Arc::clone(&pending_sound_requests);
+        let (sound_released_tx, sound_released_rx) = crossbeam_channel::unbounded();
+        let sound_locked = Arc::new(AtomicBool::new(false));
+        let sound_locked_for_pump = Arc::clone(&sound_locked);
+        let sound_transport_closed = Arc::new(AtomicBool::new(false));
+        let sound_closed_for_pump = Arc::clone(&sound_transport_closed);
         let cached_latency_for_pump = cached_latency.clone();
         let cached_latency_by_slot_for_pump = cached_latency_by_slot.clone();
         std::thread::Builder::new()
@@ -863,6 +1018,10 @@ impl Bridge {
                             );
                         }
                         Ok(other) => {
+                            if route_sound_event(&other, &pending_sound_for_pump, &sound_released_tx,
+                                &sound_locked_for_pump, gui_signal_wake.as_ref()) {
+                                continue;
+                            }
                             // Loaded を受信したら cached_latency にも反映する
                             // (= 起動直後は LatencyChanged 通知が来ないプラグインに対応)
                             if let Event::Loaded {
@@ -897,12 +1056,18 @@ impl Bridge {
                                 &pending_state_queries_for_pump,
                                 query_error.clone(),
                             );
-                            finish_pending_gui_requests(&pending_gui_for_pump, query_error);
+                            finish_pending_gui_requests(&pending_gui_for_pump, query_error.clone());
+                            sound_closed_for_pump.store(true, Ordering::Release);
+                            sound_locked_for_pump.store(false, Ordering::Release);
+                            finish_pending_sound(&pending_sound_for_pump, query_error);
                             let _ = event_tx.send(Err(e));
                             break;  // EOF or error
                         }
                     }
                 }
+                sound_closed_for_pump.store(true, Ordering::Release);
+                sound_locked_for_pump.store(false, Ordering::Release);
+                finish_pending_sound(&pending_sound_for_pump, ConcurrentStateError::HostExited);
             })
             .ok();
 
@@ -932,6 +1097,10 @@ impl Bridge {
             next_request_id: AtomicU64::new(0),
             pending_state_queries,
             pending_gui_requests,
+            pending_sound_requests,
+            sound_released_rx,
+            sound_locked,
+            sound_transport_closed,
             #[cfg(windows)]
             shm: None,
             #[cfg(windows)]
@@ -1186,6 +1355,39 @@ impl Bridge {
         Ok(reply_rx)
     }
 
+    /// Worker-only. The caller's deadline never cancels a host operation.
+    pub fn sound_request(
+        &self,
+        slot_id: u64,
+        command: SoundCommand,
+    ) -> Result<
+        crossbeam_channel::Receiver<Result<SoundReply, ConcurrentStateError>>,
+        ConcurrentStateError,
+    > {
+        let id = self.next_request_id.fetch_add(1, Ordering::AcqRel) + 1;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        {
+            let mut pending = self.pending_sound_requests.lock().unwrap();
+            if self.sound_transport_closed.load(Ordering::Acquire) {
+                return Err(ConcurrentStateError::HostExited);
+            }
+            pending.insert(id, tx);
+        }
+        if self.send_value(&command.wire(slot_id, id)).is_err() {
+            self.pending_sound_requests.lock().unwrap().remove(&id);
+            return Err(ConcurrentStateError::HostExited);
+        }
+        Ok(rx)
+    }
+
+    pub fn sound_locked(&self) -> bool {
+        self.sound_locked.load(Ordering::Acquire)
+    }
+
+    pub fn poll_sound_release(&self) -> Option<SoundLockRelease> {
+        self.sound_released_rx.try_recv().ok()
+    }
+
     /// Worker-only; the pipe write is not a successful presentation outcome.
     pub fn set_gui_visibility_checked(
         &self,
@@ -1231,6 +1433,12 @@ impl Bridge {
     }
 
     pub fn abort_state_queries(&self) {
+        self.sound_transport_closed.store(true, Ordering::Release);
+        self.sound_locked.store(false, Ordering::Release);
+        finish_pending_sound(
+            &self.pending_sound_requests,
+            ConcurrentStateError::HostExited,
+        );
         finish_pending_gui_requests(
             &self.pending_gui_requests,
             ConcurrentStateError::Interrupted("bridge shutting down".into()),
@@ -1780,7 +1988,7 @@ mod concurrent_state_tests {
     use super::*;
 
     #[test]
-    fn protocol_handshake_rejects_v7_ready_before_any_audio_or_gui_command() {
+    fn protocol_handshake_rejects_v8_ready_before_any_audio_or_gui_command() {
         let (bridge, commands, events) = Bridge::fake_host_for_test();
         bridge
             .send(&Cmd::Hello {
@@ -1792,12 +2000,12 @@ mod concurrent_state_tests {
             .unwrap();
         assert_eq!(hello["cmd"], "hello");
         assert_eq!(hello["version"], PROTOCOL_VERSION);
-        events.emit(Event::Ready { version: 7 });
+        events.emit(Event::Ready { version: 8 });
         let Event::Ready { version } = bridge.recv().unwrap() else {
             panic!("fake legacy host must reply Ready")
         };
         let error = require_current_protocol(version).unwrap_err();
-        assert!(error.contains("bridge reported 7"));
+        assert!(error.contains("bridge reported 8"));
         assert!(
             commands.try_recv().is_err(),
             "rejected peer must not receive open or show_gui"

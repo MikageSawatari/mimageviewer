@@ -23,6 +23,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[path = "../config/miv-sound.rs"]
 pub(crate) mod miv_sound_config;
+pub mod sound_effects;
 
 #[cfg(test)]
 mod diagnostic_entry_tests;

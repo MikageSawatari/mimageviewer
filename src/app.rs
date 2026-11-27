@@ -34276,7 +34276,12 @@ impl App {
                 format!("音響調整は停止しました: {}", reason.user_reason())
             }
             EffetuneRuntime::Running { .. } => {
-                crate::effetune::running_gui_tooltip(self.effetune.effective_state())
+                let mut text =
+                    crate::effetune::running_gui_tooltip(self.effetune.effective_state());
+                if self.effetune.sound_locked() {
+                    text.push_str("\nAI が編集中です");
+                }
+                text
             }
         }
     }

@@ -522,6 +522,13 @@ purge lease解放後にStack candidateを読み、同じ削除終端でowner／�
 
 ## EffeTuneのタスクバー設定・通常矩形（§1.378、未リリース）
 
+§1.843 第3段の mIV Sound 編集は `CaptureQueue` の既存 FIFO worker を共有する。
+`SoundRequest` の受付とロード完了の受け渡しは controller、文書検査・bridge 往復・プリセット I/O・変更後の保存は worker が所有する。
+host 側の印・世代・undo・プリセット handle は GUI thread だけが所有し、音声 thread の fence を使わない。
+応答期限で受信を終えても要求を取り消さず、遅い結果も通知・記録・保存する。host 終了では要求 ID の待機を Aborted で閉じる。
+GUI の thread message は起床通知だけとし、入れ子の modal loop が通知を捨てても外側の DispatchMessage の帰りに残りの列を drain する。
+実装はビルド・実行検証待ち。正本は [MCP 設計 §21](mcp-guide-settings-plan.md)。
+
 Preferences OKと起動時は`effetune-host-control`へ設定を配送するだけで、UIはIPCを送信しない。
 workerの一つの最新targetをRegisterBridgeで将来attachへ継承し、作成済みframeは同じhost GUI threadで
 通常caption/exstyleを保ったままITaskbarListへAddTab/DeleteTabする。正当な表示/復元と

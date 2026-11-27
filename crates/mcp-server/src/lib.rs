@@ -6,6 +6,8 @@ mod help_build;
 mod input;
 pub mod pipe;
 mod schema;
+#[path = "../../../src/sound_effects.rs"]
+pub mod sound_effects;
 #[cfg(test)]
 mod tests;
 use base64::{Engine, engine::general_purpose::STANDARD};

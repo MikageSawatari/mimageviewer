@@ -167,6 +167,26 @@ void send_event_error(const std::string& detail) {
     write_message(msg);
 }
 
+void send_event_sound_lock_released(uint64_t slot_id, const std::string& lock, const char* by) {
+    write_message("{\"event\":\"sound_lock_released\",\"slot_id\":" + std::to_string(slot_id) +
+        ",\"lock\":\"" + json_escape(lock) + "\",\"by\":\"" + by + "\"}");
+}
+
+static std::string base64_encode(const std::vector<uint8_t>& bytes);
+static void send_sound_reply(const std::string& command, uint64_t slot, uint64_t request_id,
+                             const SoundReply& result) {
+    std::string guard = "null";
+    if (result.lock && result.guard.kind == SoundGuard::Kind::Absent) guard = "\"absent\"";
+    if (result.lock && result.guard.kind == SoundGuard::Kind::Held)
+        guard = "{\"epoch\":" + std::to_string(result.guard.epoch) + "}";
+    std::string reply = "{\"event\":\"" + command + "\",\"slot_id\":" + std::to_string(slot) +
+        ",\"request_id\":" + std::to_string(request_id) + ",\"status\":\"" + result.status +
+        "\",\"lock\":" + (result.lock ? "\"" + json_escape(*result.lock) + "\"" : "null") +
+        ",\"generation\":" + std::to_string(result.generation) + ",\"guard\":" + guard;
+    if (result.state) reply += ",\"state\":\"" + base64_encode(*result.state) + "\"";
+    write_message(reply + "}");
+}
+
 void send_event_gui_user_hidden(uint64_t slot_id, uint64_t container_hwnd, const std::optional<NormalScreenRect>& normal) {
     std::string msg = "{\"event\":\"gui_user_hidden\",\"slot_id\":" +
                       std::to_string(slot_id) + ",\"container_hwnd\":" + std::to_string(container_hwnd) +
@@ -1192,6 +1212,31 @@ private:
             pending_state_slot_.store(extract_number_field(msg, "slot_id"), std::memory_order_release);
             query_state_pending_.store(true, std::memory_order_release);
             pipe_.wake_input();
+            return true;
+        }
+        if (cmd == "sound_lock" || cmd == "sound_unlock" || cmd == "sound_get" ||
+            cmd == "sound_replace_locked" || cmd == "sound_undo_locked" || cmd == "sound_preset_commit") {
+            const auto slot = extract_number_field(msg, "slot_id");
+            const auto id = extract_number_field(msg, "request_id");
+            SoundRequest request;
+            request.command = cmd;
+            request.lock = extract_string_field(msg, "lock");
+            request.generation = extract_number_field(msg, "generation");
+            request.guard = {SoundGuard::Kind::Unavailable, 0};
+            if (extract_string_field(msg, "guard") == "absent") request.guard = {};
+            else if (msg.find("\"epoch\"") != std::string::npos)
+                request.guard = {SoundGuard::Kind::Held, extract_number_field(msg, "epoch")};
+            PluginLoader* loader = loader_for_message(msg);
+            const bool state_ok = cmd != "sound_replace_locked" ||
+                base64_decode(extract_string_field(msg, "state"), request.state);
+            if (!id || slot != 0 || !loader || !state_ok) {
+                SoundReply rejected; rejected.status = "Rejected";
+                send_sound_reply(cmd, slot, id, rejected);
+                return true;
+            }
+            loader->sound_command(std::move(request), [cmd, slot, id](SoundReply result) {
+                send_sound_reply(cmd, slot, id, result);
+            });
             return true;
         }
         if (cmd == "query_state_concurrent") {
