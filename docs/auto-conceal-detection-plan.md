@@ -1769,3 +1769,14 @@ ui_snapshot 269 件を実行し、失敗は actual close の回帰と App の st
 製品の close の所有条件・detached の述語・viewport 経路・利用者から見た操作・保存形式は変更しない。
 今回も cargo は整形の `cargo fmt` 以外を実行せず、git add / commit も行わない。修正後の検証は設計担当へ引き継ぐ。
 整形・差分の確認: `cargo fmt` (引数なし) と `git diff --check` は終了コード 0。
+
+#### 取り込みの検証と独立レビュー (2026-11-28、設計担当)
+
+- 設計担当が run-heavy 経由で関連テストを実行した。`2fa97266d` で nextest 1074 件 (mask_detect・page_edit_920・page_edit_item_change・
+  detector_catalog・ai::detect・settings_transfer・operation_script_runtime・conceal・ui_erase・about::・viewer_context_registry・
+  history_transition_storage・book_append_undo・prepared_edit・settings::) のうち 1073 件成功、ui_snapshot 269 件成功。
+- 残る 1 件は `history_transition_storage_keeps_app_stack_footprint_bounded` (`size_of::<App>() < 110_000`)。実測 App=110704 で、
+  master `e62893dd1` 単体の 110688 (§1.911 + §1.917) に、このブランチの inline 16 バイトが乗った値。§1.917 側が master で直す。上限は上げていない。
+- 独立実装レビュー (実装者とは別の GPT-6.1 Sol / xhigh、read-only): `d853ec222`・`c119c5402` は指摘なし ACCEPT、
+  `2fa97266d` も指摘なし ACCEPT。detached に触れた範囲 (registry の bundle の Box 交換) は症状パッチではなく所有境界を保つ
+  構造的変更と判断された。本体 lib の全件は master 取り込み後に統括が実行する。実機は取り込み後の版では未確認。
