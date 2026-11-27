@@ -581,13 +581,10 @@ impl App {
                 });
         }
         let mut witnesses = ctx.pointer_button_targets().into_iter();
-        let (events, releases, time) = ctx.input(|input| {
+        let (events, edges, time) = ctx.input(|input| {
             (
                 input.events.clone(),
-                input
-                    .pointer
-                    .released_buttons_with_click_counts()
-                    .collect::<Vec<_>>(),
+                input.pointer.button_edges().collect::<Vec<_>>(),
                 input.time,
             )
         });
@@ -600,7 +597,7 @@ impl App {
                 options.input_options.max_double_click_delay,
             )
         });
-        let mut releases = releases.into_iter();
+        let mut edges = edges.into_iter();
         let mut ordinal = 0;
         enum Diagnostic {
             Continuation(ContinuationGate, String),
@@ -620,7 +617,12 @@ impl App {
                     } else {
                         InputDiscard::TouchCancelled
                     };
-                    resolved.push((Input::Cancel, None, Some(Diagnostic::Discard(reason))));
+                    resolved.push((
+                        Input::Cancel,
+                        None,
+                        Some(Diagnostic::Discard(reason)),
+                        egui::EdgeTime::from(time),
+                    ));
                 }
                 egui::Event::PointerButton {
                     pos,
@@ -638,27 +640,26 @@ impl App {
                             .clear_label_click(GestureReset::PointerWitnessMismatch);
                         return;
                     }
-                    let click = if pressed {
-                        None
-                    } else {
-                        let Some((released_button, click)) = releases.next() else {
-                            self.folder_pane
-                                .clear_label_click(GestureReset::ReleaseWitnessMissing);
-                            return;
-                        };
-                        if released_button != button {
-                            self.folder_pane
-                                .clear_label_click(GestureReset::ReleaseButtonMismatch);
-                            return;
-                        }
-                        click
+                    let Some(button_edge) = edges.next() else {
+                        self.folder_pane
+                            .clear_label_click(GestureReset::ReleaseWitnessMissing);
+                        return;
                     };
+                    if (button_edge.button, button_edge.pressed, button_edge.pos)
+                        != (button, pressed, Some(pos))
+                    {
+                        self.folder_pane
+                            .clear_label_click(GestureReset::ReleaseButtonMismatch);
+                        return;
+                    }
+                    let click = button_edge.click;
                     if button != egui::PointerButton::Primary {
                         if pressed {
                             resolved.push((
                                 Input::Cancel,
                                 None,
                                 Some(Diagnostic::Discard(InputDiscard::NonPrimaryButton)),
+                                button_edge.time,
                             ));
                         } else {
                             self.folder_pane.log_label_input_discard(
@@ -683,7 +684,12 @@ impl App {
                         } else {
                             InputDiscard::SuppressedPointerEdge
                         };
-                        resolved.push((Input::Cancel, None, Some(Diagnostic::Discard(reason))));
+                        resolved.push((
+                            Input::Cancel,
+                            None,
+                            Some(Diagnostic::Discard(reason)),
+                            button_edge.time,
+                        ));
                         continue;
                     }
                     let source = if edge.touch_derived {
@@ -768,6 +774,7 @@ impl App {
                             },
                             widget,
                             diagnostic,
+                            button_edge.time,
                         ));
                     } else {
                         resolved.push((
@@ -779,6 +786,7 @@ impl App {
                             },
                             widget,
                             None,
+                            button_edge.time,
                         ));
                     }
                 }
@@ -787,12 +795,12 @@ impl App {
                 _ => {}
             }
         }
-        if witnesses.next().is_some() || releases.next().is_some() {
+        if witnesses.next().is_some() || edges.next().is_some() {
             self.folder_pane
                 .clear_label_click(GestureReset::ExtraPointerOrReleaseWitness);
             return;
         }
-        for (event, widget, diagnostic) in resolved {
+        for (event, widget, diagnostic, at) in resolved {
             match diagnostic {
                 Some(Diagnostic::Continuation(reason, details)) => {
                     self.folder_pane
@@ -806,7 +814,7 @@ impl App {
             }
             if self
                 .folder_pane
-                .process_label_input(event, time, max_dist, max_delay)
+                .process_label_input(event, at, max_dist, max_delay)
                 && let Some(widget) = widget
             {
                 self.folder_pane.record_label_pointer_activation(widget);

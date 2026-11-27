@@ -900,3 +900,149 @@ guard・遅延・再試行・時間切れを足さない。ClaudeCode と Codex 
   - 試験: 外側の押下の枠の中で、内側の同じ属性の押下の呼び出しを始めて終わらせ、その後に保留のイベント → 外側のイベントの順で
     egui-winit に渡す。どちらにも時刻が付かない。ボタン以外の呼び出しを挟んだだけなら外側に時刻が付く。
 - r4 (同じ担当の続き、2026-11-27): **ACCEPT** (指摘なし)。構造的修正であることに **AGREE**。設計はここで確定し、実装へ進む。
+
+### 16.17 実装記録・検証引き継ぎ (2026-11-27、dblclick-919)
+
+- 状態: 実装・静的点検・整形まで (実装担当 Codex の記録)。Rust の build / check / test、実窓 probe、
+  本物のマウス、build-dev は未確認。利用者の役割分担により cargo は fmt だけ実行し、コンパイル・実行を伴う検証は runner へ引き継ぐ。
+  この節のテスト一覧はソースから抽出した名前で、実行成功や発見済みテスト一覧ではない。コミット・exe 起動はしていない。
+- 静的確認: 本体の cargo fmt --all と vendor egui / egui-winit / eframe の cargo fmt、各 fmt --check は完了。
+  git diff --check は成功。既存 stall_919_tests.rs の git diff --quiet は exit 0 (差分なし)。
+- 実装担当 (Codex) の報告では、Codex の中で別のエージェントにソースを点検させ ACCEPT だった。ClaudeCode はその内容を確かめておらず、
+  統括の決めた独立実装レビュー (別の Sol xhigh) には数えない。独立実装レビューの結果は 16.18 に記録する。
+- egui-winit: `input_clock` の OnceLock 起点は State・viewport・窓世代で共通。
+  Windows の `native_pointer_time` は受信した MSG の4属性と換算時刻を一件だけ保持し、vendor 独自 subclass が全メッセージの
+  呼出枠を DefSubclassProc の前後で積む / 外す。時刻の所有は Available / Used / Unavailable / Ambiguous の型で表し、
+  入れ子ボタンは既存の未使用枠を曖昧化する。最内枠の証明が揃った実 MouseInput だけ一回注釈を付ける。
+  Touch と位置なし離しには付けず、observer を通った並びは時刻 → provenance → PointerButton のまま。
+- eframe: 内部 msg hook を利用者の event_loop_builder より前に設定する。subclass の資源は既存の
+  `NativeWindowAllocationLease` に置き、窓置換・破棄時の既存の退役点で外す (WM_NCDESTROY でも自分の subclass を外す)。
+  native の RawInput.time 全5設定点で、同じ Instant から pass 時刻と input_clock を設定する。
+  Windows の時刻注釈を生成せず egui-winit 依存もない web backend は、input_clock=None の既定を維持する。
+- 設置順の追補: ROOT の timestamp subclass は App 生成前、利用者の native input listener は後から replay されるため、
+  listener の任意 subclass が外側になり得た。現 mIV の ROOT 前処理に実際の SendMessage 再入経路は確認されていないが、
+  public listener 接続も含めて §16.15 の呼出前 claim を守る設置順の実装判断として、listener.install 後に既存の vendor proc/id を
+  RemoveWindowSubclass → SetWindowSubclass の順で最外へ戻す。単なる Set は refData 更新だけなので使わない。
+  child は listener の後に初回 timestamp 設置となる。同じ lease の所有・退役を維持し、新しい pending 状態は加えていない。
+  共通の設置順関数を偽 subclass chain で駆動し、ROOT / child の順序と、外側 listener が同属性メッセージを再入させても
+  内側が外側の時刻を取らず両枠が時刻なしになることを追加検査する (未実行)。
+- egui: `PointerButtonTime` は provenance だけを挟んだ一致ボタンへ結合し、clock 不在・不一致・他イベントで捨てる。
+  `EdgeTime` の入力時刻を pass 以下へ、同じボタンの離しを既知の押下入力時刻以上へ丸める。
+  押下の長さ・押下時の回数・double / triple の履歴は `EdgeTime::since` を共有する。
+  進行中のドラッグ・長押し・velocity・tooltip は現在の pass を観測する既存経路に残す。
+  `button_edges` と既存の release counts は同じ pointer_events を読み、cancel 後の edge はどちらにも残らない。
+  vendor と本体の Event / PointerEvent match を棚卸しし、内部 scroll_area のパターンと focus_debug の表示名を追従させた。
+- 一覧: Release 自身が `EdgeTime` を持ち、raw / canonical edge / widget witness を順序・ボタン・押す/離す・位置で照合する。
+  `accept_primary_input` の pass 時刻引数を除き、pending.at の比較も共有 since へ変更した。フレーム番号による条件は維持。
+  ツリーも各押下・離しの照合済み EdgeTime を process_label_input へ渡す。不一致は従来の cancel に進み、pass 時刻へ補完しない。
+  既存の純状態テスト向け f64 引数は `Into<EdgeTime>` で「入力時刻なし」を明示して受け取る。
+- 計装: `PointerLag` Context plugin の on_begin_pass を全 viewport の共通入口とし、perf 有効時だけ edge を読む。
+  入力時刻があり、pass−input が100ms以上の edge ごとに input / pointer_lag (button・pressed・lag_ms・viewport・fullscreen) を記録する。
+  fullscreen はその viewport の native Fullscreen 情報。実際のログ出力は未確認。
+- 子窓再作成の回帰は headless EpiIntegration::prepare_raw_input と二つの実 egui-winit State を通す。
+  Context の進行で State の開始基準が変わり、State 側 time を異なる値にしても、eframe の共通開始基準と input_clock が
+  元の物理間隔を保つことを検査する。窓 A の cancel・retire・同じ ID の再作成は実 Context の viewport を通して窓 B の edge と履歴の不変を検査する。
+- `stall_919_tests.rs` の既存4件はファイルごと変更していない。共用テスト固定具は input_clock を供給するが、
+  注釈なし入力の判定は従来の pass 時刻のまま。追加試験は同じ RawInput.events へ注釈とボタンをまとめ、kittest の event() による分割を避ける。
+- 旧コードで失敗する見込み: 時刻付き (a) の二回目終了、(b) の離しのクリック認定と二回目終了、
+  同じ pass に入った遅い二クリックの非 double、一覧セルの open・余白の親移動・ツリー名の toggle。
+  旧実装には新 API が無いため、API だけを受け取って注釈を無視する比較を想定した見込みで、旧コードでの実行はしていない。
+- まれな時計 / subclass 設置失敗は時刻を渡さず既存の pass 判定 (subclass 設置失敗だけ一度の警告) とし、回復機構を増やしていない。
+  入力が常時並行するためモーダル化では原因を除けず、共通の生成・所有境界を修正した。閾値延長・待ち・追加 repaint は使わない。
+  detached の実装者判断は [detached-rework-plan §11](detached-rework-plan.md) に記録。独立実装レビューの合意は 16.18 の後に追記する。
+
+追加テストの完全名 (nextest の test filter 用、ソースから抽出。すべて未実行):
+
+Main: mimageviewer --lib
+
+```text
+ui_fullscreen::double_click_close_tests::timestamp_919_tests::close_mode_919_timestamped_stall_between_clicks_closes_on_second_click
+ui_fullscreen::double_click_close_tests::timestamp_919_tests::close_mode_919_timestamped_stall_during_press_remains_click_and_closes
+ui_fullscreen::double_click_close_tests::timestamp_919_tests::close_mode_919_timestamped_slow_clicks_in_same_pass_do_not_close
+ui_fullscreen::double_click_close_tests::timestamp_919_tests::close_mode_919_timestamped_opening_pair_does_not_carry_into_viewer
+ui_fullscreen::double_click_close_tests::timestamp_919_tests::close_mode_919_timestamped_reset_pair_then_close_pair
+app::folder_pane_refresh_tests::timestamp_919::folder_pane_919_timestamped_stall_toggles_label_but_unstamped_does_not
+app::folder_pane_refresh_tests::timestamp_919::folder_pane_919_mixed_timestamps_retain_pass_interval_in_both_orders
+pointer_input_time::tests::pointer_lag_919_requires_known_input_and_at_least_100ms
+app::detached_activation_gesture::tests::timestamp_919_canonical_activation_accepts_time_provenance_button_once
+ui_main::grid_reclick_open_tests::grid_919_timestamped_stall_opens_cell_but_unstamped_does_not
+ui_main::grid_reclick_open_tests::grid_919_timestamped_stall_pairs_background_but_unstamped_does_not
+ui_main::grid_reclick_open_tests::grid_919_mixed_timestamp_pairs_retain_pass_interval_in_both_orders
+```
+
+Vendor: egui --lib
+
+```text
+input_state::timestamp_tests::timestamp_919_stall_between_clicks_uses_actual_interval
+input_state::timestamp_tests::timestamp_919_delayed_release_uses_press_release_interval
+input_state::timestamp_tests::timestamp_919_slow_clicks_batched_together_are_not_double
+input_state::timestamp_tests::timestamp_919_annotation_allows_only_provenance_and_matching_button
+input_state::timestamp_tests::timestamp_919_translation_clamps_future_and_negative_hold_interval
+input_state::timestamp_tests::timestamp_919_mixed_click_pairs_use_pass_time_in_both_orders
+input_state::timestamp_tests::timestamp_919_mixed_press_release_uses_pass_duration_in_both_orders
+input_state::timestamp_tests::timestamp_919_edges_preserve_order_clicks_and_cancel_removes_owned_edges
+input_state::timestamp_tests::timestamp_919_pending_append_keeps_absolute_stamps_and_latest_clock
+input_state::timestamp_tests::timestamp_919_viewport_cancel_and_recreation_do_not_change_sibling_history
+input_state::timestamp_tests::timestamp_919_shared_interval_rule_clamps_negative_and_uses_whole_pair_clock
+```
+
+Vendor: egui-winit --lib (native_pointer_time: Windows only)
+
+```text
+native_pointer_time::tests::timestamp_919_tick_age_range_and_wrap
+native_pointer_time::tests::timestamp_919_claims_exact_invocation_once_and_rejects_deferred_delivery
+native_pointer_time::tests::timestamp_919_all_message_attributes_must_match
+native_pointer_time::tests::timestamp_919_nested_button_invalidates_outer_even_when_buffer_delivered_first
+native_pointer_time::tests::timestamp_919_nonbutton_reentry_preserves_outer_but_never_lends_it
+native_pointer_time::tests::timestamp_919_nested_loop_and_sent_messages_have_no_queue_time
+native_pointer_time::tests::timestamp_919_retire_recreate_does_not_change_other_window_queue_or_call
+native_pointer_time::tests::timestamp_919_listener_replay_and_new_child_keep_timestamp_outermost
+native_pointer_time::tests::timestamp_919_listener_outermost_restoration_prevents_preclaim_reentry
+pointer_input_observer::tests::timestamp_919_observer_keeps_time_provenance_button_order
+```
+
+Vendor: eframe --lib (wgpu / glow)
+
+```text
+native::epi_integration::tests::timestamp_919_recreated_child_state_uses_eframe_clock_and_preserves_intervals
+```
+
+Changed files (relative to repository root)
+
+```text
+docs/architecture-overview.md
+docs/detached-rework-plan.md
+docs/fullscreen-double-click-close-plan.md
+docs/keymap-spec.md
+src/app.rs
+src/app/detached_activation_gesture.rs
+src/app/folder_pane_refresh_tests.rs
+src/app/folder_pane_timestamp_919_tests.rs
+src/focus_debug.rs
+src/folder_pane.rs
+src/lib.rs
+src/pointer_input_time.rs
+src/ui_folder_pane.rs
+src/ui_fullscreen/double_click_close_tests.rs
+src/ui_fullscreen/double_click_close_tests/timestamp_919_tests.rs
+src/ui_main.rs
+vendor/eframe/PATCHES.md
+vendor/eframe/src/native/epi_integration.rs
+vendor/eframe/src/native/glow_integration.rs
+vendor/eframe/src/native/run.rs
+vendor/eframe/src/native/wgpu_integration.rs
+vendor/eframe/src/native_window_input.rs
+vendor/egui-winit/Cargo.toml
+vendor/egui-winit/PATCHES.md
+vendor/egui-winit/src/input_clock.rs
+vendor/egui-winit/src/lib.rs
+vendor/egui-winit/src/native_pointer_time.rs
+vendor/egui-winit/src/pointer_input_observer.rs
+vendor/egui/PATCHES.md
+vendor/egui/src/containers/scroll_area.rs
+vendor/egui/src/data/input/event.rs
+vendor/egui/src/data/input/raw_input.rs
+vendor/egui/src/input_state/mod.rs
+vendor/egui/src/input_state/timestamp_tests.rs
+vendor/egui/src/lib.rs
+```

@@ -6,6 +6,7 @@ mod close_900_tests;
 mod scrub_907_tests;
 mod stall_919_tests;
 mod suppression_906_tests;
+mod timestamp_919_tests;
 
 fn viewport() -> egui::Rect {
     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))
@@ -117,6 +118,7 @@ impl Canvas {
             egui::RawInput {
                 screen_rect: Some(viewport()),
                 time: Some(self.time),
+                input_clock: Some(self.time),
                 focused: true,
                 events,
                 ..Default::default()
@@ -245,6 +247,7 @@ impl Canvas {
             viewport_id,
             screen_rect: Some(viewport()),
             time: Some(self.time),
+            input_clock: Some(self.time),
             focused,
             events,
             ..Default::default()

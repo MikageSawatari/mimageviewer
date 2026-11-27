@@ -1,5 +1,13 @@
 # egui-winit 0.37.0 のローカル変更（段2a-1）
 
+## §1.919: Process input clock and wndproc timestamp ownership (2026-11-27)
+
+`input_clock` は全 State / 窓世代で共通の OnceLock 起点。Windows の `native_pointer_time` は
+winit msg hook の MSG を一度だけ受信し、別 id の subclass が全メッセージの呼出枠を管理する。
+ボタンの入れ子呼出で未使用の外枠を曖昧化し、保留したイベントへ外側の時刻を貸さない。
+時刻は MouseInput の窓・ボタン・押す/離すが一致した最内枠だけから取得し、touch・位置なし離しには付けない。
+順序は時刻 → provenance → PointerButton。古さは GetTickCount の wrapping 差 0〜5000ms に限定する。
+
 原本の版・archive checksum・VCS・全ファイルhashは
 [upstream-provenance.json](../upstream-provenance.json) に記録する。
 0.37.0原本へ必要な旧差分を付け直し、旧manifestを上書きコピーしていない。

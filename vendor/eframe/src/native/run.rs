@@ -413,6 +413,15 @@ fn create_event_loop(native_options: &mut epi::NativeOptions) -> Result<EventLoo
             ))
         })?);
 
+    #[cfg(target_os = "windows")]
+    {
+        use winit::platform::windows::EventLoopBuilderExtWindows as _;
+        #[expect(unsafe_code)]
+        builder.with_msg_hook(|message| unsafe {
+            egui_winit::native_pointer_time::message_hook(message)
+        });
+    }
+
     if let Some(hook) = core::mem::take(&mut native_options.event_loop_builder) {
         hook(&mut builder);
     }

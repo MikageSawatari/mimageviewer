@@ -1,5 +1,8 @@
 # アーキテクチャ概観
 
+Windows のボタン入力は vendor egui-winit のプロセス共通時計・wndproc 呼出単位の証跡から egui の `EdgeTime` へ運ぶ。
+egui・一覧・ツリーは両端の入力時刻が分かる組だけ実入力の間隔を使い、処理待ちをクリックの時間へ混ぜない ([設計 §16](fullscreen-double-click-close-plan.md))。
+
 ## 操作のスクリプト（§1.363 段1〜5・§17）
 
 `operation_script` がサンドボックス、状態の写し、スロット・戻り値の解釈、操作の許可表と並びの検査を持つ。

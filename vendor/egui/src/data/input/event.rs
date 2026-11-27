@@ -105,6 +105,15 @@ pub enum Event {
     /// a later press. Ordinary egui pointer/keyboard/IME handling ignores it.
     PointerInputProvenance(crate::Id),
 
+    /// Native button time on the integration's process input clock. Applies only
+    /// to the following matching button, allowing provenance markers in between.
+    /// Requires [`crate::RawInput::input_clock`] to translate to the pass clock.
+    PointerButtonTime {
+        button: PointerButton,
+        pressed: bool,
+        time: f64,
+    },
+
     /// The mouse moved, the units are unspecified.
     /// Represents the actual movement of the mouse, without acceleration or clamped by screen edges.
     /// `PointerMoved` and `MouseMoved` can be sent at the same time.
