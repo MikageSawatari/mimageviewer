@@ -1,6 +1,6 @@
 # 編集ツールの途中で表示中の画像が外から替わるときの扱い (§1.920)
 
-作成: 2026-11-27 / ClaudeCode (設計担当)。状態: 設計 r3 (案 A'、独立設計レビュー r2 の指摘を反映、r3 待ち)。
+作成: 2026-11-27 / ClaudeCode (設計担当)。状態: 設計 r4 (案 A'、独立設計レビュー r3 の指摘を反映)。
 
 関連: [next-release-backlog.md §1.920](next-release-backlog.md)、[conceal-feature-plan.md](conceal-feature-plan.md)、
 [detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) と §11 (リワーク外からの変更記録)。
@@ -161,7 +161,10 @@ SNS 分割の見開きの退避 (`PageEditSpreadPivot`) は数値の idx を持�
 その所有 context であるときだけ**作用する。構成のサービスなどが `with_viewer_context` で park 中の sibling を
 一時投影して items を書き換える間 (`book_composition_runtime.rs:761`、`viewer_context_registry.rs:6013`) は、
 active の編集に触れず、終えもしない (sibling の書き換えは active の表示中の項目を替えない)。所有の確かめは
-既存の context の identity (mounted / 投影中の context の id) で行い、新しい印は足さない。
+既存の context の identity で行い、新しい印は足さない。一時投影の間は `mounted_viewer_context_id()` と
+`projected_viewer_context_id()` がどちらも投影先を返す (`viewer_context_registry.rs:501`・`:509`・`:869`) ので、
+この 2 つの一致は所有の証明にならない。一時投影の前の正当な所有者 (投影の仕組みが退避している元の context) と
+照合する (r3)。
 
 呼ぶ場所 (どれも「旧項目がまだ有効」な時点):
 
@@ -211,11 +214,17 @@ active の編集に触れず、終えもしない (sibling の書き換えは ac
 受理済みの自動送りは、ほかにも次の形で残る (r2 P2): 次のフォルダへの送りは開始時に `slideshow_playing = false`
 にしてから、完了側が `resume_slideshow` で再開する (`ui_fullscreen.rs:45471`、`app.rs:64441`)。ZIP の DFS の
 `Slideshow` の continuation は完了時に再生を true にする (`ui_fullscreen.rs:45387`)。既存の停止 (`:45297`) は
-これらを取り消さない。**受理済みの移動 (自動送り由来か手動かを問わず、fs_nav の lock・フォルダ移動の pending・
-DFS の continuation・構成の許可待ち) がある間は、編集ツールへ入らない** (入場を断り、
+これらを取り消さない。紙めくりの完了待ち (`PresentationState::Completing.continuation`) も、解決済みの移動を
+保持して完了後に実行し、`Slideshow` でも `slideshow_playing` を見ない (`page_turn/barrier.rs:296`・`:451`、r3 P2)。
+**受理済みの移動 (自動送り由来か手動かを問わず、fs_nav の lock・フォルダ移動の pending・DFS の continuation・
+構成の許可待ちの受理済み open・紙めくりの完了待ち) がある間は、編集ツールへ入らない** (入場を断り、
 「移動が終わってから編集してください」と通知する)。移動が着地すれば viewer の画像が替わるので、入ってから
-終わらせるより、入らないほうが組み合わせが少ない。これは移動中の一瞬の状態で、通常の使い方は変わらない。
-判定は既存の移動の所有者の述語を使い、新しい印は足さない。
+終わらせるより、入らないほうが組み合わせが少ない。静止した状態での操作は変わらない (遅い読み込みでは待ちが
+長くなることがある)。判定は、同じ所有 context の既存の移動の述語を組み合わせて 1 つの関数にし、新しい印は足さない:
+fs_nav の lock、フォルダ移動・DFS の pending、構成の許可待ちは受理済み open を表す `open_pending()`
+(`book_composition_permission.rs:344`、受動的な許可の読み取りも含む `pending()` は使わない)、紙めくりは
+`page_turn_barrier_active()` (`page_turn/barrier.rs:131`)。6 ツールすべて (切り取り・SNS 分割を含む) の入場と、
+入場の非同期の完了 (隠蔽加工・消しゴムの素材の準備の後の入場など) に同じ受付の規則を当てる。
 
 タイマーに編集中の条件を足して「一時停止」にする案は、編集の終了後に再開するかという組み合わせを残すので
 採らない。編集とスライドショーは同時に成り立たない。
@@ -269,7 +278,8 @@ linked の別ウィンドウだけが一覧を viewer の入口として残し�
   (保存前へ戻らない)。
 - スライドショー: 再生中に編集ツールへ入ると止まる。許可待ちの送りが後から完了しても採用されない。
   編集中は開始できない。次のフォルダへの送り・ZIP の DFS の continuation・fs_nav の lock がある間は、編集ツールへ
-  入れず通知が出る。手動の移動が終わった後は入れる。
+  入れず通知が出る。紙めくりの完了待ちに次の移動を受理した状態で入場を断り、移動の完了後は入れる。6 ツールと
+  入場の非同期の完了に同じ規則が効く。手動の移動が終わった後は入れる。
 - sibling: park 中の束の `fullscreen_idx`・items・cache・世代・pending・cancel が、active 側の終了・一覧の門・
   書き換えで変わらない。逆方向: active で隠蔽加工の編集中に、park 中の sibling の構成の更新が一時投影で完了しても、
   active の下書き・モード・保存先が変わらず、sibling の項目へ保存されない。
