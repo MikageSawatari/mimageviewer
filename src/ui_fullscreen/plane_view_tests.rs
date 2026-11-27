@@ -332,8 +332,8 @@ mod gpu_tests {
         assert!(!app.fs_exclusive_view.is_plane_view());
         let entered = enter(&mut app, &mut viewer);
         assert!(
-            entered.zoom > 1.1,
-            "the portrait fixture first covers the wide canvas"
+            entered.zoom > 1.1 && entered.zoom <= 1.5,
+            "the portrait fixture starts bounded progress toward covering the wide canvas"
         );
         let expected = plane_view_wheel_transition(wheel_input_for_current_view(
             &mut app,

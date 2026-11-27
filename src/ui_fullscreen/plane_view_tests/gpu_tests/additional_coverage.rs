@@ -384,6 +384,146 @@ fn install_pdf_raster(
 }
 
 #[test]
+fn plane_revision3_real_pdf_inward_outward_and_exit_keep_the_planned_geometry_across_reraster() {
+    let _keys = crate::key_input::lock_test_input();
+    for notches in [1., -0.5, -8.] {
+        let mut app = crate::app::setup_app_for_test();
+        let mut viewer = viewer(&mut app);
+        let probe = crate::app::PdfRerenderRequestProbe::start();
+        app.items[0] = GridItem::PdfPage {
+            pdf_path: app.tmp.path().join("plane-revision3-geometry.pdf"),
+            page_num: 0,
+            content_type: Some(PdfPageContentType::Vector),
+        };
+        viewer.size = egui::vec2(1200., 900.);
+        install_pdf_raster(&mut app, &viewer.ctx, &probe, [317, 409]);
+        register_final_texture(&mut app, &viewer.ctx);
+        viewer.frame(&mut app, vec![]);
+        enter(&mut app, &mut viewer);
+        let old = drawn(&app);
+        let canvas = old.params.canvas();
+        let before = (app.fs_zoom, app.fs_pan);
+        let expected = plane_view_wheel_transition(wheel_input_for_current_view(
+            &mut app,
+            &viewer.ctx,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size),
+            Some(canvas.center()),
+            notches,
+        ));
+        if notches < 0. {
+            assert_eq!((expected.zoom, expected.pan), before);
+        } else {
+            assert!(expected.zoom <= before.0 * 1.5 + 1.0e-6);
+        }
+        // Complete a genuine PDF reraster before the same input pass; the current
+        // texture is not registered yet, so active PlaneView still paints the old one.
+        install_pdf_raster(&mut app, &viewer.ctx, &probe, [634, 819]);
+        viewer.frame(
+            &mut app,
+            vec![wheel(
+                0.,
+                notches * 40.,
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+            )],
+        );
+        assert_eq!(app.plane_view_pose(), expected.pose);
+        assert!((app.fs_zoom - expected.zoom).abs() < 1.0e-5);
+        assert!((app.fs_pan - expected.pan).length() < 0.01);
+        let pending = app
+            .fullscreen_page_layout
+            .displayed_pages()
+            .next()
+            .unwrap()
+            .transform;
+        let crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+            zoom_pan: Some((paint_zoom, paint_pan)),
+        } = pending.placement
+        else {
+            panic!("the real single PDF paint must publish its normal zoom/pan");
+        };
+        assert!((paint_zoom - expected.zoom).abs() < 1.0e-5);
+        assert!(
+            (paint_pan - expected.pan).length() < 0.01,
+            "paint-time pan correction must not move the planned placement"
+        );
+        if expected.pose.is_some() {
+            assert!(Arc::ptr_eq(&drawn(&app).material, &old.material));
+        }
+        let planned = app
+            .plane_cover_input_for_canvas(&viewer.ctx, canvas)
+            .unwrap();
+        let resolved = planned
+            .resolve(
+                expected.zoom,
+                expected.pan,
+                crate::displayed_image_transform::RectPixelFit::Texels,
+            )
+            .unwrap();
+        let assert_same_board =
+            |actual: &crate::displayed_image_transform::DisplayedImageTransform,
+             expected: &crate::displayed_image_transform::DisplayedImageTransform| {
+                for source in [
+                    egui::pos2(0., 0.),
+                    egui::pos2(1., 0.),
+                    egui::pos2(1., 1.),
+                    egui::pos2(0., 1.),
+                ] {
+                    assert!(
+                        (actual.source_normalized_to_screen(source)
+                            - expected.source_normalized_to_screen(source))
+                        .length()
+                            <= 1. / 64.,
+                        "PDF paint differs from its canonical material geometry at source {source:?}"
+                    );
+                }
+            };
+        assert_same_board(&pending, &resolved);
+        register_final_texture(&mut app, &viewer.ctx);
+        viewer.frame(&mut app, vec![]);
+        assert_eq!((app.fs_zoom, app.fs_pan), (expected.zoom, expected.pan));
+        let adopted = app
+            .fullscreen_page_layout
+            .displayed_pages()
+            .next()
+            .unwrap()
+            .transform;
+        let adopted_input = app
+            .plane_cover_input_for_canvas(&viewer.ctx, canvas)
+            .unwrap();
+        let adopted_expected = adopted_input
+            .resolve(
+                expected.zoom,
+                expected.pan,
+                crate::displayed_image_transform::RectPixelFit::Texels,
+            )
+            .unwrap();
+        // PDF raster rounding may change the sampler aspect and its contained paint
+        // rectangle. The canonical page placement must stay fixed across that change.
+        assert!(placement_frames_match(
+            pending.placement_frame,
+            adopted.placement_frame,
+            adopted.pixels_per_point,
+        ));
+        assert!(placement_frames_match(
+            resolved.layout_full_image_rect,
+            adopted.layout_full_image_rect,
+            adopted.pixels_per_point,
+        ));
+        assert_same_board(&adopted, &adopted_expected);
+        if expected.pose.is_some() {
+            assert_eq!(
+                drawn(&app).material.description.texture_size,
+                egui::vec2(634., 819.)
+            );
+        }
+        // Exit hands the very same placement to the ordinary renderer.
+        if expected.pose.is_none() {
+            assert_eq!((app.fs_zoom, app.fs_pan), before);
+        }
+    }
+}
+
+#[test]
 fn plane_real_pdf_routes_keep_both_demands_current_while_previous_material_is_painted() {
     let _keys = crate::key_input::lock_test_input();
     for tilt_only in [false, true] {

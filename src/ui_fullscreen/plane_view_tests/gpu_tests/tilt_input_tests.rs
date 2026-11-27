@@ -671,6 +671,7 @@ fn plane_tilt_preserves_auto_or_locked_fill_and_ordinary_zoom_rules() {
         crate::key_input::clear_test_synthetic_input();
         viewer.frame(&mut app, vec![wheel(0., -80., egui::Modifiers::CTRL)]);
         assert!(matches!(mode(&app), PlaneFillMode::Locked(_)));
+        let locked_mode = mode(&app);
         assert_eq!(tilt(&app), tilted);
         viewer.frame(
             &mut app,
@@ -680,7 +681,7 @@ fn plane_tilt_preserves_auto_or_locked_fill_and_ordinary_zoom_rules() {
                 egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
             )],
         );
-        assert_eq!(mode(&app), PlaneFillMode::Auto);
+        assert_eq!(mode(&app), locked_mode);
         assert_eq!(tilt(&app), tilted);
         // The ordinary primary drag keeps the same tilt and fill policy.
         app.fs_focus_regained_at = None;
@@ -693,7 +694,7 @@ fn plane_tilt_preserves_auto_or_locked_fill_and_ordinary_zoom_rules() {
         }
         release(&mut viewer, &mut app, start + egui::vec2(80., 40.));
         assert_eq!(tilt(&app), tilted);
-        assert_eq!(mode(&app), PlaneFillMode::Auto);
+        assert_eq!(mode(&app), locked_mode);
     }
 }
 

@@ -37452,7 +37452,7 @@ impl App {
                     cover,
                 ) {
                     let outcome = crate::plane_view::plane_view_wheel_transition(input);
-                    self.apply_plane_view_outcome(ctx, outcome, notches > 0.);
+                    self.apply_plane_view_outcome(ctx, outcome);
                 }
             }
         }
@@ -42939,11 +42939,7 @@ impl App {
                     ) {
                         plane_end.apply(&mut input);
                         let outcome = crate::plane_view::plane_view_wheel_transition(input);
-                        self.apply_plane_view_outcome(
-                            ctx,
-                            outcome,
-                            wheel_action.segment.vertical_before_axis_mapping > 0.,
-                        );
+                        self.apply_plane_view_outcome(ctx, outcome);
                         if plane_fill_lock.is_some_and(|candidate| {
                             !self.plane_fill_lock_candidate_matches(candidate)
                         }) {
@@ -43538,7 +43534,6 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         out: crate::plane_view::PlaneViewWheelOutcome,
-        inward: bool,
     ) {
         if let Some(block) = out.blocked {
             self.show_fullscreen_nav_noop(
@@ -43555,18 +43550,6 @@ impl App {
             self.fullscreen_idx
                 .is_some_and(|idx| pose.anchor == self.plane_view_anchor(idx))
         });
-        if out.accepted
-            && inward
-            && let crate::fs_exclusive_view::FsExclusiveView::PlaneView(state) =
-                &mut self.fs_exclusive_view
-            && out
-                .pose
-                .is_some_and(|pose| pose.anchor == state.pose.anchor)
-            && state.fill_mode != crate::plane_view::PlaneFillMode::Auto
-        {
-            state.fill_mode = crate::plane_view::PlaneFillMode::Auto;
-            ctx.request_repaint();
-        }
         if !out.changes_view(current, self.fs_zoom, self.fs_pan) {
             return;
         }

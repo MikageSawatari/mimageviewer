@@ -482,7 +482,9 @@ fn plane_tilt_wheel_keeps_zero_strength_for_tilt_or_owned_drag_without_changing_
             tilt_is_identity: identity,
             tilt_drag_owned: owned,
         });
-        assert!(out.accepted);
+        assert_eq!(out.zoom, 2.);
+        assert_eq!(out.pan, Vec2::ZERO);
+        assert_eq!(out.blocked, None);
         assert_eq!(out.pose.is_some(), !identity || owned);
         if let Some(pose) = out.pose {
             assert_eq!(pose.strength, 0.);
@@ -588,7 +590,7 @@ fn plane_tilt_zero_strength_outward_segment_preserves_even_offscreen_pan_exactly
             tilt_is_identity: identity,
             tilt_drag_owned: owned,
         });
-        assert!(out.accepted);
+        assert_eq!(out.blocked, None);
         assert_eq!(out.zoom, 1.23);
         assert_eq!(out.pan, pan);
         assert_eq!(out.pose, (!identity || owned).then_some(pose));

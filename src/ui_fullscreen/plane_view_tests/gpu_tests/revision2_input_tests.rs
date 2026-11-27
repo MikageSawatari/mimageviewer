@@ -38,6 +38,13 @@ fn fisheye_wheel(viewer: &mut RootDepthViewer, app: &mut App, delta: f32) {
         )],
     );
 }
+fn enter_covered(app: &mut App, viewer: &mut RootDepthViewer) {
+    // Ordinary-zoom lock tests require a nonzero displayed coefficient. Revision 3
+    // intentionally leaves the portrait Page-fit fixture uncovered after one notch.
+    app.fs_zoom = 3.;
+    enter(app, viewer);
+    assert!(snapshot(app).k_fill > 0.);
+}
 struct ClearPhysicalInput;
 impl Drop for ClearPhysicalInput {
     fn drop(&mut self) {
@@ -227,7 +234,7 @@ fn plane_revision2_every_ordinary_zoom_entry_locks_only_when_the_zoom_changes() 
         for limited in [false, true] {
             let mut app = crate::app::setup_app_for_test();
             let mut viewer = viewer(&mut app);
-            enter(&mut app, &mut viewer);
+            enter_covered(&mut app, &mut viewer);
             if limited {
                 app.fs_zoom = ZOOM_MAX;
                 viewer.frame(&mut app, vec![]);
@@ -258,7 +265,7 @@ fn plane_revision2_ordinary_shrink_keeps_visible_distortion_and_second_zoom_keep
     let _keys = crate::key_input::lock_test_input();
     let mut app = crate::app::setup_app_for_test();
     let mut viewer = viewer(&mut app);
-    enter(&mut app, &mut viewer);
+    enter_covered(&mut app, &mut viewer);
     let before = snapshot(&app);
     let pose = app.plane_view_pose();
     ordinary_wheel(&mut viewer, &mut app, -480.);
@@ -286,7 +293,7 @@ fn plane_revision2_delayed_zoom_uses_the_candidate_captured_before_paint() {
     let _keys = crate::key_input::lock_test_input();
     let mut app = crate::app::setup_app_for_test();
     let mut viewer = viewer(&mut app);
-    enter(&mut app, &mut viewer);
+    enter_covered(&mut app, &mut viewer);
     let before = snapshot(&app);
     let old_zoom = app.fs_zoom;
     let mut retained = None;
@@ -367,13 +374,13 @@ fn plane_revision2_delayed_zoom_uses_the_candidate_captured_before_paint() {
 }
 
 #[test]
-fn plane_revision2_inward_wheel_and_assigned_key_restore_auto_even_without_geometry_change() {
+fn plane_revision2_inward_wheel_and_assigned_key_keep_locked_even_without_geometry_change() {
     let _keys = crate::key_input::lock_test_input();
     for keyboard in [false, true] {
         for missing_record in [false, true] {
             let mut app = crate::app::setup_app_for_test();
             let mut viewer = viewer(&mut app);
-            enter(&mut app, &mut viewer);
+            enter_covered(&mut app, &mut viewer);
             app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsFisheyeIn = F13\n");
             app.fs_zoom = ZOOM_MAX;
             app.fs_pan = egui::Vec2::ZERO;
@@ -400,35 +407,32 @@ fn plane_revision2_inward_wheel_and_assigned_key_restore_auto_even_without_geome
                 },
             );
             assert_eq!((app.fs_zoom, app.fs_pan, app.plane_view_pose()), geometric);
-            assert_eq!(
-                mode(&app),
-                if missing_record {
-                    PlaneFillMode::Locked(0.1)
-                } else {
-                    PlaneFillMode::Auto
-                }
-            );
+            assert_eq!(mode(&app), PlaneFillMode::Locked(0.1));
         }
     }
 }
 
 #[test]
-fn plane_revision2_locked_outward_input_scales_strength_and_inward_input_covers_again() {
+fn plane_revision2_locked_outward_keeps_geometry_and_inward_gradually_covers() {
     let _keys = crate::key_input::lock_test_input();
     let mut app = crate::app::setup_app_for_test();
     let mut viewer = viewer(&mut app);
-    enter(&mut app, &mut viewer);
+    enter_covered(&mut app, &mut viewer);
     fisheye_wheel(&mut viewer, &mut app, 40.);
     ordinary_wheel(&mut viewer, &mut app, -480.);
     let locked = mode(&app);
     let before = snapshot(&app);
+    let zoom_pan = (app.fs_zoom, app.fs_pan);
     assert_eq!(app.plane_view_pose().unwrap().strength, 0.5);
     fisheye_wheel(&mut viewer, &mut app, -40.);
     assert_eq!(mode(&app), locked);
     assert_eq!(app.plane_view_pose().unwrap().strength, 0.25);
+    assert_eq!((app.fs_zoom, app.fs_pan), zoom_pan);
     assert!((snapshot(&app).params.values[2][0] * 2. - before.params.values[2][0]).abs() < 1.0e-6);
     fisheye_wheel(&mut viewer, &mut app, 40.);
-    assert_eq!(mode(&app), PlaneFillMode::Auto);
+    assert_eq!(mode(&app), locked);
+    assert!(app.fs_zoom > zoom_pan.0);
+    assert!(app.fs_zoom <= zoom_pan.0 * 1.5 + 1.0e-6);
     assert!(snapshot(&app).k_fill > 0.);
     let record = app.fullscreen_page_layout.plane_cover.unwrap();
     let drawn = app
@@ -438,13 +442,15 @@ fn plane_revision2_locked_outward_input_scales_strength_and_inward_input_covers_
         .unwrap()
         .transform;
     let quad = plane_effective_quad(&drawn, record.material).unwrap();
-    assert!(
+    assert_eq!(
         plane_fill_coefficient(
             drawn.viewport_rect,
             drawn.viewport_rect.center(),
             quad,
             app.settings.plane_view_lens
-        ) > 0.
+        ),
+        0.,
+        "one bounded step still exposes the edge after the large ordinary shrink"
     );
     ordinary_wheel(&mut viewer, &mut app, -40.);
     fisheye_wheel(&mut viewer, &mut app, -80.);
@@ -457,7 +463,7 @@ fn plane_revision2_snapshot_absence_and_exit_reentry_discard_the_old_lock_candid
     for reenter in [false, true] {
         let mut app = crate::app::setup_app_for_test();
         let mut viewer = viewer(&mut app);
-        enter(&mut app, &mut viewer);
+        enter_covered(&mut app, &mut viewer);
         let zoom = app.fs_zoom;
         let events = if reenter {
             let mut inward = wheel(0., 40., egui::Modifiers::CTRL | egui::Modifiers::SHIFT);
@@ -513,13 +519,13 @@ fn plane_revision2_snapshot_absence_and_exit_reentry_discard_the_old_lock_candid
 }
 
 #[test]
-fn plane_revision2_mixed_wheel_order_and_key_stage_determine_the_final_fill_mode() {
+fn plane_revision2_mixed_wheel_orders_and_key_stages_preserve_locked_fill() {
     let _keys = crate::key_input::lock_test_input();
     for inward_first in [false, true] {
         let mut app = crate::app::setup_app_for_test();
         let mut viewer = viewer(&mut app);
-        enter(&mut app, &mut viewer);
-        ordinary_wheel(&mut viewer, &mut app, -40.);
+        enter_covered(&mut app, &mut viewer);
+        let candidate = app.plane_fill_lock_candidate().unwrap();
         let ordinary = wheel(0., -40., egui::Modifiers::CTRL);
         let inward = wheel(0., 40., egui::Modifiers::CTRL | egui::Modifiers::SHIFT);
         let mut predicted = None;
@@ -566,7 +572,8 @@ fn plane_revision2_mixed_wheel_order_and_key_stage_determine_the_final_fill_mode
             (app.fs_zoom, app.fs_pan, app.plane_view_pose().is_some()),
             (predicted.0, predicted.1, predicted.3)
         );
-        assert_eq!(matches!(mode(&app), PlaneFillMode::Locked(_)), inward_first);
+        assert!(matches!(mode(&app), PlaneFillMode::Locked(_)));
+        assert_eq!(mode(&app), PlaneFillMode::Locked(candidate.k_fill));
         viewer.frame(&mut app, vec![]);
         assert!(snapshot(&app).k_fill > 0.);
 
@@ -577,7 +584,7 @@ fn plane_revision2_mixed_wheel_order_and_key_stage_determine_the_final_fill_mode
         viewer.frame(&mut app, events);
         assert!(
             matches!(mode(&app), PlaneFillMode::Locked(_)),
-            "key stage restores Auto before wheel locks it"
+            "inward key preserves the lock before the ordinary wheel"
         );
         let mut events = vec![wheel(
             0.,
@@ -586,21 +593,17 @@ fn plane_revision2_mixed_wheel_order_and_key_stage_determine_the_final_fill_mode
         )];
         events.extend(key(egui::Key::F14));
         viewer.frame(&mut app, events);
-        assert_eq!(
-            mode(&app),
-            PlaneFillMode::Auto,
-            "ordinary key precedes the inward wheel"
-        );
+        assert!(matches!(mode(&app), PlaneFillMode::Locked(_)));
     }
 }
 
 #[test]
-fn plane_revision2_locked_zero_can_restore_auto_and_end_through_existing_inputs() {
+fn plane_revision2_locked_zero_stays_undistorted_and_ends_through_existing_inputs() {
     let _keys = crate::key_input::lock_test_input();
     for ending in [0, 1, 2] {
         let mut app = crate::app::setup_app_for_test();
         let mut viewer = viewer(&mut app);
-        enter(&mut app, &mut viewer);
+        enter_covered(&mut app, &mut viewer);
         set_mode(&mut app, PlaneFillMode::Locked(0.));
         viewer.frame(&mut app, vec![]);
         assert_eq!(snapshot(&app).k_fill, 0.);
@@ -608,8 +611,9 @@ fn plane_revision2_locked_zero_can_restore_auto_and_end_through_existing_inputs(
         match ending {
             0 => {
                 fisheye_wheel(&mut viewer, &mut app, 40.);
-                assert_eq!(mode(&app), PlaneFillMode::Auto);
-                assert!(snapshot(&app).k_fill > 0.);
+                assert_eq!(mode(&app), PlaneFillMode::Locked(0.));
+                assert_eq!(snapshot(&app).k_fill, 0.);
+                assert_eq!(snapshot(&app).params.values[2][0], 0.);
             }
             1 => {
                 fisheye_wheel(&mut viewer, &mut app, -40.);
@@ -635,7 +639,7 @@ fn plane_revision2_drags_rotation_and_resize_preserve_the_fill_owner() {
     for locked in [false, true] {
         let mut app = crate::app::setup_app_for_test();
         let mut viewer = viewer(&mut app);
-        enter(&mut app, &mut viewer);
+        enter_covered(&mut app, &mut viewer);
         if locked {
             ordinary_wheel(&mut viewer, &mut app, -480.);
         }
@@ -711,7 +715,7 @@ fn plane_revision2_candidates_reject_foreign_context_or_anchor_and_mounts_keep_s
     let _keys = crate::key_input::lock_test_input();
     let mut app = crate::app::setup_app_for_test();
     let mut viewer = viewer(&mut app);
-    enter(&mut app, &mut viewer);
+    enter_covered(&mut app, &mut viewer);
     let valid = app.plane_fill_lock_candidate().unwrap();
     let bad_context = PlaneFillLockCandidate {
         context: crate::app::ViewerContextId::for_test(917_202),
@@ -784,7 +788,7 @@ fn plane_revision2_linked_f11_and_scoped_mount_preserve_locked_fill() {
         app.settings.fullscreen_wheel_zoom_step =
             crate::settings::FullscreenWheelZoomStep::Percent10;
         viewer.frame(&mut app, vec![]);
-        enter(&mut app, &mut viewer);
+        enter_covered(&mut app, &mut viewer);
         ordinary_wheel(&mut viewer, &mut app, -40.);
         let locked = mode(&app);
         assert!(matches!(locked, PlaneFillMode::Locked(_)));
@@ -814,7 +818,7 @@ fn plane_revision2_a_tiny_gamepad_zoom_locks_even_when_the_existing_endpoint_ret
     let _keys = crate::key_input::lock_test_input();
     let mut app = crate::app::setup_app_for_test();
     let mut viewer = viewer(&mut app);
-    enter(&mut app, &mut viewer);
+    enter_covered(&mut app, &mut viewer);
     app.fs_zoom = ZOOM_MIN;
     viewer.frame(&mut app, vec![]);
     let before = snapshot(&app);
@@ -832,7 +836,7 @@ fn plane_revision2_locked_capture_copy_and_export_keep_the_displayed_uniform() {
     let _keys = crate::key_input::lock_test_input();
     let mut app = crate::app::setup_app_for_test();
     let mut viewer = viewer(&mut app);
-    enter(&mut app, &mut viewer);
+    enter_covered(&mut app, &mut viewer);
     ordinary_wheel(&mut viewer, &mut app, -480.);
     let frozen = snapshot(&app);
     assert!(matches!(mode(&app), PlaneFillMode::Locked(_)));
@@ -872,5 +876,388 @@ fn plane_revision2_locked_capture_copy_and_export_keep_the_displayed_uniform() {
             request.color_image().unwrap().size,
             [request.size[0] as usize, request.size[1] as usize]
         );
+    }
+}
+
+#[test]
+fn plane_revision3_locked_wheel_and_key_raise_strength_without_unlocking_or_jumping_k() {
+    let _keys = crate::key_input::lock_test_input();
+    for keyboard in [false, true] {
+        for uncovered in [false, true] {
+            for coefficient in [0., 0.1] {
+                let mut app = crate::app::setup_app_for_test();
+                let mut viewer = viewer(&mut app);
+                enter_covered(&mut app, &mut viewer);
+                app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsFisheyeIn = F13\n");
+                if uncovered {
+                    app.fs_zoom = 0.5;
+                }
+                app.fs_pan = egui::Vec2::ZERO;
+                if let FsExclusiveView::PlaneView(state) = &mut app.fs_exclusive_view {
+                    state.pose.lens_center = egui::Vec2::splat(0.5);
+                }
+                set_mode(&mut app, PlaneFillMode::Locked(coefficient));
+                viewer.frame(&mut app, vec![]);
+                for strength in [0.5, 0.75, 1.] {
+                    let before_zoom = app.fs_zoom;
+                    let expected = plane_view_wheel_transition(wheel_input_for_current_view(
+                        &mut app,
+                        &viewer.ctx,
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size),
+                        None,
+                        1.,
+                    ));
+                    if keyboard {
+                        viewer.frame(&mut app, key(egui::Key::F13));
+                    } else {
+                        fisheye_wheel(&mut viewer, &mut app, 40.);
+                    }
+                    assert_eq!(mode(&app), PlaneFillMode::Locked(coefficient));
+                    assert_eq!(app.plane_view_pose().unwrap().strength, strength);
+                    assert!((app.fs_zoom - expected.zoom).abs() < 1.0e-5);
+                    assert!((app.fs_pan - expected.pan).length() < 0.01);
+                    assert!(app.fs_zoom > before_zoom);
+                    if uncovered {
+                        assert!(app.fs_zoom <= before_zoom * 1.5 + 1.0e-6);
+                    }
+                    let drawn = snapshot(&app);
+                    assert_eq!(drawn.k_fill, coefficient);
+                    assert!((drawn.params.values[2][0] - strength * coefficient).abs() < 1.0e-6);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn plane_revision3_locked_zero_strength_holds_until_tilt_or_owned_drag_actually_ends() {
+    let _keys = crate::key_input::lock_test_input();
+    let _clear = ClearPhysicalInput;
+    for owned in [false, true] {
+        let mut app = crate::app::setup_app_for_test();
+        let mut viewer = viewer(&mut app);
+        enter_covered(&mut app, &mut viewer);
+        set_mode(&mut app, PlaneFillMode::Locked(0.1));
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[FsImage]\nFsFisheyeIn = F13\nFsPlaneTiltReset = F14\n",
+        );
+        let start = egui::pos2(500., 300.);
+        if owned {
+            app.fs_focus_regained_at = None;
+            physical_modifiers(crate::key_input::SyntheticModifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            });
+            viewer.frame(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(start),
+                    button(
+                        start,
+                        egui::PointerButton::Primary,
+                        true,
+                        egui::Modifiers::NONE,
+                    ),
+                ],
+            );
+            assert!(app.fs_canvas_drag.is_tilt());
+        } else {
+            physical_modifiers(crate::key_input::SyntheticModifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            });
+            drag(
+                &mut viewer,
+                &mut app,
+                egui::PointerButton::Primary,
+                egui::Modifiers::NONE,
+                egui::vec2(70., 35.),
+            );
+            let FsExclusiveView::PlaneView(state) = &app.fs_exclusive_view else {
+                panic!("tilted PlaneView remains active")
+            };
+            assert!(!state.tilt.is_identity());
+        }
+        let zoom_pan = (app.fs_zoom, app.fs_pan);
+        fisheye_wheel(&mut viewer, &mut app, -40.);
+        assert_eq!(app.plane_view_pose().unwrap().strength, 0.);
+        assert_eq!(mode(&app), PlaneFillMode::Locked(0.1));
+        assert_eq!((app.fs_zoom, app.fs_pan), zoom_pan);
+        assert_eq!(snapshot(&app).params.values[2][0], 0.);
+        // Inward input while strength is held at zero still belongs to this lock.
+        crate::key_input::clear_test_synthetic_input();
+        viewer.frame(&mut app, key(egui::Key::F13));
+        assert_eq!(mode(&app), PlaneFillMode::Locked(0.1));
+        assert_eq!(app.plane_view_pose().unwrap().strength, 0.25);
+        let zoom_pan = (app.fs_zoom, app.fs_pan);
+        fisheye_wheel(&mut viewer, &mut app, -40.);
+        assert_eq!((app.fs_zoom, app.fs_pan), zoom_pan);
+        assert_eq!(app.plane_view_pose().unwrap().strength, 0.);
+        assert_eq!(mode(&app), PlaneFillMode::Locked(0.1));
+        if owned {
+            assert!(app.fs_canvas_drag.is_tilt());
+            viewer.frame(
+                &mut app,
+                vec![button(
+                    start,
+                    egui::PointerButton::Primary,
+                    false,
+                    egui::Modifiers::NONE,
+                )],
+            );
+        } else {
+            viewer.frame(&mut app, key(egui::Key::F14));
+        }
+        assert!(!app.fs_exclusive_view.is_plane_view());
+        assert_eq!((app.fs_zoom, app.fs_pan), zoom_pan);
+        viewer.frame(&mut app, key(egui::Key::F13));
+        assert_eq!(mode(&app), PlaneFillMode::Auto);
+        assert_eq!(app.plane_view_pose().unwrap().strength, 0.25);
+    }
+}
+
+#[test]
+fn plane_revision3_locked_exit_preserves_size_and_only_reentry_starts_auto() {
+    let _keys = crate::key_input::lock_test_input();
+    for keyboard in [false, true] {
+        let mut app = crate::app::setup_app_for_test();
+        let mut viewer = viewer(&mut app);
+        enter_covered(&mut app, &mut viewer);
+        ordinary_wheel(&mut viewer, &mut app, -40.);
+        assert!(matches!(mode(&app), PlaneFillMode::Locked(_)));
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[FsImage]\nFsFisheyeIn = F13\nFsFisheyeOut = F14\n",
+        );
+        let zoom_pan = (app.fs_zoom, app.fs_pan);
+        let rect = app
+            .fullscreen_page_layout
+            .displayed_pages()
+            .next()
+            .unwrap()
+            .transform
+            .layout_full_image_rect;
+        if keyboard {
+            viewer.frame(&mut app, key(egui::Key::F14));
+        } else {
+            fisheye_wheel(&mut viewer, &mut app, -40.);
+        }
+        assert!(!app.fs_exclusive_view.is_plane_view());
+        assert_eq!((app.fs_zoom, app.fs_pan), zoom_pan);
+        assert_eq!(
+            app.fullscreen_page_layout
+                .displayed_pages()
+                .next()
+                .unwrap()
+                .transform
+                .layout_full_image_rect,
+            rect
+        );
+        if keyboard {
+            viewer.frame(&mut app, key(egui::Key::F13));
+        } else {
+            fisheye_wheel(&mut viewer, &mut app, 40.);
+        }
+        assert_eq!(mode(&app), PlaneFillMode::Auto);
+        assert_eq!(app.plane_view_pose().unwrap().strength, 0.25);
+    }
+}
+
+#[test]
+fn plane_revision3_locked_combined_integer_and_fractional_wheels_agree_without_overlap_correction()
+{
+    let _keys = crate::key_input::lock_test_input();
+    for coefficient in [0., 0.1] {
+        let mut reference: Option<(f32, egui::Vec2, PlaneViewPose, f32)> = None;
+        for notches in [vec![4.], vec![1.; 4], vec![0.25, 0.5, 0.75, 1.5, 1.]] {
+            let mut app = crate::app::setup_app_for_test();
+            let mut viewer = viewer(&mut app);
+            enter(&mut app, &mut viewer);
+            app.fs_pan = egui::Vec2::ZERO;
+            if let FsExclusiveView::PlaneView(state) = &mut app.fs_exclusive_view {
+                state.pose.lens_center = egui::Vec2::splat(0.5);
+            }
+            set_mode(&mut app, PlaneFillMode::Locked(coefficient));
+            viewer.frame(&mut app, vec![]);
+            for notch in notches {
+                fisheye_wheel(&mut viewer, &mut app, notch * 40.);
+                assert_eq!(mode(&app), PlaneFillMode::Locked(coefficient));
+                let cover = app.fullscreen_page_layout.plane_cover.unwrap();
+                let transform = resolve_fs_image_transform(
+                    DisplayedImageTransformInput {
+                        placement: ResolvedDisplayPlacement::Normal {
+                            zoom_pan: Some((app.fs_zoom, app.fs_pan)),
+                        },
+                        pixel_fit: RectPixelFit::Proportional,
+                        ..cover.input
+                    },
+                    cover.layout_source_size,
+                )
+                .unwrap();
+                assert_eq!(
+                    pan_correction_for_minimum_overlap(
+                        egui::Rect::from_points(&transform.paint_quad().positions),
+                        transform.viewport_rect
+                    ),
+                    egui::Vec2::ZERO
+                );
+            }
+            let current = (
+                app.fs_zoom,
+                app.fs_pan,
+                app.plane_view_pose().unwrap(),
+                snapshot(&app).params.values[2][0],
+            );
+            assert_eq!(current.2.strength, 1.);
+            if let Some(expected) = reference {
+                assert!((current.0 - expected.0).abs() < 1.0e-5);
+                assert!((current.1 - expected.1).length() < 0.01);
+                assert_eq!(current.2, expected.2);
+                assert_eq!(current.3, expected.3);
+            } else {
+                reference = Some(current);
+            }
+        }
+    }
+}
+
+#[test]
+fn plane_revision3_portrait_page_fit_draws_each_bounded_inward_step_without_extra_pan_correction() {
+    let _keys = crate::key_input::lock_test_input();
+    let mut app = crate::app::setup_app_for_test();
+    let mut viewer = viewer(&mut app);
+    let pointer = viewer.size.to_pos2() * 0.5;
+    for index in 0..3 {
+        let zoom_pan = (app.fs_zoom, app.fs_pan);
+        let input = wheel_input_for_current_view(
+            &mut app,
+            &viewer.ctx,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size),
+            Some(pointer),
+            1.,
+        );
+        let cover = input.cover.unwrap();
+        let expected = plane_view_wheel_transition(input);
+        let expected_draw = resolve_fs_image_transform(
+            DisplayedImageTransformInput {
+                placement: ResolvedDisplayPlacement::Normal {
+                    zoom_pan: Some((expected.zoom, expected.pan)),
+                },
+                pixel_fit: RectPixelFit::Texels,
+                ..cover.transform
+            },
+            cover.layout_source_size,
+        )
+        .unwrap();
+        viewer.frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(pointer),
+                wheel(0., 40., egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
+            ],
+        );
+        assert_eq!(mode(&app), PlaneFillMode::Auto);
+        assert_eq!(app.plane_view_pose(), expected.pose);
+        assert!((app.fs_zoom - expected.zoom).abs() < 1.0e-5);
+        assert!((app.fs_pan - expected.pan).length() < 0.01);
+        assert!(app.fs_zoom <= zoom_pan.0 * 1.5 + 1.0e-6);
+        assert!(
+            (app.fs_pan - zoom_pan.1).length()
+                <= cover.transform.viewport_rect.size().length() * 0.25 + 0.01
+        );
+        let drawn = app
+            .fullscreen_page_layout
+            .displayed_pages()
+            .next()
+            .unwrap()
+            .transform;
+        assert_eq!(
+            drawn, expected_draw,
+            "the real draw must not apply another placement correction"
+        );
+        if index < 2 {
+            assert_eq!(snapshot(&app).k_fill, 0.);
+        } else {
+            assert!(
+                snapshot(&app).k_fill > 0.,
+                "the portrait covers the actual canvas on the third notch"
+            );
+        }
+        let settled = (app.fs_zoom, app.fs_pan, drawn);
+        viewer.frame(&mut app, vec![]);
+        assert_eq!(
+            (
+                app.fs_zoom,
+                app.fs_pan,
+                app.fullscreen_page_layout
+                    .displayed_pages()
+                    .next()
+                    .unwrap()
+                    .transform
+            ),
+            settled
+        );
+    }
+}
+
+#[test]
+fn plane_revision3_auto_and_locked_outward_paints_only_weaker_distortion_through_exit() {
+    let _keys = crate::key_input::lock_test_input();
+    for locked in [false, true] {
+        let mut app = crate::app::setup_app_for_test();
+        let mut viewer = viewer(&mut app);
+        enter_covered(&mut app, &mut viewer);
+        fisheye_wheel(&mut viewer, &mut app, 80.);
+        app.fs_pan = egui::vec2(60., 40.);
+        if locked {
+            set_mode(&mut app, PlaneFillMode::Locked(0.1));
+        }
+        viewer.frame(&mut app, vec![]);
+        let fill_mode = mode(&app);
+        let coefficient = snapshot(&app).k_fill;
+        assert!(coefficient > 0.);
+        let zoom_pan = (app.fs_zoom, app.fs_pan);
+        let drawn = app
+            .fullscreen_page_layout
+            .displayed_pages()
+            .next()
+            .unwrap()
+            .transform;
+        let mut previous_k = snapshot(&app).params.values[2][0];
+        for strength in [0.5, 0.25, 0.] {
+            fisheye_wheel(&mut viewer, &mut app, -40.);
+            assert_eq!((app.fs_zoom, app.fs_pan), zoom_pan);
+            assert_eq!(
+                app.fullscreen_page_layout
+                    .displayed_pages()
+                    .next()
+                    .unwrap()
+                    .transform,
+                drawn
+            );
+            if strength > 0. {
+                assert_eq!(mode(&app), fill_mode);
+                assert_eq!(app.plane_view_pose().unwrap().strength, strength);
+                let paint = snapshot(&app);
+                assert_eq!(paint.k_fill, coefficient);
+                let k = paint.params.values[2][0];
+                assert!((k - strength * coefficient).abs() < 1.0e-6);
+                assert!(k > 0. && k < previous_k);
+                previous_k = k;
+            } else {
+                assert!(!app.fs_exclusive_view.is_plane_view());
+            }
+            viewer.frame(&mut app, vec![]);
+            assert_eq!((app.fs_zoom, app.fs_pan), zoom_pan);
+            assert_eq!(
+                app.fullscreen_page_layout
+                    .displayed_pages()
+                    .next()
+                    .unwrap()
+                    .transform,
+                drawn
+            );
+        }
     }
 }

@@ -349,6 +349,47 @@ impl PlaneCoverInput {
             + v * correction(v, (next_quad[3] - next_quad[0]).length());
         Some((next_zoom, next_pan))
     }
+
+    /// Advance toward the continuous cover placement, spending only its bounded notch cost.
+    /// No progress state or distant fixed point is needed; both endpoints use this frozen input.
+    fn advance_cover(
+        self,
+        zoom: f32,
+        pan: Vec2,
+        center: Pos2,
+        notches: f32,
+    ) -> Option<(f32, Vec2, f32)> {
+        let (cover_zoom, cover_pan) = self.cover(zoom, pan, center)?;
+        // Evaluate the near-unit scale limit before converting the placement back to f32.
+        let sigma = f64::from(cover_zoom) / f64::from(zoom);
+        let x = sigma.ln();
+        let dx = f64::from(cover_pan.x) - f64::from(pan.x);
+        let dy = f64::from(cover_pan.y) - f64::from(pan.y);
+        let size = self.transform.viewport_rect.size();
+        let max_pan = 0.25 * f64::from(size.x).hypot(f64::from(size.y));
+        let pan_cost = dx.hypot(dy) / max_pan * if x == 0. { 1. } else { sigma * x / x.exp_m1() };
+        let cost = (x / 1.5_f64.ln()).max(pan_cost);
+        if cost == 0. {
+            return Some((zoom, pan, notches));
+        }
+        if f64::from(notches) >= cost {
+            return Some((cover_zoom, cover_pan, (f64::from(notches) - cost) as f32));
+        }
+        let lambda = f64::from(notches) / cost;
+        let weight = if x == 0. {
+            lambda
+        } else {
+            (lambda * x).exp_m1() / x.exp_m1()
+        };
+        Some((
+            (f64::from(zoom) * (lambda * x).exp()) as f32,
+            Vec2::new(
+                (f64::from(pan.x) + weight * dx) as f32,
+                (f64::from(pan.y) + weight * dy) as f32,
+            ),
+            0.,
+        ))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -643,8 +684,6 @@ pub(crate) struct PlaneViewWheelOutcome {
     pub zoom: f32,
     pub pan: Vec2,
     pub blocked: Option<PlaneViewEntryBlock>,
-    /// The segment was handled even if its saturated geometry is unchanged.
-    pub accepted: bool,
 }
 impl PlaneViewWheelOutcome {
     pub(crate) fn changes_view(self, pose: Option<PlaneViewPose>, zoom: f32, pan: Vec2) -> bool {
@@ -659,7 +698,6 @@ pub(crate) fn plane_view_wheel_transition(input: PlaneViewWheelInput) -> PlaneVi
         zoom: input.zoom,
         pan: input.pan,
         blocked: None,
-        accepted: false,
     };
     if !input.notches.is_finite() || input.notches == 0. || !input.canvas.is_positive() {
         return out;
@@ -691,35 +729,37 @@ pub(crate) fn plane_view_wheel_transition(input: PlaneViewWheelInput) -> PlaneVi
     } else {
         input.notches
     };
-    if used == 0. {
-        // Tilt-only views have no fisheye strength left to spend. This accepted segment
-        // must not re-resolve or clamp their otherwise unchanged zoom/pan.
+    pose.strength = (pose.strength + used / 4.).clamp(0., 1.);
+    if used <= 0. {
+        // Outward segments only weaken the lens. This also retains the zero-used
+        // tilt-only pose/end decision without re-resolving or clamping zoom/pan.
         out.pose = (pose.strength > 0. || !input.tilt_is_identity || input.tilt_drag_owned)
             .then_some(pose);
-        out.accepted = true;
         return out;
     }
-    pose.strength = (pose.strength + used / 4.).clamp(0., 1.);
     let center = input.canvas.min + pose.lens_center * input.canvas.size();
-    let Some((zoom, pan)) = (if used > 0. {
-        cover.cover(out.zoom, out.pan, center)
-    } else {
-        Some((out.zoom, out.pan))
-    }) else {
+    let Some((zoom, pan, remaining)) = cover.advance_cover(out.zoom, out.pan, center, used) else {
         return out;
     };
     let mut next_zoom = zoom;
     let mut unused_pan = Vec2::ZERO;
-    crate::app::App::apply_wheel_zoom(
-        &mut next_zoom,
-        &mut unused_pan,
-        used * 40.,
-        input.step,
-        None,
-        input.canvas.center(),
-    );
-    let Some(mut next_pan) = cover.zoom_about_source(zoom, pan, next_zoom, center) else {
-        return out;
+    if remaining > 0. {
+        crate::app::App::apply_wheel_zoom(
+            &mut next_zoom,
+            &mut unused_pan,
+            remaining * 40.,
+            input.step,
+            None,
+            input.canvas.center(),
+        );
+    }
+    let mut next_pan = if next_zoom == zoom {
+        pan
+    } else {
+        let Some(pan) = cover.zoom_about_source(zoom, pan, next_zoom, center) else {
+            return out;
+        };
+        pan
     };
     let Some(final_transform) = cover.continuous(next_zoom, next_pan) else {
         return out;
@@ -735,7 +775,6 @@ pub(crate) fn plane_view_wheel_transition(input: PlaneViewWheelInput) -> PlaneVi
     out.pan = next_pan;
     out.pose =
         (pose.strength > 0. || !input.tilt_is_identity || input.tilt_drag_owned).then_some(pose);
-    out.accepted = true;
     out
 }
 
@@ -912,17 +951,14 @@ mod tests {
         let joined = step(first.pose, first.zoom, first.pan, -2.);
         let one = step(first.pose, first.zoom, first.pan, -1.);
         let split = step(one.pose, one.zoom, one.pan, -1.);
-        assert!(joined.accepted);
-        assert!(
-            !split.accepted,
-            "the second inactive exit segment is ignored"
-        );
+        assert!(!split.changes_view(one.pose, one.zoom, one.pan));
         assert_eq!(
             (joined.pose, joined.zoom, joined.pan, joined.blocked),
             (split.pose, split.zoom, split.pan, split.blocked)
         );
         assert!(joined.pose.is_none());
-        close(joined.zoom, 1. + 8. / 600.);
+        assert_eq!(joined.zoom, first.zoom);
+        assert_eq!(joined.pan, first.pan);
         assert_eq!(step(None, 1., Vec2::ZERO, -2.).zoom, 1.);
     }
     #[test]
@@ -1092,6 +1128,8 @@ mod tests {
 
 #[cfg(test)]
 mod precision_tests;
+#[cfg(test)]
+mod revision3_tests;
 #[cfg(test)]
 mod revision_tests;
 #[cfg(test)]

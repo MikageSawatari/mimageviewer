@@ -1,4 +1,5 @@
-//! Revision 1's pure geometry and wheel-transition regressions. These never create a GPU or window.
+//! Pure geometry and wheel regressions, with Revision 3's gradual entry and fixed-size exit.
+//! These never create a GPU or window.
 use super::*;
 use crate::displayed_image_transform::{
     DisplayedImageTransformInput, FullscreenFitScaleLimits, RectPixelFit, ResolvedDisplayPlacement,
@@ -105,6 +106,32 @@ fn wheel(
         cover.transform.viewport_rect,
         notches,
     )
+}
+fn wheel_until_covered(
+    cover: PlaneCoverInput,
+    current: Option<PlaneViewPose>,
+    zoom: f32,
+    pan: Vec2,
+    center: Pos2,
+) -> PlaneViewWheelOutcome {
+    // Revision 3 limits cover progress per notch. Preserve the older geometry scenarios
+    // by supplying whole notches until their continuous placement reaches canvas+.
+    let target = cover
+        .transform
+        .viewport_rect
+        .expand(PLANE_COVER_MARGIN_PHYSICAL / cover.transform.pixels_per_point);
+    let mut out = wheel(cover, current, zoom, pan, center, 1.);
+    for _ in 0..512 {
+        let q = quad(cover, out.zoom, out.pan, RectPixelFit::Proportional);
+        if corners(target)
+            .into_iter()
+            .all(|p| signed_distance(q, p) <= 0.002)
+        {
+            return out;
+        }
+        out = wheel(cover, out.pose, out.zoom, out.pan, center, 1.);
+    }
+    panic!("cover fixture did not reach canvas+: {out:?}");
 }
 fn close(a: f32, b: f32, tolerance: f32) {
     assert!(
@@ -426,13 +453,23 @@ fn plane_revision_fill_is_scale_invariant_and_matches_documented_equidistant_ang
 }
 
 #[test]
-fn plane_revision_portrait_first_notch_covers_then_applies_normal_zoom() {
+fn plane_revision_portrait_gradually_reaches_the_same_cover_target() {
     let canvas = rect(vec2(1600., 900.));
     let cover = fixture(canvas, vec2(600., 900.));
     let center = pos2(550., 450.);
-    let out = wheel(cover, None, 1., Vec2::ZERO, center, 1.);
-    close(out.zoom, (1608. / 600.) * 1.1, 0.00001);
-    close(out.pose.unwrap().strength, 0.25, 0.000001);
+    let (cover_zoom, cover_pan) = cover.cover(1., Vec2::ZERO, center).unwrap();
+    close(cover_zoom, 1608. / 600., 0.00001);
+    assert_covers(
+        quad(cover, cover_zoom, cover_pan, RectPixelFit::Proportional),
+        canvas.expand(4.),
+        0.001,
+    );
+    let first = wheel(cover, None, 1., Vec2::ZERO, center, 1.);
+    assert!(first.zoom <= 1.5 + 1.0e-6);
+    assert!(first.pan.length() <= 0.25 * canvas.size().length() + 1.0e-6);
+    assert!(first.zoom < cover_zoom);
+    close(first.pose.unwrap().strength, 0.25, 1.0e-6);
+    let out = wheel_until_covered(cover, first.pose, first.zoom, first.pan, center);
     assert_covers(
         quad(cover, out.zoom, out.pan, RectPixelFit::Proportional),
         canvas.expand(4.),
@@ -461,7 +498,7 @@ fn plane_revision_covered_zoom_keeps_source_pivot_and_pan_reentry_recovers_cover
     close(out.zoom, 2.2, 0.000001);
     let after = cover.continuous(out.zoom, out.pan).unwrap();
     assert!((after.source_normalized_to_screen(source) - center).length() < 0.001);
-    let panned = wheel(cover, out.pose, out.zoom, vec2(2000., 0.), center, 1.);
+    let panned = wheel_until_covered(cover, out.pose, out.zoom, vec2(2000., 0.), center);
     assert_covers(
         quad(cover, panned.zoom, panned.pan, RectPixelFit::Texels),
         canvas,
@@ -486,7 +523,7 @@ fn plane_revision_singleton_gap_rotation_trim_and_dpi_use_canonical_resolver() {
             zoom_pan: None,
         };
         let center = pos2(10., 450.);
-        let out = wheel(cover, None, 1.1, Vec2::ZERO, center, 1.);
+        let out = wheel_until_covered(cover, None, 1.1, Vec2::ZERO, center);
         assert_covers(
             quad(cover, out.zoom, out.pan, RectPixelFit::Proportional),
             canvas.expand(4. / 1.25),
@@ -509,12 +546,19 @@ fn plane_revision_singleton_gap_rotation_trim_and_dpi_use_canonical_resolver() {
 }
 
 #[test]
-fn plane_revision_r8_narrow_trim_reaches_cover_below_zoom_max_without_iteration() {
+fn plane_revision_r8_narrow_trim_cover_target_is_below_zoom_max_and_reached_gradually() {
     let canvas = rect(vec2(200., 200.));
     let mut cover = fixture(canvas, vec2(1000., 1000.));
     cover.transform.content_bbox = Some(Rect::from_min_max(pos2(0., 0.), pos2(0.028, 1.)));
-    let out = wheel(cover, None, 1., Vec2::ZERO, canvas.center(), 1.);
-    close(out.zoom, (208. / 5.6) * 1.1, 0.001);
+    let (cover_zoom, cover_pan) = cover.cover(1., Vec2::ZERO, canvas.center()).unwrap();
+    close(cover_zoom, 208. / 5.6, 0.001);
+    assert!(cover_zoom < crate::ui_fullscreen::ZOOM_MAX);
+    assert_covers(
+        quad(cover, cover_zoom, cover_pan, RectPixelFit::Proportional),
+        canvas.expand(4.),
+        0.002,
+    );
+    let out = wheel_until_covered(cover, None, 1., Vec2::ZERO, canvas.center());
     assert!(out.zoom < crate::ui_fullscreen::ZOOM_MAX);
     assert_covers(
         quad(cover, out.zoom, out.pan, RectPixelFit::Texels),
@@ -543,7 +587,7 @@ fn plane_revision_source_layout_pdf_raw_q_uses_shared_contain_path() {
         };
         cover.layout_source_size = Some(layout);
         cover.transform.content_bbox = Some(Rect::from_min_max(pos2(0.13, 0.08), pos2(0.89, 0.91)));
-        let out = wheel(cover, None, 1., Vec2::ZERO, canvas.center(), 1.);
+        let out = wheel_until_covered(cover, None, 1., Vec2::ZERO, canvas.center());
         let continuous = quad(cover, out.zoom, out.pan, RectPixelFit::Proportional);
         let drawn = quad(cover, out.zoom, out.pan, RectPixelFit::Texels);
         assert_covers(drawn, canvas, 0.001);
@@ -641,18 +685,18 @@ fn plane_revision_r7_and_r8_partitioned_notches_preserve_pan_strength_and_fill()
             FullscreenWheelZoomStep::Standard,
             FullscreenWheelZoomStep::Percent10,
         ] {
-            let joined = partition(cover, zoom, pan, center, 2., 1, step);
+            let joined = partition(cover, zoom, pan, center, 4., 1, step);
             assert_same(
                 cover,
                 center,
                 joined,
-                partition(cover, zoom, pan, center, 2., 2, step),
+                partition(cover, zoom, pan, center, 4., 4, step),
             );
             assert_same(
                 cover,
                 center,
                 joined,
-                partition(cover, zoom, pan, center, 2., 20, step),
+                partition(cover, zoom, pan, center, 4., 40, step),
             );
         }
     }
@@ -671,13 +715,12 @@ fn plane_revision_resize_recomputes_cover_from_current_canvas() {
     );
     let mut current = old;
     current.transform.viewport_rect = rect(vec2(900., 1600.));
-    let next = wheel(
+    let next = wheel_until_covered(
         current,
         first.pose,
         first.zoom,
         first.pan,
         current.transform.viewport_rect.center(),
-        1.,
     );
     assert!(next.zoom > first.zoom * 1.1);
     assert_covers(
@@ -688,7 +731,7 @@ fn plane_revision_resize_recomputes_cover_from_current_canvas() {
 }
 
 #[test]
-fn plane_revision_r9_resize_keeps_pure_result_and_terminal_overlap_uses_same_input() {
+fn plane_revision_r9_inward_keeps_pure_result_and_outward_keeps_input_geometry() {
     let canvas = rect(vec2(1600., 900.));
     let cover = fixture(canvas, vec2(1600., 900.));
     let center = pos2(0., 450.);
@@ -708,18 +751,13 @@ fn plane_revision_r9_resize_keeps_pure_result_and_terminal_overlap_uses_same_inp
         center,
         -1.,
     );
-    let transformed = cover.continuous(leaving.zoom, leaving.pan).unwrap();
-    let painted_bounds = Rect::from_points(&transformed.paint_quad().positions);
-    assert_eq!(
-        crate::ui_fullscreen::pan_correction_for_minimum_overlap(painted_bounds, canvas),
-        Vec2::ZERO
-    );
-    let overlap = painted_bounds.intersect(canvas);
-    assert!(overlap.width() >= 47.99 && overlap.height() >= 47.99);
+    assert_eq!(leaving.zoom, out.zoom);
+    assert_eq!(leaving.pan, vec2(100000., -100000.));
+    close(leaving.pose.unwrap().strength, 0.5, 1.0e-6);
 }
 
 #[test]
-fn plane_revision_terminal_overlap_uses_unclipped_paint_for_each_offscreen_direction() {
+fn plane_revision_inward_terminal_overlap_uses_unclipped_paint_for_each_offscreen_direction() {
     let canvas = rect(vec2(1600., 900.));
     let center = canvas.center();
     for rotation in [Rotation::None, Rotation::Cw90] {
@@ -742,7 +780,9 @@ fn plane_revision_terminal_overlap_uses_unclipped_paint_for_each_offscreen_direc
             ] {
                 let before = cover.continuous(4., pan).unwrap();
                 assert!(!before.hit_rect.is_positive(), "fixture must be offscreen");
-                let out = wheel(cover, Some(pose), 4., pan, center, -1.);
+                // Only inward transitions keep R9's terminal overlap correction (§19.2).
+                let out = wheel(cover, Some(pose), 4., pan, center, 0.01);
+                close(out.pose.unwrap().strength, 0.5025, 1.0e-6);
                 let after = cover.continuous(out.zoom, out.pan).unwrap();
                 let painted_bounds = Rect::from_points(&after.paint_quad().positions);
                 let overlap = painted_bounds.intersect(canvas);
@@ -760,7 +800,8 @@ fn plane_revision_zoom_max_uncovered_support_is_identity_but_stays_plane_view() 
     let canvas = rect(vec2(200., 200.));
     let mut cover = fixture(canvas, vec2(1000., 1000.));
     cover.material.coverage = Rect::from_min_max(pos2(0.4999, 0.), pos2(0.5001, 1.));
-    let out = wheel(cover, None, 1., Vec2::ZERO, canvas.center(), 1.);
+    // Even an unreachable cover target is approached over multiple notches (§19.2).
+    let out = wheel(cover, None, 1., Vec2::ZERO, canvas.center(), 16.);
     assert_eq!(out.zoom, crate::ui_fullscreen::ZOOM_MAX);
     assert!(out.pose.is_some());
     let q = quad(cover, out.zoom, out.pan, RectPixelFit::Texels);
@@ -797,7 +838,8 @@ fn plane_revision_four_notches_saturate_and_exit_spends_only_remaining_strength(
     let exact_exit = wheel(cover, tiny.pose, tiny.zoom, tiny.pan, canvas.center(), -0.5);
     assert_eq!(huge_exit, exact_exit);
     assert!(huge_exit.pose.is_none());
-    close(huge_exit.zoom, 2., 0.000001);
+    assert_eq!(huge_exit.zoom, tiny.zoom);
+    assert_eq!(huge_exit.pan, tiny.pan);
 }
 
 #[test]
@@ -823,7 +865,6 @@ fn plane_revision_missing_drawn_material_skips_input_without_entering_or_notifyi
             assert_eq!(out.zoom, 2.);
             assert_eq!(out.pan, vec2(5., 7.));
             assert!(out.blocked.is_none());
-            assert!(!out.accepted);
         }
     }
 }
@@ -979,7 +1020,7 @@ fn plane_revision_screen_records_fill_before_strength_even_when_strength_is_zero
 }
 
 #[test]
-fn plane_revision_new_state_uses_auto_and_accepted_is_independent_of_geometry_change() {
+fn plane_revision_new_state_uses_auto_and_noops_or_rejections_preserve_geometry_and_pose() {
     let canvas = rect(vec2(800., 600.));
     let cover = fixture(canvas, canvas.size());
     let pose = PlaneViewPose {
@@ -996,12 +1037,25 @@ fn plane_revision_new_state_uses_auto_and_accepted_is_independent_of_geometry_ch
         canvas.center(),
         1.,
     );
-    assert!(saturated.accepted);
+    assert_eq!(saturated.pose, Some(pose));
+    assert_eq!(saturated.zoom, crate::ui_fullscreen::ZOOM_MAX);
+    assert_eq!(saturated.pan, Vec2::ZERO);
+    assert_eq!(saturated.blocked, None);
     assert!(!saturated.changes_view(Some(pose), crate::ui_fullscreen::ZOOM_MAX, Vec2::ZERO));
     for notches in [0., f32::NAN, f32::INFINITY] {
-        assert!(!wheel(cover, Some(pose), 2., Vec2::ZERO, canvas.center(), notches).accepted);
+        let noop = wheel(cover, Some(pose), 2., Vec2::ZERO, canvas.center(), notches);
+        assert_eq!(noop.pose, Some(pose));
+        assert_eq!(noop.zoom, 2.);
+        assert_eq!(noop.pan, Vec2::ZERO);
+        assert_eq!(noop.blocked, None);
+        assert!(!noop.changes_view(Some(pose), 2., Vec2::ZERO));
     }
-    assert!(!wheel(cover, None, 2., Vec2::ZERO, canvas.center(), -1.).accepted);
+    let absent = wheel(cover, None, 2., Vec2::ZERO, canvas.center(), -1.);
+    assert_eq!(absent.pose, None);
+    assert_eq!(absent.zoom, 2.);
+    assert_eq!(absent.pan, Vec2::ZERO);
+    assert_eq!(absent.blocked, None);
+    assert!(!absent.changes_view(None, 2., Vec2::ZERO));
     let rejected = plane_view_wheel_transition(PlaneViewWheelInput {
         current: None,
         anchor: anchor(),
@@ -1016,9 +1070,13 @@ fn plane_revision_new_state_uses_auto_and_accepted_is_independent_of_geometry_ch
         step: FullscreenWheelZoomStep::Percent10,
         cover: Some(cover),
     });
-    assert!(!rejected.accepted);
+    assert_eq!(rejected.pose, None);
+    assert_eq!(rejected.zoom, 2.);
+    assert_eq!(rejected.pan, Vec2::ZERO);
     assert_eq!(rejected.blocked, Some(PlaneViewEntryBlock::Editing));
     let leaving = wheel(cover, Some(pose), 2., Vec2::ZERO, canvas.center(), -1.);
-    assert!(leaving.accepted);
+    assert_eq!(leaving.zoom, 2.);
+    assert_eq!(leaving.pan, Vec2::ZERO);
+    assert_eq!(leaving.blocked, None);
     assert_eq!(leaving.pose.unwrap().strength, 0.75);
 }
