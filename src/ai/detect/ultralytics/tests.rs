@@ -286,7 +286,62 @@ fn detect_ultralytics_mask_multiplies_all_coefficients_and_interpolates_logits_b
             0,
         )
         .unwrap();
-    assert!(result.patches[0].bits.iter().all(|&v| !v)); // strictly >0, never >=0
+    // Strictly >0, never >=0: an empty contour is not an adopted detection.
+    assert!(result.patches.is_empty());
+    assert!(result.detections.is_empty());
+}
+
+#[test]
+fn detect_ultralytics_empty_contours_drop_candidates_and_keep_nonempty_patches_aligned() {
+    let mut outputs = Outputs::new(2, 2, true, 8);
+    outputs.bbox(0, [2.0, 2.0, 2.0, 2.0]);
+    outputs.set(0, 4, 0.9); // strongest candidate has all-zero coefficients
+    outputs.bbox(1, [6.0, 6.0, 2.0, 2.0]);
+    outputs.set(1, 5, 0.8);
+    outputs.set(1, 6, 1.0);
+    outputs.proto[..4].fill(1.0);
+    for radius in [0, 2] {
+        let result = outputs
+            .decode(
+                true,
+                Letterbox::new([8, 8], 8).unwrap(),
+                &params(2),
+                true,
+                radius,
+            )
+            .unwrap();
+        assert_eq!(result.detections.len(), 1);
+        assert_eq!(result.detections[0].class_idx, 1);
+        assert_eq!(result.detections[0].score, 0.8);
+        assert_eq!(result.patches.len(), 1);
+        assert!(result.patches[0].bits.iter().any(|&inside| inside));
+    }
+    outputs.proto.fill(0.0);
+    let result = outputs
+        .decode(
+            true,
+            Letterbox::new([8, 8], 8).unwrap(),
+            &params(2),
+            true,
+            2,
+        )
+        .unwrap();
+    assert!(result.detections.is_empty() && result.patches.is_empty());
+    let boxed = outputs
+        .decode(
+            true,
+            Letterbox::new([8, 8], 8).unwrap(),
+            &params(2),
+            false,
+            2,
+        )
+        .unwrap();
+    assert_eq!(
+        boxed.detections.len(),
+        2,
+        "box/ellipse mode keeps valid boxes even when the contour is empty"
+    );
+    assert!(boxed.patches.is_empty());
 }
 
 #[test]
@@ -841,7 +896,7 @@ fn record_reference_mask_quality(
     mask_iou: f64,
 ) {
     stats.min_mask_iou = Some(stats.min_mask_iou.map_or(mask_iou, |min| min.min(mask_iou)));
-    let required = if box_iou >= 0.95 { 0.9 } else { 0.8 };
+    let required = 0.9;
     if mask_iou < required {
         stats.failures.push(format!(
             "mask {index} IoU {mask_iou} < {required} (box IoU {box_iou})"
@@ -1090,13 +1145,17 @@ fn detect_ultralytics_reference_box_quality_enforces_floor_and_pair_weighted_glo
 }
 
 #[test]
-fn detect_ultralytics_reference_mask_quality_uses_matched_box_iou_threshold() {
+fn detect_ultralytics_reference_mask_quality_requires_point_nine_for_every_matched_box() {
     let mut total = ReferenceTotals::default();
     for (box_iou, mask_iou, passes) in [
         (0.95, 0.9, true),
         (0.95, 0.899, false),
-        (0.949, 0.8, true),
+        (0.949, 0.9, true),
+        (0.949, 0.899, false),
+        (0.949, 0.8, false),
         (0.949, 0.799, false),
+        (0.85, 0.9, true),
+        (0.85, 0.899, false),
     ] {
         let mut stats = ReferenceComparison::default();
         record_reference_mask_quality(&mut stats, 0, box_iou, mask_iou);

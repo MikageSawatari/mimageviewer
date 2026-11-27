@@ -137,6 +137,8 @@
 - 各検出器の行には、ファイル名・分類の数・種類 (箱 / 輪郭)・ONNX に書かれたライセンス文字列 (あれば) を出す。
 - 文言は処理内容だけを書く (例:「顔を検出して楕円のマスクを追加します」)。「投稿用」などの用途判定の語は使わない。
 - 読めなかったファイルは灰色の行で理由を出す (例:「出力の形式を読めません」)。黙って隠さない。
+- 選択済み BYO の設定がある間は、一覧が Ready になるまで [検出] を押せない。Ready 後は読める・分類が選ばれた検出器だけを要求に含める。
+  読めない／不在／分類未選択の BYO の設定は残すが実行しない。それらしかなければ顔の選択ありで顔だけを実行でき、顔も未選択なら開始できない。
 
 ### 4.3 置き場所とボタンを押せる条件
 
@@ -197,6 +199,8 @@
   (元マスクの解像度で 0/1 にしてから拡大すると、元の画像では約 30px の階段になるため)。そのあと §4.2 の余白
   (**元の画像の px**) ぶん太らせる。結果は **検出ごとの小さなパッチ** (画像座標の矩形 + その範囲のビット列) にする
   (§7.4 の UI スレッドの負荷のため)。この方法で ultralytics の `retina_masks` と IoU 中央値 0.999 (最小 0.97) だった。
+- 輪郭に沿うモードで全画素 false のパッチは検出 worker で候補と一緒に捨て、分類別件数も残った候補から集計する。
+  全候補が空なら 0 件とし、UI の Undo・書き先作成・Raster 変換・表示 ON に進まない。楕円／矩形のモードは箱を使う。
 - **YuNet (段 0 で OpenCV と一致を確認、§17)**: 入力は **BGR、0..255 のまま、縦横を 32 の倍数へ右下に 0 で埋める**。
   出力は stride 8 / 16 / 32 ごとに、`score = sqrt(clamp(cls) × clamp(obj))`、
   `cx = (列 + bbox0) × stride`、`cy = (行 + bbox1) × stride`、`w = exp(bbox2) × stride`、`h = exp(bbox3) × stride`
@@ -988,7 +992,7 @@ mask_detect_parked_empty_receiver_keeps_root_poll_awake_until_result
 - ignored `detect_ultralytics_reference_matches_external_models` は `MIV_DETECT_REFERENCE` の外部 JSON を読み、
   外部モデルの実セッション経路で検出し、同分類・箱 IoU ≥ 0.5 の全組を IoU 降順に貪欲に 1 対 1 に対応させる。
   対応箱は全組 IoU ≥ 0.85・score 差 ≤ 0.05、かつ全ケースの全組を合わせて 95% 以上が IoU ≥ 0.95 とする（ケースごとの割合の平均ではない）。
-  未対応は両側とも score < 閾値 + 0.03 だけ許す。輪郭は対応箱の IoU ≥ 0.95 なら IoU ≥ 0.9、それ未満なら IoU ≥ 0.8 を検査する。
+  未対応は両側とも score < 閾値 + 0.03 だけ許す。輪郭は対応箱の IoU にかかわらず全組 IoU ≥ 0.9 を検査する。
   参照 PNG は Ultralytics の余白前の結果なので、同じ推論・読取経路の private 入口から半径 0 を渡して比較する。
   製品入口の余白は常に最小 2px で、正方形の太らせと端の切詰めは別の単体テストで検査する。
   ONNX・画像・参照 JSON は追加していない。この ignored テストは既存の nextest `gpu` group に登録した。
@@ -1038,7 +1042,7 @@ detect_ultralytics_rejects_invalid_options_and_honors_cancel
 detect_ultralytics_reference_matches_external_models
 detect_ultralytics_reference_matching_is_global_iou_greedy_with_half_iou_cutoff
 detect_ultralytics_reference_box_quality_enforces_floor_and_pair_weighted_global_ratio
-detect_ultralytics_reference_mask_quality_uses_matched_box_iou_threshold
+detect_ultralytics_reference_mask_quality_requires_point_nine_for_every_matched_box
 detect_ultralytics_reference_jpeg_uses_full_size_without_exif_orientation
 detect_ultralytics_reference_unmatched_diagnostic_searches_all_opposite_classes
 detect_ultralytics_reference_allows_only_strict_boundary_unmatched_on_either_side
@@ -1175,3 +1179,37 @@ htdocs/mimageviewer/manual/troubleshooting.html
 htdocs/mimageviewer/manual/tutorial.html
 htdocs/mimageviewer/manual/video.html
 ```
+
+### 23.6 設計担当が依頼した独立レビューの P2 対応（対象 7ca8732ff、修正後の検証待ち）
+
+- 設計担当から、別担当 Sol / xhigh の独立レビューは **REJECT、P1 なし・P2 3 件**との全文を受領した。
+  設計担当も 3 件をコードと照合して妥当と判断した。以下はその修正であり、修正後の独立レビューの結果ではない。
+- P2-1: 顔の選択を採用する前に、選択済み BYO があれば一覧が Ready であることを受付条件に加えた。
+  同じ条件を UI のボタンと要求捕捉で使い、Loading 中に顔だけの要求を作らない。
+  Ready 後の読めない／不在／分類未選択は設定を残し、顔が選ばれていれば顔だけ、選ばれていなければ開始不可とする。
+- P2-2: Ultralytics の輪郭読取でパッチの全 false を除外し、対応する検出候補も返さない。
+  worker の既存の結果合流を `MaskDetectOutput::append_ultralytics_result` へ抽出し、分類別件数は採用候補と揃える。
+  箱／楕円のモードは輪郭が空でも有効な箱を残す。UI に空パッチを捨てる追加走査やガードは足さない。
+- P2-3: 参照照合の輪郭の下限を、対応箱の IoU によらず 0.9 へ戻した。0.8 への緩和は撤回し、§23.2 と単体テストを更新した。
+  箱の貪欲対応・全組 0.85 以上・全体 95% 以上が 0.95 以上、score 差と未対応の境目の基準は維持する。
+- 追加テスト（成功の記録ではない）:
+
+```text
+mask_detect_selected_byo_blocks_start_until_catalog_ready_and_is_captured
+mask_detect_ready_unavailable_byo_requires_face_or_another_executable_detector
+mask_detect_empty_contour_worker_result_keeps_masks_history_targets_and_visibility
+mask_detect_contour_counts_follow_adopted_worker_detections
+detect_ultralytics_empty_contours_drop_candidates_and_keep_nonempty_patches_aligned
+```
+
+輪郭の既存テスト `detect_ultralytics_mask_multiplies_all_coefficients_and_interpolates_logits_before_threshold` は
+全ゼロのロジットで候補も空になる検査に広げた。基準テストは
+`detect_ultralytics_reference_mask_quality_requires_point_nine_for_every_matched_box` に改名し、
+箱 IoU 0.95／0.949／0.85 のいずれでも輪郭 0.9 は成功・0.899 は失敗になる条件を検査する。
+App の 0 件テストは 3 ツールと補正レイヤーの Raster／未作成追加／未作成削除を対象に、
+件数・マスク・文書・Undo・表示状態・「見つかりませんでした」を検査する。
+すべて `test(/mask_detect|^ai::detect::/)` に含まれる。
+
+- cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動、git add / commit は実行しない依頼で、未実行。
+  自動検証・実モデル照合・独立レビューの再判定は設計担当へ引き継ぐ。
+- 今回の `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。`python scripts/check_ui_glyphs.py` は危険 glyph 0。

@@ -1,7 +1,9 @@
 //! 自動検出の受付・所有・結果採用。要求の世代は表示位置の付け直しで変更しない。
 
 use super::*;
-use crate::ai::detect::{DetectError, Detection, FaceDetectParams, MaskPatch, UltralyticsParams};
+use crate::ai::detect::{
+    DetectError, Detection, FaceDetectParams, MaskPatch, UltralyticsOutput, UltralyticsParams,
+};
 use crate::ai::detector_catalog::{DetectorEntry, DetectorFormat, DetectorInfo, DetectorShape};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -116,6 +118,40 @@ struct MaskDetectOutput {
     boxes: Vec<DetectedBox>,
     patches: Vec<MaskPatch>,
     counts: Vec<(String, usize)>,
+}
+
+impl MaskDetectOutput {
+    /// Merge worker results after detection has discarded empty contours, keeping
+    /// the reported class counts aligned with the masks actually being adopted.
+    fn append_ultralytics_result(
+        &mut self,
+        chosen: &ChosenDetector,
+        result: UltralyticsOutput,
+        margin_percent: f32,
+    ) {
+        for (class_idx, name) in chosen.info.names.iter().enumerate() {
+            let count = result
+                .detections
+                .iter()
+                .filter(|d| d.class_idx == class_idx)
+                .count();
+            if count > 0 {
+                self.counts
+                    .push((format!("{} / {name}", chosen.info.name), count));
+            }
+        }
+        if chosen.shape == DetectorShape::Contour {
+            self.patches.extend(result.patches);
+        } else {
+            let shape_options = crate::settings::MaskDetectSettings {
+                ellipse: chosen.shape == DetectorShape::Ellipse,
+                margin_percent,
+                ..Default::default()
+            };
+            self.boxes
+                .extend(mask_detect_boxes(result.detections, &shape_options).boxes);
+        }
+    }
 }
 
 /// Worker output in image coordinates; mask types are constructed only on the UI.
@@ -500,6 +536,18 @@ impl App {
     }
 
     fn mask_detect_selection_valid(&self) -> bool {
+        // Until the catalog is terminal, selected BYO models cannot be resolved
+        // into the immutable request. Do not silently run only the selected face.
+        if self
+            .settings
+            .mask_detect
+            .detectors
+            .values()
+            .any(|setting| setting.selected)
+            && !matches!(&*self.mask_detect_catalog, DetectorCatalogState::Ready(_))
+        {
+            return false;
+        }
         if self.settings.mask_detect.face_selected {
             return true;
         }
@@ -726,30 +774,7 @@ impl App {
                             trace_label,
                         )
                         .map_err(MaskDetectError::Detect)?;
-                        for (class_idx, name) in chosen.info.names.iter().enumerate() {
-                            let count = result
-                                .detections
-                                .iter()
-                                .filter(|d| d.class_idx == class_idx)
-                                .count();
-                            if count > 0 {
-                                output
-                                    .counts
-                                    .push((format!("{} / {name}", chosen.info.name), count));
-                            }
-                        }
-                        if contour {
-                            output.patches.extend(result.patches);
-                        } else {
-                            let shape_options = crate::settings::MaskDetectSettings {
-                                ellipse: chosen.shape == DetectorShape::Ellipse,
-                                margin_percent: options.margin_percent,
-                                ..Default::default()
-                            };
-                            output
-                                .boxes
-                                .extend(mask_detect_boxes(result.detections, &shape_options).boxes);
-                        }
+                        output.append_ultralytics_result(&chosen, result, options.margin_percent);
                     }
                     Ok(output)
                 }
@@ -1111,6 +1136,8 @@ impl App {
                                 vec![start.rect, dismiss.rect],
                             )
                         });
+                        #[cfg(test)]
+                        ctx.data_mut(|data| data.insert_temp(egui::Id::unique("mask_detect_start_enabled"), start.enabled()));
                     });
                 })
         });

@@ -90,7 +90,11 @@ pub(super) fn mask_detect_install_source(
     }
 }
 
-fn mask_detect_install_local(app: &mut App, mask: LocalMask, target: LocalAdjustMaskEditTarget) {
+pub(super) fn mask_detect_install_local(
+    app: &mut App,
+    mask: LocalMask,
+    target: LocalAdjustMaskEditTarget,
+) {
     app.local_page_edit_document = LocalPageEditDocument::Idle;
     app.adopt_materialized_local_layers(
         0,
@@ -104,7 +108,7 @@ fn mask_detect_install_local(app: &mut App, mask: LocalMask, target: LocalAdjust
     app.local_adjust_mask_edit_target = target;
 }
 
-fn mask_detect_history(app: &App) -> (usize, usize, usize) {
+pub(super) fn mask_detect_history(app: &App) -> (usize, usize, usize) {
     (
         app.erase_undo_stack.len(),
         app.conceal_undo_stack.len(),

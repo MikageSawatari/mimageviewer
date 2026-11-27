@@ -449,14 +449,11 @@ fn decode(
         if contour {
             let coefficients: [f32; 32] =
                 std::array::from_fn(|i| at(4 + classes + i, candidate.anchor));
-            output.patches.push(mask_patch(
-                r,
-                coefficients,
-                &outputs[1],
-                lb,
-                radius,
-                cancel,
-            )?);
+            let patch = mask_patch(r, coefficients, &outputs[1], lb, radius, cancel)?;
+            if !patch.bits.iter().any(|&inside| inside) {
+                continue;
+            }
+            output.patches.push(patch);
         }
         output.detections.push(candidate.detection);
     }

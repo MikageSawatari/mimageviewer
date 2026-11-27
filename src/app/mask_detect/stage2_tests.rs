@@ -1,4 +1,7 @@
-use super::tests::{mask_detect_fixture, mask_detect_output, mask_detect_queue};
+use super::tests::{
+    mask_detect_fixture, mask_detect_history, mask_detect_install_local, mask_detect_output,
+    mask_detect_queue,
+};
 use super::*;
 use crate::ai::detector_catalog::DetectorReadError;
 use crate::ai::runtime::ExternalModelKey;
@@ -31,6 +34,223 @@ fn patch() -> MaskPatch {
         h: 2,
         bits: vec![true, false, false, true],
     }
+}
+
+#[test]
+fn mask_detect_selected_byo_blocks_start_until_catalog_ready_and_is_captured() {
+    let _input = crate::key_input::lock_test_input();
+    let mut app = mask_detect_fixture(MaskDetectTool::Erase);
+    app.settings.mask_detect.detectors.insert(
+        "saved".into(),
+        crate::settings::ExternalDetectorSettings {
+            selected: true,
+            ..Default::default()
+        },
+    );
+    *app.mask_detect_catalog = DetectorCatalogState::Idle;
+    assert!(!app.mask_detect_selection_valid());
+    assert!(
+        app.capture_mask_detect_request(MaskDetectTool::Erase)
+            .is_none()
+    );
+    let (tx, rx) = mpsc::channel();
+    *app.mask_detect_catalog = DetectorCatalogState::Loading {
+        cancel: Arc::new(AtomicBool::new(false)),
+        rx,
+    };
+    app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    let frame = |app: &mut App| {
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1093.0, 614.0),
+                )),
+                ..Default::default()
+            },
+            |ui| app.show_mask_detect_dialog(ui.ctx()),
+        )
+        .drop_without_applying_deltas();
+    };
+    for _ in 0..3 {
+        frame(&mut app);
+    }
+    assert_eq!(
+        ctx.data(|d| d.get_temp::<bool>(egui::Id::unique("mask_detect_start_enabled"))),
+        Some(false)
+    );
+    assert!(!app.mask_detect_selection_valid());
+    assert!(
+        app.capture_mask_detect_request(MaskDetectTool::Erase)
+            .is_none()
+    );
+    tx.send(Ok(vec![entry("saved")])).unwrap();
+    frame(&mut app);
+    assert_eq!(
+        ctx.data(|d| d.get_temp::<bool>(egui::Id::unique("mask_detect_start_enabled"))),
+        Some(true)
+    );
+    let request = app
+        .capture_mask_detect_request(MaskDetectTool::Erase)
+        .unwrap();
+    assert!(request.options.face_selected);
+    assert_eq!(request.detectors.len(), 1);
+    assert_eq!(request.detectors[0].info.name, "saved");
+    assert_eq!(
+        request.detectors[0].params.selected_classes,
+        vec![true, true]
+    );
+}
+
+#[test]
+fn mask_detect_ready_unavailable_byo_requires_face_or_another_executable_detector() {
+    for face in [false, true] {
+        for state in 0..4 {
+            let mut app = mask_detect_fixture(MaskDetectTool::Erase);
+            app.settings.mask_detect.face_selected = face;
+            app.settings.mask_detect.detectors.insert(
+                "saved".into(),
+                crate::settings::ExternalDetectorSettings {
+                    selected: true,
+                    classes: (state == 2).then(Vec::new),
+                    ..Default::default()
+                },
+            );
+            *app.mask_detect_catalog = DetectorCatalogState::Ready(match state {
+                0 => Ok(Vec::new()), // temporarily absent
+                1 => Ok(vec![DetectorEntry {
+                    name: "saved".into(),
+                    result: Err(DetectorReadError::OutputShape),
+                }]),
+                2 => Ok(vec![entry("saved")]), // no selected classes
+                _ => Err("catalog read failed".into()),
+            });
+            assert_eq!(
+                app.mask_detect_selection_valid(),
+                face,
+                "face={face}, state={state}"
+            );
+            let request = app.capture_mask_detect_request(MaskDetectTool::Erase);
+            assert_eq!(request.is_some(), face);
+            if let Some(request) = request {
+                assert!(request.options.face_selected);
+                assert!(request.detectors.is_empty());
+            }
+            assert!(app.settings.mask_detect.detectors["saved"].selected);
+        }
+    }
+}
+
+#[test]
+fn mask_detect_empty_contour_worker_result_keeps_masks_history_targets_and_visibility() {
+    for (tool, target) in [
+        (MaskDetectTool::Erase, LocalAdjustMaskEditTarget::Base),
+        (MaskDetectTool::Conceal, LocalAdjustMaskEditTarget::Base),
+        (MaskDetectTool::LocalAdjust, LocalAdjustMaskEditTarget::Base),
+        (
+            MaskDetectTool::LocalAdjust,
+            LocalAdjustMaskEditTarget::OverrideAdd,
+        ),
+        (
+            MaskDetectTool::LocalAdjust,
+            LocalAdjustMaskEditTarget::OverrideSubtract,
+        ),
+    ] {
+        let mut app = mask_detect_fixture(tool);
+        if tool == MaskDetectTool::LocalAdjust {
+            let mask = if target == LocalAdjustMaskEditTarget::Base {
+                local_adjust_core::LocalMask::Raster(local_adjust_core::RasterMask {
+                    width: 8,
+                    height: 8,
+                    alpha: Arc::new(vec![0.25; 64]),
+                })
+            } else {
+                local_adjust_core::LocalMask::LinearGradient(Default::default())
+            };
+            mask_detect_install_local(&mut app, mask, target);
+        }
+        app.local_adjust_show_mask = false;
+        app.settings.mask_detect.face_selected = false;
+        app.settings.mask_detect.detectors.insert(
+            "empty".into(),
+            crate::settings::ExternalDetectorSettings {
+                selected: true,
+                ..Default::default()
+            },
+        );
+        *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(vec![entry("empty")]));
+        let before = app.local_adjust_page_layers.get(&0).cloned();
+        let history = mask_detect_history(&app);
+        let request = app.capture_mask_detect_request(tool).unwrap();
+        let mut output = MaskDetectOutput::default();
+        // Detection removes the all-false contour and its candidate together.
+        // Inject that worker contract through the production merge and poll.
+        output.append_ultralytics_result(
+            &request.detectors[0],
+            UltralyticsOutput {
+                detections: Vec::new(),
+                patches: Vec::new(),
+            },
+            request.options.margin_percent,
+        );
+        assert!(output.counts.is_empty());
+        assert!(output.boxes.is_empty() && output.patches.is_empty());
+        mask_detect_queue(&mut app, request, output);
+        app.poll_mask_detect(&egui::Context::default());
+        assert_eq!(app.local_adjust_page_layers.get(&0), before.as_ref());
+        assert_eq!(mask_detect_history(&app), history);
+        assert!(!app.local_adjust_show_mask);
+        assert!(app.erase_shapes.is_empty() && app.conceal_shapes.is_empty());
+        assert_eq!(app.erase_mask.as_deref(), Some([false; 64].as_slice()));
+        assert_eq!(app.conceal_mask.as_deref(), Some([false; 64].as_slice()));
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "見つかりませんでした"
+        );
+    }
+}
+
+#[test]
+fn mask_detect_contour_counts_follow_adopted_worker_detections() {
+    let catalog = DetectorCatalogState::Ready(Ok(vec![entry("mixed")]));
+    let mut options = crate::settings::MaskDetectSettings::default();
+    options.detectors.insert(
+        "mixed".into(),
+        crate::settings::ExternalDetectorSettings {
+            selected: true,
+            ..Default::default()
+        },
+    );
+    let chosen = chosen_detectors(&catalog, &options).remove(0);
+    let mut output = mask_detect_output();
+    output.append_ultralytics_result(
+        &chosen,
+        UltralyticsOutput {
+            detections: vec![Detection {
+                class_idx: 1,
+                score: 0.8,
+                rect: [1.0, 0.0, 3.0, 2.0],
+            }],
+            patches: vec![patch()],
+        },
+        options.margin_percent,
+    );
+    output.append_ultralytics_result(
+        &chosen,
+        UltralyticsOutput {
+            detections: Vec::new(),
+            patches: Vec::new(),
+        },
+        options.margin_percent,
+    );
+    assert_eq!(output.boxes.len(), 1); // existing face result is kept
+    assert_eq!(output.patches.len(), 1);
+    assert_eq!(
+        output.counts,
+        vec![("顔".into(), 1), ("mixed / second".into(), 1)]
+    );
 }
 
 #[test]
