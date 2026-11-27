@@ -1078,7 +1078,8 @@ impl crate::app::App {
     }
 
     pub(crate) fn grid_context_menu_owner_is_current(&self, owner: GridContextMenuOwner) -> bool {
-        (owner.index == usize::MAX || self.grid_item_input_allowed())
+        !self.detached_viewer_editing_blocks_grid_input()
+            && (owner.index == usize::MAX || self.grid_item_input_allowed())
             && owner.context_id == self.collection_grid_context_id()
             && owner.items_generation == self.items_generation
     }
@@ -1978,6 +1979,12 @@ impl crate::app::App {
         ),
         G: FnOnce(&mut Self, &egui::Context, PathBuf),
     {
+        if target.surface == ContextMenuSurface::Grid
+            && self.detached_viewer_editing_blocks_grid_input()
+        {
+            self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+            return None;
+        }
         if let MenuCommand::ScriptSlot(slot) = command {
             if target.surface != ContextMenuSurface::Grid {
                 return None;

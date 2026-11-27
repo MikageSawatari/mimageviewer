@@ -930,6 +930,7 @@ impl App {
             self.show_feedback_warning("固定する items がありません".into());
             return;
         }
+        self.end_page_edit_tools_for_viewer_item_change("snapshot_activate");
         self.normalize_direct_media_basis_for_snapshot();
         let accepted_policy = self.page_identity_index.policy.clone();
         let source_had_exact_page_edits = self.page_edit_snapshot.is_some();
@@ -1340,6 +1341,9 @@ impl App {
     /// origin と一致する場合のみ復元、不一致の場合は current_folder の通常 reload を
     /// 行う (= snapshot state を捨てるだけ)。
     pub(crate) fn deactivate_snapshot(&mut self) {
+        if self.snapshot.is_some() {
+            self.end_page_edit_tools_for_viewer_item_change("snapshot_deactivate");
+        }
         let Some(snap) = self.snapshot.take() else {
             return;
         };

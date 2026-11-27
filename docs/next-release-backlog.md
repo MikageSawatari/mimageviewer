@@ -42,7 +42,7 @@
 
 ### 1.920 別ウィンドウで隠蔽加工の編集中に外からページが替わると、編集中の図形が新しい画像へ引き継がれて保存される — §1.914 のサブ PC 確認から (2026-11-27)
 
-- 状態: **v5.9.0 で直す (利用者決定 2026-11-27)、未着手**。リリース済み (v5.8.0 にも同じ経路がある、`src/app.rs` の `conceal: active edit rescaled ... reason=exit_save`)。
+- 状態: **実装済み・ブランチ conceal-920、自動テストと独立実装レビューは ClaudeCode が実施予定、実機未確認**。正本は [page-edit-item-change-plan.md](page-edit-item-change-plan.md)。スマートフォルダの固定結果は同書 §3.4.2 の補足どおり維持し、保存・終了を検証と旧 root 捕捉の前へ揃えた。固定結果のバッジが保存後に古く見え得る既存挙動は本件の範囲外。
 - 観測 (サブ PC の Claude、ブランチ auto-conceal-914 1144dcf76 のビルド、記録は `C:\home\mimageviewer-subpc\v590-914\results\notes.md`): F12 の別ウィンドウで隠蔽加工 (Ctrl+M) を開き、矩形を描いたまま、メインの一覧で別の画像をダブルクリックすると、別ウィンドウのページだけが替わる (ログ `active-detached-session session_begin previous=Some(1) next=Some(1)`、その間に conceal の reset / enter が無い)。図形は新しい画像の縦横に引き伸ばされて残り、パネルを閉じると新しい画像の隠蔽加工として保存される (`rescaled idx=1 reason=exit_save 1920x1080->1080x1920 shapes=1`)。自動検出を使わず手で描いた矩形でも、生成した単色画像でも起きる。画像ファイル本体は変わらない。
 - 見立て (§1.914 担当のコード読み、未検証): 隠蔽加工・消しゴムの編集中の下書きが viewer context の束でなく App 共通にあり、外からのページ切り替えがモードの終了・リセットを通らない。detached リワークの分類では BA-7 系 (context 固有の状態の置き場) の候補。消しゴム・補正レイヤーなど同型の編集モードと、ほかの外からのページ切り替えの入口も列挙して確かめる。
 - detached の経路に触れるので、CLAUDE.md の「Detached viewer リワーク中のルール」に従う (BA 番号の対応付け、双方のレビューで構造的修正と合意、[detached-rework-plan.md](detached-rework-plan.md) への記録)。

@@ -2398,3 +2398,7 @@ mod manual_nav_wrap_book;
 #[cfg(test)]
 #[path = "../ui_fullscreen/in_page_scroll/permission_landing_tests.rs"]
 mod scroll_landing_tests;
+
+#[cfg(test)]
+#[path = "page_edit_permission_admission_tests.rs"]
+mod page_edit_admission_tests;

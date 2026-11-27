@@ -11620,10 +11620,11 @@ impl App {
     /// この境界で揃える。終了時の状態が次回起動へ漏れないよう、元画像比較は OFF、
     /// マスク表示は ON から始める。
     pub(crate) fn enter_local_adjust_mode(&mut self, ctx: &egui::Context) {
-        if self
-            .fullscreen_idx
-            .is_some_and(|fs_idx| !self.fullscreen_edit_mode_entry_allowed(fs_idx))
-        {
+        let entry_allowed = match self.fullscreen_idx {
+            Some(fs_idx) => self.fullscreen_edit_mode_entry_allowed(fs_idx),
+            None => self.page_edit_mode_navigation_entry_allowed(),
+        };
+        if !entry_allowed {
             return;
         }
         // 他の 4 ツールと同じく、編集する 1 ページを単独で表示してから始める。
@@ -11655,6 +11656,7 @@ impl App {
             }
         }
         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
+        self.stop_projected_slideshow_playback();
         self.local_adjust_mode = true;
         self.local_adjust_show_source = false;
         self.local_adjust_show_mask = true;

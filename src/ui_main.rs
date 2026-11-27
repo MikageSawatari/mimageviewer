@@ -22194,6 +22194,23 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let nav = egui::CentralPanel::default()
             .show(root_ui, |ui| -> Option<AddressBarNav> {
                 if !self.grid_item_input_allowed() {
+                    if self.detached_viewer_editing_blocks_grid_input() {
+                        // Preserve the disabled list's extent for native drop hit-testing,
+                        // including empty and filtered-empty early returns below.
+                        self.record_main_drop_grid_geometry(ui, ui.max_rect(), Vec::new());
+                        let presses = ctx.input(|input| input.events.iter().filter_map(|event| match event {
+                            egui::Event::PointerButton { pos, pressed: true, .. }
+                            | egui::Event::Touch { pos, phase: egui::TouchPhase::Start, .. } => {
+                                ui.max_rect().contains(*pos).then_some(*pos)
+                            }
+                            _ => None,
+                        }).collect::<Vec<_>>());
+                        if ctx.viewport_id() == egui::ViewportId::ROOT
+                            && presses.iter().any(|pos| ctx.layer_id_at(*pos) == Some(ui.layer_id()))
+                        {
+                            self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+                        }
+                    }
                     ui.disable();
                 }
                 let suppress_primary_pointer = self.begin_grid_right_drag_primary_frame(ctx);

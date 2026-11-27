@@ -3946,6 +3946,8 @@ impl App {
         }
         let boundary_plan = self.physical_main_list_boundary_plan(&prepared_visible);
         self.adopt_main_list_navigation(adoption, boundary_plan, |app, boundary| {
+            // The old root's captured cell state must include the same save as an Esc exit.
+            app.end_page_edit_tools_for_viewer_item_change("smart_child_projection");
             app.adopt_smart_child_session(request_id, root, target, &source);
             let hydration = app.install_adopted_smart_child_ready(
                 request_id,
@@ -4759,6 +4761,13 @@ impl App {
                             }
                         }
                     } else {
+                        // This current request is about to replace the visible root. A child
+                        // target is still only entering preflight and must retain its draft.
+                        if matches!(transition.target, SmartFolderTransitionTarget::Root(_)) {
+                            self.end_page_edit_tools_for_viewer_item_change(
+                                "smart_root_projection",
+                            );
+                        }
                         let latest_presentation = SmartFolderPresentation::for_location(
                             self,
                             &smart_folder_synthetic_path(current_definition.id),
@@ -8978,6 +8987,10 @@ impl App {
         let Some(navigation) = navigation else {
             return false;
         };
+        if self.main_list_navigation_is_current(&navigation) {
+            // Finish against the old item space before inspecting the retained root.
+            self.end_page_edit_tools_for_viewer_item_change("smart_root_restore");
+        }
         let state = self
             .top_level_grid_view
             .smart_folder()
@@ -9362,6 +9375,10 @@ impl App {
             self.retire_prepared_smart_folder(prepared);
             let _ = self.refresh_smart_folder_staged(id);
             return false;
+        }
+        if self.smart_folder_source_lease().is_some() {
+            // Finish the outgoing draft before inspecting the candidate's metadata.
+            self.end_page_edit_tools_for_viewer_item_change("smart_prepared_projection");
         }
         let PreparedSmartFolder {
             snapshot,
@@ -10179,6 +10196,10 @@ impl App {
         ctx.request_repaint_after(Duration::from_millis(50));
     }
 }
+
+#[cfg(test)]
+#[path = "page_edit_smart_tests.rs"]
+mod page_edit_item_change_tests;
 
 #[cfg(test)]
 mod tests {

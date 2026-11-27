@@ -18,6 +18,7 @@
 /// The owner which blocks grid item input. Physical scan waits also suppress legacy stack keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GridItemInputBlock {
+    DetachedViewerEditing,
     BookStructuralOperation,
     ImageFolderZip,
     LocationNavigation,
@@ -25,6 +26,9 @@ pub(crate) enum GridItemInputBlock {
     ViewOrderRefreshScan,
     StackRefresh,
 }
+
+pub(crate) const DETACHED_VIEWER_EDITING_GRID_NOTICE: &str =
+    "別ウィンドウで編集中です。別ウィンドウで Esc を押して編集を終えると、一覧を使えます";
 
 impl GridItemInputBlock {
     /// Refreshing the order keeps the current location's non-item controls usable.
@@ -1431,6 +1435,9 @@ impl crate::app::App {
             rule,
             error,
         } = ready;
+        // Finishing an outgoing draft advances page-edit stamps. Do this before
+        // validating the candidate, so a pre-save projection is prepared again.
+        self.end_page_edit_tools_for_viewer_item_change("stack_grouping");
         let valid = read
             .result
             .as_ref()
@@ -2401,6 +2408,10 @@ impl crate::app::App {
             if self.stack_view.as_ref().is_some_and(|current| Arc::ptr_eq(current, view)))
         {
             Some(GridItemInputBlock::StackRefresh)
+        } else if self.detached_viewer_editing_blocks_grid_input() {
+            // The open boundary exempts only this reason. Existing ownership
+            // barriers must keep precedence when editing overlaps their wait.
+            Some(GridItemInputBlock::DetachedViewerEditing)
         } else {
             None
         }
@@ -2409,6 +2420,65 @@ impl crate::app::App {
     /// All item input (key, pointer, touch, ring, gamepad and menu) shares this gate.
     pub(crate) fn grid_item_input_allowed(&self) -> bool {
         self.grid_item_input_block().is_none()
+    }
+
+    /// The App-wide draft belongs to the foreground context, never a temporarily mounted sibling.
+    pub(crate) fn detached_viewer_editing_blocks_grid_input(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.page_edit_tools_owned_by_projected_context()
+                && self.current_viewer_session_is_detached_or_switching()
+                && !self.detached_viewer_independent_active
+                && self.is_overlay_edit_mode_active()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// Called only when an input was rejected. Merely querying the gate must stay silent.
+    pub(crate) fn notify_detached_viewer_editing_grid_input_blocked(
+        &mut self,
+        ctx: &eframe::egui::Context,
+    ) {
+        let frame = ctx.cumulative_frame_nr();
+        let already_notified = ctx.data_mut(|data| {
+            let id = eframe::egui::Id::unique("detached_viewer_editing_grid_notice_frame");
+            let already = data.get_temp::<u64>(id) == Some(frame);
+            data.insert_temp(id, frame);
+            already
+        });
+        if already_notified {
+            return;
+        }
+        self.show_feedback_toast_on(
+            DETACHED_VIEWER_EDITING_GRID_NOTICE.to_owned(),
+            crate::app::ActionSurface::MainWindow,
+        );
+    }
+
+    pub(crate) fn notify_detached_viewer_editing_grid_key_input(
+        &mut self,
+        ctx: &eframe::egui::Context,
+    ) {
+        if !self.shortcuts_blocked_by_text_input(ctx)
+            && !self.ime_input_active(ctx)
+            && ctx.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        eframe::egui::Event::Key {
+                            pressed: true,
+                            repeat: false,
+                            ..
+                        }
+                    )
+                })
+            })
+        {
+            self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+        }
     }
 
     fn swap_stack_view_items(
@@ -2644,6 +2714,78 @@ mod tests {
         pending.rx = rx;
         app.stack_script_pending = Some(StackPreparePending::Grouping(pending));
         (ready, deliver)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_edit_920_stack_grouping_saves_old_key_before_stamp_check_and_same_index_replacement() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("page-edit-stack-group");
+        std::fs::create_dir(&folder).unwrap();
+        for name in ["111_p0.png", "111_p1.png", "222_p0.png", "222_p1.png"] {
+            image::RgbImage::new(2, 2).save(folder.join(name)).unwrap();
+        }
+        app.settings.stack_separator = '_';
+        app.settings.stack_script_enabled = false;
+        let (ready, deliver) = hold_stack_grouping_completion(&mut app, &ctx, folder);
+        let old_item = app.items[0].clone();
+        let old_key = app.page_path_key(0).unwrap();
+        assert_ne!(
+            ready.read.order.items[0], old_item,
+            "the producer replaces the same index"
+        );
+        assert!(
+            ready
+                .read
+                .result
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .stamps_current()
+        );
+        app.fullscreen_idx = Some(0);
+        app.selected = Some(0);
+        app.viewer_presentation = crate::app::ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = false;
+        app.conceal_mode = true;
+        app.conceal_mask_size = [2, 2];
+        app.conceal_mask = Some(vec![true, false, true, false]);
+        app.conceal_shapes.clear();
+        deliver.send(Ok(Some(ready))).unwrap();
+        app.poll_stack_script(&ctx);
+        assert!(!app.conceal_mode);
+        assert_eq!(
+            app.items[0], old_item,
+            "stale pre-save edits must not be installed"
+        );
+        assert!(matches!(
+            app.stack_script_pending,
+            Some(StackPreparePending::Retry(_))
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.stack_script_pending.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "saved stack projection did not settle"
+            );
+            app.poll_stack_script(&ctx);
+            std::thread::yield_now();
+        }
+        assert!(app.stack_view.is_some());
+        assert_ne!(app.items[0], old_item);
+        let (mask, _, dimensions) = app
+            .conceal_db
+            .as_ref()
+            .unwrap()
+            .get_full_checked(&old_key)
+            .unwrap()
+            .expect("old item owns the saved draft");
+        assert_eq!(dimensions, [2, 2]);
+        assert_eq!(mask, vec![true, false, true, false]);
+        assert!(!app.conceal_mode);
     }
 
     #[test]

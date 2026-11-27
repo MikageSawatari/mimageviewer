@@ -1458,6 +1458,27 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-27: 編集中の画像の交代と前面 context の所有境界 (§1.920、実装済み・自動検証と独立実装レビューは実施予定)
+
+- 正本: [page-edit-item-change-plan.md](page-edit-item-change-plan.md) §3・§5。
+  linked の別ウィンドウで 6 編集ツールを使う間は一覧の共通の門で項目操作を拒否し、操作時だけ案内する。
+  一覧領域への drop は背景コピーへ読み替えず拒否する。ツールへの入場でスライドショーを停止し、
+  受理済みの移動中は入場の開始・非同期完了を受け付けない。
+- 別項目の open・items の identity/index 空間の採用・true close は、旧項目が有効なうちに各ツールの既存の退出で
+  保存して見開きの退避を消費する。同一項目の open は編集を継続する。構成の採用は終了の保存後に鮮度を検証する。
+- registry の投影の表が scoped mount の最外の元 id を保持し、前面の所有者を返す。新しい一覧の門・入場・終了・
+  close の App 共通編集の保存と終了は前面の投影だけに作用し、sibling の一時投影で前面の下書きを保存・破棄しない。
+  App に detached 用の bool / Option は追加しない。
+- detached の既存の述語の意味・viewport・窓の所有・session の開始・park の退出・見開き内の左右切り替えは変更しない。
+  BA-7 の下書きと寿命を決める遷移の所有を結ぶ構造的修正であり、遅延・再試行・追加 repaint による症状パッチではない。
+- 合意: ClaudeCode (設計担当) と独立設計レビュー r1〜r4 (GPT-6.1 Sol / xhigh)。実装の独立レビューは未実施。
+  所有者を読む経路・close の所有条件・スマートフォルダの固定結果は正本 §3.4 の追記に従う。
+- 検証: 状態遷移・handler-level の回帰テストを追加。利用者指示により cargo のビルド・自動テストは実行せず、
+  ClaudeCode が自動テストと独立実装レビューを実施予定。実機未確認。
+- スマートフォルダは RootReady・install・resident 復帰の検証と ChildReady の旧 root 捕捉より前に終了する。
+  session が無い間は保存後の既存 revision 検証で再準備し、session がある間は固定結果を維持する。
+  保存後に再利用 metadata のバッジが古く見え得る点は Esc と同じ既存挙動として範囲外。新たな失効・再検索は足さない。
+
 ### 2026-11-26: 閉じるモードの数え方の区切りと、この pass の押下位置 (§1.900・§1.907)
 
 - 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §14・§15。F12 の別ウィンドウと共有する

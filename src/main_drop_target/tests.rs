@@ -229,6 +229,7 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> egui::Rect {
 
 fn geometry(path: &str, ppp: f32) -> DropGeometry {
     DropGeometry {
+        grid_input_blocked: None,
         pane_rect: rect(0.0, 0.0, 200.0, 400.0),
         tree_clip: rect(0.0, 30.0, 185.0, 390.0),
         rows: vec![DropRow {
@@ -242,6 +243,47 @@ fn geometry(path: &str, ppp: f32) -> DropGeometry {
         dpi: 96,
         pixels_per_point: ppp,
     }
+}
+
+#[test]
+fn page_edit_920_drop_hit_refuses_grid_without_redirecting_to_background_copy() {
+    let reason = crate::filename_stack_ui::DETACHED_VIEWER_EDITING_GRID_NOTICE.to_owned();
+    let mut geometry = geometry(r"C:\tree", 1.0);
+    geometry.grid_clip = rect(200., 0., 800., 600.);
+    geometry.grid_input_blocked = Some(reason.clone());
+    geometry.grid_folders.push(DropRow {
+        rect: rect(220., 40., 400., 90.),
+        path: r"C:\grid-folder".into(),
+    });
+    let geometries = VecDeque::from([(1, geometry)]);
+    let metrics = WindowMetrics {
+        client_size_px: [800, 600],
+        dpi: 96,
+    };
+    for point in [[250, 50], [600, 400]] {
+        let hit = hit_test(&geometries, Some(1), metrics, point);
+        assert_eq!(hit, Some(Hit::GridInputBlocked(reason.clone())));
+        let decision = decide(hit, true, None, true, true, 0);
+        assert!(!decision.accepted());
+        let data = Rc::new(FakeData::default());
+        let session = DragSession::new(data.clone(), true, false);
+        assert!(matches!(session.drop_request(&decision, None).unwrap(),
+            Some(DropRequest::GridInputBlocked(message)) if message == reason));
+        assert_eq!(
+            data.reads.get(),
+            0,
+            "refusal must not request external paths"
+        );
+    }
+    let tree = hit_test(&geometries, Some(1), metrics, [50, 50]);
+    assert!(matches!(
+        tree,
+        Some(Hit::Folder {
+            place: DropPlace::Tree,
+            ..
+        })
+    ));
+    assert!(decide(tree, true, None, true, true, 0).accepted());
 }
 
 #[test]
@@ -442,7 +484,7 @@ fn grid_drop_858_folder_request_retains_payload_and_external_copy() {
         true,
         0,
     );
-    let Some(DropRequest::FolderTransfer(request)) =
+    let Some(DropRequest::FolderTransfer(request, _)) =
         session.drop_request(&decision, Some(&source)).unwrap()
     else {
         panic!("folder transfer expected")
@@ -466,7 +508,7 @@ fn grid_drop_858_folder_request_retains_payload_and_external_copy() {
             true,
             keys,
         );
-        let Some(DropRequest::FolderTransfer(request)) =
+        let Some(DropRequest::FolderTransfer(request, _)) =
             session.drop_request(&decision, None).unwrap()
         else {
             panic!("external folder transfer expected")
@@ -666,7 +708,7 @@ fn main_drop_internal_request_uses_all_original_paths_without_querying_data_obje
         .drop_request(&tree(r"C:\dst", Some(&source), 0), Some(&source))
         .unwrap()
         .unwrap();
-    let DropRequest::FolderTransfer(request) = request else {
+    let DropRequest::FolderTransfer(request, _) = request else {
         panic!("tree request expected")
     };
     assert_eq!(request.sources, source.paths);
@@ -713,7 +755,7 @@ fn drive_root_898_drop_root_decision_and_temporary_transfer_execution() {
     );
     let copy = tree(r"D:\destination", Some(&source), CONTROL);
     assert!(copy.accepted());
-    let Some(DropRequest::FolderTransfer(request)) =
+    let Some(DropRequest::FolderTransfer(request, _)) =
         session.drop_request(&copy, Some(&source)).unwrap()
     else {
         panic!("copy must remain available")
@@ -768,7 +810,7 @@ fn drive_root_898_submit_drop_with_fake_transfer(
                 .push(DropRequest::Failed(message));
             app.consume_main_drops(ctx);
         }
-        DropRequest::FolderTransfer(request) => {
+        DropRequest::FolderTransfer(request, _) => {
             assert!(request.sources.iter().all(|path| path.starts_with(scope)));
             assert!(request.destination.starts_with(scope));
             app.file_organize_request =
@@ -784,6 +826,7 @@ fn drive_root_898_submit_drop_with_fake_transfer(
             );
         }
         DropRequest::GridFiles(_) => panic!("unexpected grid file open"),
+        DropRequest::GridInputBlocked(_) => panic!("unexpected blocked grid input"),
     }
 }
 
@@ -808,7 +851,7 @@ fn main_drop_external_requests_copy_or_grid_and_only_description_writes_change()
             Description::Invalid
         ]
     );
-    let DropRequest::FolderTransfer(request) =
+    let DropRequest::FolderTransfer(request, _) =
         session.drop_request(&decision, None).unwrap().unwrap()
     else {
         panic!("tree request expected")

@@ -927,6 +927,10 @@ impl App {
         ctx: &egui::Context,
         main_viewer_blocked: bool,
     ) -> Option<crate::ui_main::AddressBarNav> {
+        if self.detached_viewer_editing_blocks_grid_input() {
+            self.notify_detached_viewer_editing_grid_key_input(ctx);
+            return None;
+        }
         if !main_viewer_blocked {
             self.detect_operation_script_events(
                 ctx,
