@@ -5,6 +5,58 @@ use crate::plane_view::*;
 use crate::plane_view_wgpu::*;
 
 impl App {
+    /// Capture the picture the user saw, before paint clears last_drawn.
+    pub(crate) fn plane_fill_lock_candidate(
+        &self,
+    ) -> Option<crate::ui_fullscreen::PlaneFillLockCandidate> {
+        let FsExclusiveView::PlaneView(state) = &self.fs_exclusive_view else {
+            return None;
+        };
+        let idx = self.fullscreen_idx?;
+        let anchor = self.plane_view_anchor(idx);
+        let context = self.edit_request_owner_context();
+        let frame = state.last_drawn.as_ref()?;
+        (state.pose.anchor == anchor && frame.anchor == anchor && frame.context == context)
+            .then_some(crate::ui_fullscreen::PlaneFillLockCandidate {
+                context,
+                anchor,
+                k_fill: frame.k_fill,
+            })
+    }
+
+    pub(crate) fn plane_fill_lock_candidate_matches(
+        &self,
+        candidate: crate::ui_fullscreen::PlaneFillLockCandidate,
+    ) -> bool {
+        self.edit_request_owner_context() == candidate.context
+            && self
+                .fullscreen_idx
+                .is_some_and(|idx| self.plane_view_anchor(idx) == candidate.anchor)
+            && matches!(&self.fs_exclusive_view, FsExclusiveView::PlaneView(state) if state.pose.anchor == candidate.anchor)
+    }
+
+    /// Every ordinary zoom writer freezes the displayed fill only when magnification changed.
+    pub(crate) fn lock_plane_fill_for_zoom(
+        &mut self,
+        old_zoom: f32,
+        new_zoom: f32,
+        candidate: Option<crate::ui_fullscreen::PlaneFillLockCandidate>,
+    ) {
+        if old_zoom == new_zoom {
+            return;
+        }
+        let Some(candidate) =
+            candidate.filter(|candidate| self.plane_fill_lock_candidate_matches(*candidate))
+        else {
+            return;
+        };
+        if let FsExclusiveView::PlaneView(state) = &mut self.fs_exclusive_view
+            && state.fill_mode == PlaneFillMode::Auto
+        {
+            state.fill_mode = PlaneFillMode::Locked(candidate.k_fill);
+        }
+    }
+
     pub(crate) fn handle_plane_lens_drag(
         &mut self,
         ctx: &egui::Context,
@@ -317,7 +369,7 @@ impl App {
                 return false;
             };
             let rgb = self.settings.fullscreen_image_margin_color;
-            let params = PlaneRenderParams::screen(
+            let (params, k_fill) = PlaneRenderParams::screen_with_fill_mode(
                 transform,
                 canvas,
                 state.pose.lens_center,
@@ -327,12 +379,14 @@ impl App {
                 material.description,
                 underlay,
                 egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                state.fill_mode,
             );
             let snapshot = Arc::new(PlaneFrameSnapshot {
                 context,
                 anchor: state.pose.anchor,
                 material,
                 params,
+                k_fill,
             });
             let pipeline = render
                 .renderer

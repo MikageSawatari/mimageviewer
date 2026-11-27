@@ -130,7 +130,7 @@ fn request_for_transform(
     strength: f32,
 ) -> PlaneFrameRequest {
     let ppp = t.pixels_per_point;
-    let params = PlaneRenderParams::screen(
+    let (params, k_fill) = PlaneRenderParams::screen_with_fill_mode(
         t,
         canvas,
         center,
@@ -140,6 +140,7 @@ fn request_for_transform(
         material.description,
         &crate::ui_fullscreen::FsBgStyle::Solid(egui::Color32::WHITE),
         egui::Color32::from_rgb(13, 23, 37),
+        PlaneFillMode::Auto,
     );
     let snapshot = Arc::new(PlaneFrameSnapshot {
         context: crate::app::ViewerContextId::for_test(917),
@@ -151,6 +152,7 @@ fn request_for_transform(
         },
         material,
         params,
+        k_fill,
     });
     PlaneFrameRequest {
         size: resolve_plane_output_size(
@@ -270,6 +272,7 @@ fn plane_gpu_pipeline_formats_and_sibling_callback_uniforms_are_independent() {
         anchor: old.anchor,
         material: old.material.clone(),
         params: old.params,
+        k_fill: old.k_fill,
     });
     let device = gpu.device.clone();
     let make = |r: &PlaneFrameRequest| {
@@ -286,6 +289,149 @@ fn plane_gpu_pipeline_formats_and_sibling_callback_uniforms_are_independent() {
         actual, expected,
         "later callback writes cannot replace its sibling's uniform"
     );
+}
+
+#[test]
+fn plane_locked_snapshot_preserves_displayed_fill_and_gpu_pixels_for_copy_and_export() {
+    let mut gpu = OffscreenGpu::new();
+    let mut cache = PlaneRendererCache::default();
+    let material = material(&gpu, &mut cache, 942, false);
+    let canvas = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(128., 96.));
+    for lens in PlaneLensKind::ALL {
+        let original = transform(canvas, 1.);
+        let (_, fixed) = PlaneRenderParams::screen_with_fill_mode(
+            &original,
+            canvas,
+            Vec2::splat(0.5),
+            0.75,
+            lens,
+            PlaneTilt::default(),
+            material.description,
+            &crate::ui_fullscreen::FsBgStyle::Solid(egui::Color32::WHITE),
+            egui::Color32::from_rgb(13, 23, 37),
+            PlaneFillMode::Auto,
+        );
+        assert!(fixed > 0.);
+        let shrunk = DisplayedImageTransform::resolve(DisplayedImageTransformInput {
+            page_idx: 0,
+            viewport_rect: canvas,
+            source_size: Vec2::new(64., 48.),
+            texture_size: Vec2::new(64., 48.),
+            rotation: crate::rotation_db::Rotation::None,
+            free_rotation_rad: 0.,
+            content_bbox: None,
+            fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                crate::settings::FullscreenFitMode::Page,
+            ),
+            fit_scale_limits: Default::default(),
+            pixels_per_point: 1.,
+            placement: ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((0.5, Vec2::ZERO)),
+            },
+            pixel_fit: RectPixelFit::Proportional,
+        })
+        .unwrap();
+        let auto = PlaneRenderParams::screen(
+            &shrunk,
+            canvas,
+            Vec2::splat(0.5),
+            0.75,
+            lens,
+            PlaneTilt::default(),
+            material.description,
+            &crate::ui_fullscreen::FsBgStyle::Solid(egui::Color32::WHITE),
+            egui::Color32::from_rgb(13, 23, 37),
+        );
+        assert_eq!(auto.values[2][0], 0.);
+        let (params, k_fill) = PlaneRenderParams::screen_with_fill_mode(
+            &shrunk,
+            canvas,
+            Vec2::splat(0.5),
+            0.75,
+            lens,
+            PlaneTilt::default(),
+            material.description,
+            &crate::ui_fullscreen::FsBgStyle::Solid(egui::Color32::WHITE),
+            egui::Color32::from_rgb(13, 23, 37),
+            PlaneFillMode::Locked(fixed),
+        );
+        assert_eq!(k_fill, fixed);
+        assert_eq!(params.values[2][0], 0.75 * fixed);
+        let mut screen = request_for_transform(
+            &gpu,
+            &mut cache,
+            material.clone(),
+            &shrunk,
+            canvas,
+            Vec2::splat(0.5),
+            lens,
+            0.75,
+        );
+        screen.snapshot = Arc::new(PlaneFrameSnapshot {
+            context: screen.snapshot.context,
+            anchor: screen.snapshot.anchor,
+            material: material.clone(),
+            params,
+            k_fill,
+        });
+        let callback = crate::egui037_stage4_gpu_tests::callback(
+            canvas,
+            PlaneShaderCallback::new(
+                &gpu.device,
+                screen.pipeline.clone(),
+                screen.snapshot.clone(),
+            ),
+        );
+        let screenshot: Vec<u8> = gpu
+            .render(&[callback], [128, 96], [13, 23, 37, 255])
+            .into_iter()
+            .flatten()
+            .collect();
+        assert_eq!(
+            screenshot,
+            screen.render().unwrap(),
+            "screen and copied canvas keep the same locked k"
+        );
+        for choice in [
+            PlaneOutputChoice::Canvas,
+            PlaneOutputChoice::Export(crate::export_dialog::ExportScale::Full),
+            PlaneOutputChoice::Export(crate::export_dialog::ExportScale::Half),
+        ] {
+            let output = screen.with_choice(choice);
+            assert!(Arc::ptr_eq(&screen.snapshot, &output.snapshot));
+            assert_eq!(output.snapshot.k_fill, fixed);
+            assert_eq!(
+                output.snapshot.params.for_output(output.size).values[2][0],
+                0.75 * fixed
+            );
+            let rgba = output.render().unwrap();
+            let [w, h] = output.size;
+            for (x, y) in [(w / 2, h / 2), (w / 3, h / 3), (0, 0)] {
+                let p = egui::pos2(
+                    (x as f32 + 0.5) * 128. / w as f32,
+                    (y as f32 + 0.5) * 96. / h as f32,
+                );
+                let uv = camera_point(
+                    p,
+                    canvas,
+                    Vec2::splat(0.5),
+                    params.values[2][0],
+                    lens,
+                    PlaneTilt::default(),
+                )
+                .and_then(|q| texture_point(q, &shrunk, full_uv(), full_uv()));
+                let pixel = &rgba[((y * w + x) * 4) as usize..((y * w + x) * 4 + 4) as usize];
+                match uv {
+                    Some(uv) => {
+                        let r = ((uv.x * 64. - 0.5).clamp(0., 63.) * 3.).round() as u8;
+                        let g = ((uv.y * 48. - 0.5).clamp(0., 47.) * 4.).round() as u8;
+                        assert!(pixel[0].abs_diff(r) <= 4 && pixel[1].abs_diff(g) <= 4);
+                    }
+                    None => assert_eq!(pixel, &[13, 23, 37, 255]),
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -312,6 +458,7 @@ fn plane_checker_underlay_is_frozen_in_canvas_coordinates_at_double_output() {
         anchor: old.anchor,
         material: old.material.clone(),
         params,
+        k_fill: old.k_fill,
     });
     for choice in [
         PlaneOutputChoice::Canvas,
@@ -435,22 +582,24 @@ fn plane_gpu_partial_material_roi_trim_and_quarter_rotation_match_cpu() {
             PlaneLensKind::Equidistant,
             0.2,
         );
+        let (params, k_fill) = PlaneRenderParams::screen_with_fill_mode(
+            &t,
+            canvas,
+            Vec2::splat(0.5),
+            0.2,
+            PlaneLensKind::Equidistant,
+            PlaneTilt::default(),
+            description,
+            &crate::ui_fullscreen::FsBgStyle::Solid(egui::Color32::WHITE),
+            egui::Color32::from_rgb(13, 23, 37),
+            PlaneFillMode::Auto,
+        );
         r.snapshot = Arc::new(PlaneFrameSnapshot {
             context: r.snapshot.context,
             anchor: r.snapshot.anchor,
             material: material.clone(),
-
-            params: PlaneRenderParams::screen(
-                &t,
-                canvas,
-                Vec2::splat(0.5),
-                0.2,
-                PlaneLensKind::Equidistant,
-                PlaneTilt::default(),
-                description,
-                &crate::ui_fullscreen::FsBgStyle::Solid(egui::Color32::WHITE),
-                egui::Color32::from_rgb(13, 23, 37),
-            ),
+            params,
+            k_fill,
         });
         let bytes = r.render().unwrap();
         for (x, y) in [(64, 48), (48, 35), (80, 60), (5, 5)] {

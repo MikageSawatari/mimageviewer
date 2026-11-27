@@ -93,6 +93,49 @@ fn lens_g(lens: PlaneLensKind, theta: f64) -> f64 {
     }
 }
 
+fn plane_cap_limit(canvas: Rect, center: Pos2, lens: PlaneLensKind) -> Option<f64> {
+    if !canvas.is_positive() || !canvas.is_finite() || !center.is_finite() {
+        return None;
+    }
+    let far = [
+        canvas.left_top(),
+        canvas.right_top(),
+        canvas.right_bottom(),
+        canvas.left_bottom(),
+    ]
+    .into_iter()
+    .map(|p| (f64::from(p.x) - f64::from(center.x)).hypot(f64::from(p.y) - f64::from(center.y)))
+    .fold(0., f64::max);
+    let radius = 0.5 * f64::from(canvas.size().min_elem());
+    (far > 0.).then(|| lens_g(lens, PLANE_THETA_CAP) * radius / far)
+}
+
+/// The shared per-frame 80° bound, rounded toward the safe side of shader f32 arithmetic.
+pub(crate) fn plane_cap_coefficient(canvas: Rect, center: Pos2, lens: PlaneLensKind) -> f32 {
+    plane_cap_limit(canvas, center, lens).map_or(0., |k| (k as f32) * (1. - f32::EPSILON))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum PlaneFillMode {
+    #[default]
+    Auto,
+    Locked(f32),
+}
+
+/// Locked mode deliberately omits the support inequalities: ordinary zoom may expose margins.
+pub(crate) fn plane_fill_for_mode(
+    canvas: Rect,
+    center: Pos2,
+    quad: Option<[Pos2; 4]>,
+    lens: PlaneLensKind,
+    mode: PlaneFillMode,
+) -> f32 {
+    match mode {
+        PlaneFillMode::Auto => quad.map_or(0., |q| plane_fill_coefficient(canvas, center, q, lens)),
+        PlaneFillMode::Locked(k) => k.min(plane_cap_coefficient(canvas, center, lens)),
+    }
+}
+
 /// Largest untilted coefficient allowed by the sixteen corner/edge inequalities and 80° cap.
 /// Canvas, center and quad must all use the same units (screen callers use physical pixels).
 pub(crate) fn plane_fill_coefficient(
@@ -121,17 +164,9 @@ pub(crate) fn plane_fill_coefficient(
             f64::from(p.y) - f64::from(center.y),
         ]
     };
-    let far = corners
-        .iter()
-        .map(|p| {
-            let v = delta(*p);
-            v[0].hypot(v[1])
-        })
-        .fold(0., f64::max);
-    if far == 0. {
+    let Some(mut limit) = plane_cap_limit(canvas, center, lens) else {
         return 0.;
-    }
-    let mut limit = lens_g(lens, PLANE_THETA_CAP) * radius / far;
+    };
     let area: f64 = (0..4)
         .map(|i| {
             let a = delta(quad[i]);
@@ -417,6 +452,7 @@ pub(crate) struct PlaneViewPose {
 pub(crate) struct PlaneViewState {
     pub pose: PlaneViewPose,
     pub tilt: PlaneTilt,
+    pub fill_mode: PlaneFillMode,
     pub color: PlaneColorPhase,
     pub last_drawn: Option<Arc<crate::plane_view_wgpu::PlaneFrameSnapshot>>,
 }
@@ -425,6 +461,7 @@ impl PlaneViewState {
         Self {
             pose,
             tilt: PlaneTilt::default(),
+            fill_mode: PlaneFillMode::Auto,
             color: PlaneColorPhase::Empty,
             last_drawn: None,
         }
@@ -492,6 +529,8 @@ pub(crate) struct PlaneViewWheelOutcome {
     pub zoom: f32,
     pub pan: Vec2,
     pub blocked: Option<PlaneViewEntryBlock>,
+    /// The segment was handled even if its saturated geometry is unchanged.
+    pub accepted: bool,
 }
 impl PlaneViewWheelOutcome {
     pub(crate) fn changes_view(self, pose: Option<PlaneViewPose>, zoom: f32, pan: Vec2) -> bool {
@@ -506,6 +545,7 @@ pub(crate) fn plane_view_wheel_transition(input: PlaneViewWheelInput) -> PlaneVi
         zoom: input.zoom,
         pan: input.pan,
         blocked: None,
+        accepted: false,
     };
     if !input.notches.is_finite() || input.notches == 0. || !input.canvas.is_positive() {
         return out;
@@ -572,6 +612,7 @@ pub(crate) fn plane_view_wheel_transition(input: PlaneViewWheelInput) -> PlaneVi
     out.zoom = next_zoom;
     out.pan = next_pan;
     out.pose = (pose.strength > 0.).then_some(pose);
+    out.accepted = true;
     out
 }
 
@@ -713,7 +754,15 @@ mod tests {
         let joined = step(first.pose, first.zoom, first.pan, -2.);
         let one = step(first.pose, first.zoom, first.pan, -1.);
         let split = step(one.pose, one.zoom, one.pan, -1.);
-        assert_eq!(joined, split);
+        assert!(joined.accepted);
+        assert!(
+            !split.accepted,
+            "the second inactive exit segment is ignored"
+        );
+        assert_eq!(
+            (joined.pose, joined.zoom, joined.pan, joined.blocked),
+            (split.pose, split.zoom, split.pan, split.blocked)
+        );
         assert!(joined.pose.is_none());
         close(joined.zoom, 1. + 8. / 600.);
         assert_eq!(step(None, 1., Vec2::ZERO, -2.).zoom, 1.);

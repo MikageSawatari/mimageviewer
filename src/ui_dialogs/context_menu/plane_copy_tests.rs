@@ -199,6 +199,56 @@ mod gpu_tests {
     }
 
     #[test]
+    fn plane_copy_locked_zoom_action_menu_and_ring_keep_the_displayed_distortion() {
+        let _keys = crate::key_input::lock_test_input();
+        let (mut app, mut viewer) = ready();
+        let before = match &app.fs_exclusive_view {
+            FsExclusiveView::PlaneView(state) => state.last_drawn.clone().unwrap(),
+            _ => panic!("PlaneView fixture"),
+        };
+        app.settings.fullscreen_wheel_zoom_step =
+            crate::settings::FullscreenWheelZoomStep::Percent10;
+        viewer.frame(
+            &mut app,
+            vec![
+                egui::Event::PointerMoved(viewer.size.to_pos2() * 0.5),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0., -480.),
+                    modifiers: egui::Modifiers::CTRL,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                },
+            ],
+        );
+        let FsExclusiveView::PlaneView(state) = &app.fs_exclusive_view else {
+            panic!("PlaneView fixture")
+        };
+        assert_eq!(
+            state.fill_mode,
+            crate::plane_view::PlaneFillMode::Locked(before.k_fill)
+        );
+        let frozen = state.last_drawn.clone().unwrap();
+        assert_eq!(frozen.k_fill, before.k_fill);
+        assert!(frozen.params.values[2][0] > 0.);
+        let capture = ClipboardCapture::new();
+        for entry in 0..3 {
+            dispatch(&mut app, &viewer.ctx, entry);
+            let mut work = capture.take();
+            assert_eq!(work.len(), 1, "copy entry {entry}");
+            let CapturePixelWork::PlaneView { request, .. } = work.remove(0) else {
+                panic!("PlaneView copy")
+            };
+            assert!(Arc::ptr_eq(&request.snapshot, &frozen));
+            assert_eq!(request.snapshot.k_fill, before.k_fill);
+            assert_eq!(
+                request.snapshot.params.for_output(request.size).values[2][0],
+                frozen.params.values[2][0]
+            );
+        }
+    }
+
+    #[test]
     fn plane_copy_action_rejects_stale_context_and_page_slice_snapshots() {
         let _keys = crate::key_input::lock_test_input();
         let (mut app, viewer) = ready();
@@ -214,6 +264,7 @@ mod gpu_tests {
                     anchor: frozen.anchor,
                     material: frozen.material.clone(),
                     params: frozen.params,
+                    k_fill: frozen.k_fill,
                 }));
             }
             app.fs_feedback_toast = None;

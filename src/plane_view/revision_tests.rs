@@ -819,6 +819,7 @@ fn plane_revision_missing_drawn_material_skips_input_without_entering_or_notifyi
             assert_eq!(out.zoom, 2.);
             assert_eq!(out.pan, vec2(5., 7.));
             assert!(out.blocked.is_none());
+            assert!(!out.accepted);
         }
     }
 }
@@ -868,4 +869,150 @@ fn plane_revision_camera_identity_center_domain_and_horizon_remain_finite() {
             .is_none()
     );
     assert!(PlaneLensKind::EquisolidAngle.theta(2.001).is_none());
+}
+
+#[test]
+fn plane_revision_locked_fill_keeps_fixed_value_when_support_leaves_canvas() {
+    let canvas = rect(vec2(160., 90.));
+    let center = canvas.center();
+    let covering = corners(canvas.expand(100.));
+    let exposed = corners(Rect::from_min_size(pos2(200., 200.), vec2(20., 30.)));
+    for lens in PlaneLensKind::ALL {
+        let fixed = plane_fill_for_mode(canvas, center, Some(covering), lens, PlaneFillMode::Auto);
+        assert!(fixed > 0.);
+        assert_eq!(
+            plane_fill_for_mode(canvas, center, Some(exposed), lens, PlaneFillMode::Auto),
+            0.
+        );
+        for support in [Some(covering), Some(exposed), None] {
+            assert_eq!(
+                plane_fill_for_mode(canvas, center, support, lens, PlaneFillMode::Locked(fixed)),
+                fixed
+            );
+            assert_eq!(
+                plane_fill_for_mode(canvas, center, support, lens, PlaneFillMode::Locked(0.)),
+                0.
+            );
+        }
+    }
+}
+
+#[test]
+fn plane_revision_locked_fill_shares_auto_cap_after_center_move_and_resize() {
+    for size in [vec2(160., 90.), vec2(90., 160.), vec2(400., 150.)] {
+        let canvas = Rect::from_min_size(pos2(17., 23.), size);
+        for normalized in [
+            Vec2::splat(0.5),
+            vec2(0., 0.5),
+            vec2(0.03, 0.04),
+            Vec2::ZERO,
+        ] {
+            let center = canvas.min + normalized * size;
+            for lens in PlaneLensKind::ALL {
+                let cap = plane_cap_coefficient(canvas, center, lens);
+                let huge_support = corners(canvas.expand(100000.));
+                assert_eq!(
+                    plane_fill_coefficient(canvas, center, huge_support, lens),
+                    cap
+                );
+                for fixed in [0., cap * 0.5, cap, cap * 2.] {
+                    let fill = plane_fill_for_mode(
+                        canvas,
+                        center,
+                        None,
+                        lens,
+                        PlaneFillMode::Locked(fixed),
+                    );
+                    assert_eq!(fill, fixed.min(cap));
+                    for p in corners(canvas) {
+                        let theta = lens
+                            .theta(fill * (p - center).length() / (0.5 * size.min_elem()))
+                            .unwrap();
+                        assert!(theta.to_degrees() <= 80.00001);
+                        assert!(
+                            camera_point(p, canvas, normalized, fill, lens, PlaneTilt::default())
+                                .unwrap()
+                                .is_finite()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn plane_revision_screen_records_fill_before_strength_even_when_strength_is_zero() {
+    let canvas = rect(vec2(160., 90.));
+    for density in [1., 1.25, 2.] {
+        let mut cover = fixture(canvas, vec2(800., 450.));
+        cover.transform.pixels_per_point = density;
+        let shrunk = cover
+            .resolve(0.5, Vec2::ZERO, RectPixelFit::Proportional)
+            .unwrap();
+        for lens in PlaneLensKind::ALL {
+            let fixed =
+                plane_cap_coefficient(canvas * density, canvas.center() * density, lens) * 0.5;
+            for strength in [0., 0.25, 0.75] {
+                let (params, fill) =
+                    crate::plane_view_wgpu::PlaneRenderParams::screen_with_fill_mode(
+                        &shrunk,
+                        canvas,
+                        Vec2::splat(0.5),
+                        strength,
+                        lens,
+                        PlaneTilt::default(),
+                        cover.material,
+                        &crate::ui_fullscreen::FsBgStyle::Solid(egui::Color32::WHITE),
+                        egui::Color32::BLACK,
+                        PlaneFillMode::Locked(fixed),
+                    );
+                assert_eq!(fill, fixed);
+                assert_eq!(params.values[2][0], strength * fixed);
+            }
+        }
+    }
+}
+
+#[test]
+fn plane_revision_new_state_uses_auto_and_accepted_is_independent_of_geometry_change() {
+    let canvas = rect(vec2(800., 600.));
+    let cover = fixture(canvas, canvas.size());
+    let pose = PlaneViewPose {
+        anchor: anchor(),
+        strength: 1.,
+        lens_center: Vec2::splat(0.5),
+    };
+    assert_eq!(PlaneViewState::new(pose).fill_mode, PlaneFillMode::Auto);
+    let saturated = wheel(
+        cover,
+        Some(pose),
+        crate::ui_fullscreen::ZOOM_MAX,
+        Vec2::ZERO,
+        canvas.center(),
+        1.,
+    );
+    assert!(saturated.accepted);
+    assert!(!saturated.changes_view(Some(pose), crate::ui_fullscreen::ZOOM_MAX, Vec2::ZERO));
+    for notches in [0., f32::NAN, f32::INFINITY] {
+        assert!(!wheel(cover, Some(pose), 2., Vec2::ZERO, canvas.center(), notches).accepted);
+    }
+    assert!(!wheel(cover, None, 2., Vec2::ZERO, canvas.center(), -1.).accepted);
+    let rejected = plane_view_wheel_transition(PlaneViewWheelInput {
+        current: None,
+        anchor: anchor(),
+        zoom: 2.,
+        pan: Vec2::ZERO,
+        pointer: Some(canvas.center()),
+        canvas,
+        notches: 1.,
+        allowed: Err(PlaneViewEntryBlock::Editing),
+        step: FullscreenWheelZoomStep::Percent10,
+        cover: Some(cover),
+    });
+    assert!(!rejected.accepted);
+    assert_eq!(rejected.blocked, Some(PlaneViewEntryBlock::Editing));
+    let leaving = wheel(cover, Some(pose), 2., Vec2::ZERO, canvas.center(), -1.);
+    assert!(leaving.accepted);
+    assert_eq!(leaving.pose.unwrap().strength, 0.75);
 }

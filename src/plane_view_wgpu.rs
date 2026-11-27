@@ -133,6 +133,7 @@ pub(crate) struct PlaneRenderParams {
     pub values: [[f32; 4]; 13],
 }
 impl PlaneRenderParams {
+    #[cfg(test)]
     pub(crate) fn screen(
         transform: &DisplayedImageTransform,
         canvas: Rect,
@@ -144,6 +145,33 @@ impl PlaneRenderParams {
         underlay: &crate::ui_fullscreen::FsBgStyle,
         background: egui::Color32,
     ) -> Self {
+        Self::screen_with_fill_mode(
+            transform,
+            canvas,
+            center,
+            strength,
+            lens,
+            tilt,
+            material,
+            underlay,
+            background,
+            crate::plane_view::PlaneFillMode::Auto,
+        )
+        .0
+    }
+
+    pub(crate) fn screen_with_fill_mode(
+        transform: &DisplayedImageTransform,
+        canvas: Rect,
+        center: Vec2,
+        strength: f32,
+        lens: PlaneLensKind,
+        tilt: PlaneTilt,
+        material: PlaneMaterialDescription,
+        underlay: &crate::ui_fullscreen::FsBgStyle,
+        background: egui::Color32,
+        fill_mode: crate::plane_view::PlaneFillMode,
+    ) -> (Self, f32) {
         let ppp = transform.pixels_per_point;
         let paint = transform.paint_rect * ppp;
         let frame = transform.full_image_rect.center() * ppp;
@@ -167,16 +195,20 @@ impl PlaneRenderParams {
         let crop = transform.uv_rect;
         let canvas = canvas * ppp;
         let started = crate::perf::is_enabled().then(std::time::Instant::now);
-        let k_fill = crate::plane_view::plane_effective_quad(transform, material)
-            .map(|quad| {
-                crate::plane_view::plane_fill_coefficient(
-                    canvas,
-                    canvas.min + center * canvas.size(),
-                    quad.map(|p| p * ppp),
-                    lens,
-                )
-            })
-            .unwrap_or(0.);
+        let quad = match fill_mode {
+            crate::plane_view::PlaneFillMode::Auto => {
+                crate::plane_view::plane_effective_quad(transform, material)
+                    .map(|q| q.map(|p| p * ppp))
+            }
+            crate::plane_view::PlaneFillMode::Locked(_) => None,
+        };
+        let k_fill = crate::plane_view::plane_fill_for_mode(
+            canvas,
+            canvas.min + center * canvas.size(),
+            quad,
+            lens,
+            fill_mode,
+        );
         if let Some(started) = started {
             crate::perf::event(
                 "plane_view",
@@ -187,38 +219,41 @@ impl PlaneRenderParams {
             );
         }
         let bg = background.to_array();
-        Self {
-            values: [
-                [canvas.min.x, canvas.min.y, canvas.width(), canvas.height()],
-                [center.x, center.y, strength, lens.shader_id()],
-                [strength * k_fill, tilt.yaw, tilt.pitch, 0.],
-                [paint.min.x, paint.min.y, paint.width(), paint.height()],
-                [frame.x, frame.y, cos, sin],
-                [crop.min.x, crop.min.y, crop.max.x, crop.max.y],
-                [
-                    coverage.min.x,
-                    coverage.min.y,
-                    coverage.max.x,
-                    coverage.max.y,
+        (
+            Self {
+                values: [
+                    [canvas.min.x, canvas.min.y, canvas.width(), canvas.height()],
+                    [center.x, center.y, strength, lens.shader_id()],
+                    [strength * k_fill, tilt.yaw, tilt.pitch, 0.],
+                    [paint.min.x, paint.min.y, paint.width(), paint.height()],
+                    [frame.x, frame.y, cos, sin],
+                    [crop.min.x, crop.min.y, crop.max.x, crop.max.y],
+                    [
+                        coverage.min.x,
+                        coverage.min.y,
+                        coverage.max.x,
+                        coverage.max.y,
+                    ],
+                    [source.min.x, source.min.y, source.width(), source.height()],
+                    [0., 0., 1., 1.],
+                    [
+                        rgb[0] as f32 / 255.,
+                        rgb[1] as f32 / 255.,
+                        rgb[2] as f32 / 255.,
+                        kind,
+                    ],
+                    [paint.min.x, paint.min.y, cell.x, cell.y],
+                    [
+                        bg[0] as f32 / 255.,
+                        bg[1] as f32 / 255.,
+                        bg[2] as f32 / 255.,
+                        1.,
+                    ],
+                    [transform.rotation.degrees() as f32 / 90., 0., 0., 0.],
                 ],
-                [source.min.x, source.min.y, source.width(), source.height()],
-                [0., 0., 1., 1.],
-                [
-                    rgb[0] as f32 / 255.,
-                    rgb[1] as f32 / 255.,
-                    rgb[2] as f32 / 255.,
-                    kind,
-                ],
-                [paint.min.x, paint.min.y, cell.x, cell.y],
-                [
-                    bg[0] as f32 / 255.,
-                    bg[1] as f32 / 255.,
-                    bg[2] as f32 / 255.,
-                    1.,
-                ],
-                [transform.rotation.degrees() as f32 / 90., 0., 0., 0.],
-            ],
-        }
+            },
+            k_fill,
+        )
     }
     fn bytes(&self) -> Vec<u8> {
         self.values
@@ -248,6 +283,8 @@ pub(crate) struct PlaneFrameSnapshot {
     pub anchor: PlaneViewAnchor,
     pub material: Arc<PlaneMaterial>,
     pub params: PlaneRenderParams,
+    /// Actual pre-strength coefficient used for this frame, including its 80° bound.
+    pub k_fill: f32,
 }
 #[derive(Clone)]
 pub struct PlaneFrameRequest {

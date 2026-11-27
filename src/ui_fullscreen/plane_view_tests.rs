@@ -5,6 +5,7 @@ use crate::plane_view::*;
 
 mod gpu_tests {
     mod additional_coverage;
+    mod revision2_input_tests;
     mod revision_input_tests;
     mod transition_and_click_tests;
     use super::*;
@@ -1025,6 +1026,7 @@ mod gpu_tests {
                 anchor: frozen.anchor,
                 material: frozen.material.clone(),
                 params: frozen.params,
+                k_fill: frozen.k_fill,
             }));
         }
         assert!(

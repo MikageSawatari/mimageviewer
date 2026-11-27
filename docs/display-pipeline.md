@@ -2,16 +2,30 @@
 
 ## 魚眼の表示レイヤー (PlaneView)
 
-正本: [魚眼と板の傾け設計](fisheye-plane-view-plan.md) §3〜§6・§16。段1は単ページの静止画を対象とし、
+正本: [魚眼と板の傾け設計](fisheye-plane-view-plan.md) §3〜§6・§16・§17。段1は単ページの静止画を対象とし、
 `FsExclusiveView::PlaneView` が context ごとの強さ・レンズ中心・素材・直近の描画 snapshot を所有する。
 2D の selector、zoom / pan / 回転 / trim / fit と `commit_fs_single_page_placement` を共用する。
 resampler の準備より前に採用を決め、元の TextureHandle から `gpu_color_copy` (Depth と共用) で mip を作る。
 PlaneView は拡大方式の resampler を通らず、最終の補正・AI・元画像ホールドの選択をそのまま描く。
 
-魚眼の係数は `k = strength × k_fill`。`k_fill` は、その pass に描く素材の paint 四角形と
+魚眼の係数は `k = strength × k_fill`。`PlaneViewState` の `PlaneFillMode` が `Auto` のとき、`k_fill` はその pass に描く素材の paint 四角形と
 `coverage ∩ material_source` の交わりから作る有効四角形 `Q` により、canvas 全体で余白を出さない最大値を求める。
 canvas の4隅と `Q` の4辺の16条件と、最遠点の入射角80°の上限を使い、画面寸法に比例する標本走査は行わない。
-画像の端を画面に入れたときは `k_fill = 0` となるが、PlaneView の占有と終了条件は変えない。
+`Auto` で画像の端を画面に入れたときは `k_fill = 0` となるが、PlaneView の占有と終了条件は変えない。
+
+通常のズームで倍率が実際に変わると、最後に画面へ描いた snapshot の `k_fill` をそのまま採用し、
+`Locked(k_lock)` へ切り替える。snapshot は `k` と `k_fill` を別々に保持し、strength から割り戻さない。
+`Locked` は余白なしの16条件を使わず、`k_fill = min(k_lock, k_cap(c))` とする。
+中心やcanvasの変更後も80°の上限だけは毎pass適用する。縮小による余白を許し、ドラッグ・自由回転・resizeで固定を解かない。
+通常ズームの倍率が変わらない入力やsnapshotの無い入力では固定せず、既に固定中なら値を更新しない。
+
+Ctrl+Shiftの寄るsegmentと `FsFisheyeIn` の受理で `Auto` へ戻す。幾何が変わらない受理も含み、
+無視・拒否された入力は含まない。離れる入力は `Locked` を維持し、strengthに比例して歪みを弱める。
+固定の状態は描画側が所有し、pose・純粋な覆う遷移・クリックの分類へ入れない。
+ホイールの固定候補は予測前にsnapshotからproposalへ写し、context・anchorを照合して遅延適用でも同じ値を使う。
+入力列の途中の終了・所有者交代で候補を捨て、同じpassで入り直した状態へ引き継がない。
+即時入力は描画前のsnapshotを読み、そのpassに反映する。遅延適用のpassは旧状態で描き、適用後の状態は次passで描く。
+固定状態は既存の `fs_exclusive_view` 全体の退避・引き継ぎに含め、contextをまたいで共有しない。
 
 寄る操作は、まず連続配置の `Q` が余裕を加えた canvas を覆う倍率・pan に揃え、
 その後にレンズ中心の下の source 点を固定して通常の拡大を行う。1ノッチの strength は1/4。
@@ -23,8 +37,8 @@ canvas の4隅と `Q` の4辺の16条件と、最遠点の入射角80°の上限
 量子化との差への余裕は4物理画素。覆いを保証する範囲の候補は、表示の縦横比32以下・遷移後の連続配置の
 座標の絶対値が2²¹物理画素以下であり、倍率の再計算と平均・trim・自由回転を通る実経路の総誤差の試験で確定する。
 範囲の外でも同じ覆う計算を使い、誤差に応じた余裕の再計算や追加の補正経路は設けない。
-ズーム上限や範囲の外で描画の `Q` が canvas を覆わなければ、`k_fill = 0` の恒等表示となり2Dの余白が残る。
-描画の `Q` が覆う場合は、その `Q` から求めた係数により歪みによる余白を作らない。
+`Auto` ではズーム上限や範囲の外で描画の `Q` が canvas を覆わなければ、`k_fill = 0` の恒等表示となり2Dの余白が残る。
+`Auto` で描画の `Q` が覆う場合は、その `Q` から求めた係数により歪みによる余白を作らない。
 
 `PlaneGpuCopy` は TextureId、`PlaneMaterial` は幾何の記述全体で照合する。登録待ちは所有 viewport の次passを要求し、
 配置枠の各辺が1/64物理画素以内で一致すれば前の不変素材をその素材自身の変換で描く。

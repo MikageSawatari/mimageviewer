@@ -1056,6 +1056,45 @@ cargo nextest run -p mimageviewer --lib -E 'test(/depth_/) | test(/displayed_ima
 
 変更ファイル: `src/displayed_image_transform.rs`、`src/ui_fullscreen.rs`、`src/plane_view.rs`、`src/plane_view/precision_tests.rs`、`src/plane_view/revision_tests.rs`、`src/ui_fullscreen/plane_view_tests.rs`、同 `gpu_tests/revision_input_tests.rs`、本書§11。`cargo fmt` は正常終了、UI字形検査は危険な字形なし、サイト検査は54カード・超過0、`git diff --check` も正常終了。修正後のコンパイル・試験、新しい数値例、GPU画素と実機の見た目は未確認。アプリ起動・コミットは行っていない。
 
+### 改訂 2 の実装記録
+
+§0・§17 を通読し、通常ズームで画面に見えている歪みを固定する動作、固定後のドラッグでの維持、Ctrl+Shift の寄る操作での自動調整への復帰を文書へ反映した。縮小や移動による余白を許す `Locked` と、余白なしの制限を使う `Auto` を区別し、改訂1の無条件な「端が入ると歪みが消える」という説明を `Auto` の場合へ限定した。
+
+設計で定めた接続は、`PlaneViewState` が描画の `PlaneFillMode` を所有し、poseと純粋な覆う遷移へ入れない形。固定値は最後のsnapshotが保持する `k_fill` を使い、強さから割り戻さない。倍率の変わらない通常入力やsnapshot欠落では新たに固定しない。寄る操作では「受理」と「幾何の変化」を区別し、受理されれば `Auto` へ戻す。即時・遅延適用の描画順は維持し、遅延用の候補はcontext・anchorを照合して終了・所有者交代で破棄する。固定中も中心・canvasから80°上限を適用し、出力はsnapshotの `k` を使う。
+
+**通常ズームの入口一覧** (着手時 `6f9785302` の全 `fs_zoom` 書き込みと呼び出し元を調査):
+
+| 入力 | 倍率を書き込む境界と接続 |
+| --- | --- |
+| Ctrl+ホイール | `apply_fs_wheel_frame_proposal` の通常Imageズームの changed 分岐。予測前に写した `plane_fill_lock` 候補を共通の固定処理へ渡す |
+| 設定で通常ホイールがズーム (`SettingZoom`) | 同じ通常Imageズームの分岐。Ctrlの有無で固定の扱いを分けない |
+| 中ボタンのドラッグ | `handle_drag_zoom` の `FsZoomOwner::Image` の倍率書き込みで、直前のsnapshot候補を共通の固定処理へ渡す |
+| Ctrl+Spaceスクラブ | 同じドラッグズームのImage所有の書き込み。修飾キーの取得・配送・終了処理は既存のまま |
+| `FsZoomIn/Out` | `apply_fs_key_zoom_step` → `apply_touch_zoom_factor_about_pivot` のImage所有の倍率書き込みで固定 |
+| 2本指ピンチ | 実Touch入力 → `TouchCommand::Zoom` → 同じ `apply_touch_zoom_factor_about_pivot` で固定 |
+| ゲームパッド | `apply_gamepad_fullscreen_zoom` の倍率書き込みで固定。既存の微小差の戻り値の規則は変えず、実際に倍率を書き換えたときに固定する |
+
+固定の処理は `lock_plane_fill_for_zoom` の1か所。旧倍率と新倍率が同じなら何もせず、候補のcontext・anchorと現在のPlaneViewを照合して、AutoだけをLockedへ変える。すでにLockedなら値を維持する。静的な `apply_wheel_zoom` 自体はCtrl+Shiftの遷移も使うため変更しない。中ボタンとスクラブの関数名は既存ソースのものを使い、キー・ピンチ・ゲームパッドの配送は変更しない。
+
+占有中に停止するナビゲータは対象外。分析モードとの倍率引き継ぎ、連結読みの描画倍率同期、fit/初期配置/reset、viewport復元は通常ズームの入力ではなく、それぞれ既存の所有・終了の規則を維持する。追加の通常ズーム入口は見つからなかった。
+
+`FsWheelFrameProposal` は予測前にsnapshotの `k_fill` とcontext/anchorを写す。実適用ではsnapshotを読み直さず、残ったsegmentを順に処理する。各segmentの継続確認後と魚眼遷移の直後に候補の所有を照合し、終了で捨てる。同じanchorで入り直しても捨てた候補は再採取しない。永続の世代や描画用の予測状態は追加しない。純粋な遷移の `accepted` は幾何の変更とは独立で、受理した寄る入力は `changes_view` の早期returnより前にAutoへ戻す。姿勢・倍率・覆う判定・panの計算は変更していない。
+
+**設計との差分**: 仕様の差分はない。上限は内部のf64の計算を共有し、AutoもLockedも最後に同じf32への丸めを一度だけ適用する。既存の純粋試験で入力の分割と合算の結果全体を比較していた箇所は、終了後の負のsegmentは無視されるため新しいacceptedが異なる。倍率・pan・pose・拒否理由の一致の検査は維持し、受理/無視を別に検査する。detachedの述語・viewport経路・swapの対象は変更せず、既存の `fs_exclusive_view` の所有に乗せる。
+
+**試験の追加**: `plane_view::revision_tests` にLockedのsupport非依存、共有capと3レンズの中心移動/resize、strengthゼロでも独立なfillの記録、受理と幾何の区別の4件。`plane_view_wgpu::gpu_tests` に固定後の画面/copy/exportの実画素とsnapshotの不変を1件。`ui_fullscreen::plane_view_tests::gpu_tests::revision2_input_tests` に通常ズーム7入口の変更/上限、即時/遅延、2回目の固定保持、下/上と幾何同値の受理、欠落記録、Locked(0)、各ドラッグ/回転/resize、同passの終了再入場/操作順、context照合とF11/scoped mount、出力snapshotの13件。終了再入場の試験はwheelのsourceを分けて3segmentを確認し、逆向きの量がゼロへ合算されただけでは通らない。`ui_dialogs::context_menu::plane_copy_tests::gpu_tests` に固定した状態の実コピーaction/menu/ringの1件を追加。GPUを使う試験は全て既存の `gpu_tests::` のgroupに入る。新規統合試験やUI PNG更新は不要。
+
+**変更ファイル**: `src/plane_view.rs`、`src/plane_view/revision_tests.rs`、`src/plane_view_wgpu.rs`、`src/plane_view_wgpu/gpu_tests.rs`、`src/app/plane_view.rs`、`src/ui_fullscreen.rs`、`src/ui_fullscreen/plane_view_tests.rs`、新規 `src/ui_fullscreen/plane_view_tests/gpu_tests/revision2_input_tests.rs`、`src/ui_dialogs/context_menu/plane_copy_tests.rs`、`docs/display-pipeline.md`、`docs/spec.md`、`htdocs/mimageviewer/manual/fullscreen.html`、本書§11/§13。
+
+**未検証の範囲**: ビルド・test・check・clippy・算術用スクリプト・実アプリ起動・コミットは実装担当では行っていない。改訂2のコンパイル・自動試験・GPU画素・実機の見た目は未確認。以前の改訂の成功記録を、今回の変更後の検証結果として扱わない。設計担当の共通の実行口へ次を引き継ぐ。
+
+実装担当で許可された検査は `cargo fmt` 正常終了、`python scripts/check_ui_glyphs.py` は危険な字形なし、`python scripts/check_site_cards.py` は54カード・超過0、`git diff --check` 正常終了。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/plane_view|fisheye|displayed_image_transform|plane_copy/)'
+cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen|in_page_scroll|page_turn|depth|ui_erase|gamepad/)'
+```
+
 ## 12. 文書
 
 - [display-pipeline.md](display-pipeline.md): PlaneView の節 (§5 の要約と §6 の出口)。
@@ -1068,7 +1107,8 @@ cargo nextest run -p mimageviewer --lib -E 'test(/depth_/) | test(/displayed_ima
 
 ## 13. CHANGELOG の下書き
 
-- 余白の出ない魚眼ズームを追加しました。1ページの静止画で Ctrl+Shift+ホイールを回すと、画像が画面を覆うまで寄り、余白を作らない範囲で歪みを加えます。画像の端を画面に入れると歪みが消えます。極端に細長い画像や大きな拡大・移動では、通常表示と同じ余白が残ることがあります。
+- 余白の出ない魚眼ズームを追加しました。1ページの静止画で Ctrl+Shift+ホイールを回すと、画像が画面を覆うまで寄り、余白を作らない範囲で歪みを加えます。歪みを固定していないときは、画像の端を画面に入れると歪みが消えます。極端に細長い画像や大きな拡大・移動では、通常表示と同じ余白が残ることがあります。
+- 魚眼中に Ctrl+ホイールなどの通常のズームを使うと、そのとき見えている歪みを保ったまま倍率だけを変えられます。縮小すると周囲に余白が出ます。そのあとはドラッグで動かしても歪みを保ち、Ctrl+Shift+ホイール上で余白を作らない動きに戻ります。
 - 下へ回すと歪みと倍率が戻ります。覆うために増えた倍率を最初のフィットへ戻すには、ダブルクリックかフィットの切り替えを使います。
 - 魚眼中は Shift+左ドラッグでレンズの中心を動かせます。通常のズーム・パン・自由回転と組み合わせて使えます。レンズの種類は環境設定で選べます。
 - 魚眼の見た目をキャプチャ保存・画像のコピー・エクスポートで出力できます。「魚眼で寄る」「魚眼で離れる」には操作カスタマイズでキーを割り当てられます。

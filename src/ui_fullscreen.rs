@@ -15951,6 +15951,8 @@ impl App {
             self.analysis_zoom = new_zoom;
             self.analysis_pan = proposed_pan;
         } else {
+            let candidate = self.plane_fill_lock_candidate();
+            self.lock_plane_fill_for_zoom(old_zoom, new_zoom, candidate);
             self.fs_zoom = new_zoom;
             self.set_fs_pan_from_input(new_zoom, proposed_pan);
         }
@@ -16152,6 +16154,8 @@ impl App {
             {
                 match drag.owner {
                     FsZoomOwner::Image => {
+                        let candidate = self.plane_fill_lock_candidate();
+                        self.lock_plane_fill_for_zoom(self.fs_zoom, zoom, candidate);
                         self.fs_zoom = zoom;
                         self.set_fs_pan_from_input(zoom, pan);
                     }
@@ -16340,6 +16344,8 @@ impl App {
         let old_zoom = self.fs_zoom;
         let factor = 2.0_f32.powf(amount * dt);
         self.fs_zoom = (self.fs_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+        let candidate = self.plane_fill_lock_candidate();
+        self.lock_plane_fill_for_zoom(old_zoom, self.fs_zoom, candidate);
         if (self.fs_zoom - old_zoom).abs() <= f32::EPSILON {
             return false;
         }
@@ -20388,6 +20394,14 @@ struct FsSinglePageDraw {
     plane_cover: Option<crate::displayed_image_transform::PlaneCoverRecord>,
 }
 
+/// A displayed fill value belongs to one context and uninterrupted PlaneView owner.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlaneFillLockCandidate {
+    pub(crate) context: crate::app::ViewerContextId,
+    pub(crate) anchor: crate::plane_view::PlaneViewAnchor,
+    pub(crate) k_fill: f32,
+}
+
 struct FsWheelFrameProposal {
     context: egui::Context,
     viewport: egui::ViewportId,
@@ -20403,6 +20417,7 @@ struct FsWheelFrameProposal {
     full_rect: egui::Rect,
     default_image_rect: egui::Rect,
     plane_cover: Option<crate::plane_view::PlaneCoverInput>,
+    plane_fill_lock: Option<PlaneFillLockCandidate>,
     primary_suppression: FullscreenPrimarySuppressionDecision,
     fs_response: egui::Response,
     is_spread_double: bool,
@@ -37417,7 +37432,7 @@ impl App {
                     cover,
                 ) {
                     let outcome = crate::plane_view::plane_view_wheel_transition(input);
-                    self.apply_plane_view_outcome(ctx, outcome);
+                    self.apply_plane_view_outcome(ctx, outcome, notches > 0.);
                 }
             }
         }
@@ -42583,6 +42598,7 @@ impl App {
         // Preserve the released wheel-before-click classification without mutating
         // a page which an intermediate navigation has already left.
         let plane_cover = self.plane_cover_input_for_canvas(ctx, default_image_rect);
+        let plane_fill_lock = self.plane_fill_lock_candidate();
         let (click_zoom, click_pan, wheel_navigation_produced, click_plane_active) = self
             .predict_fs_wheel_frame_with_cover(
                 ctx,
@@ -42643,6 +42659,7 @@ impl App {
             full_rect,
             default_image_rect,
             plane_cover,
+            plane_fill_lock,
             primary_suppression,
             fs_response,
             is_spread_double,
@@ -42819,6 +42836,7 @@ impl App {
             full_rect,
             default_image_rect,
             plane_cover,
+            mut plane_fill_lock,
             primary_suppression,
             fs_response,
             is_spread_double,
@@ -42875,6 +42893,11 @@ impl App {
         let mut wheel_actions = accepted_wheel.into_iter().peekable();
         while let Some(wheel_action) = wheel_actions.next() {
             self.plane_view_may_continue(self.fullscreen_idx.unwrap_or(usize::MAX));
+            if plane_fill_lock
+                .is_some_and(|candidate| !self.plane_fill_lock_candidate_matches(candidate))
+            {
+                plane_fill_lock = None;
+            }
             let wheel = wheel_action.input;
             if wheel_action.class == FsWheelInPageClass::PlaneView {
                 if !wheel_navigation_produced
@@ -42892,7 +42915,16 @@ impl App {
                         plane_cover,
                     ) {
                         let outcome = crate::plane_view::plane_view_wheel_transition(input);
-                        self.apply_plane_view_outcome(ctx, outcome);
+                        self.apply_plane_view_outcome(
+                            ctx,
+                            outcome,
+                            wheel_action.segment.vertical_before_axis_mapping > 0.,
+                        );
+                        if plane_fill_lock.is_some_and(|candidate| {
+                            !self.plane_fill_lock_candidate_matches(candidate)
+                        }) {
+                            plane_fill_lock = None;
+                        }
                     }
                 }
                 continue;
@@ -43071,6 +43103,7 @@ impl App {
                         default_image_rect.center(),
                     );
                     if changed {
+                        self.lock_plane_fill_for_zoom(self.fs_zoom, proposed_zoom, plane_fill_lock);
                         self.fs_zoom = proposed_zoom;
                         self.set_fs_pan_from_input(proposed_zoom, proposed_pan);
                         self.maybe_rerender_pdf(self.fs_zoom);
@@ -43481,6 +43514,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         out: crate::plane_view::PlaneViewWheelOutcome,
+        inward: bool,
     ) {
         if let Some(block) = out.blocked {
             self.show_fullscreen_nav_noop(
@@ -43497,6 +43531,18 @@ impl App {
             self.fullscreen_idx
                 .is_some_and(|idx| pose.anchor == self.plane_view_anchor(idx))
         });
+        if out.accepted
+            && inward
+            && let crate::fs_exclusive_view::FsExclusiveView::PlaneView(state) =
+                &mut self.fs_exclusive_view
+            && out
+                .pose
+                .is_some_and(|pose| pose.anchor == state.pose.anchor)
+            && state.fill_mode != crate::plane_view::PlaneFillMode::Auto
+        {
+            state.fill_mode = crate::plane_view::PlaneFillMode::Auto;
+            ctx.request_repaint();
+        }
         if !out.changes_view(current, self.fs_zoom, self.fs_pan) {
             return;
         }
