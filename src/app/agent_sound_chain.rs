@@ -8,6 +8,7 @@ impl App {
         &mut self,
         request: SoundRequest,
         client_name: String,
+        permit: Option<Arc<crate::agent_ipc::Permit>>,
         ctx: &egui::Context,
     ) -> Result<SoundTicket, AgentError> {
         self.admit_agent_settings_write()?;
@@ -23,13 +24,17 @@ impl App {
             let user_latency_secs = self.dsp_bridge.total_latency_samples() as f64
                 / self.dsp_bridge.sample_rate().max(1) as f64;
             self.effetune.set_repaint_context(ctx);
-            Ok(self
-                .effetune
-                .submit_sound(request, &client_name, changes, user_latency_secs))
+            Ok(self.effetune.submit_sound(
+                request,
+                &client_name,
+                changes,
+                user_latency_secs,
+                permit,
+            ))
         }
         #[cfg(not(windows))]
         {
-            let _ = (request, client_name, ctx);
+            let _ = (request, client_name, permit, ctx);
             Err(AgentError::new(
                 ErrorCode::NotReady,
                 "この OS では音響調整を利用できません",

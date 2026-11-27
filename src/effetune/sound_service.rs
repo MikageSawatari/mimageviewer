@@ -164,6 +164,9 @@ pub(super) struct SoundJob {
     pub client: String,
     pub changes: Arc<ChangeController>,
     pub user_latency_secs: f64,
+    // Kept through load, FIFO wait, host completion, persistence and notices.
+    // Internal callers without an agent admission slot use None.
+    pub permit: Option<Arc<crate::agent_ipc::Permit>>,
     reply: mpsc::Sender<Result<SoundResponse, SoundError>>,
 }
 
@@ -180,6 +183,7 @@ pub(super) fn job(
             client: client.into(),
             changes,
             user_latency_secs,
+            permit: None,
             reply,
         },
         SoundTicket {
@@ -741,3 +745,6 @@ fn preset_timestamp() -> String {
 #[cfg(test)]
 #[path = "sound_service_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::sound_job_with_fake_host;

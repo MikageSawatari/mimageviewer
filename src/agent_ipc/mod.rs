@@ -253,8 +253,8 @@ impl Reply {
     }
 }
 
-/// The slot remains occupied until the actual read worker returns, including after
-/// a deadline response. A connection can cancel only its own active identity.
+/// The slot remains occupied until the actual work ends, including a sound FIFO
+/// job after its deadline response. A connection cancels only its own identity.
 struct Connection {
     handlers: Arc<Handlers>,
     running: Mutex<Option<Running>>,
@@ -274,7 +274,9 @@ struct ClientRequest {
     adapter_protocol_version: u32,
 }
 
-struct Permit {
+/// One admission owner; sound jobs share it with the response worker through
+/// Arc so the connection/global counters are released exactly once, at the end.
+pub(crate) struct Permit {
     connection: Arc<Connection>,
 }
 impl Drop for Permit {

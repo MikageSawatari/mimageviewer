@@ -18,6 +18,10 @@ pub(super) fn respond(
     client: Option<ClientRequest>,
     tool: &'static str,
 ) {
+    // A sound response can finish before its FIFO job. Share this one permit
+    // with that job so neither Pending nor a disconnected client frees its slot.
+    let permit = Arc::new(permit);
+    let worker_permit = Arc::clone(&permit);
     let dispatch = Arc::new(UiRequestDispatch::pending());
     let worker_dispatch = dispatch.clone();
     let controller = connection.handlers.open.clone();
@@ -36,9 +40,13 @@ pub(super) fn respond(
         .name("agent-metadata-worker".into())
         .spawn(move || {
             let result = match command {
-                Command::SoundChain(args) => {
-                    controller.execute_sound_chain(args, &worker_ctx, client_name, worker_dispatch)
-                }
+                Command::SoundChain(args) => controller.execute_sound_chain(
+                    args,
+                    &worker_ctx,
+                    client_name,
+                    worker_dispatch,
+                    worker_permit,
+                ),
                 Command::OperationScript {
                     source,
                     part,

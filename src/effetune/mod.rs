@@ -1693,9 +1693,11 @@ impl EffetuneController {
         client: &str,
         changes: Arc<crate::agent_ipc::changes::ChangeController>,
         user_latency_secs: f64,
+        permit: Option<Arc<crate::agent_ipc::Permit>>,
     ) -> sound_service::SoundTicket {
-        let (job, ticket) =
+        let (mut job, ticket) =
             sound_service::job(request, client, Arc::clone(&changes), user_latency_secs);
+        job.permit = permit;
         self.sound_changes = Some(changes);
         self.sound_pending_load.push_back(job);
         self.poll_sound_service();

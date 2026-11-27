@@ -39,6 +39,39 @@ where
     }
 }
 
+/// Return an owned job separately from its response ticket, just as the FIFO
+/// does. Dropping the unstarted closure exercises queue shutdown as well.
+pub(crate) fn sound_job_with_fake_host(
+    request: SoundRequest,
+    client: String,
+    changes: Arc<ChangeController>,
+    permit: Option<Arc<crate::agent_ipc::Permit>>,
+) -> (
+    SoundTicket,
+    mpsc::Receiver<SoundCommand>,
+    mpsc::Sender<Result<SoundReply, SoundError>>,
+    impl FnOnce() -> bool + Send + 'static,
+) {
+    let (mut job, ticket) = job(request, &client, changes, 0.0);
+    job.permit = permit;
+    let (commands, command_rx) = mpsc::channel();
+    let (replies, reply_rx) = mpsc::channel();
+    let run = move || {
+        let directory = tempfile::tempdir().unwrap();
+        let host = FakeHost::new(move |command| {
+            commands.send(command).map_err(|_| SoundError::Aborted)?;
+            reply_rx.recv().unwrap_or(Err(SoundError::Aborted))
+        });
+        let mut saved = false;
+        run_with_host(job, &host, directory.path(), |_| {
+            saved = true;
+            Ok(())
+        });
+        saved
+    };
+    (ticket, command_rx, replies, run)
+}
+
 fn state(bypass: bool) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "formatVersion":1,"appVersion":"test","pipelineA":[

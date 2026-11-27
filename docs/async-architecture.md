@@ -528,6 +528,9 @@ agent IPC版9の `SoundChain` はUIで設定許可と既存の操作受付条件
 `SoundRequest` の受付とロード完了の受け渡しは controller、文書検査・bridge 往復・プリセット I/O・変更後の保存は worker が所有する。
 host 側の印・世代・undo・プリセット handle は GUI thread だけが所有し、音声 thread の fence を使わない。
 応答期限で受信を終えても要求を取り消さず、遅い結果も通知・記録・保存する。host 終了では要求 ID の待機を Aborted で閉じる。
+同時実行枠の `Permit` は応答処理と `SoundJob` が `Arc` で共有し、ロード待ちから保存・通知・記録の終端まで保持する。
+`Pending`・取消・切断・EOFでは枠を空けず、ジョブの成功・失敗・拒否またはキュー破棄と応答処理の両方が終わると解放する。
+寿命を既存ジョブに合わせることで、完了通知用の別workerや追加の完了待ち状態は作らない。他のtoolのPermit解放経路は維持する。
 GUI の thread message は起床通知だけとし、入れ子の modal loop が通知を捨てても外側の DispatchMessage の帰りに残りの列を drain する。
 実装はビルド・実行検証待ち。正本は [MCP 設計 §21](mcp-guide-settings-plan.md)。
 

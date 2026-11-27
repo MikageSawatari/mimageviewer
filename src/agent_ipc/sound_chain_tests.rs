@@ -328,3 +328,392 @@ fn sound_chain_claimed_get_rechecks_permission_but_mutation_keeps_accepted_resul
         }
     }
 }
+
+fn pending_permit_case(read: bool, terminal: &str, client_end: &str) {
+    use super::open::{UiOpenOutcome, UiRequestKind};
+    use crate::effetune::sound_service::sound_job_with_fake_host;
+    use crate::video::dsp::bridge::{SoundCommand, SoundReply};
+    use base64::Engine;
+
+    let fixture = tests::Fixture::new();
+    crate::settings_db::with_db_result(|db| {
+        let mut settings = db.load_into_settings()?;
+        settings.agent_allow_settings = true;
+        db.save_full(&settings)
+    })
+    .unwrap();
+    let ui = fixture.handlers.open.install(egui::Context::default());
+    let connection = fixture.connection();
+    let other = fixture.connection();
+    let third = fixture.connection();
+    let (other_permit, _) = other.acquire(900).unwrap();
+    let command = Command::SoundChain(if read {
+        SoundChainRequest::Get {
+            pipeline: None,
+            offset: 0,
+            ids: None,
+        }
+    } else {
+        SoundChainRequest::Lock {}
+    });
+    let (send, receive) = crossbeam_channel::unbounded();
+    let worker = connection
+        .request(Request { id: 43, command }, send)
+        .unwrap();
+    let request = ui.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(request.try_claim());
+    let mut receive = Some(receive);
+    if client_end == "eof" {
+        // The pipe's EOF path disconnects the connection and drops its reader.
+        connection.disconnect();
+        drop(receive.take());
+    }
+    let mut held = None;
+    request.complete_with(|kind| {
+        let UiRequestKind::SoundChain {
+            request,
+            client_name,
+            permit,
+        } = kind
+        else {
+            panic!()
+        };
+        assert!(permit.is_some(), "real agent admission must carry its slot");
+        let (ticket, commands, replies, run) = sound_job_with_fake_host(
+            request,
+            client_name,
+            Arc::clone(&fixture.handlers.changes),
+            permit,
+        );
+        held = Some((commands, replies, run));
+        UiOpenOutcome::SoundChainAdmitted(ticket.with_wait_budget(Duration::ZERO))
+    });
+    let (commands, host_replies, run) = held.unwrap();
+    // The unstarted closure owns the same job as the FIFO. In queue_drop we
+    // keep it queued through the response deadline, then discard that queue.
+    enum HeldJob<F> {
+        Queued(F),
+        Running(std::thread::JoinHandle<bool>),
+    }
+    let held = if terminal == "queue_drop" {
+        HeldJob::Queued(run)
+    } else {
+        HeldJob::Running(std::thread::spawn(run))
+    };
+    let first = match &held {
+        HeldJob::Queued(_) => None,
+        HeldJob::Running(_) => Some(commands.recv_timeout(Duration::from_secs(5)).unwrap()),
+    };
+    if let Some(receive) = receive.as_ref() {
+        let reply = receive.recv_timeout(Duration::from_secs(5)).unwrap().wire();
+        let Ok(Payload::SoundChain(Ok(response))) = reply.result else {
+            panic!("expected Pending")
+        };
+        assert!(matches!(
+            response.outcome,
+            SoundChainOutcome::Pending { .. }
+        ));
+    }
+    worker.join().unwrap();
+    if client_end == "cancel" {
+        assert!(
+            fixture
+                .call(&connection, 44, Command::Cancel { request_id: 43 })
+                .result
+                .is_ok()
+        );
+    } else if client_end == "disconnect" {
+        connection.disconnect();
+    }
+    assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 2);
+    assert!(connection.running.lock().unwrap().is_some());
+    let next_sound = || {
+        Command::SoundChain(SoundChainRequest::Get {
+            pipeline: None,
+            offset: 0,
+            ids: None,
+        })
+    };
+    assert_eq!(
+        fixture
+            .call(&connection, 45, next_sound())
+            .result
+            .unwrap_err()
+            .code,
+        ErrorCode::Busy
+    );
+    assert_eq!(
+        fixture
+            .call(&third, 46, next_sound())
+            .result
+            .unwrap_err()
+            .code,
+        ErrorCode::Busy
+    );
+    assert!(
+        fixture
+            .handlers
+            .changes
+            .records()
+            .lock()
+            .unwrap()
+            .entries()
+            .is_empty()
+    );
+    assert!(
+        ui.try_recv().is_err(),
+        "Busy requests must not add FIFO work"
+    );
+
+    if terminal == "success" {
+        let reply = |status: &str, state| SoundReply {
+            request_id: 1,
+            slot_id: 0,
+            status: status.into(),
+            lock: Some("test-lock".into()),
+            generation: 0,
+            state,
+            guard: None,
+        };
+        if !read {
+            assert!(matches!(first, Some(SoundCommand::Lock)));
+            host_replies.send(Ok(reply("Locked", None))).unwrap();
+        } else {
+            assert!(matches!(first, Some(SoundCommand::Get)));
+            host_replies
+                .send(Ok(reply(
+                    "State",
+                    Some(base64::engine::general_purpose::STANDARD.encode(state(0, false))),
+                )))
+                .unwrap();
+        }
+        // Existing service persistence also fetches state after a successful get.
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+            SoundCommand::Get
+        ));
+        host_replies
+            .send(Ok(reply(
+                "State",
+                Some(base64::engine::general_purpose::STANDARD.encode(state(0, false))),
+            )))
+            .unwrap();
+    } else if terminal == "invalid" {
+        host_replies
+            .send(Err(SoundError::Invalid("fake rejection".into())))
+            .unwrap();
+    } else if terminal == "aborted" {
+        host_replies.send(Err(SoundError::Aborted)).unwrap();
+    } else {
+        assert!(matches!(terminal, "host_eof" | "queue_drop"));
+        drop(host_replies);
+    }
+    match held {
+        HeldJob::Queued(job) => drop(job),
+        HeldJob::Running(worker) => {
+            assert_eq!(worker.join().unwrap(), terminal == "success");
+        }
+    }
+    assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 1);
+    assert!(connection.running.lock().unwrap().is_none());
+    assert!(fixture.call(&third, 47, Command::Status).result.is_ok());
+    assert_eq!(
+        fixture
+            .handlers
+            .changes
+            .records()
+            .lock()
+            .unwrap()
+            .entries()
+            .len(),
+        usize::from(terminal != "queue_drop" && !(terminal == "success" && read))
+    );
+    drop(other_permit);
+    assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn sound_chain_pending_keeps_permit_until_fake_host_terminal() {
+    for read in [false, true] {
+        for terminal in ["success", "invalid", "aborted", "host_eof", "queue_drop"] {
+            pending_permit_case(read, terminal, "connected");
+        }
+    }
+}
+
+#[test]
+fn sound_chain_pending_keeps_permit_after_cancel_disconnect_and_eof() {
+    for read in [false, true] {
+        for client_end in ["cancel", "disconnect", "eof"] {
+            pending_permit_case(read, "aborted", client_end);
+        }
+    }
+}
+
+#[test]
+fn sound_chain_refusal_and_other_metadata_tools_release_permits() {
+    use super::open::{UiOpenOutcome, UiRequestKind};
+    let fixture = tests::Fixture::new();
+    crate::settings_db::with_db_result(|db| {
+        let mut settings = db.load_into_settings()?;
+        settings.agent_allow_settings = true;
+        db.save_full(&settings)
+    })
+    .unwrap();
+    let ui = fixture.handlers.open.install(egui::Context::default());
+    let connection = fixture.connection();
+    for sound in [true, false] {
+        let command = if sound {
+            Command::SoundChain(SoundChainRequest::Lock {})
+        } else {
+            Command::SetSettings {
+                changes: json!({"fullscreen_wheel_action":"PageTurn"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            }
+        };
+        let (send, receive) = crossbeam_channel::unbounded();
+        let worker = connection
+            .request(Request { id: 51, command }, send)
+            .unwrap();
+        let request = ui.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(request.try_claim());
+        assert_eq!(
+            matches!(&request.kind, UiRequestKind::SoundChain { .. }),
+            sound
+        );
+        assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 1);
+        request.complete(UiOpenOutcome::Refused(error(
+            ErrorCode::Busy,
+            "fake UI refusal",
+        )));
+        assert_eq!(
+            receive
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .wire()
+                .result
+                .unwrap_err()
+                .code,
+            ErrorCode::Busy
+        );
+        worker.join().unwrap();
+        assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 0);
+        assert!(connection.running.lock().unwrap().is_none());
+        assert!(
+            fixture
+                .call(&connection, 52, Command::Status)
+                .result
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn sound_chain_pending_load_holds_permit_until_rejection_or_controller_drop() {
+    use super::open::{UiOpenOutcome, UiRequestKind};
+    use crate::effetune::{EffetuneController, EffetuneFailure, EffetuneRuntime, LoadOrigin};
+
+    for read in [false, true] {
+        for reject_load in [false, true] {
+            let fixture = tests::Fixture::new();
+            crate::settings_db::with_db_result(|db| {
+                let mut settings = db.load_into_settings()?;
+                settings.agent_allow_settings = true;
+                db.save_full(&settings)
+            })
+            .unwrap();
+            let ui = fixture.handlers.open.install(egui::Context::default());
+            let connection = fixture.connection();
+            let mut controller = EffetuneController::new();
+            // No actual load worker or host exists. Keep the job in the real
+            // controller's pending-load queue without entering start_load.
+            controller.runtime = EffetuneRuntime::Loading {
+                origin: LoadOrigin::SoundAgent,
+                open_gui_when_ready: None,
+            };
+            let command = Command::SoundChain(if read {
+                SoundChainRequest::Get {
+                    pipeline: None,
+                    offset: 0,
+                    ids: None,
+                }
+            } else {
+                SoundChainRequest::Lock {}
+            });
+            let (send, receive) = crossbeam_channel::unbounded();
+            let worker = connection
+                .request(Request { id: 61, command }, send)
+                .unwrap();
+            let request = ui.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(request.try_claim());
+            request.complete_with(|kind| {
+                let UiRequestKind::SoundChain {
+                    request,
+                    client_name,
+                    permit,
+                } = kind
+                else {
+                    panic!()
+                };
+                assert!(permit.is_some());
+                let ticket = controller.submit_sound(
+                    request,
+                    &client_name,
+                    Arc::clone(&fixture.handlers.changes),
+                    0.0,
+                    permit,
+                );
+                UiOpenOutcome::SoundChainAdmitted(ticket.with_wait_budget(Duration::ZERO))
+            });
+            let reply = receive.recv_timeout(Duration::from_secs(5)).unwrap().wire();
+            assert!(matches!(
+                reply.result,
+                Ok(Payload::SoundChain(Ok(SoundChainResponse {
+                    outcome: SoundChainOutcome::Pending { .. },
+                    ..
+                })))
+            ));
+            worker.join().unwrap();
+            assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 1);
+            assert_eq!(
+                fixture
+                    .call(&connection, 62, Command::Status)
+                    .result
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Busy
+            );
+            if reject_load {
+                controller.set_test_startup_completion(Err(EffetuneFailure::LoadFailed(
+                    "fake load rejection".into(),
+                )));
+                assert!(controller.poll());
+                assert!(matches!(controller.runtime, EffetuneRuntime::Failed(_)));
+            }
+            // Dropping the controller also drops pending jobs if mIV exits
+            // before its load completion is delivered to the UI.
+            drop(controller);
+            assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 0);
+            assert!(connection.running.lock().unwrap().is_none());
+            assert_eq!(
+                fixture
+                    .handlers
+                    .changes
+                    .records()
+                    .lock()
+                    .unwrap()
+                    .entries()
+                    .len(),
+                usize::from(reject_load)
+            );
+            assert!(
+                fixture
+                    .call(&connection, 63, Command::Status)
+                    .result
+                    .is_ok()
+            );
+        }
+    }
+}

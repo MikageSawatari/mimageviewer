@@ -28,6 +28,7 @@ fn enqueue_on_worker(
             .execute_settings_for_test(UiRequestKind::SoundChain {
                 request,
                 client_name: "sound-ui-fixture".into(),
+                permit: None,
             })
             .unwrap()
         {

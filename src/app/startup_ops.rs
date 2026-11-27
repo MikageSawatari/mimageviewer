@@ -262,11 +262,12 @@ impl App {
                         let crate::agent_ipc::open::UiRequestKind::SoundChain {
                             request,
                             client_name,
+                            permit,
                         } = kind
                         else {
                             unreachable!("sound request arm owns its prepared request");
                         };
-                        match self.admit_agent_sound_chain(request, client_name, ctx) {
+                        match self.admit_agent_sound_chain(request, client_name, permit, ctx) {
                             Ok(ticket) => {
                                 crate::agent_ipc::open::UiOpenOutcome::SoundChainAdmitted(ticket)
                             }

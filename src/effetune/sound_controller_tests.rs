@@ -73,8 +73,13 @@ fn sound_controller_loading_holds_request_without_opening_then_resumes_after_fak
     let bridge = fake_dsp(directory.path());
     bridge.install_fake_host_for_test(Arc::clone(&host));
 
-    let ticket =
-        controller.submit_sound(SoundRequest::Lock, "test client", Arc::clone(&changes), 0.0);
+    let ticket = controller.submit_sound(
+        SoundRequest::Lock,
+        "test client",
+        Arc::clone(&changes),
+        0.0,
+        None,
+    );
     assert!(matches!(
         controller.runtime,
         EffetuneRuntime::Loading {
@@ -156,6 +161,7 @@ fn sound_controller_load_failures_return_the_existing_reason_without_dispatch_or
             "test client",
             ChangeController::new(),
             0.0,
+            None,
         );
         controller.set_test_startup_completion(Err(failure.clone()));
         assert!(controller.poll());
@@ -180,12 +186,14 @@ fn sound_controller_unavailable_load_completion_rejects_all_waiting_jobs() {
         "first client",
         Arc::clone(&changes),
         0.0,
+        None,
     );
     let second = controller.submit_sound(
         SoundRequest::Get(Default::default()),
         "second client",
         changes,
         0.0,
+        None,
     );
     let reason = UnavailableReason::CpuUnsupported;
     let expected = reason.user_reason().to_owned();
@@ -217,12 +225,14 @@ fn sound_controller_preparation_failure_closes_all_waiters_without_automatic_rel
         "first client",
         Arc::clone(&changes),
         0.0,
+        None,
     );
     let second = controller.submit_sound(
         SoundRequest::Get(Default::default()),
         "second client",
         Arc::clone(&changes),
         0.0,
+        None,
     );
     let reason = UnavailableReason::BundlePreparationFailed {
         reason: "fake preparation failure".into(),
@@ -285,6 +295,7 @@ fn sound_controller_capture_and_sound_share_fifo_and_only_capture_worker_writes_
         "test client",
         ChangeController::new(),
         0.0,
+        None,
     );
     let last_capture = controller.captures.request(Arc::clone(&bridge)).unwrap();
 
@@ -376,6 +387,7 @@ fn sound_controller_stopped_capture_queue_aborts_sound_without_dispatch() {
         "test client",
         ChangeController::new(),
         0.0,
+        None,
     );
     assert_eq!(ticket.wait(), Err(SoundError::Aborted));
     assert!(commands.try_recv().is_err());

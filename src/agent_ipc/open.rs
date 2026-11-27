@@ -87,6 +87,7 @@ pub(crate) enum UiRequestKind {
     SoundChain {
         request: crate::effetune::sound_service::SoundRequest,
         client_name: String,
+        permit: Option<Arc<super::Permit>>,
     },
     TagWrite(super::metadata_write::PreparedTags),
     RatingWrite(super::metadata_write::PreparedRatings),
@@ -424,6 +425,7 @@ impl OpenController {
         ctx: &super::ReadContext,
         client_name: String,
         dispatch: Arc<UiRequestDispatch>,
+        permit: Arc<super::Permit>,
     ) -> Result<UiOpenOutcome, AgentError> {
         let request = super::sound_chain::prepare_request(args)?;
         ctx.checkpoint()?;
@@ -431,6 +433,7 @@ impl OpenController {
             Ok(UiRequestKind::SoundChain {
                 request,
                 client_name,
+                permit: Some(permit),
             })
         })?;
         match admission {
