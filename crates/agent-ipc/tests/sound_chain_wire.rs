@@ -280,6 +280,7 @@ fn sound_chain_outcomes_and_command_specific_errors_are_typed_and_round_trip() {
     for code in [
         SoundChainErrorCode::Busy,
         SoundChainErrorCode::Unlocked,
+        SoundChainErrorCode::LockMismatch,
         SoundChainErrorCode::Changed,
         SoundChainErrorCode::NothingToUndo,
         SoundChainErrorCode::Aborted,
@@ -302,5 +303,6 @@ fn sound_chain_outcomes_and_command_specific_errors_are_typed_and_round_trip() {
         );
     }
     assert!(serde_json::from_value::<ErrorCode>(json!("unlocked")).is_err());
+    assert!(serde_json::from_value::<ErrorCode>(json!("lock_mismatch")).is_err());
     assert!(serde_json::from_value::<ErrorCode>(json!("nothing_to_undo")).is_err());
 }

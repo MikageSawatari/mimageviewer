@@ -173,6 +173,7 @@ fn sound_chain_wire_maps_all_service_outcomes_and_error_codes() {
     for (error, code) in [
         (SoundError::Busy, SoundChainErrorCode::Busy),
         (SoundError::Unlocked, SoundChainErrorCode::Unlocked),
+        (SoundError::LockMismatch, SoundChainErrorCode::LockMismatch),
         (SoundError::Changed, SoundChainErrorCode::Changed),
         (
             SoundError::NothingToUndo,
@@ -194,6 +195,58 @@ fn sound_chain_wire_maps_all_service_outcomes_and_error_codes() {
         let mapped = wire.unwrap_err();
         assert_eq!(mapped.code, code);
         assert_eq!(mapped.message, message);
+    }
+}
+
+#[test]
+fn sound_chain_stale_undo_and_unlock_hide_host_lock_in_wire_errors() {
+    use crate::effetune::sound_service::sound_job_with_fake_host;
+    use crate::video::dsp::bridge::{SoundCommand, SoundReply};
+    const PRIVATE_LOCK: &str = "private-host-lock-843c";
+    for request in [
+        SoundRequest::Undo {
+            lock: "stale".into(),
+        },
+        SoundRequest::Unlock {
+            lock: "stale".into(),
+        },
+    ] {
+        let changes = changes::ChangeController::new();
+        let (ticket, commands, replies, run) =
+            sound_job_with_fake_host(request, "wire client".into(), Arc::clone(&changes), None);
+        let worker = std::thread::spawn(run);
+        let status = match commands.recv_timeout(Duration::from_secs(5)).unwrap() {
+            SoundCommand::Undo { .. } => "Unlocked",
+            SoundCommand::Unlock { .. } => "AlreadyReleased",
+            command => panic!("unexpected command: {command:?}"),
+        };
+        replies
+            .send(Ok(SoundReply {
+                request_id: 1,
+                slot_id: 0,
+                status: status.into(),
+                lock: Some(PRIVATE_LOCK.into()),
+                generation: 3,
+                state: None,
+                guard: None,
+            }))
+            .unwrap();
+        let wire = sound_chain::wire_result(ticket.wait()).unwrap();
+        assert!(!worker.join().unwrap(), "mismatch must not persist");
+        let error = wire.as_ref().unwrap_err();
+        assert_eq!(error.code, SoundChainErrorCode::LockMismatch);
+        let value = serde_json::to_value(&wire).unwrap();
+        assert_eq!(
+            value,
+            json!({"Err":{"code":"lock_mismatch","message":SoundError::LockMismatch.to_string()}})
+        );
+        assert!(!value.to_string().contains(PRIVATE_LOCK));
+        let records = changes.records();
+        let records = records.lock().unwrap();
+        assert_eq!(records.entries().len(), 1);
+        assert!(records.entries()[0].rows.is_empty());
+        assert!(!format!("{:?}", records.entries()).contains(PRIVATE_LOCK));
+        final_budget(&wire);
     }
 }
 

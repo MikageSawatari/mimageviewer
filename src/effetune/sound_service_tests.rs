@@ -124,6 +124,305 @@ fn select_request(revision: &str) -> SoundRequest {
     }
 }
 
+fn writing_requests() -> [SoundRequest; 5] {
+    [
+        SoundRequest::Apply {
+            lock: "test-lock".into(),
+            revision: "test-lock:3".into(),
+            input: serde_json::from_value(json!({"pipeline":"B","effects":[]})).unwrap(),
+        },
+        select_request("test-lock:3"),
+        SoundRequest::Undo {
+            lock: "test-lock".into(),
+        },
+        save_request(),
+        SoundRequest::Unlock {
+            lock: "test-lock".into(),
+        },
+    ]
+}
+
+#[test]
+fn sound_service_lock_classification_and_messages_do_not_expose_tokens() {
+    assert_eq!(
+        SoundError::LockMismatch.to_string(),
+        "印が今のロックと違います。ロックは続いています。lock で受け取った最新の印を使ってください"
+    );
+    assert_eq!(
+        SoundError::Unlocked.to_string(),
+        "ロックは解除されています。利用者が解除したか、このロックは既に終わっています。続けるなら lock からやり直してください"
+    );
+    for status in ["State", "Unlocked", "AlreadyReleased"] {
+        for (lock, expected) in [
+            (Some("test-lock"), Ok(())),
+            (Some("private-current-lock"), Err(SoundError::LockMismatch)),
+            (None, Err(SoundError::Unlocked)),
+        ] {
+            let response = SoundReply {
+                lock: lock.map(str::to_owned),
+                ..reply(status, 3)
+            };
+            assert_eq!(check_lock(&response, "test-lock"), expected);
+            if status != "State" {
+                let result = accepted(response, &["AlreadyReleased"], Some("test-lock"));
+                match result {
+                    Err(error) => {
+                        assert_eq!(error, expected.err().unwrap_or(SoundError::Unlocked));
+                        assert!(!format!("{error:?}: {error}").contains("private-current-lock"));
+                    }
+                    Ok(_) => assert_eq!(status, "AlreadyReleased"),
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sound_service_lock_matrix_and_privacy() {
+    // The real logger is process-global. Keep its disposable sink and shutdown
+    // isolated from other tests without initializing the user's data directory.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "effetune::sound_service::tests::sound_service_lock_matrix_and_privacy_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("MIV_SOUND_LOCK_PRIVACY_CHILD", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated sound lock test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+#[test]
+#[ignore = "isolated helper invoked by sound_service_lock_matrix_and_privacy"]
+fn sound_service_lock_matrix_and_privacy_child() {
+    assert_eq!(std::env::var("MIV_SOUND_LOCK_PRIVACY_CHILD").unwrap(), "1");
+    const OTHER_LOCK: &str = "other-lock-private-843c";
+    let logs = tempfile::tempdir().unwrap();
+    let writer = crate::log_writer::test_support::writer(logs.path(), 256, 1_048_576);
+    crate::log_writer::test_support::install_global(&writer);
+    for initial_lock in [Some(OTHER_LOCK), None, Some("test-lock")] {
+        for request in writing_requests() {
+            let directory = tempfile::tempdir().unwrap();
+            let current_lock = Cell::new(initial_lock);
+            let generation = Cell::new(3);
+            let host = FakeHost::new(|command| {
+                let response = match command {
+                    SoundCommand::Get => state_reply(
+                        generation.get(),
+                        Some(SoundPresetGuard::Epoch { epoch: 4 }),
+                        false,
+                    ),
+                    SoundCommand::Unlock { lock } => {
+                        if current_lock.get() == Some(lock.as_str()) {
+                            current_lock.set(None);
+                            reply("Released", generation.get())
+                        } else {
+                            reply("AlreadyReleased", generation.get())
+                        }
+                    }
+                    SoundCommand::Undo { lock } => {
+                        if current_lock.get() == Some(lock.as_str()) {
+                            generation.set(generation.get() + 1);
+                            reply("Undone", generation.get())
+                        } else {
+                            reply("Unlocked", generation.get())
+                        }
+                    }
+                    SoundCommand::Replace {
+                        lock,
+                        generation: sent,
+                        ..
+                    } => {
+                        assert_eq!(current_lock.get(), Some(lock.as_str()));
+                        assert_eq!(sent, generation.get());
+                        generation.set(generation.get() + 1);
+                        reply("Replaced", generation.get())
+                    }
+                    SoundCommand::PresetCommit {
+                        lock,
+                        generation: sent,
+                        ..
+                    } => {
+                        assert_eq!(current_lock.get(), Some(lock.as_str()));
+                        assert_eq!(sent, generation.get());
+                        fs::rename(
+                            directory.path().join("effetune_presets.json.miv-mcp.tmp"),
+                            directory.path().join("effetune_presets.json"),
+                        )
+                        .unwrap();
+                        reply("Committed", generation.get())
+                    }
+                    other => panic!("unexpected command: {other:?}"),
+                };
+                Ok(SoundReply {
+                    lock: current_lock.get().map(str::to_owned),
+                    ..response
+                })
+            });
+            let unlock = matches!(&request, SoundRequest::Unlock { .. });
+            let changes = ChangeController::new();
+            let notices = changes.install(egui::Context::default());
+            let (job, ticket) = job(request.clone(), "lock client", Arc::clone(&changes), 0.0);
+            let mut persisted = false;
+            run_with_host(job, &host, directory.path(), |_| {
+                persisted = true;
+                Ok(())
+            });
+            let result = ticket.wait();
+            if initial_lock == Some(OTHER_LOCK) || (initial_lock.is_none() && !unlock) {
+                let expected = if initial_lock.is_some() {
+                    SoundError::LockMismatch
+                } else {
+                    SoundError::Unlocked
+                };
+                assert_eq!(result, Err(expected.clone()), "{request:?}");
+                assert!(!persisted);
+                assert_eq!(current_lock.get(), initial_lock);
+                assert_eq!(host.commands.lock().unwrap().len(), 1);
+                assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+                let expected_notice = format!("mIV Sound: {expected}");
+                assert_eq!(notices.try_recv().unwrap(), expected_notice);
+                let records = changes.records();
+                let records = records.lock().unwrap();
+                assert_eq!(records.entries().len(), 1);
+                assert_eq!(records.entries()[0].notice, expected_notice);
+                assert!(records.entries()[0].rows.is_empty());
+                assert_eq!(records.entries()[0].counts.changed, 0);
+                assert!(!format!("{:?}", records.entries()).contains(OTHER_LOCK));
+                assert!(!expected_notice.contains(OTHER_LOCK));
+                assert!(!expected_notice.contains("AI アプリが mIV Sound のロックを解除しました"));
+                let error = result.as_ref().unwrap_err();
+                assert!(!error.to_string().contains(OTHER_LOCK));
+                assert!(!serde_json::to_string(error).unwrap().contains(OTHER_LOCK));
+                if unlock {
+                    // A stale unlock leaves the real lock usable by its owner.
+                    let released = execute(
+                        &host,
+                        &SoundRequest::Unlock {
+                            lock: OTHER_LOCK.into(),
+                        },
+                        directory.path(),
+                        0.0,
+                    )
+                    .unwrap();
+                    assert_eq!(current_lock.get(), None);
+                    assert_eq!(
+                        released.outcome,
+                        SoundOutcome::Released {
+                            already_released: false
+                        }
+                    );
+                }
+            } else {
+                let response = result.unwrap();
+                assert!(persisted);
+                match request {
+                    SoundRequest::Apply { .. } | SoundRequest::Select { .. } => {
+                        assert!(
+                            matches!(response.outcome, SoundOutcome::Accepted { ref revision, .. } if revision == "test-lock:4")
+                        );
+                    }
+                    SoundRequest::Undo { .. } => {
+                        assert_eq!(
+                            response.outcome,
+                            SoundOutcome::Undone {
+                                revision: "test-lock:4".into()
+                            }
+                        );
+                    }
+                    SoundRequest::SavePreset { .. } => {
+                        assert!(matches!(response.outcome, SoundOutcome::PresetSaved { .. }));
+                        assert!(directory.path().join("effetune_presets.json").is_file());
+                    }
+                    SoundRequest::Unlock { .. } => {
+                        assert_eq!(
+                            response.outcome,
+                            SoundOutcome::Released {
+                                already_released: initial_lock.is_none()
+                            }
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(current_lock.get(), if unlock { None } else { initial_lock });
+                let records = changes.records();
+                let records = records.lock().unwrap();
+                if initial_lock.is_none() {
+                    assert!(records.entries().is_empty());
+                } else {
+                    assert_eq!(records.entries().len(), 1);
+                    assert!(!records.entries()[0].rows.is_empty());
+                    notices.try_recv().unwrap();
+                }
+            }
+            assert!(notices.try_recv().is_err());
+        }
+    }
+    assert!(writer.shutdown());
+    let text = fs::read_to_string(logs.path().join("mimageviewer.log")).unwrap();
+    assert!(text.contains("action=unlock failed: 印が今のロックと違います"));
+    assert!(text.contains("action=undo failed: ロックは解除されています"));
+    assert!(!text.contains(OTHER_LOCK));
+}
+
+#[test]
+fn sound_service_lock_changes_before_host_commit_reject_all_prepared_writes() {
+    for current_lock in [Some("other-private-commit-lock"), None] {
+        for request in writing_requests().into_iter().filter(|request| {
+            matches!(
+                request,
+                SoundRequest::Apply { .. }
+                    | SoundRequest::Select { .. }
+                    | SoundRequest::SavePreset { .. }
+            )
+        }) {
+            let directory = tempfile::tempdir().unwrap();
+            let host = FakeHost::new(|command| match command {
+                SoundCommand::Get => Ok(state_reply(
+                    3,
+                    Some(SoundPresetGuard::Epoch { epoch: 4 }),
+                    false,
+                )),
+                SoundCommand::Replace { .. } | SoundCommand::PresetCommit { .. } => {
+                    Ok(SoundReply {
+                        lock: current_lock.map(str::to_owned),
+                        ..reply("Unlocked", 0)
+                    })
+                }
+                other => panic!("unexpected command: {other:?}"),
+            });
+            let changes = ChangeController::new();
+            let (job, ticket) = job(request, "commit client", Arc::clone(&changes), 0.0);
+            run_with_host(job, &host, directory.path(), |_| {
+                panic!("rejected write must not persist")
+            });
+            assert_eq!(
+                ticket.wait(),
+                Err(if current_lock.is_some() {
+                    SoundError::LockMismatch
+                } else {
+                    SoundError::Unlocked
+                })
+            );
+            assert_eq!(host.commands.lock().unwrap().len(), 2);
+            let records = changes.records();
+            let records = records.lock().unwrap();
+            assert_eq!(records.entries().len(), 1);
+            assert!(records.entries()[0].rows.is_empty());
+            assert!(!format!("{:?}", records.entries()).contains("other-private-commit-lock"));
+            assert!(!directory.path().join("effetune_presets.json").exists());
+        }
+    }
+}
+
 #[test]
 fn sound_service_revision_and_lock_mismatch_prevent_replace_for_both_edit_routes() {
     let directory = tempfile::tempdir().unwrap();
@@ -133,11 +432,11 @@ fn sound_service_revision_and_lock_mismatch_prevent_replace_for_both_edit_routes
         input: serde_json::from_value(json!({"pipeline":"B","effects":[]})).unwrap(),
     };
     for request in [apply, select_request("test-lock:2")] {
-        for unlocked in [false, true] {
+        for mismatch in [false, true] {
             let host = FakeHost::new(|command| {
                 assert!(matches!(command, SoundCommand::Get));
                 let mut current = state_reply(3, None, false);
-                if unlocked {
+                if mismatch {
                     current.lock = Some("new-lock".into());
                 }
                 Ok(current)
@@ -145,13 +444,13 @@ fn sound_service_revision_and_lock_mismatch_prevent_replace_for_both_edit_routes
             match execute(&host, &request, directory.path(), 0.0) {
                 Err(error) => assert_eq!(
                     error,
-                    if unlocked {
-                        SoundError::Unlocked
+                    if mismatch {
+                        SoundError::LockMismatch
                     } else {
                         SoundError::Changed
                     }
                 ),
-                Ok(_) => panic!("stale revision or released lock must not mutate state"),
+                Ok(_) => panic!("stale revision or mismatched lock must not mutate state"),
             }
             host.only_get();
         }
@@ -615,7 +914,11 @@ fn sound_service_undo_nothing_or_unlocked_never_persists_or_records_success() {
                 panic!("rejected undo must not fetch state");
             };
             assert_eq!(lock, "test-lock");
-            Ok(reply(status, 3))
+            let mut result = reply(status, 3);
+            if status == "Unlocked" {
+                result.lock = None;
+            }
+            Ok(result)
         });
         let changes = ChangeController::new();
         let notices = changes.install(egui::Context::default());

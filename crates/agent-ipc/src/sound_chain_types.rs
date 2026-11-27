@@ -200,6 +200,7 @@ pub type SoundChainResult = Result<SoundChainResponse, SoundChainError>;
 pub enum SoundChainErrorCode {
     Busy,
     Unlocked,
+    LockMismatch,
     Changed,
     NothingToUndo,
     Aborted,
@@ -212,6 +213,7 @@ impl SoundChainErrorCode {
         match self {
             Self::Busy => "busy",
             Self::Unlocked => "unlocked",
+            Self::LockMismatch => "lock_mismatch",
             Self::Changed => "changed",
             Self::NothingToUndo => "nothing_to_undo",
             Self::Aborted => "aborted",

@@ -201,6 +201,14 @@ impl Backend for FrameBackend {
             panic!("wrong typed command")
         };
         let result = match request {
+            SoundChainRequest::Unlock { ref lock } | SoundChainRequest::Undo { ref lock }
+                if lock == "stale" =>
+            {
+                Err(SoundChainError {
+                    code: SoundChainErrorCode::LockMismatch,
+                    message: "印が今のロックと違います。ロックは続いています。lock で受け取った最新の印を使ってください".into(),
+                })
+            }
             SoundChainRequest::Lock {} => Ok(response(
                 json!({"status":"locked","lock":"token","revision":"token:0"}),
             )),
@@ -282,6 +290,39 @@ fn sound_chain_all_mcp_versions_transport_actions_and_typed_errors_over_fake_fra
             "changed"
         );
         assert_eq!(backend.0.load(Ordering::Relaxed), 8);
+        for action in ["undo", "unlock"] {
+            h.send(version_request(
+                version,
+                3,
+                "tools/call",
+                json!({"name":"sound_chain","arguments":{"action":action,"lock":"stale"}}),
+            ));
+            let result = h.receive()["result"].clone();
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["structuredContent"]["error"]["code"],
+                "lock_mismatch"
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap())
+                    .unwrap(),
+                result["structuredContent"]
+            );
+            assert_eq!(
+                result["structuredContent"]["error"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                2,
+                "only code and message may be exposed"
+            );
+            assert!(!result.to_string().contains("token"));
+            assert!(accepts_schema(
+                &definition("sound_chain")["outputSchema"],
+                &result["structuredContent"]
+            ));
+        }
+        assert_eq!(backend.0.load(Ordering::Relaxed), 10);
         h.close();
     }
 }
@@ -347,6 +388,7 @@ fn sound_chain_errors_pending_and_unexpected_payloads_keep_tool_error_contract()
     for code in [
         SoundChainErrorCode::Busy,
         SoundChainErrorCode::Unlocked,
+        SoundChainErrorCode::LockMismatch,
         SoundChainErrorCode::Changed,
         SoundChainErrorCode::NothingToUndo,
         SoundChainErrorCode::Aborted,
@@ -433,6 +475,7 @@ fn sound_tool_descriptions_keep_lock_undo_recovery_and_risk_conditions() {
         "user-requested edits",
         "latest revision",
         "User may force unlock",
+        "lock_mismatch: use latest lock.",
         "sound_effects",
         "no new external assets",
         "Build in B leaving A",

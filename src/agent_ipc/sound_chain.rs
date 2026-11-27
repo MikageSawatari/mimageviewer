@@ -88,6 +88,7 @@ fn service_error(error: SoundError) -> SoundChainError {
     let code = match &error {
         SoundError::Busy => SoundChainErrorCode::Busy,
         SoundError::Unlocked => SoundChainErrorCode::Unlocked,
+        SoundError::LockMismatch => SoundChainErrorCode::LockMismatch,
         SoundError::Changed => SoundChainErrorCode::Changed,
         SoundError::NothingToUndo => SoundChainErrorCode::NothingToUndo,
         SoundError::Aborted => SoundChainErrorCode::Aborted,

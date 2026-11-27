@@ -90,6 +90,7 @@ pub(crate) enum SoundOutcome {
 pub(crate) enum SoundError {
     Busy,
     Unlocked,
+    LockMismatch,
     Changed,
     NothingToUndo,
     Aborted,
@@ -101,7 +102,8 @@ impl std::fmt::Display for SoundError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Busy => f.write_str("ほかの操作でロック中です"),
-            Self::Unlocked => f.write_str("利用者がロックを解除しました"),
+            Self::Unlocked => f.write_str("ロックは解除されています。利用者が解除したか、このロックは既に終わっています。続けるなら lock からやり直してください"),
+            Self::LockMismatch => f.write_str("印が今のロックと違います。ロックは続いています。lock で受け取った最新の印を使ってください"),
             Self::Changed => f.write_str("状態が変わりました。get で確かめてください"),
             Self::NothingToUndo => f.write_str("戻せる変更がありません。窓で直してください"),
             Self::Aborted => f.write_str("音響調整との接続が切れ、処理を中断しました"),
@@ -231,13 +233,35 @@ fn bridge_error(error: ConcurrentStateError) -> SoundError {
     }
 }
 
-fn accepted(reply: SoundReply, statuses: &[&str]) -> Result<SoundReply, SoundError> {
+/// Classify ownership without carrying the host's current token into an error.
+fn check_lock(reply: &SoundReply, sent: &str) -> Result<(), SoundError> {
+    match reply.lock.as_deref() {
+        Some(current) if current == sent => Ok(()),
+        Some(_) => Err(SoundError::LockMismatch),
+        None => Err(SoundError::Unlocked),
+    }
+}
+
+fn accepted(
+    reply: SoundReply,
+    statuses: &[&str],
+    sent_lock: Option<&str>,
+) -> Result<SoundReply, SoundError> {
+    if matches!(reply.status.as_str(), "Unlocked" | "AlreadyReleased") {
+        if let Some(lock) = sent_lock {
+            match check_lock(&reply, lock) {
+                // An absent lock is an idempotent unlock, not a failed write.
+                Err(SoundError::Unlocked) if reply.status == "AlreadyReleased" => {}
+                result => result?,
+            }
+        }
+    }
     if statuses.contains(&reply.status.as_str()) {
         return Ok(reply);
     }
     Err(match reply.status.as_str() {
         "Busy" => SoundError::Busy,
-        "Unlocked" => SoundError::Unlocked,
+        "Unlocked" | "AlreadyReleased" => SoundError::Unlocked,
         "Changed" => SoundError::Changed,
         "NothingToUndo" => SoundError::NothingToUndo,
         _ => SoundError::Invalid("mIV Sound が要求を受け付けませんでした".into()),
@@ -260,9 +284,7 @@ fn revision(reply: &SoundReply) -> Result<String, SoundError> {
 }
 
 fn check_revision(reply: &SoundReply, lock: &str, expected: &str) -> Result<(), SoundError> {
-    if reply.lock.as_deref() != Some(lock) {
-        return Err(SoundError::Unlocked);
-    }
+    check_lock(reply, lock)?;
     if reply.revision().as_deref() != Some(expected) {
         return Err(SoundError::Changed);
     }
@@ -354,7 +376,7 @@ fn execute(
     let mut rows = Vec::new();
     let (outcome, notice) = match request {
         SoundRequest::Lock => {
-            let r = accepted(host.call(SoundCommand::Lock)?, &["Locked"])?;
+            let r = accepted(host.call(SoundCommand::Lock)?, &["Locked"], None)?;
             rows.push(row("mIV Sound のロック", "解除", "開始"));
             (
                 SoundOutcome::Locked {
@@ -368,6 +390,7 @@ fn execute(
             let r = accepted(
                 host.call(SoundCommand::Unlock { lock: lock.clone() })?,
                 &["Released", "AlreadyReleased"],
+                Some(lock),
             )?;
             let already_released = r.status == "AlreadyReleased";
             if !already_released {
@@ -379,7 +402,7 @@ fn execute(
             )
         }
         SoundRequest::Get(input) => {
-            let r = accepted(host.call(SoundCommand::Get)?, &["State"])?;
+            let r = accepted(host.call(SoundCommand::Get)?, &["State"], None)?;
             let data = sound_document::get(
                 &bytes(&r)?,
                 input,
@@ -405,7 +428,7 @@ fn execute(
             ..
         } => {
             check_startup(plugin_dir)?;
-            let r = accepted(host.call(SoundCommand::Get)?, &["State"])?;
+            let r = accepted(host.call(SoundCommand::Get)?, &["State"], Some(lock))?;
             check_revision(&r, lock, expected)?;
             let current = bytes(&r)?;
             let prepared = match request {
@@ -443,6 +466,7 @@ fn execute(
                     state: base64::engine::general_purpose::STANDARD.encode(&prepared.bytes),
                 })?,
                 &["Replaced"],
+                Some(lock),
             )?;
             // Record only counts, selection and bypass, never parameter values.
             let before: Value =
@@ -522,6 +546,7 @@ fn execute(
             let r = accepted(
                 host.call(SoundCommand::Undo { lock: lock.clone() })?,
                 &["Undone"],
+                Some(lock),
             )?;
             rows.push(row("mIV Sound", "AI による変更", "取り消し"));
             (
@@ -538,10 +563,8 @@ fn execute(
             replace,
         } => {
             check_startup(plugin_dir)?;
-            let r = accepted(host.call(SoundCommand::Get)?, &["State"])?;
-            if r.lock.as_deref() != Some(lock) {
-                return Err(SoundError::Unlocked);
-            }
+            let r = accepted(host.call(SoundCommand::Get)?, &["State"], Some(lock))?;
+            check_lock(&r, lock)?;
             let guard = r.guard.clone().ok_or(SoundError::Changed)?;
             let existing = read_optional(&plugin_dir.join("effetune_presets.json"), PRESET_LIMIT)?;
             let timestamp = preset_timestamp();
@@ -576,6 +599,7 @@ fn execute(
                     guard,
                 })?,
                 &["Committed"],
+                Some(lock),
             )?;
             rows.push(row(
                 "mIV Sound のプリセット",
@@ -644,7 +668,7 @@ fn run_with_host(
             // nested queue wait. A failed save cannot change an accepted outcome.
             let saved = bridge
                 .call(SoundCommand::Get)
-                .and_then(|r| accepted(r, &["State"]))
+                .and_then(|r| accepted(r, &["State"], None))
                 .and_then(|r| bytes(&r))
                 .map_err(|e| e.to_string())
                 .and_then(|data| persist(&data).map_err(|e| e.to_string()));
