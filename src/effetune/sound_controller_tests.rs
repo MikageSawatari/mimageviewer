@@ -207,6 +207,65 @@ fn sound_controller_unavailable_load_completion_rejects_all_waiting_jobs() {
 }
 
 #[test]
+fn sound_controller_preparation_failure_closes_all_waiters_without_automatic_reload() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("mixwright-state.json");
+    let (mut controller, host_commands) = loading_controller(&path);
+    let changes = ChangeController::new();
+    let first = controller.submit_sound(
+        SoundRequest::Lock,
+        "first client",
+        Arc::clone(&changes),
+        0.0,
+    );
+    let second = controller.submit_sound(
+        SoundRequest::Get(Default::default()),
+        "second client",
+        Arc::clone(&changes),
+        0.0,
+    );
+    let reason = UnavailableReason::BundlePreparationFailed {
+        reason: "fake preparation failure".into(),
+        rejected_generation: Some("invalid-test-generation".into()),
+    };
+    let expected = reason.user_reason().to_owned();
+    let (tx, rx) = mpsc::channel();
+    controller.pending_load = Some(rx);
+    tx.send(LoadCompletion::Unavailable(reason.clone()))
+        .unwrap();
+
+    assert!(controller.poll());
+    for ticket in [first, second] {
+        assert_eq!(
+            ticket.wait(),
+            Err(SoundError::Unavailable(expected.clone()))
+        );
+    }
+    assert_eq!(controller.runtime, EffetuneRuntime::Unavailable(reason));
+    // Keep the existing permission for a later explicit request, while no
+    // failed job may re-enter start_load on this or subsequent polls.
+    assert!(controller.runtime.can_start_load());
+    for _ in 0..3 {
+        assert!(controller.sound_pending_load.is_empty());
+        assert!(controller.pending_load.is_none());
+        assert!(!controller.has_pending_ui_work());
+        assert!(!controller.poll());
+    }
+    let records = changes.records();
+    let records = records.lock().unwrap();
+    assert_eq!(records.entries().len(), 2);
+    assert!(
+        records
+            .entries()
+            .iter()
+            .all(|record| record.notice.contains(&expected))
+    );
+    assert!(controller.bridge().is_none());
+    assert!(host_commands.try_recv().is_err());
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn sound_controller_capture_and_sound_share_fifo_and_only_capture_worker_writes_the_pipe() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("mixwright-state.json");

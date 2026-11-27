@@ -5,6 +5,10 @@
 #include <utility>
 
 namespace miv {
+void initialize_sound_owner(std::string_view plugin_name, const std::wstring& data_dir,
+                            const std::function<void(const std::wstring&)>& create) {
+    if (plugin_name == "mIV Sound" && !data_dir.empty()) create(data_dir);
+}
 std::wstring SoundPresetFile::environment_directory() {
     const DWORD size = GetEnvironmentVariableW(L"MIV_SOUND_DATA_DIR", nullptr, 0);
     if (!size) return {};

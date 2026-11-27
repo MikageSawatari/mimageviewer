@@ -1653,6 +1653,9 @@ impl EffetuneController {
                     }
                     LoadCompletion::Unavailable(reason) => {
                         crate::logger::log(format!("[EffeTune] unavailable: {reason:?}"));
+                        // Retryability belongs to the next explicit request,
+                        // never to jobs waiting for this completed load.
+                        self.reject_waiting_sound(reason.user_reason());
                         self.runtime = EffetuneRuntime::Unavailable(reason);
                     }
                     LoadCompletion::Failed(error) => self.fail(error),
@@ -1732,13 +1735,14 @@ impl EffetuneController {
                     EffetuneRuntime::Unavailable(reason) => reason.user_reason(),
                     _ => "mIV Sound の起動処理中です",
                 };
-                while let Some(job) = self.sound_pending_load.pop_front() {
-                    sound_service::reject(
-                        job,
-                        sound_service::SoundError::Unavailable(reason.into()),
-                    );
-                }
+                self.reject_waiting_sound(reason);
             }
+        }
+    }
+
+    fn reject_waiting_sound(&mut self, reason: &str) {
+        while let Some(job) = self.sound_pending_load.pop_front() {
+            sound_service::reject(job, sound_service::SoundError::Unavailable(reason.into()));
         }
     }
 

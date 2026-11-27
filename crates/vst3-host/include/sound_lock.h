@@ -4,10 +4,16 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <windows.h>
 
 namespace miv {
+// Creation is lazy: even a plugin named mIV Sound must not acquire an owner
+// unless its dedicated environment supplied a data directory. The callback
+// also makes the no-owner boundary testable without loading a plugin or files.
+void initialize_sound_owner(std::string_view plugin_name, const std::wstring& data_dir,
+                            const std::function<void(const std::wstring&)>& create);
 using SoundBytes = std::vector<uint8_t>;
 struct SoundGuard {
     enum class Kind { Absent, Held, Unavailable } kind = Kind::Absent;

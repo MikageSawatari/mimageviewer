@@ -1148,14 +1148,15 @@ bool PluginLoader::load(const std::string& plugin_path,
 
             info_out.plugin_name = info.name();
             plugin_name_ = info_out.plugin_name;
-            if (plugin_name_ == "mIV Sound" && !SoundPresetFile::environment_directory().empty()) {
-                sound_presets_ = std::make_unique<SoundPresetFile>(SoundPresetFile::environment_directory());
-                sound_lock_ = std::make_unique<SoundLock>(static_cast<SoundPlugin&>(*this), *sound_presets_, [] {
-                    static std::atomic<uint64_t> sequence{0};
-                    return std::to_string(GetCurrentProcessId()) + ":" +
-                        std::to_string(GetTickCount64()) + ":" + std::to_string(++sequence);
+            initialize_sound_owner(plugin_name_, SoundPresetFile::environment_directory(),
+                [this](const std::wstring& data_dir) {
+                    sound_presets_ = std::make_unique<SoundPresetFile>(data_dir);
+                    sound_lock_ = std::make_unique<SoundLock>(static_cast<SoundPlugin&>(*this), *sound_presets_, [] {
+                        static std::atomic<uint64_t> sequence{0};
+                        return std::to_string(GetCurrentProcessId()) + ":" +
+                            std::to_string(GetTickCount64()) + ":" + std::to_string(++sequence);
+                    });
                 });
-            }
             break;
         }
     }

@@ -441,6 +441,179 @@ fn sound_service_get_persists_fresh_snapshot_without_publishing_change() {
 }
 
 #[test]
+fn sound_service_unlock_released_and_already_released_persist_with_only_real_release_notice() {
+    for already_released in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let host = FakeHost::new(|command| match command {
+            SoundCommand::Unlock { lock } => {
+                assert_eq!(lock, "test-lock");
+                let mut result = reply(
+                    if already_released {
+                        "AlreadyReleased"
+                    } else {
+                        "Released"
+                    },
+                    0,
+                );
+                result.lock = None;
+                Ok(result)
+            }
+            SoundCommand::Get => {
+                let mut result = state_reply(0, None, false);
+                result.lock = None;
+                Ok(result)
+            }
+            other => panic!("unexpected command: {other:?}"),
+        });
+        let changes = ChangeController::new();
+        let notices = changes.install(egui::Context::default());
+        let (job, ticket) = job(
+            SoundRequest::Unlock {
+                lock: "test-lock".into(),
+            },
+            "unlock client",
+            Arc::clone(&changes),
+            0.0,
+        );
+        let mut saved = None;
+        run_with_host(job, &host, directory.path(), |bytes| {
+            saved = Some(bytes.to_vec());
+            Ok(())
+        });
+        let response = ticket.wait().unwrap();
+        assert_eq!(
+            response.outcome,
+            SoundOutcome::Released { already_released }
+        );
+        assert_eq!(response.persistence_warning, None);
+        assert_eq!(saved, Some(state(false)));
+        let commands = host.commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(&commands[0], SoundCommand::Unlock { .. }));
+        assert!(matches!(&commands[1], SoundCommand::Get));
+        let records = changes.records();
+        let records = records.lock().unwrap();
+        if already_released {
+            assert!(notices.try_recv().is_err());
+            assert!(records.entries().is_empty());
+        } else {
+            assert_eq!(
+                notices.try_recv().unwrap(),
+                "AI アプリが mIV Sound のロックを解除しました"
+            );
+            assert!(notices.try_recv().is_err());
+            assert_eq!(records.entries().len(), 1);
+            let record = &records.entries()[0];
+            assert_eq!(record.client_name, "unlock client");
+            assert_eq!(record.counts.changed, 1);
+            assert_eq!(record.rows.len(), 1);
+            assert_eq!(record.rows[0].item, "mIV Sound のロック");
+            assert_eq!(record.rows[0].before, "開始");
+            assert_eq!(record.rows[0].after, "解除 (AI)");
+        }
+    }
+}
+
+#[test]
+fn sound_service_undo_success_persists_and_publishes_one_notice_and_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let host = FakeHost::new(|command| match command {
+        SoundCommand::Undo { lock } => {
+            assert_eq!(lock, "test-lock");
+            Ok(reply("Undone", 4))
+        }
+        SoundCommand::Get => Ok(state_reply(4, None, true)),
+        other => panic!("unexpected command: {other:?}"),
+    });
+    let changes = ChangeController::new();
+    let notices = changes.install(egui::Context::default());
+    let (job, ticket) = job(
+        SoundRequest::Undo {
+            lock: "test-lock".into(),
+        },
+        "undo client",
+        Arc::clone(&changes),
+        0.0,
+    );
+    let mut saved = None;
+    run_with_host(job, &host, directory.path(), |bytes| {
+        saved = Some(bytes.to_vec());
+        Ok(())
+    });
+    let response = ticket.wait().unwrap();
+    assert_eq!(
+        response.outcome,
+        SoundOutcome::Undone {
+            revision: "test-lock:4".into()
+        }
+    );
+    assert_eq!(response.persistence_warning, None);
+    assert_eq!(saved, Some(state(true)));
+    let commands = host.commands.lock().unwrap();
+    assert_eq!(commands.len(), 2);
+    assert!(matches!(&commands[0], SoundCommand::Undo { .. }));
+    assert!(matches!(&commands[1], SoundCommand::Get));
+    assert_eq!(
+        notices.try_recv().unwrap(),
+        "AI アプリが mIV Sound の変更を取り消しました"
+    );
+    assert!(notices.try_recv().is_err());
+    let records = changes.records();
+    let records = records.lock().unwrap();
+    assert_eq!(records.entries().len(), 1);
+    let record = &records.entries()[0];
+    assert_eq!(record.client_name, "undo client");
+    assert_eq!(record.counts.changed, 1);
+    assert_eq!(record.rows.len(), 1);
+    assert_eq!(record.rows[0].item, "mIV Sound");
+    assert_eq!(record.rows[0].before, "AI による変更");
+    assert_eq!(record.rows[0].after, "取り消し");
+}
+
+#[test]
+fn sound_service_undo_nothing_or_unlocked_never_persists_or_records_success() {
+    for (status, expected) in [
+        ("NothingToUndo", SoundError::NothingToUndo),
+        ("Unlocked", SoundError::Unlocked),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let host = FakeHost::new(|command| {
+            let SoundCommand::Undo { lock } = command else {
+                panic!("rejected undo must not fetch state");
+            };
+            assert_eq!(lock, "test-lock");
+            Ok(reply(status, 3))
+        });
+        let changes = ChangeController::new();
+        let notices = changes.install(egui::Context::default());
+        let (job, ticket) = job(
+            SoundRequest::Undo {
+                lock: "test-lock".into(),
+            },
+            "undo client",
+            Arc::clone(&changes),
+            0.0,
+        );
+        run_with_host(job, &host, directory.path(), |_| {
+            panic!("rejected undo must not persist")
+        });
+        let expected_notice = format!("mIV Sound: {expected}");
+        assert_eq!(ticket.wait(), Err(expected));
+        assert_eq!(host.commands.lock().unwrap().len(), 1);
+        // Failures still have their existing notice/history entry, including
+        // late results, but never a successful undo row or state save.
+        assert_eq!(notices.try_recv().unwrap(), expected_notice);
+        assert!(notices.try_recv().is_err());
+        let records = changes.records();
+        let records = records.lock().unwrap();
+        assert_eq!(records.entries().len(), 1);
+        assert_eq!(records.entries()[0].notice, expected_notice);
+        assert_eq!(records.entries()[0].counts.changed, 0);
+        assert!(records.entries()[0].rows.is_empty());
+    }
+}
+
+#[test]
 fn sound_service_reject_and_disconnected_queue_return_aborted_without_host() {
     let changes = ChangeController::new();
     let (queued, ticket) = job(SoundRequest::Lock, "test client", Arc::clone(&changes), 0.0);

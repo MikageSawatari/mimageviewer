@@ -38,8 +38,9 @@ struct Presets final : SoundPresetBoundary {
     SoundGuard guard;
     uint64_t epoch = 0;
     bool exists = true, held = false, fail_reopen = false;
-    unsigned commits = 0;
+    unsigned commits = 0, acquires = 0;
     SoundGuard acquire() override {
+        ++acquires;
         held = exists;
         return guard = {held ? SoundGuard::Kind::Held : SoundGuard::Kind::Absent, held ? ++epoch : 0};
     }
@@ -115,6 +116,38 @@ void state_tests() {
     queue.push([&] { lock.release(); });
     queue.drain();
     check(plugin.bytes == SoundBytes{5} && !lock.locked(), "ordered write/release complete");
+}
+void sound_owner_requires_dedicated_environment_tests() {
+    // Inject the resolved environment value rather than changing this test
+    // process's environment. No real data directory or plugin is consulted.
+    for (const bool has_directory : {false, true}) {
+        for (const auto* name : {"mIV Sound", "User VST"}) {
+            Plugin plugin; Presets presets;
+            unsigned created = 0;
+            const std::wstring directory = has_directory ? L"unused-disposable-profile" : L"";
+            initialize_sound_owner(name, directory, [&](const std::wstring& resolved) {
+                ++created;
+                check(resolved == directory, "owner receives dedicated directory");
+                SoundLock owner(plugin, presets, [] { return "token"; });
+                auto locked = owner.execute(request("sound_lock"));
+                check(locked.status == "Locked", "eligible owner locks");
+                auto replace = request("sound_replace_locked", "token");
+                replace.state = {2};
+                check(owner.execute(replace).status == "Replaced", "eligible owner reaches setState");
+                auto commit = request("sound_preset_commit", "token", 1);
+                commit.guard = locked.guard;
+                check(owner.execute(commit).status == "Committed", "eligible owner reaches preset commit");
+                owner.release();
+            });
+            const bool eligible = has_directory && std::strcmp(name, "mIV Sound") == 0;
+            check(created == (eligible ? 1u : 0u), "name alone cannot create sound owner");
+            check(plugin.get_calls == (eligible ? 1u : 0u), "no environment never reaches getState");
+            check(plugin.set_calls == (eligible ? 1u : 0u), "no environment never reaches setState");
+            check(presets.acquires == (eligible ? 2u : 0u), "no environment never acquires preset guard");
+            check(presets.commits == (eligible ? 1u : 0u), "no environment never commits preset");
+            check(!plugin.locked, "no lock remains after fixture");
+        }
+    }
 }
 void guard_state_tests() {
     Plugin plugin; Presets presets;
@@ -265,7 +298,8 @@ void modal_and_window_tests() {
 }
 }
 int main() {
-    state_tests(); guard_state_tests(); file_tests(); modal_and_window_tests();
+    state_tests(); sound_owner_requires_dedicated_environment_tests();
+    guard_state_tests(); file_tests(); modal_and_window_tests();
     std::puts("sound lock boundaries passed");
     return 0;
 }

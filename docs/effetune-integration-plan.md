@@ -298,6 +298,7 @@ UI にファイル検査・コピー・プロセス待機を置かず、設定�
 `sound_service::SoundRequest` / `SoundTicket` は lock・unlock・get・apply・select・undo・save_preset の型付き入口。
 `EffetuneController::submit_sound` はメモリ上の受付だけを行い、既存 `CaptureQueue` の FIFO worker へ渡す。
 まだ起動していない場合は `LoadOrigin::SoundAgent` / `open_gui_when_ready=None` で読み込み、その完了後に要求を続ける。
+読み込み失敗時は、その読み込みを待っていた要求を理由付きで閉じる。準備失敗が再読込可能な種類でも同じ要求を再試行せず、次の明示要求だけが新しい読み込みを始められる。
 読み込み・文書の組み立て・bridge 往復・プリセット I/O・成功後の状態取得と保存は UI thread では行わない。
 通常の状態取得と AI の要求は同じ列で直列化し、保存先と `EffectiveState` の正本は従来のまま。
 保存の世代はこの worker が列から取り出す順に振る。複数の送り手が採番と送信の間で前後しても、後の変更の保存を古い世代として捨てない。
@@ -310,6 +311,7 @@ host protocol 9 の `sound_lock`・`sound_unlock`・`sound_get`・`sound_replace
 
 `sound_document` は全体状態のうち指定の並び・使う側・全体バイパスと ID watermark だけを更新する。
 未知の項目は保持し、予約の鍵は parameters 直下だけを検査する。範囲合わせは mIV Sound に任せる。
+`channel` の新規指定は同梱画面の選択肢（Stereo の空文字、A/L/R、3〜8、34/56/78）に合わせる。指定省略時は既存の広い経路も保持する。
 `src/sound_effects.generated.json` は同梱 JS から生成し、本体と MCP exe が同一ファイルを組み込む。
 プリセットは worker が全体8 MiB以下を検査して固定名の一時ファイルへ書き、閉じてから host の番を照合して置き換える。
 名前は「MCP: 」付き、同名の置換は「MCP:」で始まるものだけ。GUI thread でファイル本文を読んだりハッシュを計算しない。

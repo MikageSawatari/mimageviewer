@@ -526,34 +526,11 @@ pub(crate) fn apply(bytes: &[u8], input: &ApplyInput) -> Result<PreparedDocument
 }
 
 fn valid_channel(channel: &str) -> bool {
+    // New selections match the bundled pipeline-routing-dialog.js. Wider
+    // restored routes are retained by apply when channel is omitted.
     matches!(
         channel,
-        "" | "A"
-            | "L"
-            | "R"
-            | "1"
-            | "2"
-            | "3"
-            | "4"
-            | "5"
-            | "6"
-            | "7"
-            | "8"
-            | "9"
-            | "10"
-            | "11"
-            | "12"
-            | "13"
-            | "14"
-            | "15"
-            | "16"
-            | "34"
-            | "56"
-            | "78"
-            | "910"
-            | "1112"
-            | "1314"
-            | "1516"
+        "" | "A" | "L" | "R" | "3" | "4" | "5" | "6" | "7" | "8" | "34" | "56" | "78"
     )
 }
 
@@ -854,6 +831,56 @@ mod tests {
         }
         assert_eq!(result.before_counts, [2, 1]);
         assert_eq!(result.after_counts, [2, 1]);
+    }
+
+    #[test]
+    fn sound_document_channel_selections_match_bundled_ui_and_preserve_omitted_routes() {
+        let allowed = [
+            "", "A", "L", "R", "3", "4", "5", "6", "7", "8", "34", "56", "78",
+        ];
+        let rejected = [
+            "1", "2", "9", "10", "11", "12", "13", "14", "15", "16", "910", "1112", "1314", "1516",
+            "Left", "Right", "All", "Stereo", "0", "invalid",
+        ];
+        let root = bytes(&document(vec![stage(1)], Value::Null));
+        for channel in allowed {
+            // Both new stages and updates of retained stages use this boundary.
+            for identity in [
+                json!({"type": known_type()}),
+                json!({"id": 1, "type": known_type()}),
+            ] {
+                let mut effect = identity;
+                effect["channel"] = json!(channel);
+                let prepared = apply(&root, &apply_input(Pipeline::A, json!([effect]))).unwrap();
+                assert_eq!(output(&prepared)["pipelineA"][0]["channel"], channel);
+            }
+        }
+        for channel in rejected {
+            for identity in [
+                json!({"type": known_type()}),
+                json!({"id": 1, "type": known_type()}),
+            ] {
+                let mut effect = identity;
+                effect["channel"] = json!(channel);
+                assert!(
+                    apply(&root, &apply_input(Pipeline::A, json!([effect]))).is_err(),
+                    "{channel}"
+                );
+            }
+        }
+        for channel in ["9", "16", "910", "1112", "1314", "1516"] {
+            let mut old_stage = stage(1);
+            old_stage["channel"] = json!(channel);
+            let restored = bytes(&document(vec![old_stage], Value::Null));
+            for effect in [
+                json!({"id": 1}),
+                json!({"id": 1, "type": known_type(), "enabled": false}),
+            ] {
+                let prepared =
+                    apply(&restored, &apply_input(Pipeline::A, json!([effect]))).unwrap();
+                assert_eq!(output(&prepared)["pipelineA"][0]["channel"], channel);
+            }
+        }
     }
 
     #[test]
