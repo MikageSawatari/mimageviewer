@@ -74,7 +74,10 @@ fn plane_revision3_portrait_cover_takes_three_bounded_notches_and_fill_starts_be
     let center = canvas.center();
     let (target_zoom, target_pan) = cover.cover(1., Vec2::ZERO, center).unwrap();
     close(target_zoom, 1928. / 600., 1.0e-5);
-    assert_eq!(target_pan, Vec2::ZERO);
+    // Inward cover resolves continuous f32 geometry; Vec2's Debug hides small
+    // nonzero components behind one decimal place. This is not an outward copy.
+    close(target_pan.x, 0., 0.001);
+    close(target_pan.y, 0., 0.001);
     let mut zoom = 1.;
     let mut pan = Vec2::ZERO;
     for notch in 0..3 {
@@ -85,7 +88,8 @@ fn plane_revision3_portrait_cover_takes_three_bounded_notches_and_fill_starts_be
             close(next_zoom / zoom, 1.5, 1.0e-6);
             assert_eq!(remaining, 0.);
         } else {
-            assert_eq!(next_zoom, target_zoom);
+            close(next_zoom, target_zoom, 1.0e-5);
+            assert!((next_pan - target_pan).length() < 0.001);
             assert!(remaining > 0. && remaining < 1.);
         }
         zoom = next_zoom;
@@ -344,7 +348,8 @@ fn plane_revision3_resize_overlap_preserves_the_same_cover_and_accepted_complete
     close(initial_target.1.x, 496., 0.001);
     assert_eq!(corrected_target.0, initial_target.0);
     assert!((corrected_target.1 - initial_target.1).length() < 0.001);
-    assert_eq!(first.pan, vec2(1452., 0.));
+    close(first.pan.x, 1452., 0.001);
+    close(first.pan.y, 0., 0.001);
 
     // Inspect the actual cover stage, before each segment spends its normal remainder.
     let joined_cover = cover.advance_cover(2., start_pan, center, 5.).unwrap();
@@ -457,6 +462,43 @@ fn plane_revision3_outward_resize_retains_geometry_and_only_strength_and_lifetim
                 assert_eq!(pose.strength, expected_strength);
             }
             current = out.pose;
+        }
+    }
+}
+
+#[test]
+fn plane_revision3_outward_preserves_zoom_and_pan_bits_including_signed_zero() {
+    let canvas = canvas(Vec2::splat(1000.));
+    let cover = super::revision_tests::fixture(canvas, Vec2::splat(1000.));
+    for pan in [vec2(-0., 0.), vec2(0., -0.), vec2(4000., -3000.)] {
+        for strength in [0., 0.5] {
+            for (identity, owned) in [(true, false), (false, false), (true, true)] {
+                let mut input = input(
+                    cover,
+                    None,
+                    1.23,
+                    pan,
+                    canvas.center(),
+                    -8.,
+                    FullscreenWheelZoomStep::Percent10,
+                );
+                input.current = Some(PlaneViewPose {
+                    anchor: input.anchor,
+                    strength,
+                    lens_center: Vec2::splat(0.5),
+                });
+                input.tilt_is_identity = identity;
+                input.tilt_drag_owned = owned;
+                let zoom_bits = input.zoom.to_bits();
+                let pan_bits = [input.pan.x.to_bits(), input.pan.y.to_bits()];
+                let out = plane_view_wheel_transition(input);
+                assert_eq!(out.zoom.to_bits(), zoom_bits);
+                assert_eq!([out.pan.x.to_bits(), out.pan.y.to_bits()], pan_bits);
+                assert_eq!(out.pose.is_some(), !identity || owned);
+                if let Some(pose) = out.pose {
+                    assert_eq!(pose.strength, 0.);
+                }
+            }
         }
     }
 }

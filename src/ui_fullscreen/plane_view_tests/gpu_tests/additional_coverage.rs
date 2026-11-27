@@ -478,6 +478,11 @@ fn plane_revision3_real_pdf_inward_outward_and_exit_keep_the_planned_geometry_ac
                 }
             };
         assert_same_board(&pending, &resolved);
+        assert!(placement_frames_match(
+            pending.layout_full_image_rect,
+            resolved.layout_full_image_rect,
+            pending.pixels_per_point,
+        ));
         register_final_texture(&mut app, &viewer.ctx);
         viewer.frame(&mut app, vec![]);
         assert_eq!((app.fs_zoom, app.fs_pan), (expected.zoom, expected.pan));
@@ -505,8 +510,15 @@ fn plane_revision3_real_pdf_inward_outward_and_exit_keep_the_planned_geometry_ac
             adopted.pixels_per_point,
         ));
         assert!(placement_frames_match(
-            resolved.layout_full_image_rect,
+            resolved.placement_frame,
+            adopted_expected.placement_frame,
+            adopted.pixels_per_point,
+        ));
+        // In legacy SourceLayout the layout_full_image_rect field is the contained,
+        // snapped sampler rectangle, not the pre-containment page placement_frame.
+        assert!(placement_frames_match(
             adopted.layout_full_image_rect,
+            adopted_expected.layout_full_image_rect,
             adopted.pixels_per_point,
         ));
         assert_same_board(&adopted, &adopted_expected);

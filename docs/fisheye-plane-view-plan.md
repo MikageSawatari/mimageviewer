@@ -1225,6 +1225,23 @@ cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen|in_page_scroll|p
 
 今回の許可された検査は、`cargo fmt`正常終了、UI字形は危険な字形なし、サイトは54カード・超過0、`git diff --check`正常終了。追加/変更テストの成功と測定値の確定は未確認である。
 
+### 改訂 3 の実装記録 (関連試験の4件への対応)
+
+設計担当の`r3-test1.log` (対象コミット`2227d74e4`) と失敗箇所、製品の呼び出し経路を照合した。4件ともテストの前提/比較対象の誤りと判断し、製品コードと遷移の規則は変更していない。
+
+1. **portraitのcover目標pan**: §19.2の寄る操作は連続の配置をf32で解いており、中心の下のsource点の逆/順写像とpan射影には微小差が残る。emathの`Vec2::Debug`は既定で小数1桁だけを表示するため、表示上の`-0.0`は値が厳密な負のゼロである証拠ではない。`PartialEq`は成分の通常のf32比較なので、正負のゼロだけなら等しい。ゼロへの完全一致というテストの前提を、成分ごとの0.001論理画素以内 (このfixtureはDPI=1で、§19.2の1/64物理画素より厳しい) に変更した。倍率の期待、ノッチごとのF/P上限、途中からのfill増加は維持した。
+2. **補正後のpan=1452**: 同じく§19.2の寄る遷移で、f64で計算した進行をf32の連続配置へ戻し、最後に最小の重なりの補正をするため、最下位桁までの完全一致は契約ではない。Vec2の1桁表示では隠れる差を、成分ごとの0.001論理画素以内で比較する。同じC、194pxの途中差、完了後の倍率比・位置・strengthの期待は維持した。§19.3の離れる操作は出力を入力からコピーした後、geometry計算の前に返しており、今回の2件はこの経路ではない。追加の`plane_revision3_outward_preserves_zoom_and_pan_bits_including_signed_zero`で、strengthが残る/0、恒等/傾き/所有中、正負のゼロと画面外panについて、zoom・panのビット列までそのまま返ることを検査する。
+3. **通常ズーム後のコピーのk>0**: `ready()`は縦長のPage fitから1ノッチだけ寄っていた。§19.2ではその時点では覆い途中でk_fill=0となり、§17.3の通常ズームはその0を正しくLocked(0)に固定する。製品の通常ホイールの倍率書き込みは`lock_plane_fill_for_zoom`を呼び、コピーのキー/メニュー/リングは同じFullscreenのコピー配送点から照合済みsnapshotを渡すため、固定やコピーの入口の漏れではない。この試験だけ実際の寄るホイールを追加して十分に覆い、通常ズーム前からk_fillとkが正であることを明示した。固定後のk_fillだけでなくkも入力前と完全一致すること、3入口が同じsnapshotを出すことを維持/追加した。通常の1ノッチentryを使う他のfixtureは変えていない。
+4. **PDFのlayout_full_image_rect**: §5.2の素材再利用の一致条件はsamplerをcontainする前の配置枠であり、legacyの`layout_full_image_rect`ではない。`resolve_fs_image_geometry`のSourceLayout経路は中間のページ配置から`resolve_fs_geometry_in_layout_rect`へ進み、legacyでは`from_resolved_rect(...).with_placement_frame(page_rect)`となる。このとき`placement_frame`だけがcontain前のページ枠で、`layout_full_image_rect`はcontain/物理画素丸め後の素材矩形である (指定倍率等の`from_layout_rect`とは異なる)。直前の実装記録でこのフィールドまでcontain前と扱った説明も誤りだった。失敗前に通った入力期待とのzoom/pan照合、前の素材の描画と今の素材への採用、実際のplacement_frameの1/64物理画素内の一致を維持し、入力から解いた期待同士もplacement_frameで照合する。layout_full_image_rectは各素材自身のresolverの期待と1/64物理画素内で一致することを比較する。四隅も素材ごとの正しい期待に一致させ、§19.5の「飛び」の検査を保持した。
+
+**設計との差分**: なし。期待を変更した根拠は§19.2のf32/量子化内の一致と段階的な覆い、§19.3の入力geometryの完全保持、§5.2のcontain前の配置枠である。負のゼロの正規化や追加の補正などの製品処理は加えていない。
+
+**変更ファイル**: `src/plane_view/revision3_tests.rs`、`src/ui_dialogs/context_menu/plane_copy_tests.rs`、`src/ui_fullscreen/plane_view_tests/gpu_tests/additional_coverage.rs`、本節。共有実行口への指定は`cargo nextest run -p mimageviewer --lib -E 'test(/plane_revision3|plane_copy_locked_zoom/)'`、関連回帰は`test(/plane_view|plane_copy|fisheye|displayed_image_transform/)`。GPU試験の配置は既存gpu_tests配下のままで、PNG更新は不要。
+
+**未検証**: cargoのビルド/test/check/clippyは実行しておらず、追加/変更試験の成功・実際の差の値・実機の挙動は未確認。アプリ起動・コミットは行っていない。
+
+許可された検査は`cargo fmt`正常終了、UI字形は危険な字形なし、サイトは54カード・超過0、`git diff --check`正常終了。コンパイル/追加試験の成功は示さない。
+
 ## 12. 文書
 
 - [display-pipeline.md](display-pipeline.md): PlaneView の節 (§5 の要約と §6 の出口)。

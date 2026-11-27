@@ -202,10 +202,26 @@ mod gpu_tests {
     fn plane_copy_locked_zoom_action_menu_and_ring_keep_the_displayed_distortion() {
         let _keys = crate::key_input::lock_test_input();
         let (mut app, mut viewer) = ready();
+        // Revision 3's first inward notch leaves this portrait Page-fit image
+        // uncovered (k_fill=0). Continue real inward input before testing a nonzero lock.
+        viewer.frame(
+            &mut app,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0., 120.),
+                modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            }],
+        );
         let before = match &app.fs_exclusive_view {
             FsExclusiveView::PlaneView(state) => state.last_drawn.clone().unwrap(),
             _ => panic!("PlaneView fixture"),
         };
+        assert!(
+            before.k_fill > 0. && before.params.values[2][0] > 0.,
+            "the lock fixture must start with actual visible distortion"
+        );
         app.settings.fullscreen_wheel_zoom_step =
             crate::settings::FullscreenWheelZoomStep::Percent10;
         viewer.frame(
@@ -230,6 +246,7 @@ mod gpu_tests {
         );
         let frozen = state.last_drawn.clone().unwrap();
         assert_eq!(frozen.k_fill, before.k_fill);
+        assert_eq!(frozen.params.values[2][0], before.params.values[2][0]);
         assert!(frozen.params.values[2][0] > 0.);
         let capture = ClipboardCapture::new();
         for entry in 0..3 {
