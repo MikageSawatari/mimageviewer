@@ -399,7 +399,7 @@ fn detect_ultralytics_mask_accepts_nonquarter_prototypes_and_computes_only_box_r
     )
     .unwrap();
     assert_eq!((patch.x, patch.y, patch.w, patch.h), (318, 318, 12, 12));
-    assert!(patch.bits.iter().all(|&b| b));
+    assert_circle_dilated_rect(&patch, [320, 320, 328, 328], 2);
     let mut outputs = Outputs::new(1, 1, true, 640);
     outputs.proto_shape = shape.to_vec();
     outputs.proto = data;
@@ -411,7 +411,7 @@ fn detect_ultralytics_mask_accepts_nonquarter_prototypes_and_computes_only_box_r
 }
 
 #[test]
-fn detect_ultralytics_crop_original_box_before_square_dilation_and_clip_patch() {
+fn detect_ultralytics_crop_original_box_before_circle_dilation_and_clip_patch() {
     let mut outputs = Outputs::new(1, 1, true, 8);
     outputs.set(0, 4, 0.9);
     outputs.set(0, 5, 1.0);
@@ -422,12 +422,15 @@ fn detect_ultralytics_crop_original_box_before_square_dilation_and_clip_patch() 
     let result = outputs.decode(true, lb, &params(1), true, 2).unwrap();
     let patch = &result.patches[0];
     assert_eq!((patch.x, patch.y, patch.w, patch.h), (14, 6, 12, 12));
-    assert!(patch.bits.iter().all(|&b| b));
+    assert_circle_dilated_rect(patch, [16, 8, 24, 16], 2);
     outputs.bbox(0, [0.0625, 2.0625, 0.125, 0.125]);
     let result = outputs.decode(true, lb, &params(1), true, 2).unwrap();
     let patch = &result.patches[0];
     assert_eq!((patch.x, patch.y, patch.w, patch.h), (0, 0, 3, 3));
-    assert!(patch.bits.iter().all(|&b| b));
+    assert_eq!(
+        patch.bits,
+        [true, true, true, true, true, false, true, false, false]
+    );
     assert_eq!(dilation_radius([1000, 500], 0.6), 6);
     assert_eq!(dilation_radius([1000, 500], 0.0), 2);
     assert_eq!(dilation_radius([8000, 6000], 0.5), 40);
@@ -435,32 +438,65 @@ fn detect_ultralytics_crop_original_box_before_square_dilation_and_clip_patch() 
 }
 
 #[test]
-fn detect_ultralytics_square_dilation_matches_naive_neighborhood() {
+fn detect_ultralytics_circle_dilation_matches_naive_neighborhood() {
     for (w, h) in [(1, 1), (3, 5), (9, 7)] {
-        let bits: Vec<_> = (0..w * h).map(|i| i % 7 == 3 || i % 13 == 0).collect();
-        for radius in [0, 1, 2, 4, 20] {
-            let mut patch = MaskPatch {
-                x: 0,
-                y: 0,
-                w,
-                h,
-                bits: bits.clone(),
-            };
-            dilate_square(&mut patch, radius, &AtomicBool::new(false)).unwrap();
-            for y in 0..h {
-                for x in 0..w {
-                    let expected = (y.saturating_sub(radius)..=y.saturating_add(radius).min(h - 1))
-                        .any(|sy| {
-                            (x.saturating_sub(radius)..=x.saturating_add(radius).min(w - 1))
-                                .any(|sx| bits[sy * w + sx])
-                        });
-                    assert_eq!(
-                        patch.bits[y * w + x],
-                        expected,
-                        "{w}x{h}, radius {radius}, {x},{y}"
-                    );
+        for pattern in 0..5 {
+            let bits: Vec<_> = (0..w * h)
+                .map(|i| match pattern {
+                    0 => false,
+                    1 => true,
+                    2 => i == 0, // clip the circle at the top/left patch edges
+                    3 => i == (h / 2) * w + w / 2,
+                    _ => i % 7 == 3 || i % 13 == 0,
+                })
+                .collect();
+            for radius in [0, 1, 2, 4, 20] {
+                let mut patch = MaskPatch {
+                    x: 17,
+                    y: 23,
+                    w,
+                    h,
+                    bits: bits.clone(),
+                };
+                dilate_circle(&mut patch, radius, &AtomicBool::new(false)).unwrap();
+                assert_eq!((patch.x, patch.y, patch.w, patch.h), (17, 23, w, h));
+                for y in 0..h {
+                    for x in 0..w {
+                        let expected = (y.saturating_sub(radius)
+                            ..=y.saturating_add(radius).min(h - 1))
+                            .any(|sy| {
+                                (x.saturating_sub(radius)..=x.saturating_add(radius).min(w - 1))
+                                    .any(|sx| {
+                                        let dx = x.abs_diff(sx);
+                                        let dy = y.abs_diff(sy);
+                                        bits[sy * w + sx] && dx * dx + dy * dy <= radius * radius
+                                    })
+                            });
+                        assert_eq!(
+                            patch.bits[y * w + x],
+                            expected,
+                            "{w}x{h}, pattern {pattern}, radius {radius}, {x},{y}"
+                        );
+                    }
                 }
             }
+        }
+    }
+}
+
+fn assert_circle_dilated_rect(patch: &MaskPatch, rect: [usize; 4], radius: usize) {
+    for y in 0..patch.h {
+        for x in 0..patch.w {
+            let ox = patch.x + x;
+            let oy = patch.y + y;
+            let expected = (rect[1]..rect[3]).any(|sy| {
+                (rect[0]..rect[2]).any(|sx| {
+                    let dx = ox.abs_diff(sx);
+                    let dy = oy.abs_diff(sy);
+                    dx * dx + dy * dy <= radius * radius
+                })
+            });
+            assert_eq!(patch.bits[y * patch.w + x], expected, "original {ox},{oy}");
         }
     }
 }

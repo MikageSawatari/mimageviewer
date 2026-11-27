@@ -285,6 +285,74 @@ fn chosen_detectors(
         .collect()
 }
 
+fn mask_detect_margin_visibility(
+    catalog: &DetectorCatalogState,
+    options: &crate::settings::MaskDetectSettings,
+) -> (bool, bool) {
+    let mut boxes = options.face_selected;
+    let mut contours = false;
+    if let DetectorCatalogState::Ready(Ok(entries)) = catalog {
+        for entry in entries {
+            let (Ok(info), Some(setting)) = (&entry.result, options.detectors.get(&entry.name))
+            else {
+                continue;
+            };
+            if !setting.selected {
+                continue;
+            }
+            contours |= info.format == DetectorFormat::UltralyticsSegment;
+            // Segment models can also add boxes/ellipses, using the box margin.
+            boxes |= info.format == DetectorFormat::UltralyticsDetect
+                || detector_shape(info, setting) != DetectorShape::Contour;
+        }
+    }
+    (boxes, contours)
+}
+
+struct DetectorCatalogReport {
+    readable: usize,
+    unreadable: usize,
+    lines: Vec<String>,
+}
+
+/// Pure formatting keeps the completion diagnostics testable without installing
+/// a global logger. Debug quoting preserves one line even for multiline errors.
+fn detector_catalog_report(
+    folder: &std::path::Path,
+    result: &Result<Vec<DetectorEntry>, String>,
+) -> DetectorCatalogReport {
+    match result {
+        Ok(entries) => {
+            let readable = entries.iter().filter(|entry| entry.result.is_ok()).count();
+            let unreadable = entries.len() - readable;
+            let mut lines = vec![format!(
+                "mask_detect/catalog folder={folder:?} readable={readable} unreadable={unreadable}"
+            )];
+            for entry in entries {
+                if let Err(error) = &entry.result {
+                    lines.push(format!(
+                        "mask_detect/catalog unreadable name={:?} reason={error:?} detail={:?}",
+                        entry.name,
+                        error.to_string()
+                    ));
+                }
+            }
+            DetectorCatalogReport {
+                readable,
+                unreadable,
+                lines,
+            }
+        }
+        Err(error) => DetectorCatalogReport {
+            readable: 0,
+            unreadable: 0,
+            lines: vec![format!(
+                "mask_detect/catalog folder={folder:?} readable=0 unreadable=0 error={error:?}"
+            )],
+        },
+    }
+}
+
 /// Only the returned patch area is visited; existing subtract shapes still apply later.
 pub(crate) fn apply_mask_patches(
     patches: &[MaskPatch],
@@ -444,10 +512,11 @@ impl App {
         self.ensure_ai_runtime();
         let runtime_init = Arc::clone(&self.ai_runtime_init);
         let folder = crate::data_dir::get().join("detectors");
-        self.launch_mask_detect_catalog_worker(move |cancel| {
+        let scan_folder = folder.clone();
+        self.launch_mask_detect_catalog_worker(folder, move |cancel| {
             match runtime_init.wait_terminal_while(|| !cancel.load(Ordering::Acquire)) {
                 crate::ai::runtime::AiRuntimeInitWait::Ready(_) => {
-                    crate::ai::detector_catalog::scan_detectors(&folder)
+                    crate::ai::detector_catalog::scan_detectors(&scan_folder)
                 }
                 crate::ai::runtime::AiRuntimeInitWait::Failed(error) => {
                     Err(format!("AI の準備に失敗しました: {error}"))
@@ -461,6 +530,7 @@ impl App {
 
     fn launch_mask_detect_catalog_worker(
         &mut self,
+        folder: PathBuf,
         work: impl FnOnce(Arc<AtomicBool>) -> Result<Vec<DetectorEntry>, String> + Send + 'static,
     ) {
         if matches!(
@@ -477,7 +547,24 @@ impl App {
             .name("detector-catalog".into())
             .spawn(move || {
                 let _activity = activity;
+                let started = std::time::Instant::now();
                 let result = work(worker_cancel);
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let report = detector_catalog_report(&folder, &result);
+                for line in report.lines {
+                    crate::logger::log(line);
+                }
+                crate::perf::event(
+                    "mask_detect",
+                    "catalog",
+                    None,
+                    0,
+                    &[
+                        ("readable", report.readable.into()),
+                        ("unreadable", report.unreadable.into()),
+                        ("ms", elapsed_ms.into()),
+                    ],
+                );
                 let _ = tx.send(result);
             }) {
             Ok(_) => *self.mask_detect_catalog = DetectorCatalogState::Loading { cancel, rx },
@@ -531,7 +618,7 @@ impl App {
                 }
             });
         if let Err(error) = spawn {
-            self.show_feedback_error(format!("検出器フォルダを開けません: {error}"));
+            self.show_mask_detect_error(format!("検出器フォルダを開けません: {error}"));
         }
     }
 
@@ -674,7 +761,7 @@ impl App {
         }
         let (idx, source, mask_size, source_kind) = self.mask_detect_source(tool)?;
         if source.size != mask_size || mask_size.contains(&0) {
-            self.show_feedback_error("画像とマスクの大きさが一致しません".to_string());
+            self.show_mask_detect_error("画像とマスクの大きさが一致しません".to_string());
             return None;
         }
         let target = match tool {
@@ -703,7 +790,7 @@ impl App {
                 )
                 .is_some_and(|size| size != mask_size)
                 {
-                    self.show_feedback_error("画像とマスクの大きさが一致しません".into());
+                    self.show_mask_detect_error("画像とマスクの大きさが一致しません".into());
                     return None;
                 }
                 MaskDetectTarget::LocalAdjust {
@@ -819,7 +906,9 @@ impl App {
                     rx,
                 }));
             }
-            Err(error) => self.show_feedback_error(format!("検出を開始できませんでした: {error}")),
+            Err(error) => {
+                self.show_mask_detect_error(format!("検出を開始できませんでした: {error}"))
+            }
         }
         crate::perf::event(
             "mask_detect",
@@ -868,12 +957,15 @@ impl App {
 
     fn apply_mask_detect_output(&mut self, request: &MaskDetectRequest, output: MaskDetectOutput) {
         if !self.mask_detect_request_is_current(request) {
-            self.show_feedback_toast("画像が変わったため中止しました".into());
+            self.show_feedback_toast_on(
+                "画像が変わったため中止しました".into(),
+                ActionSurface::Viewer,
+            );
             return;
         }
         let count = output.boxes.len() + output.patches.len();
         if count == 0 {
-            self.show_feedback_toast("見つかりませんでした".into());
+            self.show_feedback_toast_on("見つかりませんでした".into(), ActionSurface::Viewer);
             return;
         }
         if self.remote_session_blocks_local_control() || !self.admit_book_append_followup_mutation()
@@ -926,7 +1018,15 @@ impl App {
                 ("ms", (start.elapsed().as_secs_f64() * 1000.0).into()),
             ],
         );
-        self.show_feedback_toast(summary);
+        self.show_feedback_toast_on(summary, ActionSurface::Viewer);
+    }
+
+    fn show_mask_detect_error(&mut self, message: String) {
+        self.show_feedback_result_on(
+            message,
+            ActionSurface::Viewer,
+            crate::feedback::FeedbackKind::Error,
+        );
     }
 
     pub(crate) fn poll_mask_detect(&mut self, ctx: &egui::Context) {
@@ -942,7 +1042,7 @@ impl App {
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.mask_detect_pending = None;
-                self.show_feedback_error("検出処理が停止しました".into());
+                self.show_mask_detect_error("検出処理が停止しました".into());
                 return;
             }
             Ok(result) => result,
@@ -979,7 +1079,7 @@ impl App {
                     }
                 };
                 crate::logger::log(format!("mask_detect: {message}"));
-                self.show_feedback_error(message);
+                self.show_mask_detect_error(message);
             }
         }
         ctx.request_repaint();
@@ -991,7 +1091,9 @@ impl App {
             crate::os_theme::with_dark_context_style(ctx, || {
                 egui::Window::new("検出中")
                     .id(egui::Id::unique("mask_detect_progress"))
-                    .order(egui::Order::Foreground)
+                    // Match the local-adjust dialogs: stay above the Foreground
+                    // tool panels even after their last click raised them.
+                    .order(egui::Order::Debug)
                     .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
                     .collapsible(false)
                     .resizable(false)
@@ -1023,7 +1125,7 @@ impl App {
             egui::Window::new("自動検出")
                 .id(egui::Id::unique("mask_detect_settings"))
                 .open(&mut open)
-                .order(egui::Order::Foreground)
+                .order(egui::Order::Debug)
                 .default_pos(ctx.content_rect().min + egui::vec2(60.0, 40.0))
                 .default_width(380.0)
                 .collapsible(false)
@@ -1053,6 +1155,7 @@ impl App {
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             ui.checkbox(&mut self.settings.mask_detect.face_selected, "顔 (内蔵)");
+                            let (show_box_margin, _) = mask_detect_margin_visibility(&self.mask_detect_catalog, &self.settings.mask_detect);
                             if self.settings.mask_detect.face_selected {
                             ui.horizontal(|ui| {
                                 ui.label("形");
@@ -1068,14 +1171,14 @@ impl App {
                                 );
                             });
                             }
-                            ui.add(
+                            if show_box_margin { ui.add(
                                 egui::Slider::new(
                                     &mut self.settings.mask_detect.margin_percent,
                                     0.0..=100.0,
                                 )
                                 .text("箱の余白 (%)"),
                             )
-                            .on_hover_text("幅・高さの指定割合を各辺の外側に足します");
+                            .on_hover_text("幅・高さの指定割合を各辺の外側に足します"); }
                             if self.settings.mask_detect.face_selected {
                             let _details = ui.collapsing("詳細", |ui| {
                                 ui.add(
@@ -1100,8 +1203,11 @@ impl App {
                             }
                             show_detector_entries(ui, &self.mask_detect_catalog, &mut self.settings.mask_detect);
                             ui.separator();
-                            ui.add(egui::Slider::new(&mut self.settings.mask_detect.contour_margin_percent, 0.0..=5.0).text("輪郭の余白 (%)"))
-                                .on_hover_text("元の画像の長辺に対する割合で太らせます (最小 2px)");
+                            // Resolve again after detector-row controls, so a new
+                            // selection is reflected in this same UI pass.
+                            let (_, show_contour_margin) = mask_detect_margin_visibility(&self.mask_detect_catalog, &self.settings.mask_detect);
+                            if show_contour_margin { ui.add(egui::Slider::new(&mut self.settings.mask_detect.contour_margin_percent, 0.0..=5.0).text("輪郭の余白 (%)"))
+                                .on_hover_text("元の画像の長辺に対する割合で太らせます (最小 2px)"); }
                             ui.horizontal_wrapped(|ui| {
                                 folder = ui.button("フォルダを開く").clicked();
                                 let loading = matches!(&*self.mask_detect_catalog, DetectorCatalogState::Loading { .. });

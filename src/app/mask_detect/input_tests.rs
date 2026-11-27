@@ -40,6 +40,281 @@ fn key(key: egui::Key) -> egui::Event {
     }
 }
 
+fn draw_mask_detect_layer_frame(
+    app: &mut App,
+    ctx: &egui::Context,
+    tool: MaskDetectTool,
+    transform: &DisplayedImageTransform,
+    events: Vec<egui::Event>,
+) {
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(transform.viewport_rect),
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            // Draw the real panels after the dialog too: Order, not call order or
+            // the most recently clicked Area, must keep the dialog above them.
+            app.show_mask_detect_dialog(ctx);
+            match tool {
+                MaskDetectTool::Erase => app.draw_erase_overlay(ui, ctx, transform),
+                MaskDetectTool::Conceal => app.draw_conceal_panel(ctx, transform.viewport_rect),
+                MaskDetectTool::LocalAdjust => {
+                    app.draw_local_adjust_panel(ctx, transform.viewport_rect)
+                }
+            }
+        },
+    )
+    .drop_without_applying_deltas();
+}
+
+fn assert_mask_detect_layer_above(ctx: &egui::Context, dialog_id: &str, lower_ids: &[&str]) {
+    let layers: Vec<_> = ctx.memory(|memory| memory.layer_ids().collect());
+    let dialog_index = layers
+        .iter()
+        .position(|layer| layer.id == egui::Id::unique(dialog_id))
+        .expect("dialog layer exists");
+    let dialog = layers[dialog_index];
+    assert_eq!(dialog.order, egui::Order::Debug);
+    let rect = ctx.memory(|memory| memory.area_rect(dialog.id)).unwrap();
+    let mut checked_overlap = false;
+    for id in lower_ids {
+        let index = layers
+            .iter()
+            .position(|layer| layer.id == egui::Id::unique(id))
+            .unwrap_or_else(|| panic!("missing lower layer {id}"));
+        assert!(
+            index < dialog_index,
+            "{id} must be below {dialog_id}: {layers:?}"
+        );
+        let lower_rect = ctx
+            .memory(|memory| memory.area_rect(layers[index].id))
+            .unwrap();
+        let overlap = rect.intersect(lower_rect);
+        if overlap.is_positive() {
+            assert_eq!(
+                ctx.layer_id_at(overlap.center()),
+                Some(dialog),
+                "{dialog_id} must own the overlap with {id}"
+            );
+            checked_overlap = true;
+        }
+    }
+    assert!(
+        checked_overlap,
+        "fixture must actually overlap the dialog and a lower surface"
+    );
+}
+
+#[test]
+fn mask_detect_settings_and_progress_layers_stay_above_real_panels_after_reopen_and_tool_switch() {
+    let _input = crate::key_input::lock_test_input();
+    // One Context retains both Window IDs and Area stacking history across all
+    // fixtures, including the reported conceal -> erase transition.
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    let transform = transform();
+    for tool in [
+        MaskDetectTool::Conceal,
+        MaskDetectTool::Erase,
+        MaskDetectTool::LocalAdjust,
+        MaskDetectTool::Conceal,
+        MaskDetectTool::Erase,
+        MaskDetectTool::LocalAdjust,
+    ] {
+        let mut app = mask_detect_fixture(tool);
+        let (_catalog_tx, rx) = mpsc::channel();
+        *app.mask_detect_catalog = DetectorCatalogState::Loading {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        };
+        let panels: &[&str] = match tool {
+            MaskDetectTool::Erase => &["erase_tool_panel"],
+            MaskDetectTool::Conceal => &["conceal_panel"],
+            MaskDetectTool::LocalAdjust => &["local_adjust_panel", "local_adjust_tool_panel"],
+        };
+        for _ in 0..2 {
+            app.cancel_mask_detect();
+            for _ in 0..3 {
+                draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
+            }
+            let panel = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique(panels[0]));
+            let point =
+                ctx.memory(|memory| memory.area_rect(panel.id)).unwrap().min + egui::vec2(2.0, 2.0);
+            assert_eq!(ctx.layer_id_at(point), Some(panel));
+            // A real headless press on the panel background exercises egui's
+            // bring-to-front behavior without activating a tool button.
+            for pressed in [true, false] {
+                draw_mask_detect_layer_frame(
+                    &mut app,
+                    &ctx,
+                    tool,
+                    &transform,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                );
+            }
+            app.open_mask_detect_dialog(tool);
+            assert_eq!(app.mask_detect_dialog, Some(tool));
+            for _ in 0..4 {
+                draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
+            }
+            assert_mask_detect_layer_above(&ctx, "mask_detect_settings", panels);
+            let request = app.capture_mask_detect_request(tool).unwrap();
+            mask_detect_queue(&mut app, request, mask_detect_output());
+            app.mask_detect_dialog = None;
+            for _ in 0..4 {
+                draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
+            }
+            assert_mask_detect_layer_above(&ctx, "mask_detect_progress", panels);
+        }
+    }
+}
+
+#[test]
+fn mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_during_progress() {
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    let transform = transform();
+    // Retain Window/Area history for both the first open and subsequent opens.
+    for click_button in [false, true, true] {
+        let tool = MaskDetectTool::Conceal;
+        let mut app = mask_detect_fixture(tool);
+        let (_catalog_tx, rx) = mpsc::channel();
+        *app.mask_detect_catalog = DetectorCatalogState::Loading {
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        };
+        // Complete egui's initial measurement passes, with no intervening
+        // operation between showing/clicking the panel and opening detection.
+        for _ in 0..3 {
+            draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
+        }
+        let select = ctx
+            .data(|data| {
+                data.get_temp::<egui::Rect>(egui::Id::unique("conceal_select_button_test_rect"))
+            })
+            .unwrap();
+        let point = select.center();
+        let panel = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("conceal_panel"));
+        assert_eq!(ctx.layer_id_at(point), Some(panel));
+        let pointer = |pressed| {
+            vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        if click_button {
+            app.conceal_tool = crate::conceal::ConcealTool::Brush;
+            for pressed in [true, false] {
+                draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, pointer(pressed));
+            }
+            assert_eq!(
+                app.conceal_tool,
+                crate::conceal::ConcealTool::Select,
+                "the real panel button must receive the click"
+            );
+        }
+        // The very next frame opens the dialog via the normal entry boundary.
+        app.open_mask_detect_dialog(tool);
+        assert_eq!(app.mask_detect_dialog, Some(tool));
+        for _ in 0..4 {
+            draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
+        }
+        assert_mask_detect_layer_above(&ctx, "mask_detect_settings", &["conceal_panel"]);
+        let request = app.capture_mask_detect_request(tool).unwrap();
+        mask_detect_queue(&mut app, request, mask_detect_output());
+        app.mask_detect_dialog = None;
+        app.conceal_tool = crate::conceal::ConcealTool::Brush;
+        for _ in 0..4 {
+            draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
+        }
+        // This exposed panel button lies outside the smaller progress window.
+        // Area-level interactions must not raise it above the Debug window,
+        // and the modal gate must keep the underlying tool button disabled.
+        assert_eq!(ctx.layer_id_at(point), Some(panel));
+        for pressed in [true, false] {
+            draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, pointer(pressed));
+            assert_mask_detect_layer_above(&ctx, "mask_detect_progress", &["conceal_panel"]);
+            assert_eq!(app.conceal_tool, crate::conceal::ConcealTool::Brush);
+            assert!(app.mask_detect_pending.is_some());
+        }
+        app.cancel_mask_detect();
+        // Close before the next fixture reuses the retained layer history.
+        draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
+    }
+}
+
+#[test]
+fn mask_detect_debug_windows_stay_above_menu_tooltip_and_toast_orders() {
+    let _input = crate::key_input::lock_test_input();
+    for progress in [false, true] {
+        let mut app = mask_detect_fixture(MaskDetectTool::Erase);
+        let id = if progress {
+            let request = app
+                .capture_mask_detect_request(MaskDetectTool::Erase)
+                .unwrap();
+            mask_detect_queue(&mut app, request, mask_detect_output());
+            "mask_detect_progress"
+        } else {
+            app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+            "mask_detect_settings"
+        };
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let rect = transform().viewport_rect;
+        for _ in 0..4 {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |_| {
+                    app.show_mask_detect_dialog(&ctx);
+                    // These overlapping Areas use the production PopupKind orders
+                    // and the fullscreen feedback toast's Tooltip order.
+                    for (name, order) in [
+                        ("mask_detect_test_menu", egui::PopupKind::Menu.order()),
+                        ("mask_detect_test_tooltip", egui::PopupKind::Tooltip.order()),
+                        ("mask_detect_test_toast", egui::Order::Tooltip),
+                    ] {
+                        egui::Area::new(egui::Id::unique(name))
+                            .fixed_pos(rect.min)
+                            .order(order)
+                            .show(&ctx, |ui| {
+                                ui.allocate_exact_size(rect.size(), egui::Sense::hover());
+                            });
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert_mask_detect_layer_above(
+            &ctx,
+            id,
+            &[
+                "mask_detect_test_menu",
+                "mask_detect_test_tooltip",
+                "mask_detect_test_toast",
+            ],
+        );
+    }
+}
+
 fn mask_detect_append_receipt(
     app: &crate::app::AppTestEnvForTest,
     operation_id: u64,
@@ -619,7 +894,8 @@ fn mask_detect_open_cancel_and_zero_keep_book_append_undo_receipt() {
 fn mask_detect_expanded_dialog_keeps_actions_outside_scroll_at_small_screen() {
     use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
     let _input = crate::key_input::lock_test_input();
-    // The stage-2 folder controls and license notice are part of the body.
+    // With no added models, the contour margin is hidden. The folder controls
+    // and license notice are still part of the expanded body.
     // With details expanded they fit at 100%, but require scrolling at 200%.
     for (scale, expected_height) in [
         (1.0_f32, HeightExpectation::Fits),
@@ -630,6 +906,10 @@ fn mask_detect_expanded_dialog_keeps_actions_outside_scroll_at_small_screen() {
         // Exercise the normal empty catalog, independently of worker timing or
         // the fixture's disconnected receiver and its error-message layout.
         *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(Vec::new()));
+        assert_eq!(
+            mask_detect_margin_visibility(&app.mask_detect_catalog, &app.settings.mask_detect),
+            (true, false)
+        );
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         ctx.set_pixels_per_point(scale);

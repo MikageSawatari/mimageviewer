@@ -36,6 +36,173 @@ fn patch() -> MaskPatch {
     }
 }
 
+fn assert_mask_detect_feedback_only_on_viewer(app: &mut App, kind: crate::feedback::FeedbackKind) {
+    assert_eq!(app.fs_feedback_toast_surface, Some(ActionSurface::Viewer));
+    assert_eq!(app.feedback_toasts_for_test.last().unwrap().1, kind);
+    let message = app.fs_feedback_toast.as_ref().unwrap().0.clone();
+    fn contains_message(shape: &egui::Shape, message: &str) -> bool {
+        match shape {
+            egui::Shape::Text(text) => text.galley.text() == message,
+            egui::Shape::Vec(shapes) => shapes.iter().any(|s| contains_message(s, message)),
+            _ => false,
+        }
+    }
+    for surface in [ActionSurface::MainWindow, ActionSurface::Viewer] {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 900.0));
+        for _ in 0..2 {
+            // Verify routing independently of font initialization and wall time.
+            app.fs_feedback_toast.as_mut().unwrap().1 = std::time::Instant::now();
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    app.draw_feedback_toast(ui, rect, &ctx, surface);
+                },
+            );
+            let painted = output
+                .shapes
+                .iter()
+                .any(|s| contains_message(&s.shape, &message));
+            assert_eq!(
+                painted,
+                surface == ActionSurface::Viewer,
+                "{surface:?}: {message}"
+            );
+            output.drop_without_applying_deltas();
+        }
+    }
+}
+
+#[test]
+fn mask_detect_results_empty_and_stale_feedback_only_paint_on_originating_viewer_surface() {
+    let _input = crate::key_input::lock_test_input();
+    for presentation in [
+        ViewerPresentation::Fullscreen,
+        ViewerPresentation::DetachedWindow,
+    ] {
+        for tool in [
+            MaskDetectTool::Erase,
+            MaskDetectTool::Conceal,
+            MaskDetectTool::LocalAdjust,
+        ] {
+            for outcome in 0..3 {
+                let mut app = mask_detect_fixture(tool);
+                app.viewer_presentation = presentation;
+                let request = app.capture_mask_detect_request(tool).unwrap();
+                let output = if outcome == 1 {
+                    MaskDetectOutput::default()
+                } else {
+                    mask_detect_output()
+                };
+                if outcome == 2 {
+                    app.items_generation = app.items_generation.wrapping_add(1);
+                }
+                mask_detect_queue(&mut app, request, output);
+                app.poll_mask_detect(&egui::Context::default());
+                let message = &app.fs_feedback_toast.as_ref().unwrap().0;
+                match outcome {
+                    0 => assert!(message.starts_with("1 か所を追加しました")),
+                    1 => assert_eq!(message, "見つかりませんでした"),
+                    _ => assert_eq!(message, "画像が変わったため中止しました"),
+                }
+                assert_mask_detect_feedback_only_on_viewer(
+                    &mut app,
+                    crate::feedback::FeedbackKind::Info,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mask_detect_errors_and_folder_warning_only_paint_on_viewer_surface() {
+    let _input = crate::key_input::lock_test_input();
+    for presentation in [
+        ViewerPresentation::Fullscreen,
+        ViewerPresentation::DetachedWindow,
+    ] {
+        let mut app = mask_detect_fixture(MaskDetectTool::Erase);
+        app.viewer_presentation = presentation;
+        for error in [
+            MaskDetectError::MissingModel,
+            MaskDetectError::Runtime("test runtime".into()),
+            MaskDetectError::Detect(DetectError::ModelMissing(PathBuf::from("missing.onnx"))),
+            MaskDetectError::Detect(DetectError::LoadFailed(crate::ai::AiError::Ort(
+                "test load".into(),
+            ))),
+            MaskDetectError::Detect(DetectError::InferenceFailed(crate::ai::AiError::Ort(
+                "test inference".into(),
+            ))),
+            MaskDetectError::Detect(DetectError::OutputShape("test shape".into())),
+            MaskDetectError::Detect(DetectError::InvalidInput("test image".into())),
+            MaskDetectError::Detect(DetectError::DetectorChanged),
+        ] {
+            app.feedback_toasts_for_test.clear();
+            let request = app
+                .capture_mask_detect_request(MaskDetectTool::Erase)
+                .unwrap();
+            let (tx, rx) = mpsc::channel();
+            assert!(tx.send(Err(error)).is_ok());
+            app.mask_detect_pending = Some(Box::new(MaskDetectPending {
+                request,
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+            }));
+            app.poll_mask_detect(&egui::Context::default());
+            assert_mask_detect_feedback_only_on_viewer(
+                &mut app,
+                crate::feedback::FeedbackKind::Error,
+            );
+        }
+        let request = app
+            .capture_mask_detect_request(MaskDetectTool::Erase)
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+        app.mask_detect_pending = Some(Box::new(MaskDetectPending {
+            request,
+            cancel: Arc::new(AtomicBool::new(false)),
+            rx,
+        }));
+        app.poll_mask_detect(&egui::Context::default());
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "検出処理が停止しました"
+        );
+        assert_mask_detect_feedback_only_on_viewer(&mut app, crate::feedback::FeedbackKind::Error);
+        app.erase_mask_size = [7, 8];
+        assert!(
+            app.capture_mask_detect_request(MaskDetectTool::Erase)
+                .is_none()
+        );
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "画像とマスクの大きさが一致しません"
+        );
+        assert_mask_detect_feedback_only_on_viewer(&mut app, crate::feedback::FeedbackKind::Error);
+        // Thread-spawn failures share this publisher; do not exhaust threads or
+        // launch Explorer just to induce the rare failure in a regression test.
+        app.show_mask_detect_error("検出器フォルダを開けません: test spawn".into());
+        assert_mask_detect_feedback_only_on_viewer(&mut app, crate::feedback::FeedbackKind::Error);
+        app.external_open_failure_tx
+            .send(crate::external_links::ExternalOpenFailure::DetectorFolder)
+            .unwrap();
+        app.poll_external_open_failures();
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().unwrap().0,
+            "検出器フォルダを開けませんでした"
+        );
+        assert_mask_detect_feedback_only_on_viewer(
+            &mut app,
+            crate::feedback::FeedbackKind::Warning,
+        );
+    }
+}
+
 #[test]
 fn mask_detect_selected_byo_blocks_start_until_catalog_ready_and_is_captured() {
     let _input = crate::key_input::lock_test_input();
@@ -434,7 +601,8 @@ fn mask_detect_catalog_loading_worker_runs_off_ui_and_retains_activity_until_ter
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let activity = app.local_ai_activity.load(Ordering::Acquire);
-    app.launch_mask_detect_catalog_worker(move |_| {
+    let folder = app.tmp.path().join("detectors");
+    app.launch_mask_detect_catalog_worker(folder, move |_| {
         started_tx.send(std::thread::current().id()).unwrap();
         release_rx.recv().unwrap();
         Ok(vec![entry("worker.onnx")])
@@ -587,7 +755,16 @@ fn mask_detect_unselected_face_collapses_shape_and_details_but_keeps_shared_marg
     }
     for selected in [false, true] {
         let mut app = mask_detect_fixture(MaskDetectTool::Erase);
-        *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(Vec::new()));
+        let mut boxed = entry("boxed");
+        boxed.result.as_mut().unwrap().format = DetectorFormat::UltralyticsDetect;
+        *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(vec![boxed]));
+        app.settings.mask_detect.detectors.insert(
+            "boxed".into(),
+            crate::settings::ExternalDetectorSettings {
+                selected: true,
+                ..Default::default()
+            },
+        );
         app.mask_detect_dialog = Some(MaskDetectTool::Erase);
         app.settings.mask_detect.face_selected = selected;
         let ctx = egui::Context::default();
@@ -617,6 +794,245 @@ fn mask_detect_unselected_face_collapses_shape_and_details_but_keeps_shared_marg
         );
         assert!(margin_painted);
     }
+}
+
+#[test]
+fn mask_detect_margin_sliders_follow_selected_readable_detector_kinds_and_keep_values() {
+    let _input = crate::key_input::lock_test_input();
+    for (label, face, format, selected, readable, shape, expected) in [
+        ("empty", false, None, false, true, None, (false, false)),
+        ("face only", true, None, false, true, None, (true, false)),
+        (
+            "unselected box",
+            false,
+            Some(DetectorFormat::UltralyticsDetect),
+            false,
+            true,
+            None,
+            (false, false),
+        ),
+        (
+            "selected box",
+            false,
+            Some(DetectorFormat::UltralyticsDetect),
+            true,
+            true,
+            None,
+            (true, false),
+        ),
+        (
+            "unselected segment",
+            false,
+            Some(DetectorFormat::UltralyticsSegment),
+            false,
+            true,
+            None,
+            (false, false),
+        ),
+        (
+            "selected segment",
+            false,
+            Some(DetectorFormat::UltralyticsSegment),
+            true,
+            true,
+            None,
+            (false, true),
+        ),
+        (
+            "face and segment",
+            true,
+            Some(DetectorFormat::UltralyticsSegment),
+            true,
+            true,
+            None,
+            (true, true),
+        ),
+        (
+            "unreadable segment",
+            false,
+            Some(DetectorFormat::UltralyticsSegment),
+            true,
+            false,
+            None,
+            (false, false),
+        ),
+        (
+            "unreadable box",
+            false,
+            Some(DetectorFormat::UltralyticsDetect),
+            true,
+            false,
+            None,
+            (false, false),
+        ),
+        (
+            "segment as ellipse",
+            false,
+            Some(DetectorFormat::UltralyticsSegment),
+            true,
+            true,
+            Some(DetectorShape::Ellipse),
+            (true, true),
+        ),
+        (
+            "segment as rect",
+            false,
+            Some(DetectorFormat::UltralyticsSegment),
+            true,
+            true,
+            Some(DetectorShape::Rect),
+            (true, true),
+        ),
+    ] {
+        let mut app = mask_detect_fixture(MaskDetectTool::Erase);
+        app.settings.mask_detect.face_selected = face;
+        app.settings.mask_detect.margin_percent = 27.0;
+        app.settings.mask_detect.contour_margin_percent = 1.2;
+        // An absent saved selection must neither enable a slider nor be erased.
+        app.settings.mask_detect.detectors.insert(
+            "absent".into(),
+            crate::settings::ExternalDetectorSettings {
+                selected: true,
+                ..Default::default()
+            },
+        );
+        let mut entries = Vec::new();
+        if let Some(format) = format {
+            let mut detector = entry("model");
+            detector.result.as_mut().unwrap().format = format;
+            if !readable {
+                detector.result = Err(DetectorReadError::OutputShape);
+            }
+            entries.push(detector);
+            app.settings.mask_detect.detectors.insert(
+                "model".into(),
+                crate::settings::ExternalDetectorSettings {
+                    selected,
+                    shape,
+                    ..Default::default()
+                },
+            );
+        }
+        *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(entries));
+        assert_eq!(
+            mask_detect_margin_visibility(&app.mask_detect_catalog, &app.settings.mask_detect),
+            expected,
+            "{label}"
+        );
+        app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        // A selected model's controls can push the contour margin below the
+        // ScrollArea viewport. egui omits clipped labels from output.shapes, so
+        // the shared visibility predicate, rather than painted text, determines
+        // whether each slider belongs to the body. Render as well to check that
+        // the widgets preserve the stored values.
+        for _ in 0..3 {
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1093.0, 614.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.show_mask_detect_dialog(ui.ctx()),
+            );
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            mask_detect_margin_visibility(&app.mask_detect_catalog, &app.settings.mask_detect),
+            expected,
+            "{label}: after rendering"
+        );
+        assert_eq!(app.settings.mask_detect.margin_percent, 27.0);
+        assert_eq!(app.settings.mask_detect.contour_margin_percent, 1.2);
+        assert!(app.settings.mask_detect.detectors["absent"].selected);
+    }
+}
+
+#[test]
+fn mask_detect_margin_sliders_do_not_infer_detector_kinds_before_catalog_ready() {
+    let mut options = crate::settings::MaskDetectSettings::default();
+    options.detectors.insert(
+        "saved".into(),
+        crate::settings::ExternalDetectorSettings {
+            selected: true,
+            ..Default::default()
+        },
+    );
+    for face in [false, true] {
+        options.face_selected = face;
+        let (_tx, rx) = mpsc::channel();
+        for catalog in [
+            DetectorCatalogState::Idle,
+            DetectorCatalogState::Loading {
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+            },
+            DetectorCatalogState::Ready(Err("read failed".into())),
+        ] {
+            assert_eq!(
+                mask_detect_margin_visibility(&catalog, &options),
+                (face, false)
+            );
+        }
+    }
+}
+
+#[test]
+fn mask_detect_catalog_report_includes_counts_typed_reasons_and_error_details_on_single_lines() {
+    let folder = PathBuf::from("test-data").join("detectors");
+    let report = detector_catalog_report(
+        &folder,
+        &Ok(vec![
+            entry("good"),
+            DetectorEntry {
+                name: "broken\nname".into(),
+                result: Err(DetectorReadError::Json(
+                    "threshold.json: invalid value\nline 2".into(),
+                )),
+            },
+            DetectorEntry {
+                name: "shape".into(),
+                result: Err(DetectorReadError::OutputShape),
+            },
+        ]),
+    );
+    assert_eq!((report.readable, report.unreadable), (1, 2));
+    assert_eq!(report.lines.len(), 3);
+    assert!(report.lines[0].contains(&format!("folder={folder:?}")));
+    assert!(report.lines[0].contains("readable=1 unreadable=2"));
+    assert!(report.lines[1].contains("broken\\nname"));
+    assert!(report.lines[1].contains("reason=Json("));
+    assert!(report.lines[1].contains("JSON を読めません"));
+    assert!(report.lines[1].contains("threshold.json: invalid value\\nline 2"));
+    assert!(report.lines[2].contains("name=\"shape\" reason=OutputShape"));
+    assert!(report.lines[2].contains("出力の形式を読めません"));
+    assert!(
+        report
+            .lines
+            .iter()
+            .all(|line| !line.contains('\r') && !line.contains('\n'))
+    );
+}
+
+#[test]
+fn mask_detect_catalog_report_empty_missing_and_failed_reads_each_have_one_summary() {
+    for folder in ["absent/detectors", "empty/detectors"] {
+        let report = detector_catalog_report(std::path::Path::new(folder), &Ok(Vec::new()));
+        assert_eq!((report.readable, report.unreadable), (0, 0));
+        assert_eq!(report.lines.len(), 1);
+        assert!(report.lines[0].contains("readable=0 unreadable=0"));
+        assert!(report.lines[0].contains(folder));
+    }
+    let report = detector_catalog_report(
+        std::path::Path::new("detectors"),
+        &Err("read_dir failed\naccess denied".into()),
+    );
+    assert_eq!(report.lines.len(), 1);
+    assert!(report.lines[0].contains("read_dir failed\\naccess denied"));
+    assert!(!report.lines[0].contains('\n'));
 }
 
 #[test]

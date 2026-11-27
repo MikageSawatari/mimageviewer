@@ -508,7 +508,7 @@ fn mask_patch(
         }
     }
     let mut patch = MaskPatch { x, y, w, h, bits };
-    dilate_square(&mut patch, radius, cancel)?;
+    dilate_circle(&mut patch, radius, cancel)?;
     Ok(patch)
 }
 
@@ -593,9 +593,9 @@ fn bounded_logits(
     Ok(LogitPatch { x, y, w, values })
 }
 
-/// Separable sliding windows keep dilation linear in the bounded patch area,
-/// even for a large original image and a large margin.
-fn dilate_square(
+/// The existing exact Euclidean distance transform is linear in this bounded
+/// patch's area, independent of radius. No full-image mask is allocated/scanned.
+fn dilate_circle(
     patch: &mut MaskPatch,
     radius: usize,
     cancel: &AtomicBool,
@@ -603,48 +603,18 @@ fn dilate_square(
     if radius == 0 || patch.w == 0 || patch.h == 0 {
         return Ok(());
     }
-    let (w, h) = (patch.w, patch.h);
-    let mut horizontal = vec![false; patch.bits.len()];
-    for y in 0..h {
+    check_cancel(cancel)?;
+    let distances = crate::mask_db::squared_distance_map(&patch.bits, patch.w, patch.h);
+    check_cancel(cancel)?;
+    let radius_squared = (radius as f64) * (radius as f64);
+    for (row, distances) in patch
+        .bits
+        .chunks_mut(patch.w)
+        .zip(distances.chunks(patch.w))
+    {
         check_cancel(cancel)?;
-        let row = &patch.bits[y * w..(y + 1) * w];
-        let mut count = row[..radius.saturating_add(1).min(w)]
-            .iter()
-            .filter(|&&b| b)
-            .count();
-        for x in 0..w {
-            horizontal[y * w + x] = count != 0;
-            if x >= radius {
-                count -= usize::from(row[x - radius]);
-            }
-            if let Some(enter) = x
-                .checked_add(radius)
-                .and_then(|v| v.checked_add(1))
-                .filter(|&v| v < w)
-            {
-                count += usize::from(row[enter]);
-            }
-        }
-    }
-    for x in 0..w {
-        if x % 256 == 0 {
-            check_cancel(cancel)?;
-        }
-        let mut count = (0..radius.saturating_add(1).min(h))
-            .filter(|&y| horizontal[y * w + x])
-            .count();
-        for y in 0..h {
-            patch.bits[y * w + x] = count != 0;
-            if y >= radius {
-                count -= usize::from(horizontal[(y - radius) * w + x]);
-            }
-            if let Some(enter) = y
-                .checked_add(radius)
-                .and_then(|v| v.checked_add(1))
-                .filter(|&v| v < h)
-            {
-                count += usize::from(horizontal[enter * w + x]);
-            }
+        for (inside, &distance_squared) in row.iter_mut().zip(distances) {
+            *inside = distance_squared <= radius_squared;
         }
     }
     Ok(())

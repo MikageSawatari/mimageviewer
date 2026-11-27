@@ -118,6 +118,8 @@
 `default_pos()` の通常ダイアログ (モーダル)。1093×614 でも [検出] と [閉じる] が見えること (見出しと操作行は ScrollArea の外)。
 設定と検出中の Window は fullscreen の描画経路だけで表示し、`with_dark_context_style` でタイトルバーを含めて常に暗色にする。
 描画後は Context の Light / Dark 両 Style と theme preference を復元する。
+両 Window は補正レイヤーの選択ダイアログと同じ `Order::Debug` に置き、`Foreground` のツールパネルより上に固定する。
+同一 Order 内の記憶や毎フレームの `move_to_top` による後追いには依存しない。
 
 | 項目 | 内容 | 既定 |
 |---|---|---|
@@ -137,6 +139,8 @@
 - 各検出器の行には、ファイル名・分類の数・種類 (箱 / 輪郭)・ONNX に書かれたライセンス文字列 (あれば) を出す。
 - 文言は処理内容だけを書く (例:「顔を検出して楕円のマスクを追加します」)。「投稿用」などの用途判定の語は使わない。
 - 読めなかったファイルは灰色の行で理由を出す (例:「出力の形式を読めません」)。黙って隠さない。
+- 輪郭の余白は、選択済みで読める輪郭検出器があるときだけ表示する。箱の余白は顔または選択済みで読める箱検出器があるときに表示する。
+  輪郭検出器で楕円／矩形を選んだ場合も箱の余白を使うので表示する。非表示でも保存値・既定値は変えない。
 - 選択済み BYO の設定がある間は、一覧が Ready になるまで [検出] を押せない。Ready 後は読める・分類が選ばれた検出器だけを要求に含める。
   読めない／不在／分類未選択の BYO の設定は残すが実行しない。それらしかなければ顔の選択ありで顔だけを実行でき、顔も未選択なら開始できない。
 
@@ -197,7 +201,8 @@
 - **輪郭**: 32 係数 × 元マスクで元マスクの解像度の値 (ロジット) を作る。**元の画像の箱の中の各画素について、
   画素の中心を letterbox の座標 → 元マスクの座標へ写し、ロジットを双線形で読んで 0 より大きければ内側**とする
   (元マスクの解像度で 0/1 にしてから拡大すると、元の画像では約 30px の階段になるため)。そのあと §4.2 の余白
-  (**元の画像の px**) ぶん太らせる。結果は **検出ごとの小さなパッチ** (画像座標の矩形 + その範囲のビット列) にする
+  (**元の画像の px**) を半径とし、最も近い内側の画素からのユークリッド距離が半径以下の画素を含めて円形に太らせる。
+  拡張後のパッチ範囲だけを二乗距離変換で走査し、費用はパッチの画素数に比例させる。結果は **検出ごとの小さなパッチ** (画像座標の矩形 + その範囲のビット列) にする
   (§7.4 の UI スレッドの負荷のため)。この方法で ultralytics の `retina_masks` と IoU 中央値 0.999 (最小 0.97) だった。
 - 輪郭に沿うモードで全画素 false のパッチは検出 worker で候補と一緒に捨て、分類別件数も残った候補から集計する。
   全候補が空なら 0 件とし、UI の Undo・書き先作成・Raster 変換・表示 ON に進まない。楕円／矩形のモードは箱を使う。
@@ -453,6 +458,8 @@ impl Drop for MaskDetectPending { fn drop(&mut self) { self.cancel.store(true, R
 
 モデルが壊れている・読めない・推論に失敗した・GPU のメモリが足りない、はログとエラー表示で終わる
 (既定の割り切り)。再試行・自動で別の検出器に切り替える・途中の結果を残すことはしない。
+自動検出の結果・0 件・対象変更・警告・エラー・フォルダを開く失敗の通知は、すべて `ActionSurface::Viewer` を指定する。
+メインの全画面でも別ウィンドウでもビューアー面だけで描き、後ろのメイングリッドへ二重に出さない。
 
 ## 8. 配布・ライセンス・公開文書
 
@@ -519,6 +526,7 @@ detect / runtime 層は label の値を解釈せず、ツールの型・UI 状�
 | 区間 | event |
 |---|---|
 | 開始 | `mask_detect/start`（既存の `tool` と `trace_label`） |
+| 一覧の読み込み完了 | `mask_detect/catalog`（`readable`・`unreadable`・`ms`、worker 完了時だけ 1 件） |
 | セッション準備 | `ai/external_session_prepare`（`trace_label`・`cache`・`ms`） |
 | 推論 | `ai/detect_faces_inference`（`trace_label`・段の `w/h`・`ms`） |
 | 後処理 | `ai/detect_faces_postprocess`、全段をまとめる `ai/detect_faces_postprocess_merge_nms`（同上） |
@@ -968,7 +976,7 @@ mask_detect_parked_empty_receiver_keeps_root_poll_awake_until_result
   選択分類・分類別閾値、分類ごとの IoU 0.7 の NMS と全体 300 件上限を実装する。
   segment は箱の中の元画像の画素中心から元マスクへ写し、ロジットを双線形に読んで 0 より大きければ内側とする。
   ロジットの計算・確保は、箱に必要な双線形の隣接画素を含む元マスクの範囲に限る。
-  正方形近傍の太らせを separable な線形走査で行い、この形を単体テストに固定した。
+  太らせは §23.8 の修正で円形近傍へ変更し、既存の二乗ユークリッド距離変換でパッチ内だけを線形走査する。
   推論ごとに出力数・形式・分類数を検査し、ファイル identity の変化は型付き `DetectorChanged` で全体を中止する。
 - `MaskDetectRequest` は検出器情報・選択・形・閾値・余白を複製して固定し、一覧再読込と独立させた。
   worker は顔と選ばれた BYO を順に実行し、検出器間の NMS はしない。箱・輪郭パッチ・分類ごとの件数をまとめる。
@@ -994,7 +1002,7 @@ mask_detect_parked_empty_receiver_keeps_root_poll_awake_until_result
   対応箱は全組 IoU ≥ 0.85・score 差 ≤ 0.05、かつ全ケースの全組を合わせて 95% 以上が IoU ≥ 0.95 とする（ケースごとの割合の平均ではない）。
   未対応は両側とも score < 閾値 + 0.03 だけ許す。輪郭は対応箱の IoU にかかわらず全組 IoU ≥ 0.9 を検査する。
   参照 PNG は Ultralytics の余白前の結果なので、同じ推論・読取経路の private 入口から半径 0 を渡して比較する。
-  製品入口の余白は常に最小 2px で、正方形の太らせと端の切詰めは別の単体テストで検査する。
+  製品入口の余白は常に最小 2px で、円形の太らせと端の切詰めは別の単体テストで検査する（円形への変更は §23.8）。
   ONNX・画像・参照 JSON は追加していない。この ignored テストは既存の nextest `gpu` group に登録した。
 - **設計担当の判断による基準の変更**: CPU と DirectML の推論・縮小の固定小数点の差で、確からしさの低い大きな箱の縁が動く数値差を許容する。
   設計担当が TurboJPEG 入力で照合した case 4 の分類 5 では、score 約 0.40 の大きな箱が IoU 0.910382 となり、他の対応はすべて 0.98 以上だったとの報告に基づく。
@@ -1034,8 +1042,8 @@ detect_ultralytics_nms_precedes_original_coordinate_clipping
 detect_ultralytics_mask_multiplies_all_coefficients_and_interpolates_logits_before_threshold
 detect_ultralytics_mask_sampling_uses_original_centers_and_replicated_edges
 detect_ultralytics_mask_accepts_nonquarter_prototypes_and_computes_only_box_roi
-detect_ultralytics_crop_original_box_before_square_dilation_and_clip_patch
-detect_ultralytics_square_dilation_matches_naive_neighborhood
+detect_ultralytics_crop_original_box_before_circle_dilation_and_clip_patch
+detect_ultralytics_circle_dilation_matches_naive_neighborhood
 detect_ultralytics_runtime_shapes_and_nonfinite_data_return_errors
 detect_ultralytics_changed_file_rejects_catalog_identity_without_onnx_load
 detect_ultralytics_rejects_invalid_options_and_honors_cancel
@@ -1227,3 +1235,101 @@ App の 0 件テストは 3 ツールと補正レイヤーの Raster／未作成
 - **独立レビュー (Sol gpt-6.1-sol / xhigh、実装担当とは別)**: R1 (対象 7ca8732ff) は **REJECT** (P1 なし・P2 3 件:
   一覧の読み込み中に顔だけで開始できる、全 false の輪郭を 1 件として採用する、照合で輪郭の下限を 0.8 へ緩める)。
   3 件とも妥当と判断して実装担当が直した (§23.6)。R2 (対象 ac335361d) は **ACCEPT** (新しい指摘なし)。
+
+### 23.8 サブ PC の観測による余白表示・一覧ログ・ダイアログの層の修正（修正後の実行検証待ち）
+
+- 観測者はサブ PC の Claude。追加検出器が 0 個でも輪郭の余白が出ることと、一覧読み込みの記録がログに残らないことを観測したとの報告を受けた。
+  設計担当がこの 2 点を修正対象と判断した。今回の実装担当は実機での観測・起動をしていない。
+- 追加の観測もサブ PC の Claude による写真付きの報告: 隠蔽加工で自動検出を開いて閉じ、隠蔽パネルを閉じてから
+  消しゴムで自動検出を開くと、消しゴムのパネルがダイアログの上に残り、2 秒後も文字が読めなかった。
+  最初に隠蔽加工から開いたときはダイアログがパネルの上に出ていたとの報告。今回の実装担当自身の再現ではない。
+- 消しゴム・隠蔽加工・補正レイヤーの実パネルと自動検出の 2 Window は、修正前はいずれも `Order::Foreground` だった。
+  vendored egui の Area は押下や再表示で同じ Order の中の前後を変え、Memory の層順序がその記憶を使うことをソースで確認した。
+  初回だけでなく「前フレームに無かった Area」も最前へ移すため、初回／2 回目だけによる原因の断定はしない。
+  同一 Order の履歴依存を除くため、設計担当が示した補正レイヤーの「追加」「マスク種類変更」「加工内容を選択」の先例へ揃え、
+  自動検出の設定と進行の両 Window を `Order::Debug` にした。毎フレームの最前面化・再描画要求・Window Id の変更は追加していない。
+- 他の fullscreen の面はソースを確認し、通常のメニュー／popup は `Foreground`、tooltip と feedback toast は `Tooltip` のまま維持する。
+  重なる場合は新しい自動検出 Window が上になる。既存の補正レイヤーの Debug ダイアログと同じ関係で、既存のモーダル入力停止も維持する。
+  回帰では同じ Order を使う代表 Area を重ねて層順序と hit test を検査するが、実アプリでの tooltip・メニュー等の見え方は未確認。
+- 余白の表示条件を在メモリの一覧・選択・形から解決する。輪郭は選択済みで読める輪郭検出器が 1 つ以上ある場合だけ、
+  箱は顔または選択済みで読める箱検出器がある場合に表示する。輪郭検出器で楕円／矩形を選んだ場合も箱の余白を使うため表示する。
+  不在・読めない・未選択・一覧の未完了からは検出器の種類を推測しない。余白の保存形式・値・既定は変更しない。
+- 一覧 worker は準備待ちと読み込みの完了後、フォルダのパス・読めた数・読めない数の要約を `crate::logger::log` で 1 行、
+  読めない検出器は表示名・型付き理由（enum の Debug）・詳細（Display）をそれぞれ 1 行出す。
+  空／フォルダなしも 0 / 0 の要約を 1 行出し、一覧全体の失敗は同じ要約に理由を含める。
+  引用形式で制御文字をエスケープし、複数行のエラーでも 1 行を維持する。
+- 同じ worker 完了箇所から `mask_detect/catalog`（`readable`・`unreadable`・`ms`）を 1 件出す。
+  `ms` はランタイム準備待ちと一覧読み込みを含み、ログの文章作成・送出より前に計測を終える。
+  `poll_mask_detect_catalog` と描画からは記録せず、一覧の読み込み 1 回につき 1 回に限定する。
+  normal / perf とも既存の非同期 log writer の publication を使い、UI スレッドへ新しい同期 I/O は足さない。
+- 設計担当が修正しないと判断した 2 点も維持する: `fs/page_turn_decision` の `reason=mask_detect` が毎フレーム出るのは
+  共通モーダルと同じ既存動作なので変更しない。置き方 b の `mismatch-names` が読めるのは ONNX の `names`（80 個）が
+  `labels.json`（3 個）より優先される §6.1 どおりで、試験の期待の誤りとの判断を受けた。名前の優先順位は変更しない。
+- マニュアルにも余白の表示条件を追記した。既存の小画面テストは空の一覧で箱のみ表示、詳細展開時は
+  100% = Fits / 200% = Scrolls を引き続き検査する。多数行では選択中の輪郭検出器と顔を並べる。
+  `mask_detect_unselected_face_collapses_shape_and_details_but_keeps_shared_margin` は選択中の箱検出器を明示し、
+  顔を畳んでも箱側の共有余白を残す検査にした。
+- 追加したテスト（共有 runner の結果と修正後の未実行箇所は後述、すべて `test(/mask_detect/)` に含まれる）:
+
+```text
+mask_detect_margin_sliders_follow_selected_readable_detector_kinds_and_keep_values
+mask_detect_margin_sliders_do_not_infer_detector_kinds_before_catalog_ready
+mask_detect_catalog_report_includes_counts_typed_reasons_and_error_details_on_single_lines
+mask_detect_catalog_report_empty_missing_and_failed_reads_each_have_one_summary
+mask_detect_settings_and_progress_layers_stay_above_real_panels_after_reopen_and_tool_switch
+mask_detect_debug_windows_stay_above_menu_tooltip_and_toast_orders
+```
+
+層の回帰は、同じ egui Context と両 Window Id の記憶を保持したまま、隠蔽加工 → 消しゴム → 補正レイヤーを繰り返し、
+各ツールでも 2 回ずつ開く。実パネルの背景を headless のポインター入力で押した後、設定・進行 Window を描き、
+`memory.layer_ids()` の順序と実際の重なり点の `layer_id_at` がダイアログを返すことを検査する。
+今回の実装担当はテストを実行しておらず、実機での解消も未確認。
+
+- r7・r8 の共有 runner による検証は設計担当の報告: core の `cargo check` は成功、
+  `test(/mask_detect|^ai::detect|detector_catalog|external_model|settings_transfer/)` は 172 件中 171 件成功。
+  余白スライダーのテストだけ、顔＋輪郭で表示条件は `(true, true)` の検査を通過した後、
+  描画文字の検査が `(true, false)` となって失敗した。
+- 原因は表示条件ではなくテストの検査方法。輪郭の余白は検出器の詳細行より後ろにあり、
+  ScrollArea は本文を表示範囲で切り抜く。vendored egui の Slider は Label を作るが、Label は
+  `ui.is_rect_visible(response.rect)` が偽なら文字を描画せず、`output.shapes` に現れない。
+  このため余白の有無は描画文字ではなく、UI と共通の `mask_detect_margin_visibility` で描画前後に検査するよう直した。
+  描画による保存値の維持と、既存の小画面・多数行でのスクロール／操作行の検査は残す。製品の表示条件は変更していない。
+  このテスト修正後の cargo 検証は未実行。
+
+- 続くサブ PC の Claude による観測と設計担当の判断: F12 の別ウィンドウで検出結果の通知がメインの右上にも出た。
+  輪郭の余白 4.1% では角張った塊になった。また、隠蔽パネルの表示直後／ボタン押下直後から開いた設定窓の重なりと、
+  検出中にパネルを押した際に進行窓が隠れる動きも報告された。今回の実装担当自身の実機観測ではない。
+- 通知の原因は面を指定しない発行。`fs_feedback_toast_surface` の説明と `draw_feedback_toast` の面ゲートを確認し、
+  自動検出の結果・0 件・対象変更は `show_feedback_toast_on(..., Viewer)`、エラーは既存の
+  `show_feedback_result_on(..., Viewer, Error)` を使う共通の小さな発行関数へ揃えた。
+  エラーの種類と既存の通知時間ポリシーは面指定の既存関数へ渡す。フォルダ起動 worker の失敗も、既存 channel の
+  root 側受信口で `DetectorFolder` だけ `show_feedback_warning_on(..., Viewer)` とする。他の外部操作の通知は変えない。
+  detached の述語・viewport・bundle・窓の寿命は変更せず、既存の Viewer 面の描画契約を利用する。
+- 輪郭の余白は、正方形近傍から円形（内側の画素までのユークリッド距離 ≤ 半径）へ変更した。
+  既存の `mask_db::squared_distance_map` を拡張・画像端で切詰め済みのパッチだけに適用し、半径の二乗以下を採用する。
+  2 軸の距離変換と閾値化は O(パッチの画素数)、距離の作業領域もパッチ内だけ。半径に比例する近傍走査や
+  全画像への拡張はしない。距離変換の前後と書き戻しの各行でキャンセルを確認する。余白の割合・最小 2px は維持する。
+  元の箱で切り抜いてから太らせる順番と、最小パッチの返却・空パッチの除外も維持する。
+- 新しい層順序の回帰は、実際の隠蔽パネルを描き、初回表示と同じ Context での再表示を対象にする。
+  ボタンを押さず直ちに開く場合と、実際の「選択」ボタンを press / release して変更を確認した次フレームに開く場合を検査する。
+  続いて進行窓が出ている間に露出したパネルのボタン位置を押し、press / release の各フレームで
+  `memory.layer_ids()` と重なり点の hit test が進行窓を上とすること、パネルのツールは変更されないことを検査する。
+  設定・進行 Window の `Order::Debug` は r8 のままで、毎フレームの最前面化は追加していない。
+- 追加したテスト（未実行、すべて `test(/mask_detect|^ai::detect/)` に含まれる）:
+
+```text
+mask_detect_results_empty_and_stale_feedback_only_paint_on_originating_viewer_surface
+mask_detect_errors_and_folder_warning_only_paint_on_viewer_surface
+mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_during_progress
+```
+
+  通知の検査はメイン全画面／別ウィンドウの両表示状態で、結果・0 件・対象変更を 3 ツールから注入し、
+  検出器変更など各 worker エラー・受信切断・大きさ不一致・フォルダ失敗も発行面と種類を検査する。
+  実際の `draw_feedback_toast` に MainWindow / Viewer を渡し、メインには文字を描かず Viewer にだけ描くことも検査する。
+  OS のスレッド起動失敗は強制せず、共通のエラー発行関数だけを直接検査する。
+  既存の太らせテスト 2 件は上記リストの `circle` 名へ置き換え、半径 0・1・2・4・20、種なし・全面・隅・中央・複数の種を
+  素朴な円形近傍と比較する。箱での切抜き・画像端の切詰め・太らせ時のパッチ位置と大きさの不変も検査する。
+
+- cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動、git add / commit は依頼に従い未実行。
+  修正後の自動検証と実機での表示・ログ／perf の観測は設計担当へ引き継ぐ。
+- 今回の `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。glyph 検査は危険 glyph 0、card 検査は 55 件・超過 0。
