@@ -1244,7 +1244,7 @@ cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen|in_page_scroll|p
 
 ### master 取り込み後の App の大きさ (2026-11-28)
 
-§1.911と§1.917の追加がmasterで合わさり、設計担当のx64テスト実行体で`App=110688`バイトとなって既存の`<110_000`検査に失敗した。変更前の実測は`FsExclusiveView=976`、`DepthViewState=976`、`PlaneViewState=96`、`FullscreenPageLayout=456`、`Option<PlaneCoverRecord>=344`バイトである。`FullscreenPageLayout::plane_cover`を`Option<Box<PlaneCoverRecord>>`へ、`FsExclusiveView::Depth`を`Depth(Box<DepthViewState>)`へ変更し、生成/参照箇所と既存テストを型に合わせた。読み出すrecordは元のCopy値を取り、単ページの公開では既存のBoxがあれば中身を書き換える。`begin`/`clear`/ページ追加の無効化と描画ページとの対応は維持する。Depthは自動derefと必要な`as_mut()`だけで既存処理を通し、余分なclone、所有/再作成/退役、detachedのbundle移動、Panorama/PlaneViewの格納方式は変えない。
+§1.911と§1.917の追加がmasterで合わさり、設計担当のx64テスト実行体で`App=110688`バイトとなって既存の`<110_000`検査に失敗した。変更前の実測は`FsExclusiveView=976`、`DepthViewState=976`、`PlaneViewState=96`、`FullscreenPageLayout=456`、`Option<PlaneCoverRecord>=344`バイトである。`FullscreenPageLayout::plane_cover`を`Option<Box<PlaneCoverRecord>>`へ、`FsExclusiveView::Depth`を`Depth(Box<DepthViewState>)`へ変更し、生成/参照箇所と既存テストを型に合わせた。読み出すrecordは元のCopy値を取る。単ページの公開では、描画 pass ごとに小さな確保 (約 340 バイト) が 1 回増える。描画の前に `clear()` が記録を消すので、確保を使い回すには無効の状態を別に持つ必要があり、そこまでの価値はないため受け入れた (独立レビュー I7 の P2 への対応)。`begin`/`clear`/ページ追加の無効化と描画ページとの対応は維持する。Depthは自動derefと必要な`as_mut()`だけで既存処理を通し、余分なclone、所有/再作成/退役、detachedのbundle移動、Panorama/PlaneViewの格納方式は変えない。
 
 `history_transition_storage_keeps_app_stack_footprint_bounded`に、Option<Box<PlaneCoverRecord>>と実際のlayoutフィールドがポインターサイズであること、`FsExclusiveView<=128`かつ`PlaneViewState+2ポインター`以内であることの検査と型ごとのサイズ出力を追加した。Appの上限`110_000`は変更していない。実装の範囲は`displayed_image_transform.rs`・`fs_exclusive_view.rs`・Depthの生成/借用とPlaneCoverの読み取りを行う製品/テスト箇所、および本節とdetached計画§11。指示との差分はない。
 

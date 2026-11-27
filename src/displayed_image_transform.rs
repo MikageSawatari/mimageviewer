@@ -1199,17 +1199,10 @@ impl FullscreenPageLayout {
         plane_cover: Option<PlaneCoverRecord>,
     ) {
         debug_assert!(plane_cover.is_none_or(|record| record.input.page_idx == transform.page_idx));
-        // begin/push still invalidate the record; reuse its allocation at publication.
-        let previous = self.plane_cover.take();
         self.begin(FullscreenPageLayoutKind::Single);
         self.push(transform);
-        self.plane_cover = plane_cover.map(|record| match previous {
-            Some(mut slot) => {
-                *slot = record;
-                slot
-            }
-            None => Box::new(record),
-        });
+        // One small allocation per published pass keeps the inline layout small (App size test).
+        self.plane_cover = plane_cover.map(Box::new);
     }
 
     pub(crate) fn push(&mut self, transform: DisplayedImageTransform) {
