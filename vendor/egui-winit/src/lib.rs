@@ -27,6 +27,9 @@ mod macos_scroll_momentum;
 pub mod clipboard;
 #[cfg(not(target_arch = "wasm32"))]
 mod dropped_file;
+pub mod input_clock;
+#[cfg(target_os = "windows")]
+pub mod native_pointer_time;
 pub mod pointer_input_observer;
 mod safe_area;
 mod window_settings;
@@ -354,7 +357,9 @@ impl State {
     pub fn take_egui_input(&mut self, window: &Window) -> egui::RawInput {
         profiling::function_scope!();
 
-        self.egui_input.time = Some(self.start_time.elapsed().as_secs_f64());
+        let now = web_time::Instant::now();
+        self.egui_input.time = Some(now.duration_since(self.start_time).as_secs_f64());
+        self.egui_input.input_clock = Some(input_clock::at(now));
 
         // On Windows, a minimized window will have 0 width and height.
         // See: https://github.com/rust-windowing/winit/issues/208
@@ -509,6 +514,19 @@ impl State {
         event: &winit::event::WindowEvent,
     ) -> EventResponse {
         let events_before = self.egui_input.events.len();
+        #[cfg(target_os = "windows")]
+        if self.pointer_pos_in_points.is_some()
+            && let winit::event::WindowEvent::MouseInput { button, state, .. } = event
+            && let Some(button) = translate_mouse_button(*button)
+            && let Some(time) =
+                native_pointer_time::take(window, button, *state == ElementState::Pressed)
+        {
+            self.egui_input.events.push(egui::Event::PointerButtonTime {
+                button,
+                pressed: *state == ElementState::Pressed,
+                time,
+            });
+        }
         let response = self.on_window_event_inner(window, event);
         pointer_input_observer::observe(
             &self.egui_ctx,

@@ -1360,7 +1360,7 @@ UI スレッドの I/O・読み戻しの待ち・Context の再帰 lock には�
 
 修正の途中で、PageTurn の通常キャンバスのクリックが、1 pass に届いた複数の離しを 1 回と数えていた既存の欠陥が見つかった
 (同じ pass の入場とダブルクリックの試験で露見)。DoubleClickClose 側の既存の数え方 (離しごとに照合) に揃えて直した
-([fullscreen-double-click-close-plan.md §16](fullscreen-double-click-close-plan.md))。再レビューで名指しで確かめる。
+([fullscreen-double-click-close-plan.md §17](fullscreen-double-click-close-plan.md)。master 取り込みのときに §16 から §17 へ番号を移した)。再レビューで名指しで確かめる。
 
 関連の nextest (plane_・context_menu・click・double_click・touch・page_turn・depth_・preferences・capture・gamepad ほか) 3630 件が共有 runner で成功。
 

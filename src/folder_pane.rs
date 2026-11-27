@@ -131,7 +131,7 @@ enum FolderPaneLabelGesture {
     },
     AwaitingPress {
         anchor: FolderPaneLabelAnchor,
-        time: f64,
+        time: egui::EdgeTime,
     },
     PressAccepted(FolderPaneLabelAnchor),
     ArrowPress {
@@ -160,7 +160,7 @@ impl FolderPaneLabelGesture {
         arrow_rect: bool,
         continue_allowed: bool,
         pos: egui::Pos2,
-        time: f64,
+        time: egui::EdgeTime,
         max_dist: f32,
         max_delay: f64,
     ) -> Option<FolderPaneGestureNotContinued> {
@@ -197,7 +197,7 @@ impl FolderPaneLabelGesture {
                 Some(ContinueNotAllowed)
             } else if !(pos.distance(anchor.pos) <= max_dist) {
                 Some(DistanceExceeded)
-            } else if !(0.0..=max_delay).contains(&(time - released)) {
+            } else if !(0.0..=max_delay).contains(&(time.since(*released))) {
                 Some(ReleaseTimeOutsideDoubleClickDelay)
             } else {
                 None
@@ -697,13 +697,14 @@ impl FolderPaneState {
     pub(crate) fn process_label_input(
         &mut self,
         input: FolderPaneLabelInput,
-        time: f64,
+        time: impl Into<egui::EdgeTime>,
         max_dist: f32,
         max_delay: f64,
     ) -> bool {
+        let time = time.into();
         use FolderPaneLabelGesture::*;
         use FolderPanePointerHit as Hit;
-        self.label_diagnostic_time = Some(time);
+        self.label_diagnostic_time = Some(time.pass);
         if let FolderPaneLabelInput::Press {
             pos,
             ref hit,
@@ -728,7 +729,7 @@ impl FolderPaneState {
                     AwaitingPress {
                         anchor,
                         time: released,
-                    } => (Some(pos.distance(anchor.pos)), Some(time - released)),
+                    } => (Some(pos.distance(anchor.pos)), Some(time.since(*released))),
                     _ => (None, None),
                 };
                 log_folder_pane_gesture(
@@ -737,7 +738,7 @@ impl FolderPaneState {
                     previous,
                     path,
                     self.label_input.pass,
-                    Some(time),
+                    Some(time.pass),
                     format_args!(
                         "source={source:?} hit={hit:?} pos={pos:?} start_allowed={start_allowed} continue_allowed={continue_allowed} arrow_rect={arrow_rect} distance={distance:?} max_dist={max_dist} delay={delay:?} max_delay={max_delay}"
                     ),
@@ -813,7 +814,7 @@ impl FolderPaneState {
                     && source == FolderPanePointerSource::Mouse
                     && continue_allowed
                     && pos.distance(anchor.pos) <= max_dist
-                    && (0.0..=max_delay).contains(&(time - released))
+                    && (0.0..=max_delay).contains(&(time.since(released)))
                 {
                     continuation_owned = true;
                     if !anchor.toggled {
@@ -829,12 +830,12 @@ impl FolderPaneState {
                             "AwaitingPress",
                             &anchor.path,
                             self.label_input.pass,
-                            Some(time),
+                            Some(time.pass),
                             format_args!(
                                 "expanded={} source={source:?} pos={pos:?} distance={} delay={}",
                                 !anchor.first_expanded,
                                 pos.distance(anchor.pos),
-                                time - released,
+                                time.since(released),
                             ),
                         );
                         anchor.toggled = true;
@@ -845,7 +846,7 @@ impl FolderPaneState {
                             "AwaitingPress",
                             &anchor.path,
                             self.label_input.pass,
-                            Some(time),
+                            Some(time.pass),
                             format_args!("source={source:?}"),
                         );
                     }
@@ -885,7 +886,7 @@ impl FolderPaneState {
                         "FirstPress",
                         &path,
                         self.label_input.pass,
-                        Some(time),
+                        Some(time.pass),
                         format_args!(
                             "source={source:?} pos={pos:?} first_expanded={first_expanded}"
                         ),
@@ -931,7 +932,7 @@ impl FolderPaneState {
                 previous,
                 &path,
                 self.label_input.pass,
-                Some(time),
+                Some(time.pass),
                 format_args!("{}", input_details.as_deref().unwrap_or_default()),
             );
             #[cfg(test)]

@@ -1469,6 +1469,47 @@ Panoramaの既存退役・intent保持、Depthの再入場案内は既存の分�
 新しいdetached述語・viewport・入力配送・時間窓は追加しない。登録待ちの次pass要求は素材のrenderer登録境界でだけ行う。
 実装後のコンパイル・自動検証・実機確認は未実施。実装記録・ソースとの相違は設計書§11へ記載する。
 
+### 2026-11-27: 編集中の画像の交代と前面 context の所有境界 (§1.920、実装済み・自動検証済み・実機未確認)
+
+- 正本: [page-edit-item-change-plan.md](page-edit-item-change-plan.md) §3・§5。
+  linked の別ウィンドウで 6 編集ツールを使う間は一覧の共通の門で項目操作を拒否し、操作時だけ案内する。
+  一覧領域への drop は背景コピーへ読み替えず拒否する。ツールへの入場でスライドショーを停止し、
+  受理済みの移動中は入場の開始・非同期完了を受け付けない。
+- 別項目の open・items の identity/index 空間の採用・true close は、旧項目が有効なうちに各ツールの既存の退出で
+  保存する。同じ identity が残る付け替えでは補正レイヤーの既存 owner による継続を保つ。
+  同一項目の open は従来どおり消しゴムだけ reset し、ほかの 5 ツールは継続する。
+  close のテキスト・切り取り・SNS の退避は従来どおり戻さず捨て、構成の採用は終了の保存後に鮮度を検証する。
+- registry の投影の表が scoped mount の最外の元 id を保持し、前面の所有者を返す。新しい一覧の門・入場・終了・
+  close の App 共通編集の保存と終了は前面の投影だけに作用し、sibling の一時投影で前面の下書きを保存・破棄しない。
+  App に detached 用の bool / Option は追加しない。
+- detached の既存の述語の意味・viewport・窓の所有・session の開始・park の退出・見開き内の左右切り替えは変更しない。
+  BA-7 の下書きと寿命を決める遷移の所有を結ぶ構造的修正であり、遅延・再試行・追加 repaint による症状パッチではない。
+- 合意: ClaudeCode (設計担当) と独立設計レビュー r1〜r5 (GPT-6.1 Sol / xhigh、r4 ACCEPT、r5 で所有者の経路と
+  close の所有条件を追補)。実装の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh、r1 ACCEPT + P3 → r2・r3 REVISE
+  (補正レイヤーの継続判定の対象) → r4 ACCEPT、`7dd968445..e20097823`) も、構造的修正であることに AGREE。
+  所有者を読む経路・close の所有条件・スマートフォルダの固定結果・補正レイヤーの例外・同じ画像の open の消しゴムは
+  正本 §3.4 の追記に従う。
+- 検証: 状態遷移・handler-level の回帰テストを追加。ClaudeCode が run-heavy 経由で本体 lib 全件を実行し
+  21448 件すべて成功 (`e20097823`)。実機未確認。
+- スマートフォルダは RootReady・install・resident 復帰の検証と ChildReady の旧 root 捕捉より前に終了する。
+  session が無い間は保存後の既存 revision 検証で再準備し、session がある間は固定結果を維持する。
+  保存後に再利用 metadata のバッジが古く見え得る点は Esc と同じ既存挙動として範囲外。新たな失効・再検索は足さない。
+
+### 2026-11-27: 実入力時刻をクリック判定まで保つ (§1.919、実装・検証待ち)
+
+- 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §16、実装記録は §16.17。
+  Windows の共有入力経路 (eframe の msg hook、egui-winit の timestamp subclass、egui の PointerState) を変更した。
+  timestamp subclass の資源は既存 `NativeWindowAllocationLease` に載せ、窓の置換・終了と同じ退役点で外す。
+  ROOT の listener replay 後も vendor subclass を最外へ戻し、listener が設置した subclass より先に呼出を claim する。
+  detached の述語・窓の選択・viewport 経路・open / close の動作は変更していない。
+- 実装者として、処理待ちを物理クリックの長さへ混ぜていた入力の境界を直す構造的修正と判断する。
+  呼出枠と不透明な provenance は別の証跡で、再入・保留で元メッセージを証明できない時刻は渡さない。
+  別窓の入力履歴を reset せず、閾値・猶予・待ち・追加 repaint で症状を吸収していない。
+- 設計の構造的修正への合意は正本 §16.14〜16.16 の記録による (ClaudeCode と独立設計レビュー)。
+  独立設計レビュー (Sol xhigh) は r1〜r4 の各回で構造的修正であることに AGREE し、r4 で ACCEPT。
+  実装の独立レビュー (実装者と別の Sol xhigh、ClaudeCode が依頼) は r1・r2 とも ACCEPT で、構造的修正であり症状パッチではないことに AGREE (2026-11-27、正本 §16.18)。
+
+
 ### 2026-11-26: 閉じるモードの数え方の区切りと、この pass の押下位置 (§1.900・§1.907)
 
 - 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §14・§15。F12 の別ウィンドウと共有する
@@ -1483,6 +1524,22 @@ Panoramaの既存退役・intent保持、Depthの再入場案内は既存の分�
 - 構造的修正であることの合意: Codex 独立設計レビュー r1・r2・r3 (GPT-6.1 Sol / xhigh、r3 ACCEPT) と ClaudeCode (設計担当)。
   実装担当 (Codex GPT-6.1 Sol / high) も同じ判断を報告。実装の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh、
   `2990a608e..ddff279d7`) も、構造的修正であることに合意。
+
+### 2026-11-26: main の未走査呼び出しの継続と全画面の閉じ戻り（§1.853 C・D・E、実装・検証待ち）
+
+判断は `main_folder_history_available()` と `!navigation_scope.is_detached_physical()` に限定し、
+detached／投影中の別 context の loader は従来どおり同期とする。`FolderOpenScanPurpose::DirectNavigation` は
+同じ呼び出しの引数を保持する boxed continuation となり、context 所有の pane pending が取消・採用・失敗を所有する。
+main の待ちは兄弟 context の入力・scan・cache を退役させない。
+
+main の全画面から親へ戻る場合だけ、true-close 前の描画単位を既存 close continuation → navigation へ移し、
+同じ要求 ID の `CloseReturn` sequence で保持する。新しい close の受付で待ちを退役させ、
+受付済み content-close の teardown では繰り返さない。通常描画に戻っても lock は保持し、採用境界だけで `ViewerExited` とする。
+native の対象入力の新規受付と受付済み非同期 continuation も型で区別する。
+
+ClaudeCode の設計合意と、本件の独立設計レビュー r1〜r7（[記録 §6.9〜§6.16](ui-sync-853-plan.md#69-設計レビュー-r1-gpt-61-sol--xhighread-only30ee454c72026-11-26-reject)）は、
+走査の判断・close の受付・採用済み teardown・描画資源の所有を各境界へ集める構造的修正であり、症状パッチではないことに AGREE。
+この記録はそれらの設計合意を参照するもので、今回の独立実装レビューは未実施。コンパイル・テスト・実機確認も未実施。
 
 ### 2026-11-26: 押す・離すが同じフレームのクリックの止めの寿命 (§1.906)
 
@@ -1531,6 +1588,39 @@ Panoramaの既存退役・intent保持、Depthの再入場案内は既存の分�
   走査を同じ worker に移すことに伴う入力/待機表示/同じ request ID の期限の契約で、症状を隠す guard・delay ではない。
 - detached の分類・記述子・viewport・placement は変えない。実装前に §2 を読み、設計 r3 の main 投影と lease 除外を
   実装の根拠とした。受けていない独立実装レビューの合意・検証結果は記載しない。コンパイル・Rust テストは未実施。
+
+### 2026-11-24: 操作のスクリプトはメインウィンドウの context だけで実行・イベント検出する (§1.363、設計の段階。実装はこれから)
+
+- 正本は [operation-script-plan.md](operation-script-plan.md) §3.2「凍結の決まり (detached リワーク) との照合」。キー・リング・右クリック等からスクリプトの操作の並びを実行し、本を開いた・ページが変わった等のイベントでも動く機能。
+- detached に触れる範囲: 入口の関数 (全画面のキー処理・`apply_ring_action`・右クリックメニュー) とイベントの検出点 (`render_fs_body`) は、別ウィンドウの context を取り付けている間も走る。本機能は 1 つの利用資格の関数を `run_script_slot` の冒頭とイベントの検出の冒頭の 2 か所から呼び、既存の述語を読むだけで判断する: 今の context がメインか (`projected_viewer_context_id() == viewer_context_main()`、§1.733 と同じ)、全画面の viewer の面では今の viewer の表示先が別ウィンドウか・そこへ切り替え中か (`current_viewer_session_is_detached_or_switching`。F12 の別ウィンドウ表示はメインの context のままでも起きるため)。メインウィンドウの一覧の面はメインの viewer の表示先を見ない。別ウィンドウの述語・viewport・窓の寿命・placement・context の取り付けと bundle の入れ替えは変えない。App に足す状態はメインの context 用で、bundle には入れない。
+- 合意: 独立設計レビュー (GPT-6.1 Sol / xhigh、read-only) の r6 では、方針 (メイン専用の所有範囲を既存の context・表示先・遷移の事実で定義する) は「症状パッチではなく構造的な決定」と評価されたが、具体案 (context ID の比較だけ) には合意が無かった。r7 で表示先・遷移の事実を加え、r7 のレビューで合意を得た。レビュー担当の言葉:「r7 が、既存の context・現在の表示先・遷移先・入力面によってメイン専用の所有範囲を定義することは、症状パッチではなく構造的な決定であることに合意します。detached の寿命・placement・取り付けを変更せず、メイン専用状態を bundle 外で保持する方針も、憲法と context 所有規則に整合します。」設計担当 ClaudeCode も、症状パッチではなく「メインウィンドウだけの機能」という所有の範囲を既存の事実で表す構造的な決定であることに同意する。設計の残りの指摘 (detached 以外) を r8・r9 で直し、r9 で ACCEPT WITH CHANGES (文言 1 件、反映済み)。r8・r9 でも合意は変わらないことを確かめた。
+- 実装の段 2a (2026-11-25、cd48a44fc・f106e2e3f、ブランチ script-363-impl): 利用資格の関数は `src/app/operation_script_runtime.rs` の `eligibility_from_facts` (125 行) と `operation_script_eligibility` (307 行)。上の既存の述語を読むだけで、一覧の面は表示先を見ない。描画の前と中の区別は呼び出しの引数と戻り値だけで運び、App の pending や bundle の項目を足していない。
+  - 段 2a のレビューの P3 (`GridOpenSelected` が開けなかった場合も成功を返す) の修正で、一覧から開く処理の「受け付けたか」を返すために、別ウィンドウへ開く経路の関数にも戻り値を足した。`src/app.rs` の `prepare_detached_context_for_grid_open(_with_admission)` (73038・73050 行)・`activate_existing_detached_viewer_for_grid_open(_with_admission)` (72931・72941 行)・`raise_active_detached_media_for_grid_open(_with_admission)` (72850・72860 行)・`open_grid_item_in_detached_book_context(_classified)(_with_admission)` (69687〜69765 行)・`execute_detached_grid_item_open_plan(_with_admission)` (69799・69810 行)・`open_bookmark_browser_row_with_admission` の別ウィンドウの読み込みの開始 (55246 行〜、`start_detached_bookmark_loading_context` の呼び出し 55359・55452 行)。呼び出し元は `src/app.rs` 2804・74019 行、`src/app/archive_inner_book.rs` 222 行、`src/filename_stack_ui.rs` 2227 行。既存の関数は同じ名前の bool を返す形で残し、`_with_admission` が受付の結果を足して返す。判定の順序 (Remote の拒否 → 既存の別ウィンドウの前面化 → 退避して新しく開く)・早期 return・副作用・非同期の開始の条件は変えていない。
+  - 合意: 段 2a の実装の独立レビュー (GPT-6 Astra / medium、read-only、新しい会話) で、初回 (cd48a44fc) は「既存のcontext・現在の表示先・遷移先・入力面でメイン専用の所有範囲を定義する、症状パッチではない構造的な決定」と合意 (判定は別の指摘で REVISE)。修正後の再確認 (f106e2e3f、同じ会話の続き) で、レビュー担当の言葉:「変更範囲は受付結果の伝搬まで広がりましたが、寿命・placement・contextの取り付け・bundleの所有境界を変えず、既存の判断結果を明示する構造的修正です。症状パッチではありません。」判定 ACCEPT WITH CHANGES (この記録の追補だけ)。設計担当 ClaudeCode も、既存の判断の結果を戻り値で明示するだけの構造的な修正であることに同意する。
+- 実装の段 2b (2026-11-25、38d42f4c9〜e4447cd07): 全画面の描画の中の入口 (通常・転送のキー処理、secondary 入力のジェスチャー・リング、右ドラッグ、中ボタン、全画面の右クリックメニュー) は、別ウィンドウの context を取り付けている間も走る経路。これらはスクリプトの要求をその場で実行せず、描画の所有 pass (`render_fs_body`) のローカル変数へ返し、末尾の 1 か所で段 2a の利用資格の関数を通して実行する。別ウィンドウの述語・viewport の生成・窓の寿命・context の取り付け・bundle は変えていない。App の pending や bundle の項目は足していない。
+  - 合意: 段 2b の実装の独立レビュー (GPT-6 Astra / medium、read-only、新しい会話、対象 e4447cd07、判定 ACCEPT) で、レビュー担当の言葉:「既存の context・表示先・遷移の述語によってメイン専用の利用範囲を定義する構造的な決定であり、症状パッチではありません。今回の差分は detached の述語、viewport、窓の寿命、context の取り付け、bundle の所有境界を変更していません。」設計担当 ClaudeCode も、要求を描画の所有者へ返して既存の判定で実行するだけの構造的な修正であることに同意する。
+- 実装の段 3 (2026-11-25、adc256441〜13558102f): native 動画のリング・ジェスチャーの、既存の別ウィンドウの命令へ委ねる経路 (`queue_recognized_detached_right_drag_command` 等) は変えず、`ScriptSlot*` に解決された要求は共通の利用資格の関数で拒否される。native 動画の入口 (キー・Browser キー・XButton・中ボタン・リング) と egui の動画・音楽の表示は、同じ利用資格を通してから実行する。別ウィンドウの述語・viewport・窓の寿命・context の取り付け・bundle は変えていない。App の pending や bundle の項目は足していない。
+  - 合意: 段 3 の実装の独立レビュー (GPT-6 Astra / medium、read-only、新しい会話、対象 13558102f、判定 ACCEPT WITH CHANGES、指摘は設計書の文書の P3 だけ) で、レビュー担当の言葉:「今回の触れ方は、既存の context・表示先・遷移の事実でメイン専用の利用範囲を定める構造的な決定であり、症状パッチではありません。detached の述語、viewport、窓の寿命、context の取り付け、bundle の所有境界は変更していません。」設計担当 ClaudeCode も同意する。
+- 実装の段 4 (2026-11-25〜26、c7627e6fc〜47fdcb264): イベントの検出はメインの context だけで行う。基準・覚えておく本の構成の `Arc`・フレームの番号 (ROOT の `cumulative_frame_nr_for`)・時刻は App 側に置き、bundle に入れない。取り付け中の別の context からの検出は、基準を更新する前に共通の利用資格で拒否する。別ウィンドウの述語・viewport・窓の寿命・context の取り付け・bundle は変えていない。
+  - 合意: 段 4 の実装の独立レビュー (GPT-6 Astra / medium、read-only、1 回目は新しい会話・対象 cf856ebba、3 回目の 47fdcb264 で ACCEPT) で、レビュー担当の言葉 (1 回目):「既存の context・表示先・遷移の述語でメイン専用の所有範囲を定める構造的な決定であり、症状パッチではありません。」3 回目も「既存の所有境界に沿う構造的な決定であり、症状パッチではありません。今回もdetachedの述語・viewport・窓の寿命・contextの取り付け・bundleは変更されていません。」設計担当 ClaudeCode も同意する。
+- 実装の段 5 (2026-11-26、4d8bfbf93〜9e46c1127): 環境設定のページ・設定の確定との接続・状態の写し・App が持つ loader の中のファイルの worker (読み込み・開く・既定に戻すを 1 本の FIFO)。別ウィンドウの述語・viewport・窓の寿命・context の取り付け・bundle には触れていない。読み込みの状態は段 1 から App が持ち bundle に入れていない (変わらない)。
+  - 合意: 段 5 の実装の独立レビュー (GPT-6 Astra / medium、read-only、新しい会話、2 回目の 9e46c1127 で ACCEPT) で、レビュー担当の言葉 (1 回目):「段5はApp所有のloader内でファイル要求を直列化し、環境設定から接続する変更です。別ウィンドウの述語・viewport・寿命・context取り付け・bundleを変更せず、段1〜4の利用資格も維持しています。症状を隠す追加条件ではなく、既存の所有境界を保つ構造的な決定です。」設計担当 ClaudeCode も同意する。
+- 段 4 (イベント) の実装の後に独立レビューを受け、結果をここに足す。
+
+### 2026-11-26: 3D 写真・スライドショーのキーの受付条件を判定の関数にし、操作のスクリプトと共用する (§1.363 の v5.9.0 の追加)
+
+- 正本は [操作のスクリプトの設計](operation-script-plan.md) §17.2。`FsDepthParallax`・`FsSlideshow` をスクリプトの許可リスト (種別 A、イベント不可) に足すため、
+  `ui_fullscreen.rs` のキーの受付の条件を純粋な判定の関数 (`fullscreen_depth_input_allowed`・`fullscreen_slideshow_input_allowed`・`fullscreen_slideshow_view_allowed`) にした。
+  キーは consume・条件の評価・実行の位置を 1 つも動かさず、式を関数の呼び出しに置き換えただけ。スクリプトは共用の入口 (`apply_fullscreen_shared_key_action`) で同じ判定を評価し、
+  同じ本体 (`toggle_depth_parallax`・`toggle_fullscreen_slideshow`) を呼ぶ。スクリプトの実行は今までどおりメインの context だけ。
+- detached の述語・viewport の選択と配送・窓の寿命・context の取り付け・bundle は変えていない。guard・delay・retry・一括 reset・silent fallback は足していない。
+  同じ判定は別ウィンドウの viewer のキーからも、その viewer の値で評価される (今と同じ)。
+- 合意 (設計の段階): 設計担当 ClaudeCode と独立設計レビュー (GPT-6 Astra / medium) は、条件の評価の時点を保つ形なら症状パッチではなく構造的修正であることに合意。
+  レビュー担当の言葉:「§17.2 は、上記2の条件評価時点も保存する形なら、既存の context 所有を維持した実行入口の共用化であり、症状パッチではなく構造的な修正であることに明示的に同意します。」
+- 合意 (実装): 独立実装レビュー (GPT-6 Astra / medium、対象 `521accf85..9e71c99f1`) で ACCEPT。レビュー担当の言葉:「主張に明示的に同意します。
+  §11 の2026-11-26記録と実装は一致しています。前半は評価時点と context 所有を維持した構造的な共用化であり、症状パッチではありません。後半も App の
+  loader と agent 受付に閉じ、detached の述語・viewport・寿命・context 取り付け・bundle を変更していません。」
+- 同じ追加の MCP tool `operation_script` (§17.5) は App の loader と agent の受付だけで、detached に触れない (同じレビューで同意)。
 
 ### 2026-11-23: ブラウザ閲覧の保存先のフォルダはページ構成の既定を単ページにする (§1.870、設計の段階。実装はこれから)
 
@@ -8300,3 +8390,35 @@ fork 先は空、元 context は cache と proof を保持する。detached の�
 - 変更の内容: 左右のキー・画面の左右半分のクリック・タップ・パッド・割り当てた見開きずらし・ヘルプの行が、左右の前後をページ構成 (`SpreadMode`) だけで決めていたため、1 ページ表示では <kbd>7</kbd> で右→左にしても右が次だった (左右キーは既定のカーソル設定のとき。「シークバー方向に合わせる」では左右キーだけ従来から読み方向に従っていた)。判定を `App::input_advances_right_to_left` の 1 つにまとめた (ページ構成が向きを持てばその向き、持たなければ viewer の読み方向)。紙めくりの束の判定 (`page_turn_reading_rtl`) と `SpreadMode::advances_right_to_left` はこれに統合した。Remote の Web 画面の同じ判定も揃えた。
 - detached に触れる範囲: 別ウィンドウの述語・viewport の選択と配送・窓の寿命・placement・HWND の処理は変えない。判定が読むのは、そのとき載っている viewer context の `spread_mode` と `reading_direction` だけで、どちらも context ごとの束に入っている (別ウィンドウは自分の値を読む。`input_reading_direction_uses_only_the_mounted_viewer_context` で確認)。guard・delay・retry・一括 reset・silent fallback は足していない。
 - 合意: 設計担当 ClaudeCode と独立実装レビュー (実装者とは別の GPT-6.1 Sol / xhigh、1 回目) は、これが症状パッチではなく構造的修正であることに合意。レビュー担当の言葉:「Both direction fields belong to the mounted viewer bundle, so detached/F12 contexts read their own values. I agree this is a structural fix, not a symptom patch.」 2 回目 (Remote の Web 画面を含めた全体、`b65066753`) で ACCEPT、合意は変わらない。レビュー担当の言葉:「I agree that the whole desktop + Remote change is a structural fix, not a symptom patch, under the detached freeze rules.」
+
+### 2026-11-26: フォルダ手動順の一覧所有状態（§1.911 段 2）
+
+- 正本は [フォルダ手動順](folder-manual-order-plan.md) §4.2〜§4.3 と段 2 の指示。
+  手動順の記録・inventory・mode・order_revision は items と同じ viewer context が所有し、
+  `ViewerContextBundle` の capture / swap / fork で items と一緒に移す。process 所有の DB actor は bundle に複製しない。
+  ★固定の saved items と direct-media fork の元一覧の復元にも同じ手動状態を対で持たせ、復元先の revision は巻き戻さない。
+- これは一覧データの所有境界を揃える構造的変更で、窓の種類から状態を推測する症状パッチではない。
+  detached の述語・viewport 配送・HWND 捕捉・placement・窓の寿命へ新しい分岐や保存先を加えない。
+  読み取りや別 context の close で兄弟の手動記録を更新・無効化せず、fork は記録の写しを保持する。
+- 本項は設計担当から指定された実装範囲と実装上の判断理由の記録。独立実装レビューの受領・検収を表さない。
+  コンパイル・テスト実行は利用者指定により行わず、設計担当の共有 runner へ引き継ぐ。
+- 2026-11-27 の関連テスト失敗対応で、固定内の通常物理 child を解除するときの surface 退役も成功採用へ揃えた。
+  `take_return_origin` による早期の Folder 化を避け、worker の Read 待機中は旧 items と Snapshot surface・戻り先の所有を保つ。
+  origin の復元と対象外 child の即時経路、detached の述語・viewport 配送・窓の寿命は変更しない。
+- 2026-11-27 の App サイズ検査への対応で、手動状態を App / ViewerContextBundle / SnapshotState の
+  すべてで Box に揃えた。swap は Box の移動、fork は Box の clone による独立した状態の複製で、
+  同じ items 所有境界を維持する。inline payload の配置だけを変える構造上の修正で、
+  detached の述語・viewport 配送・窓の寿命は変更しない。
+
+### 2026-11-27: 並び順の再採用中に描く代役（§1.911 段 6）
+
+- 正本は [フォルダ手動順](folder-manual-order-plan.md) §13.2〜13.4。
+  表示専用の `thumbnail_standins` を thumbnails と同じ context の Box owner として追加し、
+  `ViewerContextBundle` の empty / swap / fork / generation 更新へ接続した。fork は独立した集合の clone、
+  同世代の texture handle だけは既存 thumbnails と同じく共有する。終了時は owner の drop で解放する。
+- 代役は表示専用で context をまたがない構造的な追加であり、症状パッチではない。
+  旧一覧の保持済み画像を次の同一物理一覧へ対応づける責任を items 世代の所有者へ置き、
+  兄弟 context の画像・要求・世代を変更しない。既存の別 context の明示 eviction にも、その context の代役破棄を対で足した。
+  detached 述語・viewport 配送・HWND 捕捉・placement・窓の寿命には分岐を追加しない。
+- 本項は指定された変更範囲と実装上の判断理由の記録であり、独立実装レビューの受領・検収を表さない。
+  コンパイル・テスト実行は利用者指定により行わず、設計担当の runner へ引き継ぐ。

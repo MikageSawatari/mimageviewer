@@ -722,7 +722,7 @@ struct FavoriteWriteArgs {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StackScriptArgs {
+struct ScriptArgs {
     source: Option<String>,
     part: Option<u32>,
     expected_sha256: Option<String>,
@@ -948,16 +948,29 @@ fn parse_tool(params: &Value) -> Result<(&'static str, Command), &'static str> {
                 },
             )
         }
-        Some("stack_script") => {
-            let a: StackScriptArgs = serde_json::from_value(args).map_err(bad)?;
+        Some(name @ ("stack_script" | "operation_script")) => {
+            let a: ScriptArgs = serde_json::from_value(args).map_err(bad)?;
             if a.part == Some(0) {
-                return Err("Specify a stack script part starting at 1");
+                return Err(if name == "operation_script" {
+                    "Specify an operation script part starting at 1"
+                } else {
+                    "Specify a stack script part starting at 1"
+                });
             }
+            let max_bytes = if name == "operation_script" {
+                MAX_OPERATION_SCRIPT_SOURCE_BYTES
+            } else {
+                MAX_STACK_SCRIPT_SOURCE_BYTES
+            };
             if a.source
                 .as_ref()
-                .is_some_and(|source| source.len() > MAX_STACK_SCRIPT_SOURCE_BYTES)
+                .is_some_and(|source| source.len() > max_bytes)
             {
-                return Err("Stack script must be at most 256 KiB UTF-8");
+                return Err(if name == "operation_script" {
+                    "Operation script must be at most 256 KiB UTF-8"
+                } else {
+                    "Stack script must be at most 256 KiB UTF-8"
+                });
             }
             if a.expected_sha256.as_ref().is_some_and(|hash| {
                 hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -969,14 +982,25 @@ fn parse_tool(params: &Value) -> Result<(&'static str, Command), &'static str> {
             {
                 return Err("Read first; writes and parts after 1 require expected_sha256");
             }
-            (
-                "stack_script",
-                Command::StackScript {
-                    source: a.source,
-                    part: a.part,
-                    expected_sha256: a.expected_sha256,
-                },
-            )
+            if name == "operation_script" {
+                (
+                    "operation_script",
+                    Command::OperationScript {
+                        source: a.source,
+                        part: a.part,
+                        expected_sha256: a.expected_sha256,
+                    },
+                )
+            } else {
+                (
+                    "stack_script",
+                    Command::StackScript {
+                        source: a.source,
+                        part: a.part,
+                        expected_sha256: a.expected_sha256,
+                    },
+                )
+            }
         }
         Some("open_in_viewer") => {
             let a: OpenArgs = serde_json::from_value(args).map_err(bad)?;
@@ -1283,6 +1307,7 @@ fn tool_result_with_side(
             | ("set_settings", Ok(Payload::SettingsWrite(_)))
             | ("set_favorite", Ok(Payload::FavoriteWrite(_)))
             | ("stack_script", Ok(Payload::StackScript(_)))
+            | ("operation_script", Ok(Payload::OperationScript(_)))
             | (
                 "search_items" | "items_by_tag" | "get_collection",
                 Ok(Payload::Items(_))
@@ -1329,6 +1354,7 @@ fn tool_result_with_side(
                 Payload::SettingsWrite(v) => json!(v),
                 Payload::FavoriteWrite(v) => json!(v),
                 Payload::StackScript(v) => json!(v),
+                Payload::OperationScript(v) => json!(v),
                 Payload::Items(v) => json!(v),
                 Payload::Tags(v) => json!(v),
                 Payload::Collections(v) => json!(v),

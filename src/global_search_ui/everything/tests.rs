@@ -168,7 +168,7 @@ fn section1431_drive_list_search_initializes_thumbnail_owner_and_restores_icons(
     ]);
     #[cfg(windows)]
     let sibling = app.build_window_context_for_test(1431, |mounted| {
-        mounted.load_folder(root.clone());
+        mounted.load_folder_and_finish_for_test(root.clone());
         mounted.finish_page_identity_preparation_for_test();
     });
     #[cfg(windows)]
@@ -1034,7 +1034,7 @@ fn folder_activation_parent_chain_gamepad_return_research_and_close_keep_one_own
     std::fs::create_dir(&origin).unwrap();
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(origin.join("original.jpg"), b"image").unwrap();
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     app.finish_page_identity_preparation_for_test();
     let row = GridItem::Folder(folder.clone());
     let result = dataset(vec![
@@ -1045,6 +1045,7 @@ fn folder_activation_parent_chain_gamepad_return_research_and_close_keep_one_own
     let index = app.items.iter().position(|item| item == &row).unwrap();
     let nav = app.grid_physical_navigation(index, folder.clone(), false);
     assert!(app.apply_fullscreen_close_nav_immediate(nav));
+    app.finish_direct_navigation_scan_for_test();
     app.finish_page_identity_preparation_for_test();
     assert!(
         app.everything_has_physical_child(),
@@ -1056,9 +1057,10 @@ fn folder_activation_parent_chain_gamepad_return_research_and_close_keep_one_own
         position: EverythingPosition::PhysicalChild { logical_source, return_anchor, .. }, ..
     } if logical_source == &folder && return_anchor == &folder)
     );
-    app.load_folder(sub.clone());
+    app.load_folder_and_finish_for_test(sub.clone());
     app.finish_page_identity_preparation_for_test();
     assert!(app.handle_grid_parent_folder_action().is_none());
+    app.finish_direct_navigation_scan_for_test();
     app.finish_page_identity_preparation_for_test();
     assert_eq!(app.current_folder.as_ref(), Some(&folder));
     assert_eq!(app.items[app.selected.unwrap()], GridItem::Folder(sub));
@@ -1229,7 +1231,7 @@ fn cold_folder_video_pin_seed_cascades_and_retargets_thumbnail_owner_on_return()
         .insert("png".into());
     let origin = app.tmp.path().join("origin");
     std::fs::create_dir(&origin).unwrap();
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     app.finish_page_identity_preparation_for_test();
     let origin_catalog = Arc::clone(app.current_color_catalog.as_ref().unwrap());
     let origin_cache = Arc::clone(app.current_color_cache_map.as_ref().unwrap());
@@ -1280,7 +1282,7 @@ fn cold_folder_video_pin_seed_cascades_and_retargets_thumbnail_owner_on_return()
     assert!(app.accept_everything_physical_child(&folder, &EverythingChildAdmission::Descend));
     // A physical child owns a different pool. Returning must prepare a fresh search
     // owner and seed it, without publishing search keys into the child's resources.
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     app.finish_page_identity_preparation_for_test();
     let child_cache = Arc::clone(app.current_color_cache_map.as_ref().unwrap());
     let child_catalog = Arc::clone(app.current_color_catalog.as_ref().unwrap());
@@ -1364,7 +1366,7 @@ fn section1741_search_from_folder_replaces_pool_once_for_both_producers() {
         let ctx = egui::Context::default();
         let origin = app.tmp.path().join("origin");
         std::fs::create_dir(&origin).unwrap();
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         app.finish_page_identity_preparation_for_test();
         let old_cancel = Arc::clone(&app.cancel_token);
         let old_queue = Arc::clone(app.reload_queue.as_ref().unwrap());
@@ -1434,7 +1436,7 @@ fn section1741_prepare_owner_replaced_before_ready_retries_with_current_search_p
         let origin = app.tmp.path().join("origin");
         std::fs::create_dir(&origin).unwrap();
         if had_pool {
-            app.load_folder(origin);
+            app.load_folder_and_finish_for_test(origin);
             app.finish_page_identity_preparation_for_test();
         } else {
             app.enter_drive_list(None);

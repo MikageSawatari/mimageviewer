@@ -383,6 +383,42 @@ fn point() -> POINTL {
 }
 
 #[test]
+fn page_edit_920_native_drop_refusal_notifies_once_without_drop_or_path_reads() {
+    let fixture = fixture(None, false);
+    let reason = crate::filename_stack_ui::DETACHED_VIEWER_EDITING_GRID_NOTICE.to_owned();
+    *fixture.hit.borrow_mut() = Some(Hit::GridInputBlocked(reason.clone()));
+    let mut output = DROPEFFECT_COPY;
+    unsafe {
+        fixture
+            .target
+            .DragEnter(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+    }
+    .unwrap();
+    assert_eq!(output, DROPEFFECT_NONE);
+    for _ in 0..3 {
+        unsafe {
+            fixture
+                .target
+                .DragOver(MODIFIERKEYS_FLAGS(0), point(), &mut output)
+        }
+        .unwrap();
+        assert_eq!(output, DROPEFFECT_NONE);
+    }
+    assert!(matches!(fixture.shared.borrow().drops.as_slice(),
+        [DropRequest::GridInputBlocked(message)] if message == &reason));
+    assert_eq!(fixture.observed.reads.get(), 0);
+    unsafe {
+        fixture
+            .target
+            .Drop(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+    }
+    .unwrap();
+    assert_eq!(output, DROPEFFECT_NONE);
+    assert_eq!(fixture.shared.borrow().drops.len(), 1);
+    assert_eq!(fixture.observed.reads.get(), 0);
+}
+
+#[test]
 fn main_drop_nodrop_rejected_hits_write_none_on_enter_over_and_drop() {
     let source = InternalDrag {
         paths: vec![r"C:\src\a".into()],
@@ -517,7 +553,7 @@ fn main_drop_com_external_shift_drop_returns_copy_and_only_writes_drop_descripti
     .unwrap();
     assert_eq!(effect, DROPEFFECT_COPY);
     let mut shared = fixture.shared.borrow_mut();
-    let DropRequest::FolderTransfer(request) = shared.drops.pop().unwrap() else {
+    let DropRequest::FolderTransfer(request, _) = shared.drops.pop().unwrap() else {
         panic!("tree transfer expected")
     };
     assert_eq!(request.operation, ShellTransferOperation::Copy);
@@ -587,7 +623,7 @@ fn main_drop_com_internal_keeps_full_payload_and_rejects_grid_and_partial_source
     assert_eq!(fixture.observed.queries.get(), 0);
     assert_eq!(fixture.observed.reads.get(), 0);
     let request = fixture.shared.borrow_mut().drops.pop().unwrap();
-    let DropRequest::FolderTransfer(request) = request else {
+    let DropRequest::FolderTransfer(request, _) = request else {
         panic!("tree request expected")
     };
     assert_eq!(request.sources, paths);
@@ -831,7 +867,7 @@ fn hover_860_drop_clears_hover_and_preserves_request_wake() {
         match hit {
             Some(Hit::Folder { .. }) => assert!(matches!(
                 shared.drops.as_slice(),
-                [DropRequest::FolderTransfer(_)]
+                [DropRequest::FolderTransfer(_, _)]
             )),
             Some(Hit::ExistingDropArea) => assert!(matches!(
                 shared.drops.as_slice(),

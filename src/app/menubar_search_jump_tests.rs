@@ -105,7 +105,7 @@ fn search_failure(entrance: Entrance) {
 }
 
 #[test]
-fn menubar_plain_books_root_opens_during_render_without_deferred_candidate() {
+fn menubar_plain_books_root_starts_during_render_and_adopts_without_deferred_candidate() {
     let mut app = setup_app_for_test();
     let origin = app.tmp.path().join("plain-origin");
     let target = app.tmp.path().join("plain-books-root");
@@ -115,10 +115,12 @@ fn menubar_plain_books_root_opens_during_render_without_deferred_candidate() {
         .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
     configure_destination(&mut app, Entrance::BooksRoot, &target);
     let app = Rc::new(RefCell::new(app));
-    // click_menu never invokes a navigation dispatcher. Any change here must
-    // therefore come from the released immediate open_books_root menu handler.
+    // click_menu never invokes a navigation dispatcher. The menu handler starts
+    // its request during rendering, while §1.853 defers the scan and adoption.
     assert!(click_menu(&app, Entrance::BooksRoot).is_none());
-    let app = app.borrow();
+    let mut app = app.borrow_mut();
+    assert!(app.direct_navigation_scan_pending());
+    settle_menu_navigation(&mut app, Some(&target));
     assert_eq!(app.current_folder.as_ref(), Some(&target));
     assert!(target.is_dir());
     assert!(app.folder_pane_open_pending.is_none());
@@ -148,7 +150,7 @@ fn menubar_plain_favorite_uses_existing_direct_navigation_and_history() {
         .expect("plain favorite must start a DirectNavigation scan");
     assert!(matches!(
         pending.purpose,
-        FolderOpenScanPurpose::DirectNavigation
+        FolderOpenScanPurpose::DirectNavigation(_)
     ));
     assert_eq!(pending.path, target);
     settle_menu_navigation(&mut app, Some(&target));

@@ -120,7 +120,7 @@
       本アプリは利用者の PC 上で動作するデスクトップアプリケーションです。
       <strong>開発者が利用者の個人情報を収集・送信・販売することはありません。</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月26日</p>
+    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月27日</p>
   </section>
 
   <section>
@@ -176,6 +176,7 @@
       <li>検索欄の入力履歴（既定で保存がオン）。コンテナ検索・現在地の絞り込み・アイテム検索・Everything 検索の種類ごとに、最近の検索語を 20 件まで設定と同じ <code>settings.db</code> に保存します。検索を確定したときと、実行済みの語のまま入力欄から通常に離れたときに記録します。環境設定の「ライブラリ → 履歴と復元 → 検索欄の入力履歴」でオフ・全件消去ができます。オフで「OK」を押すと現在の入力履歴も消去しますが、どちらの消去でも設定の自動バックアップにはしばらく残ります。履歴の内容を診断ログ・リモート閲覧・AI 連携には渡しません。リモート閲覧や AI 連携からの検索は、この入力履歴に記録しません</li>
       <li>AI 連携の許可の範囲、縮小画像・撮影位置・AI 説明文・文字起こし・今開いている場所を AI に見せるか、設定の確認と変更を AI に任せるかの設定</li>
       <li>キー・リング・マウスボタン・ジェスチャーなどの操作カスタマイズの割り当て。AI に変更を許可した場合も、既存の設定と同じ場所に保存します</li>
+      <li>操作の組み合わせを記したスクリプト（データフォルダ内の <code>operation_scripts.rhai</code>）。AI に変更を許可した場合も、このファイルに保存します。実行の有効・無効と初回説明の確認記録は設定に保存し、利用者だけが変更できます。スクリプト自身は通信できません</li>
       <li>スタック表示の分け方を変更するカスタムスクリプト（データフォルダ内の <code>stack_rules.rhai</code>）。AI に変更を許可した場合も、このファイルに保存します</li>
       <li>本ごとの見開き1ページずらしの調整（記憶をOFFにしても保存済み調整は保持し、明示的に解除できます。メタ情報の移行で持ち運べます）</li>
       <li>音響調整 (mIV Sound) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像。Headphone EQ でダウンロードまたは読み込んだ測定カーブとターゲットカーブは、エフェクトの保存済み状態やプリセットに含まれます</li>
@@ -185,6 +186,7 @@
       <li>タグ・レーティング・回転情報・読み込み履歴</li>
       <li>フォルダや本の代表サムネイルに固定した画像と、手動で指定した表紙の範囲</li>
       <li>製本したページ画像と本棚の本の並び順（並び順は本棚ルートの <code>mimageviewer.book-order.json</code> に保存）</li>
+      <li>フォルダごとの手動の並び順と、対象のフォルダ・ファイルの保存場所（<code>folder_order.db</code>）。順番は mIV のデータフォルダに保存し、閲覧するフォルダには書き込みません</li>
 
       <li>画像や本の表紙について作成・取り込み済みの AI 説明文、画像内の文字の書き写し、検索語（<code>ai_caption.db</code>）。写っている氏名や連絡先なども含むことがあります。アイテム索引を有効にしたお気に入りでは、画像・PDF・EPUB と説明文がある書庫・フォルダの本の保存済み説明文を、PC 内の全文索引にも保存します。メタ情報の移行で書き出した分は、対象フォルダにも保存されます。保存済みの説明文は、一覧の右クリックの「AI 説明文を削除」で消せます</li>
       <li>追加取得した AI 説明文のモデル（<code>addons\vlm\</code>）と、通常版で利用時に展開する実行用ファイル（<code>vlm\workers\</code>）。モデルを削除しても保存済みの説明文は残ります</li>
@@ -288,7 +290,7 @@
       AI からの検索語や読み取り結果は、mImageViewer の履歴・診断ログへ保存しません。
       AI にタグや★の変更を許可した場合は、通常の操作と共通の動作記録に、変更したファイルの場所やタグ名などが残ります。
       AI による設定の変更では、変えた項目と変更前後の値（場所・外部ツールの実行ファイルと引数を含む）、お気に入りへの登録では場所も通常のログに残ります。
-      スタック用スクリプトの変更は、通知・「AI による変更」・通常のログに変更前後の行数だけを残し、本文は記録しません。
+      スタック用・操作スクリプトの変更は、通知・「AI による変更」・通常のログに変更前後の行数だけを残し、本文は記録しません。
       「AI による変更」と「最近使った AI アプリ」の表示用の記録はメモリ内に持ち、本アプリを終了すると消えます。
       変更済みのタグ・★・コレクション・設定・お気に入りや、通常の動作記録はこの表示用の記録とは別に保存されます。
     </div>
@@ -342,9 +344,10 @@
         文字起こしを許可すると、動画・音声の文字起こしの本文を時刻つきで、ファイルの情報としてその作成日などの状態も AI アプリへ渡します。話された氏名や私的な会話もそのまま含むことがあります。許可しない場合は渡しません。
         GPS 欄を無効にしても、ファイル名やプロンプトなどの文章に書かれた場所の情報を取り除くものではありません。
         「今開いている場所を AI に見せる」を有効にすると、開いている場所と表示中の項目の場所を渡します。
-        「設定の確認と変更を AI に任せる」（既定ではオフ）を有効にすると、環境設定の項目と値（起動時のフォルダや保存先などの場所、外部ツールの実行ファイルと引数を含む）に加え、操作カスタマイズの割り当てとスタック用スクリプトの本文を渡します。本文も AI アプリの提供元へ送られます。
-        AI アプリからの指示で環境設定やキー・リング・マウスボタン・ジェスチャーの割り当ての変更、外部ツールの登録・変更・削除、スタック用スクリプトの書き換え、お気に入りへの登録と索引の切り替えを確認なしで行います。
-        スタック用スクリプトのオン・オフも変えられます。外部ツールの起動はこの連携では行いません。
+        「設定の確認と変更を AI に任せる」（既定ではオフ）を有効にすると、環境設定の項目と値（起動時のフォルダや保存先などの場所、外部ツールの実行ファイルと引数を含む）に加え、操作カスタマイズの割り当てとスタック用・操作スクリプトの本文を渡します。本文も AI アプリの提供元へ送られます。
+        AI アプリからの指示で環境設定やキー・リング・マウスボタン・ジェスチャーの割り当ての変更、外部ツールの登録・変更・削除、スタック用・操作スクリプトの書き換え、お気に入りへの登録と索引の切り替えを確認なしで行います。
+        スタック用スクリプトのオン・オフも変えられます。操作スクリプトの有効化と初回説明の確認は利用者だけが行い、AI は変更できません。
+        操作スクリプトが有効なら AI が書いた内容を自動で反映するため、自動で行う表示操作や 1 回の入力で行う操作の組み合わせも変わります。無効なら保存だけを行います。外部ツールの起動はこの連携では行いません。
         AI 連携の許可の状態は渡しますが、AI からは変えられません。保存した PDF のパスワードとリモート接続の暗証番号は渡しません。
         AI が更新の確認をオンにすると、起動時とその後 24 時間ごとに GitHub へ新しい版を問い合わせます。
         リモート端末への動画配信をオンにすると、リモート閲覧が有効な場合に端末から求められた動画を配信します。リモート接続そのものの有効化は AI からはできません。
@@ -504,8 +507,10 @@
     <p>The App stores the following data on your PC. When you enable remote viewing, playback progress and related information travel from your device to your PC. They are not sent to the developer's server. Encrypted traffic may pass through a Tailscale relay server when you connect from outside your home.</p>
     <ul class="pink-list">
       <li>Application settings and view state, video and audio playback positions, and the audio track selected for each file</li>
+      <li>Per-folder manual ordering and the paths of the folders and files it refers to (<code>folder_order.db</code>). The order is saved in the App's data folder, not in the folders being viewed</li>
       <li>Search input history, enabled by default: up to 20 recent queries for each of container search, current-location filtering, item search, and Everything search, saved with settings in <code>settings.db</code>. Queries are recorded when you submit a search, or when you normally leave an input field whose current query has already been run. You can disable or clear this history in Preferences → Library → History and Restore → Search Input History. Turning saving off and selecting OK also clears the current history. After either clearing operation, earlier history may remain in automatic settings backups for a while. History contents are not passed to diagnostic logs, remote viewing, or AI integration. Searches made through remote viewing or AI integration are not recorded in this history</li>
       <li>The permission level for AI integration; settings for showing reduced images, shooting locations, AI captions, transcripts, and the current location to AI; and permission for AI to inspect and change settings</li>
+      <li>A script for combining viewer operations (<code>operation_scripts.rhai</code> in the data folder). Changes made with AI permission are saved to the same file. Whether scripts are enabled and whether the initial explanation was confirmed are saved in settings and can be changed only by the user. The script itself cannot communicate over a network</li>
       <li>A custom script for grouping images in stack view (<code>stack_rules.rhai</code> in the data folder). Changes made with AI permission are saved to the same file</li>
       <li>Per-book spread-pairing adjustments (saved adjustments remain when remembering is turned off and can be explicitly cleared or moved using metadata transfer)</li>
       <li>mIV Sound adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images. Measurement and target curves downloaded or loaded in Headphone EQ are included in the effect's saved state and presets</li>
@@ -594,7 +599,7 @@
       If you allow AI to change tags or ratings, the operation logs shared with normal user actions
       contain information such as the locations of changed files and tag names.
       AI settings changes also leave the changed settings and their old and new values (including paths and external-tool executables and arguments) in normal logs. Favorite registration also logs the location.
-      Stack script changes show only the old and new line counts in notifications, "AI changes", and normal logs; the script body is not recorded there.
+      Stack and operation script changes show only the old and new line counts in notifications, "AI changes", and normal logs; the script body is not recorded there.
       The display records for "AI changes" and "Recent AI apps" are held in memory and cleared when the App exits.
       Saved changes to tags, ratings, collections, settings, and favorites, and normal operation logs, are stored separately from these display records.
     </div>
@@ -651,9 +656,10 @@
         Allowing transcripts passes the text of video and audio transcripts with timestamps, and their status such as the creation date as part of file information. Spoken names and private conversations may be included as they are. Without this permission, transcripts are not passed.
         Turning off GPS fields does not remove location information written in text such as filenames or prompts.
         Enabling permission to show the current location shares the open location and the location of the item being viewed.
-        Enabling permission for AI to inspect and change settings (off by default) shares Preferences settings and values, including startup folders, output paths, and external-tool executables and arguments, as well as the stack script body. The body is also sent to the AI app's provider.
-        AI requests can then change Preferences, register, change or delete external tools, rewrite the stack script, register favorite folders, and switch their indexing on or off without confirmation.
-        AI can also switch the stack script option on or off. This integration does not launch external tools.
+        Enabling permission for AI to inspect and change settings (off by default) shares Preferences settings and values, including startup folders, output paths, and external-tool executables and arguments, operation customization assignments, and the bodies of stack and operation scripts. The script bodies are also sent to the AI app's provider.
+        AI requests can then change Preferences and key, ring, mouse-button, and gesture assignments, register, change or delete external tools, rewrite stack and operation scripts, register favorite folders, and switch their indexing on or off without confirmation.
+        AI can also switch the stack script option on or off. Only the user can enable operation scripts and confirm their initial explanation; AI cannot change these settings.
+        When operation scripts are enabled, AI-written changes are applied automatically and can change automatic display operations and the combination of operations performed by one input. When disabled, changes are saved without running them. This integration does not launch external tools.
         AI integration permission states are shared, but AI cannot change them. Saved PDF passwords and the remote connection PIN are not shared.
         If AI turns on update checks, the App queries GitHub for new versions at startup and every 24 hours thereafter.
         If AI turns on video streaming to remote devices, videos are streamed when requested by a device while remote viewing is enabled. AI cannot enable remote viewing itself.

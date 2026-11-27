@@ -793,7 +793,13 @@ impl GlowWinitRunning<'_> {
 
             let raw_input = raw_input.map(|mut raw_input| {
                 self.integration.pre_update();
-                raw_input.time = Some(self.integration.beginning.elapsed().as_secs_f64());
+                let input_now = web_time::Instant::now();
+                raw_input.time = Some(
+                    input_now
+                        .duration_since(self.integration.beginning)
+                        .as_secs_f64(),
+                );
+                raw_input.input_clock = Some(egui_winit::input_clock::at(input_now));
                 raw_input.viewports = glutin
                     .viewports
                     .iter()
@@ -2368,7 +2374,9 @@ impl ImmediateViewportBackend for NativeGlowImmediateBackend<'_> {
             .iter()
             .map(|(id, viewport)| (*id, viewport.info.clone()))
             .collect();
-        input.time = Some(self.beginning.elapsed().as_secs_f64());
+        let input_now = web_time::Instant::now();
+        input.time = Some(input_now.duration_since(self.beginning).as_secs_f64());
+        input.input_clock = Some(egui_winit::input_clock::at(input_now));
         Some((self.egui_ctx.clone(), input))
         // All native borrows end before the shared driver calls user UI.
     }

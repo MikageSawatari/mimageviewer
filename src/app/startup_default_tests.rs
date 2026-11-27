@@ -152,7 +152,7 @@ fn startup_default_same_folder_keeps_existing_history_without_an_extra_departure
     let mut app = fixture();
     let target = folder(&app, "same-default");
     std::fs::create_dir(target.join("child")).unwrap();
-    app.load_folder(target.clone());
+    app.load_folder_and_finish_for_test(target.clone());
     settle(&mut app);
     let before = app.folder_nav_history_snapshot();
     specific(&mut app, &target);
@@ -463,7 +463,7 @@ fn startup_default_remote_return_redispatches_asynchronously_without_empty_expli
 fn startup_default_remote_return_preserves_an_already_adopted_local_folder() {
     let mut app = fixture();
     let origin = folder(&app, "adopted");
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     settle(&mut app);
     let target = folder(&app, "interrupted-default");
     specific(&mut app, &target);
@@ -483,7 +483,7 @@ fn startup_default_late_tree_favorite_and_dfs_requests_retire_the_old_default() 
     for route in ["tree", "favorite", "dfs"] {
         let mut app = fixture();
         let origin = folder(&app, "origin");
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         settle(&mut app);
         let stale = folder(&app, "old-default");
         let next = folder(&app, "later-navigation");
@@ -529,7 +529,7 @@ fn startup_default_and_explicit_global_search_entry_retire_pending_main_open() {
         let mut app = fixture();
         let ctx = egui::Context::default();
         let origin = folder(&app, "search-origin");
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         settle(&mut app);
         let stale = folder(&app, "stale-startup-target");
         if explicit {

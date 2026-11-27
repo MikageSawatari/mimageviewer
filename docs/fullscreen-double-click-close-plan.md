@@ -643,7 +643,454 @@ guard・遅延・再試行・時間切れを足さない。ClaudeCode と Codex 
 - 995eeba7c の runner で新規 Depth 2 件の GPU group 登録漏れが判明したため、`.config/nextest.toml` の
   既存 gpu filter に完全名 2 件を追加した。group の並列数・timeout・retry は変えない。修正後の Rust 検証は未実行。
 
-## 16. 同じ pass の通常キャンバスのクリック回数 (§1.917 の境界試験)
+## 16. §1.919 調査: 高負荷時にダブルクリック終了を取りこぼす (入力の時刻が pass の時刻になる)
+
+- 状態: 原因の確定と設計 (2026-11-27、ブランチ dblclick-919、担当 ClaudeCode)。範囲は 16.9 の利用者の決定で一覧・ツリー・計装へ広げた。独立設計レビュー・実装は 16.14 に記録する。
+- 報告: [backlog §1.919](next-release-backlog.md) (5ch >>917「改善している時としていない時がある。処理が重い時かもしれない」)。
+  負荷との関係は報告者の推測。報告者の環境で何が UI を止めているかは分からず、確かめていない。
+
+### 16.1 原因 (コード)
+
+- egui-winit は、入力のまとまりを取り出す時点 (`take_egui_input`) の時刻を `RawInput.time` にする。
+  マウスの押す・離すに、実際に押した・離した時刻は付けない。
+- egui (`PointerState::begin_pass`) は、その pass の時刻で押した時刻 (`press_start_time`)、離しがクリックか
+  (`could_any_button_be_click`、押していた時間が `max_click_duration` 0.8 秒以下か)、回数 (`click_count`、前のクリックから
+  `max_double_click_delay` 以内か) を決める。閉じるモードの数え方 (§4.3) は egui の回数に従う。
+- eframe (vendor) は、winit がメッセージの列を空になるまで (または WM_PAINT を配るまで) 配った後の `about_to_wait` で
+  pass を走らせる。UI スレッドが pass の中で止まっている間に届いた入力は、止まりが終わった次の pass にまとめて入る。
+- その結果:
+  - (a) 1 回目のクリックを処理した後に重い pass が始まり、その間に 2 回目が届くと、2 回目は次の pass の時刻になる。
+    実際の間隔が 250ms でも egui には重い pass の長さ分の間隔に見え、回数が 1 に戻る。3 回目で閉じる (>>906 と同じ見え方)。
+  - (b) 押した後に 0.8 秒以上の重い pass が挟まると、実際は短い押下でも長押しに見え、その離しはクリックにならない。
+  - (c) 2 回のクリックが同じ重い pass の間に届くと、同じ pass に同じ時刻で入るので閉じる。
+- Windows のダブルクリック時間 (`GetDoubleClickTime`、起動時に取得して egui へ渡している。`src/double_click_time.rs`) を合わせても、この時刻のずれは残る。
+
+### 16.2 試験
+
+- handler-level (`src/ui_fullscreen/double_click_close_tests/stall_919_tests.rs`): 実際の全画面ハンドラ (`actual_merge`) を、
+  egui-winit と同じ「pass の開始時刻 = その pass の全入力の時刻」で駆動した。ダブルクリック時間は Windows 既定の 500ms。
+  4 件とも想定どおり (run-heavy の nextest、2026-11-27): 止まりのない対照は閉じる、(a) は閉じず 3 回目で閉じる、
+  (b) は離しがクリックにならず次のクリックが 1 回目になる、(c) は閉じる。今の挙動を固定する試験で、修正後も
+  「時刻の無い入力は今どおり」の確認として残す。
+- 実際の窓への配送 (`target/investigation/forum-919-real-window/`、git 管理外、出力は同所の `run-output.txt`): mIV と同じ
+  vendor の eframe / egui-winit / egui で窓を 1 つ作り、別スレッドから自分の窓へ PostMessageW で WM_MOUSEMOVE /
+  WM_LBUTTONDOWN / WM_LBUTTONUP を送った (利用者のマウス・他の窓には送らない)。UI スレッドを pass の中で止め、各 pass の
+  egui の時刻と回数、winit の msg hook で取った OS のメッセージ時刻 (MSG.time) を記録した (2026-11-27、メイン PC、ClaudeCode が実行)。
+
+  | 場面 | 実際 (MSG.time) | egui の判定 |
+  | --- | --- | --- |
+  | 対照 (止まりなし) | 離しの間隔 250ms | 1 → 2 (閉じる) |
+  | (a) 1 回目の後に 700ms 止まる | 2 回目は 1 回目の離しから 254ms、配送まで 453ms 待った | 1 → 1 (取りこぼし) |
+  | (b) 押した後に 900ms 止まる | 押下 76ms、離しの配送まで 828ms 待った | 離しはクリックにならない |
+  | (c) 700ms の止まりの間に 2 回 | 離しの間隔 173ms、同じ pass で配送 | 1, 2 (閉じる) |
+  | (d) 毎 pass 150ms (途切れなく描き直す) | 離しの間隔 約 215ms、4 通りの位相 | 4 回とも 2 (この間隔では取りこぼさない) |
+
+  OS のメッセージ時刻は、配送が 400〜800ms 遅れても実際の間隔・押下の長さを保っていた。
+  制限: PostMessage のメッセージは本物のマウス入力とは取り出しの順位が違う (どちらも WM_PAINT より先なので、
+  pass との関係は同じと見ている)。本物のマウスでの確認はサブ PC で行う (16.8)。
+- 開発機の perf ログ (利用者の PC、2026-11-26〜27 の 4 ファイル): 全画面中の pass の App 更新が 200ms 以上だったのは
+  約 16 万 pass のうち 4 回 (最長 408ms)、500ms 以上は無し。この PC では稀。報告者の PC の値は分からない。
+
+### 16.3 守る性質
+
+- ダブルクリックの間隔と押下の長さは、利用者が実際に押した・離した時刻で判定する。UI スレッドの処理待ちを混ぜない。
+- 時刻の分からない入力 (テスト・合成した離し・タッチ・別スレッドからの合成) は、今と同じ pass の時刻で判定する。
+- クリックの判定 (時間・距離) は今と同じく egui の 1 か所に置き、mIV に 2 つ目のタイマーを作らない (§4.3、§14.3)。
+
+### 16.4 直し方 (推奨: OS の入力時刻を egui のクリック判定まで運ぶ)
+
+1. egui-winit (Windows): `WindowEvent::MouseInput` を受けたとき (winit の wndproc がそのメッセージを配っている最中)、
+   `GetMessageTime()` と `GetTickCount()` の差 (wrapping) から入力の古さを出し、`RawInput.time` と同じ基準
+   (`start_time.elapsed()` − 古さ) の時刻にする。古さが 0〜5 秒の外 (時計の取り違え等) なら時刻を付けない。
+   タッチから作る PointerButton と、位置の無い離し (`PointerButtonReleased`) には付けない。
+2. その時刻を、対応する `Event::PointerButton` の直前に置く新しいイベント (例 `Event::PointerButtonTime { button, pressed, time }`)
+   で egui へ渡す。`Event::PointerButton` に欄を足さない (src・tests に約 490 か所の構築があり、並行の作業と衝突する)。
+   `RawInput` に並行の配列を足す形も採らない (eframe の保留入力の連結や、イベントの取捨でずれる)。
+   直前イベントの形なら、連結しても隣り合ったまま残り、知らない処理は読み飛ばす。
+3. egui (`PointerState::begin_pass`): 直前に同じ button・pressed の時刻イベントがあれば、その PointerButton の時刻に使う
+   (それ以外のイベントを挟んだら捨てる)。時刻は「その pass の時刻以下」かつ「同じボタンの押した時刻以上」に丸める。
+   使う所: 押した時刻、押した時点の回数 (`press_click_count`)、離しがクリックかの判定 (**離しの時刻 − 押した時刻**で比べる。
+   今は pass の時刻 − 押した時刻)、`click_count`、`last_click_time`。押している間のドラッグ・長押しの判定、速度、ツールチップは
+   今のまま pass の時刻で測る (押した時刻が実際の時刻になるので、実際に押していた長さで測る形になる)。
+4. mIV 本体の閉じるモードの数え方は変えない (egui の回数に従っているため、egui 側が直れば直る)。
+5. 計装: 押す・離すの時刻と pass の時刻の差が 100ms 以上のとき、perf の event (例 `input`/`pointer_lag`、差・viewport・全画面か) を出す。
+   サブ PC の確認と、今後のログでの照合に使う。perf が無効なら何もしない。
+
+### 16.5 採らなかった案
+
+- ダブルクリック時間・長押しの上限を延ばす: 症状パッチ。(b) には効かず、止まりがそれより長ければ同じく取りこぼす。
+- UI 側の長い処理を減らすことを主な直し方にする: 報告者の環境で何が止めているか分からず、止まりを無くせる保証も無い。
+  個別の長い pass は perf の計装 (16.4 の 5 と既存の frame / hitches) で見つけ次第、別項目で扱う。
+- 入力のまとまりごとに pass の時刻を最初の入力の時刻へ戻す: アニメーション・速度など pass の時刻の全利用者へ波及し、
+  1 つの pass に時刻の違う入力が複数あると表せない。
+- mIV に OS 時刻で数える独自のダブルクリック判定を作る: 2 つ目のタイマーになる (16.3)。一覧などは直らない。
+- 描画を待たずに入力だけ先に処理する (入力用の pass を挟む): eframe の pass の順序と全 viewport の所有に触れる大きな変更。
+
+### 16.6 影響の範囲 (vendor の egui / egui-winit を変えるため)
+
+- 時刻の付かない入力 (全テスト、タッチ、合成した離し) は今と同じ判定。
+- 一覧・フォルダーツリー: egui のクリック判定 (押下の長さ・回数) は実際の時刻になる。ただし mIV 独自の組の判定
+  (一覧のダブルクリックの `grid_click_pairing.accept_primary_input` の `at`、ツリーの名前のダブルクリック `ui_folder_pane.rs`) は
+  pass の時刻 (`input.time`) のままで、同じ取りこぼしが残る (サムネイル作成中は主に一覧なので、一覧のダブルクリックで開く操作に
+  同じ形が出ていてもおかしくない。観測は無い)。直すなら、egui が離しごとの時刻を返す API を足し、その 2 か所の `at` を
+  離しの時刻にする (16.7 の判断 1)。
+- 動画: native presenter は別の窓で egui を通らないので変わらない。
+- HUD・メニュー・ナビゲーター: egui のクリックの判定が実際の時刻になるだけで、所有・位置の判定は変わらない。
+- 開いたクリックの持ち越し防止 (§4.4): 受け付け数で防いでいて時刻に依らない。一覧のダブルクリックで開いた直後の速い 3 回目は、
+  今は重い開く処理で回数 1 になりやすいが、修正後は egui の回数 3 になり得る。受け付け数が 1 なので閉じない。テストで固定する。
+- 表示リセット (§14): 受け付け数を 1・2 で繰り返す今の形のまま。時刻だけが実際の時刻になる。
+- F12 / 複数窓: 各 viewport の egui-winit の State が、自分の窓のメッセージに自分の基準の時刻を付ける。detached の述語・viewport の
+  経路・窓の所有は変えないが、共有の入力経路を変えるので、CLAUDE.md の決まり (双方のレビューで構造的修正であることの合意、
+  detached-rework-plan §11 への記録) に従う。
+- 見える挙動の変化: 重い pass の間に、実際には 0.5 秒以上空けた 2 回のクリックが届くと、今は同じ pass でダブルクリックになる
+  (閉じるモードなら閉じる) が、修正後は 2 回の単クリックになる。正しい方向の変化で、通常の使い方の不便にはならない。
+
+### 16.7 統括へ判断を求めた点 (16.9 で決定)
+
+1. 一覧・ツリーの独自の組の判定 (16.6) を同じ版で直すか、別項目にするか (推奨: 別項目。今回は画像閲覧を起点にし、egui 側の変更と
+   閉じるモードに絞る。egui 側には離しごとの時刻を返す API を最初から用意しておく)。
+2. 16.4 の計装を同じ変更に入れるか (推奨: 入れる)。
+
+### 16.8 テストと確認 (案)
+
+- egui の単体: 時刻イベント付きの (a)(b) が閉じる / クリックになる。時刻イベントの無い入力は今と同じ (16.2 の 4 件が変わらない)。
+  時刻イベントの後に別のイベントを挟むと捨てる。時刻が pass より新しい・押した時刻より古い場合の丸め。
+- handler-level: 時刻イベント付きで (a)(b) が閉じる (**旧コードで落ちる**)。(c) と対照は今と同じ。持ち越し防止 (16.6) の固定。
+- egui-winit (Windows): `GetMessageTime` からの換算の単体 (古さの範囲外は付けない、wrapping)。
+- 実窓の probe を修正後の vendor で流し直し、(a)(b) が 2 回目で閉じる / クリックになることを確かめる (メイン PC で可、
+  自分の窓へのメッセージだけ)。
+- サブ PC (本物のマウス): probe に「離しの後の pass を 700ms 止める」対話の形を足し、修正前後の probe でダブルクリックして
+  回数を記録する。製品の dev ビルドでは、止まりの無い通常のダブルクリックで閉じる・一覧のダブルクリックで開く・
+  拡大中のダブルクリックで戻る (§1.899・§1.900 の手順) が今と同じであることを確かめる。
+
+### 16.9 利用者の決定 (2026-11-27、統括経由) と範囲
+
+- 16.7 の 1: 一覧のダブルクリック (`grid_click_pairing`) とツリーの名前のダブルクリック (`ui_folder_pane.rs`) も、**同じ版 (v5.9.0) で直す**。
+- 16.7 の 2: 入力の遅れが 100ms 以上のときに perf の記録を出す計装を、**同じ変更に入れる**。
+- 進め方 (統括の指示): Sol xhigh の独立設計レビュー → Codex gpt-6.1-sol/high が実装 → 別の Sol xhigh の独立実装レビュー →
+  本体 lib 全件 (共有の土台の変更なので) と build-dev。サブ PC の確認は統括が依頼する。
+
+### 16.10 範囲を広げた直し方 (16.4 に足す)
+
+1. **egui に、押す・離すごとの時刻を返す API を足す**。egui 自身の pointer の記録 (`PointerState` の `pointer_events`) の
+   `Pressed` / `Released` に、16.4 の 3 で決めた時刻 (時刻イベントがあればその時刻、無ければ pass の時刻) を持たせ、
+   raw のイベント順で「ボタン・押したか・時刻・(離しなら) クリックの位置と回数」を返す (例 `PointerState::button_edges()`)。
+   既存の `released_buttons_with_click_counts` はこの記録から作る形のままにし、返す内容は変えない。
+   raw のイベント (`InputState::events`) は前の持ち主に消費され得るので、時刻を raw のイベントへ付け直すのではなく、
+   呼び出し側が今 `released_buttons_with_click_counts` と raw を突き合わせている所で、同じ順の edge から時刻を取る。
+   突き合わせが合わないときは、今と同じく取り消す (`Cancelled` 等)。pass の時刻へ黙って戻す分岐は作らない。
+2. **一覧**: `GridPrimaryInput::Release` に離しの時刻を持たせ、`GridClickPairing::accept_primary_input` の組の判定
+   (`register_cell_click` / `register_background_click` の `at`) をその時刻にする。今の呼び出し (`ui_main.rs` の
+   `accept_primary_input(context, frame, ctx.input(|input| input.time), ...)`) の pass の時刻は使わない。
+   フレーム番号で見る条件 (`validate_background` 等) は変えない。
+3. **ツリーの名前**: `ui_folder_pane.rs` の raw と egui の離しを突き合わせる処理で、押す・離すの各 edge の時刻を取り、
+   `FolderPane::process_label_input` へ pass の時刻の代わりに渡す (2 回目の押下での確定も、直前の離しからの時間も、
+   その edge の時刻で測る)。診断の記録に出す時刻は今のままでよい。
+4. **計装**: 各 viewport の pass で 1 か所 (ROOT・F12・独立窓すべてで走る所)、その pass の edge のうち
+   「pass の時刻 − edge の時刻」が 100ms 以上のものを perf の event (`cat: "input"`, `kind: "pointer_lag"`、
+   button・pressed・lag_ms・viewport・全画面か) として出す。perf が無効なら edge を読まない。
+5. 時刻の無い入力 (テスト・タッチ・合成) は、一覧・ツリーでも今と同じ判定になる (edge の時刻 = pass の時刻)。
+
+### 16.11 影響の範囲の追記 (16.6 の一覧・ツリーの行を置き換える)
+
+- 一覧: ダブルクリックで開く・余白のダブルクリック (§1.298) の組の判定が、実際の離しの時刻になる。押した位置・ウィジェットの
+  照合、タッチの扱い、フレーム番号の条件は変えない。
+- ツリー: 名前のダブルクリック (keymap-spec の「1 回目の位置と直前の離しからの時間で判定し、2 回目を押した瞬間に確定」) の
+  時間が実際の時刻になる。現在地のフォルダ名のクリックでの更新 (1 回目だけが更新) は時刻に依らない。
+- 時刻の比較が新しくなる所はこの 3 つ (egui・一覧・ツリー) だけ。ほかの mIV の `input.time` の利用 (アニメーション・診断等) は変えない。
+
+### 16.12 テスト (16.8 に足す)
+
+- 一覧: 時刻イベント付きで、1 回目の離しの後に重い pass (700ms) が挟まり、実際は 250ms 後の 2 回目 → ダブルクリックで開く
+  (**旧コードで落ちる**)。時刻の無い同じ入力は今と同じ (開かない)。余白のダブルクリックも同じ形で 1 件。
+- ツリー: 同じ形で名前のダブルクリックが開閉する (**旧コードで落ちる**)。時刻の無い入力は今と同じ。
+- egui: `button_edges` が raw の順・時刻・クリックを返し、`released_buttons_with_click_counts` の結果が今と同じ。
+  `cancel_button` で消した edge は返さない。
+- 計装: 遅れ 100ms 以上の edge だけを記録する (perf 有効時)。
+
+### 16.13 detached の決まり
+
+- 変えるのは共有の入力経路 (egui-winit が付ける時刻と egui の判定) で、detached の述語・viewport の経路・窓の所有・
+  open / close の初期化は変えない。各 viewport の State が自分の窓の入力に時刻を付け、判定も viewport ごとの入力のまま。
+- CLAUDE.md の決まりに従い、設計と実装の独立レビューの双方で「症状パッチではなく構造的修正である」ことの合意を取り、
+  [detached-rework-plan.md](detached-rework-plan.md) §11 に記録する。
+- まれな失敗 (時計の取り違え等で古さが範囲外): 時刻を付けず pass の時刻で判定する (今と同じ)。ログは出さない
+  (CLAUDE.md の既定の割り切り。入力ごとに出すと量が多い)。
+
+### 16.14 独立設計レビュー r1 (Sol xhigh、2026-11-27) と改訂
+
+- r1: **REVISE** (P2 × 3)。「実際の入力時刻を保って egui の 1 か所の判定へ渡す方針は、症状パッチではなく構造的修正」に **AGREE**。
+  3 件ともコードで正しいと確認した (ClaudeCode)。以下で 16.4 の 1〜3 を置き換える。
+- r1 P2-1 (時刻の基準): eframe は入力を取り出した後、`RawInput.time` を自分の `beginning` 基準で上書きする
+  (`vendor/eframe/src/native/epi_integration.rs` の `prepare_raw_input`、`wgpu_integration.rs` の `input.time = ...`)。
+  egui-winit の `State.start_time` とは基準が違い、子窓の作り直しでずれる。また、保留した入力 (`pending_raw_input`) は
+  取り出した時刻と pass の時刻が違うので、「取り出し時点からの古さ」で持つと、保留した組と新しい組の間隔が縮み、
+  遅いクリックが速く見え得る。
+  - 改訂: **プロセスで 1 つの入力用の時計** (egui-winit の `OnceLock<Instant>` を起点にした秒) を作る。egui-winit は edge の時刻を
+    この時計で持つ。eframe は `RawInput.time` を設定する全ての箇所で、同じ瞬間のこの時計の値も `RawInput` の新しい欄
+    (例 `input_clock: Option<f64>`) に入れる。egui は edge の pass 基準の時刻を `time − (input_clock − edge の時計の値)` で出す。
+    `input_clock` が無い (テスト・kittest・他の統合) ときは時刻の注釈を使わない。古さは pass ごとに計算するので、保留・連結しても間隔は変わらない。
+- r1 P2-2 (メッセージとの対応): egui-winit が MouseInput を受けた時点の `GetMessageTime` は、winit が再入中に保留して後で配る
+  イベント (`runner.rs` の `event_buffer`、時刻を持たない) や、送信メッセージでは、そのクリックのメッセージの時刻ではない。
+  保留した複数のクリックが同じ遅い時刻になると間隔が縮み、誤ってダブルクリックになり得る。
+  - 改訂: **winit の msg hook** (eframe (vendor) が Windows で `EventLoopBuilderExtWindows::with_msg_hook` を設定) で、winit 自身の
+    メッセージの取り出しごとに「今から配るメッセージ」をスレッドの 1 か所に記録する (マウスのボタンのメッセージなら
+    hwnd・ボタン・押したか・`MSG.time`、それ以外は空にする)。egui-winit は MouseInput を受けたとき、その記録が
+    自分の窓の hwnd・同じボタン・同じ押したかなら取り出して (1 回だけ使う) 時刻にし、合わなければ時刻を付けない。
+    保留されて後で配られたイベント、入れ子のメッセージループ (DoDragDrop 等、hook を通らない)、送信メッセージは
+    記録と合わないので時刻なし (= 今と同じ pass の時刻)。誤って速く見える方向の時刻は作らない。
+    `MSG.time` の古さ (`GetTickCount` との差) は hook の時点で入力用の時計へ換算する。利用者の `event_loop_builder` が
+    msg hook を上書きした場合は時刻が付かないだけ (mIV は設定していない)。
+- r1 P2-3 (provenance との並び): egui-winit の observer は、主ボタンの押下の直前に `Event::PointerInputProvenance` を挿入し
+  (`pointer_input_observer.rs` の `events.insert(events_before + start, ...)`)、`src/app/detached_activation_gesture.rs` は
+  「押下の直前が provenance」を要求する。
+  - 改訂: 時刻の注釈は PointerButton より前に積み、observer の挿入で **時刻 → provenance → PointerButton** の並びになる形を
+    契約にする。egui は「注釈の後、provenance だけを挟んで来た同じボタン・同じ押したかの PointerButton」に時刻を使い、
+    それ以外のイベントを挟んだら捨てる。detached の「直前が provenance」は変わらない。
+    `Event::PointerButton` に欄を足す案は、src・tests の約 490 か所の構築に及ぶので採らない。
+- 影響の追記: egui のテキスト選択 (ダブル・トリプルクリック)、ツールチップ、長押しも実際の時刻で測るようになる。
+  native presenter の HUD は独自の `RawInput` (時刻なし) を作るので今と同じ。
+- テストの追記 (r1): 保留・連結した入力で間隔が縮まない / 再入で保留されたイベントと送信メッセージに時刻が付かない
+  (hook の記録との照合の単体) / 子窓の作り直し後も時刻の基準が合う / provenance と併存して detached の起動の照合が今どおり /
+  窓 A の入力・取り消し・作り直しが窓 B の edge・クリックの履歴を変えない / 時刻付きの持ち越し防止 (§4.4)・表示リセット (§14) /
+  同じ pass に入った、実際は 0.5 秒以上空いた 2 回のクリックはダブルクリックにならない (handler-level)。
+  `egui_kittest::Harness::step` はイベントを pass ごとに分けるので、注釈の試験は同じ `RawInput.events` にまとめて渡す。
+
+### 16.15 独立設計レビュー r2 (同じ担当の続き) と改訂
+
+- r2: **REVISE** (P2 × 2)。r1 の時刻の基準と provenance の並びは解消と判断。構造的修正であることに引き続き **AGREE**。
+  2 件ともコードで正しいと確認した (ClaudeCode)。
+- r2 P2-1 (属性の照合では元メッセージとの対応を証明できない): winit の msg hook は配る前だけに呼ばれ、MouseInput を出すまでに
+  `SetCapture` と修飾キーの配送がある (winit `event_loop.rs` 1786〜1808 付近)。同じスレッドの `SendMessage` は wndproc を直接
+  呼ぶので、外側の押下を記録した後に同じ hwnd・ボタン・押したかの送信メッセージが再入すると、内側が外側の時刻を取り得る。
+  mIV の `key_input.rs` も同じ HWND・メッセージの再入を別の呼び出しとして扱っている (`NativeDetachedCall` の sequence)。
+  - 改訂 (16.14 の P2-2 の改訂を置き換える): **時刻は「wndproc の呼び出し」に属させる**。
+    1. winit の msg hook (eframe が設定) は、winit 自身が取り出したメッセージ (hwnd・message・wParam・lParam・`MSG.time` を
+       入力用の時計に換算したもの) を「取り出した直後、まだ誰も受け取っていない 1 件」として記録する。
+    2. 各 egui の窓に vendor 側の subclass を 1 つ付ける (eframe が窓を作るとき。mIV の `key_input.rs` の subclass とは別の id)。
+       subclass は**すべての**メッセージで呼び出しの枠をスレッドのスタックに積み、`DefSubclassProc` から戻ったら外す。
+       ボタンのメッセージで、1 の記録と hwnd・message・wParam・lParam が一致し、まだ受け取られていなければ、その枠が記録を
+       受け取る (1 回だけ)。それ以外 (入れ子のメッセージループから来たもの、送信メッセージ、受け取り済み、ボタン以外) の枠は時刻を持たない。
+       外側の呼び出しは `DefSubclassProc` を呼ぶ前に受け取るので、内側の再入が外側の時刻を取ることはない。
+    3. egui-winit は MouseInput を受けたとき、**いちばん内側の枠**が自分の窓・同じボタン・同じ押したかで、時刻を持ち、まだ使われて
+       いなければその時刻を使う (1 回だけ)。winit が保留して後で配ったイベントは、配られた時点のいちばん内側の枠 (別の呼び出し、
+       または使用済み、またはスタックが空) に当たるので時刻なし。
+  - 試験: 同じ hwnd・ボタン・押したかの送信メッセージを外側の呼び出しの中で再入させても、内側に時刻が付かず外側の時刻が変わらない。
+    入れ子のループから配ったメッセージと保留されたイベントに時刻が付かない。
+- r2 P2-2 (時刻あり・なしを混ぜると遅いクリックがダブルクリックになる): 時刻の無い edge を pass の時刻にすると、それより実際の時刻が
+  早い次の時刻付きの edge と比べたとき間隔が縮む (例: 1 回目 実際 1.00・pass 1.70・時刻なし、2 回目 実際 2.10・時刻あり → 0.40 秒)。
+  - 改訂: **edge の時刻を 2 つ組で持つ** (pass の時刻と、あれば入力の時刻。例 `EdgeTime { pass, input: Option<f64> }`)。
+    2 つの edge の間隔は、**両方に入力の時刻があるときだけ入力の時刻の差**、どちらかに無ければ **pass の時刻の差** (今と同じ) で測る。
+    押下の長さ (離し − 押下)、ダブル・トリプルクリックの間隔 (egui の `last_click_time` / `last_last_click_time`)、一覧の組の判定
+    (`pending.at`)、ツリーの名前の判定 (直前の離しの時刻) をすべてこの 1 つの規則 (例 `EdgeTime::since(earlier)`) で測り、
+    egui・一覧・ツリーで共有する (egui が型と関数を公開し、mIV はそれを使う)。片方だけ時刻のある組は今の挙動と同じになる。
+  - 試験: 時刻あり→なし、なし→あり の両方の順で、間隔が今の挙動より短くならない。押下・離しの片方だけに時刻がある場合も同じ。
+
+### 16.16 独立設計レビュー r3 と改訂
+
+- r3: **REVISE** (P2 × 1)。r2 の 2 件目 (EdgeTime) は解消と判断。構造的修正であることに引き続き **AGREE**。
+- r3 P2 (保留されたイベントが外側の未使用の時刻を取り得る): 時刻付きの外側の押下 (枠 A) の中で、winit が MouseInput より前に
+  修飾キーの配送 (`update_modifiers`) をする。そのコールバック中に同じ hwnd・ボタンの押下が再入すると、内側の MouseInput は
+  runner に保留され、内側の枠が外れた後、外側の MouseInput より先に配られる。そのとき最も内側は未使用の枠 A なので、内側のイベントが
+  A の時刻を取る。コードの順序として正しい (通常の使い方では起きないが、正しさを証明できない)。
+  - 改訂 (16.15 の P2-1 の 3 に足す): **曖昧になった枠は時刻を貸さない**。枠が自分の時刻を使われる前に、その枠の中で別の
+    **ボタンのメッセージの呼び出し**が始まったら、その枠を「曖昧」にして時刻を捨てる (内側の枠はもともと時刻なし)。
+    したがって、再入が 1 つでもあった押下・離しはどれも時刻なしになり、今と同じ pass の時刻で判定される。誤った時刻は付かない。
+    再入の無い通常の配送 (修飾キーの配送・`SetCapture` の `WM_CAPTURECHANGED` などボタン以外の呼び出しだけを挟む) は今の設計どおり時刻が付く。
+  - 試験: 外側の押下の枠の中で、内側の同じ属性の押下の呼び出しを始めて終わらせ、その後に保留のイベント → 外側のイベントの順で
+    egui-winit に渡す。どちらにも時刻が付かない。ボタン以外の呼び出しを挟んだだけなら外側に時刻が付く。
+- r4 (同じ担当の続き、2026-11-27): **ACCEPT** (指摘なし)。構造的修正であることに **AGREE**。設計はここで確定し、実装へ進む。
+
+### 16.17 実装記録・検証引き継ぎ (2026-11-27、dblclick-919)
+
+- 状態: 実装・静的点検・整形まで (実装担当 Codex の記録)。Rust の build / check / test、実窓 probe、
+  本物のマウス、build-dev は未確認。利用者の役割分担により cargo は fmt だけ実行し、コンパイル・実行を伴う検証は runner へ引き継ぐ。
+  この節のテスト一覧はソースから抽出した名前で、実行成功や発見済みテスト一覧ではない。コミット・exe 起動はしていない。
+- 静的確認: 本体の cargo fmt --all と vendor egui / egui-winit / eframe の cargo fmt、各 fmt --check は完了。
+  git diff --check は成功。既存 stall_919_tests.rs の git diff --quiet は exit 0 (差分なし)。
+- 実装担当 (Codex) の報告では、Codex の中で別のエージェントにソースを点検させ ACCEPT だった。ClaudeCode はその内容を確かめておらず、
+  統括の決めた独立実装レビュー (別の Sol xhigh) には数えない。独立実装レビューの結果は 16.18 に記録する。
+- egui-winit: `input_clock` の OnceLock 起点は State・viewport・窓世代で共通。
+  Windows の `native_pointer_time` は受信した MSG の4属性と換算時刻を一件だけ保持し、vendor 独自 subclass が全メッセージの
+  呼出枠を DefSubclassProc の前後で積む / 外す。時刻の所有は Available / Used / Unavailable / Ambiguous の型で表し、
+  入れ子ボタンは既存の未使用枠を曖昧化する。最内枠の証明が揃った実 MouseInput だけ一回注釈を付ける。
+  Touch と位置なし離しには付けず、observer を通った並びは時刻 → provenance → PointerButton のまま。
+- eframe: 内部 msg hook を利用者の event_loop_builder より前に設定する。subclass の資源は既存の
+  `NativeWindowAllocationLease` に置き、窓置換・破棄時の既存の退役点で外す (WM_NCDESTROY でも自分の subclass を外す)。
+  native の RawInput.time 全5設定点で、同じ Instant から pass 時刻と input_clock を設定する。
+  Windows の時刻注釈を生成せず egui-winit 依存もない web backend は、input_clock=None の既定を維持する。
+- 設置順の追補: ROOT の timestamp subclass は App 生成前、利用者の native input listener は後から replay されるため、
+  listener の任意 subclass が外側になり得た。現 mIV の ROOT 前処理に実際の SendMessage 再入経路は確認されていないが、
+  public listener 接続も含めて §16.15 の呼出前 claim を守る設置順の実装判断として、listener.install 後に既存の vendor proc/id を
+  RemoveWindowSubclass → SetWindowSubclass の順で最外へ戻す。単なる Set は refData 更新だけなので使わない。
+  child は listener の後に初回 timestamp 設置となる。同じ lease の所有・退役を維持し、新しい pending 状態は加えていない。
+  共通の設置順関数を偽 subclass chain で駆動し、ROOT / child の順序と、外側 listener が同属性メッセージを再入させても
+  内側が外側の時刻を取らず両枠が時刻なしになることを追加検査する (未実行)。
+- egui: `PointerButtonTime` は provenance だけを挟んだ一致ボタンへ結合し、clock 不在・不一致・他イベントで捨てる。
+  `EdgeTime` の入力時刻を pass 以下へ、同じボタンの離しを既知の押下入力時刻以上へ丸める。
+  押下の長さ・押下時の回数・double / triple の履歴は `EdgeTime::since` を共有する。
+  追補: runner で既存の `folder_pane::tests::label_gesture_diagnostic_reports_double_click_delay_rejection` が失敗したとの
+  ClaudeCode の報告を受け、`since` の差を 0 へ丸めず符号付きで返すよう修正した。両端が入力時刻を持つときだけ入力差、
+  それ以外は pass 差を選ぶ規則は維持する。egui・一覧の従来の上限比較と、ツリーの `0.0..=max_delay` による
+  負の間隔の棄却をそのまま有効にする。注釈時刻の正規化とは別の規則であり、その丸めは変更していない。
+  共有規則のテストを符号保持の期待へ更新した。この追補の実行検証は未実施で、cargo は fmt のみ。
+  進行中のドラッグ・長押し・velocity・tooltip は現在の pass を観測する既存経路に残す。
+  `button_edges` と既存の release counts は同じ pointer_events を読み、cancel 後の edge はどちらにも残らない。
+  vendor と本体の Event / PointerEvent match を棚卸しし、内部 scroll_area のパターンと focus_debug の表示名を追従させた。
+- 一覧: Release 自身が `EdgeTime` を持ち、raw / canonical edge / widget witness を順序・ボタン・押す/離す・位置で照合する。
+  `accept_primary_input` の pass 時刻引数を除き、pending.at の比較も共有 since へ変更した。フレーム番号による条件は維持。
+  ツリーも各押下・離しの照合済み EdgeTime を process_label_input へ渡す。不一致は従来の cancel に進み、pass 時刻へ補完しない。
+  既存の純状態テスト向け f64 引数は `Into<EdgeTime>` で「入力時刻なし」を明示して受け取る。
+- 計装: `PointerLag` Context plugin の on_begin_pass を全 viewport の共通入口とし、perf 有効時だけ edge を読む。
+  入力時刻があり、pass−input が100ms以上の edge ごとに input / pointer_lag (button・pressed・lag_ms・viewport・fullscreen) を記録する。
+  fullscreen はその viewport の native Fullscreen 情報。実際のログ出力は未確認。
+- 子窓再作成の回帰は headless EpiIntegration::prepare_raw_input と二つの実 egui-winit State を通す。
+  Context の進行で State の開始基準が変わり、State 側 time を異なる値にしても、eframe の共通開始基準と input_clock が
+  元の物理間隔を保つことを検査する。窓 A の cancel・retire・同じ ID の再作成は実 Context の viewport を通して窓 B の edge と履歴の不変を検査する。
+- `stall_919_tests.rs` の既存4件はファイルごと変更していない。共用テスト固定具は input_clock を供給するが、
+  注釈なし入力の判定は従来の pass 時刻のまま。追加試験は同じ RawInput.events へ注釈とボタンをまとめ、kittest の event() による分割を避ける。
+- 旧コードで失敗する見込み: 時刻付き (a) の二回目終了、(b) の離しのクリック認定と二回目終了、
+  同じ pass に入った遅い二クリックの非 double、一覧セルの open・余白の親移動・ツリー名の toggle。
+  旧実装には新 API が無いため、API だけを受け取って注釈を無視する比較を想定した見込みで、旧コードでの実行はしていない。
+- まれな時計 / subclass 設置失敗は時刻を渡さず既存の pass 判定 (subclass 設置失敗だけ一度の警告) とし、回復機構を増やしていない。
+  入力が常時並行するためモーダル化では原因を除けず、共通の生成・所有境界を修正した。閾値延長・待ち・追加 repaint は使わない。
+  detached の実装者判断は [detached-rework-plan §11](detached-rework-plan.md) に記録。独立実装レビューの合意は 16.18。
+
+追加テストの完全名 (nextest の test filter 用、ソースから抽出。すべて未実行):
+
+Main: mimageviewer --lib
+
+```text
+ui_fullscreen::double_click_close_tests::timestamp_919_tests::close_mode_919_timestamped_stall_between_clicks_closes_on_second_click
+ui_fullscreen::double_click_close_tests::timestamp_919_tests::close_mode_919_timestamped_stall_during_press_remains_click_and_closes
+ui_fullscreen::double_click_close_tests::timestamp_919_tests::close_mode_919_timestamped_slow_clicks_in_same_pass_do_not_close
+ui_fullscreen::double_click_close_tests::timestamp_919_tests::close_mode_919_timestamped_opening_pair_does_not_carry_into_viewer
+ui_fullscreen::double_click_close_tests::timestamp_919_tests::close_mode_919_timestamped_reset_pair_then_close_pair
+app::folder_pane_refresh_tests::timestamp_919::folder_pane_919_timestamped_stall_toggles_label_but_unstamped_does_not
+app::folder_pane_refresh_tests::timestamp_919::folder_pane_919_mixed_timestamps_retain_pass_interval_in_both_orders
+pointer_input_time::tests::pointer_lag_919_requires_known_input_and_at_least_100ms
+app::detached_activation_gesture::tests::timestamp_919_canonical_activation_accepts_time_provenance_button_once
+ui_main::grid_reclick_open_tests::grid_919_timestamped_stall_opens_cell_but_unstamped_does_not
+ui_main::grid_reclick_open_tests::grid_919_timestamped_stall_pairs_background_but_unstamped_does_not
+ui_main::grid_reclick_open_tests::grid_919_mixed_timestamp_pairs_retain_pass_interval_in_both_orders
+```
+
+Vendor: egui --lib
+
+```text
+input_state::timestamp_tests::timestamp_919_stall_between_clicks_uses_actual_interval
+input_state::timestamp_tests::timestamp_919_delayed_release_uses_press_release_interval
+input_state::timestamp_tests::timestamp_919_slow_clicks_batched_together_are_not_double
+input_state::timestamp_tests::timestamp_919_annotation_allows_only_provenance_and_matching_button
+input_state::timestamp_tests::timestamp_919_translation_clamps_future_and_negative_hold_interval
+input_state::timestamp_tests::timestamp_919_mixed_click_pairs_use_pass_time_in_both_orders
+input_state::timestamp_tests::timestamp_919_mixed_press_release_uses_pass_duration_in_both_orders
+input_state::timestamp_tests::timestamp_919_edges_preserve_order_clicks_and_cancel_removes_owned_edges
+input_state::timestamp_tests::timestamp_919_pending_append_keeps_absolute_stamps_and_latest_clock
+input_state::timestamp_tests::timestamp_919_viewport_cancel_and_recreation_do_not_change_sibling_history
+input_state::timestamp_tests::timestamp_919_shared_interval_rule_preserves_sign_and_uses_whole_pair_clock
+```
+
+Vendor: egui-winit --lib (native_pointer_time: Windows only)
+
+```text
+native_pointer_time::tests::timestamp_919_tick_age_range_and_wrap
+native_pointer_time::tests::timestamp_919_claims_exact_invocation_once_and_rejects_deferred_delivery
+native_pointer_time::tests::timestamp_919_all_message_attributes_must_match
+native_pointer_time::tests::timestamp_919_nested_button_invalidates_outer_even_when_buffer_delivered_first
+native_pointer_time::tests::timestamp_919_nonbutton_reentry_preserves_outer_but_never_lends_it
+native_pointer_time::tests::timestamp_919_nested_loop_and_sent_messages_have_no_queue_time
+native_pointer_time::tests::timestamp_919_retire_recreate_does_not_change_other_window_queue_or_call
+native_pointer_time::tests::timestamp_919_listener_replay_and_new_child_keep_timestamp_outermost
+native_pointer_time::tests::timestamp_919_listener_outermost_restoration_prevents_preclaim_reentry
+pointer_input_observer::tests::timestamp_919_observer_keeps_time_provenance_button_order
+```
+
+Vendor: eframe --lib (wgpu / glow)
+
+```text
+native::epi_integration::tests::timestamp_919_recreated_child_state_uses_eframe_clock_and_preserves_intervals
+```
+
+Changed files (relative to repository root)
+
+```text
+docs/architecture-overview.md
+docs/detached-rework-plan.md
+docs/fullscreen-double-click-close-plan.md
+docs/keymap-spec.md
+src/app.rs
+src/app/detached_activation_gesture.rs
+src/app/folder_pane_refresh_tests.rs
+src/app/folder_pane_timestamp_919_tests.rs
+src/focus_debug.rs
+src/folder_pane.rs
+src/lib.rs
+src/pointer_input_time.rs
+src/ui_folder_pane.rs
+src/ui_fullscreen/double_click_close_tests.rs
+src/ui_fullscreen/double_click_close_tests/timestamp_919_tests.rs
+src/ui_main.rs
+vendor/eframe/PATCHES.md
+vendor/eframe/src/native/epi_integration.rs
+vendor/eframe/src/native/glow_integration.rs
+vendor/eframe/src/native/run.rs
+vendor/eframe/src/native/wgpu_integration.rs
+vendor/eframe/src/native_window_input.rs
+vendor/egui-winit/Cargo.toml
+vendor/egui-winit/PATCHES.md
+vendor/egui-winit/src/input_clock.rs
+vendor/egui-winit/src/lib.rs
+vendor/egui-winit/src/native_pointer_time.rs
+vendor/egui-winit/src/pointer_input_observer.rs
+vendor/egui/PATCHES.md
+vendor/egui/src/containers/scroll_area.rs
+vendor/egui/src/data/input/event.rs
+vendor/egui/src/data/input/raw_input.rs
+vendor/egui/src/input_state/mod.rs
+vendor/egui/src/input_state/timestamp_tests.rs
+vendor/egui/src/lib.rs
+```
+
+### 16.18 独立実装レビュー・検証 (2026-11-27、ClaudeCode)
+
+- 実装: Codex gpt-6.1-sol / high (9006d1cd3)。コンパイルと試験で見つかった 2 点を直した:
+  632f2c745 (ClaudeCode。`GetWindowSubclass` を使わない。manifest の無い eframe のテスト実行体が 0xc0000139 で読み込めなかった。
+  refData は常に 0 なので `RemoveWindowSubclass` の戻り値で付いていたかを判定。テストの import と型の 2 か所)、
+  051d49e18 (Codex。`EdgeTime::since` を符号付きに戻した。0 に丸めるとツリーの「前の離しより前の押下」を弾く判定が通ってしまい、
+  既存のテスト `folder_pane::tests::label_gesture_diagnostic_reports_double_click_delay_rejection` が落ちた)。
+- 独立実装レビュー (実装者と別の Sol xhigh、ClaudeCode が依頼): r1 (ce3453461..9006d1cd3) **ACCEPT**、指摘なし。
+  r2 (9006d1cd3..051d49e18) **ACCEPT**、指摘なし。両回とも、入力時刻の所有境界を正す**構造的修正であり症状パッチではない**ことに **AGREE**。
+  r2 は System32 の DLL の export を確かめ、残る import (`SetWindowSubclass`・`RemoveWindowSubclass`・`DefSubclassProc`・`GetTickCount`) に
+  同じ読み込みの問題が無いことを確認した (レビュー担当の報告)。
+- 自動試験 (run-heavy、051d49e18): vendor egui 234/234、egui-winit 83/83、eframe wgpu 65 成功 1 skip、eframe glow 67/67、
+  本体の関連 (`919|double_click_close|grid_reclick|folder_pane|detached_activation_gesture|pointer_input|double_click_time`) 543/543。
+  旧コードでの比較実行はしていない (新しい API を使う試験のため)。今の挙動の固定 (`stall_919_tests.rs` の 4 件) は変えずに通っている。
+- 実窓の probe (メイン PC、ClaudeCode が実行、自分の窓へのメッセージだけ。出力 `target/investigation/forum-919-real-window/run-output-after-fix.txt`):
+  修正後の vendor で、(a) 1 回目の後の 700ms の止まり → 回数 2 (修正前 1)、(b) 押下の後の 900ms の止まり → クリック 1 回 (修正前はクリックにならない)、
+  対照・(c)・(d) は修正前と同じ。本物のマウスでの確認はまだ (サブ PC、16.19)。
+- 本体 lib 全件 (`test-lib-full.ps1`、run-heavy、654fe611e と同じソース): **21389 成功・111 skip** (868.9 秒)。
+  build-dev (`target/dev-runtime`) 成功。core exe の comctl32 の import は `SetWindowSubclass`・`RemoveWindowSubclass`・`DefSubclassProc`・`InitCommonControlsEx` のみ。
+  製品の実機での操作は未確認 (16.19)。
+
+### 16.19 サブ PC での確認 (案、統括が依頼する)
+
+- 道具: `target/investigation/forum-919-real-window/` の `forum-919-probe-before-fix.exe` と `forum-919-probe-after-fix.exe`
+  (mIV ではない試験プログラム。データの保存は無し。出力は実行した場所の `run-output-interactive.txt`)。
+  `--interactive` で起動すると 720×480 の窓が出て、**離しのたびに UI を 700ms 止める** (`--stall-ms N` で変更、`--stall-on-press` で
+  押下のたびに止める、`--seconds N` で自動終了までの秒数、既定 90)。窓の中の表示「Last click counts」に、各クリックの回数 (2 がダブルクリック) が出る。
+- 手順:
+  1. before で `--interactive` を起動し、窓の中を普通の速さで 10 回ダブルクリックする (ダブルクリックの間は 1 秒以上空ける)。
+     「egui double clicks」の数と、終了後の `run-output-interactive.txt` を保存する。期待: 多くが 1 のまま (取りこぼし)。
+  2. after で同じ。期待: 10 回とも 2 が出る。
+  3. 1・2 を `--stall-on-press --stall-ms 900` でも行う。期待: before は回数が出ない (クリックにならない) ものが多く、after は 2 が出る。
+- 製品 (build-dev の dev ビルド、試験用の `--data-dir`) で、止まりの無い通常の操作が今と同じことを確かめる:
+  全画面の「クリックでは送らず、ダブルクリックで閉じる」でダブルクリックで閉じる、拡大中のダブルクリックで表示が戻り続けてダブルクリックで閉じる
+  (§1.899・§1.900 の手順)、一覧のダブルクリックで開く、ツリーのフォルダ名のダブルクリックで開閉する、F12 の別ウィンドウのダブルクリックで
+  その窓だけ閉じる、既定モードのクリック送り。
+- 依頼文の決まり: 入力欄はフォーカスを写真で確かめてから入力する。Backspace・Delete を続けて送らない。確認の画面は Enter で確定せず止めて報告。
+
+## 17. 同じ pass の通常キャンバスのクリック回数 (§1.917 の境界試験)
 
 従来の PageTurn の `accept_backing_click` は Response ごとに一度だけ加算していたため、1 pass に2組の押下/離しが届くと2打目をダブルクリックとして受け付けなかった。通常のクリックでも所有情報・前面 layer・focus・egui の認定・canvas の位置を離しごとに照合し、従来どおり3で飽和する受け付け数へ加算する。frame の初めの境界から再演し、同じ入力を再参照しても二重に足さない。DoubleClickClose 固有の2回ごとの区切りは従来の専用処理に残す。
 

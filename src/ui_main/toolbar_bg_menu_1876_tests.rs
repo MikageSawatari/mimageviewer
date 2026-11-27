@@ -418,7 +418,7 @@ fn section1876_row_two_pinned_tag_secondary_click_keeps_tag_action() {
         path = folder.join("image.jpg");
         std::fs::write(&path, b"fixture").unwrap();
         app.settings.auto_fullscreen_image_folders = false;
-        app.load_folder_with_scan(folder, None);
+        app.load_folder_and_finish_for_test(folder);
         app.finish_page_identity_preparation_for_test();
         app.selected = Some(0);
         app.last_main_focused = true;

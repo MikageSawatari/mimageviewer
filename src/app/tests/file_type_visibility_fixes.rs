@@ -73,7 +73,7 @@ fn visibility_settings_ok_snapshot_reader_close_and_reopen_reload_origin() {
             image::RgbImage::new(1, 1).save(folder.join(name)).unwrap();
         }
         app.settings.auto_fullscreen_image_folders = true;
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.finish_page_identity_preparation_for_test();
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
         app.finish_page_identity_preparation_for_test();
@@ -191,7 +191,7 @@ fn visibility_bookmark_cache_reopen_uses_accepted_policy_and_restores_rows() {
             PageIdentity::RelativePath("b.png".into()),
         ],
     );
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     app.finish_page_identity_preparation_for_test();
     app.open_fullscreen(0, HistoryTrigger::UserChosen);
     assert!(app.fullscreen_idx.is_some());
@@ -373,7 +373,7 @@ fn visibility_bookmark_context_bundles_keep_concurrent_policies_completions_and_
         ],
     );
     let rows = crate::book_bookmarks::load_for_container_from_disk_readonly(&folder).unwrap();
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     app.finish_page_identity_preparation_for_test();
     app.fullscreen_idx = Some(0);
     let main_context = app.virtual_list_context_id();
@@ -389,7 +389,7 @@ fn visibility_bookmark_context_bundles_keep_concurrent_policies_completions_and_
     app.settings.file_type_visibility = policy_excluding("png");
     let mut detached_held = None;
     let detached = app.build_window_context_for_test(13450, |viewer| {
-        viewer.load_folder(folder.clone());
+        viewer.load_folder_and_finish_for_test(folder.clone());
         viewer.finish_page_identity_preparation_for_test();
         viewer.fullscreen_idx = Some(0);
         detached_held = Some(held_projection(viewer, &folder));
@@ -519,7 +519,7 @@ fn visibility_bookmark_actor_routes_same_book_results_to_different_context_polic
             PageIdentity::RelativePath("page.png".into()),
         ],
     );
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     app.finish_page_identity_preparation_for_test();
     app.fullscreen_idx = Some(0);
     app.ensure_current_book_bookmarks_loaded(0);
@@ -529,7 +529,7 @@ fn visibility_bookmark_actor_routes_same_book_results_to_different_context_polic
     };
     app.settings.file_type_visibility = policy_excluding("png");
     let detached = app.build_window_context_for_test(13451, |viewer| {
-        viewer.load_folder(folder.clone());
+        viewer.load_folder_and_finish_for_test(folder.clone());
         viewer.finish_page_identity_preparation_for_test();
         viewer.fullscreen_idx = Some(0);
         viewer.ensure_current_book_bookmarks_loaded(0);
@@ -824,7 +824,7 @@ fn visibility_shared_archive_admission_uses_only_the_mounted_matching_source_pai
     assert_excluded(&mut app, &unrelated_cache);
 
     let sibling = app.build_window_context_for_test(13455, |viewer| {
-        viewer.load_folder(sibling_folder.clone());
+        viewer.load_folder_and_finish_for_test(sibling_folder.clone());
         viewer.finish_page_identity_preparation_for_test();
     });
     app.with_viewer_context(sibling, |viewer| {
@@ -857,11 +857,11 @@ fn visibility_bookmark_projection_rejects_same_context_late_container_completion
     for folder in [&first, &second] {
         std::fs::create_dir(folder).unwrap();
     }
-    app.load_folder(first.clone());
+    app.load_folder_and_finish_for_test(first.clone());
     app.finish_page_identity_preparation_for_test();
     let context = app.virtual_list_context_id();
     let (tx, cancel) = held_projection(&mut app, &first);
-    app.load_folder(second);
+    app.load_folder_and_finish_for_test(second);
     app.finish_page_identity_preparation_for_test();
     assert_eq!(app.virtual_list_context_id(), context);
     tx.send(crate::bookmark_browser::BookBookmarkProjection {
@@ -972,7 +972,7 @@ fn visibility_bookmark_mutation_invalidates_matching_bundles_and_preserves_unrel
             .find(|row| row.page_identity == PageIdentity::RelativePath("page.jpg".into()))
             .unwrap()
             .id;
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.finish_page_identity_preparation_for_test();
         app.fullscreen_idx = Some(0);
         app.current_book_bookmarks = rows.clone();
@@ -986,7 +986,7 @@ fn visibility_bookmark_mutation_invalidates_matching_bundles_and_preserves_unrel
         app.settings.file_type_visibility = policy_excluding("png");
         let mut sibling_held = None;
         let sibling = app.build_window_context_for_test(13453, |viewer| {
-            viewer.load_folder(folder.clone());
+            viewer.load_folder_and_finish_for_test(folder.clone());
             viewer.finish_page_identity_preparation_for_test();
             viewer.fullscreen_idx = Some(0);
             viewer.current_book_bookmarks =
@@ -1004,7 +1004,7 @@ fn visibility_bookmark_mutation_invalidates_matching_bundles_and_preserves_unrel
         let other_viewport = egui::ViewportId::from_hash_of("unrelated-mutation-sibling");
         let mut other_held = None;
         let unrelated = app.build_window_context_for_test(13454, |viewer| {
-            viewer.load_folder(other.clone());
+            viewer.load_folder_and_finish_for_test(other.clone());
             viewer.finish_page_identity_preparation_for_test();
             viewer.fullscreen_idx = Some(0);
             viewer.current_book_bookmarks = other_rows.clone();

@@ -954,7 +954,9 @@ fn external_capture_input(
     let mut short_press = None;
     for event in &events {
         match *event {
-            PointerEvent::Pressed { position, button } => {
+            PointerEvent::Pressed {
+                position, button, ..
+            } => {
                 if !down.iter().any(|down| *down) {
                     tail = Some(ExternalPress {
                         stamp: ExternalPressStamp { frame, ordinal },
@@ -999,7 +1001,9 @@ fn external_capture_input(
     ordinal = 0;
     for event in &events {
         match *event {
-            PointerEvent::Pressed { position, button } => {
+            PointerEvent::Pressed {
+                position, button, ..
+            } => {
                 if tail.is_some_and(|press| press.stamp.ordinal == ordinal)
                     && !capture.contains_stamp(tail.unwrap().stamp)
                     && let Some(role) = holding

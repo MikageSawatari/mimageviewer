@@ -562,6 +562,51 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_919_observer_keeps_time_provenance_button_order() {
+        let (state, _) = fixture();
+        let provenance = egui::Id::new("timestamp-owner");
+        return_provenance(&state, provenance);
+        let mut events = vec![
+            Event::PointerButtonTime {
+                button: PointerButton::Primary,
+                pressed: true,
+                time: 0.25,
+            },
+            Event::PointerButton {
+                pos: egui::pos2(20.0, 30.0),
+                button: PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        observe(
+            &state.egui_ctx,
+            state.viewport_id,
+            &mouse(true, MouseButton::Left),
+            &mut events,
+            0,
+        );
+        assert!(
+            matches!(events.as_slice(), [Event::PointerButtonTime { .. }, Event::PointerInputProvenance(id), Event::PointerButton { .. }] if *id == provenance)
+        );
+        state
+            .egui_ctx
+            .run_ui(
+                egui::RawInput {
+                    time: Some(1.0),
+                    input_clock: Some(1.0),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let edge = ui.input(|input| input.pointer.button_edges().next().unwrap());
+                    assert_eq!(edge.time.input, Some(0.25));
+                },
+            )
+            .drop_without_applying_deltas();
+    }
+
+    #[test]
     fn pointer_input_observer_provenance_tags_raw_touch_start_once_with_or_without_promotion() {
         for promoted in [false, true] {
             let (mut state, _) = fixture();

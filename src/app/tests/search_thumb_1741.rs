@@ -71,7 +71,7 @@ fn section1741_everything_zip_generation_reuses_parent_catalog_and_folder_select
     std::fs::create_dir_all(&parent).unwrap();
     let zip = parent.join("vol01.zip");
     zip_fixture(&zip);
-    env.load_folder(origin.clone());
+    env.load_folder_and_finish_for_test(origin.clone());
     env.finish_page_identity_preparation_for_test();
     env.settings.cache_policy = crate::settings::CachePolicy::Always;
     env.settings.thumb_idle_upgrade = false;
@@ -142,7 +142,7 @@ fn section1741_everything_zip_generation_reuses_parent_catalog_and_folder_select
     // Reopening the physical parent uses exactly the generated row.
     env.close_global_search();
     env.finish_history_restore_preparation_for_test();
-    env.load_folder(parent.clone());
+    env.load_folder_and_finish_for_test(parent.clone());
     env.finish_page_identity_preparation_for_test();
     let mut normal = request(&env, &GridItem::ZipFile(zip), observed).unwrap();
     env.attach_viewer_thumbnail_context(&mut normal);

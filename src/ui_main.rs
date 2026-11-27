@@ -25,6 +25,10 @@ use crate::settings::{
 };
 use crate::tag_view::{TagViewMenuChoice, tag_view_menu_sections};
 
+#[cfg(test)]
+#[path = "ui_main_folder_order_drag_tests.rs"]
+mod folder_order_drag_tests;
+
 const PHYSICAL_PARENT_BUTTON_WIDTH: f32 = 28.0;
 const PHYSICAL_PARENT_ACTION_LABEL: &str = "実際の親フォルダへ移動";
 
@@ -238,10 +242,11 @@ fn sort_control_decision(
     clicked: bool,
     selected_before_click: bool,
     order: crate::settings::SortOrder,
+    folder_manual_active: bool,
 ) -> SortControlDecision {
     if !clicked {
         SortControlDecision::None
-    } else if !selected_before_click {
+    } else if folder_manual_active || !selected_before_click {
         SortControlDecision::Change
     } else if order.is_rating() || order.lazy_metric().is_some() {
         SortControlDecision::Reload
@@ -856,6 +861,8 @@ pub(crate) enum AddressBarNav {
     RecentFolder(PathBuf),
     ZipListReturn(crate::app::ZipListReturnRequest),
     Direct(PathBuf, crate::app::StartupListIntent),
+    /// A grid folder activation carries its admission effects until visible adoption.
+    GridFolder(crate::app::GridVirtualOpenIntent),
     GridVirtual(crate::app::GridVirtualOpenIntent),
     RatingSource {
         path: PathBuf,
@@ -1156,7 +1163,7 @@ fn grid_primary_input_events(
         .unwrap_or_else(|| ctx.pointer_button_targets());
     let mut witnesses = witnesses.into_iter();
     ctx.input(|input| {
-        let mut releases = input.pointer.released_buttons_with_click_counts();
+        let mut edges = input.pointer.button_edges();
         let mut ordinal = 0;
         let mut events = Vec::new();
         for event in &input.events {
@@ -1170,10 +1177,14 @@ fn grid_primary_input_events(
                 egui::Event::PointerButtonReleased { button, .. } => {
                     // This release has no widget witness or click position. It
                     // still occupies its adjudicated release and primary ordinal.
-                    let Some((released_button, click)) = releases.next() else {
+                    let Some(edge) = edges.next() else {
                         return vec![GridPrimaryInput::Cancelled];
                     };
-                    if released_button != button || click.is_some() {
+                    if edge.button != button
+                        || edge.pressed
+                        || edge.pos.is_some()
+                        || edge.click.is_some()
+                    {
                         return vec![GridPrimaryInput::Cancelled];
                     }
                     if button == egui::PointerButton::Primary {
@@ -1197,17 +1208,15 @@ fn grid_primary_input_events(
                         }
                         _ => return vec![GridPrimaryInput::Cancelled],
                     };
-                    let click = if !pressed {
-                        let Some((released_button, click)) = releases.next() else {
-                            return vec![GridPrimaryInput::Cancelled];
-                        };
-                        if released_button != button {
-                            return vec![GridPrimaryInput::Cancelled];
-                        }
-                        click
-                    } else {
-                        None
+                    let Some(edge_time) = edges.next() else {
+                        return vec![GridPrimaryInput::Cancelled];
                     };
+                    if (edge_time.button, edge_time.pressed, edge_time.pos)
+                        != (button, pressed, Some(pos))
+                    {
+                        return vec![GridPrimaryInput::Cancelled];
+                    }
+                    let click = edge_time.click;
                     if button != egui::PointerButton::Primary {
                         events.push(if button == egui::PointerButton::Secondary {
                             GridPrimaryInput::Secondary {
@@ -1238,6 +1247,7 @@ fn grid_primary_input_events(
                     } else {
                         ordinal += 1;
                         events.push(GridPrimaryInput::Release {
+                            at: edge_time.time,
                             click,
                             modifiers,
                             source,
@@ -1259,7 +1269,7 @@ fn grid_primary_input_events(
         }
         // Earlier input owners can consume raw events. Never join a remaining raw
         // edge to a different adjudicated release or carry its old click pair on.
-        if releases.next().is_some() || witnesses.next().is_some() {
+        if edges.next().is_some() || witnesses.next().is_some() {
             return vec![GridPrimaryInput::Cancelled];
         }
         events
@@ -8587,11 +8597,288 @@ mod fixed_sort_control_tests {
         rc::Rc,
     };
 
+    fn folder_sort_control_fixture() -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+        app.settings.show_toolbar_sort = true;
+        app.settings.show_facet_sort = false;
+        app.settings.toolbar_sort_items = vec![crate::settings::SortOrder::FileName];
+        app.active_quick_folder_slot = None;
+        let folder = app.tmp.path().join("manual-sort-controls");
+        std::fs::create_dir_all(&folder).unwrap();
+        app.load_folder_with_scan(folder, None);
+        app.finish_page_identity_preparation_for_test();
+        assert!(app.folder_manual_order_eligible());
+        app
+    }
+
+    #[test]
+    fn folder_manual_sort_standard_same_value_is_a_change_even_when_stack_suppresses_display() {
+        use crate::settings::SortOrder;
+        for order in SortOrder::all() {
+            for selected in [false, true] {
+                assert_eq!(
+                    sort_control_decision(true, selected, *order, true),
+                    SortControlDecision::Change
+                );
+                assert_eq!(
+                    sort_control_decision(false, selected, *order, true),
+                    SortControlDecision::None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn folder_manual_sort_menu_and_dropdown_inputs_enter_without_standard_reload_request() {
+        for surface in ["menu", "toolbar_sort_combo", "facet_sort_combo"] {
+            let app = Rc::new(RefCell::new(folder_sort_control_fixture()));
+            let render_app = Rc::clone(&app);
+            let standard_request = Rc::new(Cell::new(false));
+            let observed = Rc::clone(&standard_request);
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1500.0, 600.0))
+                .build_ui(move |root_ui| {
+                    if surface == "menu" {
+                        let (_, changed) = render_app.borrow_mut().render_menubar(root_ui);
+                        observed.set(observed.get() || changed);
+                    } else {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            let (changed, reload, _) =
+                                render_app.borrow_mut().draw_grid_sort_dropdown(ui, surface);
+                            observed.set(observed.get() || changed || reload);
+                        });
+                    }
+                });
+            harness.run();
+            if surface == "menu" {
+                harness.get_all_by_label("設定").next().unwrap().click();
+                harness.run();
+                harness.get_by_label("ソート順").click();
+            } else {
+                harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+            }
+            harness.run();
+            assert!(
+                harness
+                    .get_by_label("手動順をリセット…")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            harness.get_by_label("手動順 (このフォルダ)").click();
+            harness.run();
+            assert!(app.borrow().folder_manual_order_applied(), "{surface}");
+            assert!(
+                !standard_request.get(),
+                "manual handler owns refresh: {surface}"
+            );
+            assert_eq!(
+                app.borrow().settings.sort_order,
+                crate::settings::SortOrder::FileName
+            );
+        }
+    }
+
+    #[test]
+    fn folder_manual_sort_standard_inputs_leave_same_value_and_stack_suppressed_mode() {
+        use crate::settings::SortOrder;
+        for surface in ["menu", "toolbar_sort_combo", "facet_sort_combo", "buttons"] {
+            for stacked in [false, true] {
+                let mut app = folder_sort_control_fixture();
+                app.folder_order.enter_manual();
+                app.stack_mode_requested = stacked;
+                app.settings.toolbar_sort_display = crate::settings::ToolbarSectionDisplay::Buttons;
+                let app = Rc::new(RefCell::new(app));
+                let render_app = Rc::clone(&app);
+                let mut harness = crate::test_ui::builder()
+                    .with_context_setup(crate::ui_fonts::configure_fonts)
+                    .with_size(egui::vec2(1500.0, 600.0))
+                    .build_ui(move |root_ui| match surface {
+                        "menu" => {
+                            render_app.borrow_mut().render_menubar(root_ui);
+                        }
+                        "buttons" => {
+                            render_app.borrow_mut().render_toolbar(root_ui);
+                        }
+                        _ => {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                render_app.borrow_mut().draw_grid_sort_dropdown(ui, surface);
+                            });
+                        }
+                    });
+                harness.run();
+                if surface == "menu" {
+                    harness.get_all_by_label("設定").next().unwrap().click();
+                    harness.run();
+                    harness.get_by_label("ソート順").click();
+                    harness.run();
+                    let prefix = if stacked { "✓ " } else { "  " };
+                    harness
+                        .get_by_label(&format!("{prefix}{}", SortOrder::FileName.label()))
+                        .click();
+                } else {
+                    if surface != "buttons" {
+                        harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+                        harness.run();
+                    }
+                    harness
+                        .get_by_label(SortOrder::FileName.short_label())
+                        .click();
+                }
+                harness.run();
+                assert!(
+                    !app.borrow().folder_order.manual_active(),
+                    "{surface}, stack={stacked}"
+                );
+                assert_eq!(app.borrow().settings.sort_order, SortOrder::FileName);
+            }
+        }
+    }
+
+    #[test]
+    fn folder_manual_sort_details_overlay_keeps_manual_entry_available() {
+        for surface in ["menu", "toolbar_sort_combo", "facet_sort_combo"] {
+            let mut app = folder_sort_control_fixture();
+            app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+            app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+            let app = Rc::new(RefCell::new(app));
+            let render_app = Rc::clone(&app);
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1500.0, 600.0))
+                .build_ui(move |root_ui| {
+                    if surface == "menu" {
+                        render_app.borrow_mut().render_menubar(root_ui);
+                    } else {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            render_app.borrow_mut().draw_grid_sort_dropdown(ui, surface);
+                        });
+                    }
+                });
+            harness.run();
+            if surface == "menu" {
+                harness.get_all_by_label("設定").next().unwrap().click();
+                harness.run();
+                harness.get_by_label("ソート順").click();
+            } else {
+                let combo = harness.get_by_role(egui::accesskit::Role::ComboBox);
+                assert!(!combo.accesskit_node().is_disabled());
+                combo.click();
+            }
+            harness.run();
+            assert!(
+                !harness
+                    .get_by_label("手動順 (このフォルダ)")
+                    .accesskit_node()
+                    .is_disabled()
+            );
+            harness.get_by_label("手動順 (このフォルダ)").click();
+            harness.run();
+            assert!(app.borrow().folder_manual_order_applied());
+            assert_eq!(
+                app.borrow().settings.details_sort_key,
+                crate::settings::DetailsSortKey::Name
+            );
+            assert_eq!(app.borrow().grid_sort_dropdown_text(), "列ヘッダ");
+        }
+    }
+
+    #[test]
+    fn folder_manual_sort_entries_are_disabled_outside_physical_folders() {
+        for surface in ["menu", "toolbar_sort_combo", "facet_sort_combo"] {
+            let mut app = folder_sort_control_fixture();
+            app.items_are_rating_view = true;
+            app.top_level_grid_view.replace_surface(
+                crate::app::top_level_grid_view::TopLevelGridSurface::Rating { stars: 3 },
+            );
+            let app = Rc::new(RefCell::new(app));
+            let render_app = Rc::clone(&app);
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1500.0, 600.0))
+                .build_ui(move |root_ui| {
+                    if surface == "menu" {
+                        render_app.borrow_mut().render_menubar(root_ui);
+                    } else {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            render_app.borrow_mut().draw_grid_sort_dropdown(ui, surface);
+                        });
+                    }
+                });
+            harness.run();
+            if surface == "menu" {
+                harness.get_all_by_label("設定").next().unwrap().click();
+                harness.run();
+                harness.get_by_label("ソート順").click();
+            } else {
+                harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+            }
+            harness.run();
+            let manual = harness.get_by_label("手動順 (このフォルダ)");
+            assert!(manual.accesskit_node().is_disabled());
+            manual.click();
+            harness.run();
+            assert!(!app.borrow().folder_order.manual_active());
+        }
+    }
+
+    #[test]
+    fn folder_manual_sort_reset_inputs_request_confirmation_before_changing_record() {
+        for surface in ["menu", "toolbar_sort_combo", "facet_sort_combo"] {
+            let mut app = folder_sort_control_fixture();
+            let record = crate::folder_order::FolderOrderRecord {
+                active: false,
+                revision: 7,
+                items: vec!["saved-child".to_owned()],
+            };
+            app.folder_order.record = Some(record.clone());
+            let app = Rc::new(RefCell::new(app));
+            let render_app = Rc::clone(&app);
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1500.0, 600.0))
+                .build_ui(move |root_ui| {
+                    if surface == "menu" {
+                        render_app.borrow_mut().render_menubar(root_ui);
+                    } else {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            render_app.borrow_mut().draw_grid_sort_dropdown(ui, surface);
+                        });
+                    }
+                });
+            harness.run();
+            if surface == "menu" {
+                harness.get_all_by_label("設定").next().unwrap().click();
+                harness.run();
+                harness.get_by_label("ソート順").click();
+            } else {
+                harness.get_by_role(egui::accesskit::Role::ComboBox).click();
+            }
+            harness.run();
+            let reset = harness.get_by_label("手動順をリセット…");
+            assert!(!reset.accesskit_node().is_disabled());
+            reset.click();
+            harness.run();
+            assert!(
+                app.borrow().folder_order_reset_dialog_visible(),
+                "{surface}"
+            );
+            assert_eq!(app.borrow().folder_order.record.as_ref(), Some(&record));
+            app.borrow_mut()
+                .resolve_folder_order_reset_confirmation(false);
+            assert!(!app.borrow().folder_order_reset_dialog_visible());
+            assert_eq!(app.borrow().folder_order.record.as_ref(), Some(&record));
+        }
+    }
+
     #[test]
     fn rating_sort_click_and_collection_choice_contract() {
         use crate::settings::SortOrder;
         assert_eq!(
-            sort_control_decision(true, true, SortOrder::RatingDesc),
+            sort_control_decision(true, true, SortOrder::RatingDesc, false),
             SortControlDecision::Reload
         );
         for order in [
@@ -8601,24 +8888,24 @@ mod fixed_sort_control_tests {
             SortOrder::PageCountDesc,
         ] {
             assert_eq!(
-                sort_control_decision(true, true, order),
+                sort_control_decision(true, true, order, false),
                 SortControlDecision::Reload
             );
             assert_eq!(
-                sort_control_decision(true, false, order),
+                sort_control_decision(true, false, order, false),
                 SortControlDecision::Change
             );
         }
         assert_eq!(
-            sort_control_decision(true, true, SortOrder::DateDesc),
+            sort_control_decision(true, true, SortOrder::DateDesc, false),
             SortControlDecision::None
         );
         assert_eq!(
-            sort_control_decision(true, false, SortOrder::RatingAsc),
+            sort_control_decision(true, false, SortOrder::RatingAsc, false),
             SortControlDecision::Change
         );
         assert_eq!(
-            sort_control_decision(false, false, SortOrder::RatingAsc),
+            sort_control_decision(false, false, SortOrder::RatingAsc, false),
             SortControlDecision::None
         );
         assert!(
@@ -8682,7 +8969,7 @@ mod fixed_sort_control_tests {
                 } else {
                     ToolbarSectionDisplay::Buttons
                 };
-                app.load_folder_with_scan(folder, None);
+                app.load_folder_and_finish_for_test(folder);
                 // Production sanitizes pointer input during hydration; this harness must settle it first.
                 app.finish_page_identity_preparation_for_test();
                 assert!(app.grid_sort_lock_reason().is_none());
@@ -8839,6 +9126,7 @@ mod fixed_sort_control_tests {
                     .iter()
                     .map(|order| order.short_label())
                     .collect::<Vec<_>>();
+                labels.extend(["手動順 (このフォルダ)", "手動順をリセット…"]);
                 if app.items_are_rating_view {
                     labels.extend([
                         crate::rating_view::RatingViewSort::RatedAtDesc.short_label(),
@@ -9538,6 +9826,35 @@ mod fixed_sort_control_tests {
 
 impl App {
     // ── メニューバー ─────────────────────────────────────────────────
+
+    /// Manual selection remains available when a details header owns only the
+    /// final projection. Its handler owns refreshing; callers must not reload.
+    fn draw_folder_manual_sort_entries(&mut self, ui: &mut egui::Ui) {
+        let disabled_reason = self
+            .listing_sort_capabilities()
+            .manual_order_disabled_reason;
+        let response = ui.add_enabled(
+            disabled_reason.is_none(),
+            egui::Button::selectable(self.folder_manual_order_applied(), "手動順 (このフォルダ)"),
+        );
+        let response = if let Some(reason) = disabled_reason {
+            response.hover_tip_disabled(reason)
+        } else {
+            response.on_hover_text("このフォルダで記録した並び順を使います")
+        };
+        if response.clicked() {
+            self.select_folder_sort(crate::app::FolderSortChoice::Manual);
+            ui.close();
+        }
+        let response = ui.add_enabled(
+            self.folder_order_reset_available(),
+            egui::Button::new("手動順をリセット…"),
+        );
+        if response.clicked() {
+            self.request_folder_order_reset_confirmation();
+            ui.close();
+        }
+    }
 
     fn sort_order_control_label(
         &self,
@@ -10654,7 +10971,7 @@ impl App {
                                         }
                                     }
                                 });
-                                if let Some(reason) = sort_lock.filter(|_| self.sort_loading_control_label().is_none()) {
+                                if let Some(reason) = sort_lock.filter(|_| self.sort_loading_control_label().is_none() && self.listing_sort_capabilities().manual_order_disabled_reason.is_some()) {
                                     // 無効ウィジェットは通常の hover を sense しないため、
                                     // disabled 専用ツールチップで理由を出す。
                                     let _response = ui.add_enabled(
@@ -10702,7 +11019,7 @@ impl App {
                                                 self.rating_view_sort
                                                     == crate::rating_view::RatingViewSort::Normal(order)
                                             } else {
-                                                self.settings.sort_order == order
+                                                !self.folder_manual_order_applied() && self.settings.sort_order == order
                                             };
                                             let prefix = if checked { "✓ " } else { "  " };
                                             let disabled_reason = self.listing_sort_capabilities().disabled_reason(order);
@@ -10715,7 +11032,7 @@ impl App {
                                             } else {
                                                 resp.on_hover_text(self.sort_order_tooltip(order, checked))
                                             };
-                                            match sort_control_decision(resp.clicked(), checked, order) {
+                                            match sort_control_decision(resp.clicked(), checked, order, self.folder_order.manual_active()) {
                                                 SortControlDecision::Reload => {
                                                     sort_reload_requested = true;
                                                     ui.close();
@@ -10733,8 +11050,7 @@ impl App {
                                                         crate::rating_view::RatingViewSort::Normal(order),
                                                     );
                                                 } else {
-                                                    self.settings.sort_order = order;
-                                                    sort_changed = true;
+                                                    sort_changed |= self.select_folder_sort(crate::app::FolderSortChoice::Standard(order));
                                                 }
                                                 ui.close();
                                                 }
@@ -10775,6 +11091,8 @@ impl App {
                                             }
                                         }
                                         });
+                                        ui.separator();
+                                        self.draw_folder_manual_sort_entries(ui);
                                         if self.draw_sort_loading_control(ui) {
                                             ui.close();
                                         }
@@ -12275,12 +12593,16 @@ impl App {
     }
 
     /// Keep the source grid visible while a location or its new order is prepared offscreen.
-    fn render_location_navigation_wait_overlay(&self, ctx: &egui::Context) {
+    fn render_location_navigation_wait_overlay(
+        &self,
+        ctx: &egui::Context,
+        now: std::time::Instant,
+    ) {
         let location_pending = self.location_navigation_pending();
         if !location_pending && !self.view_order_refresh_scan_pending() {
             return;
         }
-        if let Some(delay) = self.direct_navigation_wait_overlay_delay() {
+        if let Some(delay) = self.direct_navigation_wait_overlay_delay_at(now) {
             ctx.request_repaint_after(delay);
             return;
         }
@@ -13044,7 +13366,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                     self.rating_view_sort
                                         == crate::rating_view::RatingViewSort::Normal(order)
                                 } else {
-                                    self.settings.sort_order == order
+                                    !self.folder_manual_order_applied() && self.settings.sort_order == order
                                 };
                                 let disabled_reason = self.listing_sort_capabilities().disabled_reason(order);
                                 let resp = ui.add_enabled(
@@ -13059,7 +13381,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                         resp.hover_tip_disabled(disabled_reason.unwrap()),
                                     None => resp.on_hover_text(self.sort_order_tooltip(order, selected)),
                                 };
-                                match sort_control_decision(resp.clicked(), selected, order) {
+                                match sort_control_decision(resp.clicked(), selected, order, self.folder_order.manual_active()) {
                                     SortControlDecision::Reload => toolbar_sort_reload_requested = true,
                                     SortControlDecision::Change => {
                                     if let Some(root) = root_order {
@@ -13080,9 +13402,10 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                             crate::rating_view::RatingViewSort::Normal(order),
                                         );
                                     } else {
-                                        self.settings.sort_order = order;
-                                        self.settings.save();
-                                        toolbar_sort_changed = true;
+                                        if self.select_folder_sort(crate::app::FolderSortChoice::Standard(order)) {
+                                            self.settings.save();
+                                            toolbar_sort_changed = true;
+                                        }
                                     }
                                     }
                                     SortControlDecision::None => {}
@@ -14669,6 +14992,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     root.standard_sort.short_label().to_string()
                 }
             }
+        } else if self.folder_manual_order_applied() {
+            "手動順 (このフォルダ)".to_string()
         } else if self.items_are_bookmark_view {
             self.bookmark_view_sort.short_label().to_string()
         } else if self.items_are_tag_view {
@@ -14695,8 +15020,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             id_salt == "facet_sort_combo" && self.items_are_subfolder_expansion_view;
         let refresh_available = id_salt == "facet_sort_combo" && self.grid_sort_refresh_available();
         let loading_control = self.sort_loading_control_label();
-        let combo_enabled =
-            !sort_disabled || grouping_available || refresh_available || loading_control.is_some();
+        let combo_enabled = !sort_disabled
+            || grouping_available
+            || refresh_available
+            || loading_control.is_some()
+            || self
+                .listing_sort_capabilities()
+                .manual_order_disabled_reason
+                .is_none();
         let root_order = self.collection_grid_root_order().and_then(Result::ok);
         let tb_sorts = self.settings.toolbar_sort_items.clone();
         let mut sort_changed = false;
@@ -14713,10 +15044,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.items_are_bookmark_view,
             2 * usize::from(grouping_available)
                 + usize::from(refresh_available)
-                + usize::from(loading_control.is_some()),
+                + usize::from(loading_control.is_some())
+                + 2,
             usize::from(grouping_available)
                 + usize::from(refresh_available)
-                + usize::from(loading_control.is_some()),
+                + usize::from(loading_control.is_some())
+                + 1,
         );
         let current_text = self.grid_sort_dropdown_text();
         // 場所を先に取ってから無効化する。逆順だと折り返しが子 UI の
@@ -14729,7 +15062,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             sort_popup_height,
             |ui| {
                 apply_toolbar_style(ui);
-                // Only sort selection is locked. Refresh and grouping remain usable.
+                // Only standard sort selection is locked. Manual selection,
+                // refresh and grouping have their own capability checks.
                 ui.add_enabled_ui(!sort_disabled, |ui| {
                     #[cfg(all(windows, feature = "test-script"))]
                     if root_order.is_some() {
@@ -14785,7 +15119,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         } else if self.items_are_rating_view {
                             self.rating_view_sort == crate::rating_view::RatingViewSort::Normal(order)
                         } else {
-                            self.settings.sort_order == order
+                            !self.folder_manual_order_applied() && self.settings.sort_order == order
                         };
                         let disabled_reason = self.listing_sort_capabilities().disabled_reason(order);
                         let resp = ui.add_enabled(
@@ -14824,7 +15158,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 ui.clip_rect(),
                             );
                         }
-                        match sort_control_decision(resp.clicked(), selected, order) {
+                        match sort_control_decision(resp.clicked(), selected, order, self.folder_order.manual_active()) {
                             SortControlDecision::Reload => reload_requested = true,
                             SortControlDecision::Change => {
                                 if let Some(root) = root_order {
@@ -14845,9 +15179,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         crate::rating_view::RatingViewSort::Normal(order),
                                     );
                                 } else {
-                                    self.settings.sort_order = order;
-                                    self.settings.save();
-                                    sort_changed = true;
+                                    if self.select_folder_sort(crate::app::FolderSortChoice::Standard(order)) {
+                                        self.settings.save();
+                                        sort_changed = true;
+                                    }
                                 }
                             }
                             SortControlDecision::None => {}
@@ -14881,6 +15216,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     }
                 });
+                ui.separator();
+                self.draw_folder_manual_sort_entries(ui);
                 if id_salt == "facet_sort_combo" {
                     if grouping_available {
                         ui.separator();
@@ -17475,7 +17812,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     | Some(AddressBarNav::CollectionSource { path: p, .. }) => {
                                         format!("親フォルダへ [BS]\n{}", p.to_string_lossy())
                                     }
-                                    Some(AddressBarNav::GridVirtual(intent)) => {
+                                    Some(AddressBarNav::GridFolder(intent))
+                                    | Some(AddressBarNav::GridVirtual(intent)) => {
                                         format!(
                                             "親フォルダへ [BS]\n{}",
                                             intent.path.to_string_lossy()
@@ -19193,7 +19531,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 } else {
                     self.thumb_adjust_tex.get(&idx)
                 };
-                crate::app::draw_cell(
+                let display_image = self.grid_thumbnail_display_image(idx);
+                crate::app::draw_cell_with_display_image(
                     &ui,
                     rect,
                     self.selected == Some(idx),
@@ -19214,6 +19553,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     is_cut,
                     resume,
                     &self.settings.folder_cell_background,
+                    display_image.as_ref(),
                 );
                 if self.grid_drop_hover(idx) {
                     crate::app::draw_grid_drop_target(ui.painter(), rect, ui.visuals());
@@ -19658,18 +19998,22 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         // primary (左) ボタンのドラッグだけを起点にする。native drag 直後の
         // 1 フレームは抑止 (幽霊ドラッグ防止の保険、§6.1)。
         if native_drag_started {
-            match decide_drag_payload(&self.items, &self.checked, idx) {
-                DragDecision::Start {
-                    paths,
-                    post_drag_toast,
-                } => {
-                    self.pending_native_drag = Some(crate::app::PendingNativeDrag {
+            if self.folder_manual_order_drag_enabled() {
+                self.begin_folder_order_drag(ctx, idx);
+            } else {
+                match decide_drag_payload(&self.items, &self.checked, idx) {
+                    DragDecision::Start {
                         paths,
                         post_drag_toast,
-                    });
+                    } => {
+                        self.pending_native_drag = Some(crate::app::PendingNativeDrag {
+                            paths,
+                            post_drag_toast,
+                        });
+                    }
+                    DragDecision::ImmediateToast(msg) => self.show_feedback_warning(msg),
+                    DragDecision::None => {}
                 }
-                DragDecision::ImmediateToast(msg) => self.show_feedback_warning(msg),
-                DragDecision::None => {}
             }
         }
         nav
@@ -19882,12 +20226,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     &effective_event
                 }
                 GridPrimaryInput::Release {
+                    at,
                     click,
                     modifiers,
                     source,
                     suppressed,
                 } => {
                     effective_event = GridPrimaryInput::Release {
+                        at: *at,
                         click: *click,
                         modifiers: *modifiers,
                         source: *source,
@@ -19904,7 +20250,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             let accepted = self.grid_click_pairing.accept_primary_input(
                 context,
                 frame,
-                ctx.input(|input| input.time),
                 options.max_double_click_delay,
                 options.max_click_dist,
                 selected_event,
@@ -22171,9 +22516,38 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
     // ── サムネイルグリッド ───────────────────────────────────────────
 
+    /// Preserve the old list's appearance during the sort indicator's visual grace.
+    /// Input ownership remains entirely with the existing grid item gate.
+    pub(crate) fn gate_main_grid_item_input_at(&self, ui: &mut egui::Ui, now: std::time::Instant) {
+        let Some(block) = self.grid_item_input_block() else {
+            return;
+        };
+        if block == crate::filename_stack_ui::GridItemInputBlock::ViewOrderRefreshScan
+            && self.direct_navigation_wait_overlay_delay_at(now).is_some()
+        {
+            // As in gate_main_chrome, restore the style immediately so genuinely
+            // disabled child controls retain their own disabled appearance.
+            let disabled_alpha = ui.visuals().disabled_alpha;
+            ui.visuals_mut().disabled_alpha = 1.0;
+            ui.disable();
+            ui.visuals_mut().disabled_alpha = disabled_alpha;
+        } else {
+            ui.disable();
+        }
+    }
+
     /// サムネイルグリッドを描画し、フォルダナビゲーション先を返す。
     pub(crate) fn render_grid(&mut self, root_ui: &mut egui::Ui) -> Option<AddressBarNav> {
+        self.render_grid_at(root_ui, std::time::Instant::now())
+    }
+
+    pub(crate) fn render_grid_at(
+        &mut self,
+        root_ui: &mut egui::Ui,
+        now: std::time::Instant,
+    ) -> Option<AddressBarNav> {
         let ctx = &root_ui.ctx().clone();
+        let folder_drag_end = self.take_folder_order_drag_end(ctx);
         self.begin_grid_click_input_frame(ctx);
         let scroll_to = self.grid_scroll.take_reveal();
         if self.settings.grid_view_mode != GridViewMode::Details
@@ -22190,9 +22564,24 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         let nav = egui::CentralPanel::default()
             .show(root_ui, |ui| -> Option<AddressBarNav> {
-                if !self.grid_item_input_allowed() {
-                    ui.disable();
+                if self.detached_viewer_editing_blocks_grid_input() {
+                    // Preserve the disabled list's extent for native drop hit-testing,
+                    // including empty and filtered-empty early returns below.
+                    self.record_main_drop_grid_geometry(ui, ui.max_rect(), Vec::new());
+                    let presses = ctx.input(|input| input.events.iter().filter_map(|event| match event {
+                        egui::Event::PointerButton { pos, pressed: true, .. }
+                        | egui::Event::Touch { pos, phase: egui::TouchPhase::Start, .. } => {
+                            ui.max_rect().contains(*pos).then_some(*pos)
+                        }
+                        _ => None,
+                    }).collect::<Vec<_>>());
+                    if ctx.viewport_id() == egui::ViewportId::ROOT
+                        && presses.iter().any(|pos| ctx.layer_id_at(*pos) == Some(ui.layer_id()))
+                    {
+                        self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+                    }
                 }
+                self.gate_main_grid_item_input_at(ui, now);
                 let suppress_primary_pointer = self.begin_grid_right_drag_primary_frame(ctx);
                 // Preserve the grid-owned pending click for this frame's cell check, while
                 // clearing App state up front so a primary click not accepted by any cell breaks
@@ -22748,6 +23137,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     input.pointer.latest_pos(), input.pointer.primary_down(),
                     input.pointer.delta(), input.pointer.velocity())));
                 let mut drop_clip = egui::Rect::NOTHING;
+                let mut folder_drag_origin = egui::Pos2::ZERO;
                 let mut drop_folders = Vec::new();
                 let capture_drop_folders = self.is_physical_folder_listing() && self.grid_item_input_allowed();
                 let scroll_output = egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
@@ -22767,6 +23157,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             egui::vec2(avail_w, total_h),
                             egui::Sense::hover(),
                         );
+                        folder_drag_origin = content_rect.min;
                         #[cfg(test)]
                         ctx.data_mut(|data| data.insert_temp(
                             egui::Id::unique(("grid_scroll_render_origin", grid_context)),
@@ -22972,7 +23363,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     let is_cut = self.items[idx]
                                         .drag_source_path()
                                         .is_some_and(|path| self.cut_clipboard.contains(path));
-                                    let mut areas = crate::app::draw_cell_with_hit_areas(
+                                    let display_image = self.grid_thumbnail_display_image(idx);
+                                    let mut areas = crate::app::draw_cell_with_hit_areas_and_display_image(
                                         ui,
                                         cell_rect,
                                         selected_before,
@@ -22993,6 +23385,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         is_cut,
                                         resume,
                                         &self.settings.folder_cell_background,
+                                        display_image.as_ref(),
                                     );
                                     if let Some(title) = self.draw_bookmark_view_overlay(
                                         ui,
@@ -23120,7 +23513,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     // で対応させる)。
                                     // ネスト ZIP では本ごとピン (Model B): book キー + ZipEntry source
                                     // (ルート = zip_path / 本の中 = 実効 prefix)。
-                                    crate::app::draw_cell(
+                                    let display_image = self.grid_thumbnail_display_image(idx);
+                                    crate::app::draw_cell_with_display_image(
                                         ui,
                                         cell_rect,
                                         self.selected == Some(idx),
@@ -23141,6 +23535,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         is_cut,
                                         book_resume_meter,
                                         &self.settings.folder_cell_background,
+                                        display_image.as_ref(),
                                     );
                                 }
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
@@ -23251,6 +23646,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     primary_click_hit_cell, primary_press_hit_cell, suppress_primary_pointer,
                     previous_grid_click_pairing, &touch_frame,
                 ));
+                self.finish_folder_order_drag_frame(
+                    ui, scroll_output.inner_rect, folder_drag_origin, geometry, cell_w, folder_drag_end,
+                );
                 self.finish_grid_pointer_trace(ctx);
                 self.clear_mouse_ring_context_menu_suppression_if_idle(ctx);
 
@@ -23293,7 +23691,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 nav
             })
             .inner;
-        self.render_location_navigation_wait_overlay(ctx);
+        self.render_location_navigation_wait_overlay(ctx, now);
         nav
     }
 
@@ -34242,6 +34640,94 @@ mod grid_reclick_open_tests {
             .collect()
     }
 
+    fn timestamp_919_grid_pass(
+        harness: &mut Harness<'static, HandlerState>,
+        pos: egui::Pos2,
+        pass: f64,
+        stamps: Option<(f64, f64)>,
+    ) {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        for (pressed, time) in [(true, stamps.map(|s| s.0)), (false, stamps.map(|s| s.1))] {
+            if let Some(time) = time {
+                events.push(egui::Event::PointerButtonTime {
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    time,
+                });
+            }
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let raw = harness.input_mut();
+        raw.time = Some(pass);
+        raw.input_clock = Some(pass);
+        raw.events = events;
+        // Keep annotations and button events in the same RawInput; event() would
+        // split them into independent egui passes.
+        harness.step();
+    }
+
+    #[test]
+    fn grid_919_timestamped_stall_opens_cell_but_unstamped_does_not() {
+        for known in [false, true] {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+            harness
+                .ctx
+                .options_mut(|o| o.input_options.max_double_click_delay = 0.5);
+            let pos = cell_rect(0).center();
+            harness.hover_at(pos);
+            harness.run();
+            timestamp_919_grid_pass(&mut harness, pos, 1.08, known.then_some((1.0, 1.08)));
+            assert_eq!(harness.state().activations, 0);
+            timestamp_919_grid_pass(&mut harness, pos, 1.8, known.then_some((1.25, 1.33)));
+            assert_eq!(harness.state().activations, usize::from(known));
+        }
+    }
+
+    #[test]
+    fn grid_919_timestamped_stall_pairs_background_but_unstamped_does_not() {
+        for known in [false, true] {
+            let mut harness = background_harness(GridClickSelectionMode::Explorer);
+            harness
+                .ctx
+                .options_mut(|o| o.input_options.max_double_click_delay = 0.5);
+            let pos = egui::pos2(30.0, 170.0);
+            harness.hover_at(pos);
+            harness.run();
+            timestamp_919_grid_pass(&mut harness, pos, 1.08, known.then_some((1.0, 1.08)));
+            assert!(harness.state().background_navs.is_empty());
+            timestamp_919_grid_pass(&mut harness, pos, 1.8, known.then_some((1.25, 1.33)));
+            assert_eq!(harness.state().background_navs.len(), usize::from(known));
+        }
+    }
+
+    #[test]
+    fn grid_919_mixed_timestamp_pairs_retain_pass_interval_in_both_orders() {
+        for first_known in [false, true] {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+            harness
+                .ctx
+                .options_mut(|o| o.input_options.max_double_click_delay = 0.5);
+            let pos = cell_rect(0).center();
+            harness.hover_at(pos);
+            harness.run();
+            timestamp_919_grid_pass(&mut harness, pos, 1.08, first_known.then_some((1.0, 1.08)));
+            timestamp_919_grid_pass(
+                &mut harness,
+                pos,
+                1.8,
+                (!first_known).then_some((1.25, 1.33)),
+            );
+            assert_eq!(harness.state().activations, 0);
+        }
+    }
+
     fn section1680_double_click(harness: &mut Harness<'static, HandlerState>, pos: egui::Pos2) {
         harness.hover_at(pos);
         harness.run();
@@ -35437,6 +35923,7 @@ mod grid_reclick_open_tests {
                         OpenRequestOwner::Navigation,
                         StartupListIntent::ExplicitList,
                     ));
+                    app.finish_direct_navigation_scan_before_hydration_for_test();
                     app.finish_page_identity_preparation_for_test();
                     if !stacked {
                         app.move_grid_cursor(Some(3), crate::app::GridCursorIntent::Automatic);
@@ -36794,7 +37281,7 @@ mod section207_tests {
             only_folder_and_tree(&mut env);
             let folder = env.tmp.path().join("physical-parent-button");
             std::fs::create_dir_all(&folder).unwrap();
-            env.load_folder_with_scan(folder, None);
+            env.load_folder_and_finish_for_test(folder);
             let app = Rc::new(RefCell::new(env));
             let render = Rc::clone(&app);
             let settings_menu = Rc::new(Cell::new(false));
@@ -37667,7 +38154,7 @@ mod section207_tests {
                         let folder = app.tmp.path().join("snapshot-label");
                         std::fs::create_dir_all(&folder).unwrap();
                         std::fs::write(folder.join("image.jpg"), b"fixture").unwrap();
-                        app.load_folder_with_scan(folder, None);
+                        app.load_folder_and_finish_for_test(folder);
                         app.finish_page_identity_preparation_for_test();
                         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
                         app.finish_page_identity_preparation_for_test();
@@ -37782,7 +38269,7 @@ mod section207_tests {
                 let folder = env.tmp.path().join("reported-controls");
                 std::fs::create_dir_all(&folder).unwrap();
                 std::fs::write(folder.join("image.jpg"), b"fixture").unwrap();
-                env.load_folder_with_scan(folder.clone(), None);
+                env.load_folder_and_finish_for_test(folder.clone());
                 let item = env.items[0].clone();
                 env.items.resize(674, item);
                 env.visible_indices = (0..674).collect();
@@ -37968,7 +38455,7 @@ mod section207_tests {
                                 std::fs::write(folder.join(name), b"fixture").unwrap();
                             }
                             env.settings.skip_duplicate_images = true;
-                            env.load_folder_with_scan(folder, None);
+                            env.load_folder_and_finish_for_test(folder);
                             env.selected = Some(0);
                             // Representative state for the existing cached status badge.
                             env.current_folder_rating_cache = Some(5);
@@ -38040,7 +38527,12 @@ mod section207_tests {
                 std::fs::write(target.join(name), []).unwrap();
                 std::fs::write(source.join(name), []).unwrap();
             }
-            env.load_folder_with_scan(source.clone(), None);
+            // This fixture inspects hydration before it completes; keep its scan prepared
+            // rather than using the shared helper that also finishes page identities.
+            let scan =
+                crate::app::folder_scan::scan_directory_with_settings(&source, &env.settings)
+                    .unwrap();
+            env.load_folder_with_scan(source.clone(), Some(scan));
             assert_eq!(
                 env.modal_dialog_block_reason(),
                 Some("sidecar_restore"),
@@ -38114,7 +38606,7 @@ mod section207_tests {
         for path in [&source, &middle, &oldest] {
             std::fs::create_dir_all(path).unwrap();
         }
-        env.load_folder(source.clone());
+        env.load_folder_and_finish_for_test(source.clone());
         env.folder_nav_back_stack = vec![
             FolderNavHistoryTarget::Path(oldest.clone()).into(),
             FolderNavHistoryTarget::Path(middle.clone()).into(),
@@ -38243,7 +38735,7 @@ mod section207_tests {
                 target
             });
             env.active_quick_folder_slot = None;
-            env.load_folder(source);
+            env.load_folder_and_finish_for_test(source);
             env.recent_folders = targets.to_vec();
             let app = Rc::new(RefCell::new(env));
             let render = Rc::clone(&app);
@@ -38833,7 +39325,7 @@ mod section292_tests {
         for name in ["a.jpg", "b.jpg"] {
             std::fs::write(folder.join(name), b"image").unwrap();
         }
-        app.load_folder_with_scan(folder, None);
+        app.load_folder_and_finish_for_test(folder);
         // Production sanitizes pointer input during hydration; this harness must settle it first.
         app.finish_page_identity_preparation_for_test();
         app.settings.show_toolbar_sort = true;
@@ -38940,7 +39432,7 @@ mod section292_tests {
             .filter(|n| n.value().as_deref() == Some("列ヘッダ"))
             .collect();
         assert_eq!(locked.len(), 2);
-        assert!(locked[0].accesskit_node().is_disabled());
+        assert!(!locked[0].accesskit_node().is_disabled());
         assert!(!locked[1].accesskit_node().is_disabled());
     }
 
@@ -38967,7 +39459,7 @@ mod section292_tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, b"image").unwrap();
         }
-        app.load_folder_with_scan(root.join("a"), None);
+        app.load_folder_and_finish_for_test(root.join("a"));
         app.finish_page_identity_preparation_for_test();
         app.settings.show_toolbar_sort = false;
         app.settings.show_facet_sort = true;

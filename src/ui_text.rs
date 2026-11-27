@@ -2013,6 +2013,7 @@ impl App {
         self.comic_preview_base = None;
         self.comic_tail_stash.clear();
 
+        self.stop_projected_slideshow_playback();
         self.text_mode = true;
         self.text_selected = None;
         self.text_selected_ids.clear();

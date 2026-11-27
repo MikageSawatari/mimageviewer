@@ -225,11 +225,12 @@ fn native_backdrop_plain_favorite_and_direct_keep_immediate_loader_cleanup() {
             let pending = app.folder_pane_open_pending.as_ref().unwrap();
             assert!(matches!(
                 pending.purpose,
-                FolderOpenScanPurpose::DirectNavigation
+                FolderOpenScanPurpose::DirectNavigation(_)
             ));
             assert_eq!(pending.path, target);
-            settle(&mut app, Some(&target));
         }
+        // Both marked favorites and unmarked Direct opens now finish on the worker.
+        settle(&mut app, Some(&target));
         assert_eq!(app.current_folder.as_ref(), Some(&target));
         assert!(app.folder_pane_open_pending.is_none());
         settle(&mut app, Some(&target));

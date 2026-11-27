@@ -550,6 +550,8 @@ pub struct SnapshotState {
     // ── 退避 state (= snapshot OFF 時に復元) ──
     /// snapshot ON 時点の `App.items` (= 通常フォルダの GridItem 一覧)
     pub saved_items: Vec<crate::grid_item::GridItem>,
+    /// The retained physical order belongs to saved_items, not the fixed subset.
+    pub(crate) saved_folder_order: Box<crate::folder_order::FolderOrderState>,
     pub(crate) saved_viewing_state: SnapshotViewingState,
     pub(crate) saved_projection_recipe: crate::app::book_materialization::ProjectionRecipe,
     /// Immutable prepared identities stay paired with the saved basis rows.

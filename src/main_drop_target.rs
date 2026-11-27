@@ -39,7 +39,8 @@ pub(crate) struct InternalDrag {
 #[derive(Debug)]
 pub(crate) enum DropRequest {
     GridFiles(Vec<PathBuf>),
-    FolderTransfer(ShellTransferRequest),
+    GridInputBlocked(String),
+    FolderTransfer(ShellTransferRequest, DropPlace),
     Failed(String),
 }
 
@@ -55,6 +56,7 @@ pub(crate) struct DropGeometry {
     pub(crate) tree_clip: egui::Rect,
     pub(crate) rows: Vec<DropRow>,
     pub(crate) grid_clip: egui::Rect,
+    pub(crate) grid_input_blocked: Option<String>,
     pub(crate) grid_folders: Vec<DropRow>,
     pub(crate) grid_blocked: Vec<egui::Rect>,
     pub(crate) client_size_px: [i32; 2],
@@ -111,6 +113,7 @@ enum Hit {
     Folder { path: PathBuf, place: DropPlace },
     TreeNonTarget,
     GridNonTarget,
+    GridInputBlocked(String),
     ExistingDropArea,
 }
 
@@ -145,6 +148,9 @@ fn hit_test(
         return Some(Hit::TreeNonTarget);
     }
     if geometry.grid_clip.contains(point) {
+        if let Some(reason) = &geometry.grid_input_blocked {
+            return Some(Hit::GridInputBlocked(reason.clone()));
+        }
         if let Some(row) = geometry
             .grid_folders
             .iter()
@@ -177,16 +183,19 @@ const ALT: u32 = 32;
 enum Description {
     Invalid,
     None,
+    GridInputBlocked(String),
     Transfer(ShellTransferOperation, PathBuf),
 }
 
 #[derive(Clone, Debug)]
 enum Decision {
     None(Description),
+    GridInputBlocked(String),
     Refused(crate::grid_item::FileOperationRefusal),
     Grid,
     Folder {
         destination: PathBuf,
+        place: DropPlace,
         operation: ShellTransferOperation,
         default_move_needs_volume_check: bool,
     },
@@ -194,12 +203,16 @@ enum Decision {
 
 impl Decision {
     fn accepted(&self) -> bool {
-        !matches!(self, Self::None(_) | Self::Refused(_))
+        !matches!(
+            self,
+            Self::None(_) | Self::Refused(_) | Self::GridInputBlocked(_)
+        )
     }
 
     fn description(&self) -> Description {
         match self {
             Self::None(description) => description.clone(),
+            Self::GridInputBlocked(reason) => Description::GridInputBlocked(reason.clone()),
             Self::Refused(_) => Description::None,
             Self::Grid => Description::Invalid,
             Self::Folder {
@@ -247,9 +260,10 @@ fn decide(
     let Some(hit) = hit else {
         return Decision::None(Description::None);
     };
-    let destination = match hit {
-        Hit::Folder { path, .. } => path,
+    let (destination, place) = match hit {
+        Hit::Folder { path, place } => (path, place),
         Hit::TreeNonTarget | Hit::GridNonTarget => return Decision::None(Description::None),
+        Hit::GridInputBlocked(reason) => return Decision::GridInputBlocked(reason),
         Hit::ExistingDropArea => {
             return if internal.is_none() && external_has_paths && source_allows_copy {
                 Decision::Grid
@@ -265,6 +279,7 @@ fn decide(
         return if external_has_paths {
             Decision::Folder {
                 destination,
+                place,
                 operation: ShellTransferOperation::Copy,
                 default_move_needs_volume_check: false,
             }
@@ -325,6 +340,7 @@ fn decide(
     }
     Decision::Folder {
         destination,
+        place,
         operation,
         default_move_needs_volume_check: default && operation == ShellTransferOperation::Move,
     }
@@ -354,7 +370,7 @@ impl DragSession {
         }
     }
 
-    fn describe(&self, description: Description) {
+    fn describe(&self, description: Description) -> bool {
         let changed = {
             let mut last = self.description.borrow_mut();
             if last.as_ref() == Some(&description) {
@@ -369,6 +385,7 @@ impl DragSession {
                 "main_drop_target: drop description failed: {error}"
             ));
         }
+        changed
     }
 
     fn drop_request(
@@ -378,6 +395,9 @@ impl DragSession {
     ) -> Result<Option<DropRequest>, String> {
         match decision {
             Decision::None(_) => Ok(None),
+            Decision::GridInputBlocked(reason) => {
+                Ok(Some(DropRequest::GridInputBlocked(reason.clone())))
+            }
             Decision::Refused(reason) => Ok(Some(DropRequest::Failed(reason.message("移動")))),
             Decision::Grid => {
                 let paths = self.data.paths()?;
@@ -388,6 +408,7 @@ impl DragSession {
             }
             Decision::Folder {
                 destination,
+                place,
                 operation,
                 default_move_needs_volume_check,
             } => {
@@ -398,12 +419,15 @@ impl DragSession {
                 if sources.is_empty() {
                     return Err("ドロップする項目がありません".into());
                 }
-                Ok(Some(DropRequest::FolderTransfer(ShellTransferRequest {
-                    operation: *operation,
-                    default_move_needs_volume_check: *default_move_needs_volume_check,
-                    sources,
-                    destination: destination.clone(),
-                })))
+                Ok(Some(DropRequest::FolderTransfer(
+                    ShellTransferRequest {
+                        operation: *operation,
+                        default_move_needs_volume_check: *default_move_needs_volume_check,
+                        sources,
+                        destination: destination.clone(),
+                    },
+                    *place,
+                )))
             }
         }
     }

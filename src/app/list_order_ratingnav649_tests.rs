@@ -97,6 +97,7 @@ fn settle(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         app.settle_open_path_classification_for_test();
+        app.poll_direct_navigation_scan_for_test(ctx);
         app.poll_history_navigation_transition_for_test(ctx);
         app.poll_zip_enumerate();
         app.poll_reading_history_thumbnail_sources(ctx);
@@ -112,6 +113,7 @@ fn settle(app: &mut App, ctx: &egui::Context) {
             && app.fs_nav_after_pdf_enumerate.is_none()
             && app.reading_history_sources_pending.is_empty()
             && !app.sidecar_restore_active()
+            && !app.direct_navigation_scan_pending()
         {
             break;
         }
@@ -272,7 +274,7 @@ fn scenario(zip_books: bool, entry: Entry, date_desc: bool) {
                 .unwrap();
         }
         app.settings.rating_filter = FIVE_ONLY;
-        app.load_folder(root.clone());
+        app.load_folder_and_finish_for_test(root.clone());
         app.finish_page_identity_preparation_for_test();
         let expected = if date_desc {
             vec![paths[2].clone(), paths[0].clone()]
@@ -327,15 +329,28 @@ fn scenario(zip_books: bool, entry: Entry, date_desc: bool) {
                 "virtual request owns the auto-open intent"
             );
         } else {
+            // §6.3(8)/§6.6(6a): admission captures these effects; only adoption
+            // changes the still-visible Folder's return/filter state.
+            let crate::ui_main::AddressBarNav::GridFolder(intent) = &nav else {
+                panic!("Folder activation must carry its deferred effects");
+            };
             assert!(
-                app.reading_history_return_from.is_none(),
-                "ordinary Folder clears the old history return at admission"
+                intent.effects.reading_history_return_from.is_none(),
+                "ordinary Folder clears the old history return at adoption"
             );
             assert_eq!(
-                app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
+                intent.effects.rating_suppression.as_deref().map(|(p, _)| p),
                 Some(first)
             );
-            assert_eq!(app.pending_auto_fs_open, auto_open);
+            assert_eq!(intent.effects.auto_fullscreen, auto_open);
+            assert_eq!(
+                app.reading_history_return_from
+                    .as_ref()
+                    .map(|return_from| &return_from.container),
+                Some(&previous_return)
+            );
+            assert!(app.rating_filter_suppressed_at.is_none());
+            assert!(!app.pending_auto_fs_open);
         }
         trace(&app, "open accepted before load");
         let snapshot = app
@@ -411,7 +426,7 @@ fn folder_enter_auto_open(filter: [bool; 6]) {
         .unwrap()
         .set(&crate::adjustment_db::normalize_path(&book), 5)
         .unwrap();
-    app.load_folder(root);
+    app.load_folder_and_finish_for_test(root);
     app.finish_page_identity_preparation_for_test();
     app.selected = Some(0);
     assert!(app.should_auto_fullscreen_grid_container(0));
@@ -481,18 +496,29 @@ fn ratingnav649_enter_and_pointer_folder_receipt_preserve_history_return() {
             assert!(app.items_are_reading_history_view);
             assert_eq!(app.items.len(), 1);
             app.selected = Some(0);
+            let return_before = app.reading_history_return_from.clone();
+            let suppression_before = app.rating_filter_suppressed_at.clone();
             let nav = accept_entry(&mut app, &ctx, entry).unwrap();
+            // §6.3(8)/§6.6(6a): retain the history list until this candidate is adopted.
+            let crate::ui_main::AddressBarNav::GridFolder(intent) = &nav else {
+                panic!("history Folder activation must carry its deferred effects");
+            };
             assert_eq!(
-                app.reading_history_return_from
+                intent
+                    .effects
+                    .reading_history_return_from
                     .as_ref()
                     .map(|reservation| &reservation.container),
                 Some(&book)
             );
             assert_eq!(
-                app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
+                intent.effects.rating_suppression.as_deref().map(|(p, _)| p),
                 Some(&book)
             );
-            assert_eq!(app.pending_auto_fs_open, auto_open);
+            assert_eq!(intent.effects.auto_fullscreen, auto_open);
+            assert_eq!(app.reading_history_return_from, return_before);
+            assert_eq!(app.rating_filter_suppressed_at, suppression_before);
+            assert!(!app.pending_auto_fs_open);
             assert!(
                 app.list_order.is_none(),
                 "history cannot replace a normal-folder snapshot"
@@ -542,7 +568,7 @@ fn ratingnav649_gamepad_extension_named_folder_keeps_existing_receipt() {
             .unwrap()
             .set(&crate::adjustment_db::normalize_path(&book), 5)
             .unwrap();
-        app.load_folder(root.clone());
+        app.load_folder_and_finish_for_test(root.clone());
         app.finish_page_identity_preparation_for_test();
         assert!(matches!(app.items.as_slice(), [GridItem::Folder(_)]));
         app.selected = Some(0);
@@ -550,7 +576,9 @@ fn ratingnav649_gamepad_extension_named_folder_keeps_existing_receipt() {
         app.reading_history_return_from =
             Some(ReadingHistoryBookReturn::without_entrance(previous.clone()));
         let nav = accept_entry(&mut app, &ctx, Entry::Gamepad).unwrap();
-        assert!(matches!(nav, crate::ui_main::AddressBarNav::Direct(ref path, _) if path == &book));
+        assert!(
+            matches!(nav, crate::ui_main::AddressBarNav::GridFolder(ref intent) if intent.path == book)
+        );
         assert_eq!(captured_paths(&app), [book]);
         assert_eq!(
             app.reading_history_return_from
@@ -603,7 +631,7 @@ fn ratingnav649_smart_pointer_consumed_open_does_not_fall_through_to_secondary_c
         // release + secondary press/release must reach the context-menu footer.
         // Since §1.680, activation ends the ordered stream for ordinary opens
         // as well as Smart opens; an activating double-click is not a control.
-        app.load_folder(source.clone());
+        app.load_folder_and_finish_for_test(source.clone());
         app.finish_page_identity_preparation_for_test();
         let idx = app
             .items

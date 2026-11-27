@@ -1,5 +1,121 @@
 mod physical;
 
+#[cfg(all(test, windows))]
+mod page_edit_920_tests {
+    use super::*;
+
+    fn linked_editing_app() -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().to_owned();
+        app.items = vec![
+            GridItem::Image(root.join("old.png")),
+            GridItem::Image(root.join("new.png")),
+        ];
+        app.visible_indices = vec![0, 1];
+        app.details_order = vec![0, 1];
+        app.selected = Some(0);
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = super::super::ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = false;
+        app.main_hwnd = Some(1);
+        app.settings.gamepad_enabled = true;
+        app.conceal_mode = true;
+        app
+    }
+
+    fn poll(app: &mut App, ctx: &egui::Context) -> GamepadDispatchOutcome {
+        let mut outcome = None;
+        ctx.run_pass(Default::default(), |ctx| {
+            let batch = app.sample_gamepad_input_with_logic_for_test(ctx);
+            outcome = Some(app.dispatch_gamepad_batch_with_admission(ctx, batch, |_, _| true));
+        })
+        .drop_without_applying_deltas();
+        outcome.unwrap()
+    }
+
+    #[test]
+    fn page_edit_920_gamepad_rejected_holds_never_fire_after_editing_ends() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        for button in [
+            PadButton::South,
+            PadButton::West,
+            PadButton::North,
+            PadButton::DPadRight,
+        ] {
+            let mut app = linked_editing_app();
+            let ctx = egui::Context::default();
+            assert!(!app.gamepad_targets_viewer());
+            app.gamepad.push_for_test(PadEvent::ButtonPressed(button));
+            let rejected = poll(&mut app, &ctx);
+            assert!(!rejected.dispatch_allowed, "{button:?}");
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.feedback_toasts_for_test.len(), 1);
+            poll(&mut app, &ctx);
+            assert_eq!(
+                app.feedback_toasts_for_test.len(),
+                1,
+                "a held poll is not a new refusal"
+            );
+            app.conceal_mode = false;
+            assert!(!app.gamepad.state.due_button_repeat(
+                button,
+                Instant::now() + Duration::from_secs(2),
+                BUTTON_REPEAT_INTERVAL
+            ));
+            poll(&mut app, &ctx);
+            app.gamepad.push_for_test(PadEvent::ButtonReleased(button));
+            poll(&mut app, &ctx);
+            assert_eq!(app.selected, Some(0));
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(app.ring_picker.is_none());
+            assert!(!app.settings.folder_tree_pane_visible);
+            app.gamepad
+                .push_for_test(PadEvent::ButtonPressed(PadButton::DPadRight));
+            poll(&mut app, &ctx);
+            assert_eq!(
+                app.selected,
+                Some(1),
+                "fresh input works after neutral/release: {button:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_edit_920_gamepad_blocked_trigger_waits_for_neutral_and_grid_ring_has_no_exception() {
+        let _foreground = crate::test_native_focus::scoped(1, 1, true);
+        let mut app = linked_editing_app();
+        let ctx = egui::Context::default();
+        app.last_cell_h = 100.;
+        app.gamepad
+            .push_for_test(PadEvent::AxisChanged(PadAxis::RightTrigger, 0.9));
+        assert!(!poll(&mut app, &ctx).dispatch_allowed);
+        let offset = app.grid_scroll.offset();
+        app.conceal_mode = false;
+        poll(&mut app, &ctx);
+        assert_eq!(app.grid_scroll.offset(), offset);
+        assert!(app.gamepad.state.directional_neutral_required());
+        app.gamepad
+            .push_for_test(PadEvent::AxisChanged(PadAxis::RightTrigger, 0.));
+        poll(&mut app, &ctx);
+        assert!(!app.gamepad.state.directional_neutral_required());
+        app.conceal_mode = true;
+        for action in [
+            RingActionId::OpenPreferences,
+            RingActionId::OpenBook1,
+            RingActionId::ScriptSlot1,
+        ] {
+            assert!(
+                app.apply_ring_action(&ctx, RingShortcutContext::Grid, action, "page-edit-920")
+                    .is_none()
+            );
+        }
+        assert!(!app.show_preferences);
+        assert!(app.saved_group_open_request_id_for_test().is_none());
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+}
+
 #[cfg(test)]
 mod positionless_release_tests {
     use super::*;
@@ -257,8 +373,8 @@ use eframe::egui;
 #[cfg(windows)]
 use super::ViewerPresentation;
 use super::{
-    App, ContainerRatingTarget, FolderNavMode, GridContainerOpenMode, GridCursorDirection,
-    GridCursorMove, GridScrollIntent, grid_cursor_nav_target_pos,
+    App, ContainerRatingTarget, FolderNavMode, FolderSortChoice, GridContainerOpenMode,
+    GridCursorDirection, GridCursorMove, GridScrollIntent, grid_cursor_nav_target_pos,
 };
 use crate::adjustment::{POST_FILTER_GROUPS, PostFilter};
 use crate::folder_pane::{FolderPaneCommand, FolderPaneTreeKey};
@@ -2768,6 +2884,16 @@ fn draw_mouse_gesture_guide_row(
 pub(crate) struct MouseButtonDispatchResult {
     pub(crate) navigation: Option<AddressBarNav>,
     pub(crate) dispatched_action: Option<RingActionId>,
+    /// Draw-owned fullscreen input returns the request to its key/render owner.
+    pub(crate) script_slot: Option<u8>,
+}
+
+/// Whether the caller can finish a fullscreen key result before drawing starts.
+/// Draw-owned requests are connected separately in stage 2b.
+#[derive(Clone, Copy)]
+enum RingScriptPhase {
+    DrawOwned,
+    BeforeRender,
 }
 
 impl App {
@@ -3868,6 +3994,50 @@ impl App {
         ctx: &egui::Context,
         command: RightDragCommand,
     ) -> Option<AddressBarNav> {
+        self.execute_right_drag_command_in_phase(
+            ctx,
+            command,
+            RingScriptPhase::DrawOwned,
+            &mut None,
+        )
+    }
+
+    /// The render owner executes viewer scripts only after its final UI has closed.
+    pub(crate) fn execute_right_drag_command_for_fullscreen_render(
+        &mut self,
+        ctx: &egui::Context,
+        command: RightDragCommand,
+    ) -> (Option<AddressBarNav>, Option<u8>) {
+        let mut slot = None;
+        let nav = self.execute_right_drag_command_in_phase(
+            ctx,
+            command,
+            RingScriptPhase::DrawOwned,
+            &mut slot,
+        );
+        (nav, slot)
+    }
+
+    pub(crate) fn execute_right_drag_command_before_fullscreen_render(
+        &mut self,
+        ctx: &egui::Context,
+        command: RightDragCommand,
+    ) -> Option<AddressBarNav> {
+        self.execute_right_drag_command_in_phase(
+            ctx,
+            command,
+            RingScriptPhase::BeforeRender,
+            &mut None,
+        )
+    }
+
+    fn execute_right_drag_command_in_phase(
+        &mut self,
+        ctx: &egui::Context,
+        command: RightDragCommand,
+        phase: RingScriptPhase,
+        script_slot: &mut Option<u8>,
+    ) -> Option<AddressBarNav> {
         match command {
             RightDragCommand::RingShortcut {
                 context,
@@ -3886,7 +4056,14 @@ impl App {
                     self.show_feedback_toast(format!("[{}: なし]", direction.label()));
                     return None;
                 }
-                self.apply_ring_action(ctx, context, action, source)
+                self.apply_right_drag_action_in_phase(
+                    ctx,
+                    context,
+                    action,
+                    source,
+                    phase,
+                    script_slot,
+                )
             }
             RightDragCommand::MouseGesture {
                 context,
@@ -3914,7 +4091,14 @@ impl App {
                         self.ring_runtime_label(action_context, &action)
                     ));
                 }
-                self.apply_ring_action(ctx, action_context, action, "mouse-gesture")
+                self.apply_right_drag_action_in_phase(
+                    ctx,
+                    action_context,
+                    action,
+                    "mouse-gesture",
+                    phase,
+                    script_slot,
+                )
             }
             RightDragCommand::ViewerShortRightClick { context, pos } => {
                 if self.page_overview.session().is_some() {
@@ -4226,7 +4410,15 @@ impl App {
             RingPickerRowId::GridSortOrder => match picker.grid_sort_target {
                 RingPickerGridSortTarget::Locked(reason) => reason.short_label().to_string(),
                 RingPickerGridSortTarget::Global | RingPickerGridSortTarget::Collection(_) => {
-                    picker.sort_order.label().to_string()
+                    match picker.grid_sort_choice {
+                        FolderSortChoice::Manual => "手動順 (このフォルダ)".to_string(),
+                        FolderSortChoice::Standard(order) => self
+                            .listing_sort_capabilities()
+                            .sort_locked_reason
+                            .map(|reason| reason.short_label())
+                            .unwrap_or_else(|| order.label())
+                            .to_string(),
+                    }
                 }
             },
             RingPickerRowId::GridThumbAspect => {
@@ -4486,6 +4678,26 @@ impl App {
         batch: GamepadFrameBatch,
         admission: impl Fn(&Self, &egui::Context) -> bool,
     ) -> GamepadDispatchOutcome {
+        // The grid barrier is semantic admission, including headless/fake input.
+        // Keep receipt delivery below so rejected holds are retired before editing ends.
+        let base_admission = admission;
+        let admission = |app: &Self, ctx: &egui::Context| {
+            base_admission(app, ctx)
+                && (app.gamepad_targets_viewer()
+                    || !app.detached_viewer_editing_blocks_grid_input())
+        };
+        let editing_blocks_grid =
+            !self.gamepad_targets_viewer() && self.detached_viewer_editing_blocks_grid_input();
+        if editing_blocks_grid
+            && batch.delivery == PadBatchDelivery::Fresh
+            && batch.events.iter().any(|event| match event {
+                PadBatchEvent::Action(action) => action.kind == PadActionKind::Press,
+                PadBatchEvent::AxesChanged(_) => batch.analog_operation,
+                PadBatchEvent::SessionEnded => false,
+            })
+        {
+            self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+        }
         let operations = if self.page_turn_operation_tracking_needed() {
             batch.presentation_operations()
         } else {
@@ -4640,6 +4852,9 @@ impl App {
             self.reset_gamepad_continuous_steps(now);
             // ブロック中に押されたボタンが解除後に遅れて発火しないよう抑止する。
             self.gamepad.state.suppress_pending_actions();
+            if editing_blocks_grid {
+                self.gamepad.state.require_grid_navigation_neutral();
+            }
         }
 
         GamepadDispatchOutcome {
@@ -5079,6 +5294,9 @@ impl App {
     fn gamepad_directional_neutral(&self) -> bool {
         !self.gamepad.state.dpad_direction_down()
             && stick_pair(&self.gamepad.state, PadAxis::LeftX, PadAxis::LeftY).length_sq() == 0.0
+            && (!self.gamepad.state.grid_navigation_neutral_required()
+                || (self.gamepad.state.trigger_value(true) <= TRIGGER_THRESHOLD
+                    && self.gamepad.state.trigger_value(false) <= TRIGGER_THRESHOLD))
     }
 
     fn consume_gamepad_directional_neutral_gate(&mut self, now: Instant) -> bool {
@@ -5394,6 +5612,13 @@ impl App {
                     .map(RingPickerGridSortTarget::Locked)
                     .unwrap_or(RingPickerGridSortTarget::Collection(target)),
                 Some(Err(reason)) => RingPickerGridSortTarget::Locked(reason),
+                None if self
+                    .listing_sort_capabilities()
+                    .manual_order_disabled_reason
+                    .is_none() =>
+                {
+                    RingPickerGridSortTarget::Global
+                }
                 None => self
                     .grid_sort_lock_reason()
                     .map(RingPickerGridSortTarget::Locked)
@@ -5419,6 +5644,14 @@ impl App {
             }
         };
         let sort_order = self.effective_listing_sort_order(sort_order);
+        let grid_sort_choice = if context == RingShortcutContext::Grid
+            && matches!(grid_sort_target, RingPickerGridSortTarget::Global)
+            && self.folder_manual_order_applied()
+        {
+            FolderSortChoice::Manual
+        } else {
+            FolderSortChoice::Standard(sort_order)
+        };
         let thumb_aspect_auto = self.settings.thumb_aspect_auto;
         let thumb_aspect = self.settings.thumb_aspect;
         let spread_mode = self.spread_mode;
@@ -5466,7 +5699,7 @@ impl App {
         );
         let original = RingPickerOriginalState {
             grid_cols,
-            sort_order,
+            grid_sort_choice,
             thumb_aspect_auto,
             thumb_aspect,
             item_rating_records,
@@ -5498,7 +5731,7 @@ impl App {
             x_close_armed: false,
             drill: None,
             grid_cols,
-            sort_order,
+            grid_sort_choice,
             thumb_aspect_auto,
             thumb_aspect,
             item_rating,
@@ -6178,12 +6411,18 @@ impl App {
                 } else {
                     SortOrder::all()
                 };
-                let options = options
+                let mut options = options
                     .iter()
                     .copied()
                     .filter(|order| sort_capabilities.disabled_reason(*order).is_none())
+                    .map(FolderSortChoice::Standard)
                     .collect::<Vec<_>>();
-                picker.sort_order = cycle_value(&options, picker.sort_order, delta);
+                if matches!(picker.grid_sort_target, RingPickerGridSortTarget::Global)
+                    && sort_capabilities.manual_order_disabled_reason.is_none()
+                {
+                    options.push(FolderSortChoice::Manual);
+                }
+                picker.grid_sort_choice = cycle_value(&options, picker.grid_sort_choice, delta);
                 mark_picker_dirty(picker, row);
             }
             RingPickerRowId::GridThumbAspect => {
@@ -6312,9 +6551,9 @@ impl App {
             }
             RingPickerRowId::GridSortOrder
                 if matches!(picker.grid_sort_target, RingPickerGridSortTarget::Global)
-                    && self.settings.sort_order != picker.sort_order =>
+                    && self.grid_picker_sort_choice_changed(picker.grid_sort_choice) =>
             {
-                self.apply_grid_picker_sort_order(picker.sort_order);
+                self.apply_grid_picker_sort_choice(picker.grid_sort_choice);
             }
             RingPickerRowId::GridThumbAspect
                 if self.settings.thumb_aspect_auto != picker.thumb_aspect_auto
@@ -7651,17 +7890,19 @@ impl App {
         if picker.dirty_rows.contains(&RingPickerRowId::GridSortOrder) {
             match picker.grid_sort_target {
                 RingPickerGridSortTarget::Global
-                    if self.settings.sort_order != picker.sort_order =>
+                    if self.grid_picker_sort_choice_changed(picker.grid_sort_choice) =>
                 {
-                    self.apply_grid_picker_sort_order(picker.sort_order);
+                    self.apply_grid_picker_sort_choice(picker.grid_sort_choice);
                 }
                 RingPickerGridSortTarget::Collection(target) => {
-                    self.request_collection_grid_set_order(
-                        target,
-                        crate::collection_store::CollectionOrderMode::Standard,
-                        picker.sort_order,
-                        crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
-                    );
+                    if let FolderSortChoice::Standard(sort_order) = picker.grid_sort_choice {
+                        self.request_collection_grid_set_order(
+                            target,
+                            crate::collection_store::CollectionOrderMode::Standard,
+                            sort_order,
+                            crate::app::collection_grid::CollectionGridSetOrderRoute::StandardControl,
+                        );
+                    }
                 }
                 RingPickerGridSortTarget::Global | RingPickerGridSortTarget::Locked(_) => {}
             }
@@ -7680,21 +7921,38 @@ impl App {
         }
     }
 
-    fn apply_grid_picker_sort_order(&mut self, sort_order: SortOrder) {
-        if self
-            .listing_sort_capabilities()
-            .disabled_reason(sort_order)
-            .is_some()
-            || (self.settings.sort_order == sort_order && sort_order.lazy_metric().is_none())
-        {
+    fn grid_picker_sort_choice_changed(&self, choice: FolderSortChoice) -> bool {
+        match choice {
+            FolderSortChoice::Manual => !self.folder_manual_order_applied(),
+            FolderSortChoice::Standard(order) => {
+                self.settings.sort_order != order || self.folder_order.manual_active()
+            }
+        }
+    }
+
+    fn apply_grid_picker_sort_choice(&mut self, choice: FolderSortChoice) {
+        let capabilities = self.listing_sort_capabilities();
+        let disabled = match choice {
+            FolderSortChoice::Standard(order) => capabilities.disabled_reason(order),
+            FolderSortChoice::Manual => capabilities.manual_order_disabled_reason,
+        };
+        if disabled.is_some() {
             return;
         }
-        if self.settings.sort_order != sort_order {
-            self.settings.sort_order = sort_order;
-            self.settings.save();
+        let retry_lazy = matches!(choice, FolderSortChoice::Standard(order)
+            if order.lazy_metric().is_some());
+        if !self.grid_picker_sort_choice_changed(choice) && !retry_lazy {
+            return;
         }
-        self.apply_sort_change_reload();
-        self.grid_scroll.set_reveal_requested(true);
+        let before_order = self.settings.sort_order;
+        let changed = self.select_folder_sort(choice);
+        if matches!(choice, FolderSortChoice::Standard(_)) && (changed || retry_lazy) {
+            if self.settings.sort_order != before_order {
+                self.settings.save();
+            }
+            self.apply_sort_change_reload();
+            self.grid_scroll.set_reveal_requested(true);
+        }
     }
 
     fn apply_picker_thumb_aspect(&mut self, auto: bool, aspect: ThumbAspect) {
@@ -7925,7 +8183,8 @@ impl App {
         direction: RingDirection,
     ) -> Option<AddressBarNav> {
         let context = self.current_ring_shortcut_context();
-        self.trigger_ring_shortcut_action(ctx, context, direction, "gamepad-ring")
+        let command = self.right_drag_ring_command(context, direction, "gamepad-ring");
+        self.execute_right_drag_command_before_fullscreen_render(ctx, command)
     }
 
     #[cfg(test)]
@@ -7981,7 +8240,18 @@ impl App {
         surface: crate::app::ActionSurface,
         source: &'static str,
     ) -> Option<AddressBarNav> {
-        self.apply_mouse_button(
+        self.apply_mouse_back_forward_button_with_repeat(ctx, forward, surface, source, false)
+    }
+
+    pub(crate) fn apply_mouse_back_forward_button_with_repeat(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+        surface: crate::app::ActionSurface,
+        source: &'static str,
+        repeat: bool,
+    ) -> Option<AddressBarNav> {
+        self.dispatch_mouse_button_with_repeat(
             ctx,
             if forward {
                 MouseButtonSlot::Forward
@@ -7990,7 +8260,9 @@ impl App {
             },
             surface,
             source,
+            repeat,
         )
+        .navigation
     }
 
     pub(crate) fn update_mouse_middle_short_click(
@@ -8090,6 +8362,19 @@ impl App {
         surface: crate::app::ActionSurface,
         source: &'static str,
     ) -> MouseButtonDispatchResult {
+        self.dispatch_mouse_button_with_repeat(ctx, slot, surface, source, false)
+    }
+
+    /// Browser-key repeats keep their normal assignment behavior, but may not
+    /// start a script. Resolve the assignment before applying that distinction.
+    pub(crate) fn dispatch_mouse_button_with_repeat(
+        &mut self,
+        ctx: &egui::Context,
+        slot: MouseButtonSlot,
+        surface: crate::app::ActionSurface,
+        source: &'static str,
+        repeat: bool,
+    ) -> MouseButtonDispatchResult {
         self.note_input_surface(surface);
         let context = self.ring_shortcut_context_for_surface(surface);
         let action = self
@@ -8097,6 +8382,9 @@ impl App {
             .ring_shortcuts
             .mouse_button_profile(context)
             .action(slot);
+        if repeat && action.script_slot_key_action().is_some() {
+            return MouseButtonDispatchResult::default();
+        }
         if !action.is_valid_for_mouse_button_context(context) {
             crate::logger::log(format!(
                 "[input-nav] source={source} ignored invalid mouse button action={} context={context:?}",
@@ -8123,9 +8411,15 @@ impl App {
             action.as_str()
         ));
         let dispatched_action = action.clone();
+        let script_slot = (context != RingShortcutContext::Grid
+            && !self.operation_script_uses_native_video())
+        .then(|| action.script_slot_key_action())
+        .flatten()
+        .and_then(super::operation_script_runtime::script_slot_number);
         MouseButtonDispatchResult {
             navigation: self.apply_ring_action(ctx, context, action, source),
             dispatched_action: Some(dispatched_action),
+            script_slot,
         }
     }
 
@@ -8243,9 +8537,13 @@ impl App {
         }
     }
 
-    pub(crate) fn apply_pinned_tag_key_action(&mut self, action: KeyAction, source: &'static str) {
+    pub(crate) fn apply_pinned_tag_key_action(
+        &mut self,
+        action: KeyAction,
+        source: &'static str,
+    ) -> bool {
         let Some(slot) = action.pinned_tag_slot_number() else {
-            return;
+            return false;
         };
         let Some(name) = self
             .settings
@@ -8256,7 +8554,7 @@ impl App {
             .map(|tag| tag.name.clone())
         else {
             self.show_feedback_warning(format!("ピン留めタグ {slot} は未登録です"));
-            return;
+            return false;
         };
         self.bump_input_seq(source, Some(&format!("pinned_tag_slot={slot}")));
         // ピン留めタグ KeyAction は Grid コンテキスト専用 (keymap テストで固定) なので
@@ -8271,9 +8569,10 @@ impl App {
             .is_empty()
         {
             self.show_feedback_warning("[タグ対象なし]".to_string());
-            return;
+            return false;
         }
         self.request_tag_toggle_for_selection(&name, crate::app::ActionSurface::MainWindow);
+        true
     }
 
     pub(crate) fn apply_history_clear_key_action(
@@ -8462,6 +8761,36 @@ impl App {
         action: RingActionId,
         source: &'static str,
     ) -> Option<AddressBarNav> {
+        self.apply_ring_action_in_phase(ctx, context, action, source, RingScriptPhase::DrawOwned)
+    }
+
+    pub(crate) fn apply_ring_action_before_fullscreen_render(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        action: RingActionId,
+        source: &'static str,
+    ) -> Option<AddressBarNav> {
+        self.apply_ring_action_in_phase(ctx, context, action, source, RingScriptPhase::BeforeRender)
+    }
+
+    fn apply_ring_action_in_phase(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        action: RingActionId,
+        source: &'static str,
+        phase: RingScriptPhase,
+    ) -> Option<AddressBarNav> {
+        if context == RingShortcutContext::Grid && self.detached_viewer_editing_blocks_grid_input()
+        {
+            self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+            return None;
+        }
+        if let Some(key) = action.script_slot_key_action() {
+            let slot = super::operation_script_runtime::script_slot_number(key)?;
+            return self.apply_ring_script_slot(ctx, context, slot, phase);
+        }
         // These alternate input routes share Depth's fullscreen restrictions.
         // Panorama keeps its released ring behavior; its key restrictions remain separate.
         if context == RingShortcutContext::ImageFullscreen
@@ -8549,6 +8878,27 @@ impl App {
 
         match action {
             RingActionId::None | RingActionId::Unknown(_) => None,
+            // Script slots are routed above, before ordinary ring action dispatch.
+            RingActionId::ScriptSlot1
+            | RingActionId::ScriptSlot2
+            | RingActionId::ScriptSlot3
+            | RingActionId::ScriptSlot4
+            | RingActionId::ScriptSlot5
+            | RingActionId::ScriptSlot6
+            | RingActionId::ScriptSlot7
+            | RingActionId::ScriptSlot8
+            | RingActionId::ScriptSlot9
+            | RingActionId::ScriptSlot10
+            | RingActionId::ScriptSlot11
+            | RingActionId::ScriptSlot12
+            | RingActionId::ScriptSlot13
+            | RingActionId::ScriptSlot14
+            | RingActionId::ScriptSlot15
+            | RingActionId::ScriptSlot16
+            | RingActionId::ScriptSlot17
+            | RingActionId::ScriptSlot18
+            | RingActionId::ScriptSlot19
+            | RingActionId::ScriptSlot20 => None,
             action @ (RingActionId::CopyFiles
             | RingActionId::ImageCopyPath
             | RingActionId::ImageCopyFileName
@@ -9076,6 +9426,74 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    fn apply_ring_script_slot(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        slot: u8,
+        phase: RingScriptPhase,
+    ) -> Option<AddressBarNav> {
+        use super::operation_script_runtime::{ScriptInputSurface, ScriptRunResult};
+        match context {
+            RingShortcutContext::Grid => {
+                match self.run_script_slot(ctx, slot, ScriptInputSurface::Grid, false) {
+                    ScriptRunResult::Grid { nav, .. } => nav,
+                    _ => None,
+                }
+            }
+            RingShortcutContext::ImageFullscreen => {
+                if matches!(phase, RingScriptPhase::DrawOwned) {
+                    // Stage 2b returns the request to the draw owner. Never run
+                    // through the pre-render finisher from inside its render pass.
+                    return None;
+                }
+                let fs_idx = self.fullscreen_idx?;
+                let mut action = crate::ui_fullscreen::FsKeyAction::default();
+                self.run_fullscreen_script_slot_for_action(ctx, slot, &mut action, &mut None);
+                self.finish_fullscreen_key_action(ctx, fs_idx, action);
+                None
+            }
+            RingShortcutContext::VideoFullscreen => {
+                if self.operation_script_uses_native_video() {
+                    // Native operations finish here, including their ordinary
+                    // navigation/close handling. Do not also return a draw request.
+                    self.run_script_slot(ctx, slot, ScriptInputSurface::Viewer, false);
+                    return None;
+                }
+                if matches!(phase, RingScriptPhase::DrawOwned) {
+                    return None;
+                }
+                let fs_idx = self.fullscreen_idx?;
+                let mut action = crate::ui_fullscreen::FsKeyAction::default();
+                self.run_fullscreen_script_slot_for_action(ctx, slot, &mut action, &mut None);
+                self.finish_fullscreen_key_action(ctx, fs_idx, action);
+                None
+            }
+        }
+    }
+
+    fn apply_right_drag_action_in_phase(
+        &mut self,
+        ctx: &egui::Context,
+        context: RingShortcutContext,
+        action: RingActionId,
+        source: &'static str,
+        phase: RingScriptPhase,
+        script_slot: &mut Option<u8>,
+    ) -> Option<AddressBarNav> {
+        if matches!(phase, RingScriptPhase::DrawOwned)
+            && context != RingShortcutContext::Grid
+            && !self.operation_script_uses_native_video()
+            && let Some(slot) = action
+                .script_slot_key_action()
+                .and_then(super::operation_script_runtime::script_slot_number)
+        {
+            *script_slot = Some(slot);
+            return None;
+        }
+        self.apply_ring_action_in_phase(ctx, context, action, source, phase)
     }
 
     fn apply_ring_grid_column_count(&mut self, cols: usize) {
@@ -10089,13 +10507,6 @@ impl App {
                     crate::app::StartupListIntent::container_open(auto_fullscreen),
                 ) {
                     return None;
-                }
-                if !crate::folder_tree::is_virtual_folder(&p) {
-                    self.note_reading_history_open(idx);
-                    self.maybe_suppress_rating_filter_for_opened_container(idx);
-                    if auto_fullscreen {
-                        self.pending_auto_fs_open = true;
-                    }
                 }
                 Some(self.grid_physical_navigation(idx, p, auto_fullscreen))
             }
@@ -11890,8 +12301,8 @@ mod tests {
         let nav = app.handle_gamepad_grid_accept(&egui::Context::default());
         assert!(matches!(
             nav,
-            Some(crate::ui_main::AddressBarNav::Direct(path, _))
-                if path == folder.join("folder-book")
+            Some(crate::ui_main::AddressBarNav::GridFolder(intent))
+                if intent.path == folder.join("folder-book")
         ));
         assert_eq!(app.current_folder.as_ref(), Some(&folder));
         assert_list_order_gamepad_replaced_stale_snapshot(&app, &stale);
@@ -12503,10 +12914,16 @@ mod tests {
         app.bookmark_view_sort =
             crate::bookmark_browser::BookmarkViewSort::Normal(crate::settings::SortOrder::DateDesc);
         let picker = app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
-        assert_eq!(picker.sort_order, crate::settings::SortOrder::DateDesc);
+        assert_eq!(
+            picker.grid_sort_choice,
+            FolderSortChoice::Standard(crate::settings::SortOrder::DateDesc)
+        );
         app.bookmark_view_sort = crate::bookmark_browser::BookmarkViewSort::CreatedAtDesc;
         let picker = app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid);
-        assert_eq!(picker.sort_order, crate::settings::SortOrder::FileName);
+        assert_eq!(
+            picker.grid_sort_choice,
+            FolderSortChoice::Standard(crate::settings::SortOrder::FileName)
+        );
     }
 
     #[test]
@@ -12530,7 +12947,7 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         app.current_folder = Some(folder);
         app.settings.sort_order = SortOrder::DurationAsc;
-        app.apply_grid_picker_sort_order(SortOrder::DurationAsc);
+        app.apply_grid_picker_sort_choice(FolderSortChoice::Standard(SortOrder::DurationAsc));
         let pending = app
             .folder_pane_open_pending
             .as_ref()
@@ -12548,7 +12965,7 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         app.current_folder = Some(folder);
         app.settings.sort_order = SortOrder::PageCountAsc;
-        app.apply_grid_picker_sort_order(SortOrder::PageCountAsc);
+        app.apply_grid_picker_sort_choice(FolderSortChoice::Standard(SortOrder::PageCountAsc));
         let pending = app
             .folder_pane_open_pending
             .as_ref()
@@ -12572,13 +12989,13 @@ mod tests {
         let ctx = egui::Context::default();
         app.change_ring_picker_value(&ctx, RingPickerRowId::GridSortOrder, 1);
         assert_eq!(
-            app.ring_picker.as_ref().unwrap().sort_order,
-            SortOrder::RatingAsc
+            app.ring_picker.as_ref().unwrap().grid_sort_choice,
+            FolderSortChoice::Standard(SortOrder::RatingAsc)
         );
         app.change_ring_picker_value(&ctx, RingPickerRowId::GridSortOrder, -1);
         assert_eq!(
-            app.ring_picker.as_ref().unwrap().sort_order,
-            SortOrder::SizeDesc
+            app.ring_picker.as_ref().unwrap().grid_sort_choice,
+            FolderSortChoice::Standard(SortOrder::SizeDesc)
         );
     }
     use super::{
@@ -12594,6 +13011,7 @@ mod tests {
         update_mouse_middle_click_state, video_seek_ring_action,
     };
     use crate::adjustment::PostFilter;
+    use crate::app::FolderSortChoice;
 
     #[test]
     fn multi_item_ring_rating_publishes_once() {
@@ -12699,7 +13117,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         let folder = app.tmp.path().join("ring-modal-source");
         std::fs::create_dir(&folder).unwrap();
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.active_quick_folder_slot = None;
         let back = app.tmp.path().join("ring-modal-back");
         std::fs::create_dir(&back).unwrap();
@@ -13187,8 +13605,11 @@ mod tests {
             RingPickerGridSortTarget::Collection(target) => target,
             target => panic!("collection target was not captured: {target:?}"),
         };
-        assert_eq!(picker.sort_order, captured.standard_sort);
-        picker.sort_order = SortOrder::SizeDesc;
+        assert_eq!(
+            picker.grid_sort_choice,
+            FolderSortChoice::Standard(captured.standard_sort)
+        );
+        picker.grid_sort_choice = FolderSortChoice::Standard(SortOrder::SizeDesc);
         mark_picker_dirty(&mut picker, RingPickerRowId::GridSortOrder);
         app.preview_grid_picker_row(&picker, RingPickerRowId::GridSortOrder);
         assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
@@ -13227,18 +13648,18 @@ mod tests {
             locked.grid_sort_target,
             RingPickerGridSortTarget::Locked(crate::app::GridSortLockReason::DetailsHeaderSort)
         );
-        let locked_sort = locked.sort_order;
+        let locked_sort = locked.grid_sort_choice;
         app.ring_picker = Some(locked);
         app.change_ring_picker_value(&ctx, RingPickerRowId::GridSortOrder, 1);
         let locked = app.ring_picker.as_ref().unwrap();
-        assert_eq!(locked.sort_order, locked_sort);
+        assert_eq!(locked.grid_sort_choice, locked_sort);
         assert!(!locked.dirty_rows.contains(&RingPickerRowId::GridSortOrder));
         app.finish_gamepad_input_for_sidecar_restore(&ctx);
         assert!(app.ring_picker.is_none());
 
         app.settings.details_sort_key = DetailsSortKey::Toolbar;
         let mut stale = app.build_ring_picker_state(RingShortcutContext::Grid);
-        stale.sort_order = SortOrder::FileName;
+        stale.grid_sort_choice = FolderSortChoice::Standard(SortOrder::FileName);
         mark_picker_dirty(&mut stale, RingPickerRowId::GridSortOrder);
         let external = client
             .set_order(
@@ -13281,7 +13702,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         let mut stale = app.build_ring_picker_state(RingShortcutContext::Grid);
-        stale.sort_order = SortOrder::FileName;
+        stale.grid_sort_choice = FolderSortChoice::Standard(SortOrder::FileName);
         mark_picker_dirty(&mut stale, RingPickerRowId::GridSortOrder);
         app.ring_picker = Some(stale);
         let session = app.top_level_grid_view.collection_session_mut().unwrap();
@@ -13308,6 +13729,134 @@ mod tests {
         app.shutdown_collection_runtime_for_exit();
     }
 
+    fn folder_manual_picker_fixture() -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.sort_order = crate::settings::SortOrder::FileName;
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+        app.active_quick_folder_slot = None;
+        let folder = app.tmp.path().join("manual-picker");
+        std::fs::create_dir(&folder).unwrap();
+        for name in ["a.jpg", "b.jpg"] {
+            std::fs::write(folder.join(name), b"fixture").unwrap();
+        }
+        app.load_folder(folder);
+        app.finish_page_identity_preparation_for_test();
+        assert!(app.folder_manual_order_eligible());
+        app
+    }
+
+    #[test]
+    fn folder_manual_ring_cycle_enters_manual_and_commit_does_not_refresh_twice() {
+        let mut app = folder_manual_picker_fixture();
+        let ctx = egui::Context::default();
+        let revision = app.folder_order.order_revision;
+        app.ring_picker = Some(app.build_ring_picker_state(RingShortcutContext::Grid));
+        app.change_ring_picker_value(&ctx, RingPickerRowId::GridSortOrder, -1);
+        let picker = app.ring_picker.take().unwrap();
+        assert_eq!(picker.grid_sort_choice, FolderSortChoice::Manual);
+        assert!(app.folder_manual_order_applied());
+        assert_eq!(
+            app.settings.sort_order,
+            crate::settings::SortOrder::FileName
+        );
+        assert_eq!(app.folder_order.order_revision, revision + 1);
+        assert!(app.folder_order.record.is_none());
+        let cancel = app
+            .folder_pane_open_pending
+            .as_ref()
+            .unwrap()
+            .cancel
+            .clone();
+        app.apply_grid_picker_state(picker);
+        assert_eq!(app.folder_order.order_revision, revision + 1);
+        assert!(std::sync::Arc::ptr_eq(
+            &cancel,
+            &app.folder_pane_open_pending.as_ref().unwrap().cancel,
+        ));
+        assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+        let reopened = app.build_ring_picker_state(RingShortcutContext::Grid);
+        assert_eq!(reopened.grid_sort_choice, FolderSortChoice::Manual);
+        assert_eq!(
+            app.picker_value_text(&reopened, RingPickerRowId::GridSortOrder),
+            "手動順 (このフォルダ)",
+        );
+    }
+
+    #[test]
+    fn folder_manual_ring_same_standard_sort_leaves_manual_from_preview_and_commit() {
+        for (preview, stack_active) in [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let mut app = folder_manual_picker_fixture();
+            app.folder_order.enter_manual();
+            app.stack_mode_requested = stack_active;
+            assert_eq!(app.folder_manual_order_applied(), !stack_active);
+            let revision = app.folder_order.order_revision;
+            let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+            picker.grid_sort_choice = FolderSortChoice::Standard(app.settings.sort_order);
+            mark_picker_dirty(&mut picker, RingPickerRowId::GridSortOrder);
+            if preview {
+                app.preview_grid_picker_row(&picker, RingPickerRowId::GridSortOrder);
+            } else {
+                app.apply_grid_picker_state(picker);
+            }
+            assert!(!app.folder_order.manual_active());
+            assert_eq!(app.folder_order.order_revision, revision + 1);
+            assert_eq!(
+                app.settings.sort_order,
+                crate::settings::SortOrder::FileName
+            );
+            assert_eq!(app.stack_mode_requested, stack_active);
+            assert!(app.folder_pane_open_pending.is_some());
+        }
+    }
+
+    #[test]
+    fn folder_manual_ring_remains_selectable_beneath_details_header_order() {
+        let mut app = folder_manual_picker_fixture();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+        app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+        let picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        assert_eq!(
+            picker.grid_sort_target,
+            crate::ring_shortcut::RingPickerGridSortTarget::Global
+        );
+        app.ring_picker = Some(picker);
+        app.change_ring_picker_value(&egui::Context::default(), RingPickerRowId::GridSortOrder, 1);
+        assert_eq!(
+            app.ring_picker.as_ref().unwrap().grid_sort_choice,
+            FolderSortChoice::Manual
+        );
+        assert!(app.folder_manual_order_applied());
+        assert_eq!(
+            app.settings.details_sort_key,
+            crate::settings::DetailsSortKey::Name
+        );
+    }
+
+    #[test]
+    fn folder_manual_ring_rejects_ineligible_manual_choice() {
+        let mut app = crate::app::setup_app_for_test();
+        assert!(
+            app.listing_sort_capabilities()
+                .manual_order_disabled_reason
+                .is_some()
+        );
+        let revision = app.folder_order.order_revision;
+        let order = app.settings.sort_order;
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
+        picker.grid_sort_choice = FolderSortChoice::Manual;
+        mark_picker_dirty(&mut picker, RingPickerRowId::GridSortOrder);
+        app.preview_grid_picker_row(&picker, RingPickerRowId::GridSortOrder);
+        app.apply_grid_picker_state(picker);
+        assert!(!app.folder_order.manual_active());
+        assert_eq!(app.folder_order.order_revision, revision);
+        assert_eq!(app.settings.sort_order, order);
+        assert!(app.folder_pane_open_pending.is_none());
+    }
+
     #[test]
     fn global_ring_sort_keeps_live_preview() {
         use crate::ring_shortcut::RingPickerGridSortTarget;
@@ -13317,7 +13866,7 @@ mod tests {
         app.settings.sort_order = SortOrder::FileName;
         let mut picker = app.build_ring_picker_state(RingShortcutContext::Grid);
         assert_eq!(picker.grid_sort_target, RingPickerGridSortTarget::Global);
-        picker.sort_order = SortOrder::DateDesc;
+        picker.grid_sort_choice = FolderSortChoice::Standard(SortOrder::DateDesc);
         mark_picker_dirty(&mut picker, RingPickerRowId::GridSortOrder);
 
         app.preview_grid_picker_row(&picker, RingPickerRowId::GridSortOrder);
@@ -15179,3 +15728,325 @@ mod physical_boundary_tests {
 #[cfg(test)]
 #[path = "spread_step_input_tests.rs"]
 mod spread_step_input_tests;
+
+#[cfg(test)]
+mod script_slot_assignment_stage_tests {
+    use super::*;
+
+    fn install_script(app: &mut App, operation: &str) {
+        app.settings.operation_script_enabled = true;
+        app.operation_script.state = crate::operation_script::OperationScriptState::Ready(Box::new(
+            crate::operation_script::CompiledOperationScript::compile(&format!(
+                "fn slots() {{ [#{{slot:1,label:\"test\",run:\"run\"}}] }} fn run(s) {{ [\"{operation}\"] }}"
+            )).unwrap(),
+        ));
+    }
+
+    #[cfg(windows)]
+    fn media_script_app(music: bool) -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        let path = std::path::PathBuf::from(if music {
+            r"C:\script-ring\audio.mp3"
+        } else {
+            r"C:\script-ring\video.mp4"
+        });
+        app.items = vec![if music {
+            crate::grid_item::GridItem::Audio(path.clone())
+        } else {
+            crate::grid_item::GridItem::Video(path.clone())
+        }];
+        app.visible_indices = vec![0];
+        app.current_folder = Some(r"C:\script-ring".into());
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        app.video_session_muted = false;
+        app.fs_cache.insert(
+            0,
+            crate::fs_animation::FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(path),
+                ),
+                load_seq: 0,
+            },
+        );
+        install_script(&mut app, "VideoMute");
+        app
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn script_native_media_mouse_runs_once_and_returns_no_draw_request() {
+        let ctx = egui::Context::default();
+        for slot in [
+            MouseButtonSlot::Back,
+            MouseButtonSlot::Forward,
+            MouseButtonSlot::Middle,
+        ] {
+            let mut app = media_script_app(false);
+            let profile = &mut app.settings.ring_shortcuts.mouse_buttons_video;
+            match slot {
+                MouseButtonSlot::Back => profile.back = RingActionId::ScriptSlot1,
+                MouseButtonSlot::Forward => profile.forward = RingActionId::ScriptSlot1,
+                MouseButtonSlot::Middle => profile.middle = RingActionId::ScriptSlot1,
+            }
+            for repeat in [false, true] {
+                let result = app.dispatch_mouse_button_with_repeat(
+                    &ctx,
+                    slot,
+                    crate::app::ActionSurface::Viewer,
+                    "script-native-mouse-test",
+                    repeat,
+                );
+                assert!(result.navigation.is_none());
+                assert!(result.script_slot.is_none());
+                assert_eq!(
+                    result.dispatched_action,
+                    (!repeat).then_some(RingActionId::ScriptSlot1)
+                );
+                assert!(
+                    app.video_session_muted,
+                    "initial runs once, repeat does not toggle again"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn script_media_ring_native_completes_and_music_keeps_draw_ownership() {
+        let ctx = egui::Context::default();
+        for music in [false, true] {
+            for gesture in [false, true] {
+                let mut app = media_script_app(music);
+                let command = if gesture {
+                    RightDragCommand::MouseGesture {
+                        context: RightDragContext::VideoFullscreen,
+                        action: RingActionId::ScriptSlot1,
+                        pattern_label: "→".into(),
+                        show_result_toast: false,
+                    }
+                } else {
+                    RightDragCommand::RingShortcut {
+                        context: RingShortcutContext::VideoFullscreen,
+                        action: RingActionId::ScriptSlot1,
+                        direction: RingDirection::Up,
+                        source: "script-media-ring-test",
+                    }
+                };
+                let (nav, slot) =
+                    app.execute_right_drag_command_for_fullscreen_render(&ctx, command);
+                assert!(nav.is_none());
+                assert_eq!(slot, music.then_some(1));
+                assert_eq!(app.video_session_muted, !music);
+                if music {
+                    app.apply_ring_action_before_fullscreen_render(
+                        &ctx,
+                        RingShortcutContext::VideoFullscreen,
+                        RingActionId::ScriptSlot1,
+                        "script-music-pre-render-test",
+                    );
+                    assert!(app.video_session_muted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn browser_mouse_grid_script_assignment_rejects_only_repeat_press() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = (0..3)
+            .map(|i| crate::grid_item::GridItem::Image(format!("C:/browser-repeat/{i}.png").into()))
+            .collect();
+        app.visible_indices = vec![0, 1, 2];
+        app.current_folder = Some("C:/browser-repeat".into());
+        install_script(&mut app, "GridMoveLast");
+        app.settings.ring_shortcuts.mouse_buttons_grid.back = RingActionId::ScriptSlot1;
+        app.settings.ring_shortcuts.mouse_buttons_grid.forward = RingActionId::ScriptSlot1;
+
+        for slot in [MouseButtonSlot::Back, MouseButtonSlot::Forward] {
+            for repeat in [true, false, true] {
+                app.selected = Some(1);
+                let result = app.dispatch_mouse_button_with_repeat(
+                    &ctx,
+                    slot,
+                    crate::app::ActionSurface::MainWindow,
+                    "browser-grid-script-repeat-test",
+                    repeat,
+                );
+                assert!(result.navigation.is_none());
+                assert_eq!(
+                    result.dispatched_action,
+                    (!repeat).then_some(RingActionId::ScriptSlot1)
+                );
+                assert_eq!(app.selected, Some(if repeat { 1 } else { 2 }));
+            }
+        }
+        app.selected = Some(1);
+        app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::Grid,
+            RingActionId::ScriptSlot1,
+            "browser-grid-script-ring-test",
+        );
+        assert_eq!(app.selected, Some(2), "ring input remains an initial press");
+    }
+
+    #[test]
+    fn browser_mouse_grid_normal_assignment_keeps_repeat_navigation() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.ring_shortcuts.mouse_buttons_grid.back = RingActionId::OpenLocationDriveList;
+        app.settings.ring_shortcuts.mouse_buttons_grid.forward =
+            RingActionId::OpenLocationDriveList;
+        for forward in [false, true] {
+            for repeat in [false, true] {
+                let nav = app.apply_mouse_back_forward_button_with_repeat(
+                    &ctx,
+                    forward,
+                    crate::app::ActionSurface::MainWindow,
+                    "browser-grid-normal-repeat-test",
+                    repeat,
+                );
+                assert!(matches!(
+                    nav,
+                    Some(AddressBarNav::LocationJump(
+                        crate::ui_main::LocationJumpTarget::DriveList
+                    ))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn browser_mouse_fullscreen_script_repeat_does_not_return_a_request() {
+        let ctx = egui::Context::default();
+        let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+            &ctx,
+            crate::settings::SpreadMode::Single,
+        );
+        install_script(&mut app, "FsClose");
+        app.settings.ring_shortcuts.mouse_buttons_image.back = RingActionId::ScriptSlot1;
+        app.settings.ring_shortcuts.mouse_buttons_image.forward = RingActionId::ScriptSlot1;
+        for slot in [MouseButtonSlot::Back, MouseButtonSlot::Forward] {
+            for repeat in [true, false] {
+                let result = app.dispatch_mouse_button_with_repeat(
+                    &ctx,
+                    slot,
+                    crate::app::ActionSurface::Viewer,
+                    "browser-image-script-repeat-test",
+                    repeat,
+                );
+                assert_eq!(result.script_slot, (!repeat).then_some(1));
+                assert_eq!(
+                    result.dispatched_action,
+                    (!repeat).then_some(RingActionId::ScriptSlot1)
+                );
+                assert_eq!(app.fullscreen_idx, Some(0));
+            }
+        }
+    }
+
+    #[test]
+    fn script_image_ring_draw_owned_path_does_not_execute_but_pre_render_finishes_close() {
+        let ctx = egui::Context::default();
+        let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+            &ctx,
+            crate::settings::SpreadMode::Single,
+        );
+        install_script(&mut app, "FsClose");
+        let original = app.fullscreen_idx;
+        assert!(original.is_some());
+        assert!(
+            app.apply_ring_action(
+                &ctx,
+                RingShortcutContext::ImageFullscreen,
+                RingActionId::ScriptSlot1,
+                "script-draw-owned-test"
+            )
+            .is_none()
+        );
+        assert_eq!(
+            app.fullscreen_idx, original,
+            "stage 2b must own the draw request"
+        );
+        assert!(
+            app.apply_ring_action_before_fullscreen_render(
+                &ctx,
+                RingShortcutContext::ImageFullscreen,
+                RingActionId::ScriptSlot1,
+                "script-before-render-test"
+            )
+            .is_none()
+        );
+        assert_eq!(app.fullscreen_idx, None);
+    }
+
+    #[test]
+    fn script_image_gamepad_ring_uses_the_pre_render_finisher() {
+        let ctx = egui::Context::default();
+        let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+            &ctx,
+            crate::settings::SpreadMode::Single,
+        );
+        install_script(&mut app, "FsClose");
+        app.note_input_surface(crate::app::ActionSurface::Viewer);
+        app.settings
+            .ring_shortcuts
+            .profile_mut(RingShortcutContext::ImageFullscreen)
+            .slots[RingDirection::Up.slot_index()] = RingActionId::ScriptSlot1;
+        assert!(
+            app.trigger_gamepad_ring_action_for_test(&ctx, RingDirection::Up)
+                .is_none()
+        );
+        assert_eq!(app.fullscreen_idx, None);
+    }
+
+    #[test]
+    fn script_image_mouse_dispatch_returns_slot_without_running_it() {
+        let ctx = egui::Context::default();
+        let mut app = crate::ui_fullscreen::page_turn_submission_tests::ready_app(
+            &ctx,
+            crate::settings::SpreadMode::Single,
+        );
+        install_script(&mut app, "FsClose");
+        app.settings
+            .ring_shortcuts
+            .mouse_button_profile_mut(RingShortcutContext::ImageFullscreen)
+            .back = RingActionId::ScriptSlot1;
+        let result = app.dispatch_mouse_button(
+            &ctx,
+            MouseButtonSlot::Back,
+            crate::app::ActionSurface::Viewer,
+            "script-image-mouse-request-test",
+        );
+        assert!(result.navigation.is_none());
+        assert_eq!(result.script_slot, Some(1));
+        assert_eq!(result.dispatched_action, Some(RingActionId::ScriptSlot1));
+        assert_eq!(app.fullscreen_idx, Some(0));
+    }
+
+    #[test]
+    fn script_slot_ring_actions_are_noops_while_scripts_are_disabled() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let settings = serde_json::to_value(&app.settings).unwrap();
+        let selected = app.selected;
+        let fullscreen_idx = app.fullscreen_idx;
+        for &context in RingShortcutContext::all() {
+            let actions = RingActionId::available_for_context(context)
+                .into_iter()
+                .filter(|action| action.script_slot_key_action().is_some());
+            for action in actions {
+                assert!(
+                    app.apply_ring_action(&ctx, context, action, "script-slot-assignment-test")
+                        .is_none()
+                );
+                assert_eq!(app.selected, selected);
+                assert_eq!(app.fullscreen_idx, fullscreen_idx);
+                assert!(app.saved_group_open_request_id_for_test().is_none());
+                assert_eq!(serde_json::to_value(&app.settings).unwrap(), settings);
+            }
+        }
+    }
+}

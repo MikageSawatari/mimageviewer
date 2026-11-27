@@ -209,12 +209,11 @@ impl App {
                         if !self.release_check_interaction_ready() {
                             return Err("environment: release open attempted before list interaction readiness".into());
                         }
-                        if !self.load_folder_with_scan_owned(
-                            path,
-                            None,
-                            super::OpenRequestOwner::Navigation,
+                        if !matches!(self.load_folder_or_convert_archive_with_auto_fullscreen_owned_at_scan_route(
+                            path, false, super::OpenRequestOwner::Navigation,
                             super::StartupListIntent::ExplicitList,
-                        ) {
+                            super::DirectoryScanRoute::UiThread(super::UiThreadScanReason::ReleaseCheck),
+                        ), super::FolderOpenOutcome::Loaded) {
                             return Err(
                                 "environment: normal release folder open was not admitted".into()
                             );
@@ -446,6 +445,27 @@ mod tests {
         assert!(!app.release_check_interaction_ready());
         app.consume_folder_thumb_pin_dirty();
         assert!(app.folder_thumb_pin_dirty.is_empty());
+        assert!(!app.release_check_interaction_ready());
+        // A real-directory refresh now uses staged preflight even without an
+        // mtime. Adopt it without polling the newly started sidecar restore.
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        assert!(matches!(
+            app.top_level_grid_view.history_navigation_transition(),
+            Some(super::super::HistoryNavigationTransition::Physical(_))
+        ));
+        while app
+            .top_level_grid_view
+            .history_navigation_transition()
+            .is_some()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pin refresh preflight did not finish"
+            );
+            app.poll_collection_history_transition(&ctx);
+            std::thread::yield_now();
+        }
         // Reproduce the actual failure: the pin consumer starts sidecar
         // restoration, then the normal physical open refuses visible adoption.
         assert!(app.sidecar_restore_active());
@@ -456,8 +476,8 @@ mod tests {
             super::super::OpenRequestOwner::Navigation,
             super::super::StartupListIntent::ExplicitList,
         ));
+        assert!(!app.direct_navigation_scan_pending());
         assert_eq!(app.current_folder.as_ref(), Some(&child));
-        let ctx = egui::Context::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while app.sidecar_restore_active() {
             assert!(
@@ -475,6 +495,7 @@ mod tests {
             super::super::OpenRequestOwner::Navigation,
             super::super::StartupListIntent::ExplicitList,
         ));
+        app.finish_direct_navigation_scan_for_test();
         assert_eq!(app.current_folder.as_ref(), Some(&parent));
     }
 

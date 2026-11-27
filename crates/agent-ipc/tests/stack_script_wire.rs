@@ -3,7 +3,7 @@ use serde_json::json;
 
 #[test]
 fn stack_script_v6_command_defaults_and_frames_are_additive() {
-    assert_eq!(AGENT_PROTOCOL_VERSION, 7);
+    assert_eq!(AGENT_PROTOCOL_VERSION, 8);
     assert_eq!(MIN_ADAPTER_PROTOCOL_VERSION, 3);
     for (fields, source, part, expected_sha256) in [
         (json!({}), None, None, None),

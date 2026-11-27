@@ -90,7 +90,7 @@ fn plain_folder_spread_install_uses_scan_and_does_not_persist_defaults() {
     ] {
         configure(&mut app, enabled, book);
         let folder = make_folder(app.tmp.path(), &format!("folder-{enabled}-{book}.txt"));
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.current_folder.as_ref(), Some(&folder));
         assert!(app.folder_observation.is_some());
@@ -131,7 +131,7 @@ fn plain_folder_spread_requires_a_scan_fact_and_normalizes_only_the_new_default(
     app.finish_page_identity_preparation_for_test();
     assert_eq!(reading(&app), (Mode::Single, Flow::Paged, Direction::Ltr));
     app.settings.default_spread_mode = Mode::Vertical;
-    app.load_folder(folder);
+    app.load_folder_and_finish_for_test(folder);
     app.finish_page_identity_preparation_for_test();
     assert_eq!(reading(&app), (Mode::Single, Flow::Paged, Direction::Ltr));
 }
@@ -159,7 +159,7 @@ fn plain_folder_spread_saved_values_and_legacy_flow_win() {
                 Direction::Ltr,
             )
             .unwrap();
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.finish_page_identity_preparation_for_test();
         assert_eq!(
             reading(&app),
@@ -245,7 +245,7 @@ fn plain_folder_spread_import_refresh_limits_opt_in_and_preserves_sibling_contex
         (true, false, (Mode::RtlCover, Flow::Paged, Direction::Rtl)),
     ] {
         configure(&mut app, enabled, book);
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.finish_page_identity_preparation_for_test();
         let initial = reading(&app);
         if enabled && !book {

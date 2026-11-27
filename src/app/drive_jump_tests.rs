@@ -688,7 +688,7 @@ fn drive_jump_classified_directories_keep_worker_scan_and_original_navigation() 
             } else {
                 assert!(matches!(
                     scan.purpose,
-                    FolderOpenScanPurpose::DirectNavigation
+                    FolderOpenScanPurpose::DirectNavigation(_)
                 ));
             }
             settle(&mut app, &ctx);

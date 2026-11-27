@@ -36,7 +36,7 @@ fn reclick_fixture() -> ReclickFixture {
         std::fs::write(a.join(name), b"image-source").unwrap();
     }
     std::fs::write(b.join("only-b.jpg"), b"image-source").unwrap();
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     settle(&mut app, &ctx);
     app.folder_pane
         .test_seed_listing(&a, vec![kept.clone(), removed.clone()], true);
@@ -197,7 +197,7 @@ fn reclick_single_scenario(mtime: bool, order: crate::settings::SortOrder) {
     for index in 0..48 {
         std::fs::write(a.join(format!("page-{index:02}.jpg")), b"image-source").unwrap();
     }
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     settle(&mut app, &ctx);
     navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
     let selected_path = a.join("page-24.jpg");
@@ -630,7 +630,7 @@ fn folder_pane_reclick_same_pass_ready_order_refresh_is_replaced() {
     let old_result = worker
         .recv_timeout(Duration::from_secs(20))
         .expect("real order-refresh worker result");
-    assert!(old_result.is_ok());
+    assert!(old_result.scan.is_ok());
     let latest = a.join("latest-after-order-scan.jpg");
     std::fs::write(&latest, b"external after old scan").unwrap();
     let generation = app.items_generation;
@@ -776,7 +776,7 @@ fn reclick_pending_pane_scenario(ready_on_release: bool) {
         let result = worker
             .recv_timeout(Duration::from_secs(20))
             .expect("real B worker result");
-        assert!(result.is_ok());
+        assert!(result.scan.is_ok());
         assert!(sender.send(result).is_ok());
     }
     navigation_tree_frame(&mut app, &ctx, &mut frame, vec![primary_event(pos, false)]);
@@ -833,9 +833,9 @@ fn folder_pane_reclick_does_not_replace_pending_history_navigation() {
         b,
         ..
     } = reclick_fixture();
-    app.load_folder(b.clone());
+    app.load_folder_and_finish_for_test(b.clone());
     settle(&mut app, &ctx);
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     settle(&mut app, &ctx);
     navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
     assert_eq!(

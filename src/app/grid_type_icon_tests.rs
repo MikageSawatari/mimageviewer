@@ -276,6 +276,7 @@ fn draw(ui: &mut egui::Ui, p: Preview) {
                         Some(0.42),
                         true,
                         &crate::folder_cell_background::FolderCellBackground::default(),
+                        None,
                     );
                     if let Some(time) = layout.top_left.bookmark_time.as_ref() {
                         crate::ui_helpers::draw_overlay_bookmark_time_badge(

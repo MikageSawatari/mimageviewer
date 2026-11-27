@@ -925,25 +925,21 @@ fn browser818_presentation_activation_restore_materialized_keeps_request_seed() 
     receive(&app, requested.clone(), request);
     let ctx = egui::Context::default();
     app.poll_activation_open_paths(&ctx);
+    // Preserve the real resolver reply: a main Directory completion includes
+    // its scan, so Loaded can defer the requested file's viewer adoption into
+    // the new restore. A synthetic folder_scan=None reply skips that seam.
+    let result = app
+        .startup_open_path_resolve_pending
+        .as_ref()
+        .unwrap()
+        .rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("activation resolver must finish its directory scan");
+    assert!(result.folder_scan.as_ref().is_some_and(Result::is_ok));
+    assert_eq!(result.scan_policy.as_ref(), Some(&app.folder_scan_policy()));
     let (tx, rx) = mpsc::channel();
     app.startup_open_path_resolve_pending.as_mut().unwrap().rx = rx;
-    tx.send(StartupOpenPathResolveResult {
-        requested: requested.clone(),
-        resolved: Some(crate::folder_tree::OpenablePathResolution {
-            path: folder.clone(),
-            kind: crate::folder_tree::OpenablePathKind::Directory,
-            requested_is_file: true,
-        }),
-        bookmark_relative_page_openable: None,
-        rar_volume_proof: None,
-        elapsed_ms: 0.0,
-        direct_media: None,
-        folder_scan: None,
-        scan_policy: None,
-        scan_policy_mixed: false,
-        default_target: None,
-    })
-    .unwrap();
+    tx.send(result).unwrap();
     let output = ctx.run_pass(Default::default(), |ctx| {
         app.poll_startup_open_path_resolve(ctx)
     });
@@ -995,7 +991,7 @@ fn browser870_browser818_linked_and_multiple_open_single_with_context_owned_savi
         app.settings.auto_fullscreen_zip_pdf = true;
         app.settings.auto_fullscreen_image_folders = true;
         app.settings.detached_viewer_open_images_in_window = multiple;
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.spread_mode, SpreadMode::Single);
         let main_source = app.spread_presentation_source.clone();

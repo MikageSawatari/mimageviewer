@@ -183,7 +183,14 @@ fn install_input(
     listener: &dyn NativeWindowInputListener,
     allocation: NativeWindowAllocation,
 ) {
-    match listener.install(allocation) {
+    let installed = listener.install(allocation);
+    #[cfg(target_os = "windows")]
+    if let Some(hwnd) = allocation.windows_hwnd {
+        // ROOT already owns timestamp input when a newly attached application
+        // listener is replayed. Its subclass must stay inside that boundary.
+        egui_winit::native_pointer_time::after_listener_install(hwnd);
+    }
+    match installed {
         Ok(input) => {
             let mut state = registry.lock();
             let entry = state
@@ -210,6 +217,8 @@ fn install_input(
 /// even if another component still holds an Arc to the old winit window.
 pub struct NativeWindowAllocationLease {
     owner: Option<(SharedRegistry, NativeWindowAllocation, Arc<()>)>,
+    #[cfg(target_os = "windows")]
+    pointer_time: Option<egui_winit::native_pointer_time::WindowTimestamp>,
 }
 
 impl NativeWindowAllocationLease {
@@ -218,6 +227,8 @@ impl NativeWindowAllocationLease {
         let Some((registry, allocation, lifetime)) = self.owner.take() else {
             return;
         };
+        #[cfg(target_os = "windows")]
+        self.pointer_time.take();
         // Only the unique backend lease holds a strong reference. Invalidate
         // cached host identities before native input teardown can run.
         drop(lifetime);
@@ -281,6 +292,8 @@ pub fn register_native_window_allocation(
     };
     let lease = NativeWindowAllocationLease {
         owner: Some((Arc::clone(&registry), allocation, lifetime)),
+        #[cfg(target_os = "windows")]
+        pointer_time: None,
     };
     if let Some(listener) = listener {
         install_input(&registry, &*listener, allocation);
@@ -300,7 +313,7 @@ pub(crate) fn register_window(
             None
         }
     });
-    register_native_window_allocation(
+    let mut lease = register_native_window_allocation(
         ctx,
         NativeWindowAllocation {
             viewport_id,
@@ -310,7 +323,13 @@ pub(crate) fn register_window(
             window_id: window.id(),
             windows_hwnd,
         },
-    )
+    );
+    #[cfg(target_os = "windows")]
+    {
+        lease.pointer_time =
+            windows_hwnd.and_then(egui_winit::native_pointer_time::WindowTimestamp::install);
+    }
+    lease
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

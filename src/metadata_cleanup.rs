@@ -1,6 +1,6 @@
 //! 明示操作による孤児メタデータ整理。
 //!
-//! `rename_key_migration::STORES` を正本として全 path-keyed SQLite ストアを列挙し、
+//! `rename_key_migration::STORES` の `orphan_cleanup` 宣言から対象ストアを列挙し、
 //! 「実体は存在しないが、その直上の親ディレクトリには到達できる」行だけを候補にする。
 //! 外付けドライブ / NAS がオフライン、権限エラー、判定不能なキーは常に残す。
 
@@ -554,6 +554,9 @@ fn scan_descriptor(
     progress: &CleanupProgress,
     state: &mut ScanState,
 ) {
+    if !descriptor.orphan_cleanup {
+        return;
+    }
     let path = data_dir.join(descriptor.file);
     if !path.exists() {
         return;
@@ -852,6 +855,9 @@ where
         .any(|descriptor| descriptor.file == "tags.db")
         .then(|| crate::tags_db::TAG_WRITES.begin());
     for index in 0..STORES.len() {
+        if !STORES[index].orphan_cleanup {
+            continue;
+        }
         let candidates = scan
             .candidates
             .iter()
@@ -1270,6 +1276,86 @@ mod tests {
                 [key],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn folder_order_rows_are_excluded_from_orphan_scan_and_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let books = temp.path().join("books");
+        let missing = temp.path().join("missing.jpg");
+        let key = crate::path_key::normalize_keep_drive(&missing);
+        let indices = [
+            descriptor_index("folder_order.db", "folder_order_items"),
+            descriptor_index("folder_order.db", "folder_order_folders"),
+        ];
+        let mut forged = ScanReport::default();
+        for index in indices {
+            insert_key(&data, index, &key);
+            forged.candidates.push(CleanupCandidate {
+                descriptor_index: index,
+                key: key.clone(),
+                physical_path: missing.clone(),
+                rows: 1,
+                store: "folder_order.db".into(),
+            });
+        }
+        let cancel = AtomicBool::new(false);
+        let scan = run_scan_at(&data, &books, &cancel, &progress(PHASE_SCANNING)).unwrap();
+        assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+        assert_eq!(scan.scanned_rows, 0);
+        assert!(scan.candidates.is_empty());
+        let deleted = run_delete_at(&data, &books, &forged, &cancel, &progress(PHASE_DELETING));
+        assert!(deleted.errors.is_empty(), "{:?}", deleted.errors);
+        assert_eq!(deleted.deleted_total(), 0);
+        for index in indices {
+            let descriptor = &STORES[index];
+            let connection = create_table(&data, descriptor);
+            let count: usize = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {}", descriptor.table),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+
+    #[test]
+    fn folder_order_orphan_scan_and_delete_do_not_open_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("folder_order.db");
+        let bytes = b"unreadable folder order database";
+        std::fs::write(&path, bytes).unwrap();
+        let books = temp.path().join("books");
+        let cancel = AtomicBool::new(false);
+        let scan = run_scan_at(temp.path(), &books, &cancel, &progress(PHASE_SCANNING)).unwrap();
+        assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+        let forged = ScanReport {
+            candidates: ["folder_order_items", "folder_order_folders"]
+                .into_iter()
+                .map(|table| CleanupCandidate {
+                    descriptor_index: descriptor_index("folder_order.db", table),
+                    key: "c:/missing.jpg".into(),
+                    physical_path: PathBuf::from("C:/missing.jpg"),
+                    rows: 1,
+                    store: "folder_order.db".into(),
+                })
+                .collect(),
+            ..ScanReport::default()
+        };
+        let deleted = run_delete_at(
+            temp.path(),
+            &books,
+            &forged,
+            &cancel,
+            &progress(PHASE_DELETING),
+        );
+        assert!(deleted.errors.is_empty(), "{:?}", deleted.errors);
+        assert_eq!(deleted.deleted_total(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[test]

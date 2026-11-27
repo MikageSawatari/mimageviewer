@@ -17,6 +17,7 @@
   お気に入りと同じく一覧へのキーを止める。残りの経路 (§3.5 の C・D) と「元の場所へ」(E) は別の項目にする
   (番号は統括が master で取る)。
 - §1.859: 「断るでよい (Recommended)」。貼り付けの処理中の 2 回目は、断って通知を出す。
+- §1.853 の残り C・D・E (2026-11-26): 「1. 待ちの間のキーを捨てる (推奨)」。お気に入り・アドレス欄 Enter と同じ規則 (§6.1)。
 - §1.861: 「案のとおり進めてください」。
 - §1.859 のクリップボードの扱い (2026-11-25、設計レビュー r3 の後に統括経由で質問): 「準備中は mIV の切り取りを断る
   (Recommended)」。貼るのは Shell が読む時点のクリップボード。貼り付けの準備中は、mIV 自身のファイルの切り取り・
@@ -998,3 +999,1716 @@ P2-2 `InvokeCommand` の戻りは Shell の画面の役目が終わった証拠�
 承認の対象は診断と outcome の変更で、**R3-3 は未修正**。サブ PC の再確認で `shell_paste/foreground_after_invoke` を見て理由を判別してから直し方を決める。
 
 **R3-3 の結論 (2026-11-26): 直さずに閉じる**。サブ PC の 3 回目 (v580c2 の D、サブ PC のエージェント) の記録で、閉じた直後の前面は Shell の進行状況の窓 (OperationStatusWindow) で、約 0.9 秒後に mIV へ戻ると → が効いた (候補 (a))。Explorer で同じ操作をした比べは、サブ PC では画面操作のツールが Explorer へキーを送れず未確認 (v580d の D)。利用者が自分の PC の Explorer で試した結果 (利用者の言葉、2026-11-26): 「スキップを押したあと、そのダイアログがまだしばらく残っており、下のウィンドウに戻るまでに1秒くらいはありました。その間の右キーは無視されますが、ダイアログが閉じてフォーカスが戻ればききました。」Explorer と同じ動きなので、mIV 側で前面を戻す仕組みは足さない (OS と挙動を一致させる方針)。
+
+
+---
+
+## 6. §1.853 の残り C・D・E (v5.9.0 予定、ブランチ `ui-scan-853b`)
+
+状態: 設計 r7 確定 (2026-11-26、設計レビュー r7 で ACCEPT。r1〜r6 の指摘と、全画面の経路の利用者決定 (§6.1) を反映。§6.9〜§6.16)。担当: 設計・検収 = ClaudeCode Opus 5.5 (uiscan-853b)、実装 = Codex GPT-6.1 Sol / high、
+独立レビュー = GPT-6.1 Sol / xhigh。作業ツリー `G:\home\mimageviewer-uiscan853b`。コードの記述は master `451ad09db` の読み取り。
+本担当は実行時の挙動を観測していない。時間の数字はサブ PC 担当の perf ログ (§1.853、3004 件のネットワークフォルダで約 7.6 秒)。
+
+まれな失敗 (走査の I/O エラー・worker の異常終了) は既定の割り切り (ログ + 通知)。再試行・回復の仕組みは足さない。
+
+### 6.1 利用者の決定 (2026-11-26、統括経由)
+
+設計担当が統括へ出した質問 (共有メモ `uiscan-853b-typeahead-question.md`) に、利用者は
+「1. 待ちの間のキーを捨てる (推奨)」を選んだ (統括の伝達、AskUserQuestion、2026-11-26)。質問での説明は
+「お気に入り・アドレス欄の Enter と同じ規則で、読み込み中に押したキーは押し直しが要る。速いローカルのフォルダでは
+待ちがごく短く、影響は主に遅い共有フォルダや件数の多いフォルダ」。
+
+したがって C・D・E の走査待ちは、§1.805 の「場所の移動待ち」(`GridItemInputBlock::DirectNavigationScan`) と同じ扱いにする。
+走査の間は今の一覧を表示したまま一覧の項目入力 (キー・ポインタ・タッチ・リング・ゲームパッド・メニュー) を止め、
+待ちの間に押したキーは新しい一覧へ渡さない。移動の入力 (ツリー・お気に入り・アドレス欄・戻る/進む等) は後勝ち。
+走査が 500 ms を超えたら「移動先を読み込み中…」を出す。どれも既存の仕組みで、新しい規則は作らない。
+2026-11-18 (§1.805 §3.2) に範囲から外した理由 (Enter 直後の先行入力) は、この決定で解消した。
+
+2 つ目の決定 (2026-11-26、統括経由): 設計担当が「全画面から戻る経路と、読込の後に続きを運ぶ作りが要る経路は別項目」と
+提案したのに対し、利用者は「全画面の経路も今回入れる」を選んだ (統括の伝達、AskUserQuestion。v5.9.0 が遅れ得ることを
+示したうえでの選択)。同じ仕組みに乗る経路は一緒に、乗らないものは理由を添えて別項目にする。全画面の待ち方は
+「設計の簡素化」を先に検討し、今の使い方が変わる点を統括へ返す (§6.12、共有メモ `uiscan-853b-fullscreen-close-proposal.md`)。
+
+3 つ目の決定 (2026-11-26、統括経由): 全画面から戻る経路の待ち方は「Ctrl+↑↓ と同じ扱い (推奨)」(統括の伝達、AskUserQuestion)。
+読み終わるまで全画面を出したままにし、読み込み中の表示は出さない。待ちの間のページ送り・ジャンプは受け付けない。拡大・回転・★は
+今のページに効く。もう一度「閉じる」を押すと親の一覧を読み直す。
+経緯: 設計担当は最初に「全部止めるモーダル + 500 ms 後に読み込み中の表示」を返し、利用者は一度それを選んだ。その後の設計レビュー r4 で、
+全部止めるには専用の全画面 viewport・動画の HUD・focus guard・ゲームパッドの配り先 (別窓 F12 の操作まで巻き込む) に新しい止めが
+要ると分かり、設計担当が「Ctrl+↑↓ と同じ扱い」へ改めた案を返した。統括が両案を比べて示し直し、利用者は改めた案を選んだ
+(前の回答はこの回答で置き換え)。
+お気に入り検索・タグ表示の BS と Ctrl+↑↓、スマートフォルダ・サブフォルダ展開を抜ける操作は同じ規則で一緒に入れ、★固定の移動は別項目
+(番号は統括が master で取る)。
+
+### 6.2 対象と対象外 (コードの棚卸し、master `451ad09db`)
+
+同期走査点は 1 つ: `load_folder_with_scan_claimed_with_search_origin` (`src/app.rs` 32692 付近) の
+`pre_scan = None` → `scan_directory_with_settings`。そこへ届く入口は 2 つ
+(`load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage` 31658 付近と
+`load_folder_with_scan_owned_with_search_origin` 31969 付近)。§1.805 の worker 分岐
+(`direct_navigation_uses_worker_scan`) は前者の入口にだけあり、owner が `Navigation`・navigation あり・
+印 `DirectoryScanRoute::Worker` のときだけ効く。
+
+main の context で同期走査に届く入口 (今回の対象):
+
+| 区分 | 入口 (生成点) | owner / intent / 全画面予約 | 読込後に使う状態 |
+| --- | --- | --- | --- |
+| C1 | 一覧のフォルダを開く: Enter (`accept_grid_container_open` → `grid_physical_navigation`、`collection_grid.rs` 1515・1603)、ダブルクリック (`ui_main.rs` 19510)、ゲームパッド A (`gamepad_input.rs` 10100) → post-render の `Direct` | Navigation / `container_open(auto)` / **`pending_auto_fs_open` を先に立てる** (`collection_grid.rs` 1546、`gamepad_input.rs` 10095) | **読込の前に閲覧履歴の帰路 (`note_reading_history_open`) と★フィルタの一時解除 (`maybe_suppress_rating_filter_for_opened_container`) を変える** (`collection_grid.rs` 1544、`gamepad_input.rs` 10094)。§6.3 の 8 で採用の時点へ移す |
+| C2 | 親へ: BS・⬆・背景・ゲームパッド B (`physical_grid_parent_action`、`grid_parent.rs` 596) → `Direct(parent, ExplicitList)`。サブフォルダ展開の戻り・スマートフォルダの物理の親 (`subfolder_expansion.rs` 1998、`smart_folder.rs` 8843) | Navigation / ExplicitList | `select_after_load` (子の名前) を先に置く |
+| C3 | コレクションの物理元: Enter・BS (`collection_grid.rs` 1592・1367) → `CollectionSource` | **CollectionGridPhysical** / 各 intent | Enter は C1 と同じ先行変更 (同じ `accept_grid_container_open`) |
+| C4 | フォルダを開くダイアログ (`open_folder_nav` → `dispatch_favorite_navigation` → `Direct`、印なし) | Navigation / ExplicitList | なし |
+| D1 | 本棚のルート `open_books_root` (`app.rs` 56021)、本の管理の「開く」(`location_jump.rs` 30) → `load_folder` | Navigation / ExplicitList | なし |
+| D2 | お気に入り検索の BS・Ctrl+↑↓ (`favsearch_back` 35896、`favsearch_navigate_sibling` 35874)、タグ表示の BS (`tag_view_back` 35466) | Navigation / ExplicitList・`container_open(false)` | **読込の前に検索の積み上げを変える**。§6.3 の 9 で install の確定へ移す |
+| D3 | スマートフォルダの取消・定義削除 (`smart_folder.rs` 8299・8373)、サブフォルダ展開の切替・終了 (`subfolder_expansion.rs` 1801・1986) | Navigation / ExplicitList | **読込の前に合成一覧の表示の状態を消す**。§6.3 の 10 で install の既存の後始末へ任せる |
+| C5 | 全画面を閉じる即時経路の `Direct` / `CollectionSource` (`app.rs` 25208・25241): 「ページを直接開く」で閉じて親へ戻る (`close_return.rs` 407)・ブックマーク・コレクションの物理元の閉じ戻り・動画の背景での移動 (`update_phases.rs` 31〜46)・Everything の物理の親 | Navigation または CollectionGridPhysical | **全画面を閉じる処理が読込の install の中にある** (ページ一覧を見せないため)。§6.12 |
+| D4 | 「ZIP を作成」完了時の親の読み直し (`ui_dialogs/archive_convert.rs` 1185) | Navigation / PreservePresentation | 出力名の `select_after_load` を先に置く |
+| D5 | 読み直しの fallback (`reload_current_physical_list_with_intent`、`app.rs` 29068): main の実フォルダは既に staged の preflight (29049) で非同期。**採用済みの表示が実フォルダ**で `current_folder_last_mtime` が無いとき (メタデータの取得失敗、スマートフォルダが mtime を消した後 `smart_folder.rs` 8657) だけ同期。ZIP/PDF は正常でも mtime を持たない (`app.rs` 40715) が、走査点の前の早期 return で UI 走査は無い | Navigation・CollectionGridPhysical・RatingPhysical / RefreshList | **読込の直後に `address`・`archive_source_override` を書き換える** (29077〜29084) |
+| E | 「元の場所へ」の ArchiveContainer (`app.rs` 61972〜62012): main で `classified_kind` が無く、`.zip`/`.pdf` 風の名前の実フォルダが今の一覧に Folder として出ているときだけ | Navigation / ExplicitList | なし |
+
+対象外 (理由):
+
+| 入口 | 理由 |
+| --- | --- |
+| トレイへ閉じる (`close_main_still_fullscreen_for_tray`、`startup_list_restore.rs` 429〜475) | 窓を隠す操作で、待ちの見え方が無い。隠れている間の poll と、再表示で一瞬全画面が見える組み合わせを作らないため、理由付きの例外 `TrayClose` で同期のままにする (止まるのは隠れた窓で、利用者が待つ前面の操作ではない) |
+| ★固定の移動 `snapshot_load_and_open` (`snapshot_ops.rs` 2135)・`snapshot_navigate_grid_inner` (2870) | 読込の直後に `self.items` から対象の葉を探して全画面を開き、スライドショーを再開する (2136〜2195)。`snapshot_internal_nav` の guard と `items_generation` の照合 (2675) も同期を前提にしている。続きを型で運ぶ設計 (既存の `RequiredFullscreenTarget` が候補) が要る |
+| 再生試験 `poll_play_test` (`app.rs` 34375) | 診断用の CLI。非同期にすると採用までの毎フレームに読込を出し直す |
+| test-script の ReleaseChecks の「開く」(`release_checks.rs` 212) | 試験の自動操作。結果の bool を同期で返す契約 |
+| main 以外の context (detached・投影中の別 context) の全入口 (表の C・D の各入口と、§1.805 の印付き入口の detached 側、`restore_view_return_origin` 35338、起動 resolver の detached lease の bookmark `startup_ops.rs` 2124・2275・2592) | detached viewer はリワーク中で凍結 (CLAUDE.md)。今回の分岐は main の述語だけで判定し、main 以外は従来どおり同期のまま |
+| 既に `pre_scan` を持つ・ファイル/書庫だけの入口 (外部再走査、DFS、分類 worker、ツリー、JumpToPhysicalFolder、view-order refresh、起動 resolver の main、ZIP/PDF/変換書庫) | UI での走査が無い |
+
+★固定の移動は、全画面のまま次のフォルダを読み、読み終わったら対象の画像で全画面を開き直してスライドショーを再開する
+続きが要る。似た既存の `RequiredFullscreenTarget` (類似画像の移動、`snapshot_ops.rs` 2226〜2237・2466〜2513) は、
+★固定を解除する (`dismiss_snapshot_without_restore`、2364)・スライドショーを再開しない (2396・2407)・対象が無いときの
+代わり (最初の画像) を持たない (`DeferredFsTarget::Required`)・フォルダ項目を扱わない、の 4 点で違い、今回の仕組みに
+乗らない。**別項目の候補として統括へ報告する** (番号は統括が master で取る)。C5・D2・D3 は、install の中の既存の確定点に
+乗るので今回入れる (§6.3 の 9・10、§6.12)。
+
+### 6.3 設計: 同期走査点で「同じ呼び出しを走査の後へ遅らせる」
+
+§1.805 は生成点に印 (`DirectoryScanRoute::Worker`) を付けて入口ごとに worker へ回した。今回は対象が十数の生成点と
+2 つの入口にまたがり、印で選ぶと付け忘れた入口が同期のまま残る。**判定を同期走査点そのものに置き、既定を反転する**
+(CLAUDE.md「設計の簡素化」: 1 つの所有者・1 つの確定の時点)。
+
+1. **判定の位置**: `load_folder_with_scan_claimed_with_search_origin` の `pre_scan = None` で
+   `scan_directory_with_settings` を呼ぶ直前 (受付・拒否・claim・staged/PDF/ZIP の早期 return・test-script の数え上げを
+   全部通った後)。次をすべて満たすときは走査せず、worker に走査を出して `FolderOpenOutcome::Classifying` を返す:
+   - main の context (`main_folder_history_available()` かつ `!navigation_scope.is_detached_physical()`)
+   - navigation がある (main ではこの関数の冒頭で `capture_physical_open_navigation` が捕捉する。main で None に
+     なる経路が実在するなら、実装担当は設計担当へ返す。黙って同期にしない)
+   - 呼び出しの走査経路が例外 (下の 4) でない
+   - 権限が `VisibleInstallAuthority::Ordinary` (pre_scan = None で届く 2 入口はどちらも Ordinary。それ以外が来たら
+     設計担当へ返す)
+2. **預けるもの (`DirectNavigationContinuation`)**: 同期走査の後に `load_folder_with_scan_claimed_with_search_origin` が
+   使う引数を、`pre_scan` 以外全部そのまま持つ: `path`・`owner`・`grid_effects`・`classified_kind`・`restore_intent`・
+   `navigation` (test-script の `folder_load_recorded` を立てた後)・`stage`・`search_origin`・`tag_admission`。
+   加えて**全画面の予約**: `pending_auto_fs_open` を `std::mem::take` で受け取り、要求が持つ。保留中に App の flag に
+   残さないので、退役・取消・走査失敗で予約が次の無関係な読込へ漏れない (§1.805 §7 の `GridFolderCandidate` の既存の漏れと
+   同じ形をここでは作らない)。`select_after_load` は navigation の `selection_after_load` に捕捉済みであることを
+   実装担当がコードで確かめ、採用時に App の値を読まない (§5.4 の追補で起動の既定先に同じ問題があった)。
+   `FolderOpenScanPurpose::DirectNavigation` をこの continuation を持つ形 (`DirectNavigation(Box<DirectNavigationContinuation>)`)
+   に変える。
+3. **完了**: 既存の pane pending の poll → 通常 nav 裁定 (`post_render_main_navigation`、より優先の nav が同じフレームに
+   あれば負ける) → `main_list_navigation_is_current` の照合 (規則 3) はそのまま。owner が `CollectionGridPhysical` なら
+   `collection_grid_physical_load_owner_is_current` も照合し、古ければ捨てる (`GridFolderCandidate` と同じ)。
+   r2 (設計レビュー r1 P2-4): 今の §1.805 の完了は `open_direct_navigation_target_at_stage` へ再入して claim を通り直すので、
+   claim 冒頭の `document_open_modal_admission_blocked()` (`app.rs` 32054。兄弟 context の PDF パスワード等も含む) が
+   完了でも効いている。遅らせた呼び出しは claim を通らないので、**採用の直前に同じ述語を評価し、塞がっていれば今の再入と
+   同じ結果 (要求を捨てる。通知も今と同じ) にする**。claim のその他の照合 (rating・Quick Folder・コレクションの owner の
+   現在性) は、遅らせた呼び出しの中の `open_request_owner_is_current` が同じ判定をしているかを実装担当が確かめ、
+   抜ける照合があれば同じく採用の直前に置く。claim の取消の副作用 (変換中・起動 resolver・ブックマークの退役) は
+   受付で済んでいるので繰り返さない。
+   r2 (設計レビュー r1 P2-5): **走査の設定と Susie の世代の照合**を §3.2 と共有する。worker は走査に使った
+   `FolderScanPolicy` (Susie の対応拡張子の世代を含む、走査の前後で読む) を結果に付け、採用の直前に今の設定の policy と
+   比べる。違えば結果を捨て、同じ pending を取り出さずに今の policy で走査だけをやり直す (§3.2 の「走査だけの続き」と同じ:
+   continuation・cancel token・開始時刻はそのまま、受付は繰り返さない)。設定の変更・「プラグインを再読み込み」は通常の
+   操作なので、割り切りではなく構造で扱う。§1.805 の入口 (お気に入り等) も同じ完了を通るので一緒に直る。
+   採用では、予約を `pending_auto_fs_open` に戻した直後に、**預けた引数と `pre_scan = Some(scan)` で同じ
+   `load_folder_with_scan_claimed_with_search_origin` を呼ぶ**。受付・claim はやり直さない (済んでいる。§1.805 の
+   「Admission is complete」と同じ)。走査の失敗は今の同期の失敗と同じ処理 (ログ・予約の破棄・`cancel_folder_pane_open`・
+   `release_fs_nav_lock`・「フォルダを読み取れませんでした」) にし、UI で走査し直さない。
+4. **例外 (同期のまま)**: 走査経路の型を「既定 = main は worker」と「理由付きの UI 走査」の 2 値にする
+   (例: `DirectoryScanRoute::{MainWorker, UiThread(UiThreadScanReason)}`、理由は `TrayClose`・`ConvertedCacheReload`
+   (届く場合だけ)・`SnapshotLeafOpen`・`PlayTest`・`ReleaseCheck`)。今の
+   `DirectoryScanRoute::UiThread` の 12 か所と `load_folder` 系の wrapper は既定になり、§6.2 の対象外の入口だけが理由を渡す。
+   理由は「この入口はまだ続きを運べない」の印で、別項目で続きを運べるようにしたら外す。理由は 2 つの入口から同期走査点まで引数で運ぶ (App の flag で運ばない)。
+   main 以外の context は経路の型にかかわらず従来どおり同期 (1 の述語で決まる)。
+5. **§1.805 の分岐を 1 つにまとめる**: `direct_navigation_uses_worker_scan` の早い分岐と `DirectoryScanRoute::Worker` の
+   印は、1 の判定に吸収して撤去する (同じ意味を 2 か所に書かない)。お気に入り・アドレス欄 Enter・最近開いたフォルダの
+   完了も 3 の「預けた同じ呼び出し」になる。§1.805 の分岐が今やっている受付時の後始末
+   (`retire_replaced_main_list_requests_with_startup_intent(Some(Pane), …)`、DFS の `folder_nav_pending` の取消、
+   `clear_pending_folder_nav_steps`、全画面の DFS holdover の `Superseded` 終了) は、1 の判定で worker を出す直前に同じ順で
+   行う。`AddressBarNav::WorkerFavorite`・`AddressEnterPhysical`・`RecentFolder` の値は、走査経路以外の意味
+   (位置・履歴の扱い) を持つなら残し、走査経路の印としての役目だけを外す。§1.805 の既存テストは期待値を変えずに通ること
+   が、このまとめの受け入れ条件。
+6. **D5 (読み直しの fallback) は staged の preflight に寄せる**: r3 (設計レビュー r2 P2-2): 対象は**採用済みの表示が
+   実フォルダ** (ZIP/PDF でも変換キャッシュでもない。`archive_source_override` が無い) で `current_folder_last_mtime` が
+   無い main の読み直しだけ。その場合だけ、既存の `start_physical_history_transition_classified_at_stage` (mtime がある
+   場合と同じ経路) へ渡す。ZIP/PDF・変換キャッシュの読み直しは既存の経路のまま変えない (キャッシュのパスを staged へ
+   渡すと論理 source と表紙 pin のキーが変わる、`app.rs` 39079・41001)。変換キャッシュの読み直しが走査点に届くなら
+   (実フォルダのキャッシュ)、理由付きの例外 `ConvertedCacheReload` で同期のままにする。読込の直後に
+   `address`・`archive_source_override` を書き換える同期前提 (29077〜29084) は、main ではこの経路を通らなくなる。
+   staged の経路が mtime 無しを扱えない理由がコードにあれば、実装担当は設計担当へ返す (同期のまま残さない)。
+   main 以外は従来どおり。
+7. **呼び出しの外で状態を変える入口の点検**: 実装担当は、既定が worker になる入口 (§6.2 の対象の表) のすべてについて、
+   呼び出しの前に App の状態 (表示中の合成一覧の owner・検索の積み上げ・アドレス・選択のヒント・全画面) を変えていないか、
+   後に読込の結果を前提にした処理をしていないかを確かめる。D2・D3・C1 と同じ形 (呼び出しの外の状態の変更) のものが
+   見つかったら、install の確定点へ移せるかを書いて設計担当へ返す (黙って worker にしない)。
+
+8. **C1・C3 のフォルダを開く操作の先行変更を、ZIP/PDF と同じ採用時の確定へ移す** (r3、設計レビュー r2 P2-1):
+   `accept_grid_container_open` (と同じ処理を持つゲームパッドの入口 `gamepad_input.rs` 10094) は、フォルダのとき読込の前に
+   閲覧履歴の帰路と★フィルタの一時解除を変えている。待ちが拒否される後続で取り消されると、旧一覧に一時解除が残り、
+   閲覧履歴からの帰路が消える。ZIP/PDF は既にこれらを `GridVirtualOpenEffects` に捕捉し、採用 (install) の中の
+   `commit_grid_virtual_open_effects` (`app.rs` 37646、呼び出しは 32783) で確定している。**フォルダも同じ型の効果を捕捉して
+   nav の値 (`Direct` / `CollectionSource` の型付きの持ち物) に入れ、読込の `grid_effects` として渡す**。先行の
+   `note_reading_history_open`・`maybe_suppress_rating_filter_for_opened_container` の呼び出しはフォルダでは外す。
+   r4 (設計レビュー r3 P2-1): フォルダでは `suppress_facet_filter = false` にする (true だと loader が `book_prefix = Some("")`
+   にして通常フォルダの履歴を `FacetScope::Book` で作り、子フォルダを包含しなくなる。`app.rs` 32757・25656、
+   `facet_navigation.rs` 106)。facet の絞り込みの扱いは今のフォルダと同じ (ZIP/PDF だけが true)。
+   r4 (設計レビュー r3 P2-2): ★フィルタの一時解除は、**受付の時点で今の idx 版の判定 (`get_rating(idx)`、session の書き込みと
+   表示中の cache を優先) で決めた結果**を効果に入れる (例: `rating_suppression: Option<(anchor, saved)>`、App を変えずに計算)。
+   採用時の確定は、その決定を `rating_filter_suppressed_at` が空のときにだけそのまま入れ、通知もそこで出す。DB の値で
+   判定し直さない。ZIP/PDF の既存の path 版の扱いは変えない (同じ型に 2 つの決め方を混ぜないよう、フォルダの決定は
+   別の field にする)。
+   全画面の予約も `effects.auto_fullscreen` で運び、読込の中で prepare (予約を消費する `app.rs` 33066) の直前に
+   `pending_auto_fs_open` へ立てる。フォルダの入口で App の flag を先に立てるのはやめる (2 の「予約を要求が持つ」と同じ
+   所有者にまとめる。2 の `take` は、効果を持たない入口が flag を立てていた場合の受け皿として残すか、flag を立てる入口が
+   他に無いことを確かめて外すかを実装担当が判断し、記録する)。同期のまま残る経路 (main 以外・例外) でも、効果は同じ
+   install の中で確定するので挙動は同じ。`capture_main_folder_list_order` は ZIP/PDF でも先行で行っている既存の扱いなので
+   変えない。
+
+9. **D2 (検索の BS・Ctrl+↑↓) の積み上げを install の確定へ移す** (r4): install の中の
+   `commit_staged_search_navigation_effects` (`app.rs` 39335〜39370、呼び出しは 32792) は既に、お気に入り検索なら
+   `nav_stack.push(path)` + アドレス更新、タグ表示なら `TagViewNavAdmission` (`Descend` / `ListOrderRow` で置き換え) で
+   積み上げを確定している。**戻る・兄弟への置き換えもこの確定に型で渡す**: お気に入り検索の bool を型
+   (例: `FavsearchNavAdmission::{Descend, Back, Sibling}`) に、タグ表示に `TagViewNavAdmission::Back` を足し、
+   `favsearch_back`・`favsearch_navigate_sibling`・`tag_view_back` は読込の前に積み上げを変えない (選択のヒントと
+   `cancel_pending_folder_nav` は今のまま先に行う)。`tag_view_back` の Ignored/Refused の巻き戻し (35472〜35478) のうち、
+   積み上げとアドレスの巻き戻しは先に変えないので不要になる。r5 (設計レビュー r4 P3-5): **選択のヒントの巻き戻しは残す**
+   (`select_after_load` は先に置くので、navigation が捕捉する前の即時の拒否 (modal、`app.rs` 31189) で次の読込へ漏れない
+   ようにする)。お気に入り検索の BS も同じく、即時の拒否ではヒントを戻す。積み上げが空になって検索結果へ戻る枝 (`execute_favsearch` / `execute_tag_view`) は
+   読込ではないので今のまま。`tag_view_back` の行き先が ZIP/PDF/変換書庫のとき (staged・分類の経路) も同じ型付きの戻りを
+   確定時に適用する。運べない経路があれば設計担当へ返す。今の `favsearch_back` は pop の後の読込で同じ path をもう一度
+   push している可能性がある (棚卸しの所見、未確認)。実装担当はテストで確かめ、型にした後の積み上げが今の利用者に
+   見える結果 (戻り先・アドレス・次の BS の行き先) と同じであることを確かめる。今と違う結果になるなら返す。
+10. **D3 (合成一覧を抜ける操作) は、読込の前の後始末をやめて install の既存の後始末に任せる** (r4): install の
+   `install_loading_items_inner` は、別の一覧を採用するとき既にサブフォルダ展開 (`app.rs` 44891〜44907) とスマートフォルダ
+   (44908〜44920、`preserve_smart_folder_session` の条件 44845〜44858 を除く) の状態を片付ける。`restore_cancelled_smart_folder_prior`・
+   `forget_smart_folder_definition`・サブフォルダ展開の切替/終了は、機能自体の取消・定義の無効化 (pending の取消・
+   `invalidate_smart_folder_definition`・削除済みパスの掃除) だけを先に行い、表示の状態の後始末
+   (`clear_smart_folder_view_state`・`clear_subfolder_expansion_view_state`) は外す。実装担当は、install の後始末が今の
+   先行の後始末と同じ field を片付けること、これらの帰り先で `preserve_smart_folder_session` が真にならないことを確かめる。
+   待ちが取り消されたときは、合成一覧とその状態がそろったまま残る (行だけ残って状態が消える、を作らない)。定義を削除した
+   スマートフォルダが待ちの取消で表示に残った場合、その一覧の操作が無効化済みの定義を既存の扱い (無効化の経路) で扱うことを
+   確かめる。
+   r5 (設計レビュー r4 P2-1): 状態を残したまま普通の読込を出すと、帰り先がスマートフォルダの entry やその配下のとき
+   スマート専用の分岐 (`app.rs` 31932、entry 自身も対象 `top_level_grid_view.rs` 129) へ入り直し、抜けられない。**抜ける操作は
+   既存の型付きの「一時表示から出る」navigation (`MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView {..})`)
+   として出す**。この navigation はスマートの分岐を通らず (`app.rs` 31444・31930 の条件)、採用時に
+   `dismiss_transparent_view_for_admitted_jump` (26285〜26310、呼び出しは 26199) がスマート・検索・タグの状態を片付ける。
+   サブフォルダ展開を抜ける操作も同じ型にする。実装担当は、同じ子への帰還でも `preserve_smart_folder_session` が働かないこと、
+   取消のときに表示中の session が残ること (採用で初めて終わること) を確かめる。
+
+### 6.4 待ちの間の入力・表示
+
+- 入力: 走査中は 3 の pending (`FolderOpenScanPurpose::DirectNavigation`) があるので、既存の
+  `direct_navigation_scan_pending()` → `GridItemInputBlock::DirectNavigationScan` がそのまま効く (§1.805 §4.4 の規則 1〜3、
+  Esc・スタック切替キーの扱いも同じ)。新しい停止理由・述語は作らない。
+- 表示: 走査中は今の一覧のまま。500 ms を超えたら既存の「移動先を読み込み中…」(`DIRECT_NAVIGATION_WAIT_GRACE`)。
+- 全画面から戻る経路 (C5) の待ちは §6.12。
+
+### 6.5 計測
+
+- worker の既存 `nav/folder_open_scan` (`ms`・`purpose`・`folders`・`media`・`failed`・`cancelled`) に、continuation から
+  `owner` (`navigation|collection|rating`)・`intent` (restore_intent の種類)・`auto_fs` (予約の有無)・
+  `rescan` (設定の不一致で走査し直した回数) を足す。生成点の名前は同期走査点では分からないので記録しない。
+- 採用時の `nav/lf_scan` は `pre_scanned=true`。`scripts/analyze_perf.py` の nav の内訳に新しい extras を足す。
+- UI スレッドの同期走査の cfg(test) 計数 (§1.805 で足したもの) を使い、対象の入口で 0 回であることをテストで確かめる。
+
+### 6.6 不変条件とテスト
+
+テストは既定と `--features test-script` の両方で流す (v5.8.0 の §1.853 では test-script 側の数え上げの期待値の誤りが
+全件まで見つからなかった)。
+
+1. §6.2 の対象の各入口 (C1〜C5・D1〜D5・E) で、dispatch したフレームと採用のフレームの UI 同期走査が 0 回。worker 完了 +
+   poll で、今の同期経路と同じ一覧・選択 (子の名前・出力名)・履歴・アドレス・カーソルが採用される。
+2. 全画面の予約: 画像フォルダを Enter で開く (自動全画面が有効) と、採用後に全画面が開く。待ちの間に別の移動で退役・
+   走査失敗・`Disconnected`・コレクションの owner の失効・bundle の破棄のどれでも、予約と選択のヒントは次の無関係な読込に
+   残らない。
+3. 入力: 待ちの間は一覧の項目入力が止まり (Enter・↓・ダブルクリック・ゲームパッド)、待ちの間に押したキーは採用後の一覧に
+   届かない。ツリー・お気に入り・アドレス欄・戻るは後勝ちで、遅れて完了した旧要求は採用されない。500 ms 未満では
+   待機表示を出さない。
+4. modal: main の走査待ちの間に兄弟 context が document modal (PDF パスワード等) に入ったら、完了は今の §1.805 の再入と
+   同じ結果になる (採用しない)。
+5. 走査の設定 (r3、設計レビュー r2 P3): 2 つに分けて確かめる。(a) 設定の適用が今の一覧の更新を始める変更
+   (種類の表示の変更 `app.rs` 29384・29464 など) では、更新の開始 (`app.rs` 62310) が待ちの要求を退役させ、旧要求は
+   復活しない (§1.805 の規則 2 のまま)。(b) 更新を始めない変更 (隠しファイル・書庫/EPUB の扱い・「プラグインを再読み込み」
+   のうち、実装担当が (a) に当たらないと確かめたもの) では、要求が生きたまま policy が不一致になるので、古い結果を採らず
+   同じ要求のまま今の設定で走査し直して採用する (受付・test-script の要求数・履歴は 1 回分)。お気に入りの入口でも同じ。
+6. D5: mtime の無い main の実フォルダの読み直しが staged の経路で採用される。ZIP/PDF・変換キャッシュの読み直しは
+   経路が変わらない (論理 source・アドレス・`archive_source_override`・表紙 pin のキーが従来どおり)。
+6a. C1・C3: ★付きのフォルダ・閲覧履歴の一覧のフォルダを開いて待つ間に、拒否される後続 (表示対象外の ZIP をアドレス欄で
+   指定する等) で取り消すと、★フィルタの一時解除も閲覧履歴の帰路も変わっていない。採用されたときは今と同じに確定する。
+   ゲームパッド A でも同じ。★の判定は受付時の値 (session の書き込みを含む) で、待ちの間に兄弟 context が★を変えても
+   採用時に判定し直さない。facet が有効な親 → 子フォルダ → 孫フォルダ → 戻る、の経路と復元が今と同じ。
+6b. D2: お気に入り検索の BS・Ctrl+↑↓、タグ表示の BS が、今と同じ戻り先・アドレス・次の BS の行き先になる。待ちの間に
+   拒否される後続で取り消すと、積み上げもアドレスも変わっていない。タグ表示の行き先が ZIP のときも同じ。
+6c. D3: スマートフォルダの取消・定義削除、サブフォルダ展開の切替/終了が今と同じ一覧と状態になる。待ちが取り消されると、
+   合成一覧と状態がそろって残る。
+6d. C5 は §6.12 のテスト。
+7. E: `.zip` という名前の実フォルダへの「元の場所へ」が worker で走査される。
+8. 例外: トレイへ閉じる・★固定の移動・再生試験・ReleaseChecks は同期のまま (計数 1 回)。main 以外の context の各入口も同期のまま。
+9. 兄弟 context・lifecycle: detached を投影している間は main の待ちで入力を止めない (§1.805 と同じ述語)。sidecar 復元中の
+   完了は保留 (既存)。Quick Folder の A→B→A の往復、待ちの間の DFS・saved-group は §1.805 の規則のまま。
+10. test-script の要求数: 受付時の 1 回だけ (採用の再入で数え直さない)。取消された受理済み要求も 1 回。
+11. §1.805 の既存テストのうち、**意図して期待値を変えるもの**は次の 2 種だけ。実装担当は該当するテストを名前で列挙し、
+    変える理由をテストのコメントと記録に書く: (a) 全画面の予約を要求が持つようになったこと (例:
+    `direct_navigation_worker_admission_does_not_take_global_fullscreen_reservation`、`direct_navigation_worker_scan.rs` 302)、
+    (b) 印の無い入口が同期で採用される前提 (例: `direct_navigation_worker_preserves_unmarked_presentation_intents`、同 1251。
+    一覧・履歴・intent の期待値は保つ)。それ以外の §1.805 のテストは期待値を変えずに通ること。
+12. 既存テストのうち、対象の入口の直後に同期採用を前提にしていたもの (§1.805 §3.2 の 39 件: history_parent_1473・
+    ratingnav649・same_position_double_click・section1328 等) は、worker 完了 + `post_render_main_navigation` を回す helper を
+    通す形に直す。**一覧・選択・履歴の期待値は変えない**。変えないと通らないものは、実装担当が理由を添えて設計担当へ返す。
+
+### 6.7 文書の更新 (実装時)
+
+- [ui-responsiveness.md](ui-responsiveness.md): 冒頭の §1.853 の節に C・D・E を追記。対象外 (C5・D2・D3・★固定の移動・診断・
+  main 以外) を明記。
+- [async-architecture.md](async-architecture.md): 物理フォルダの事前走査の行に、同期走査点の既定の反転と continuation。
+- [direct-navigation-worker-scan-plan.md](direct-navigation-worker-scan-plan.md) §7: 一覧側の後続候補を本書 §6 で実施したと記録。
+- [detached-rework-plan.md](detached-rework-plan.md) §11: 判定は main の述語だけで、main 以外の context の経路は変えないこと。
+- htdocs のマニュアルに「読み込み中のキー」に触れた記述があれば合わせる (無ければ変えない)。
+- [video-architecture.md](video-architecture.md): native の対象を変える入口を共通の受付へまとめたこと (§6.12 の 2)。
+- [display-pipeline.md](display-pipeline.md): 全画面から戻る待ちの `CloseReturn` sequence (holdover の保持と終わり方)。
+- next-release-backlog の状態行は統括が更新する (本担当は変えない)。
+
+### 6.8 状態の組み合わせを減らす検討
+
+- 採用: 判定を同期走査点 1 か所に置き、入口ごとの印をやめる。付け忘れの入口が残らず、§1.805 の分岐も吸収して
+  完了の経路が 1 つになる。
+- 採用: 待ちの間の入力は既存の「場所の移動待ち」(停止理由 1 つ) に乗せる。新しい停止理由・入力の保留は作らない
+  (利用者決定 §6.1)。
+- 採用: 全画面の予約は App の flag から要求の持ち物へ移す。flag と pending の 2 か所で同じ予約を持たない。
+- 不採用: モーダル化。移動の入力 (ツリー・お気に入り・戻る) まで止める理由がない (§1.805 §3 の D と同じ)。
+- 採用: 呼び出しの外で変えていた状態 (フォルダを開く効果・検索の積み上げ・合成一覧の後始末・全画面の close) は、新しい
+  保留を作らず、install の中の既存の確定点 (`commit_grid_virtual_open_effects`・`commit_staged_search_navigation_effects`・
+  `install_loading_items_inner` の後始末・`change_main_context_for_visible_grid…`) に寄せる。取消時の巻き戻しは作らない。
+- 採用: 全画面の待ちは、既存の「全画面のまま次のフォルダを待つ」(Ctrl+↑↓) の sequence に乗せる (§6.12)。全部止めるモーダルは
+  入力の面ごとに新しい止めが要るので採らない (r4 の検討)。
+- 不採用: ★固定の移動まで今回広げること。続きの型が既存の `RequiredFullscreenTarget` と 4 点で違う (§6.2)。
+
+### 6.9 設計レビュー r1 (GPT-6.1 Sol / xhigh、read-only、30ee454c7、2026-11-26): REJECT
+
+P1×1・P2×4・P3×1。設計担当がコードで照合し、すべて妥当と判断して r2 で直した。detached の境界は「構造的修正であって
+症状パッチではない」に **AGREE** (main の既存 context／scope 述語で走査の責務を分けるため。§11 への記録は必要)。
+追加の同期走査の入口は無く、対象外の分類は概ね妥当、D5 の staged の経路は mtime を要さず 3 つの owner を扱える、
+選択のヒントは navigation が既に `take()` している (`app.rs` 25912)、という所見もあった。
+
+| 指摘 | 対応 (r2) |
+| --- | --- |
+| P1 C5 は全画面を閉じる処理が読込の中にあり、`Classifying` では全画面が残って採用もされない | C5 を対象外にし、待ちの間の全画面の扱いを統括へ質問 (§6.2) |
+| P2-2 D2 の積み上げの先行変更が、拒否される後続での取消で一覧と食い違う | D2 を対象外 (§6.2)。採用の時点へ移す作りは別項目 |
+| P2-3 D3 は表示中の合成一覧の状態を先に消す | D3 を対象外 (§6.2)。同上 |
+| P2-4 claim の再実行を外すと完了時の document modal の拒否が消える | 採用の直前に同じ述語を評価し、今の再入と同じ結果にする (§6.3 の 3) |
+| P2-5 走査の設定・Susie の世代の照合が無い | §3.2 の policy 照合と走査だけのやり直しを共有 (§6.3 の 3) |
+| P3-6 「§1.805 の既存テストは期待値を変えない」が新仕様と矛盾 | 意図して変える 2 種を明記 (§6.6 の 11)。兄弟投影・sidecar・Quick Folder・取消/切断のテストを追加 (§6.6 の 2・9) |
+
+
+### 6.10 設計レビュー r2 (同じ担当の継続、06e53e169、2026-11-26): REJECT
+
+r1 の 6 件は方針上解消と判定 (C5 は統括判断まで同期)。新たに P2×2・P3×1。設計担当がコードで照合し、r3 で直した。
+
+| 指摘 | 対応 (r3) |
+| --- | --- |
+| P2-1 C1・C3 のフォルダを開く操作が、閲覧履歴の帰路と★フィルタの一時解除を先に変える (`collection_grid.rs` 1544、`gamepad_input.rs` 10094) | ZIP/PDF と同じ `GridVirtualOpenEffects` に捕捉し、install の中の `commit_grid_virtual_open_effects` で確定する。全画面の予約も同じ効果で運ぶ (§6.3 の 8) |
+| P2-2 D5 の「mtime が無い」には ZIP/PDF・変換キャッシュも入り、staged へ渡すと論理キーが変わる | 採用済みの表示が実フォルダのときだけに限定。変換キャッシュが走査点に届くなら理由付きの例外 (§6.3 の 6) |
+| P3 設定の適用による更新が旧要求を退役させる場合と、要求が生きたまま policy が不一致になる場合が混ざっている | 2 つに分けて記述・テスト (§6.6 の 5) |
+
+### 6.11 設計レビュー r3 (同じ担当の継続、33d08a3eb、2026-11-26): REJECT
+
+r2 の 3 件のうち D5 の限定と設定変更の分割は解消と判定。全画面の予約の他の参照・コレクションの owner の事前照合・main 以外も
+同じ install 境界を使う方針は妥当との所見。新たに P2×2。設計担当がコードで照合し、r4 で直した。
+
+| 指摘 | 対応 (r4) |
+| --- | --- |
+| P2-1 フォルダに ZIP/PDF と同じ効果を使うと `suppress_facet_filter=true` になり、通常フォルダの履歴が `FacetScope::Book` になる | フォルダでは false と明記し、facet の親→子→孫→戻るの検査を追加 (§6.3 の 8、§6.6 の 6a) |
+| P2-2 ★の判定を採用時に path 版 (DB) でやり直すと、受付時の idx 版 (session の書き込み・cache 優先) と食い違う | 受付時の idx 版の決定を別の field で運び、採用時に判定し直さない (§6.3 の 8) |
+
+### 6.12 C5 全画面から戻る経路: 全画面の Ctrl+↑↓ の待ちと同じ扱い (利用者決定 §6.1、r6)
+
+利用者が選んだ案 (2026-11-26、§6.1 の 3 つ目の決定。共有メモ `uiscan-853b-fullscreen-close-proposal.md` の「改めた案」)。r4 の「全部止めるモーダル」は
+設計レビュー r4 で、専用の全画面 viewport の入力 (`ui_fullscreen.rs` 28906・35595)・native HUD の output event
+(`native_video.rs` 6212・6833)・root の focus guard (`app.rs` 65578)・App 共通のゲームパッドの解放 (`gamepad_input.rs` 4745、
+前面の detached の操作まで途切れる) に新しい止めが要ると分かり、取り下げた (§6.13)。
+
+今の作り: 「閉じる」で親の一覧 (L1) へ戻る経路は、その場では全画面を閉じず `pending_return_to_parent` を立て、同じフレームの
+入力の合流点 (`app.rs` 103668〜103683、もう 1 か所 103814) で `Direct(親)` / `CollectionSource` の読込を出す。全画面を閉じるのは
+読込の install の中 (`install_loading_items_inner` 45042〜45048 → `change_main_context_for_visible_grid_for_destination`
+71740〜71777 → `close_fullscreen_content_for_destination` 84669)。閉じる要求の時点で `finish_fullscreen_navigation_for_true_close`
+(`snapshot_ops.rs` 2271〜2294) がスライドショー・ナビの sequence を終え、holdover も消える (`release_fs_nav_lock`、
+`ui_fullscreen.rs` 14902)。読込が失敗・拒否されると全画面のまま (`app.rs` 25206〜25231、再試行なし)。
+
+**見え方とキー (利用者決定)**:
+
+- 閉じる操作の後、親の一覧を worker で読み終わるまで全画面 (今のページ) を出したまま。読み終わったら今と同じ install の中で
+  全画面を閉じて親の一覧に替わる。ページ一覧は今どおり見せない。読み込み中の表示は出さない (全画面の Ctrl+↑↓ の待ちと同じ。
+  `fs_page_wait_indicator_visible` は `FolderItems` の待ちでは偽、`ui_fullscreen.rs` 4801)。
+- 待ちの間のページ送り・ジャンプ・スクロールは受け付けない (押し直しが要る)。拡大・回転・★などは今のページに効く。もう一度
+  「閉じる」を押すと、閉じる要求をやり直し (true-close の後始末 → 同じ親への読込を受け付け直し、前の待ちは退役)、結果は同じ
+  親の一覧。
+- 読めなかった・別の要求 (Remote・起動の転送・agent 等の受付) に退役させられたとき: 全画面のまま。失敗は今と同じ通知。
+- 不採用: 先に全画面を閉じて待つ (ページ一覧が見え、今の作りに反する)。全部止めるモーダル (上記)。
+
+**仕組み (既存の sequence に乗せる)**:
+
+1. 受付: 今の入力の合流点で出す読込が、§6.3 の 1 の判定で worker になる。continuation に「main の全画面から戻る」印
+   (例: `closes_main_fullscreen: bool`、受付時に main の全画面が出ていたか) を持たせる。新しい pending は作らない。
+2. 待ちの間の全画面: r6 (設計レビュー r5 P2-1): **true-close の後始末より前に**、今描いている表示単位を捕捉する
+   (表示中の holdover があればそれを先に、無ければ今の items/cache から。`ui_fullscreen.rs` 13036 の既存の注意と同じ順。
+   `capture_fs_nav_holdover` 15045 は今の items/cache から取るので、後始末の後では旧画像を失う)。捕捉した表示単位は、
+   既存の型付きの close continuation (`FullscreenCloseContinuation` の `Live` 等) に描画資源としてだけ持たせ、旧 sequence の
+   操作の権限は引き継がない。worker を出した直後 (§6.3 の 5 の受付時の後始末、DFS holdover の `Superseded` 終了の**後**) に、
+   その表示単位を `previous` にして `FsNavigationSequenceTarget::FolderItems` の sequence を、この待ち専用の目的
+   (例: `FsNavigationPurpose::CloseReturn`) で始める (`begin_fs_folder_navigation_sequence` 14088)。移動先が未準備のまま閉じても
+   黒や loading を挟まない。捕捉できる表示単位が無い (まだ描けていない) ときは、既存の gap surface (`draw_fs_navigation_gap_surface`) のとおり。
+   r7 (設計レビュー r6 P2-2): **描画は Ctrl+↑↓ と変える**。Ctrl+↑↓ の `FolderItems` は `previous` を捕捉時の倍率・位置・回転で
+   描き続ける (`ui_fullscreen.rs` 14809・29733・52720・52780) が、C5 の待ちでは items は採用まで変わらず、利用者決定で拡大・回転は
+   今のページに効く。そこで `CloseReturn` の目的のときは、**今のページが描ける (準備済み) なら通常の描画で描き** (拡大・回転・位置の
+   変更が見える)、描けないときだけ捕捉した表示単位を代わりに描く。対象を変える入力の止め (lock・`blocks_new_target`) は sequence の
+   まま効かせる。描画の選び方は目的で分け、Ctrl+↑↓ の描画は変えない。
+   実装の注意 (設計レビュー r7 P3): 今の描画の選択 (`ui_fullscreen.rs` 14849 付近) は、選んだ結果に応じて holdover・sequence を
+   変える。`CloseReturn` では、通常の描画へ切り替えても sequence と lock は終えない (終えるのは 4・4a の終端だけ)。「準備済み」は
+   見開き全体を描ける条件で判定する (既存の表示単位の規則 `ui_fullscreen.rs` 30263)。切り替えた後もページ送りが断られることをテストする。
+   ページ送り・ジャンプ・スクロールは、既存の `fs_nav_is_locked()`・`fs_navigation_sequence_blocks_new_target()` の判定
+   (全画面・専用 viewport・page overview・in-page scroll・動画の側にある) でそのまま止まる。新しい入力の止めは作らない。
+   閉じる操作は Ctrl+↑↓ の待ちと同じく止めない。
+   r6 (設計レビュー r5 P2-4): native 動画の Home/End は `open_native_video_fullscreen_from_navigation` を直接呼び
+   (`native_video.rs` 13215)、lock の判定を通らずに選択を変えて fast swap を始める (15875)。前後移動は `fs_nav_is_locked()` を
+   見ているので、**native の対象を変える入口 (Home/End・HUD からの対象指定) を、既存の sequence/lock を評価する共通の受付へ
+   まとめ**、選択と swap を変える前に断る。これは今の Ctrl+↑↓ の待ちの間にも同じ迂回がある (既存の不具合) ので、一緒に直る。
+   実装担当は native の対象を変える入口を列挙する。r7 (設計レビュー r6 P3): この共通受付は**新しい入力の受付**だけに置く。
+   同じ helper は受付済みの非同期の結果や EOF の続き (`app.rs` 101922・102079) からも呼ばれるが、それらは受付済みの続きなので
+   審査し直さない (受付の型で区別する)。待ちの無いときの Home/End・HUD の操作と、swap 中の後続入力の既存の保持は変えない。
+3. 完了の poll: 全画面のフレームは通常の navigation の末尾 (`post_render_main_navigation`) に届かない (embedded の
+   early-return 103809〜103870、native の背景 `update_phases.rs` 31〜46)。既存の `poll_main_embedded_required_fullscreen_folder_open`
+   (`app.rs` 62636) が `RequiredFullscreenTarget` だけを回収している場所で、上の印の `DirectNavigation` も回収し、§6.3 の 3 の
+   採用 (modal・policy の照合 → 遅らせた同じ呼び出し) を行う。native の背景の経路にも同じ回収を置く。全画面では一覧の nav 源が
+   無く、全画面の移動の入力は 2 で止まっているので、同じフレームの裁定は通常の末尾と同じ規則で足りる (実装担当は、全画面の
+   フレームで同じ pending を奪い合う別の nav が無いことを確かめる)。
+4. 終端: r6 (設計レビュー r5 P2-2): install が呼ぶ content だけの close は `ViewerExited` を出さず、`FolderItems` の sequence は
+   目的によらず「viewer が続く (閉じて開き直す)」と読まれる (`app.rs` 12693)。そのままだと、通常の終了で行う情報パネルの reset と
+   viewport を作り直す方針が飛ばされる (85080・85195。固定した情報パネルが次の全画面へ持ち越される)。**採用が確定した境界
+   (遅らせた呼び出しが install に入る直前) で、同じ要求の `CloseReturn` sequence を `ViewerExited` で終えてから** content の
+   teardown へ進む。採用以外の終端 (走査の失敗・退役・`Disconnected`・`cancel_folder_pane_open`) では、同じ要求が始めた sequence を
+   `Superseded` で終え、全画面のまま入力が戻る。どちらも sequence の終わりは pending の purpose 別の後始末 1 か所に置く
+   (入口ごとに書かない)。
+4a. 待ちの間に全画面が別の経路で閉じたとき (r6、設計レビュー r5 P2-3): Backspace はページ一覧への close
+   (`close_fullscreen_to_page_list`、`startup_list_restore.rs` 423)、focus guard は `close_fullscreen` (`app.rs` 65591) を呼ぶ。今の
+   true-close の後始末が取り消す pane の走査は `RequiredFullscreenTarget` だけ (`snapshot_ops.rs` 2276、`app.rs` 62519) なので、
+   放っておくと L2 を出した後に残った走査が親へ移してしまう。**新しい close を受け付ける境界で、その context の C5 の要求も
+   退役させる** (`RequiredFullscreenTarget` と同じ扱い。置き場所は下の r7 の段落のとおり)。採用のときは pending を取り出した後に
+   install が全画面を閉じるので、この退役に当たらない (自分の採用を消さない)。二度目の「閉じる」は、この退役の
+   後に新しい要求として受け付けられる (5)。
+   r7 (設計レビュー r6 P2-1): 退役を置くのは**新しい close の受付**の境界 (true-close の後始末、Backspace のページ一覧への close の
+   受付、focus guard の close の受付) だけにする。**受付済みの close の teardown では繰り返さない**: native の presentation 切替中の
+   content の close は `TerminalClose` を積んで戻り (`app.rs` 84684)、後の effect が content の close へ再入する
+   (`native_video.rs` 3166)。その間に agent・起動の転送の受付 (`update_phases.rs` 542、`app.rs` 103125) が新しい C5 の要求を
+   受け付けていると、遅れた close がそれを退役させてしまう。既存コードも、この effect は「予約の退役は済んでいる」としている
+   (`app.rs` 84715)。共通の content-close の入口に退役を置かない。
+5. もう一度「閉じる」: `handle_fullscreen_close_request` は今どおり true-close の後始末 (sequence の終了、4a の退役) から始まり、
+   `pending_return_to_parent` の受付 → 合流点の読込が新しい要求になる。予約・選択のヒントは前の要求と
+   一緒に消え、新しい要求が受付時のものを持つ (閉じる要求ごとに子の名前を置き直す今の `take_close_return_navigation` のまま)。
+6. 待ちの間に始まり得る他の要求 (Remote の取得、起動の転送、agent の open、ブックマーク): 既存の受付の境界が待ちを退役させ
+   (4 の後始末で sequence も終わる)、その要求の採用が全画面を扱う (§1.805 の規則 2 と同じ)。
+7. 待ちの間の Backspace・focus guard による close は 4a のとおり待ちを退役させ、今の close の結果 (ページ一覧等) になる。
+
+**テスト**: (a) 「ページを直接開く」の本を閉じる・ブックマーク・コレクションの物理元の閉じ戻りで、閉じたフレームに UI 走査 0 回、
+待ちの間は全画面が出たまま (`fullscreen_idx` が残る)、描画は閉じる前の表示単位の holdover (移動先が未準備のまま閉じた場合も)、
+完了で今と同じ親の一覧・選択になり、その間のフレームで一覧が L2 にならない。(b) 待ちの間の →・PageDown・ジャンプが何も
+起こさず、採用後の一覧にも届かない。(c) 走査失敗・Remote 等による退役で全画面のまま、sequence が終わってページ送りが戻る。
+(d) もう一度「閉じる」で前の待ちが退役し、新しい待ちの完了で同じ親の一覧になる。(d2) 待ちの間の Backspace・focus guard の close の
+後に遅い結果が来ても採用されない。(d4) native の presentation 切替中の遅れた `TerminalClose` の effect より前に受け付けた新しい
+C5 の要求が、その effect で退役しない。(d5) 待ちの間の拡大・回転・位置の変更が描画に出る (今のページが準備済みのとき)。今のページが
+未準備で閉じたときは捕捉した表示単位が出て、準備ができたら通常の描画に替わる。(d6) 待ちの無いときの native の Home/End・HUD の対象
+指定と、swap 中の後続入力の保持が今と同じ。(d3) 採用のフレームで `CloseReturn` の sequence が `ViewerExited` で終わり、固定した情報パネルが
+次の全画面へ持ち越されない (通常の close と同じ)。(e) 動画の全画面から戻る経路 (native の背景) の完了と、待ちの間の動画側の
+前後移動・Home/End・HUD の対象指定の止め (handler-level)。Ctrl+↑↓ の待ちの間の native Home/End も止まる。(f) detached を投影している間は main の待ちの影響を受けない。(g) 全画面の Ctrl+↑↓ の
+既存テストが変わらない。
+
+### 6.13 設計レビュー r4 (同じ担当の継続、20ae1c90e、2026-11-26): REJECT
+
+r3 の 2 件は解消と判定。新たに P2×4・P3×2。設計担当がコードで照合し、r5 で直した。
+
+| 指摘 | 対応 (r5) |
+| --- | --- |
+| P2-1 D3 で状態を残して普通の読込を出すと、帰り先がスマートの entry・配下のときスマートの分岐へ入り直す | 抜ける操作を既存の `ExitTemporaryView` の navigation で出し、採用時の `dismiss_transparent_view_for_admitted_jump` に片付けさせる (§6.3 の 10) |
+| P2-2 C5 の true-close の後始末が holdover を消し、待ちの間に黒/loading を挟む | worker を出した後に holdover を取り直し、Ctrl+↑↓ と同じ sequence を始める (§6.12 の 2) |
+| P2-3 root のゲートだけでは全画面の入力を止められない (専用 viewport・native HUD・focus guard) | 全部止めるモーダルをやめ、既存の Ctrl+↑↓ の待ちの止めに乗せる。統括へ案を改めて返した (§6.12) |
+| P2-4 sidecar のジェスチャ終了の流用は detached のゲームパッド操作まで壊す | sidecar のゲートを流用しない (§6.12) |
+| P3-5 D2 の巻き戻しを全部外すと、選択のヒントが即時の拒否で漏れる | ヒントの巻き戻しは残す (§6.3 の 9) |
+| P3-6 native 動画では待機表示の描画に届かない | 待機表示を出さない案に変えた (Ctrl+↑↓ の待ちと同じ。§6.12) |
+
+### 6.14 設計レビュー r5 (同じ担当の継続、aa1276045、2026-11-26): REJECT
+
+r4 の D3・sidecar の共用・D2 の選択のヒントは解消と判定 (待機表示は新しい仕様で対象外)。新たに P2×4 (どれも C5)。設計担当が
+コードで照合し、r6 で直した。
+
+| 指摘 | 対応 (r6) |
+| --- | --- |
+| P2-1 true-close の後で取り直しても、holdover だけが持っていた旧画像は失われている | true-close の前に表示単位を捕捉し、close continuation で描画資源として運んで新しい sequence の `previous` にする (§6.12 の 2) |
+| P2-2 install の content の close は `ViewerExited` を出さず、`FolderItems` は閉じて開き直すと読まれる (情報パネルの reset 等が飛ぶ) | 採用の確定時に `CloseReturn` の sequence を `ViewerExited` で終えてから teardown (§6.12 の 4) |
+| P2-3 待ちの間の Backspace・focus guard の close で走査が残り、L2 の後に親へ移る | 全画面を閉じる既存の境界で C5 の要求も退役させる (§6.12 の 4a) |
+| P2-4 native の Home/End が lock を迂回する | native の対象を変える入口を、sequence/lock を評価する共通の受付へまとめる (§6.12 の 2。Ctrl+↑↓ の待ちの既存の迂回も直る) |
+
+### 6.15 設計レビュー r6 (同じ担当の継続、05effb7b2、2026-11-26): REJECT
+
+r5 の 4 件への方針は反映済みと判定。新たに P2×2・P3×1。設計担当がコードで照合し、r7 で直した。
+
+| 指摘 | 対応 (r7) |
+| --- | --- |
+| P2-1 4a の退役を共通の content-close に置くと、遅れた `TerminalClose` の再入が新しく受け付けた C5 の要求を退役させる | 退役は新しい close の受付の境界だけに置き、受付済みの teardown では繰り返さない (§6.12 の 4a) |
+| P2-2 `FolderItems` は `previous` を捕捉時の変換で描き続け、待ちの間の拡大・回転が見えない | `CloseReturn` では今のページを通常の描画で描き、描けないときだけ捕捉を代わりに描く (§6.12 の 2) |
+| P3 native の共通受付が受付済みの続き (非同期の結果・EOF) まで審査し直すおそれ | 新しい入力の受付だけに置き、待ちの無いときの挙動の維持テストを追加 (§6.12 の 2、テスト d6) |
+
+### 6.16 設計レビュー r7 (同じ担当の継続、f0963a999、2026-11-26): ACCEPT
+
+r6 の P2×2・P3×1 は設計上解消、追加の P1/P2 は無しと判定。detached の境界は「構造的修正であって症状パッチではない」に
+**AGREE** (走査の判断・close の新しい受付・採用済みの teardown・描画資源の所有を、それぞれの境界へまとめている)。
+P3×2 は実装の注意として反映した: 4a に残っていた古い置き場所の記述を置き換えた。通常の描画への切り替えと sequence の終わりを
+分ける注意を §6.12 の 2 に足した。
+
+### 6.17 実装の記録
+
+2026-11-26、`ui-scan-853b`、基点 `30cdc0774`。§6 の C・D・E の実装差分。
+**コンパイル・Rust テスト・nextest・ビルド・製品起動は行っていない。独立実装レビューも未実施。**
+設計担当の共有 heavy-job runner へ検証を渡す。commit / stash / reset / checkout / branch switch は行っていない。
+ファイルの担当を分けた GPT-6.1 Sol / high の実装担当へ一部を委譲した。親のモデルをその設定へ変更したという意味ではない。
+
+最終の静的確認: 変更／追加した Rust 96 ファイルへ単体ごとの `rustfmt --edition 2024 --check --config skip_children=true`。
+95 ファイルが初回成功、残る新 C5 テストの整形差分を適用して当該 1 ファイルも再確認成功。
+`git diff --check` 成功、`python scripts/check_ui_glyphs.py` は危険な UI 字形 0 件。
+これは型検査・コンパイル・テストの成功を意味しない。
+
+| 変更ファイル | 設計項目と実装 |
+| --- | --- |
+| `src/app.rs` | §6.3(1–5): 共通走査点の既定反転、boxed continuation、modal／owner 再照合、同じ loader の再開、要求所有の選択・予約、理由付き例外。§6.3(6・8・9): D5 staged、Folder 効果・型付き検索帰路の確定。§6.12: close 捕捉・採用・取消 |
+| `src/app/folder_scan.rs`、`src/app/startup_ops.rs` | §6.3(3): 起動／pane 共通の policy・Susie 前後照合。不一致は同じ要求・token・開始時刻を保つ受信口交換 |
+| `src/app/update_phases.rs` | §6.3(3・5・8): 通常 nav 裁定・continuation 採用・生成点の worker 印の撤去。§6.12(3): native 背景／embedded 完了回収 |
+| `src/app/collection_grid.rs`、`src/app/gamepad_input.rs`、`src/ui_main.rs`、`src/global_search_ui.rs` | §6.3(8): GridFolder carrier、受付時の idx ★判定・履歴・auto-fullscreen の効果。Folder の facet suppression は false、Rating の固有 staged 着地は維持 |
+| `src/app/list_order_navigation.rs` | §6.3(9): 検索の Descend／Back／Sibling とタグ Back |
+| `src/app/smart_folder.rs`、`src/app/subfolder_expansion.rs` | §6.3(10): ExitTemporaryView の採用まで表示状態を保持、機能 worker 取消・定義無効化だけを受付で行う |
+| `src/app/close_return.rs`、`src/app/snapshot_ops.rs`、`src/app/startup_list_restore.rs`、`src/ui_fullscreen.rs` | §6.12: true-close 前の表示単位、request ID に属する CloseReturn、通常描画でも lock 維持、新 close 受付だけで退役。§6.3(4): SnapshotLeafOpen／TrayClose |
+| `src/app/native_video.rs` | §6.12(2): 新規入力の共通受付と受付済み continuation の区別 |
+| `src/app/release_checks.rs` | §6.3(4): ReleaseCheck の理由付き同期契約（PlayTest は app.rs、変換キャッシュの実フォルダ更新は ConvertedCacheReload） |
+| `src/app/location_jump.rs`、`src/app/drive_jump.rs`、`src/app/collection_navigation.rs` | §6.3(5): 生成点の worker 走査印を既定へ吸収、場所・履歴の意味を持つ nav 値は維持 |
+| `scripts/analyze_perf.py` | §6.5: purpose／owner／intent／auto_fs／rescan 別の内訳、旧ログの欠損値も扱う |
+| 下記のテストファイル・共有 fixture | §6.6・§6.12: worker 完了と実 post-render／fullscreen poll を通す採用待ち、回帰検査 |
+| `docs/ui-responsiveness.md`、`docs/async-architecture.md`、`docs/direct-navigation-worker-scan-plan.md`、`docs/detached-rework-plan.md`、`docs/display-pipeline.md`、`docs/video-architecture.md`、本書 | §6.7: 境界・例外・待ち方・既存設計合意・未検証の記録 |
+
+実装時の照合:
+
+- 未走査で入る二入口は Ordinary。main の navigation は既存 capture で得られ、選択は capture 時に App から take 済み。
+  採用で App の選択ヒントを読み直さない。owner の読み取り検査は snapshot・rating・Quick Folder・collection・bookmark の照合を含む。
+- 起動・書庫等、App の全画面 flag を立てる既存入口が残るため §6.3(2) の take を残した。Folder の入口は effects が予約を持つ。
+- D5 は既存の `current_sort_reload_is_physical_directory` と logical override 不在で実フォルダに限定する。
+  変換キャッシュの実ディレクトリは理由付きの同期、ZIP/PDF の早期 return は維持。
+- SnapshotLeafOpen の続きは別項目。RequiredFullscreen の `SnapshotTarget::Fs` は上流で既存 worker に分岐する。
+  横断ブックマーク一覧の Opening は従来の synthetic Bookmarks 復元であり、物理親の C5 に偽装しない。
+- D3 の entry 自身／同じ子への帰還も ExitTemporaryView。削除定義が取消で表示に残る場合は、既存の定義不在検査が refresh／child adoption を拒否する。
+- D2 の返却事項（§6.3(9) の「今と違う結果になるなら返す」）: 基点の `favsearch_back` は pop の後の loader が同じ親を push し、
+  `[root, child]` が `[root, root]` になる。Sibling も先の `[next]` への置換の後に loader が push して `[next, next]` になる。
+  次の BS の行き先を変えないため、今回の typed Back／Sibling はこの成功時の既存結果を採用時へ移す。
+  重複を除いて一段ずつ戻す既存不具合の修正は、設計担当／利用者の判断へ返す（質問は未回答、黙って変更していない）。
+  `commit_staged_search_navigation_effects` の Back／Sibling 分岐と新しい
+  `section1853_favorite_back_defers_effects_and_preserves_released_duplicate_parent`／
+  `section1853_favorite_sibling_defers_replace_and_preserves_released_duplicate_root` が証拠。
+  D2 の non-main は §6.2 の対象外規則に従って従来の同期順を維持する。
+- マニュアルの読み込み中のキーに関する既存記述を検索したが、変更すべき記述は見つからず htdocs は変更していない。
+  `docs/next-release-backlog.md` は統括担当のため変更していない。
+
+意図した既存期待値の変更（最終の一覧・選択・履歴・intent は保持）:
+
+- §6.6(11a): `direct_navigation_worker_admission_does_not_take_global_fullscreen_reservation` を
+  `direct_navigation_worker_admission_takes_and_retires_global_fullscreen_reservation` へ改名。App flag は false、予約は要求が所有。
+- §6.6(11b): `direct_navigation_worker_unmarked_producers_keep_synchronous_adoption` を
+  `direct_navigation_worker_unmarked_producers_scan_off_caller_and_keep_adoption` へ改名。
+  `direct_navigation_worker_preserves_unmarked_presentation_intents` と collection の
+  `direct_navigation_sync_preserves_collection_physical_owner`（新名 `direct_navigation_worker_preserves_collection_physical_owner`）も
+  同期走査 1 回の前提を 0 回＋完了待ちへ変更。
+- 同じ予約の所有変更: `section1335_bookshelf_compiled_folder_direct_read_and_explicit_list_restart_differ`、
+  `section1335_rating_folder_auto_request_records_the_actual_settled_physical_list` と共有 `open_selected_image_folder_book`。
+  同じ auto 値を GridFolder.effects で検査し、App に先行予約が無いことを確認する。
+- §6.3(8)・§6.6(6a): `ratingnav649_folder_enter_name`、`ratingnav649_folder_enter_date_desc`、
+  `ratingnav649_folder_double_click_name`、`ratingnav649_folder_double_click_date_desc`、
+  `ratingnav649_folder_gamepad_name`、`ratingnav649_folder_gamepad_date_desc`、
+  `ratingnav649_enter_and_pointer_folder_receipt_preserve_history_return`。
+  先行 history／★解除の値を effects へ移し、待ちの App は旧状態、採用後は従来の結果。
+- carrier を Direct／CollectionSource／RatingSource から GridFolder へ変えた箇所は、同じ path・owner・auto 値を検査する。
+  その他の変更は、同期採用の前提を共通の完了 helper へ移すか、型の引数を補ったもの。
+- C5 の描画資源を持つ LiveWithPresentation を、既存の Live と同じ pending として許容する型の補完は
+  `close_return_real_fullfeature_media_is_shared_until_promote_or_live_fork` と
+  `egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_owner` の既存の pending 検査にも適用した。
+
+共有 runner へ渡す exact nextest filter（この担当では未実行）:
+
+```powershell
+$scan853Filter = 'test(section1853_) | test(direct_navigation_worker_) | test(close_return_) | test(grid_folder_) | test(grid_collection_folder_) | test(ratingnav649_) | test(section1335_) | test(section1328_) | test(section1339_) | test(history_parent_) | test(same_position_double_click) | test(g1_) | test(tag_view_) | test(favsearch) | test(native_backdrop_) | test(native_target_) | test(fullscreen_) | test(folder_pane_) | test(section1285_)'
+cargo nextest run -p mimageviewer --lib -E $scan853Filter
+cargo nextest run -p mimageviewer --lib --features test-script -E $scan853Filter
+# 共通入口の既定変更なので focused 後に lib 全件も両構成で必要。
+cargo nextest run -p mimageviewer --lib -E 'all()'
+cargo nextest run -p mimageviewer --lib --features test-script -E 'all()'
+```
+
+設計担当は既存 run-heavy／ledger と `scripts/test-lib-full.ps1`／`scripts/test-full.ps1` の運用に載せる。
+native 実機・snapshot 生成と確認・perf 計測・検証用 binary のビルドも設計担当に残る。
+この担当から normal profile の製品を起動しない。
+
+ファイル別の追加・変更テスト／共有 helper 名（同期採用待ちだけの移行を含む）は以下に記録する。
+
+
+#### 初回コンパイル後の型修正（2026-11-26）
+
+設計担当が `5f0ab660f` で既定 feature の lib test をコンパイルし、26 エラーを報告した。
+提供された `test-default.log` 全文を読み、今回の型変更の追従漏れを修正した。
+実装担当自身は cargo／nextest／ビルド／テスト／製品起動／コミットを行っていない。
+
+- `snapshot_ops.rs`: 同期例外の `DirectoryScanRoute`／`UiThreadScanReason` の import を補った（6 エラー）。
+- `image_folder_zip_operation.rs`: modal が所有する PaneNavigation の返信から、型付き結果の `scan` を取り出す（2 エラー）。
+  DirectNavigation の policy 採用経路は変更しない。
+- `app.rs`・`tests.rs`・`startup_ops.rs`: 偽の pane 返信を作る helper を `cfg(test)` の App メソッドへ集約し、
+  現在の App の policy を付ける。親テスト module の import 依存と、裸の `io::Result` を送る箇所を修正した（6 エラー）。
+  mutable な pending を借りたまま差し替える fixture は、先に policy を捕捉する。
+- `location_jump.rs`: 完成候補を組み立てる fixture は返信の `scan` を取り出して成功／失敗を検査する（6 エラー）。
+- `tag_view_open_supersession_tests.rs`: 返信全体を保持・再送する fixture は `scan.scan.is_ok()` を検査し、policy も保持する（3 エラー）。
+- `ui_scan_853_tests.rs`: App の所有型に合わせ `ArchiveConvertState` を Box に入れる（1 エラー）。
+- `close_return.rs`・`ui_fullscreen.rs`: registry の二つの ID メソッドの可視性は維持したまま、
+  close-return owner が main であるかの述語だけを owner 側から描画側へ提供する（2 エラー）。判定条件は同じ。
+
+テストの期待する一覧・選択・履歴・成功／失敗は変更していない。ログの本体 115 警告は、
+診断行と import の使用箇所を基点 `30cdc0774` と照合し、今回追加由来と判断するものは見つからなかったため既存警告を残した。
+`test-script` 側も、走査要求の数え上げ・`folder_load_recorded` の二つの initializer・ReleaseCheck・
+親一覧の modal scan 返信を静的に点検した。今回の修正には feature 固有の field を追加していない。
+両 feature 構成のコンパイル成功とテスト実行結果は、設計担当の runner での確認が必要。
+今回変更した Rust 10 ファイルは単体ごとの `rustfmt --edition 2024 --check --config skip_children=true` に成功。
+`git diff --check` も成功した。これらはコンパイル・テストの結果ではない。
+
+#### テスト実行後の修正 (r1)
+
+設計担当が `616f04b35`（型修正＋cargo fmt）で関連 nextest を実行し、既定構成は
+1,046 件中 1,030 成功・16 失敗、`--features test-script` は 1,051 件中 1,035 成功・同じ 16 失敗だった。
+両構成のコンパイル成功も設計担当の結果である。提供された `test-both-2.log` の両構成の失敗と
+入力・採用経路を照合して、以下を修正した。実装担当自身はコンパイル・テストを実行していない。
+
+| ファイル・失敗テスト | 根因と修正 |
+| --- | --- |
+| `smart_folder.rs` / `g1_smart_real_handler_reopen_restores_legacy_flow_and_book_return` | 最初の実フォルダの走査を採用せず Book recipe を検査していた。初期読込を既存の worker 完了＋post-render＋hydration helper へ変更。Book と帰路の期待値は維持 |
+| `snapshot_ops.rs` / `g1_snapshot_a2_deactivation_preserves_source_book_presentation` | 同じ初期採用待ち不足。元 Book を採用してから snapshot を作る。元の表示状態を保存・復元する期待値は維持 |
+| `subfolder_expansion.rs` / `g1_subfolder_real_handler_reopen_restores_legacy_flow_and_book_return` | 同じ初期採用待ち不足で初期 Single を検査していた。元 Book の採用を待つ。RtlCover・flow・帰路の期待値は維持 |
+| `filename_stack_ui.rs` / `g1_subfolder_stack_book_reopen_preserves_vertical_flow_and_original_book` | 展開終了の D3 帰還だけ採用前だった。終了後に同じ worker 完了 helper を追加。元 Book・Vertical の期待値は維持 |
+| `startup_ops.rs` / `section1285_reload_keeps_unresolved_initial_request_without_user_navigation` | resolver の模擬結果が `folder_scan=None` のため、その続きが走査待ちになった。resolver poll 後に worker 採用を待つ。reload が resolver を取り消さない検査と最終行き先は維持 |
+| `startup_ops.rs` / `section1285_untouched_initial_resolver_still_opens_its_target` | 同じ模擬結果の採用待ち不足。worker 完了を待ち、行き先と完了 receiver の退役の期待値を維持 |
+| `tag_view_list_order_tests.rs` / `tag_list_order_folder_then_archive_returns_through_folder_before_results` | 共通 settle が DirectNavigation を poll せず idle と判定し、Back の積み上げ確定前に検査していた。通常 post-render の poll と pending の終了条件を追加。2 段の戻り先・積み上げ・run の期待値は維持 |
+| `tests/history_parent_1473.rs` / `section1473_v490_folder_enter_producer_boundary` | 「現行 helper は v4.9.0 と同一」という歴史的 fixture の前提が、§6.3(8) の効果捕捉で失効した。当時の `Direct(path, container_open(false))` payload を明示する。歴史的 producer の最終帰路の期待値は維持し、現行 Enter の効果は現行テストで検査 |
+| `tests/startup_restore.rs` / `section1335_rating_folder_auto_request_records_the_actual_settled_physical_list` | 製品側の退行。新しい Folder effects の auto 予約を staged 採用で一律適用し、従来の Rating Folder の一覧採用を全画面へ変えていた。`commit_physical_history_transition` で Rating owner＋Folder payload の既存方針を保つ。要求内の予約の保持を追加検査し、最終一覧と起動復元先の期待値は維持 |
+| `collection_grid.rs` / `grid_folder_enter_and_gamepad_defer_visible_effects_until_adoption` | fixture が画像フォルダ用の子設定だけを有効化し、必須の親設定を無効のままにしていた。`auto_fullscreen_zip_pdf=true` も設定。効果と旧表示不変の期待値は維持 |
+| `tests/search_scan_853_tests.rs` / `section1853_tag_back_survives_classification_and_staged_zip_adoption` | ZIP は分類 owner ではなく staged PhysicalHistory owner が戻り意図を持つ。その要求を検査する。最終 ZIP と積み上げの期待値は維持 |
+| 同 / `section1853_tag_back_intent_is_owned_by_pdf_and_conversion_classification` | PDF は直接の列挙 owner、RAR/7z は分類 owner。各実 owner の Back を検査する。積み上げの先行変更なしの期待値は維持 |
+| 同 / `section1853_search_back_classifies_suffix_directories_before_virtual_dispatch` | ZIP の staged preflight と EPUB/7z の分類を同一 owner と誤認していたため、各要求を検査する。また未分類・表示済み Folder 証明の無い PDF 名の実フォルダは基点 `30cdc0774` でも直接 PDF 経路に入る未対応ケースだった。この新規テストの成功対象から PDF 名の実フォルダだけを除外し、ZIP/EPUB/7z の一覧・選択・積み上げ・要求数の期待値を維持。PDF ファイルの Back 所有と準備済み PDF 採用は別の既存追加テストで検査する |
+| 同 / `section1853_favorite_sibling_keeps_suffix_directory_classification_and_single_count` | ZIP 名の実フォルダは分類ではなく staged preflight。実際の要求を検査する。最終一覧・重複を含む既存積み上げ・test-script の要求数は維持 |
+| 同 / `section1853_temporary_view_exit_shares_folder_preflight_and_keeps_exit_authority` | ZIP 名の帰還先は staged preflight が ExitTemporaryView を所有する。その要求を検査する。採用までの session 保持と採用後の終了の期待値は維持 |
+| `tests/ui_scan_853_tests.rs` / `section1853_collection_descendant_close_keeps_physical_owner_through_parent_wait` | fixture が collection actor の非同期起動直後に mutation を出し、C5 に到達する前に `Starting` で失敗していた。通常の App consumer で Ready を待ってから fixture を作る。C5 の owner・選択・全画面・帰還先の期待値は維持 |
+
+今回、既存テストの最終一覧・選択・履歴・表示の期待値は変更していない。新規テストの誤った
+中間 owner の検査と PDF 名の実フォルダの対象範囲を上記のとおり是正した。
+新しい設計返却事項はない。D2 のお気に入り検索の重複 stack に関する前記の返却は、既存動作を維持したまま継続する。
+
+このログで確認できた本変更由来の `unused_must_use` 3 件も修正した。
+`app.rs` の理由付き読込／D3 の void wrapper と `startup_list_restore.rs` の TrayClose は、
+結果の通知・失敗処理を loader に委ね、戻った直後の状態確定をしない呼び出しなので `let _ =` を明示する。
+既存警告を消すための lint 抑制は追加していない。
+今回変更した Rust 13 ファイルは単体ごとの `rustfmt --edition 2024 --check --config skip_children=true` に成功し、
+`git diff --check` も成功した。修正後の両構成のコンパイル・テスト成功は未確認である。
+
+設計担当へ渡す r1 focused filter（両構成で未実行、従前の関連／全件 gate も引き続き必要）:
+
+```powershell
+$scan853R1Filter = 'test(g1_) | test(section1285_) | test(tag_list_order_) | test(section1473_v490_folder_enter_producer_boundary) | test(section1335_rating_folder_auto_request_records_the_actual_settled_physical_list) | test(grid_folder_enter_and_gamepad_defer_visible_effects_until_adoption) | test(search_scan_853_tests) | test(section1853_collection_descendant_close_keeps_physical_owner_through_parent_wait)'
+cargo nextest run -p mimageviewer --lib -E $scan853R1Filter
+cargo nextest run -p mimageviewer --lib --features test-script -E $scan853R1Filter
+```
+
+#### テスト実行後の修正 (r2)
+
+2026-11-27。設計担当が `d2768a9bb` で `scripts/test-lib-full.ps1` を実行した結果、
+既定構成は 20,862 件中 20,829 成功・33 失敗、`--features test-script` は 21,024 件中
+20,989 成功・同じ 33 件＋2 件の計 35 失敗（両構成とも ignored 106 件）だった。
+提供された `full-fails.txt`・`full-panics.txt`、各 run の実ログ（`stdout.log` は空で、診断は
+`stderr.log`）を読み、下表の入力・採用・復元の境界をコードで照合した。
+実装担当自身はコンパイル・cargo・nextest・ビルド・製品起動・コミットを行っていない。
+
+| ファイル・失敗テスト（module 接頭辞省略） | 根因と修正 |
+| --- | --- |
+| `browser818_presentation_tests.rs` / `browser818_presentation_activation_restore_materialized_keeps_request_seed` | 未走査の模擬 resolver 応答から Directory worker が始まるため、sidecar はまだ始まっていなかった。走査採用だけを完了し、新しい復元 owner を残して従来の seed を検査 |
+| `app.rs` / `saved_reveal_preserves_a_staged_classification_without_reserving_navigation` | 初期 source の読込が未採用のまま次の分類へ進んでいた。source のみ完了 helper へ変更し、後続 candidate の pending／request ID は維持 |
+| `collection_grid.rs` / `failed_independent_folder_load_keeps_collection_surface_and_history_unchanged` | main 未走査要求の受付を同期 I/O の失敗と誤認。§6.3(1) の `Classifying` 受付→worker 失敗通知→元 surface／履歴不変を検査 |
+| 同 / `failed_independent_scan_keeps_collection_root_surface_and_items_atomic` | 同じ受付／完了の混同。worker の失敗を待ち、元 root・items・世代・アドレス等の atomic な保持の期待を維持 |
+| `app.rs` / `disabling_memory_rebuilds_actual_items_with_common_view_order` | 最初の favorite の採用前に実 items の順序を検査していた。初期読込を完了 helper へ変更。無効化／再有効化後の実 rebuild・順序の検査は維持 |
+| 同 / `moving_between_favorites_and_common_context_keeps_actual_order_in_sync` | 各移動の採用前に favorite の sort を検査していた。3 回の読込を完了 helper へ変更し、各実順序の期待を維持 |
+| 同 / `reset_projects_layout_fields_and_leaves_the_common_quality_alone` | 初期 favorite 未採用で Details が適用されていなかった。初期読込だけ完了を待ち、reset 後の layout・quality・世代の期待は維持 |
+| 同 / `reset_rebuilds_actual_items_with_common_view_order` | 初期 favorite の走査待ちで rows が未採用。初期読込を完了 helper へ変更し、reset による実 rows の再構築は従来どおり検査 |
+| `gamepad_input.rs` / `list_order_gamepad_folder_accept_replaces_stale_snapshot_before_navigation` | Folder の carrier を旧 `Direct` として検査していた。同じ path を持つ `GridFolder` を検査し、凍結順の置換と採用前の source の期待は維持 |
+| `grid_parent.rs` / `section1473_router_tag_children_use_owner_and_zip_moves_only_one_level` | tag の Folder Back の採用待ち不足。実 post-render を通す完了 helper を追加し、戻り先と stack の期待を維持 |
+| `list_order_everything_tests.rs` / `list_order_everything_parent_uses_the_moved_row_and_nested_book_returns_to_its_folder_first` | inner ZIP→実フォルダの Back が未採用。完了 helper を追加し、元 row／drill の親／次の帰路の期待を維持 |
+| `menubar_search_jump_tests.rs` / `menubar_plain_books_root_opens_during_render_without_deferred_candidate` | render 中の受付を同期採用として検査していた。render 中に scan が始まることと、同じ完了経路での採用を検査。最終行き先は維持。実態に合わせ `menubar_plain_books_root_starts_during_render_and_adopts_without_deferred_candidate` へ改名 |
+| `multiwindow_scenario_tests.rs` / `multiwindow_scenario_a_folder_sidecar_restore_reaches_paint` | main 以外の同期 load に完了 helper を付け、検査対象の復元まで消費していた。元の `load_folder` に戻し、実 restore→paint の検査を維持 |
+| `release_checks.rs` / `release_pin_refresh_must_finish_before_a_following_open`（test-script のみ） | pin dirty の消費が D5 の Physical preflight になり、まだ復元が始まっていなかった。preflight のみ採用し、新 sidecar を残して後続 open の拒否を検査。許可後の open は完了を待つ |
+| `smart_folder.rs` / `epub_smart_modal_blocks_superseding_open_until_cancel` | modal 取消後の next folder の採用待ち不足。読込の完了を待ち、modal 中の拒否と取消後の行き先の期待は維持 |
+| `snapshot_ops.rs` / `browser870_snapshot_child_pdf_round_trip_restores_directory_source` | snapshot が初期 Directory の採用前の Other source を捕捉していた。初期読込を完了 helper へ変更し、元 Directory source／ページ構成の復元は維持 |
+| `startup_ops.rs` / `browser818_open_owner_initial_activation_and_agent_keep_intent_through_restore` | 手動 reply が path 解決だけで、実 worker が付ける Directory scan を欠いていた。実 worker と同じ走査処理で reply を構築し、復元開始時点の request seed を維持 |
+| 同 / `direct_media_activation_can_supersede_other_folder_and_fixed_snapshot_keeps_lock` | 同じ模擬 reply の欠落で余分な走査待ちになり、Loaded 後の明示 media 継続へ届かなかった。worker 相当の reply に補正し、置換／固定の期待は維持 |
+| 同 / `excluded_external_media_startup_and_activation_keep_projected_parent_and_siblings` | 同じ欠落で明示 media の一時的な表示継続が未実行。worker 相当の reply に補正し、除外対象の直接閲覧と兄弟順の期待は維持 |
+| 同 / `section1419_activation_and_bookmark_retire_earlier_main_requests` | B の模擬 reply が新しい走査を発行し、それを A の遅延完了として検査していた。B に実 worker の走査結果を付ける。A の退役と最終 owner の期待は維持 |
+| 同 / `section1419_snapshot_bookmark_classification_continuation_is_held_until_admission` | B と再開 A の模擬 resolver 完了が同じ走査結果を欠いていた。main のみ実 worker 相当にし、detached の非走査／保留と採用順の期待は維持 |
+| `tests/close_nav_801.rs` / `close_nav_801_ai_queue_held_does_not_block_pdf_return_handler` | C5 の親 scan 採用前に親を検査していた。完了を待ち、mutex 保持中に handler／採用が完了する検査と最終親を維持 |
+| 同 / `close_nav_801_inference_sessions_held_does_not_block_pdf_return_handler` | 同じ待ち不足。実完了 seam を通し、AI sessions の lock を取らない検査を維持。同期 Loaded を表していた受付の診断期待だけ Classifying に変更 |
+| 同 / `close_nav_801_remote_state_held_blocks_pdf_return_handler_at_named_lock` | 同じ親 scan 採用待ち不足。完了を待ち、既存 Remote lock の観測と最終親を維持 |
+| `tests.rs` / `direct_page_parent_return_preserves_parent_scroll_history` | C5 の親 scan 未採用。完了 helper を追加し、親・選択・scroll 240・reveal の期待は維持 |
+| 同 / `embedded_container_close_request_allows_parent_return_to_be_consumed` | 同じ未採用。既存 dispatcher 後に完了を待ち、親と fullscreen 終了／要求の消費の期待は維持 |
+| 同 / `file_organize_destinations_direct_handler_adopts_folder_and_history` | Direct 受付直後の同期採用を仮定。完了 helper を追加し、行き先と history の最終期待を維持 |
+| 同 / `history_transition_storage_keeps_app_stack_footprint_bounded` | 製品側の storage 退行。CloseReturn の描画 payload が navigation／owner に inline で伝播し App が 114,448 bytes になっていた。描画 payload を request ID と同じ所有者内の Box に移す。110,000 の上限を維持し、presentation 自体のサイズ上限も追加 |
+| 同 / `mixed_path_history_replay_accepts_old_spelling_and_restores_the_same_folder` | Direct の採用前で back stack が空だった。完了を待ってから旧 spelling を設定し、正規化された復元先／stack の期待は維持 |
+| 同 / `subfolder_expansion_button_exits_immediately_when_view_is_on` | D3 の終了を同期採用として検査。完了を待ち、合成一覧の終了／dialog の最終期待は維持 |
+| 同 / `section1705_local_filter_and_empty_bar_allow_history_keys_and_dispatch` | 完了 helper が検査対象の初期 sidecar まで消費していた。走査採用だけを待ち、実 modal→復元終了→history dispatch の期待を維持 |
+| `tests/scroll_661.rs` / `row_anchor_resume_keeps_middle_selected_row_in_both_renderers` | resume の helper が sidecar を先に完了していた。走査採用だけを待ち、実 hydration の選択優先処理と両 renderer の row anchor の期待を維持 |
+| `global_search_ui.rs` / `caption_drill_branch_identity_lives_with_installed_rows` | Folder の carrier が旧 Direct という前提。同じ branch path の GridFolder を検査し、検索終了後も行が開ける契約を維持 |
+| `test_script.rs` / `rating_folder_back_key_pointer_reveals_and_double_clicks_actual_large_grid_without_focus`（test-script のみ） | 同じ carrier の前提。選択済み key と同じ path の GridFolder を検査し、実 grid の選択／描画／pointer の期待は維持 |
+| `ui_main.rs` / `section1804_stack_pending_background_click_keeps_explicit_deselection` | 初期 folder の未採用で stack script の開始に届かなかった。走査採用後に既存の復元を完了し、pending 中の明示 deselection の期待は維持 |
+
+共通 helper `finish_direct_navigation_scan_before_hydration_for_test` は既存の post-render／fullscreen seam で
+走査採用までを待ち、採用が始めた sidecar は消費しない。既存の full helper はこれに復元待ちを加える。
+startup の新しい reply fixture は実 worker の `scan_startup_resolved_target` を呼び、main 以外は走査しない。
+意図して scan の無い応答を扱う既存 §1.285 テストは維持する。
+
+missing path の即時 bool を戻すための同期 metadata/read_dir は追加しない。§6.3(1) は未走査 main で
+`Classifying` を返す設計で、bool wrapper も元から Loaded／Classifying を受付成功とする。
+`saved_group_actions`・`collection_navigation`・`book_append_refresh` の成功後処理は走査済みの引数、
+変換書庫の成功後処理は別の ZIP/cache 経路と行き先照合、snapshot の実フォルダ fullscreen は上流の
+Required worker に属することを点検した。main 未走査の true を同期 install 成功として後処理する
+製品 caller は見つからなかった。wrapper に「受付結果であり採用完了を保証しない」と明記した。
+
+既存の最終一覧・選択・履歴・表示の期待値と App サイズ上限は変更していない。
+変更した中間期待は、未走査 main の即時失敗→非同期失敗、Folder の Direct→GridFolder carrier、
+同期受付の Loaded 診断→Classifying、および上表の採用／復元待ちである。
+
+利用者から指定された P3 の補強（§6.12 d5／d6）も追加した:
+
+- `src/app/native_video.rs` / `native_unblocked_home_end_and_hud_choose_real_targets_from_middle_item`:
+  3 項目の中央から Home／End と HUD 前後を実 handler に渡し、要求する移動と採用先・選択を検査する。
+  端の項目は実在の画像にし、decoder／native presenter／HWND を起動せずに通常の着地まで進める。
+- `src/ui_fullscreen/close_return_tests.rs` /
+  `close_return_wait_renders_live_zoom_pan_and_rotation_while_rejecting_page_targets`:
+  CloseReturn 中に通常 fullscreen を headless 描画し、現在ページの texture mesh の頂点と paint transform の一致、
+  zoom・pan・rotation を順に変えた実描画の変化を検査する。待ちの lock が残り、ページ送り／jump は拒否されることも検査する。
+- 同ファイルの既存 `close_return_captures_visible_previous_before_true_close_cleanup` は、捕捉を clone して元を drop した後も
+  同じ request ID と描画資源で sequence を始められる検査を追加し、Box 化後の所有を補強した。
+
+新しい返却事項はない。既存のお気に入り検索の重複 stack の判断待ちは、従来結果を維持したまま継続する。
+修正後のコンパイル・両構成のテスト成功、および App の実サイズは runner での再確認が必要。
+変更した Rust 22 ファイルは単体ごとの `rustfmt --edition 2024 --check --config skip_children=true` に成功し、
+`git diff --check` も成功した。これらはコンパイル・テストの成功証拠ではない。
+
+設計担当へ渡す r2 focused filter（実装担当では未実行）:
+
+```powershell
+$scan853R2Filter = 'test(browser818_) | test(saved_reveal_preserves_a_staged_classification_without_reserving_navigation) | test(failed_independent_) | test(favorite_view_state_tests) | test(list_order_gamepad_) | test(section1473_router_tag_children_) | test(list_order_everything_parent_) | test(menubar_plain_books_root_) | test(multiwindow_scenario_a_) | test(release_pin_refresh_) | test(epub_smart_modal_) | test(browser870_snapshot_child_) | test(direct_media_activation_) | test(excluded_external_media_) | test(section1419_) | test(close_nav_801_) | test(favorite_adjustment_defaults_tests) | test(file_organize_destinations_) | test(history_transition_storage_) | test(mixed_path_history_) | test(subfolder_expansion_button_exits_) | test(section1705_local_filter_) | test(row_anchor_resume_) | test(caption_drill_branch_) | test(rating_folder_back_key_pointer_) | test(section1804_stack_pending_) | test(native_) | test(close_return_)'
+cargo nextest run -p mimageviewer --lib -E $scan853R2Filter
+cargo nextest run -p mimageviewer --lib --features test-script -E $scan853R2Filter
+# focused と従前の関連 gate の後、同じ source で全件を両構成とも確認する。
+.\scripts\test-lib-full.ps1
+.\scripts\test-lib-full.ps1 -Features test-script
+```
+
+#### テスト実行後の修正 (r3)
+
+2026-11-27、設計担当が `de9b6a308`（r2＋cargo fmt）で lib 全件を再実行した。
+既定は 20,864 件中 20,861 成功・3 失敗、test-script は 21,026 件中 21,022 成功・4 失敗。
+最新 2 run（`20261126T170315449Z-ed5b5df1`、`20261126T173114087Z-480a17be`）の診断を読んだ。
+`stdout.log` は空で、panic とサイズの実測値は `stderr.log` にある。
+実装担当自身はコンパイル・cargo／nextest・テスト・ビルド・製品起動・コミットを行っていない。
+
+| 失敗テスト | 根因・修正 |
+| --- | --- |
+| `history_transition_storage_keeps_app_stack_footprint_bounded` | r2 後も App は既定 110,448 bytes／test-script 110,464 bytes。CloseReturn 内側の Box 化だけでは、navigation ごとの search／close／選択と grid effects の増分が残った。`MainListNavigationPayload` にこの 3 値をまとめ、既存の inline 選択ヒントも含め `Option<Box<…>>` へ移す。Grid の履歴帰路と受付時の★解除決定もそれぞれ `Option<Box<…>>` にする。空の navigation payload は持たず、同じ要求が全効果を所有する。App の 110,000 上限は維持し、各 field の pointer-size と navigation／effects の型別上限も追加 |
+| `browser818_presentation_activation_restore_materialized_keeps_request_seed` | r2 fixture の `folder_scan=None` では loader が Classifying を返すため、startup の Loaded 限定の明示ファイル継続に入らず、sidecar の viewer request が無い。実 resolver は main Directory に走査結果と policy を付けてから返すため、この fixture を実 worker の応答の受信・確認・再送へ修正。seed／窓／選択の最終期待は維持 |
+| `browser870_snapshot_child_pdf_round_trip_restores_directory_source` | 最後の `load_folder(folder)` だけ採用待ちがなく、直前に操作した PDF の Ltr のまま検査していた。それ以前の Directory source 復帰・親 DB 未保存・PDF DB の Ltr 保存はログ上通過。最終読込の pending と採用前 Ltr を確認し、実完了 helper 後に元の Single を検査する。最終期待は変更しない |
+| `release_pin_refresh_must_finish_before_a_following_open`（test-script のみ） | 製品の受付順の退行。既存 `prepare_visible_install` の `sidecar_restore_active() || book_append_undo_in_progress()` が worker 分岐より後に残り、先に Classifying を返していた。この既存の在メモリの拒否条件を共通 helper にし、未走査 main Directory の分岐で予約取得・旧要求退役・worker 起動より前にも適用。可視 install 時の再確認は維持。即時 false の期待は変更せず、worker を発行していない検査も追加 |
+
+最後の拒否は scan の I/O エラーや走査した rows の内容によるものではなく、既存の可視採用の busy 条件である。
+最新指示の「走査だけを遅らせ、受付拒否は遅らせない」に従い、その条件を受付側でも評価する。
+document modal 全体や main 以外へ対象を広げず、受付後に復元が始まった場合の既存 poll の保留は変えない。
+両構成でこの境界を検査する `direct_navigation_worker_busy_install_refuses_before_scan_admission` を追加した。
+新たな返却事項はない（従前のお気に入り検索の重複 stack の判断待ちは継続）。
+
+64-bit Windows のサイズ影響（修正前 App は設計担当ログの実測、下記の型／field は layout からの見積もりで未実測）:
+
+| 移動する field | r2 の inline 見積もり | r3 の inline | 影響 |
+| --- | ---: | ---: | --- |
+| navigation の選択＋CloseReturn＋検索 admission | 32＋16＋48＝96 bytes | payload pointer 8 bytes | navigation 1 値あたり約 88 bytes 減。型全体は約 768→680 bytes、§6 前の約 704 bytes より小さい見込み |
+| grid の `rating_suppression` | 32 bytes | 8 bytes | effects 1 値あたり約 24 bytes 減 |
+| grid の `reading_history_return_from` | 32 bytes | 8 bytes | effects 1 値あたり約 24 bytes 減。上と合わせ effects は約 72→24 bytes（§6 前は約 40 bytes） |
+
+App 所有 pending へ埋め込まれた複数の値にこの削減が効く。App 全体の削減量と上限通過は再実行で測る。
+既存サイズテストへ実 field の 1 pointer 検査、`MainListNavigation <= 704`、`GridVirtualOpenEffects <= 40`、
+診断用の各型・payload サイズ出力を追加した。閾値を引き上げる変更はしていない。
+変更した Rust 13 ファイルの単体 `rustfmt --edition 2024 --check --config skip_children=true` と
+`git diff --check` は成功。これはコンパイル・テストや修正後サイズの測定ではない。
+
+変更ファイルと設計項目:
+
+- `app.rs`・`close_return.rs`・`startup_ops.rs`・`update_phases.rs`: §6.3(2・3・8・9)／§6.12 の要求所有を維持した storage。
+  busy admission の共通化と worker より前の拒否も `app.rs`。
+- `collection_grid.rs`: §6.3(8) の idx 判定を再評価せず、捕捉時に Box へ包み採用で元の値を消費。
+- `browser818_presentation_tests.rs`・`snapshot_ops.rs`・`release_checks.rs`: 上表 3 テストの修正。
+- `tests.rs`: サイズ検査の補強と `main_container_open_via_gamepad_defers_reading_history_return_until_adoption` の値比較の型追従。
+- `tests/direct_navigation_worker_scan.rs`: 新規 busy admission 回帰と既存の captured effects／選択比較の型追従。
+- `list_order_ratingnav649_tests.rs`・`tests/search_scan_853_tests.rs`・`tests/ui_scan_853_tests.rs`:
+  Box の中身／navigation accessor を通して、従来の値をそのまま比較する。最終期待は変更しない。
+
+設計担当へ渡す r3 filter（未実行）:
+
+```powershell
+$scan853R3Filter = 'test(history_transition_storage_keeps_app_stack_footprint_bounded) | test(browser818_presentation_activation_restore_materialized_keeps_request_seed) | test(browser870_snapshot_child_pdf_round_trip_restores_directory_source) | test(release_pin_refresh_must_finish_before_a_following_open) | test(direct_navigation_worker_) | test(grid_folder_) | test(ratingnav649_) | test(search_scan_853_tests) | test(ui_scan_853_tests) | test(close_return_) | test(section1335_) | test(section1853_)'
+cargo nextest run -p mimageviewer --lib -E $scan853R3Filter
+cargo nextest run -p mimageviewer --lib --features test-script -E $scan853R3Filter
+# 関連 gate の後の全件確認も従来どおり必要。
+.\scripts\test-lib-full.ps1
+.\scripts\test-lib-full.ps1 -Features test-script
+```
+
+<!-- scan853-test-inventory -->
+
+#### `src/app/native_video.rs`
+
+```text
+native_home_end_and_hud_targeting_share_folder_wait_admission
+native_wait_gate_keeps_unblocked_inputs_and_swap_delta_coalescing
+native_unblocked_home_end_and_hud_choose_real_targets_from_middle_item
+```
+
+#### `src/app/book_composition_permission_tests.rs`
+
+```text
+resume_notice_follows_materialized_open_into_its_detached_context
+```
+
+#### `src/app/book_preferred_rating_tests.rs`
+
+```text
+book_preferred_loaded_extension_named_folders_do_not_write_or_record_undo
+```
+
+#### `src/app/book_resume_meter_tests.rs`
+
+```text
+book_resume_meter_copied_data_dir_uses_existing_cache_save_restore_key
+book_resume_meter_deleted_cache_reconversion_and_source_change_resume_same_key
+```
+
+#### `src/app/browser818_activation_tests.rs`
+
+```text
+exercise_activation_with_history
+```
+
+#### `src/app/browser818_presentation_tests.rs`
+
+```text
+browser870_browser818_linked_and_multiple_open_single_with_context_owned_saving
+```
+
+#### `src/app/close_return_tests.rs`
+
+```text
+close_return_real_fullfeature_media_is_shared_until_promote_or_live_fork
+enter_source
+```
+
+#### `src/app/collection_grid.rs`
+
+```text
+assert_collection_descendant_open_round_trip
+assert_collection_native_outer_complete_temporary_origin
+collection_child_backspace_back_forward_round_trip_uses_keyboard_history
+collection_grid_error
+direct_navigation_worker_preserves_collection_physical_owner
+direct_navigation_worker_rejects_collection_owner_staled_after_admission
+g1_collection_real_handler_reopen_preserves_vertical_flow_and_book_return
+grid_collection_folder_carries_owner_without_applying_effects
+grid_folder_enter_and_gamepad_defer_visible_effects_until_adoption
+grid_folder_rating_suppression_uses_admitted_session_value_at_commit
+poll_real_history_load
+rating_child_backspace_back_forward_round_trip_uses_keyboard_history
+real_cached_epub_direct_warm_placeholder_commits_before_worker_result
+real_epub_ab_switch_changes_slot_only_after_prepared_adoption
+real_epub_ordinary_back_and_forward_replay_adopts_one_outer_point
+```
+
+#### `src/app/collection_navigation.rs`
+
+```text
+ready_collection_child_preflight_waits_for_listing_identity_or_surface_switch
+ready_direct_classifier_waits_for_listing_identity_or_surface_switch
+```
+
+#### `src/app/drive_jump_tests.rs`
+
+```text
+drive_jump_classified_directories_keep_worker_scan_and_original_navigation
+```
+
+#### `src/app/folder_pane_reclick_stage2_tests.rs`
+
+```text
+reclick_stage2_aggregate_fixture
+reclick_stage2_fixture
+```
+
+#### `src/app/folder_pane_reclick_tests.rs`
+
+```text
+folder_pane_reclick_does_not_replace_pending_history_navigation
+folder_pane_reclick_same_pass_ready_order_refresh_is_replaced
+reclick_fixture
+reclick_pending_pane_scenario
+reclick_single_scenario
+```
+
+#### `src/app/folder_pane_refresh_tests.rs`
+
+```text
+folder_pane_label_req40_completed_navigation_collapses_prior_ancestors
+folder_pane_reported_delete_is_reflected_after_main_list_acceptance_without_tree_input
+frame_end_tree_toggle_scenario
+label_double_click_scenario
+navigation_tree_fixture
+scrollable_tree_click_fixture
+```
+
+#### `src/app/gamepad_input.rs`
+
+```text
+epub_modal_blocks_ring_and_keyboard_history_dispatch
+```
+
+#### `src/app/list_order_everything_tests.rs`
+
+```text
+commit_row
+finish_landing
+landing_fixture
+list_order_everything_admission_requires_current_outer_run_and_accepted_dataset_run
+list_order_everything_internal_open_physical_book_reports_unavailable_from_real_key_handler
+retained_parent_internal_open_repro
+```
+
+#### `src/app/list_order_ratingnav649_tests.rs`
+
+```text
+folder_enter_auto_open
+ratingnav649_enter_and_pointer_folder_receipt_preserve_history_return
+ratingnav649_gamepad_extension_named_folder_keeps_existing_receipt
+ratingnav649_smart_pointer_consumed_open_does_not_fall_through_to_secondary_click
+scenario
+settle
+```
+
+#### `src/app/list_order_tests.rs`
+
+```text
+list_order_cancelled_pdf_then_existing_folder_open_still_resolves_frozen_order
+list_order_capture_uses_folder_listing_name_and_date_sorts_both_ways
+```
+
+#### `src/app/list_order_virtual_tests.rs`
+
+```text
+configure_fixture
+finish_reopen
+```
+
+#### `src/app/location_jump.rs`
+
+```text
+location_and_address_plain_physical_dispatch_scan_off_caller_and_adopt_once
+location_jump_everything_physical_child_exits_to_drive_list_with_pre_search_history
+```
+
+#### `src/app/menubar_search_jump_tests.rs`
+
+```text
+menubar_plain_favorite_uses_existing_direct_navigation_and_history
+```
+
+#### `src/app/multiwindow_scenario_tests.rs`
+
+```text
+multiwindow_rating_folder_reload_keeps_sibling_order_and_generation
+rating_publication_reaches_main_and_two_detached_without_reordering_siblings
+run_scenario_a
+```
+
+#### `src/app/native_backdrop_navigation_tests.rs`
+
+```text
+native_backdrop_plain_favorite_and_direct_keep_immediate_loader_cleanup
+```
+
+#### `src/app/rar_archive_cache_tests.rs`
+
+```text
+load_settled_folder
+rar_archive_cache_completed_probe_cancelled_before_adoption_keeps_new_folder
+```
+
+#### `src/app/search_nav_book_tests.rs`
+
+```text
+search_nav_book_retained_result_child_records_saved_origin_route_and_real_back_restores_it
+settle_target
+```
+
+#### `src/app/search_nav_boundary_tests.rs`
+
+```text
+fixture
+poll
+settle
+```
+
+#### `src/app/search_nav_entry_inventory_tests.rs`
+
+```text
+physical_parent_case
+```
+
+#### `src/app/section375_c1_tests.rs`
+
+```text
+section1375_c1_promoted_physical_reader_ignores_actual_change_and_late_restart
+```
+
+#### `src/app/section375_tests.rs`
+
+```text
+fixture
+section1375_automatic_origin_survives_match_diff_restart_resume_and_defer
+section1375_delete_during_initial_stack_extraction_or_grouping_resumes_only_after_success
+section1375_delete_hidden_candidate_and_no_visible_idx_still_reconcile
+section1375_delete_mixed_directory_mtime_observes_without_display_sort_stamp_change
+section1375_direct_reader_both_forks_rebind_only_saved_physical_basis
+section1375_favorite_effective_projection_key_matches_worker_and_first_equal
+section1375_physical_folder_zip_pdf_epub_video_audio_delete_equal
+section1375_same_second_file_overwrite_is_observed_by_actual_worker
+section1375_search_root_delete_does_not_dispatch_physical_folder_reload
+section1375_stack_flat_and_retained_aggregate_rebind_physical_record_for_equal
+section1375_stack_flat_delete_rebuilds_retained_singleton_metadata_and_maps
+section1375_stack_late_hydration_keeps_automatic_import_policy_and_group_cursor_owner
+section1375_stack_member_changes_and_equal_facet_details_keep_projection
+section1375_stack_retained_read_failure_keeps_flat_until_ordinary_reload
+section1375_stack_self_delete_equal_opens_remaining_stack_after_image_or_folder
+section1375_stack_zero_success_keeps_view_and_pending_switch
+section1375_tag_and_edit_sidecar_policy_off_on_explicit_and_open
+```
+
+#### `src/app/sidecar_restore.rs`
+
+```text
+visibility_detached_folder_auto_first_display_completes_or_terminates_its_owner
+```
+
+#### `src/app/similar_navigation_tests.rs`
+
+```text
+control_required_scan
+controlled_scan_channel
+detached_required_scan_failure_without_a_page_exits_the_password_wait_owner
+disconnected_required_scan_uses_the_same_terminal_failure_boundary
+embedded_similar_move_update_pump_does_not_consume_a_passive_context_scan
+embedded_similar_move_update_pump_leaves_non_required_scan_for_normal_tail
+image_scan
+send
+```
+
+#### `src/app/smart_folder.rs`
+
+```text
+section1853_cancelled_smart_origin_fallback_keeps_visible_owner_until_install
+section1853_deleted_smart_return_wait_keeps_owner_and_rejects_deleted_definition
+```
+
+#### `src/app/startup_default_tests.rs`
+
+```text
+startup_default_and_explicit_global_search_entry_retire_pending_main_open
+startup_default_late_tree_favorite_and_dfs_requests_retire_the_old_default
+startup_default_remote_return_preserves_an_already_adopted_local_folder
+startup_default_same_folder_keeps_existing_history_without_an_extra_departure
+```
+
+#### `src/app/startup_ops.rs`
+
+```text
+section1285_deferred_modal_target_is_replaced_by_explicit_local_navigation
+section1285_reload_keeps_unresolved_initial_request_without_user_navigation
+section1285_remote_retains_deferred_target_through_operations_and_local_reload
+section1285_same_location_explicit_open_replaces_deferred_target_but_reload_keeps_it
+```
+
+#### `src/app/startup_scan_policy_tests.rs`
+
+```text
+fixture
+```
+
+#### `src/app/startup_scan_tests.rs`
+
+```text
+fixture
+```
+
+#### `src/app/subfolder_expansion.rs`
+
+```text
+g1_subfolder_real_handler_reopen_restores_legacy_flow_and_book_return
+section1853_subfolder_exit_and_toggle_keep_visible_state_until_return_install
+```
+
+#### `src/app/tag_view_list_order_tests.rs`
+
+```text
+tag_list_order_adoption_replaces_only_matching_run_and_row
+tag_list_order_grid_request_supersedes_direct_navigation_scan
+```
+
+#### `src/app/tag_view_open_supersession_tests.rs`
+
+```text
+fixture
+tag_view_open_supersession_sibling_edge_keeps_real_current_view_order_refresh
+tag_view_open_supersession_tag_accepts_and_retires_direct_navigation_scan
+```
+
+#### `src/app/tests.rs`
+
+```text
+a_ring_sort_order_reloads_the_window_the_ring_was_opened_in
+accepted_epub_retires_pending_dfs_after_classification_but_ignore_keeps_it
+archive_suffix_directories_open_as_folders_under_ignore
+auto_fullscreen_image_folder_ignores_mixed_folder_after_load
+auto_fullscreen_image_only_folder_opens_page_after_load
+auto_fullscreen_image_only_folder_preserves_grid_intent_for_always_new_detached
+bookmark_direct_open_retires_pending_history_preflight
+detached_pdf_password_owner_blocks_new_main_open_without_changing_sibling
+direct_epub_conversion_resumes_deferred_surface_adoption
+direct_epub_modal_or_cold_enumeration_preserves_source_through_history_request
+direct_pdf_password_continuation_keeps_source_until_retry_or_cancel
+direct_pdf_rows_and_surface_commit_with_enumeration_result
+ensure_final_composite_never_leaves_stuck_incomplete_entry
+epub_batch_completion_refreshes_grid_and_applies_same_name_pdf_priority
+failed_rating_read_opens_and_reloads_with_name_order_and_ordinary_prewarm
+file_organize_destinations_direct_handler_adopts_folder_and_history
+folder_history_back_and_forward_restore_reading_history_without_folder_load
+folder_history_back_restores_preserved_subfolder_expansion_snapshot
+folder_to_drive_list_records_back_target_and_restores_both_directions
+idle_upgrade_recheck_keeps_waking_inside_margin_window
+ignored_archive_file_does_not_retire_pending_direct_pdf_owner
+installed_prepared_cache_replays_a_write_after_read_even_if_seen_advanced
+later_rating_chunk_failure_installs_the_standard_order_cache_and_filter
+leaving_smart_folder_session_discards_result_and_synthetic_return_rescans
+letterbox_real_grid_folder_icon_touch_cancel_and_double_tap
+letterbox_real_grid_folder_icons_own_inner_area_with_setting_on_and_off
+listed_epub_directory_opens_as_folder_under_ignore
+main_folder_candidate_fallback_updates_reading_history_at_adoption
+main_window_title_hides_synthetic_path_during_search_close_and_restores_adopted_path
+mixed_path_history_replay_accepts_old_spelling_and_restores_the_same_folder
+mutation_refresh_rating_child_and_backing_alias_keep_parent_chain_and_history
+navigation_cancels_archive_bookmark_scan_and_drops_late_result
+navigation_cancels_book_request_after_resolver_completion
+nested_smart_convertible_history_keeps_logical_kind_and_cache_alias
+nested_smart_pdf_history_reopens_as_pdf_after_source_session_is_gone
+newer_open_classification_cancels_old_result_without_adopting_it
+no_resident_smart_pdf_history_back_rebuilds_root_then_restores_container
+no_resident_smart_pdf_history_cancel_restores_prior_folder_and_pop_snapshot
+no_resident_smart_pdf_missing_root_row_rolls_back_history
+no_resident_smart_pdf_password_cancel_rolls_back_history_after_root_prepare
+normal_navigation_cancels_normal_archive_scan
+normal_navigation_cancels_slow_bookmark_resolve_and_ignores_late_result
+offscreen_parked_root_delete_is_not_resurrected_by_history_back
+park_terminates_classification_history_pdf_and_zip_without_adopting
+pdf_password_prompt_blocks_new_direct_open_but_its_retry_proceeds
+phase_b_reading_history_opened_folder_resolves_masked_member_before_paint
+physical_rating_reload_restores_the_exact_selected_path
+poll_folder_pane_open_returns_ready_without_loading
+quick_folder_none_startup_pdf_password_cancel_exit_reload_preserves_ownership
+realmachine50_foreign_zip_offer_transfers_main_origin_and_cancel_does_not_handoff
+same_folder_reload_preserves_history_with_archive_dialog
+same_name_test_folder_reports_its_folded_and_unsupported_entries
+section1335_direct_zip_exit_restart_keeps_explicit_parent_list
+section1339_address_bar_zip_enter_keeps_copied_path_across_row_refresh
+section1339_cold_pdf_success_retires_ready_retained_warm_verification_once
+section1339_direct_password_retry_keeps_same_navigation_until_single_adoption
+section1339_direct_warm_pdf_adopts_facet_and_history_before_verification_once
+section1339_foreign_zip_conversion_cancel_and_cached_hydration_keep_same_location
+section1339_main_pane_admission_retires_classification_even_if_pane_is_cancelled
+section1339_main_pane_admission_retires_rating_navigation_even_if_pane_is_cancelled
+section1339_new_rating_admission_retires_old_classification_before_new_request_cancel
+section1339_new_smart_admission_retires_each_old_typed_request_before_smart_cancel
+section1339_parent_failure_and_supersession_do_not_leak_child_selection_hint
+section1339_plain_main_converted_archive_preserves_source_until_owned_cached_zip_adoption
+section1339_plain_zip_grid_handler_adopts_only_usable_rows_and_reload_keeps_manual_restore
+section1339_quick_native_proof_survives_rows_but_rejects_switch_epoch
+section1339_rating_zip_backspace_back_forward_restashes_live_parent
+section1339_reported_rating_zip_fullscreen_bs_toolbar_back_forward
+section1339_smart_surface_survives_real_pdf_verification_but_row_request_expires
+section1339_successful_parent_backspace_selects_the_exact_departed_child
+section1339_zip_nested_level_history_reentry_uses_the_prepared_fresh_root_route
+section1339_zip_same_location_reload_reconciles_prepared_prefix_and_manual_restore
+section1353_disappeared_level_uses_parent_facet_and_new_backspace_stack
+section1353_disappeared_level_with_root_collapse_restores_actual_parent_facet
+section1353_grid_reload_key_preserves_zip_level_cursor_facet_and_history
+section1353_refresh_cancel_and_stale_results_keep_the_current_location
+section1353_staged_folder_refresh_reexecutes_submitted_search_on_new_rows
+section1705_alt_history_from_focused_empty_local_input_moves_and_retires_focus
+section1705_local_filter_and_empty_bar_allow_history_keys_and_dispatch
+smart_convertible_zip_late_result_cannot_replace_a_new_folder
+smart_folder_drill_parent_search_snapshot_and_history_round_trip_keep_scope
+smart_fullscreen_folder_nav_carries_continuation_into_nested_zip_and_cancel
+snapshot_out_of_scope_load_is_refused_before_main_state_effects
+snapshot_refusal_before_both_claim_sites_preserves_running_archive_open_owner
+snapshot_refusal_preserves_conflicting_bookmark_open_owner
+snapshot_refusal_preserves_unresolved_startup_open_owner
+staged_and_direct_epub_modals_block_new_opens_on_same_path
+staged_epub_ask_stale_error_and_cancel_keep_old_location
+staged_epub_ignore_retires_only_request_and_convert_policy_has_typed_child
+staged_epub_publication_resumes_same_request_and_adopts_once
+staged_epub_save_pdf_is_explicit_destination_without_popping_epub_replay
+staged_smart_folder_superseded_child_keeps_new_folder_navigation
+staged_smart_history_root_commits_once_and_does_not_suppress_next_navigation
+successful_rating_load_installs_complete_zero_cache_without_ui_prewarm
+test_script_counts_delegated_smart_start_once_through_adoption
+test_script_counts_delegated_zip_start_once_through_adoption
+test_script_counts_direct_archive_owner_without_recounting_cache_hydration
+test_script_counts_history_back_once_through_adoption
+test_script_counts_superseded_refresh_starts_before_completion
+test_script_counts_the_actual_refresh_folder_request
+test_script_does_not_count_zip_foreign_conversion_continuation
+tree_sort_change_cancellation_rejects_old_order_result_but_keeps_exact_pane_open
+visible_thumb_adjustment_4k_175pct_timing
+warm_pdf_direct_open_absent_from_current_rows_adopts_placeholders
+warm_pdf_direct_open_commits_placeholder_and_history_failure_keeps_source
+warm_pdf_navigation_absent_from_rows_adopts_before_worker
+warm_pdf_verification_keeps_placeholder_thumbnail_workers_or_rebuilds_them
+warm_pdf_verifier_survives_failed_or_cancelled_cold_direct_candidate
+```
+
+#### `src/app/tests/archive_inner_book_s1.rs`
+
+```text
+section1675_snapshot_zipdir_keeps_explicit_list_navigation
+section1676_collection_live_and_terminal_close_preserve_owner_and_back_out
+section1676_physical_history_roundtrip_does_not_restore_list_choice
+section1676_subfolder_origin_keeps_existing_physical_backout_after_chosen_close
+settle
+settle_rating
+settle_smart
+```
+
+#### `src/app/tests/bookmark_build_adoption.rs`
+
+```text
+bookmark_build_folder_adoption_retires_worker_and_preserves_audio_sidecar
+bookmark_build_late_owner_proof_rejects_held_reply_after_folder_adoption
+```
+
+#### `src/app/tests/browser870.rs`
+
+```text
+browser870_directory_books_and_three_favorite_guards_do_not_remember
+browser870_live_root_switch_controls_saving_before_reload_and_retains_old_rows
+browser870_load_preserves_non_presentation_preferences
+browser870_metadata_completion_preserves_live_presentation_and_imports_other_values
+browser870_non_directory_and_replacement_do_not_inherit_directory_provenance
+```
+
+#### `src/app/tests/ctrl_down_close_1678.rs`
+
+```text
+section1678_direct_main_open_keeps_branch_list_but_wrapper_opens_page
+section1678_main_and_linked_ctrl_down_end_in_branch_list
+```
+
+#### `src/app/tests/direct_navigation_worker_scan.rs`
+
+```text
+capture_destination_existing_opens_like_pane_navigation
+capture_destination_missing_warns_without_replacing_current_listing
+capture_destination_other_scan_errors_keep_generic_warning
+direct_navigation_worker_admission_after_real_dfs_poll_retires_sequence
+direct_navigation_worker_admission_takes_and_retires_global_fullscreen_reservation
+direct_navigation_worker_dfs_admission_cancels_only_replaceable_scan
+direct_navigation_worker_dispatch_has_zero_caller_scans_and_adopts_once
+direct_navigation_worker_history_navigation_replaces_pending_scan
+direct_navigation_worker_history_wait_keeps_released_escape_stack_toggle
+direct_navigation_worker_original_navigation_is_not_recaptured
+direct_navigation_worker_pane_retirement_does_not_retain_older_direct_scan
+direct_navigation_worker_preserves_unmarked_presentation_intents
+direct_navigation_worker_busy_install_refuses_before_scan_admission
+direct_navigation_worker_quick_folder_round_trip_retires_old_epoch
+direct_navigation_worker_ready_scan_yields_to_same_frame_navigation_inputs
+direct_navigation_worker_rejected_address_input_cancels_prior_scan_in_actual_frame
+direct_navigation_worker_rejected_filtered_backspace_cancels_prior_scan
+direct_navigation_worker_route_excludes_virtual_and_sibling_contexts
+direct_navigation_worker_snapshot_refusal_keeps_existing_owner_and_history
+direct_navigation_worker_stale_failure_and_disconnect_preserve_listing
+direct_navigation_worker_successful_pdf_claim_outside_frame_retires_scan
+direct_navigation_worker_uncached_pdf_acceptance_retires_scan_before_pdf_completion
+direct_navigation_worker_unmarked_producers_scan_off_caller_and_keep_adoption
+section1853_policy_rescan_keeps_same_continuation_token_clock_and_admission
+section1853_reasoned_ui_scan_routes_keep_synchronous_adoption
+section1853_worker_continuation_commits_captured_effects_and_selection_once
+section1853_worker_error_and_disconnect_retire_reservation_and_selection
+section1853_worker_ready_rejects_sibling_document_modal_without_adoption
+```
+
+#### `src/app/tests/everything_close_return.rs`
+
+```text
+open
+```
+
+#### `src/app/tests/facet_835.rs`
+
+```text
+image_fixture
+```
+
+#### `src/app/tests/facet_835/ranges.rs`
+
+```text
+media_fixture
+```
+
+#### `src/app/tests/file_type_visibility_fixes.rs`
+
+```text
+assert_excluded
+visibility_bookmark_actor_routes_same_book_results_to_different_context_policies
+visibility_bookmark_cache_reopen_uses_accepted_policy_and_restores_rows
+visibility_bookmark_context_bundles_keep_concurrent_policies_completions_and_close_scoped
+visibility_bookmark_mutation_invalidates_matching_bundles_and_preserves_unrelated_owner
+visibility_bookmark_projection_rejects_same_context_late_container_completion
+visibility_settings_ok_snapshot_reader_close_and_reopen_reload_origin
+visibility_shared_archive_admission_uses_only_the_mounted_matching_source_pair
+```
+
+#### `src/app/tests/g1_extracted_handlers.rs`
+
+```text
+exercise_entrance
+```
+
+#### `src/app/tests/grid_edge_buttons_1855.rs`
+
+```text
+harness
+```
+
+#### `src/app/tests/history_parent_1473.rs`
+
+```text
+matrix
+nested_rating_history_case
+section1473_bookmark_entrance_direct_exit_must_not_cycle_parent
+section1473_bookmark_entrance_restores_stable_key_and_scroll_then_its_parent
+section1473_both_markers_truncated_equal_revisit_keeps_entrance_destination
+section1473_equal_entrance_revisit_via_rating_keeps_complete_back_forward
+section1473_expansion_entrance_owns_complete_restore
+section1473_folder_bar_second_parent_keeps_physical_ancestors
+section1473_folder_descendant_does_not_resurrect_expired_book_return
+section1473_marker_presence_selects_back_or_direct_without_losing_entrance_position
+section1473_other_owned_entrances_survive_history_and_book
+section1473_other_synthetic_roots_parent_inventory
+section1473_rating_exit_keeps_its_own_complete_origin
+section1473_reading_history_root_parent_never_opens_internal_data
+section1473_returned_history_back_candidate_consumes_self_marker_first
+section1473_search_transfers_complete_canonical_origin
+section1473_smart_and_collection_physical_entrances_keep_native_root_and_origin
+section1473_snapshot_exit_cancel_keeps_visible_root_and_ends_fixed_scope
+section1473_snapshot_exit_restores_complete_native_canonical_owners
+section1473_snapshot_keeps_input_specific_admission_and_parent_owner
+section1473_snapshot_same_path_history_has_distinct_root_and_exits_to_its_captured_visit
+section1473_snapshot_subset_cannot_overwrite_ordinary_entrance_position
+settle
+```
+
+#### `src/app/tests/history_parent_lifecycle_1473.rs`
+
+```text
+history_fixture
+```
+
+#### `src/app/tests/merge_adoption.rs`
+
+```text
+folder_adoption_prunes_audio_absence_on_its_new_worker_queue
+reading_shell_with_audio
+reading_source_reply_after_reselect_cannot_fill_new_folder
+```
+
+#### `src/app/tests/physical_parent_1672.rs`
+
+```text
+section1672_all_inputs_use_the_same_preview_and_exact_jump_selection
+section1672_history_and_search_books_exit_to_physical_list_without_old_return
+section1672_history_descendant_jump_does_not_resurrect_expired_return
+```
+
+#### `src/app/tests/plain_folder_spread.rs`
+
+```text
+plain_folder_spread_import_refresh_limits_opt_in_and_preserves_sibling_context
+plain_folder_spread_install_uses_scan_and_does_not_persist_defaults
+plain_folder_spread_requires_a_scan_fact_and_normalizes_only_the_new_default
+plain_folder_spread_saved_values_and_legacy_flow_win
+```
+
+#### `src/app/tests/rating_filter_parent_return_1721.rs`
+
+```text
+new_descendant_sibling_unrelated_and_startup_entries_still_suppress
+round_trip
+same_starred_folder_reload_does_not_suppress_after_badge_restore
+synthetic_search_and_smart_origins_allow_new_physical_entry
+unrated_child_parent_action_and_same_folder_reload_keep_explicit_filter
+zip_book_reload
+```
+
+#### `src/app/tests/rating_filter_return_1671.rs`
+
+```text
+same_backing_reload_and_switch_use_the_adopted_source
+scenario
+settle
+unadopted_canceled_and_failed_pdf_leave_the_converted_book_unchanged
+unadopted_pdf_password_terminal
+```
+
+#### `src/app/tests/same_position_double_click.rs`
+
+```text
+check_same_position
+settle
+```
+
+#### `src/app/tests/scroll_661.rs`
+
+```text
+adopt_input_destination_before_first_layout
+row_anchor_after_list_adoption
+```
+
+#### `src/app/tests/search_scan_853_tests.rs`
+
+```text
+section1853_conversion_phase_uses_captured_search_back_instead_of_new_descend
+section1853_favorite_back_defers_effects_and_preserves_released_duplicate_parent
+section1853_favorite_sibling_defers_replace_and_preserves_released_duplicate_root
+section1853_favorite_sibling_keeps_suffix_directory_classification_and_single_count
+section1853_search_back_classifies_suffix_directories_before_virtual_dispatch
+section1853_search_back_failure_or_replacement_keeps_old_stack_and_address
+section1853_search_back_immediate_refusal_restores_hint_without_stack_or_address_change
+section1853_search_back_keeps_ignored_file_classification_without_stack_effects
+section1853_tag_back_intent_is_owned_by_pdf_and_conversion_classification
+section1853_tag_back_is_preserved_by_prepared_direct_pdf_adoption
+section1853_tag_back_pops_only_at_adoption_and_next_back_requeries
+section1853_tag_back_survives_classification_and_staged_zip_adoption
+section1853_temporary_view_exit_shares_folder_preflight_and_keeps_exit_authority
+```
+
+#### `src/app/tests/search_thumb_1741.rs`
+
+```text
+section1741_everything_zip_generation_reuses_parent_catalog_and_folder_selection
+```
+
+#### `src/app/tests/section1328_session.rs`
+
+```text
+section1328_session_reading_deep_zip_parent_does_not_return_to_history
+section1328_session_subfolder_prepare_uses_destination_sort_and_category_order_for_new_and_return
+section1328_session_zip_bs_preserves_physical_and_expansion_parent_meaning
+session1328_settle
+```
+
+#### `src/app/tests/section1795.rs`
+
+```text
+finish_stack_entry
+open
+section1795_off_bookshelf_root_starts_first_but_compiled_book_keeps_positions
+section1795_off_stack_load_hints_survive_final_aggregation
+section1795_off_startup_cursor_remains_independent
+section1804_stack_hidden_load_hints_do_not_request_deselection
+section1804_stack_internal_install_keeps_departure_recording
+```
+
+#### `src/app/tests/sort_hold_838.rs`
+
+```text
+(fixture ??module)
+images
+```
+
+#### `src/app/tests/sort_hold_838/gamepad.rs`
+
+```text
+direct_replacement_blocks_item_rating
+media_fixture
+```
+
+#### `src/app/tests/sort_hold_838/lifecycle.rs`
+
+```text
+direct_navigation_replacement
+sort_hold_838_scan_error_releases_gate_without_replacing_rows
+```
+
+#### `src/app/tests/sort_hold_838/watch_849.rs`
+
+```text
+sort_worker_849_watch_and_refresh_resume_after_navigation_replacement
+```
+
+#### `src/app/tests/sort_hold_838/worker_849.rs`
+
+```text
+conversion_fixture
+```
+
+#### `src/app/tests/startup_restore.rs`
+
+```text
+book_env
+direct_tray_book_env
+direct_tray_image_folder_book_env
+extra_video_close_env
+open_selected_image_folder_book
+section1335_bookshelf_compiled_folder_direct_read_and_explicit_list_restart_differ
+section1335_collection_and_rating_folder_carriers_keep_owner_and_open_intent
+section1335_collection_root_child_and_descendant_use_adopted_physical_location
+section1335_collection_root_return_from_page_b_retains_departing_list_page_a
+section1335_departing_same_items_page_open_captures_list_cursor_before_page_navigation
+section1335_favorite_reading_sibling_fallbacks_preserve_last_accepted_physical_cursor
+section1335_filtered_search_with_retained_physical_path_keeps_parent_cursor_on_back_and_tray
+section1335_flat_filename_stack_acceptance_never_persists_member_name_as_aggregate_cursor
+section1335_grid_folder_candidate_classifies_mixed_and_image_only_without_main_commit_leak
+section1335_native_back_to_list_caller_rejects_repeat_and_accepts_explicit_press
+section1335_pending_grid_candidate_setting_change_uses_completed_scan_main_intent
+section1335_rating_folder_auto_request_records_the_actual_settled_physical_list
+section1335_reading_empty_normal_folder_then_inner_zip_keeps_restore_at_each_seam
+section1335_required_virtual_zip_exact_page_success_and_missing_page_keep_parent_record
+section1335_similar_exact_page_move_preserves_accepted_departure_before_physical_materialization
+section1335_single_image_startup_and_required_page_scan_do_not_adopt_parent_lists
+section1335_subfolder_scan_reinstall_and_read_close_preserve_parent_cursor
+section1335_synthetic_install_captures_changed_physical_departure_without_manual_capture
+section1335_tray_converted_book_returns_logical_source_parent_and_preserves_reading_resume
+section1335_tray_direct_book_with_unrelated_saved_parent_keeps_book_list_and_record
+section1335_tray_image_folder_book_setting_changed_in_f12_returns_parent_and_keeps_resume
+section1335_tray_persistence_and_restore_keep_reading_session_and_parent_list
+section1335_video_ring_close_accepts_current_folder_list_for_exit_and_restart
+section1795_off_image_folder_book_resumes_and_closes_to_same_list
+settle_book
+```
+
+#### `src/app/tests/typing/search.rs`
+
+```text
+seed_images
+```
+
+#### `src/app/tests/ui_scan_853_tests.rs`
+
+```text
+section1853_archive_named_directory_context_jump_scans_off_caller
+section1853_collection_descendant_close_keeps_physical_owner_through_parent_wait
+section1853_completed_bookmark_reader_close_uses_ordinary_parent_wait
+section1853_converted_cache_reload_keeps_logical_source_and_explicit_sync_route
+section1853_created_sibling_zip_completion_keeps_output_selection_with_worker
+section1853_delayed_terminal_close_effect_preserves_new_close_return_request
+section1853_fullscreen_close_error_and_replacement_keep_reader_and_release_lock
+section1853_fullscreen_close_keeps_reader_until_parent_install
+section1853_grid_folder_facet_parent_child_grandchild_and_back_stay_physical
+section1853_main_close_wait_does_not_block_projected_detached_context
+section1853_missing_mtime_real_folder_reload_uses_staged_refresh
+section1853_native_backdrop_seam_adopts_ready_fullscreen_close_return
+section1853_page_list_and_focus_close_retire_late_parent_reply
+section1853_parent_dialog_and_books_root_dispatch_scan_off_caller
+section1853_retired_context_bundle_drops_request_owned_fullscreen_and_selection
+section1853_second_fullscreen_close_retires_first_wait_and_adopts_same_parent
+section1853_sidecar_restore_keeps_ready_scan_owned_until_restore_terminal
+section1853_visibility_apply_retires_old_scan_before_current_list_refresh
+```
+
+#### `src/app/viewer_context_registry.rs`
+
+```text
+rating_request_reaches_park_terminal
+```
+
+#### `src/filename_stack_ui.rs`
+
+```text
+failed_rating_stack_keeps_name_order_across_saved_sort_and_rebase
+g1_subfolder_stack_book_reopen_preserves_vertical_flow_and_original_book
+hold_stack_grouping_completion
+pending_stack_rebase_keeps_prepared_sort_across_global_sort_changes
+physical_rating_request_reaches_async_stack_grouping_without_re_reading_sort_keys
+rating_read_failure_notice_survives_successful_async_stack_grouping
+visibility_settings_ok_retires_extracting_and_grouping_on_worker_scan_path
+```
+
+#### `src/global_search_ui.rs`
+
+```text
+g1_global_search_producer_new_open_reopen_and_return_preserve_flow_policy
+global_search_label_unapplied_physical_child_keeps_metadata_breadcrumb_on_everything_switch
+grid_scroll_session_search_renews_at_first_rows_and_drill_not_stream_reprojection
+```
+
+#### `src/global_search_ui/everything/tests.rs`
+
+```text
+cold_folder_video_pin_seed_cascades_and_retargets_thumbnail_owner_on_return
+folder_activation_parent_chain_gamepad_return_research_and_close_keep_one_owner
+section1431_drive_list_search_initializes_thumbnail_owner_and_restores_icons
+section1741_prepare_owner_replaced_before_ready_retries_with_current_search_pool
+section1741_search_from_folder_replaces_pool_once_for_both_producers
+```
+
+#### `src/global_search_ui/thumbnail_owner_tests.rs`
+
+```text
+section1741_metadata_prepare_owner_replaced_before_ready_retries_and_adopts
+section1741_nonsearch_pool_capture_never_borrows_outgoing_resources
+section1741_search_pool_adoption_leaves_sibling_context_unchanged
+```
+
+#### `src/remote_ipc/ui.rs`
+
+```text
+remote_static_page_progress_is_the_next_pc_open_position
+```
+
+#### `src/ui_dialogs/archive_convert/rar_cache_tests.rs`
+
+```text
+request_open
+```
+
+#### `src/ui_dialogs/favorites_editor.rs`
+
+```text
+favorite_cover_auto_crop_combo_saves_and_reloads_loaded_books_with_scoped_requests
+favorite_cover_auto_crop_delete_active_view_starts_one_order_refresh
+```
+
+#### `src/ui_dialogs/preferences.rs`
+
+```text
+assert_grid_background
+folder_cell_background_preferences_confirm_applies_saves_and_paints
+ignoring_open_epub_on_preferences_ok_does_not_select_same_named_item_in_next_book
+unrated_position_survives_preferences_ok_save_reopen_and_orders_folder
+```
+
+#### `src/ui_dialogs/preferences/transfer.rs`
+
+```text
+preferences_transfer_busy_background_menu_and_toolbar_pointer_handlers
+```
+
+#### `src/ui_fullscreen/close_return_tests.rs`
+
+```text
+close_return_captures_visible_previous_before_true_close_cleanup
+close_return_does_not_change_ctrl_folder_navigation_draw_policy
+close_return_live_render_keeps_fallback_and_input_lock_until_terminal
+close_return_wait_renders_live_zoom_pan_and_rotation_while_rejecting_page_targets
+close_return_page_and_jump_handlers_discard_new_targets_without_replay
+close_return_terminal_only_releases_its_own_request_and_exit_resets_panel
+close_return_waits_for_every_page_in_current_spread
+```
+
+#### `src/ui_fullscreen/page_turn/plain_folder_regression_tests.rs`
+
+```text
+folder_fixture
+```
+
+#### `src/ui_fullscreen/wheel_frame_tests.rs`
+
+```text
+egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_owner
+```
+
+#### `src/ui_main.rs`
+
+```text
+physical_parent_folder_menu_toggle_controls_toolbar_and_resets_to_hidden
+rating_and_duration_sort_controls_dispatch_one_reload_for_selected_order
+section1339_toolbar_projects_pending_cursor_and_allows_reverse_cancel
+section1684_folder_bar_native_quick_slots_and_history_keep_whitespace
+section1705_history_buttons_allow_local_filter_and_empty_bar
+section207_production_layout_all_controls_and_positions_keep_input_usable
+section207_reported_controls_keep_left_input_right_order
+section207_snapshot_label_keeps_input_minimum_order_and_panel_bounds
+section292_both_dropdowns_share_sort_and_facet_popup_consumes_wheel
+section292_locked_facet_sort_keeps_refresh_and_subfolder_grouping_usable
+```
+
+#### `src/ui_main/toolbar_bg_menu_1876_tests.rs`
+
+```text
+section1876_row_two_pinned_tag_secondary_click_keeps_tag_action
+```
+
+### 6.18 検証と独立実装レビューの記録 (設計担当、2026-11-27)
+
+テストは設計担当が共有の heavy-job runner (`run-heavy.ps1`) で流した。実装担当はコンパイル・テストをしていない。
+
+| 回 | 対象 | 結果 |
+| --- | --- | --- |
+| 関連 filter 1 | `5f0ab660f` | lib のテストのコンパイルで 26 件のエラー (テスト側の型・可視性) |
+| 関連 filter 2 | `616f04b35` | 既定 1046 件中 16 件失敗、test-script 1051 件中 16 件失敗 (同じ 16 件) |
+| 関連 filter 3 | `d2768a9bb` | 既定 1046 件・test-script 1051 件すべて成功 |
+| lib 全件 1 | `d2768a9bb` | 既定 33 件・test-script 35 件失敗 |
+| lib 全件 2 | `de9b6a308` | 既定 20864 件中 3 件・test-script 21026 件中 4 件失敗 |
+| lib 全件 3 | `5c870a954` | **既定 20865 件・test-script 21027 件すべて成功** (`scripts/test-lib-full.ps1`、`-Features test-script`) |
+
+修正の中で見つかった製品側の退行は 3 件 (§6.17 の r1〜r3): ★フォルダを開くときの自動の一覧の扱い、App の大きさの上限超え
+(継続の持ち物を Box に)、★固定の更新中に後続の open を断る判定が走査の後ろへずれていたこと。ほかはテストの採用待ち・fixture・型の追従。
+
+独立実装レビュー (GPT-6.1 Sol / xhigh、read-only、設計・実装とは別の担当):
+
+- r1 (`30cdc0774..d2768a9bb`): **ACCEPT**。P1/P2 なし。P3×2 (native の Home/End・HUD を通常時に確かめるテスト、C5 の待ちの間の変換の
+  描画のテスト)。どちらも `de9b6a308` で追加した。detached の境界は構造的修正に **AGREE**。
+- r2 (同じ担当の継続、`d2768a9bb..5c870a954`): **ACCEPT**、指摘なし。
+
+dev-runtime の検証用バイナリ (`.\scripts\build-dev.ps1`) は `5c870a954` で作成済み。製品の起動・実機での確認・perf の計測はしていない
+(サブ PC の確認は統括が行う)。
+
+残り・別項目の候補:
+
+- お気に入り検索の BS・Ctrl+↑↓ の積み上げが今も重複する既存の挙動 (`[root, child]` → `[root, root]`、§6.17)。今回は今の結果を保った。
+  直すかは利用者の判断。
+- ★固定の移動の同期の走査 (`SnapshotLeafOpen`、§6.2)。統括が master で番号を取る。
+- `.pdf` という名前の実フォルダへの検索の戻りは、基点でも成功しない (§6.17 r1、新しいテストの対象から外した)。

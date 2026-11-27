@@ -2992,6 +2992,7 @@ mod hidden_same_name_qualification_tests {
             root,
             scan,
             &settings,
+            crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
             crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::FileName),
             |_| panic!("standard ordering must not read the rating DB"),
         );

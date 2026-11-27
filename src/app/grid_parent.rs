@@ -89,8 +89,8 @@ mod tests {
             app.handle_stack_refresh_keyboard(
                 &ctx,
                 true,
-                0,
-                0,
+                Default::default(),
+                Default::default(),
                 crate::filename_stack_ui::GridItemInputBlock::StackRefresh,
             )
         } else {
@@ -333,6 +333,7 @@ mod tests {
                 ));
                 assert_eq!(before, preview_state(&app));
                 assert!(parent_input(&mut app, input).is_none());
+                app.finish_direct_navigation_scan_for_test();
                 app.finish_page_identity_preparation_for_test();
                 assert_eq!(app.current_folder.as_ref(), Some(&root), "{mode:?}/{input}");
                 assert_eq!(app.tag_view.nav_stack, vec![root]);
@@ -627,6 +628,16 @@ impl App {
         self.execute_grid_parent_action(action, GridParentPresentation::KeyOrBackground)
     }
 
+    pub(crate) fn handle_grid_parent_folder_action_with_admission(
+        &mut self,
+    ) -> (Option<AddressBarNav>, super::ActionAdmission) {
+        let action = self.grid_parent_action();
+        self.execute_grid_parent_action_with_admission(
+            action,
+            GridParentPresentation::KeyOrBackground,
+        )
+    }
+
     /// Mouse/ring/gesture/Pad and the parent button share the same semantic owner.
     pub(crate) fn handle_grid_parent_action(&mut self) -> Option<AddressBarNav> {
         let action = self.grid_parent_action();
@@ -637,12 +648,33 @@ impl App {
         self.handle_grid_parent_action()
     }
 
+    pub(crate) fn handle_stack_refresh_parent_action_with_admission(
+        &mut self,
+    ) -> (Option<AddressBarNav>, super::ActionAdmission) {
+        let action = self.grid_parent_action();
+        self.execute_grid_parent_action_with_admission(action, GridParentPresentation::Other)
+    }
+
     fn execute_grid_parent_action(
         &mut self,
         action: GridParentAction,
         presentation: GridParentPresentation,
     ) -> Option<AddressBarNav> {
-        match action {
+        self.execute_grid_parent_action_with_admission(action, presentation)
+            .0
+    }
+
+    fn execute_grid_parent_action_with_admission(
+        &mut self,
+        action: GridParentAction,
+        presentation: GridParentPresentation,
+    ) -> (Option<AddressBarNav>, super::ActionAdmission) {
+        let admission = if matches!(&action, GridParentAction::LocalFilterBlocked) {
+            super::ActionAdmission::Rejected
+        } else {
+            super::ActionAdmission::Accepted
+        };
+        let nav = match action {
             GridParentAction::NoOp => None,
             GridParentAction::SnapshotList => {
                 self.snapshot_return_to_list_view();
@@ -694,6 +726,7 @@ impl App {
                 }
                 Some(nav)
             }
-        }
+        };
+        (nav, admission)
     }
 }

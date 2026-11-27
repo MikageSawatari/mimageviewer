@@ -674,7 +674,9 @@ impl App {
                     pending.cancel_with_diagnostic("folder_zip_close");
                     op.success()
                 } else {
-                    match pending.rx.try_recv() {
+                    // This modal owns a PaneNavigation scan, not DirectNavigation's
+                    // policy-admission continuation. Consume its existing I/O outcome.
+                    match pending.rx.try_recv().map(|result| result.scan) {
                         Ok(Ok(scan)) => self.adopt_image_zip_parent_scan(&op, pending, scan),
                         Ok(Err(error)) => op.failed(format!("親一覧の読取: {error}")),
                         Err(mpsc::TryRecvError::Empty) => Phase::ParentScan(pending),

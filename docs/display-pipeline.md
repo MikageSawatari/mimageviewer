@@ -78,6 +78,25 @@ Ctrl+Shift+左ドラッグの物理移動から `ω = ((π/2)/R)·(dy,−dx,0)` 
 寸法の上限は行padding込みbufferとtextureの両方を resolver で守り、Ctrl+Eの追加縮小は通さない。
 写しのVRAMは allocation lifetime のRAII会計で、終了後にcallback / 出力要求だけが持つ世代も重複なく数える。
 
+## 通常の物理フォルダの手動順（§1.911）
+
+`app/book_materialization.rs::materialize_local_folder_listing_with_order_and_metadata` が、
+種類の投影・重複除外と基準の並びを作った後、`folder_order::resolve_listing_order` を適用する。
+記録済みの子を記録位置順、未知の子を基準の並びのまま末尾へ置き、GridDisplayOrder のカテゴリ行をまたぐ
+一つの列にする。共通の `physical_folder_order_eligible` が偽、またはスタック ON なら適用しない。
+詳細表示の `details_order` はこの基礎の items を変えず、列ヘッダによる表示順だけを重ねる。
+
+物理一覧専用の `FolderOrderListingInput::Read(record or none)` と、投影前の直下名から取った inventory を
+scan と一緒に渡す。新規 open・履歴 preflight・Remote / Agent IPC の worker は単一 actor の handle で読み、
+materialize 自体は folder_order.db を開かない。watcher と sort refresh は現在の context のメモリ上の記録を使う。
+同期 load の記録なしが準備済み索引で確定していれば、明示的な Read(None) で従来の同期採用へ進む。
+
+採用時には単調な `order_revision` を確定し、手動が適用される場合だけ一覧の投影キーへ加える。
+通常順・対象外・スタック時の投影キーは従来値を維持する。再走査／refresh は context・世代に加えて
+order_revision を照合する。ドラッグの成功も items の直接置換ではなく、記録更新・actor Save・
+`apply_sort_change_reload` からの既存 refresh 採用を使い、selected / checked を identity で復元する。
+所有・保存集合・取消条件の正本は [フォルダ手動順の設計](folder-manual-order-plan.md)。
+
 ## 3D 写真の表示レイヤー（2026-11-07、段 B 実装・独立レビュー中）
 
 3D は既存の final / comic / source の優先順位を変更しない。
@@ -353,6 +372,15 @@ Audio は既存 worker / texture backlog に乗り、同名 sidecar → MP3 先�
 ## 1. サムネイル表示パイプライン
 
 ### 1.1 状態機械
+
+同じ物理フォルダの並び順だけを変える `CurrentViewOrderRefresh` では、旧 keep_set 内の表示素材を
+physical item key と (mtime, size) で対応づけ、まだ Pending のセルにだけ表示専用の代役を描く。
+控えるのは描画中のテクスチャ（補正済みを含む）と旧素材の UV・表示寸法・回転であり、
+thumbnails・要求・鮮度検証・補正再生成は従来どおり進む。世代が違う代役は描かない。
+Pending 以外への遷移・世代変更・確定済み keep_set の範囲外・source の利用不可確定・context 終了で破棄する。
+採用直後の空 keep_set や hydration 待機だけでは範囲外扱いにしない。代役は context の bundle と一緒に運び、
+連続した並び替えでも有効な代役を次へ渡す。詳細 hover と Remote には使わない。
+詳細は [フォルダ手動順の設計 §13](folder-manual-order-plan.md#13-並べ替えた直後のサムネイルの引き継ぎ-2026-11-27-追加)。
 
 表示状態と要求の寿命は別である。context-local な `ThumbnailRequests` が request ID / items
 generation・要求種別・未採用CPU画像を一体で所有し、sourceは `SourcePixels` の採用/破棄と
@@ -3881,6 +3909,17 @@ scale_x=3.0443971, scale_y=3.0443973` で、論理 1440 × ppp1.5 = 実 2160px �
 (ホールド中は full decode / upload を意図的に抑止しているため、別構成での測定が要る)。
 
 #### 2.5.4 表示単位 (単一 / 見開き / 連結)
+
+§1.853 C5 の全画面から親へ戻る待ちは、`FolderItems` の目的 `CloseReturn { request_id }` を使う。
+true-close の後始末より前に、実際に描いている holdover を優先して表示単位を捕捉し、
+既存の close continuation から `MainListNavigation` の `FsCloseReturnPresentation` へ描画資源だけを渡す。
+旧 sequence の操作権限を引き継がず、worker 発行後にこの要求の sequence として開始する。
+現在の補助表紙を含む表示単位全体を描けるときは通常描画にし、待ちの間の拡大・回転・位置を反映する。
+未準備のときだけ捕捉した単位を代役として描く。通常描画へ切り替えても sequence・lock・代役の資源を終えず、
+採用直前の `ViewerExited`、失敗／取消／置換の `Superseded` で同じ要求だけを終える。
+ページ送り・ジャンプ・スクロールの拒否と、読み込み中の表示を出さない扱いは既存の FolderItems 待ちに従う。
+Ctrl+↑↓ の previous 描画は変更しない。[設計 §6.12](ui-sync-853-plan.md#612-c5-全画面から戻る経路-全画面の-ctrl-の待ちと同じ扱い-利用者決定-61r6)。
+本追補のコンパイル・テスト・実機描画は未確認。
 
 単一ページは 1 ページ、見開きは左右 2 ページを表示単位として、**表示単位全体を 1 回で解決する**。
 受理時に current unit の texture / rotation / Part A の captured layout geometry を

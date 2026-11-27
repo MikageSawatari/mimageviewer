@@ -380,6 +380,7 @@ impl App {
         }
         let fs_idx = target_idx;
         let [w, h] = self.erase_working_size(fs_idx, pixels.size);
+        self.stop_projected_slideshow_playback();
         self.erase_mode = true;
         // 通常表示と消しゴムは UI / Ctrl+Z の文脈が異なるので、メタ Undo スタックを破棄。
         // 消しゴム中は erase_undo_stack が Ctrl+Z を担当する。
@@ -724,6 +725,7 @@ impl App {
             return Default::default();
         }
         let action = FsKeyAction {
+            script_slot: None,
             page_transition: Default::default(),
             close: false,
             close_to_page_list: false,
