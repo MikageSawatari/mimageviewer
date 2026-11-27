@@ -237,7 +237,7 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         let path = app.tmp.path().join("operation_scripts.rhai");
         let (release, gate) = mpsc::channel::<()>();
-        app.operation_script = crate::operation_script::OperationScriptLoader::with_file_worker(
+        *app.operation_script = crate::operation_script::OperationScriptLoader::with_file_worker(
             path,
             editor,
             move || {

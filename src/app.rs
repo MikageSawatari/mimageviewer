@@ -18696,9 +18696,11 @@ pub struct App {
     /// `poll_stack_script` が集約ビューへ差し替える (`docs/filename-stack-scripting-plan.md`)。
     pub(crate) stack_script_pending: Option<crate::filename_stack_ui::StackPreparePending>,
     /// メイン専用の操作スクリプト。viewer contextのbundleへは移さない。
-    pub(crate) operation_script: crate::operation_script::OperationScriptLoader,
+    /// App の stack footprint を抑えるため heap に置く (pref_state と同じ)。
+    pub(crate) operation_script: Box<crate::operation_script::OperationScriptLoader>,
     /// Main-only script event state; excluded from viewer-context swapping.
-    pub(crate) operation_script_events: operation_script_runtime::OperationScriptEvents,
+    /// Boxed to keep the App stack footprint bounded.
+    pub(crate) operation_script_events: Box<operation_script_runtime::OperationScriptEvents>,
     /// Invalidates grouping and view-switch results even if the source items have not changed.
     pub(crate) stack_request_sequence: u64,
     /// スタックを ON にした瞬間のカーソル画像パス。集約完了時にこの画像を含むスタックセルへ

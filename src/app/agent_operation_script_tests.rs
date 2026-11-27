@@ -28,7 +28,7 @@ fn operation_script_ui_admission_rechecks_live_permission_modal_preferences_and_
         let touched = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = touched.clone();
         let mut app = TestApp(setup_app());
-        app.operation_script = crate::operation_script::OperationScriptLoader::with_file_worker(
+        *app.operation_script = crate::operation_script::OperationScriptLoader::with_file_worker(
             crate::operation_script::script_path(temp.path()),
             |_| Ok(()),
             move || {
@@ -175,15 +175,17 @@ fn operation_script_ui_admission_rechecks_live_permission_modal_preferences_and_
 
 // Joining in Drop also protects disposable data if an assertion unwinds.
 struct TestApp(crate::app::tests::phase_c_support::AppTestEnv);
+// Deref to the fixture env (which derefs to App) so the AiRuntimeFixture
+// constructor policy sees no App alias here.
 impl std::ops::Deref for TestApp {
-    type Target = App;
-    fn deref(&self) -> &App {
-        &self.0.app
+    type Target = crate::app::tests::phase_c_support::AppTestEnv;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 impl std::ops::DerefMut for TestApp {
-    fn deref_mut(&mut self) -> &mut App {
-        &mut self.0.app
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
 impl Drop for TestApp {
