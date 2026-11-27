@@ -840,8 +840,8 @@ fn plane_tilt_front_and_back_snapshots_capture_and_export_the_same_board() {
                 let [nx, ny, n] = orientation.matrix().map(|column| column.map(f64::from));
                 let [vx, vy] = [f64::from(v.x), f64::from(v.y)];
                 let den = n[0] * vx + n[1] * vy + n[2] * focal;
-                let epsilon = 1.e - 6 * (vx * vx + vy * vy + focal * focal).sqrt();
-                let analytic = if n[2].abs() <= 1.e - 6 || den.abs() <= epsilon {
+                let epsilon = 1.0e-6 * (vx * vx + vy * vy + focal * focal).sqrt();
+                let analytic = if n[2].abs() <= 1.0e-6 || den.abs() <= epsilon {
                     None
                 } else {
                     let a = nx[0] - vx / focal * nx[2];
