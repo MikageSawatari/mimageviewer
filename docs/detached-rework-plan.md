@@ -1470,7 +1470,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   別窓の入力履歴を reset せず、閾値・猶予・待ち・追加 repaint で症状を吸収していない。
 - 設計の構造的修正への合意は正本 §16.14〜16.16 の記録による (ClaudeCode と独立設計レビュー)。
   独立設計レビュー (Sol xhigh) は r1〜r4 の各回で構造的修正であることに AGREE し、r4 で ACCEPT。
-  実装の独立レビュー (ClaudeCode が依頼する別の Sol xhigh) の合意は、結果が出たら追記する。
+  実装の独立レビュー (実装者と別の Sol xhigh、ClaudeCode が依頼) は r1・r2 とも ACCEPT で、構造的修正であり症状パッチではないことに AGREE (2026-11-27、正本 §16.18)。
 
 
 ### 2026-11-26: 閉じるモードの数え方の区切りと、この pass の押下位置 (§1.900・§1.907)

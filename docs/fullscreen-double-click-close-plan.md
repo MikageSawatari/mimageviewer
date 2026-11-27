@@ -954,7 +954,7 @@ guard・遅延・再試行・時間切れを足さない。ClaudeCode と Codex 
   旧実装には新 API が無いため、API だけを受け取って注釈を無視する比較を想定した見込みで、旧コードでの実行はしていない。
 - まれな時計 / subclass 設置失敗は時刻を渡さず既存の pass 判定 (subclass 設置失敗だけ一度の警告) とし、回復機構を増やしていない。
   入力が常時並行するためモーダル化では原因を除けず、共通の生成・所有境界を修正した。閾値延長・待ち・追加 repaint は使わない。
-  detached の実装者判断は [detached-rework-plan §11](detached-rework-plan.md) に記録。独立実装レビューの合意は 16.18 の後に追記する。
+  detached の実装者判断は [detached-rework-plan §11](detached-rework-plan.md) に記録。独立実装レビューの合意は 16.18。
 
 追加テストの完全名 (nextest の test filter 用、ソースから抽出。すべて未実行):
 
@@ -1051,3 +1051,38 @@ vendor/egui/src/input_state/mod.rs
 vendor/egui/src/input_state/timestamp_tests.rs
 vendor/egui/src/lib.rs
 ```
+
+### 16.18 独立実装レビュー・検証 (2026-11-27、ClaudeCode)
+
+- 実装: Codex gpt-6.1-sol / high (9006d1cd3)。コンパイルと試験で見つかった 2 点を直した:
+  632f2c745 (ClaudeCode。`GetWindowSubclass` を使わない。manifest の無い eframe のテスト実行体が 0xc0000139 で読み込めなかった。
+  refData は常に 0 なので `RemoveWindowSubclass` の戻り値で付いていたかを判定。テストの import と型の 2 か所)、
+  051d49e18 (Codex。`EdgeTime::since` を符号付きに戻した。0 に丸めるとツリーの「前の離しより前の押下」を弾く判定が通ってしまい、
+  既存のテスト `folder_pane::tests::label_gesture_diagnostic_reports_double_click_delay_rejection` が落ちた)。
+- 独立実装レビュー (実装者と別の Sol xhigh、ClaudeCode が依頼): r1 (ce3453461..9006d1cd3) **ACCEPT**、指摘なし。
+  r2 (9006d1cd3..051d49e18) **ACCEPT**、指摘なし。両回とも、入力時刻の所有境界を正す**構造的修正であり症状パッチではない**ことに **AGREE**。
+  r2 は System32 の DLL の export を確かめ、残る import (`SetWindowSubclass`・`RemoveWindowSubclass`・`DefSubclassProc`・`GetTickCount`) に
+  同じ読み込みの問題が無いことを確認した (レビュー担当の報告)。
+- 自動試験 (run-heavy、051d49e18): vendor egui 234/234、egui-winit 83/83、eframe wgpu 65 成功 1 skip、eframe glow 67/67、
+  本体の関連 (`919|double_click_close|grid_reclick|folder_pane|detached_activation_gesture|pointer_input|double_click_time`) 543/543。
+  旧コードでの比較実行はしていない (新しい API を使う試験のため)。今の挙動の固定 (`stall_919_tests.rs` の 4 件) は変えずに通っている。
+- 実窓の probe (メイン PC、ClaudeCode が実行、自分の窓へのメッセージだけ。出力 `target/investigation/forum-919-real-window/run-output-after-fix.txt`):
+  修正後の vendor で、(a) 1 回目の後の 700ms の止まり → 回数 2 (修正前 1)、(b) 押下の後の 900ms の止まり → クリック 1 回 (修正前はクリックにならない)、
+  対照・(c)・(d) は修正前と同じ。本物のマウスでの確認はまだ (サブ PC、16.19)。
+
+### 16.19 サブ PC での確認 (案、統括が依頼する)
+
+- 道具: `target/investigation/forum-919-real-window/` の `forum-919-probe-before-fix.exe` と `forum-919-probe-after-fix.exe`
+  (mIV ではない試験プログラム。データの保存は無し。出力は実行した場所の `run-output-interactive.txt`)。
+  `--interactive` で起動すると 720×480 の窓が出て、**離しのたびに UI を 700ms 止める** (`--stall-ms N` で変更、`--stall-on-press` で
+  押下のたびに止める、`--seconds N` で自動終了までの秒数、既定 90)。窓の中の表示「Last click counts」に、各クリックの回数 (2 がダブルクリック) が出る。
+- 手順:
+  1. before で `--interactive` を起動し、窓の中を普通の速さで 10 回ダブルクリックする (ダブルクリックの間は 1 秒以上空ける)。
+     「egui double clicks」の数と、終了後の `run-output-interactive.txt` を保存する。期待: 多くが 1 のまま (取りこぼし)。
+  2. after で同じ。期待: 10 回とも 2 が出る。
+  3. 1・2 を `--stall-on-press --stall-ms 900` でも行う。期待: before は回数が出ない (クリックにならない) ものが多く、after は 2 が出る。
+- 製品 (build-dev の dev ビルド、試験用の `--data-dir`) で、止まりの無い通常の操作が今と同じことを確かめる:
+  全画面の「クリックでは送らず、ダブルクリックで閉じる」でダブルクリックで閉じる、拡大中のダブルクリックで表示が戻り続けてダブルクリックで閉じる
+  (§1.899・§1.900 の手順)、一覧のダブルクリックで開く、ツリーのフォルダ名のダブルクリックで開閉する、F12 の別ウィンドウのダブルクリックで
+  その窓だけ閉じる、既定モードのクリック送り。
+- 依頼文の決まり: 入力欄はフォーカスを写真で確かめてから入力する。Backspace・Delete を続けて送らない。確認の画面は Enter で確定せず止めて報告。
