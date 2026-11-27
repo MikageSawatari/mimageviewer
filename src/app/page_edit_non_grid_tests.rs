@@ -201,7 +201,7 @@ fn page_edit_920_direct_reader_adoption_exits_before_capturing_return_presentati
 }
 
 #[test]
-fn page_edit_920_direct_reader_existing_target_and_loaded_file_reopen_preserve_erase_draft() {
+fn page_edit_920_direct_reader_existing_target_keeps_erase_until_loaded_file_reopen_exits() {
     let ctx = egui::Context::default();
     let mut app = fixture(&ctx);
     let path = app.items[1].drag_source_path().unwrap().to_path_buf();
@@ -223,15 +223,16 @@ fn page_edit_920_direct_reader_existing_target_and_loaded_file_reopen_preserve_e
         )
         .unwrap();
     assert_eq!(opened, 1);
-    assert_eq!(app.fullscreen_idx, Some(1));
-    assert!(app.erase_mode);
-    assert!(app.erase_spread_ctx.is_some());
-    assert_eq!(app.erase_mask.as_deref(), Some([true; 15].as_slice()));
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert_eq!(app.spread_mode, SpreadMode::Ltr);
+    assert!(!app.erase_mode);
+    assert!(app.erase_spread_ctx.is_none());
+    assert!(app.erase_mask.is_none());
 }
 
 #[cfg(windows)]
 #[test]
-fn page_edit_920_linked_sync_same_item_refresh_preserves_unapplied_erase() {
+fn page_edit_920_linked_sync_same_item_refresh_exits_erase_and_restores_spread() {
     let ctx = egui::Context::default();
     let mut app = fixture(&ctx);
     app.settings.detached_viewer_enabled = true;
@@ -244,12 +245,13 @@ fn page_edit_920_linked_sync_same_item_refresh_preserves_unapplied_erase() {
     app.erase_mask = Some(vec![true; 15]);
     app.erase_spread_ctx = Some(pivot());
     app.sync_detached_viewer_to_selected(&ctx);
-    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert_eq!(app.spread_mode, SpreadMode::Ltr);
     assert!(
         app.last_viewer_sync_stamp.is_some(),
         "the real same-item sync must run"
     );
-    assert!(app.erase_mode);
-    assert!(app.erase_spread_ctx.is_some());
-    assert_eq!(app.erase_mask.as_deref(), Some([true; 15].as_slice()));
+    assert!(!app.erase_mode);
+    assert!(app.erase_spread_ctx.is_none());
+    assert!(app.erase_mask.is_none());
 }

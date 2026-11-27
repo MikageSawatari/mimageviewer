@@ -75,6 +75,230 @@ fn assert_pivots_consumed(app: &App) {
     assert!(app.sns_split_spread_ctx.is_none());
 }
 
+struct PreviewSaveTrace;
+
+impl PreviewSaveTrace {
+    fn start() -> Self {
+        PREVIEW_SAVE_COUNT.with(|count| {
+            assert!(count.replace(Some(0)).is_none());
+        });
+        Self
+    }
+
+    fn count(&self) -> usize {
+        PREVIEW_SAVE_COUNT.with(|count| count.get().unwrap())
+    }
+}
+
+impl Drop for PreviewSaveTrace {
+    fn drop(&mut self) {
+        PREVIEW_SAVE_COUNT.with(|count| count.set(None));
+    }
+}
+
+fn seed_local_preview(app: &mut App) {
+    app.local_adjust_mode = true;
+    app.local_adjust_pages.insert(1);
+    app.image_metas[1] = Some((1, 5));
+    app.settings.edit_preview_cache_enabled = true;
+    app.edit_preview_cache =
+        Some(crate::edit_preview_cache::EditPreviewCacheService::open().unwrap());
+    let key = app.current_edit_result_key(1);
+    app.edit_result_cache.insert(
+        key,
+        EditResultEntry::raster(
+            Arc::new(egui::ColorImage::filled([5, 3], egui::Color32::RED)),
+            None,
+        ),
+    );
+}
+
+#[test]
+fn page_edit_920_close_owns_single_local_preview_and_preserves_rating_history_and_landing() {
+    for boundary in [
+        FsMetadataBoundary::Manual,
+        FsMetadataBoundary::RatingMembership,
+    ] {
+        let mut app = fixture();
+        seed_local_preview(&mut app);
+        app.local_adjust_spread_ctx = app.capture_local_page_edit_pivot(pivot());
+        app.selected = Some(2);
+        let change = crate::undo_stack::RatingChange {
+            path_key: app.rating_path_key(1).unwrap(),
+            source_path: app.items[1].drag_source_path().unwrap().to_path_buf(),
+            meta: None,
+            xmp_target: None,
+            before: 1,
+            after: 2,
+        };
+        let undo = crate::undo_stack::UndoEntry::Rating {
+            changes: vec![change.clone()],
+            origin: None,
+            summary: "retained undo".into(),
+        };
+        let redo = crate::undo_stack::UndoEntry::Rating {
+            changes: vec![change],
+            origin: None,
+            summary: "retained redo".into(),
+        };
+        app.meta_undo.push(undo);
+        app.meta_undo.push_redo(redo);
+        let trace = PreviewSaveTrace::start();
+
+        app.close_fullscreen_now_for_destination(boundary, FullscreenCloseDestination::CurrentList);
+
+        assert_eq!(
+            trace.count(),
+            1,
+            "close alone owns the completed edit-result preview"
+        );
+        assert_eq!(app.fullscreen_idx, None);
+        assert!(!app.local_adjust_mode);
+        assert_pivots_consumed(&app);
+        if boundary == FsMetadataBoundary::RatingMembership {
+            assert_eq!(app.meta_undo.undo_len(), 1);
+            assert_eq!(app.meta_undo.redo_len(), 1);
+            assert_eq!(
+                app.meta_undo.peek_undo().unwrap().summary(),
+                "retained undo"
+            );
+            assert_eq!(
+                app.meta_undo.peek_redo().unwrap().summary(),
+                "retained redo"
+            );
+            assert_eq!(
+                app.selected,
+                Some(2),
+                "rating adoption owns its destination"
+            );
+        } else {
+            assert_eq!(
+                app.selected,
+                Some(0),
+                "manual close lands on the outgoing spread anchor"
+            );
+        }
+    }
+}
+
+#[test]
+fn page_edit_920_local_panel_exit_caches_completed_preview_once() {
+    let mut app = fixture();
+    seed_local_preview(&mut app);
+    let trace = PreviewSaveTrace::start();
+    app.exit_local_adjust_mode(LocalAdjustmentExitPreview::CacheCurrent);
+    assert!(!app.local_adjust_mode);
+    assert_eq!(trace.count(), 1);
+}
+
+#[test]
+fn page_edit_920_rating_close_keeps_undo_redo_across_local_fold() {
+    let mut app = fixture();
+    let mut mask = local_adjust_core::RasterVectorMask::empty(5, 3);
+    mask.shapes.push(local_adjust_core::MaskShape::Ellipse {
+        op: local_adjust_core::ShapeOp::Add,
+        center: [0.5, 0.5],
+        rx: 0.125,
+        ry: 0.125,
+        rotation_rad: 0.0,
+    });
+    app.set_local_adjust_layers_for_idx_memory_only(
+        1,
+        local_adjust_core::LocalAdjustmentLayers::new(vec![
+            local_adjust_core::LocalAdjustmentLayer::new(
+                "layer",
+                local_adjust_core::LocalMask::RasterVector(mask),
+                local_adjust_core::LocalEffect::None,
+            ),
+        ]),
+    );
+    app.local_adjust_mode = true;
+    app.local_adjust_selected_shape = Some(0);
+    app.local_adjust_mask_edit_target = LocalAdjustMaskEditTarget::Base;
+    app.select_local_page_edit_layer(1, 0);
+    assert!(app.nudge_selected_local_adjust_shape_from_shortcut(1, 0.125, 0.0));
+    assert!(app.local_adjust_shape_key_edit.is_some());
+    let changes = vec![crate::undo_stack::RatingChange {
+        path_key: app.rating_path_key(1).unwrap(),
+        source_path: app.items[1].drag_source_path().unwrap().to_path_buf(),
+        meta: None,
+        xmp_target: None,
+        before: 1,
+        after: 2,
+    }];
+    app.meta_undo.push(crate::undo_stack::UndoEntry::Rating {
+        changes: changes.clone(),
+        origin: None,
+        summary: "undo before fold".into(),
+    });
+    app.meta_undo
+        .push_redo(crate::undo_stack::UndoEntry::Rating {
+            changes,
+            origin: None,
+            summary: "redo before fold".into(),
+        });
+    app.close_fullscreen_now_for_destination(
+        FsMetadataBoundary::RatingMembership,
+        FullscreenCloseDestination::CurrentList,
+    );
+    assert!(app.local_adjust_shape_key_edit.is_none());
+    assert_eq!(app.meta_undo.undo_len(), 1);
+    assert_eq!(app.meta_undo.redo_len(), 1);
+    assert_eq!(
+        app.meta_undo.peek_undo().unwrap().summary(),
+        "undo before fold"
+    );
+    assert_eq!(
+        app.meta_undo.peek_redo().unwrap().summary(),
+        "redo before fold"
+    );
+    app.finish_local_adjust_writes();
+}
+
+#[test]
+fn page_edit_920_close_discards_text_crop_and_sns_pivots_after_capturing_grid_landing() {
+    for tool in ["text", "crop", "sns"] {
+        let mut app = fixture();
+        app.selected = Some(2);
+        match tool {
+            "text" => {
+                app.text_mode = true;
+                app.text_spread_ctx = Some(pivot());
+            }
+            "crop" => {
+                app.export_crop_mode = true;
+                app.export_crop_spread_ctx = Some(pivot());
+            }
+            _ => {
+                app.sns_split = Some(crate::sns_split::SnsSplitLayout::centered_max(
+                    crate::sns_split::SnsTarget::X,
+                    2,
+                    [5, 3],
+                ));
+                app.sns_split_spread_ctx = Some(pivot());
+            }
+        }
+        app.close_fullscreen_now_for_destination(
+            FsMetadataBoundary::Manual,
+            FullscreenCloseDestination::CurrentList,
+        );
+        assert_eq!(
+            app.spread_mode,
+            SpreadMode::Single,
+            "{tool} keeps the released close setting"
+        );
+        assert_eq!(
+            app.selected,
+            Some(0),
+            "{tool} lands using the pivot before discarding it"
+        );
+        assert_eq!(app.fullscreen_idx, None);
+        assert_pivots_consumed(&app);
+        app.reconcile_page_edit_spread_pivots();
+        assert_eq!(app.fullscreen_idx, None);
+    }
+}
+
 #[test]
 fn page_edit_920_inner_saves_outgoing_conceal_before_new_page_without_rescale() {
     let mut env = fixture();
@@ -149,7 +373,7 @@ fn page_edit_920_item_change_consumes_already_closed_local_panel_pivot_before_ne
 }
 
 #[test]
-fn page_edit_920_inner_same_image_preserves_all_six_tools_and_unapplied_erase() {
+fn page_edit_920_inner_same_image_keeps_five_tools_but_exits_erase_and_restores_spread() {
     for tool in 0..6 {
         let mut env = fixture();
         match tool {
@@ -175,12 +399,18 @@ fn page_edit_920_inner_same_image_preserves_all_six_tools_and_unapplied_erase() 
             }
         }
         assert_eq!(open(&mut env, 1), ActionAdmission::Accepted, "tool={tool}");
+        if tool == 1 {
+            assert!(!env.erase_mode);
+            assert!(env.erase_mask.is_none());
+            assert!(env.erase_spread_ctx.is_none());
+            assert_eq!(env.fullscreen_idx, Some(0));
+            assert_eq!(env.spread_mode, SpreadMode::Ltr);
+            env.reconcile_page_edit_spread_pivots();
+            assert_eq!(env.fullscreen_idx, Some(0));
+            continue;
+        }
         assert!(env.is_overlay_edit_mode_active(), "tool={tool}");
         assert_eq!(env.fullscreen_idx, Some(1));
-        if tool == 1 {
-            assert_eq!(env.erase_mask.as_deref(), Some([true; 15].as_slice()));
-            assert!(env.erase_spread_ctx.is_some());
-        }
         if tool == 2 {
             assert_eq!(env.text_selected, Some(920));
         }

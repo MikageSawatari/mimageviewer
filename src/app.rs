@@ -724,7 +724,8 @@ pub(crate) mod page_edit_admission;
 #[cfg(test)]
 #[path = "app/page_edit_grid_tests.rs"]
 mod page_edit_grid_tests;
-mod page_edit_item_change;
+mod page_edit_item_adoption;
+pub(crate) mod page_edit_item_change;
 #[cfg(test)]
 #[path = "app/page_edit_non_grid_tests.rs"]
 mod page_edit_non_grid_tests;
@@ -47385,7 +47386,7 @@ impl App {
         image_metas: Vec<Option<(i64, i64)>>,
         refresh_container_metadata: bool,
     ) {
-        self.end_page_edit_tools_for_viewer_item_change("install_new_items");
+        self.end_page_edit_tools_before_items_adoption("install_new_items", &items);
         self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
         self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
         debug_assert_eq!(items.len(), image_metas.len());
@@ -50528,7 +50529,7 @@ impl App {
         if sorted_desc_idxs.is_empty() {
             return;
         }
-        self.end_page_edit_tools_for_viewer_item_change("remove_items_batch");
+        self.end_page_edit_tools_before_item_removal(sorted_desc_idxs);
         self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
         self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
         self.remove_smart_folder_rating_masks(sorted_desc_idxs);
@@ -75444,7 +75445,6 @@ impl App {
         if self.fullscreen_idx != Some(idx) {
             self.set_fullscreen_page_slice_for_display_unit(crate::page_split::PageSlice::Full);
         }
-        let entering_fullscreen = self.fullscreen_idx.is_none();
         self.fullscreen_idx = Some(idx);
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
@@ -75528,9 +75528,7 @@ impl App {
         self.fs_last_main_focus_restore_at = None;
         self.fs_primary_suppression = Default::default();
         let reset_erase_perf_t0 = start_fs_open_perf_span(&perf);
-        if entering_fullscreen && self.page_edit_tools_owned_by_projected_context() {
-            self.reset_erase_mode();
-        }
+        self.reset_erase_mode();
         finish_fs_open_perf_span(
             &mut perf,
             FsOpenPerfSpan::ResetFileRuntime,
@@ -86101,9 +86099,18 @@ impl App {
     /// Existing foreground-editor exit boundary, shared by close and Rating re-adoption.
     /// The caller finishes local gestures and chooses the metadata Undo policy first.
     fn finish_fullscreen_edit_modes(&mut self) {
+        self.finish_fullscreen_edit_modes_with_preview(
+            page_edit_item_change::LocalAdjustmentExitPreview::CacheCurrent,
+        );
+    }
+
+    fn finish_fullscreen_edit_modes_with_preview(
+        &mut self,
+        preview: page_edit_item_change::LocalAdjustmentExitPreview,
+    ) {
         self.fold_local_adjust_edit_state();
         if self.page_edit_tools_owned_by_projected_context() {
-            self.end_page_edit_tools_for_viewer_item_change("fullscreen_exit");
+            self.end_page_edit_tools_for_fullscreen_exit(preview);
         }
         self.persist_pending_view_trim_state();
         self.view_trim_mode = false;
@@ -86170,7 +86177,12 @@ impl App {
         let edit_preview_close_update = self
             .fullscreen_idx
             .and_then(|idx| self.snapshot_edit_preview_close_update(idx));
-        self.finish_fullscreen_edit_modes();
+        if boundary == FsMetadataBoundary::Manual {
+            self.restore_grid_cursor_to_fullscreen_item();
+        }
+        self.finish_fullscreen_edit_modes_with_preview(
+            page_edit_item_change::LocalAdjustmentExitPreview::FullscreenCloseOwnsSnapshot,
+        );
         self.cancel_media_navigation_pending_for_current_context("close_fullscreen");
         // 表示モード / フィットのポップアップを開いたまま抜けると、次回フルスクリーンで
         // メニューが残り、カーソル自動非表示やページ送りの抑制が効いたままになるため解除する。
@@ -86237,9 +86249,6 @@ impl App {
             for idx in fs_idxs {
                 self.cleanup_normalize_state_for_fs_idx(idx);
             }
-        }
-        if boundary == FsMetadataBoundary::Manual {
-            self.restore_grid_cursor_to_fullscreen_item();
         }
         #[cfg(windows)]
         self.prepare_viewer_presentation_close();
@@ -88569,6 +88578,8 @@ impl App {
                 crop,
             } => {
                 observation.emit(self.input_seq);
+                #[cfg(test)]
+                page_edit_item_change::record_edit_preview_save_for_test();
                 service.save(
                     observation.item_key,
                     source_mtime,

@@ -16007,14 +16007,9 @@ impl App {
         );
 
         if close_clicked {
-            self.cancel_original_material_entry_intents(None);
-            self.cache_current_edit_preview_if_ready();
-            self.local_adjust_mode = false;
-            self.fold_local_adjust_edit_state();
-            self.local_adjust_repair_point_pick_active = None;
-            self.local_adjust_add_layer_dialog_open = false;
-            self.local_adjust_change_mask_dialog_open = false;
-            self.local_adjust_effect_picker_dialog_open = false;
+            self.exit_local_adjust_mode(
+                crate::app::page_edit_item_change::LocalAdjustmentExitPreview::CacheCurrent,
+            );
         }
         self.local_adjust_effect_query = effect_query;
         self.local_adjust_mask_edit_target = mask_edit_target;

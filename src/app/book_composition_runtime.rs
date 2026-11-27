@@ -1224,7 +1224,7 @@ impl App {
             CompositionProjectionOutcome::Composed(_)
         ));
         if replaces_rows {
-            self.end_page_edit_tools_for_viewer_item_change("book_projection");
+            self.end_page_edit_tools_before_items_adoption("book_projection", &reply.rows.items);
         }
         if replaces_rows
             && (reply.rotation_invalidation_revision != self.rotation_cache.invalidation_revision()

@@ -2580,7 +2580,7 @@ impl App {
     ) {
         use std::sync::atomic::Ordering;
         debug_assert_eq!(items.len(), image_metas.len());
-        self.end_page_edit_tools_for_viewer_item_change("search_items");
+        self.end_page_edit_tools_before_items_adoption("search_items", &items);
         // Source rows can still be edited while the first search result is pending.
         self.save_departing_session_grid_positions();
         // 検索ビューに切り替えるのでネスト ZIP ツリーナビ状態を破棄する。
@@ -3625,7 +3625,10 @@ impl App {
                     if latest && same_surface {
                         // Exiting the outgoing draft can publish a page-edit write. Do that
                         // before checking this snapshot or capturing the viewer's old indices.
-                        self.end_page_edit_tools_for_viewer_item_change("search_projection");
+                        self.end_page_edit_tools_before_items_adoption(
+                            "search_projection",
+                            &prepared.items,
+                        );
                         if matches!(wish.source, SearchProjection::Everything { .. }) {
                             self.finish_everything_edit_boundary();
                         }
