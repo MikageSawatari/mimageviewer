@@ -166,6 +166,219 @@ fn request_for_transform(
         pipeline: cache.pipeline(&gpu.device, wgpu::TextureFormat::Rgba8Unorm),
     }
 }
+
+fn set_tilt(
+    request: &mut PlaneFrameRequest,
+    transform: &DisplayedImageTransform,
+    canvas: Rect,
+    lens: PlaneLensKind,
+    strength: f32,
+    tilt: PlaneTilt,
+) {
+    let old = &request.snapshot;
+    let (params, k_fill) = PlaneRenderParams::screen_with_fill_mode(
+        transform,
+        canvas,
+        Vec2::splat(0.5),
+        strength,
+        lens,
+        tilt,
+        old.material.description,
+        &crate::ui_fullscreen::FsBgStyle::Solid(egui::Color32::WHITE),
+        egui::Color32::from_rgb(13, 23, 37),
+        PlaneFillMode::Locked(old.k_fill),
+    );
+    request.snapshot = Arc::new(PlaneFrameSnapshot {
+        context: old.context,
+        anchor: old.anchor,
+        material: old.material.clone(),
+        params,
+        k_fill,
+    });
+}
+
+#[test]
+fn plane_tilt_gpu_all_pixels_match_two_stage_cpu_including_backfaces_and_edge_on() {
+    let gpu = OffscreenGpu::new();
+    let mut cache = PlaneRendererCache::default();
+    let material = material(&gpu, &mut cache, 948, false);
+    let mut poses = vec![
+        PlaneTilt::default(),
+        PlaneTilt {
+            q: [0., 0., 1., 0.],
+        },
+        PlaneTilt {
+            q: [0., 1., 0., 0.],
+        },
+        PlaneTilt::from_rotation_vector([0.3, 0.5, -0.2]),
+        PlaneTilt::from_rotation_vector([0.005_f32.to_radians(), 0., 0.]),
+    ];
+    for degrees in [45_f32, 89., 90., 91., 100., 180., 270.] {
+        poses.push(PlaneTilt::from_rotation_vector([
+            0.,
+            degrees.to_radians(),
+            0.,
+        ]));
+    }
+    poses.push(PlaneTilt::from_rotation_vector([
+        270_f32.to_radians(),
+        0.,
+        0.,
+    ]));
+    for lens in PlaneLensKind::ALL {
+        for density in [1., 1.5] {
+            let canvas = Rect::from_min_size(egui::pos2(23., 41.), Vec2::new(48., 36.));
+            let transform = transform(canvas, density);
+            for strength in [0., 0.75] {
+                for tilt in &poses {
+                    let mut request = request_for_transform(
+                        &gpu,
+                        &mut cache,
+                        material.clone(),
+                        &transform,
+                        canvas,
+                        Vec2::splat(0.5),
+                        lens,
+                        strength,
+                    );
+                    set_tilt(&mut request, &transform, canvas, lens, strength, *tilt);
+                    let rgba = request.render().unwrap();
+                    let [width, height] = request.size;
+                    for y in 0..height {
+                        for x in 0..width {
+                            let p = canvas.min * density
+                                + Vec2::new(
+                                    (x as f32 + 0.5) * canvas.width() * density / width as f32,
+                                    (y as f32 + 0.5) * canvas.height() * density / height as f32,
+                                );
+                            let (q, valid) = camera_sample(
+                                p,
+                                canvas * density,
+                                Vec2::splat(0.5),
+                                request.snapshot.params.values[2][0],
+                                lens,
+                                *tilt,
+                            );
+                            assert!(
+                                q.is_finite(),
+                                "masked rays must remain finite before derivatives"
+                            );
+                            let uv = valid
+                                .then(|| {
+                                    texture_point(q / density, &transform, full_uv(), full_uv())
+                                })
+                                .flatten();
+                            let pixel = &rgba[((y * width + x) * 4) as usize
+                                ..((y * width + x) * 4 + 4) as usize];
+                            // CPU/WGSL f32 may choose opposite sides within 1/64 physical pixel of a material edge.
+                            let bounds = transform.paint_rect;
+                            let local = q / density;
+                            let edge_distance = [
+                                (local.x - bounds.left()).abs(),
+                                (local.x - bounds.right()).abs(),
+                                (local.y - bounds.top()).abs(),
+                                (local.y - bounds.bottom()).abs(),
+                            ]
+                            .into_iter()
+                            .fold(f32::INFINITY, f32::min)
+                                * density;
+                            if valid && edge_distance <= 1. / 64. {
+                                continue;
+                            }
+                            if uv.is_some() {
+                                assert!(
+                                    pixel[2].abs_diff(50) <= 1,
+                                    "{lens:?}, {tilt:?}, {density}, {strength}, ({x},{y}), {pixel:?}"
+                                );
+                            } else {
+                                assert_eq!(
+                                    pixel,
+                                    &[13, 23, 37, 255],
+                                    "{lens:?}, {tilt:?}, ({x},{y})"
+                                );
+                            }
+                            assert_eq!(pixel[3], 255);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn plane_tilt_snapshot_matrix_preserves_screen_copy_and_export_pixels() {
+    let mut gpu = OffscreenGpu::new();
+    let mut cache = PlaneRendererCache::default();
+    let material = material(&gpu, &mut cache, 949, false);
+    let canvas = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(128., 96.));
+    let transform = transform(canvas, 1.);
+    for tilt in [
+        PlaneTilt::from_rotation_vector([0.3, 0.5, -0.2]),
+        PlaneTilt {
+            q: [0., 0., 1., 0.],
+        },
+        PlaneTilt {
+            q: [0., 1., 0., 0.],
+        },
+        PlaneTilt::from_rotation_vector([0., 90_f32.to_radians(), 0.]),
+    ] {
+        for lens in PlaneLensKind::ALL {
+            for strength in [0., 0.75] {
+                let mut request = request_for_transform(
+                    &gpu,
+                    &mut cache,
+                    material.clone(),
+                    &transform,
+                    canvas,
+                    Vec2::splat(0.5),
+                    lens,
+                    strength,
+                );
+                set_tilt(&mut request, &transform, canvas, lens, strength, tilt);
+                let job = crate::egui037_stage4_gpu_tests::callback(
+                    canvas,
+                    PlaneShaderCallback::new(
+                        &gpu.device,
+                        request.pipeline.clone(),
+                        request.snapshot.clone(),
+                    ),
+                );
+                let screen: Vec<u8> = gpu
+                    .render(&[job], [128, 96], [13, 23, 37, 255])
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                assert_eq!(screen, request.render().unwrap());
+                for scale in [
+                    crate::export_dialog::ExportScale::Full,
+                    crate::export_dialog::ExportScale::Half,
+                ] {
+                    let output = request.with_choice(PlaneOutputChoice::Export(scale));
+                    assert!(Arc::ptr_eq(&request.snapshot, &output.snapshot));
+                    let params = output.snapshot.params.for_output(output.size);
+                    for column in 13..16 {
+                        assert_eq!(
+                            params.values[column],
+                            request.snapshot.params.values[column]
+                        );
+                    }
+                    assert_eq!(
+                        params.values[2][0..3],
+                        request.snapshot.params.values[2][0..3]
+                    );
+                    let pixels = output.render().unwrap();
+                    if output.size == request.size {
+                        assert_eq!(pixels, screen);
+                    }
+                    if tilt.matrix()[2][2].abs() <= 1.0e-6 {
+                        assert!(pixels.chunks_exact(4).all(|p| p == [13, 23, 37, 255]));
+                    }
+                }
+            }
+        }
+    }
+}
 #[test]
 fn plane_export_gpu_matches_cpu_camera_at_multiple_origins_dpi_and_output_sizes() {
     let gpu = OffscreenGpu::new();
@@ -843,6 +1056,8 @@ fn plane_gpu_extreme_aspects_use_drawn_quad_for_fill_and_identity() {
                     notches: 1.,
                     allowed: Ok(()),
                     step: crate::settings::FullscreenWheelZoomStep::Percent10,
+                    tilt_is_identity: true,
+                    tilt_drag_owned: false,
                     cover: Some(cover),
                 });
                 assert!(out.pose.is_some());

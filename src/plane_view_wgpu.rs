@@ -22,6 +22,7 @@ struct Params {
     canvas:vec4<f32>, lens:vec4<f32>, camera:vec4<f32>, paint:vec4<f32>, frame:vec4<f32>,
     crop:vec4<f32>, coverage:vec4<f32>, material:vec4<f32>, mapping:vec4<f32>,
     underlay:vec4<f32>, checker:vec4<f32>, background:vec4<f32>, view:vec4<f32>,
+    board_x:vec4<f32>, board_y:vec4<f32>, board_z:vec4<f32>,
 };
 @group(0) @binding(0) var color:texture_2d<f32>;
 @group(0) @binding(1) var samp:sampler;
@@ -48,15 +49,26 @@ fn rotate_uv(p:vec2<f32>)->vec2<f32> {
     theta=select(0.,theta,valid);
     let sigma=select(sin(theta)/max(r,1.e-6),k,r<1.e-6);
     let d=vec3(sigma*u,cos(theta));
-    let sy=sin(params.camera.y); let cy=cos(params.camera.y);
-    let sp=sin(params.camera.z); let cp=cos(params.camera.z);
-    let nx=vec3(cy,0.,-sy); let ny=vec3(sy*sp,cp,cy*sp); let n=vec3(sy*cp,-sp,cy*cp);
-    let den=dot(n,d); valid=valid && den>1.e-6;
-    let t=n.z/max(den,1.e-6); valid=valid && t>0.;
+    // Stage one retains the untilted revision-1/2 arithmetic and its k~=0 identity path.
+    let den=d.z; valid=valid && den>1.e-6;
+    let t=1./max(den,1.e-6);
     let v=max(t,0.)*d-vec3(0.,0.,1.);
-    let local_board=vec2(dot(nx,v),dot(ny,v));
-    var q=c+(radius/max(k,1.e-7))*local_board;
-    if k<=1.e-7 {q=p;}
+    var offset=(radius/max(k,1.e-7))*v.xy;
+    var q=c+offset;
+    if k<=1.e-7 {offset=p-c; q=p;}
+    // Stage two is a fixed 50-degree diagonal pinhole camera. Exact I skips all extra
+    // arithmetic; the 0.01-degree release tolerance must not erase tiny live rotations.
+    if params.camera.z<0.5 {
+        let nx=params.board_x.xyz; let ny=params.board_y.xyz; let n=params.board_z.xyz;
+        let focal=params.camera.y; let ray=vec3(offset,focal);
+        let board_den=dot(n,ray); let epsilon=1.e-6*length(ray);
+        let safe_den=select(1.,-1.,board_den<0.)*max(abs(board_den),epsilon);
+        let raw_t=n.z*focal/safe_den;
+        valid=valid && abs(n.z)>1.e-6 && abs(board_den)>epsilon && raw_t>0.;
+        let board_t=select(1.,raw_t,valid);
+        let board_v=board_t*ray-vec3(0.,0.,focal);
+        q=c+vec2(dot(nx,board_v),dot(ny,board_v));
+    }
     let delta=q-params.frame.xy;
     let local=vec2(params.frame.z*delta.x+params.frame.w*delta.y,-params.frame.w*delta.x+params.frame.z*delta.y);
     let in_uv=(params.frame.xy+local-params.paint.xy)/params.paint.zw;
@@ -130,7 +142,7 @@ impl PlaneMaterial {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PlaneRenderParams {
-    pub values: [[f32; 4]; 13],
+    pub values: [[f32; 4]; 16],
 }
 impl PlaneRenderParams {
     #[cfg(test)]
@@ -219,12 +231,18 @@ impl PlaneRenderParams {
             );
         }
         let bg = background.to_array();
+        let [nx, ny, n] = tilt.matrix();
         (
             Self {
                 values: [
                     [canvas.min.x, canvas.min.y, canvas.width(), canvas.height()],
                     [center.x, center.y, strength, lens.shader_id()],
-                    [strength * k_fill, tilt.yaw, tilt.pitch, 0.],
+                    [
+                        strength * k_fill,
+                        crate::plane_view::plane_perspective_focal_length(canvas),
+                        if tilt.is_exact_identity() { 1. } else { 0. },
+                        0.,
+                    ],
                     [paint.min.x, paint.min.y, paint.width(), paint.height()],
                     [frame.x, frame.y, cos, sin],
                     [crop.min.x, crop.min.y, crop.max.x, crop.max.y],
@@ -250,6 +268,9 @@ impl PlaneRenderParams {
                         1.,
                     ],
                     [transform.rotation.degrees() as f32 / 90., 0., 0., 0.],
+                    [nx[0], nx[1], nx[2], 0.],
+                    [ny[0], ny[1], ny[2], 0.],
+                    [n[0], n[1], n[2], 0.],
                 ],
             },
             k_fill,
@@ -598,7 +619,7 @@ mod tests {
     #[test]
     fn plane_output_pixel_centers_and_checker_mapping_are_in_canvas_coordinates() {
         let mut params = PlaneRenderParams {
-            values: [[0.; 4]; 13],
+            values: [[0.; 4]; 16],
         };
         params.values[0] = [21., 37., 800., 600.];
         for size in [[800, 600], [1600, 1200], [400, 300]] {

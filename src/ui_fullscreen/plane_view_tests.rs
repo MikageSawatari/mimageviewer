@@ -7,6 +7,7 @@ mod gpu_tests {
     mod additional_coverage;
     mod revision2_input_tests;
     mod revision_input_tests;
+    mod tilt_input_tests;
     mod transition_and_click_tests;
     use super::*;
     use crate::app::depth_main_window_tests::RootDepthViewer;
@@ -322,7 +323,7 @@ mod gpu_tests {
     }
 
     #[test]
-    fn plane_real_handler_receives_pre_shift_vertical_and_ignores_physical_tilt() {
+    fn plane_real_handler_receives_pre_shift_vertical_and_ignores_horizontal_delta() {
         let _keys = crate::key_input::lock_test_input();
         let mut app = crate::app::setup_app_for_test();
         let mut viewer = viewer(&mut app);

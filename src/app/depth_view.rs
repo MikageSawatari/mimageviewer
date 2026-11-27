@@ -920,8 +920,22 @@ impl App {
 
     /// All live transitions retire the old owner before publishing its replacement.
     pub(crate) fn set_fs_exclusive_view(&mut self, target: FsExclusiveView, _cause: &'static str) {
+        self.fs_canvas_drag.retire_plane_drag();
+        self.publish_fs_exclusive_view(target);
+    }
+
+    /// Tilt already owns the press before its first nonzero move enters PlaneView.
+    pub(crate) fn enter_plane_view_from_tilt_drag(
+        &mut self,
+        state: crate::plane_view::PlaneViewState,
+    ) {
+        debug_assert!(self.fs_canvas_drag.is_tilt());
+        debug_assert_eq!(self.fs_canvas_drag.plane_anchor(), Some(state.pose.anchor));
+        self.publish_fs_exclusive_view(FsExclusiveView::PlaneView(state));
+    }
+
+    fn publish_fs_exclusive_view(&mut self, target: FsExclusiveView) {
         let leaving_panorama = matches!(self.fs_exclusive_view, FsExclusiveView::Panorama(_));
-        self.fs_canvas_drag.retire_lens();
         if leaving_panorama {
             self.panorama_projection_popup_open = false;
             self.clear_pano_upload();

@@ -443,6 +443,7 @@
 # FsDepthParallax = D ; 3D 写真の表示を切り替える
 # FsFisheyeIn = none ; 魚眼で寄る
 # FsFisheyeOut = none ; 魚眼で離れる
+# FsPlaneTiltReset = none ; 写真の板の傾きを戻す
 # FsNavigatorToggle = Alt+N ; ナビゲータの表示を切り替える
 # FsPageTurnAnimationToggle = none ; ページめくりアニメーションを切り替える
 # FsNavigatorHold = Alt ; 押している間だけナビゲータを表示する

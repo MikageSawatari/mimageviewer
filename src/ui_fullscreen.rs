@@ -20402,6 +20402,19 @@ pub(crate) struct PlaneFillLockCandidate {
     pub(crate) k_fill: f32,
 }
 
+/// Frozen termination facts; tilt itself remains outside the predicted pose.
+#[derive(Clone, Copy)]
+pub(crate) struct PlaneWheelEndInput {
+    pub(crate) tilt_is_identity: bool,
+    pub(crate) tilt_drag_owned: bool,
+}
+impl PlaneWheelEndInput {
+    fn apply(self, input: &mut crate::plane_view::PlaneViewWheelInput) {
+        input.tilt_is_identity = self.tilt_is_identity;
+        input.tilt_drag_owned = self.tilt_drag_owned;
+    }
+}
+
 struct FsWheelFrameProposal {
     context: egui::Context,
     viewport: egui::ViewportId,
@@ -20418,6 +20431,7 @@ struct FsWheelFrameProposal {
     default_image_rect: egui::Rect,
     plane_cover: Option<crate::plane_view::PlaneCoverInput>,
     plane_fill_lock: Option<PlaneFillLockCandidate>,
+    plane_end: PlaneWheelEndInput,
     primary_suppression: FullscreenPrimarySuppressionDecision,
     fs_response: egui::Response,
     is_spread_double: bool,
@@ -20451,16 +20465,16 @@ struct FsWheelFrameSemanticInput {
     total_drag_delta: Option<egui::Vec2>,
     drag_delta: egui::Vec2,
     double_clicked: bool,
-    plane_lens_owned: bool,
+    plane_drag_owned: bool,
     music_context_allowed: bool,
 }
 
 impl FsWheelFrameSemanticInput {
     fn capture(app: &App, ctx: &egui::Context, response: &egui::Response) -> Self {
-        let lens_frame_key =
-            egui::Id::unique(("plane_lens_used", app.edit_request_owner_context()));
+        let plane_frame_key =
+            egui::Id::unique(("plane_drag_used", app.edit_request_owner_context()));
         let frame_nr = ctx.cumulative_frame_nr();
-        let lens_used = ctx.data(|data| data.get_temp::<u64>(lens_frame_key)) == Some(frame_nr);
+        let plane_used = ctx.data(|data| data.get_temp::<u64>(plane_frame_key)) == Some(frame_nr);
         Self {
             pointer_pos: ctx.input(|input| input.pointer.hover_pos()),
             primary_press_origin: ctx.input(|input| {
@@ -20475,7 +20489,7 @@ impl FsWheelFrameSemanticInput {
             total_drag_delta: fullscreen_drag_pan_proposal(response, egui::Vec2::ZERO),
             drag_delta: response.drag_delta(),
             double_clicked: app.fs_front_pointer.backing_double_clicked(response),
-            plane_lens_owned: app.fs_canvas_drag.is_lens() || lens_used,
+            plane_drag_owned: app.fs_canvas_drag.is_plane_drag() || plane_used,
             music_context_allowed: app.music_timeline_ctrl_wheel_context_allowed(ctx),
         }
     }
@@ -37411,6 +37425,12 @@ impl App {
         {
             self.toggle_depth_parallax(ctx, fs_idx);
         }
+        if !is_video_fs
+            && !fs_music_view_active
+            && self.keymap.consume_action(ctx, KeyAction::FsPlaneTiltReset)
+        {
+            self.reset_plane_tilt(ctx);
+        }
         for (action, notches) in [(KeyAction::FsFisheyeIn, 1.), (KeyAction::FsFisheyeOut, -1.)] {
             if !is_video_fs && !fs_music_view_active && self.keymap.consume_action(ctx, action) {
                 let full_rect = ctx.content_rect();
@@ -41684,7 +41704,7 @@ impl App {
                 });
 
         if !ctx.input(|i| i.viewport().focused.unwrap_or(true)) || modal_input_blocked {
-            self.fs_canvas_drag.retire_lens();
+            self.cancel_plane_drag(ctx);
         }
         // Depth controls admit drags by their press, not by the hover position
         // after later moves in the same pass. Each button owns its admission
@@ -41884,7 +41904,7 @@ impl App {
                 .contains_pointer(pos)
                     || (top_bar_visible && fullscreen_top_bar_rect(full_rect).contains(pos))
             });
-        let primary_lens_owned = self.handle_plane_lens_drag(
+        let primary_plane_owned = self.handle_plane_drag(
             ctx,
             default_image_rect,
             !lens_press_in_chrome
@@ -42001,7 +42021,7 @@ impl App {
                     })
                     && !overflow_pointer_input.primary_owned
                     && !primary_suppression.suppresses_current_frame()
-                    && !primary_lens_owned
+                    && !primary_plane_owned
                     && self.fs_canvas_drag.pan_start().is_none()
                     && self.fs_canvas_drag.rotation_start().is_none();
                 let used = self.handle_drag_zoom(
@@ -42599,6 +42619,7 @@ impl App {
         // a page which an intermediate navigation has already left.
         let plane_cover = self.plane_cover_input_for_canvas(ctx, default_image_rect);
         let plane_fill_lock = self.plane_fill_lock_candidate();
+        let plane_end = self.plane_wheel_end_input();
         let (click_zoom, click_pan, wheel_navigation_produced, click_plane_active) = self
             .predict_fs_wheel_frame_with_cover(
                 ctx,
@@ -42660,6 +42681,7 @@ impl App {
             default_image_rect,
             plane_cover,
             plane_fill_lock,
+            plane_end,
             primary_suppression,
             fs_response,
             is_spread_double,
@@ -42837,6 +42859,7 @@ impl App {
             default_image_rect,
             plane_cover,
             mut plane_fill_lock,
+            plane_end,
             primary_suppression,
             fs_response,
             is_spread_double,
@@ -42876,7 +42899,7 @@ impl App {
                 (actions, input)
             }
         };
-        if input.plane_lens_owned
+        if (input.plane_drag_owned && !matches!(canvas_click, FsCanvasClickAction::ResetTransform))
             || click_anchor != self.fullscreen_idx.map(|idx| self.plane_view_anchor(idx))
         {
             canvas_click = FsCanvasClickAction::None;
@@ -42904,7 +42927,7 @@ impl App {
                     && self.plane_wheel_action_matches_page(&wheel_action)
                     && self.plane_wheel_route(wheel.modifiers)
                 {
-                    if let Some(input) = self.plane_view_wheel_input(
+                    if let Some(mut input) = self.plane_view_wheel_input(
                         default_image_rect,
                         input.pointer_pos,
                         wheel_action.segment.vertical_before_axis_mapping
@@ -42914,6 +42937,7 @@ impl App {
                         self.plane_view_pose(),
                         plane_cover,
                     ) {
+                        plane_end.apply(&mut input);
                         let outcome = crate::plane_view::plane_view_wheel_transition(input);
                         self.apply_plane_view_outcome(
                             ctx,
@@ -43196,7 +43220,7 @@ impl App {
                 self.maybe_rerender_pdf(1.0);
             }
             // 右クリックは analysis_panel 側で処理
-        } else if input.plane_lens_owned {
+        } else if input.plane_drag_owned {
             // Admission binds the entire primary stream, including its release pass.
         } else if self.handle_panorama_drag_if_active(
             ctx,
@@ -43327,7 +43351,7 @@ impl App {
                 self.fs_canvas_drag.set_rotation_start(None);
             }
         }
-        if input.plane_lens_owned
+        if (input.plane_drag_owned && !matches!(canvas_click, FsCanvasClickAction::ResetTransform))
             || click_anchor != self.fullscreen_idx.map(|idx| self.plane_view_anchor(idx))
         {
             canvas_click = FsCanvasClickAction::None;
@@ -43591,6 +43615,7 @@ impl App {
         actions: &[FsWheelAction],
         cover: Option<crate::plane_view::PlaneCoverInput>,
     ) -> (f32, egui::Vec2, bool, bool) {
+        let plane_end = self.plane_wheel_end_input();
         let mut plane = self.plane_view_pose().filter(|pose| {
             self.fullscreen_idx
                 .is_some_and(|idx| pose.anchor == self.plane_view_anchor(idx))
@@ -43618,7 +43643,7 @@ impl App {
                         && self.plane_wheel_action_matches_page(action)
                         && self.plane_wheel_route(action.input.modifiers)
                     {
-                        if let Some(input) = self.plane_view_wheel_input(
+                        if let Some(mut input) = self.plane_view_wheel_input(
                             image_rect,
                             mouse,
                             action.segment.vertical_before_axis_mapping
@@ -43628,6 +43653,7 @@ impl App {
                             plane,
                             cover,
                         ) {
+                            plane_end.apply(&mut input);
                             let outcome = crate::plane_view::plane_view_wheel_transition(input);
                             if outcome.changes_view(plane, zoom, pan) {
                                 plane = outcome.pose;

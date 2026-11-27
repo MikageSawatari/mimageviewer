@@ -57,29 +57,114 @@ impl App {
         }
     }
 
-    pub(crate) fn handle_plane_lens_drag(
+    fn mark_plane_drag_used(&self, ctx: &egui::Context) {
+        let key = egui::Id::unique(("plane_drag_used", self.edit_request_owner_context()));
+        let frame = ctx.cumulative_frame_nr();
+        ctx.data_mut(|data| data.insert_temp(key, frame));
+    }
+
+    fn finish_plane_drag(&mut self, released: bool) {
+        let tilt_owned = self.fs_canvas_drag.is_tilt();
+        self.fs_canvas_drag.retire_plane_drag();
+        if tilt_owned && let FsExclusiveView::PlaneView(state) = &mut self.fs_exclusive_view {
+            if released {
+                state.tilt.snap_identity();
+            }
+            if state.pose.strength == 0. && state.tilt.is_identity() {
+                self.set_fs_exclusive_view(FsExclusiveView::None, "plane_tilt_finished");
+            }
+        }
+    }
+
+    pub(crate) fn cancel_plane_drag(&mut self, ctx: &egui::Context) {
+        if self.fs_canvas_drag.is_plane_drag() {
+            self.mark_plane_drag_used(ctx);
+            self.finish_plane_drag(false);
+        }
+    }
+
+    pub(crate) fn reset_plane_tilt(&mut self, ctx: &egui::Context) {
+        if !self.fs_exclusive_view.is_plane_view() {
+            return;
+        }
+        if self.fs_canvas_drag.is_plane_drag() {
+            self.mark_plane_drag_used(ctx);
+        }
+        self.fs_canvas_drag.retire_plane_drag();
+        if let FsExclusiveView::PlaneView(state) = &mut self.fs_exclusive_view {
+            state.tilt = PlaneTilt::default();
+            if state.pose.strength == 0. {
+                self.set_fs_exclusive_view(FsExclusiveView::None, "plane_tilt_reset");
+            }
+        }
+    }
+
+    pub(crate) fn handle_plane_drag(
         &mut self,
         ctx: &egui::Context,
         canvas: egui::Rect,
         can_start: bool,
     ) -> bool {
-        let Some(pose) = self.plane_view_pose() else {
-            self.fs_canvas_drag.retire_lens();
+        let Some(idx) = self.fullscreen_idx else {
+            self.cancel_plane_drag(ctx);
             return false;
         };
-        if pose.anchor != self.plane_view_anchor(pose.anchor.fs_idx) {
-            self.fs_canvas_drag.retire_lens();
-            return false;
+        let anchor = self.plane_view_anchor(idx);
+        let mut used = self.fs_canvas_drag.is_plane_drag();
+        if self
+            .fs_canvas_drag
+            .plane_anchor()
+            .is_some_and(|owner| owner != anchor)
+            || (self.fs_canvas_drag.is_lens() && self.plane_view_pose().is_none())
+            || (self.fs_canvas_drag.is_tilt() && self.plane_view_entry_allowed(idx).is_err())
+        {
+            self.cancel_plane_drag(ctx);
         }
-        let press_origin =
-            ctx.input(|i| crate::ui_helpers::button_press_origin(i, egui::PointerButton::Primary));
-        let (pressed, down, pos, _mods) = ctx.input(|i| {
-            (
-                i.pointer.primary_pressed(),
-                i.pointer.primary_down(),
-                i.pointer.interact_pos(),
-                i.modifiers,
-            )
+        let flows = ctx.input(|input| {
+            let mut edges = input
+                .pointer
+                .button_events()
+                .filter(|edge| match edge {
+                    egui::PointerButtonEvent::Pressed { button, .. }
+                    | egui::PointerButtonEvent::Released { button, .. } => {
+                        *button == egui::PointerButton::Primary
+                    }
+                })
+                .peekable();
+            let mut flows = Vec::new();
+            while let Some(edge) = edges.next() {
+                match edge {
+                    egui::PointerButtonEvent::Pressed { pos, .. } => {
+                        let release = match edges.peek() {
+                            Some(egui::PointerButtonEvent::Released { pos, .. }) => Some(*pos),
+                            _ => None,
+                        };
+                        if let Some(end) = release {
+                            edges.next();
+                            flows.push((true, true, end.or(Some(pos)), Some(pos)));
+                        } else {
+                            flows.push((
+                                true,
+                                false,
+                                input.pointer.interact_pos().or(Some(pos)),
+                                Some(pos),
+                            ));
+                        }
+                    }
+                    egui::PointerButtonEvent::Released { pos, .. } => {
+                        flows.push((false, true, pos, None))
+                    }
+                }
+            }
+            if flows.is_empty() {
+                flows.push((
+                    false,
+                    !input.pointer.primary_down(),
+                    input.pointer.interact_pos(),
+                    None,
+                ));
+            }
+            flows
         });
         #[cfg(windows)]
         let (shift, ctrl) =
@@ -90,36 +175,81 @@ impl App {
                 )
             });
         #[cfg(not(windows))]
-        let (shift, ctrl) = (_mods.shift, _mods.ctrl);
-        if pressed
-            && can_start
-            && shift
-            && !ctrl
-            && let Some(start) = press_origin.filter(|p| canvas.contains(*p))
-        {
-            self.fs_canvas_drag = FsCanvasDrag::PlaneLens {
-                anchor: pose.anchor,
-                start,
-                center: pose.lens_center,
-            };
-        }
-        let owned = self.fs_canvas_drag.is_lens();
-        if owned {
-            if let Some(center) =
-                pos.and_then(|p| self.fs_canvas_drag.lens_center(pose.anchor, p, canvas))
-                && let FsExclusiveView::PlaneView(state) = &mut self.fs_exclusive_view
+        let (shift, ctrl) = ctx.input(|input| (input.modifiers.shift, input.modifiers.ctrl));
+        for (pressed, released, pos, press_origin) in flows {
+            if pressed
+                && can_start
+                && shift
+                && let Some(start) = press_origin.filter(|p| canvas.contains(*p))
             {
-                state.pose.lens_center = center;
+                if ctrl {
+                    if self.plane_view_entry_allowed(idx).is_ok() {
+                        self.fs_canvas_drag = FsCanvasDrag::PlaneTilt {
+                            anchor,
+                            start,
+                            previous: start,
+                        };
+                    }
+                } else if let Some(pose) = self.plane_view_pose() {
+                    self.fs_canvas_drag = FsCanvasDrag::PlaneLens {
+                        anchor,
+                        start,
+                        center: pose.lens_center,
+                    };
+                }
             }
-            let frame_key =
-                egui::Id::unique(("plane_lens_used", self.edit_request_owner_context()));
-            let frame_nr = ctx.cumulative_frame_nr();
-            ctx.data_mut(|data| data.insert_temp(frame_key, frame_nr));
-            if !down {
-                self.fs_canvas_drag.retire_lens();
+            if !self.fs_canvas_drag.is_plane_drag() {
+                continue;
+            }
+            used = true;
+            self.mark_plane_drag_used(ctx);
+            if let Some(pos) = pos {
+                match self.fs_canvas_drag {
+                    FsCanvasDrag::PlaneLens { .. } => {
+                        if let Some(center) = self.fs_canvas_drag.lens_center(anchor, pos, canvas)
+                            && let FsExclusiveView::PlaneView(state) = &mut self.fs_exclusive_view
+                        {
+                            state.pose.lens_center = center;
+                        }
+                    }
+                    FsCanvasDrag::PlaneTilt {
+                        start, previous, ..
+                    } => {
+                        let ppp = ctx.pixels_per_point();
+                        let delta = (pos - previous) * ppp;
+                        let radius = 0.5 * canvas.size().min_elem() * ppp;
+                        let mut tilt = match &self.fs_exclusive_view {
+                            FsExclusiveView::PlaneView(state) => state.tilt,
+                            _ => PlaneTilt::default(),
+                        };
+                        if tilt.apply_drag(delta, radius) {
+                            if let FsExclusiveView::PlaneView(state) = &mut self.fs_exclusive_view {
+                                state.tilt = tilt;
+                            } else {
+                                let pose = PlaneViewPose {
+                                    anchor,
+                                    strength: 0.,
+                                    lens_center: (start - canvas.min) / canvas.size(),
+                                };
+                                let mut state = PlaneViewState::new(pose);
+                                state.tilt = tilt;
+                                self.enter_plane_view_from_tilt_drag(state);
+                            }
+                        }
+                        if let FsCanvasDrag::PlaneTilt { previous, .. } = &mut self.fs_canvas_drag {
+                            *previous = pos;
+                        }
+                    }
+                    FsCanvasDrag::Image { .. } => unreachable!(),
+                }
+            }
+            if released {
+                self.finish_plane_drag(true);
             }
         }
-        owned
+        let key = egui::Id::unique(("plane_drag_used", self.edit_request_owner_context()));
+        let frame = ctx.cumulative_frame_nr();
+        used || ctx.data(|data| data.get_temp::<u64>(key)) == Some(frame)
     }
     pub(crate) fn plane_view_anchor(&self, idx: usize) -> PlaneViewAnchor {
         PlaneViewAnchor {
@@ -213,6 +343,19 @@ impl App {
         }
         true
     }
+    pub(crate) fn plane_wheel_end_input(&self) -> crate::ui_fullscreen::PlaneWheelEndInput {
+        crate::ui_fullscreen::PlaneWheelEndInput {
+            tilt_is_identity: match &self.fs_exclusive_view {
+                FsExclusiveView::PlaneView(state) => state.tilt.is_identity(),
+                _ => true,
+            },
+            tilt_drag_owned: self.fs_canvas_drag.is_tilt()
+                && self.fullscreen_idx.is_some_and(|idx| {
+                    self.fs_canvas_drag.plane_anchor() == Some(self.plane_view_anchor(idx))
+                }),
+        }
+    }
+
     pub(crate) fn plane_view_wheel_input(
         &mut self,
         canvas: egui::Rect,
@@ -224,6 +367,7 @@ impl App {
         cover: Option<PlaneCoverInput>,
     ) -> Option<PlaneViewWheelInput> {
         let idx = self.fullscreen_idx?;
+        let end = self.plane_wheel_end_input();
         Some(PlaneViewWheelInput {
             current,
             anchor: self.plane_view_anchor(idx),
@@ -235,6 +379,8 @@ impl App {
             allowed: self.plane_view_entry_allowed(idx),
             step: self.settings.fullscreen_wheel_zoom_step,
             cover,
+            tilt_is_identity: end.tilt_is_identity,
+            tilt_drag_owned: end.tilt_drag_owned,
         })
     }
     /// Owner changes retire live projections together; panorama's intent stays on its old path.

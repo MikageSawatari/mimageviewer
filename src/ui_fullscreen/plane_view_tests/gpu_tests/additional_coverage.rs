@@ -386,159 +386,170 @@ fn install_pdf_raster(
 #[test]
 fn plane_real_pdf_routes_keep_both_demands_current_while_previous_material_is_painted() {
     let _keys = crate::key_input::lock_test_input();
-    let mut app = crate::app::setup_app_for_test();
-    let mut viewer = viewer(&mut app);
-    let probe = crate::app::PdfRerenderRequestProbe::start();
-    app.items[0] = GridItem::PdfPage {
-        pdf_path: app.tmp.path().join("plane-demands.pdf"),
-        page_num: 0,
-        content_type: Some(PdfPageContentType::Vector),
-    };
-    viewer.size = egui::vec2(1200., 900.);
-    install_pdf_raster(&mut app, &viewer.ctx, &probe, [317, 409]);
-    register_final_texture(&mut app, &viewer.ctx);
-    viewer.frame(&mut app, vec![]);
-    enter(&mut app, &mut viewer);
-    let old = drawn_at(&app, "first PDF raster registered and entered");
-    assert_eq!(
-        old.material.description.texture_size,
-        egui::vec2(317., 409.)
-    );
-    probe.take_requests();
+    for tilt_only in [false, true] {
+        let mut app = crate::app::setup_app_for_test();
+        let mut viewer = viewer(&mut app);
+        let probe = crate::app::PdfRerenderRequestProbe::start();
+        app.items[0] = GridItem::PdfPage {
+            pdf_path: app.tmp.path().join("plane-demands.pdf"),
+            page_num: 0,
+            content_type: Some(PdfPageContentType::Vector),
+        };
+        viewer.size = egui::vec2(1200., 900.);
+        install_pdf_raster(&mut app, &viewer.ctx, &probe, [317, 409]);
+        register_final_texture(&mut app, &viewer.ctx);
+        viewer.frame(&mut app, vec![]);
+        if tilt_only {
+            super::tilt_input_tests::enter_tilt(&mut viewer, &mut app);
+            assert_eq!(
+                app.fs_zoom, 1.,
+                "tilt-only entry preserves the 2D PDF demand scale"
+            );
+            assert_eq!(app.plane_view_pose().unwrap().strength, 0.);
+        } else {
+            enter(&mut app, &mut viewer);
+        }
+        let old = drawn_at(&app, "first PDF raster registered and entered");
+        assert_eq!(
+            old.material.description.texture_size,
+            egui::vec2(317., 409.)
+        );
+        probe.take_requests();
 
-    // Adopt a real reraster completion, leaving its newly selected final texture
-    // unregistered until after the UI pass.
-    let previous_generation = app.current_edit_result_key(0).source_gen;
-    install_pdf_raster(&mut app, &viewer.ctx, &probe, [634, 819]);
-    assert_ne!(
-        app.current_edit_result_key(0).source_gen,
-        previous_generation
-    );
-    assert!(
-        probe.take_requests().is_empty(),
-        "adopting the completed raster has not issued either display request"
-    );
-    viewer.frame(&mut app, vec![wheel(0., 40., egui::Modifiers::CTRL)]);
-    let snapshot = drawn_at(&app, "reraster accepted but current texture unregistered");
-    assert!(Arc::ptr_eq(&snapshot.material, &old.material));
-    assert!(
-        matches!(&app.fs_exclusive_view, FsExclusiveView::PlaneView(state)
+        // Adopt a real reraster completion, leaving its newly selected final texture
+        // unregistered until after the UI pass.
+        let previous_generation = app.current_edit_result_key(0).source_gen;
+        install_pdf_raster(&mut app, &viewer.ctx, &probe, [634, 819]);
+        assert_ne!(
+            app.current_edit_result_key(0).source_gen,
+            previous_generation
+        );
+        assert!(
+            probe.take_requests().is_empty(),
+            "adopting the completed raster has not issued either display request"
+        );
+        viewer.frame(&mut app, vec![wheel(0., 40., egui::Modifiers::CTRL)]);
+        let snapshot = drawn_at(&app, "reraster accepted but current texture unregistered");
+        assert!(Arc::ptr_eq(&snapshot.material, &old.material));
+        assert!(
+            matches!(&app.fs_exclusive_view, FsExclusiveView::PlaneView(state)
         if matches!(state.color, PlaneColorPhase::Pending { .. }))
-    );
-    let viewport = app.fs_pdf_display_target.unwrap();
-    let base = crate::pdf_loader::display_render_long_edge(
-        viewport,
-        634.,
-        819.,
-        false,
-        PdfPageContentType::Vector,
-    );
-    let legacy_target = crate::pdf_loader::zoom_render_long_edge(base, app.fs_zoom, None);
-    // Before input, ensure_pdf_display_resolution reads the accepted current
-    // raster (634x819), whose 819px edge is below 90% of the fit request (991).
-    // Then the wheel calls maybe_rerender_pdf at the new zoom, requesting 1200.
-    // Neither entry uses the previous PlaneView material's drawn transform.
-    assert!(819. < base as f32 * 0.9);
-    assert_ne!(
-        base, legacy_target,
-        "the fixture distinguishes fit and wheel requests"
-    );
-    assert_eq!(
-        probe.take_requests(),
-        vec![(0, base), (0, legacy_target)],
-        "pre-input current-raster fit resolution precedes the real wheel zoom demand"
-    );
+        );
+        let viewport = app.fs_pdf_display_target.unwrap();
+        let base = crate::pdf_loader::display_render_long_edge(
+            viewport,
+            634.,
+            819.,
+            false,
+            PdfPageContentType::Vector,
+        );
+        let legacy_target = crate::pdf_loader::zoom_render_long_edge(base, app.fs_zoom, None);
+        // Before input, ensure_pdf_display_resolution reads the accepted current
+        // raster (634x819), whose 819px edge is below 90% of the fit request (991).
+        // Then the wheel calls maybe_rerender_pdf at the new 2D zoom. Tilt is not a demand input.
+        // Neither entry uses the previous PlaneView material's drawn transform.
+        assert!(819. < base as f32 * 0.9);
+        assert_ne!(
+            base, legacy_target,
+            "the fixture distinguishes fit and wheel requests"
+        );
+        assert_eq!(
+            probe.take_requests(),
+            vec![(0, base), (0, legacy_target)],
+            "pre-input current-raster fit resolution precedes the real wheel zoom demand"
+        );
 
-    app.settings.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
-    app.settings.fullscreen_specified_scale = crate::settings::FullscreenSpecifiedScale {
-        width: crate::settings::SpecifiedScaleAxisSetting::disabled(
-            crate::settings::SpecifiedScaleAxis::PercentTenths(800),
-        ),
-        height: crate::settings::SpecifiedScaleAxisSetting::enabled(
-            crate::settings::SpecifiedScaleAxis::LogicalPixels(1200),
-        ),
-    };
-    viewer.frame(&mut app, vec![]);
-    let painted = app
-        .fullscreen_page_layout
-        .displayed_pages()
-        .next()
-        .unwrap()
-        .transform;
-    assert_eq!(painted.texture_size, egui::vec2(317., 409.));
-    assert!(Arc::ptr_eq(
-        &drawn_at(
-            &app,
-            "specified-scale PDF demand while current texture is pending"
-        )
-        .material,
-        &old.material
-    ));
-    let current = app.fs_fit_payload_for_idx(0).unwrap();
-    let source = app.source_dims_for_idx(0).unwrap();
-    let current_geometry = resolve_fs_image_transform(
-        DisplayedImageTransformInput {
-            page_idx: 0,
-            viewport_rect: painted.viewport_rect,
-            source_size: egui::vec2(source.0, source.1),
-            texture_size: current.full_source_size_vec2(),
-            rotation: crate::rotation_db::Rotation::None,
-            free_rotation_rad: 0.,
-            content_bbox: None,
-            fit_mode: app
-                .fs_fit_input_for_payload(0, FullscreenFitMode::SpecifiedScale, &current)
-                .unwrap(),
-            fit_scale_limits: app.fullscreen_fit_scale_limits(viewer.ctx.pixels_per_point()),
-            pixels_per_point: viewer.ctx.pixels_per_point(),
-            placement: ResolvedDisplayPlacement::Normal {
-                zoom_pan: app.fs_zoom_pan(),
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::SpecifiedScale;
+        app.settings.fullscreen_specified_scale = crate::settings::FullscreenSpecifiedScale {
+            width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+                crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+            ),
+            height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+                crate::settings::SpecifiedScaleAxis::LogicalPixels(1200),
+            ),
+        };
+        viewer.frame(&mut app, vec![]);
+        let painted = app
+            .fullscreen_page_layout
+            .displayed_pages()
+            .next()
+            .unwrap()
+            .transform;
+        assert_eq!(painted.texture_size, egui::vec2(317., 409.));
+        assert!(Arc::ptr_eq(
+            &drawn_at(
+                &app,
+                "specified-scale PDF demand while current texture is pending"
+            )
+            .material,
+            &old.material
+        ));
+        let current = app.fs_fit_payload_for_idx(0).unwrap();
+        let source = app.source_dims_for_idx(0).unwrap();
+        let current_geometry = resolve_fs_image_transform(
+            DisplayedImageTransformInput {
+                page_idx: 0,
+                viewport_rect: painted.viewport_rect,
+                source_size: egui::vec2(source.0, source.1),
+                texture_size: current.full_source_size_vec2(),
+                rotation: crate::rotation_db::Rotation::None,
+                free_rotation_rad: 0.,
+                content_bbox: None,
+                fit_mode: app
+                    .fs_fit_input_for_payload(0, FullscreenFitMode::SpecifiedScale, &current)
+                    .unwrap(),
+                fit_scale_limits: app.fullscreen_fit_scale_limits(viewer.ctx.pixels_per_point()),
+                pixels_per_point: viewer.ctx.pixels_per_point(),
+                placement: ResolvedDisplayPlacement::Normal {
+                    zoom_pan: app.fs_zoom_pan(),
+                },
+                pixel_fit: RectPixelFit::Texels,
             },
-            pixel_fit: RectPixelFit::Texels,
-        },
-        None,
-    )
-    .unwrap();
-    let required =
-        current_geometry.layout_full_image_rect.size().max_elem() * viewer.ctx.pixels_per_point();
-    let absolute_target = crate::pdf_loader::absolute_display_render_long_edge(
-        required,
-        false,
-        PdfPageContentType::Vector,
-    );
-    assert_eq!(
-        probe.take_requests(),
-        vec![(0, absolute_target)],
-        "the actual post-draw layout demand stays enabled while previous pixels paint"
-    );
-    assert_ne!(
-        legacy_target, absolute_target,
-        "fixture must distinguish the two request policies"
-    );
-    assert_eq!(
-        painted.source_size,
-        egui::vec2(
-            old.material.description.source_size[0] as f32,
-            old.material.description.source_size[1] as f32
+            None,
         )
-    );
-    // Normal renderer registration ends the same pending interval without a
-    // replacement request or a change to the already issued absolute demand.
-    let current_id = register_final_texture(&mut app, &viewer.ctx);
-    viewer.frame(&mut app, vec![]);
-    assert_eq!(
-        drawn_at(&app, "current PDF renderer registration completed")
-            .material
-            .copy
-            .texture_id,
-        current_id
-    );
-    assert_eq!(
-        drawn(&app).material.description.texture_size,
-        egui::vec2(634., 819.)
-    );
-    assert_eq!(
-        old.material.description.texture_size,
-        egui::vec2(317., 409.)
-    );
-    assert!(probe.take_requests().is_empty());
+        .unwrap();
+        let required = current_geometry.layout_full_image_rect.size().max_elem()
+            * viewer.ctx.pixels_per_point();
+        let absolute_target = crate::pdf_loader::absolute_display_render_long_edge(
+            required,
+            false,
+            PdfPageContentType::Vector,
+        );
+        assert_eq!(
+            probe.take_requests(),
+            vec![(0, absolute_target)],
+            "the actual post-draw layout demand stays enabled while previous pixels paint"
+        );
+        assert_ne!(
+            legacy_target, absolute_target,
+            "fixture must distinguish the two request policies"
+        );
+        assert_eq!(
+            painted.source_size,
+            egui::vec2(
+                old.material.description.source_size[0] as f32,
+                old.material.description.source_size[1] as f32
+            )
+        );
+        // Normal renderer registration ends the same pending interval without a
+        // replacement request or a change to the already issued absolute demand.
+        let current_id = register_final_texture(&mut app, &viewer.ctx);
+        viewer.frame(&mut app, vec![]);
+        assert_eq!(
+            drawn_at(&app, "current PDF renderer registration completed")
+                .material
+                .copy
+                .texture_id,
+            current_id
+        );
+        assert_eq!(
+            drawn(&app).material.description.texture_size,
+            egui::vec2(634., 819.)
+        );
+        assert_eq!(
+            old.material.description.texture_size,
+            egui::vec2(317., 409.)
+        );
+        assert!(probe.take_requests().is_empty());
+    }
 }

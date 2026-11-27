@@ -1,9 +1,9 @@
 # アーキテクチャ概観
 
-## 魚眼ズーム (PlaneView)
+## 魚眼ズームと写真の板の傾け (PlaneView)
 
-- `plane_view.rs`: レンズの設定型、ページ/slice anchor、純粋なホイール遷移、CPU参照式、キャンバスドラッグの所有型。
-- `app/plane_view.rs`: 共通の入口/継続照合、素材採用、描画snapshot、出力要求、表示所有者交代時のDepth/PlaneView退役。
+- `plane_view.rs`: レンズの設定型、ページ/slice anchor、純粋なホイール遷移、魚眼と遠近のCPU参照式、四元数の傾き、パン/レンズ/傾けの排他的なドラッグ所有型。
+- `app/plane_view.rs`: 共通の入口/継続照合、傾けの所有と最初の非ゼロ移動による入場、素材採用、描画snapshot、出力要求、表示所有者交代時のDepth/PlaneView退役。
 - `plane_view_wgpu.rs` / `plane_view_wgpu/export.rs`: 共通WGSL、format別pipeline、不変素材、callback別uniform、workerでのoffscreen描画とreadback。
 - `gpu_color_copy.rs`: DepthとPlaneView共用のblit/mip生成。context共通の可変素材slotは置かない。
 

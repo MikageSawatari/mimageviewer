@@ -83,6 +83,8 @@ fn transition(
         notches,
         allowed: Ok(()),
         step: FullscreenWheelZoomStep::Percent10,
+        tilt_is_identity: true,
+        tilt_drag_owned: false,
         cover,
     })
 }
@@ -578,6 +580,8 @@ fn partition(
             notches: notches / pieces as f32,
             allowed: Ok(()),
             step,
+            tilt_is_identity: true,
+            tilt_drag_owned: false,
             cover: Some(cover),
         })
     };
@@ -1007,6 +1011,8 @@ fn plane_revision_new_state_uses_auto_and_accepted_is_independent_of_geometry_ch
         canvas,
         notches: 1.,
         allowed: Err(PlaneViewEntryBlock::Editing),
+        tilt_is_identity: true,
+        tilt_drag_owned: false,
         step: FullscreenWheelZoomStep::Percent10,
         cover: Some(cover),
     });

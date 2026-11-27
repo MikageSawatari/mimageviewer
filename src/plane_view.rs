@@ -351,10 +351,99 @@ impl PlaneCoverInput {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PlaneTilt {
-    pub yaw: f32,
-    pub pitch: f32,
+    /// Normalized quaternion in [w, x, y, z] order; board-local to camera coordinates.
+    pub q: [f32; 4],
+}
+impl Default for PlaneTilt {
+    fn default() -> Self {
+        Self {
+            q: [1., 0., 0., 0.],
+        }
+    }
+}
+impl PlaneTilt {
+    fn normalized(self) -> Self {
+        let length = self.q.iter().map(|v| v * v).sum::<f32>().sqrt();
+        Self {
+            q: self.q.map(|v| v / length),
+        }
+    }
+    pub(crate) fn from_rotation_vector(vector: [f32; 3]) -> Self {
+        let angle = vector.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if angle == 0. {
+            return Self::default();
+        }
+        let (sin, cos) = (angle * 0.5).sin_cos();
+        Self {
+            q: [
+                cos,
+                vector[0] * sin / angle,
+                vector[1] * sin / angle,
+                vector[2] * sin / angle,
+            ],
+        }
+        .normalized()
+    }
+    pub(crate) fn is_identity(self) -> bool {
+        let q = self.normalized().q;
+        let bound = (0.01_f32.to_radians() * 0.5).sin();
+        q[1] * q[1] + q[2] * q[2] + q[3] * q[3] <= bound * bound
+    }
+    pub(crate) fn is_exact_identity(self) -> bool {
+        self.q[1] == 0. && self.q[2] == 0. && self.q[3] == 0.
+    }
+    /// Only release/reset calls this; tiny intermediate rotations must accumulate.
+    pub(crate) fn snap_identity(&mut self) {
+        if self.is_identity() {
+            *self = Self::default();
+        }
+    }
+    /// Compose one screen-axis rotation on the left. Delta and radius use the same units.
+    pub(crate) fn apply_drag(&mut self, delta: Vec2, radius: f32) -> bool {
+        if delta == Vec2::ZERO || !delta.is_finite() || !radius.is_finite() || radius <= 0. {
+            return false;
+        }
+        let scale = std::f32::consts::FRAC_PI_2 / radius;
+        let [a, b, c, d] = Self::from_rotation_vector([scale * delta.y, -scale * delta.x, 0.]).q;
+        let [w, x, y, z] = self.q;
+        *self = Self {
+            q: [
+                a * w - b * x - c * y - d * z,
+                a * x + b * w + c * z - d * y,
+                a * y - b * z + c * w + d * x,
+                a * z + b * y - c * x + d * w,
+            ],
+        }
+        .normalized();
+        true
+    }
+    /// Columns of the board-local -> camera rotation matrix: nx, ny, n.
+    pub(crate) fn matrix(self) -> [[f32; 3]; 3] {
+        let [w, x, y, z] = self.normalized().q;
+        [
+            [
+                1. - 2. * (y * y + z * z),
+                2. * (x * y + w * z),
+                2. * (x * z - w * y),
+            ],
+            [
+                2. * (x * y - w * z),
+                1. - 2. * (x * x + z * z),
+                2. * (y * z + w * x),
+            ],
+            [
+                2. * (x * z + w * y),
+                2. * (y * z - w * x),
+                1. - 2. * (x * x + y * y),
+            ],
+        ]
+    }
+}
+
+pub(crate) fn plane_perspective_focal_length(canvas: Rect) -> f32 {
+    0.5 * canvas.size().length() / 25_f32.to_radians().tan()
 }
 
 /// Keep the released pan/rotation pair together; a lens drag replaces that owner.
@@ -368,6 +457,11 @@ pub(crate) enum FsCanvasDrag {
         anchor: PlaneViewAnchor,
         start: Pos2,
         center: Vec2,
+    },
+    PlaneTilt {
+        anchor: PlaneViewAnchor,
+        start: Pos2,
+        previous: Pos2,
     },
 }
 impl Default for FsCanvasDrag {
@@ -410,6 +504,24 @@ impl FsCanvasDrag {
     pub(crate) fn is_lens(&self) -> bool {
         matches!(self, Self::PlaneLens { .. })
     }
+    pub(crate) fn is_tilt(&self) -> bool {
+        matches!(self, Self::PlaneTilt { .. })
+    }
+    pub(crate) fn is_plane_drag(&self) -> bool {
+        self.is_lens() || self.is_tilt()
+    }
+    pub(crate) fn plane_anchor(&self) -> Option<PlaneViewAnchor> {
+        match self {
+            Self::PlaneLens { anchor, .. } | Self::PlaneTilt { anchor, .. } => Some(*anchor),
+            _ => None,
+        }
+    }
+    pub(crate) fn retire_plane_drag(&mut self) {
+        if self.is_plane_drag() {
+            *self = Self::default();
+        }
+    }
+    #[cfg(test)]
     pub(crate) fn retire_lens(&mut self) {
         if self.is_lens() {
             *self = Self::default();
@@ -522,6 +634,8 @@ pub(crate) struct PlaneViewWheelInput {
     pub allowed: Result<(), PlaneViewEntryBlock>,
     pub step: crate::settings::FullscreenWheelZoomStep,
     pub cover: Option<PlaneCoverInput>,
+    pub tilt_is_identity: bool,
+    pub tilt_drag_owned: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PlaneViewWheelOutcome {
@@ -577,6 +691,14 @@ pub(crate) fn plane_view_wheel_transition(input: PlaneViewWheelInput) -> PlaneVi
     } else {
         input.notches
     };
+    if used == 0. {
+        // Tilt-only views have no fisheye strength left to spend. This accepted segment
+        // must not re-resolve or clamp their otherwise unchanged zoom/pan.
+        out.pose = (pose.strength > 0. || !input.tilt_is_identity || input.tilt_drag_owned)
+            .then_some(pose);
+        out.accepted = true;
+        return out;
+    }
     pose.strength = (pose.strength + used / 4.).clamp(0., 1.);
     let center = input.canvas.min + pose.lens_center * input.canvas.size();
     let Some((zoom, pan)) = (if used > 0. {
@@ -611,7 +733,8 @@ pub(crate) fn plane_view_wheel_transition(input: PlaneViewWheelInput) -> PlaneVi
     );
     out.zoom = next_zoom;
     out.pan = next_pan;
-    out.pose = (pose.strength > 0.).then_some(pose);
+    out.pose =
+        (pose.strength > 0. || !input.tilt_is_identity || input.tilt_drag_owned).then_some(pose);
     out.accepted = true;
     out
 }
@@ -639,36 +762,57 @@ pub(crate) fn camera_point(
     lens: PlaneLensKind,
     tilt: PlaneTilt,
 ) -> Option<Pos2> {
+    let (point, valid) = camera_sample(p, canvas, center, k, lens, tilt);
+    valid.then_some(point)
+}
+
+/// Finite shader-like coordinates are retained even when the sample is masked out.
+#[cfg(test)]
+pub(crate) fn camera_sample(
+    p: Pos2,
+    canvas: Rect,
+    center: Vec2,
+    k: f32,
+    lens: PlaneLensKind,
+    tilt: PlaneTilt,
+) -> (Pos2, bool) {
     let r_scale = 0.5 * canvas.size().min_elem();
     if r_scale <= 0. {
-        return None;
+        return (p, false);
     }
     let c = canvas.min + center * canvas.size();
     let u = (p - c) / r_scale;
     let r = u.length();
-    if k <= 1.0e-7 {
-        return Some(p);
+    let mut valid = true;
+    let mut offset = p - c;
+    let mut fish_point = p;
+    if k > 1.0e-7 {
+        let theta = lens.theta(k * r).unwrap_or_else(|| {
+            valid = false;
+            0.
+        });
+        let sigma = if r < 1.0e-6 { k } else { theta.sin() / r };
+        let d = [sigma * u.x, sigma * u.y, theta.cos()];
+        valid &= d[2] > 1.0e-6;
+        let t = 1. / d[2].max(1.0e-6);
+        offset = Vec2::new(t * d[0], t * d[1]) * (r_scale / k);
+        fish_point = c + offset;
     }
-    let theta = lens.theta(k * r)?;
-    let sigma = if r < 1.0e-6 { k } else { theta.sin() / r };
-    let d = [sigma * u.x, sigma * u.y, theta.cos()];
-    let (sy, cy) = tilt.yaw.sin_cos();
-    let (sp, cp) = tilt.pitch.sin_cos();
-    // Rot = Ry(yaw) Rx(pitch). Its columns form the board's local basis.
-    let nx = [cy, 0., -sy];
-    let ny = [sy * sp, cp, cy * sp];
-    let n = [sy * cp, -sp, cy * cp];
+    if tilt.is_exact_identity() {
+        return (fish_point, valid);
+    }
+    let focal = plane_perspective_focal_length(canvas);
+    let d = [offset.x, offset.y, focal];
+    let [nx, ny, n] = tilt.matrix();
     let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     let den = dot(n, d);
-    if den <= 1.0e-6 {
-        return None;
-    }
-    let t = n[2] / den;
-    if t <= 0. {
-        return None;
-    }
-    let v = [t * d[0], t * d[1], t * d[2] - 1.];
-    Some(c + Vec2::new(dot(nx, v), dot(ny, v)) * (r_scale / k))
+    let threshold = 1.0e-6 * dot(d, d).sqrt();
+    let safe_den = den.abs().max(threshold) * if den < 0. { -1. } else { 1. };
+    let raw_t = n[2] * focal / safe_den;
+    valid &= n[2].abs() > 1.0e-6 && den.abs() > threshold && raw_t > 0.;
+    let t = if valid { raw_t } else { 1. };
+    let v = [t * d[0], t * d[1], t * d[2] - focal];
+    (c + Vec2::new(dot(nx, v), dot(ny, v)), valid)
 }
 
 /// The CPU inverse of the paint quad, including trim/slice and partial material coverage.
@@ -731,6 +875,8 @@ mod tests {
             notches,
             allowed: Ok(()),
             step: crate::settings::FullscreenWheelZoomStep::Percent10,
+            tilt_is_identity: true,
+            tilt_drag_owned: false,
             cover: Some(super::revision_tests::fixture(
                 canvas(),
                 Vec2::new(800., 600.),
@@ -802,6 +948,8 @@ mod tests {
                 notches: 1.,
                 allowed: Err(block),
                 step: Default::default(),
+                tilt_is_identity: true,
+                tilt_drag_owned: false,
                 cover: Some(super::revision_tests::fixture(
                     canvas(),
                     Vec2::new(800., 600.),
@@ -824,6 +972,8 @@ mod tests {
             notches: 1.,
             allowed: Ok(()),
             step: Default::default(),
+            tilt_is_identity: true,
+            tilt_drag_owned: false,
             cover: Some(super::revision_tests::fixture(
                 canvas(),
                 Vec2::new(800., 600.),
@@ -932,3 +1082,5 @@ mod tests {
 mod precision_tests;
 #[cfg(test)]
 mod revision_tests;
+#[cfg(test)]
+mod tilt_tests;

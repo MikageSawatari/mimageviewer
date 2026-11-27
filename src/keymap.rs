@@ -1800,6 +1800,7 @@ pub enum KeyAction {
     FsDepthParallax,
     FsFisheyeIn,
     FsFisheyeOut,
+    FsPlaneTiltReset,
     FsNavigatorToggle,
     FsPageTurnAnimationToggle,
     FsNavigatorHold,
@@ -2431,6 +2432,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsDepthParallax,
     KeyAction::FsFisheyeIn,
     KeyAction::FsFisheyeOut,
+    KeyAction::FsPlaneTiltReset,
     KeyAction::FsNavigatorToggle,
     KeyAction::FsPageTurnAnimationToggle,
     KeyAction::FsNavigatorHold,
@@ -4741,6 +4743,7 @@ impl KeyAction {
             FsDepthParallax => "FsDepthParallax",
             FsFisheyeIn => "FsFisheyeIn",
             FsFisheyeOut => "FsFisheyeOut",
+            FsPlaneTiltReset => "FsPlaneTiltReset",
             FsNavigatorToggle => "FsNavigatorToggle",
             FsPageTurnAnimationToggle => "FsPageTurnAnimationToggle",
             FsNavigatorHold => "FsNavigatorHold",
@@ -5537,6 +5540,7 @@ impl KeyAction {
             FsDepthParallax => "3D 写真の表示を切り替える",
             FsFisheyeIn => "魚眼で寄る",
             FsFisheyeOut => "魚眼で離れる",
+            FsPlaneTiltReset => "写真の板の傾きを戻す",
             FsNavigatorToggle => "ナビゲータの表示を切り替える",
             FsPageTurnAnimationToggle => "ページめくりアニメーションを切り替える",
             FsNavigatorHold => "押している間だけナビゲータを表示する",
@@ -6147,6 +6151,7 @@ impl KeyAction {
             | FsDepthParallax
             | FsFisheyeIn
             | FsFisheyeOut
+            | FsPlaneTiltReset
             | FsNavigatorToggle
             | FsPageTurnAnimationToggle
             | FsNavigatorHold
@@ -6728,6 +6733,7 @@ impl KeyAction {
             | FsDepthParallax
             | FsFisheyeIn
             | FsFisheyeOut
+            | FsPlaneTiltReset
             | FsNavigatorToggle
             | FsPageTurnAnimationToggle
             | FsPixelGrid
@@ -7321,7 +7327,7 @@ impl KeyAction {
             FsPanorama => ChordList::one(Chord::key(V)),
             FsPanoramaProjection => ChordList::one(Chord::shift(V)),
             FsDepthParallax => ChordList::one(Chord::key(D)),
-            FsFisheyeIn | FsFisheyeOut => ChordList::EMPTY,
+            FsFisheyeIn | FsFisheyeOut | FsPlaneTiltReset => ChordList::EMPTY,
             FsNavigatorToggle => ChordList::one(Chord::alt(N)),
             FsPageTurnAnimationToggle => ChordList::EMPTY,
             FsNavigatorHold => ChordList::one(Chord::modifier(ModKind::Alt)),
@@ -12723,6 +12729,105 @@ mod tests {
         let reference = include_str!("../docs/keymap.ini.default");
         assert!(reference.contains("# FsFisheyeIn = none"));
         assert!(reference.contains("# FsFisheyeOut = none"));
+    }
+
+    #[test]
+    fn plane_tilt_reset_is_an_unassigned_image_press_with_scoped_rebinding() {
+        let action = KeyAction::FsPlaneTiltReset;
+        assert!(ALL_ACTIONS.contains(&action));
+        assert!(action.is_user_facing());
+        assert_eq!(action.context(), KeyContext::FsImage);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(action.binding_policy(), BindingPolicy::FullChord);
+        assert_eq!(KeyAction::from_ini_name("FsPlaneTiltReset"), Some(action));
+        assert!(action.default_chords().iter().next().is_none());
+        assert!(command_catalog().any(|spec| spec.action == action));
+
+        let chord = Chord::key(KeyName::F13);
+        let bound = Keymap::from_ini_str("[FsImage]\nFsPlaneTiltReset = F13\n");
+        assert!(bound.warnings().is_empty());
+        assert_eq!(bound.effective_chords(action), vec![chord]);
+        assert_eq!(
+            bound.resolve_first_action_for_chord(chord, FS_IMAGE_ACTIVE_SCOPES, &[action]),
+            Some(action)
+        );
+        assert_eq!(
+            bound.resolve_first_action_for_chord(chord, FS_VIDEO_ACTIVE_SCOPES, &[action]),
+            None
+        );
+        let wire = serde_json::to_string(&KeymapSettings::from_keymap(&bound)).unwrap();
+        let restored = Keymap::from_settings(&serde_json::from_str(&wire).unwrap());
+        assert_eq!(restored.effective_chords(action), vec![chord]);
+        let disabled = Keymap::from_ini_str("[FsImage]\nFsPlaneTiltReset = none\n");
+        assert!(disabled.warnings().is_empty());
+        assert!(disabled.effective_chords(action).is_empty());
+
+        let conflict =
+            Keymap::from_ini_str("[FsImage]\nFsPlaneTiltReset = F13\nFsFisheyeIn = F13\n");
+        assert!(conflict.binding_conflicts().iter().any(|entry| {
+            (entry.action == action && entry.other_action == Some(KeyAction::FsFisheyeIn))
+                || (entry.action == KeyAction::FsFisheyeIn && entry.other_action == Some(action))
+        }));
+        let reference_line = "# FsPlaneTiltReset = none ; 写真の板の傾きを戻す";
+        assert!(
+            Keymap::default_reference_ini()
+                .lines()
+                .any(|line| line == reference_line)
+        );
+        assert!(
+            include_str!("../docs/keymap.ini.default")
+                .lines()
+                .any(|line| line == reference_line)
+        );
+    }
+
+    #[test]
+    fn plane_tilt_reset_is_exposed_and_rebindable_through_operations_api() {
+        use crate::operation_customize_agent::{get_operations, prepare_edits};
+        use crate::operation_customize_share::OperationCustomizeBundle;
+        use mimageviewer_agent_ipc::{OperationEdits, OperationRow, OperationsQuery, PageRow};
+
+        let request: OperationsQuery = serde_json::from_value(serde_json::json!({
+            "view": "keys", "actions": ["FsPlaneTiltReset"], "context": "FsImage",
+        }))
+        .unwrap();
+        let read_row = |bundle: &OperationCustomizeBundle| {
+            get_operations(bundle, &request)
+                .unwrap()
+                .items
+                .into_iter()
+                .find_map(|item| match item {
+                    PageRow::Value(OperationRow::Key(row)) if row.action == "FsPlaneTiltReset" => {
+                        Some(row)
+                    }
+                    _ => None,
+                })
+                .expect("registered reset must be available to the operations API")
+        };
+        let defaults = OperationCustomizeBundle::defaults();
+        let row = read_row(&defaults);
+        assert_eq!(row.context, "FsImage");
+        assert_eq!(row.trigger, "press");
+        assert!(row.keys.is_empty());
+        assert!(row.default.is_empty());
+        let edits: OperationEdits = serde_json::from_value(serde_json::json!({
+            "keys": { "FsPlaneTiltReset": ["F14"] },
+        }))
+        .unwrap();
+        let (changed, result) = prepare_edits(&defaults, &edits).unwrap();
+        assert!(
+            result
+                .changed
+                .iter()
+                .any(|row| row.name == "FsPlaneTiltReset")
+        );
+        assert_eq!(read_row(&changed).keys, vec!["F14".to_owned()]);
+        let clear: OperationEdits = serde_json::from_value(serde_json::json!({
+            "keys": { "FsPlaneTiltReset": [] },
+        }))
+        .unwrap();
+        let (cleared, _) = prepare_edits(&changed, &clear).unwrap();
+        assert!(read_row(&cleared).keys.is_empty());
     }
 
     #[test]

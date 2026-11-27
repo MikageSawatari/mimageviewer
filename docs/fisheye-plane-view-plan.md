@@ -1107,10 +1107,50 @@ cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen|in_page_scroll|p
 
 `cargo fmt` と `git diff --check` は正常終了。Rust/GPU試験は実行していない。
 
+### 段 2 の実装記録
+
+§0・§18を通読し、Ctrl+Shift+左ドラッグによる写真の板の傾けと、傾きを戻すキーの登録・文書を追加した。範囲は制限せず裏側も反転した絵として見せること、レンズ中心の下の点を回転中心とすること、傾けによる余白を許して倍率を自動で変えないことを反映した。
+
+**キーの登録**: `FsPlaneTiltReset` を `FsImage` / `Press` / 既定なしで追加した。enum・`ALL_ACTIONS`・INI名・説明・context・trigger・defaultを揃え、`docs/keymap.ini.default` の同じ順に `none` の参照行を追加した。表示名は「写真の板の傾きを戻す」。通常のCommandSpecと操作APIの一覧・編集は `KeyAction::all` と同じ名前解決を使うため、専用のAPI形式や別allowlistは追加していない。割り当て・解除・settings往復・FsImageと動画のscope分離・魚眼の寄る操作との競合・生成参照の試験と、操作APIの取得/再割り当て/解除の試験を `src/keymap.rs` に追加した。キーの段で `reset_plane_tilt(ctx)` へ配送し、非ナビゲーション操作のinventoryにも追加した。
+
+**所有の型と入口** (着手時 `ee7421548`): `FsCanvasDrag` のImage/PlaneLensと排他的な `PlaneTilt { anchor, start, previous }` を追加した。`handle_plane_drag` は押下時にOSのCtrl/Shiftと既存の入口条件・前面UIの可否で所有を決め、PlaneViewが無くてもTiltを保持する。最初の非ゼロ移動でstrength 0・押した位置のレンズ中心・Autoのstateを作る。専用の `enter_plane_view_from_tilt_drag` は所有を保持して公開する。普通の `set_fs_exclusive_view` はPlaneのドラッグを退役させる。両者はprivateの `publish_fs_exclusive_view` を共有し、Panoramaの後処理やDepthのdrop、通知は既存どおりである。入場のために所有を一旦退避して戻す処理は作らない。
+
+Lens/Tiltの抑止は `plane_drag_owned` とcontextごとの同じpass使用済み記録で共用し、離したpassもパン・自由回転・単クリックへ渡さない。ダブルクリックによる明示のResetTransformだけは、§18.3どおり所有中でも通す。primaryのedge列を順にfoldし、同じpassの離す→押すを別の操作として扱う。`finish_plane_drag` はrelease時だけ `snap_identity` を呼び、focus/modal/anchor不一致での取消では寄せずに所有を解く。resetは即座に所有を解いて恒等へ戻し、strength 0なら終了する。対象外の表示はTiltを取らず、既存の自由回転の可否に委ねる。
+
+`PlaneTilt { q: [w,x,y,z] }` は手書きDefaultの[1,0,0,0]。回転ベクトルから1つの四元数を作って左から掛け、各回を正規化する。恒等の判定は共通の `is_identity` のxyzのノルムで行い、0.01度以下でも操作中は寄せない。描画の恒等専用経路は許容誤差を使わないexact-I判定とし、微小な生きた回転は遠近へ通す。
+
+**式と終了の境界**: CPU/WGSLを従来の放射状魚眼→対角50度のピンホールと板の交点へ合成した。傾きが厳密な恒等なら、従来の演算順とk近傍ゼロの恒等経路をそのまま返す。遠近のdenは符号を保った有限な代用値とし、無効tは1を使って微分後にマスクする。負のdenを潰さず、真横の退化はepsilon内を無効にする。既存13個のuniform indexは変えず、13〜15へ回転行列の3列を追加した。同じuniformのsnapshotを画面・出力に使う。魚眼の係数・覆う配置・pan制約・固定の規則と、2D倍率によるPDF需要は維持する。
+
+純粋なホイール遷移は `tilt_is_identity` と `tilt_drag_owned` を受け取り、strength 0でも傾きか所有があればposeを保つ。予測前の両値を `PlaneWheelEndInput` としてproposalに写し、segmentの再分割や描画後の適用でも同じ値を使う。段2で新たに可能となるstrength 0のまま離れるsegmentはused=0なので、受理してposeの保持/終了だけを決め、倍率とpanを完全に維持する。未消費の量で逆写像の丸めやpan補正を走らせない。既存strength正の遷移・改訂1/2の幾何は変更していない。
+
+**detachedの範囲**: 述語・viewport経路・配送・swapの項目は変更していない。四元数は既存のfs_exclusive_view、Tiltの所有は既存のfs_canvas_drag全体の退避/引き継ぎに含まれる。変更した表示所有者の公開helperは入力所有の退役と公開を分ける構造上の入口で、detached用のguard・delay・retryや追加フィールドではない。
+
+**文書**: キー仕様にCtrl+Shift+左ドラッグの固定入力とkeymap対象外の理由を追加した。表示パイプラインと仕様書は魚眼と遠近の2段の合成、恒等/裏側/真横、四元数と所有・終了条件を更新した。マニュアルは操作・対象・余白・裏側・resetと出力の仕様を説明し、内部用語、panの反転やPDFのぼやけの既知の制限は書いていない。§13の下書きにも傾けを追加した。設計本文§18は変更していない。
+
+**設計との差分**: 仕様上の差分はない。旧yaw/pitch型と旧カメラの板との交点の式は§18で指定された置き換え対象。新規のused=0境界も「segmentの残りを使わない」規則の実装であり、既存の正のstrengthの計算を変えていない。回復・局所拡大率によるPDF需要・傾きに合わせたパン/ズーム補正は追加していない。
+
+**試験と変更ファイル**: 純粋な式と四元数の10件を新規 `src/plane_view/tilt_tests.rs`、GPUの全画素比較とsnapshot出力の2件を `src/plane_view_wgpu/gpu_tests.rs`、実viewerの所有/終了/reset/対象外/複数context/出力の16件を新規 `src/ui_fullscreen/plane_view_tests/gpu_tests/tilt_input_tests.rs`、keymapと操作APIの2件を `src/keymap.rs` に追加した。既存のPDF需要と前素材の試験を傾けだけのケースへも展開し、既存assertを維持した。GPU利用は全て既存gpu_testsのgroupに入る。
+
+ほかの変更ファイルは `src/plane_view.rs`、`src/plane_view/revision_tests.rs`、`src/plane_view_wgpu.rs`、`src/app/plane_view.rs`、`src/app/depth_view.rs`、`src/app/search_nav_entry_inventory_tests.rs`、`src/ui_fullscreen.rs`、`src/ui_fullscreen/plane_view_tests.rs`、同 `gpu_tests/additional_coverage.rs`、`docs/keymap.ini.default`、`docs/keymap-spec.md`、`docs/display-pipeline.md`、`docs/spec.md`、`docs/architecture-overview.md`、`htdocs/mimageviewer/manual/fullscreen.html`、本書§11/§13。
+
+**未検証の範囲**: `cargo fmt` は正常終了、UI字形検査は危険な字形なし、サイト検査は54カード・超過0、`git diff --check` は正常終了。ビルド・test・check・clippy・算術用スクリプト・アプリ起動・コミットは実装担当では実行していない。追加試験の成功、コンパイル、GPUの実画素/性能、実機の操作感と見た目は未確認。新規のUI PNGは追加しておらず、既存の操作一覧snapshotへの影響も未確認。設計担当の共通の実行口へ引き継ぐ。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/plane_view|plane_tilt|fisheye|displayed_image_transform|plane_copy/)'
+cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen|in_page_scroll|page_turn|depth|ui_erase|keymap|search_nav_entry_inventory/)'
+```
+
+**検証の引き継ぎ**: `cargo fmt` は正常終了、字形検査は危険な字形なし、サイト検査は54カード・超過0、`git diff --check` も正常終了。ビルド・test・check・clippy・算術用スクリプト・アプリ起動・コミットは実行していない。今回のコンパイル、WGSL検証、追加/既存試験、GPU画素、実時間性能、実機の操作感は未確認。既存の成功記録を変更後の成功とは扱わない。新しいPNGは追加しておらず、操作一覧の既存snapshotの更新要否も試験結果で確認する。設計担当の共通の実行口へ次を渡す。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/plane_view|plane_tilt|fisheye|displayed_image_transform|plane_copy/)'
+cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen|in_page_scroll|page_turn|depth|ui_erase|keymap|search_nav_entry_inventory/)'
+```
+
 ## 12. 文書
 
 - [display-pipeline.md](display-pipeline.md): PlaneView の節 (§5 の要約と §6 の出口)。
-- [keymap-spec.md](keymap-spec.md)・`docs/keymap.ini.default`: Action 2 つ、固定入力 2 つ (Ctrl+Shift+ホイール、PlaneView 中の Shift+左ドラッグ)。
+- [keymap-spec.md](keymap-spec.md)・`docs/keymap.ini.default`: Action 3つ、固定入力3つ (Ctrl+Shift+ホイール、PlaneView中のShift+左ドラッグ、対象の単ページ静止画のCtrl+Shift+左ドラッグ)。
 - [architecture-overview.md](architecture-overview.md): 新しいモジュール。
 - マニュアル (全画面の表示のページ) と製品ページ: 機能の説明 (版固有の説明・実装用語を書かない)。
 - [detached-rework-plan.md](detached-rework-plan.md): §4.4 の記録。
@@ -1124,6 +1164,7 @@ cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen|in_page_scroll|p
 - 下へ回すと歪みと倍率が戻ります。覆うために増えた倍率を最初のフィットへ戻すには、ダブルクリックかフィットの切り替えを使います。
 - 魚眼中は Shift+左ドラッグでレンズの中心を動かせます。通常のズーム・パン・自由回転と組み合わせて使えます。レンズの種類は環境設定で選べます。
 - 魚眼の見た目をキャプチャ保存・画像のコピー・エクスポートで出力できます。「魚眼で寄る」「魚眼で離れる」には操作カスタマイズでキーを割り当てられます。
+- 1ページの静止画を、Ctrl+Shift+左ドラッグで板のように傾けられます。レンズの中心の下の点を軸に裏側まで回せ、裏側は反転した絵になります。傾けて出る余白はそのまま残ります。「写真の板の傾きを戻す」にキーを割り当てると、魚眼を残して傾きだけを戻せます。傾けた絵も見えているとおりに保存・コピー・書き出しできます。
 
 ## 14. 独立設計レビュー
 
