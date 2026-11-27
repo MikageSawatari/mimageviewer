@@ -196,7 +196,7 @@ fn view_order_wait_dim_direct_navigation_still_dims_during_and_after_grace() {
         None,
         StartupListIntent::ExplicitList,
         MainListRequestStage::Admission,
-        DirectoryScanRoute::Worker,
+        DirectoryScanRoute::MainWorker,
     );
     let _held = HeldScan::capture(&mut h.env);
     let started = h.env.folder_pane_open_pending.as_ref().unwrap().started_at;

@@ -619,6 +619,24 @@ mod tests {
     }
 
     #[test]
+    fn section1911_physical_directory_suffix_keeps_manual_order_locked() {
+        use crate::grid_item::GridItem;
+        let mut settings = crate::settings::Settings::default();
+        settings.book_root = Some(PathBuf::from(r"C:\shelf"));
+        settings.auto_fullscreen_image_folders = false;
+        for suffix in ["epub", "pdf", "zip", "cbz", "rar", "cbr"] {
+            let path = PathBuf::from(format!(r"C:\ordinary.{suffix}"));
+            let items = [GridItem::Image(path.join("a.jpg"))];
+            // Manual order retains the same suffix lock as ordinary sorting,
+            // including a physical directory with a container-looking name.
+            assert!(!physical_folder_order_eligible(&settings, &path, &items));
+            assert!(crate::app::physical_page_order_locked(
+                &settings, &path, &items
+            ));
+        }
+    }
+
+    #[test]
     fn section1911_stack_eligibility_uses_source_still_images_without_changing_existing_sort_lock()
     {
         use crate::grid_item::GridItem;

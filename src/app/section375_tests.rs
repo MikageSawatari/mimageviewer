@@ -43,7 +43,7 @@ pub(super) fn fixture(names: &[&str]) -> (AppTestEnvForTest, PathBuf, egui::Cont
     for name in names {
         std::fs::write(folder.join(name), b"image-source").unwrap();
     }
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     let ctx = egui::Context::default();
     settle(&mut app, &ctx);
     assert!(
@@ -393,7 +393,7 @@ fn section1375_delete_hidden_candidate_and_no_visible_idx_still_reconcile() {
         let (mut app, folder, ctx) = fixture(&names);
         app.settings.image_ext_priority = vec!["jpg".into(), "png".into()];
         app.settings.skip_epub_if_pdf_exists = true;
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         settle(&mut app, &ctx);
         assert!(
             !app.items
@@ -419,7 +419,7 @@ fn section1375_delete_hidden_candidate_and_no_visible_idx_still_reconcile() {
     let (mut app, folder, ctx) = fixture(&["a.jpg", "a.png", "b.jpg"]);
     app.settings.skip_duplicate_images = true;
     app.settings.image_ext_priority = vec!["jpg".into(), "png".into()];
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     settle(&mut app, &ctx);
     let hidden = folder.join("a.png");
     assert!(
@@ -450,7 +450,7 @@ fn section1375_physical_folder_zip_pdf_epub_video_audio_delete_equal() {
         } else {
             std::fs::write(&removed, b"source").unwrap();
         }
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         settle(&mut app, &ctx);
         let generation = app.items_generation;
         if name == "child" {
@@ -585,7 +585,7 @@ fn section1375_automatic_origin_survives_match_diff_restart_resume_and_defer() {
                 "explicit reload must retain configured imports"
             );
             let after_explicit = sidecar_restore::import_starts_for_test();
-            app.load_folder(folder.clone());
+            app.load_folder_and_finish_for_test(folder.clone());
             settle(&mut app, &ctx);
             assert!(
                 sidecar_restore::import_starts_for_test() > after_explicit,
@@ -679,7 +679,7 @@ fn section1375_stack_self_delete_equal_opens_remaining_stack_after_image_or_fold
             folder.join("a_1.jpg")
         };
         app.stack_mode_requested = true;
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         settle(&mut app, &ctx);
         let survivor_count = if folder_first { 2 } else { 1 };
         assert_eq!(app.items.len(), survivor_count + 1);
@@ -752,7 +752,7 @@ fn section1375_stack_flat_delete_rebuilds_retained_singleton_metadata_and_maps()
         .set_item_tags(&key, ["survivor-tag"], "test")
         .unwrap();
     app.stack_mode_requested = true;
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     settle(&mut app, &ctx);
     assert!(app.stack_try_open_from_grid(&ctx, 1, false));
     settle(&mut app, &ctx);
@@ -795,7 +795,7 @@ fn section1375_stack_flat_delete_rebuilds_retained_singleton_metadata_and_maps()
 fn section1375_stack_zero_success_keeps_view_and_pending_switch() {
     let (mut app, folder, ctx) = fixture(&["a_1.jpg", "b_1.jpg", "b_2.jpg"]);
     app.stack_mode_requested = true;
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     settle(&mut app, &ctx);
     let original = app.stack_view.as_ref().unwrap().clone();
     assert!(app.stack_try_open_from_grid(&ctx, 1, false));
@@ -817,7 +817,7 @@ fn section1375_delete_during_initial_stack_extraction_or_grouping_resumes_only_a
         for succeeded in [false, true] {
             let (mut app, folder, ctx) = fixture(&["a_1.jpg", "b_1.jpg", "b_2.jpg", "c_1.jpg"]);
             app.stack_mode_requested = true;
-            app.load_folder(folder.clone());
+            app.load_folder_and_finish_for_test(folder.clone());
             let deadline = Instant::now() + Duration::from_secs(20);
             while app.sidecar_restore_active() {
                 app.poll_sidecar_restore(&ctx);
@@ -949,7 +949,7 @@ fn section1375_delete_during_initial_subfolder_stack_uses_current_survivor_snaps
 fn section1375_stack_retained_read_failure_keeps_flat_until_ordinary_reload() {
     let (mut app, folder, ctx) = fixture(&["a_1.jpg", "b_1.jpg", "b_2.jpg"]);
     app.stack_mode_requested = true;
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     settle(&mut app, &ctx);
     assert!(app.stack_try_open_from_grid(&ctx, 1, false));
     settle(&mut app, &ctx);
@@ -991,7 +991,7 @@ fn section1375_stack_member_changes_and_equal_facet_details_keep_projection() {
     let (mut app, folder, ctx) =
         fixture(&["post_1.jpg", "post_2.jpg", "post_3.jpg", "other_1.jpg"]);
     app.stack_mode_requested = true;
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     settle(&mut app, &ctx);
     assert!(
         app.items
@@ -1101,7 +1101,7 @@ fn section1375_tag_and_edit_sidecar_policy_off_on_explicit_and_open() {
                 tags
             );
             let starts = sidecar_restore::import_starts_for_test();
-            app.load_folder(folder.clone());
+            app.load_folder_and_finish_for_test(folder.clone());
             settle(&mut app, &ctx);
             assert_eq!(
                 sidecar_restore::import_starts_for_test() > starts,
@@ -1398,7 +1398,7 @@ fn section1375_favorite_effective_projection_key_matches_worker_and_first_equal(
     app.favorite_view_states.insert(favorite.id, state);
     app.settings.favorites.push(favorite);
     app.settings.remember_favorite_view_state = true;
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     settle(&mut app, &ctx);
     let generation = app.items_generation;
     assert_eq!(
@@ -1460,7 +1460,7 @@ fn section1375_delete_mixed_directory_mtime_observes_without_display_sort_stamp_
     let child = folder.join("child");
     std::fs::create_dir(&child).unwrap();
     app.settings.sort_order = crate::settings::SortOrder::DateDesc;
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     settle(&mut app, &ctx);
     let child_idx = app
         .items
@@ -1706,7 +1706,7 @@ fn section1375_same_second_file_overwrite_is_observed_by_actual_worker() {
         .unwrap()
         .set_modified(stamp)
         .unwrap();
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     settle(&mut app, &ctx);
     let generation = app.items_generation;
     std::fs::write(&b, b"image-source").unwrap();
@@ -1727,7 +1727,7 @@ fn section1375_stack_late_hydration_keeps_automatic_import_policy_and_group_curs
     for rebase in [false, true] {
         let (mut app, folder, ctx) = fixture(&["a_1.jpg", "a_2.jpg", "b_1.jpg", "b_2.jpg"]);
         app.stack_mode_requested = true;
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         settle(&mut app, &ctx);
         app.move_grid_cursor(Some(0), GridCursorIntent::Explicit(GridCursorMove::Move));
         app.settings.sidecar_backup_enabled = true;
@@ -1873,7 +1873,7 @@ fn section1375_search_root_delete_does_not_dispatch_physical_folder_reload() {
     );
     app.items_are_global_search_view = false;
     app.global_search.active = false;
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     settle(&mut app, &ctx);
     let physical_generation = app.items_generation;
     app.ensure_current_folder_watch(&ctx);
@@ -1960,7 +1960,7 @@ fn section1375_direct_reader_both_forks_rebind_only_saved_physical_basis() {
             .excluded_extensions
             .insert("png".into());
         std::fs::write(folder.join("m.png"), b"excluded direct target").unwrap();
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         settle(&mut app, &ctx);
         let basis_rows = app.folder_observation.as_ref().unwrap().rows.clone();
         let basis_identity = app.page_identity_index.clone();
@@ -2127,7 +2127,7 @@ fn section1375_stack_flat_and_retained_aggregate_rebind_physical_record_for_equa
     let (mut app, folder, ctx) =
         fixture(&["post_1.jpg", "post_2.jpg", "post_3.jpg", "other_1.jpg"]);
     app.stack_mode_requested = true;
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     settle(&mut app, &ctx);
     let stack = app
         .items

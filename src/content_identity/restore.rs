@@ -1385,6 +1385,80 @@ mod tests {
     }
 
     #[test]
+    fn image_combine_content_restore_copies_recipe_and_invalidates_loaded_index() {
+        use crate::image_combine::store::{CombineIndex, load_recipe, save_recipe};
+        use crate::image_combine::{
+            CombineFormat, CombineItemSpec, CombineOptions, CombineRecipe, CombineSourceRef,
+        };
+        let data = tempfile::tempdir().unwrap();
+        let origin = data.path().join("original.png");
+        let target = data.path().join("copy.png");
+        std::fs::write(&origin, b"identical image bytes").unwrap();
+        std::fs::write(&target, b"identical image bytes").unwrap();
+        let original_key = crate::adjustment_db::normalize_path(&origin);
+        let target_key = crate::adjustment_db::normalize_path(&target);
+        let ledger = ContentIdentityDb::open_at(&data.path().join("content_identity.db")).unwrap();
+        for (path, role, edit_at) in [
+            (&origin, ObservationRole::RestorableContent, 10),
+            (&target, ObservationRole::DetectionCache, 0),
+        ] {
+            let metadata = std::fs::metadata(path).unwrap();
+            ledger
+                .upsert(
+                    &ContentIdentitySource::new(path, ContentKind::Image),
+                    &RecordedFileState {
+                        file_key: crate::adjustment_db::normalize_path(path),
+                        size: metadata.len(),
+                        hashed_mtime: metadata_mtime(&metadata).unwrap(),
+                    },
+                    "head",
+                    "same-full-hash",
+                    edit_at,
+                    role,
+                )
+                .unwrap();
+        }
+        drop(ledger);
+        let recipe = CombineRecipe {
+            v: 1,
+            options: CombineOptions::default(),
+            format: CombineFormat::Png,
+            items: vec![CombineItemSpec {
+                composition_identity: None,
+                annotation_space: None,
+                source: CombineSourceRef::File {
+                    path: data.path().join("private-source.png"),
+                },
+                label_override: Some("保存したラベル".into()),
+            }],
+        };
+        save_recipe(data.path(), &origin, &recipe).unwrap();
+        let mut index = CombineIndex::default();
+        index.set_keys_for_test(std::collections::HashSet::from([original_key]));
+        assert!(!index.contains_or_unloaded(&target_key));
+        let (candidate, source) =
+            candidate(origin, target.clone(), ContentKind::Image, "same-full-hash");
+        let report = restore_candidates_at(
+            data.path(),
+            &[SelectedRestore { candidate, source }],
+            &[],
+            false,
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.store_mutations.combine_index_stale());
+        assert_eq!(load_recipe(data.path(), &target).unwrap(), Some(recipe));
+        index.mark_stale();
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !index.contains_or_unloaded(&target_key) {
+            index.poll(data.path(), &ctx);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(index.contains_or_unloaded(&target_key));
+    }
+
+    #[test]
     fn restore_union_covers_sources_targets_virtual_families_and_declines() {
         use crate::pdf_loader::EpubPinCoverage;
 
@@ -1760,6 +1834,7 @@ mod tests {
                 .unwrap(),
         );
         drop(crate::comic_db::ComicDb::open_at(&data_dir.join("comic.db")).unwrap());
+        crate::image_combine::store::initialize_database_at(&data_dir.join("combine.db")).unwrap();
         drop(crate::export_crop::CropDb::open_at(&data_dir.join("export_crop.db")).unwrap());
         drop(
             crate::edit_preview_cache::EditPreviewCacheDb::open_at(
@@ -2238,8 +2313,8 @@ mod tests {
         let hundred = measure_batch_database_opens(100);
 
         assert_eq!(
-            one, 38,
-            "29 store copy + 1 origin batch + 8 runtime reads, including captions, endpoint, page-alone and shift placement"
+            one, 39,
+            "30 store copy (including combine recipes) + 1 origin batch + 8 runtime reads, including captions, endpoint, page-alone and shift placement"
         );
         assert_eq!(hundred, one, "DB open 回数を候補数に比例させない");
     }

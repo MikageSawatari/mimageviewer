@@ -8292,6 +8292,64 @@ mod tests {
     }
 
     #[test]
+    fn image_combine_recipes_are_excluded_from_metadata_export_and_import() {
+        use crate::image_combine::store::{load_recipe, save_recipe};
+        use crate::image_combine::{
+            CombineFormat, CombineItemSpec, CombineOptions, CombineRecipe, CombineSourceRef,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("images");
+        let source_data = temp.path().join("source-data");
+        let destination_data = temp.path().join("destination-data");
+        fs::create_dir_all(&root).unwrap();
+        init_data_dir(&source_data);
+        init_data_dir(&destination_data);
+        let output = root.join("joined.png");
+        fs::write(&output, b"image bytes").unwrap();
+        set_rating(&source_data, &output, 4);
+        let recipe = CombineRecipe {
+            v: 1,
+            options: CombineOptions::default(),
+            format: CombineFormat::Png,
+            items: vec![CombineItemSpec {
+                composition_identity: None,
+                annotation_space: None,
+                source: CombineSourceRef::File {
+                    path: temp.path().join("private-input.png"),
+                },
+                label_override: Some("PRIVATE-COMBINE-LABEL-904".into()),
+            }],
+        };
+        save_recipe(&source_data, &output, &recipe).unwrap();
+        let cancel = AtomicBool::new(false);
+        export_at(&source_data, &root, false, &cancel, no_progress).unwrap();
+        let bundle = root.join(SIDECAR_FILENAME);
+        let manifest = read_bundle_manifest(&root, &cancel).unwrap();
+        let shards = bundle_generation_dir(&bundle, &manifest.generation).join(SHARDS_DIRNAME);
+        for file in fs::read_dir(shards).unwrap() {
+            let text = fs::read_to_string(file.unwrap().path()).unwrap();
+            assert!(!text.contains("private-input.png"));
+            assert!(!text.contains("PRIVATE-COMBINE-LABEL-904"));
+            assert!(!text.contains("combine_recipes"));
+        }
+        let imported = import_at(&destination_data, &root, &cancel, no_progress).unwrap();
+        assert_eq!(imported.failed_entries, 0);
+        assert!(!destination_data.join("combine.db").exists());
+        assert!(load_recipe(&destination_data, &output).unwrap().is_none());
+        let mut destination_recipe = recipe.clone();
+        destination_recipe.items[0].label_override = Some("keep destination composition".into());
+        save_recipe(&destination_data, &output, &destination_recipe).unwrap();
+        let repeated = import_at(&destination_data, &root, &cancel, no_progress).unwrap();
+        assert_eq!(repeated.failed_entries, 0);
+        assert!(!repeated.committed.store_mutations.combine_index_stale());
+        assert_eq!(
+            load_recipe(&destination_data, &output).unwrap(),
+            Some(destination_recipe)
+        );
+        assert_eq!(load_recipe(&source_data, &output).unwrap(), Some(recipe));
+    }
+
+    #[test]
     fn derived_text_export_skips_unpublished_schema_and_reads_published_rows() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");

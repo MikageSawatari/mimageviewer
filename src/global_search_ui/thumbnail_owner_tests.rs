@@ -182,7 +182,7 @@ fn section1741_metadata_prepare_owner_replaced_before_ready_retries_and_adopts()
         if had_pool {
             let origin = app.tmp.path().join("origin");
             std::fs::create_dir(&origin).unwrap();
-            app.load_folder(origin);
+            app.load_folder_and_finish_for_test(origin);
             app.finish_page_identity_preparation_for_test();
         } else {
             app.enter_drive_list(None);
@@ -265,7 +265,7 @@ fn section1741_nonsearch_pool_capture_never_borrows_outgoing_resources() {
     let mut app = crate::app::setup_app_for_test();
     let folder = app.tmp.path().join("origin");
     std::fs::create_dir(&folder).unwrap();
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     app.finish_page_identity_preparation_for_test();
     let token = Arc::clone(&app.cancel_token);
     for catalog in [
@@ -561,11 +561,11 @@ fn section1741_search_pool_adoption_leaves_sibling_context_unchanged() {
         let sibling_folder = app.tmp.path().join("sibling");
         std::fs::create_dir(&origin).unwrap();
         std::fs::create_dir(&sibling_folder).unwrap();
-        app.load_folder(origin);
+        app.load_folder_and_finish_for_test(origin);
         app.finish_page_identity_preparation_for_test();
         let main_cancel = Arc::clone(&app.cancel_token);
         let sibling = app.build_window_context_for_test(1741, |mounted| {
-            mounted.load_folder(sibling_folder.clone());
+            mounted.load_folder_and_finish_for_test(sibling_folder.clone());
             mounted.finish_page_identity_preparation_for_test();
         });
         let (marker, cancel, queue, heavy_queue, cache, catalog, generation, ticket, items) = app

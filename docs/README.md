@@ -9,6 +9,7 @@
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
 | [folder-manual-order-plan.md](folder-manual-order-plan.md) | §1.911 フォルダごとの手動順。単一 DB actor と記録索引、context 所有状態、物理一覧の resolver、ソート UI とリセット、サムネイルの並べ替えドラッグ、Remote の読取専用表示。実装記録は各段の小節 |
+| [operation-script-plan.md](operation-script-plan.md) | §1.363 操作のスクリプト。段1〜5実装（段5は実装済み、自動検証・独立実装レビュー・設計担当の検収・実機は未確認）。環境設定の下書きと初回確認、単一FIFOのLoad/Open/Reset、状態表示と公開マニュアル。イベント可は同期32＋open限定2、動画の再生・ループ・全シーク9操作は不可。段4は関連253テスト成功・独立レビューACCEPT、費用の実測と実機は未実施。段5の確定設計は§4.1.1、段4の詳細は§16 |
 | [drive-tabs-793-plan.md](drive-tabs-793-plan.md) | §1.793 ツールバーのドライブ欄 (ドライブ別の最後の場所を常設ボタンから開く)。A/B の記録から導くドライブの集合、キー操作と共有するドライブ移動の worker 解決、置き場所・右クリック・利用者判断。設計段階、未実装 |
 | [folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) | §1.464 ツリー行への D&D と右クリック貼り付け、§1.821 一覧ドロップ。表示済み pass の形・ROOT OLE target・既定操作のボリューム確認・共有受付と転送 owner。generic Shell image と target description を使用。実装記録と未実施の検証は §14〜15 |
 | [grid-folder-drop-and-handle-release-plan.md](grid-folder-drop-and-handle-release-plan.md) | §1.858 B・2 / §1.860 (v5.7.0 予定、設計中)。移動・名前の変更・削除の前に mIV が持つ ZIP / PDF の handle を手放す「変更の囲い」、一覧の実フォルダのセルへのドロップ、外部からのドラッグ中の落とし先の強調と説明のバッジ |
@@ -27,6 +28,7 @@
 | [native-dependencies.md](native-dependencies.md) | CLAUDE.md から分けたネイティブ依存物の管理。vendor/ の復旧、PDFium・ONNX Runtime・Susie・FFmpeg・LibRaw・VST3 bridge の更新やビルド |
 | [release-checklist.md](release-checklist.md) | **リリース手順チェックリストの正本**と配布形態。リリース作業を始めるときに最初に全部読む |
 | [codex-cli-usage.md](codex-cli-usage.md) | Codex CLI でレビュー・実装を依頼するときの手順 (resume・stdin・出力の受け取り) |
+| [test-build-memory-plan.md](test-build-memory-plan.md) | 全体テストのビルドのメモリ対策 (§1.908 統合テストを `tests/integration.rs` の 1 crate に、§1.910 test-full の同時数上限 8、§1.909 は採らない)。計測の方法と結果、`--test <name>` から `--test integration <name>::` への読み替え |
 | [development-build-and-test-native.md](development-build-and-test-native.md) | Windows ネイティブ挙動の実機確認用バイナリと、検証起動時の設定データ保護 |
 | [git-workflow.md](git-workflow.md) | 整形・コミット・共有作業ツリー・worktree 撤去の運用 |
 | [v5-integration.md](v5-integration.md) | v5 系の統合順、merge 衝突の解消、統合後の検証と引き渡しの記録。master は v4 系に維持 |
@@ -162,6 +164,7 @@
 | [settings-export-import-plan.md](settings-export-import-plan.md) | **§1.317 実装済み (レビュー前)**。環境設定の持ち運び、全458フィールドの分類 (144対象 / 314除外、音響調整タスクバー設定追加後)、形式 v1、draft → 既存 OK、単一転送 job、利用者承認と検証計画。既存 OK の §1.305 / §1.295 は今回未修正 |
 | [comic-integration-plan.md](comic-integration-plan.md) | comic DB、注釈 overlay、編集・書き出しパイプラインの統合契約 |
 | [conceal-feature-plan.md](conceal-feature-plan.md) | 隠蔽加工の形状、保存、合成、キャッシュ無効化の現行仕様 |
+| [auto-conceal-detection-plan.md](auto-conceal-detection-plan.md) | §1.914 隠蔽加工のマスクを検出で自動作成する設計案 (同梱の顔検出 + 利用者が置く検出器)。公開モデルのライセンス調査を含む |
 | [depth-parallax-plan.md](depth-parallax-plan.md) | **設計・実装前レビュー待ち** (ブランチ `depth-parallax`)。「3D 写真」モード: 表示中テクスチャから深度を推定し視差シェーダで描く、パネル・マウス追従・GIF / APNG / MP4 書き出し、モデルの追加ダウンロード |
 | [depth-parallax-research.md](depth-parallax-research.md) | 3D 写真の調査とスパイク結果。既存製品の手法、モデルのライセンス、描画方式、所要時間・VRAM・fp16 化の計測 |
 | [panorama-360-view-plan.md](panorama-360-view-plan.md) | **コード実装済み・実素材／実機性能の手動確認は記録上未確認**。360° パノラマ表示、GPano crop、mipmap、settle refinement、fullscreen 合成の現行仕様と設計経緯 |
@@ -219,6 +222,7 @@
 | [external-tool-file-list-plan.md](external-tool-file-list-plan.md) | §1.329 の決定済み仕様。起動ごとの UTF-8 BOM なし / CRLF リスト、実体化 worker と一時成果物の所有、index を保持したフレーム分割準備、取消・限界・検証 |
 | [single-export-thumbnail-plan.md](single-export-thumbnail-plan.md) | §1.888 1 枚の書き出しの EXIF IFD1 除去、PNG Raw profile の共通処理、残る縮小画像の警告。export-888 で実装済み・master 未統合・実機未確認。設計・実装の独立レビュー ACCEPT。44dcac70f は共有 runner の lib (`save_with_metadata::` / `export_batch::tests::` / `ui_dialogs::export_batch::tests::` / `export_dialog::`) 139 件と `export_integration` 23 件が成功 |
 | [batch-export-plan.md](batch-export-plan.md) | **§1.362 段 A〜C のコード・回帰テスト追加、段 C のコンパイル・自動検証未実行**。グリッド選択の一括エクスポート (Ctrl+E) の出力選択・文字/画像の透かし・ロゴ確認と上書き保護、保存形式のプリセット。プリセットは設定一式の値を保存・呼び出し・削除し、設定の持ち運びから除外する |
+| [image-combine-plan.md](image-combine-plan.md) | §1.904 画像の結合。配置・ラベル・描画、専用worker・ダイアログ・一覧入口・設定とプリセット・保存通知。stage Cはcombine.dbへの構成保存・索引・やり直し・置き換え |
 | [sns-split-export-plan.md](sns-split-export-plan.md) | **P1〜P6 実装済み (2026-09-01)**。1 枚の絵を X / Instagram のカルーセル投稿用に 2〜20 枚へ切り分けて書き出す。`CropSettings` / `export_crop.db` には保存しない**一度きりのモード**として分離し、グループ矩形の操作だけを既存の `CropRect` と共有する。比率固定リサイズは反対辺 / 反対角を固定する共通挙動。**X の隙間を実測** (PC ブラウザ 1.588% / iOS アプリ 1.869% / モバイル Web 2.652%、隙間の絶対値は環境ごとに違う) し、枠幅比 **1.7% 固定**を採用。投稿先は X (3:4 / 1.7%) と Instagram (4:5 / 0%) の 2 択のみ。書き出しはパネルボタンから `ExportEntry` に crop を足し、既存の 1 スナップショット→N ファイル経路へ載せる。2x2 グリッドと縦並びは非対象 |
 | [clipboard-edited-copy-plan.md](clipboard-edited-copy-plan.md) | **§1.261 実装済み・レビュー前 (2026-10-28)**。右クリック「編集を反映した画像をコピー」。Ctrl+E と同じ source + 編集 snapshot の worker 合成を、焼き込み段の設定 (`bake_stage_clipboard`) まで通して CF_DIB へ置く。既存の「画像をクリップボードにコピー」は残す。job は 1 本、mIV 世代と OS のクリップボード世代で後のコピーを上書きしない |
 

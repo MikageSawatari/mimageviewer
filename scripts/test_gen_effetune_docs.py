@@ -597,19 +597,24 @@ class GenerationTests(unittest.TestCase):
         self.assertNotIn('refresh', text)
         self.assertIn('<link rel="canonical" href="https://mikage.to/mimageviewer/manual/sound/index.html">', text)
         self.assertIn('href="eq-15band-peq.html"', text)
-        self.assertEqual(text.count('mIV Sound v0.19.0-miv.1 の説明です。'), 1)
+        self.assertNotIn('v0.19.0-miv.1', text)
+        self.assertNotIn(' の説明です。', text)
 
-    def test_version_changes_only_index_body_and_never_urls_or_redirects(self):
+    def test_version_changes_validation_target_only_and_never_output_or_redirects(self):
         first_version, second_version = 'v0.19.0-miv.1', 'v1.2.3-beta.1'
         first = docs.generate(docs.DEFAULT_SOURCE, first_version)
         with workspace_temporary_directory() as temporary:
             snapshot = Path(temporary) / 'snapshot'
             shutil.copytree(docs.DEFAULT_SOURCE, snapshot)
+            with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound'):
+                docs.generate(snapshot, second_version)
             provenance = snapshot / 'SOURCE.md'
             text = provenance.read_text(encoding='utf-8')
             text, count = re.subn(r'^- mIV Sound: .+$', '- mIV Sound: ' + second_version[1:], text, flags=re.M)
             self.assertEqual(count, 1)
             provenance.write_text(text, encoding='utf-8')
+            with self.assertRaisesRegex(docs.ConversionError, 'associated with mIV Sound'):
+                docs.generate(snapshot, first_version)
             second = docs.generate(snapshot, second_version)
         self.assertEqual(set(first), set(second))
         self.assertEqual(docs.redirect_block(first), docs.redirect_block(second))
@@ -621,12 +626,9 @@ class GenerationTests(unittest.TestCase):
                                      re.findall(r'<link rel="canonical" href="([^"]+)"', after))
                     self.assertEqual(set(re.findall(r'href="([^"]+)"', before)),
                                      set(re.findall(r'href="([^"]+)"', after)))
-                if name == 'index.html':
-                    self.assertEqual(data.replace(first_version.encode(), second_version.encode()), second[name])
-                    self.assertNotEqual(data, second[name])
-                else:
-                    self.assertNotIn(first_version.encode(), data)
-                    self.assertEqual(data, second[name])
+                self.assertNotIn(first_version.encode(), data)
+                self.assertNotIn(second_version.encode(), second[name])
+                self.assertEqual(data, second[name])
 
     def test_parent_links_resolve_at_fixed_depth_and_missing_links_fail(self):
         output = docs.generate(docs.DEFAULT_SOURCE, 'v0.19.0-miv.1')

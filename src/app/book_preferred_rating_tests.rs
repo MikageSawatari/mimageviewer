@@ -299,7 +299,7 @@ fn book_preferred_loaded_extension_named_folders_do_not_write_or_record_undo() {
         .unwrap();
         // Open the real parent first: its adopted Folder row supplies the same
         // directory proof used when entering this cell from the normal grid.
-        app.load_folder(shelf);
+        app.load_folder_and_finish_for_test(shelf);
         app.settle_open_path_classification_for_test();
         app.finish_history_restore_preparation_for_test();
         app.finish_page_identity_preparation_for_test();
@@ -309,7 +309,7 @@ fn book_preferred_loaded_extension_named_folders_do_not_write_or_record_undo() {
             .position(|item| matches!(item, GridItem::Folder(path) if path == &folder))
             .expect("parent grid must adopt the real directory as a Folder cell");
         let folder_key = app.rating_path_key(folder_index).unwrap();
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.settle_open_path_classification_for_test();
         app.finish_history_restore_preparation_for_test();
         app.finish_page_identity_preparation_for_test();

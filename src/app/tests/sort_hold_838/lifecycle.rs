@@ -88,7 +88,7 @@ fn sort_hold_838_scan_error_releases_gate_without_replacing_rows() {
     let rows = h.env.items.clone();
     let generation = h.env.items_generation;
     let held = request_sort(&mut h.env, SortOrder::DurationAsc);
-    assert!(held.result.is_err());
+    assert!(held.result.scan.is_err());
     held.release();
     resolve_ready(&mut h.env, &h.ctx);
     assert!(h.env.folder_pane_open_pending.is_none());
@@ -220,7 +220,7 @@ fn direct_navigation_replacement(order: SortOrder) {
         None,
         StartupListIntent::ExplicitList,
         MainListRequestStage::Admission,
-        DirectoryScanRoute::Worker,
+        DirectoryScanRoute::MainWorker,
     );
     let direct = HeldScan::capture(&mut h.env);
     held.assert_retired();

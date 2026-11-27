@@ -1,6 +1,10 @@
 //! サムネイルグリッドの右クリックコンテキストメニュー。
 
 use eframe::egui;
+
+#[cfg(test)]
+#[path = "context_menu/image_combine_eligibility_tests.rs"]
+mod image_combine_eligibility_tests;
 use std::path::{Path, PathBuf};
 
 use crate::app::is_synthetic_view_path;
@@ -28,6 +32,8 @@ fn primary_mouse_button_physically_down() -> bool {
 /// だけが先に走るという順序の脆さを避ける (Codex P3)。
 #[derive(Debug)]
 pub(crate) enum ContextMenuAction {
+    /// A script uses the same deferred main-navigation dispatcher as other inputs.
+    ScriptNavigation(crate::ui_main::AddressBarNav),
     /// 検索結果・閲覧履歴・コレクション root から実フォルダへ着地する。
     /// source、destination、移動後の exact selection を一つの request に保持し、
     /// 優先度判定でこの action が勝った後だけ適用する。
@@ -73,12 +79,24 @@ pub(crate) struct JumpToFolderRequest {
 
 /// The grid menu belongs to one viewer context and one immutable item generation.
 /// An index alone can name another collection entry after an async install.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct GridContextMenuOwner {
     pub(crate) index: usize,
     pub(crate) context_id: crate::app::ViewerContextId,
     pub(crate) items_generation: u64,
+    /// Count-only admission snapshot for this menu open, capped at 101.
+    pub(crate) combine_target_count: usize,
 }
+
+// Derived menu snapshots do not change the existing owner identity.
+impl PartialEq for GridContextMenuOwner {
+    fn eq(&self, other: &Self) -> bool {
+        self.index == other.index
+            && self.context_id == other.context_id
+            && self.items_generation == other.items_generation
+    }
+}
+impl Eq for GridContextMenuOwner {}
 
 fn jump_to_folder_request(item: &GridItem) -> Option<JumpToFolderRequest> {
     use crate::grid_item::SearchContainerKind;
@@ -380,8 +398,15 @@ enum NativeGridContextMenuOutcome {
     Consumed {
         nav: Option<ContextMenuAction>,
         close_fullscreen: bool,
+        script_slot: Option<u8>,
     },
     Fallback,
+}
+
+#[derive(Default)]
+pub(crate) struct FsContextMenuResult {
+    pub(crate) close: bool,
+    pub(crate) script_slot: Option<u8>,
 }
 
 /// このコマンドを実行する前にフルスクリーンを抜けるか。
@@ -907,10 +932,10 @@ impl crate::app::App {
         &mut self,
         ctx: &egui::Context,
         action: crate::keymap::KeyAction,
-    ) {
+    ) -> bool {
         self.dispatch_copy_key_action_with(ctx, action, |app, ctx, command, target| {
             let _ = app.dispatch_native_grid_context_command(ctx, command, target);
-        });
+        })
     }
 
     fn dispatch_copy_key_action_with(
@@ -918,7 +943,7 @@ impl crate::app::App {
         ctx: &egui::Context,
         action: crate::keymap::KeyAction,
         dispatch: impl FnOnce(&mut Self, &egui::Context, MenuCommand, &NativeGridContextMenuTarget),
-    ) {
+    ) -> bool {
         use crate::keymap::KeyAction::*;
         let (surface, requested) = match action {
             GridCopyFiles => (ContextMenuSurface::Grid, MenuCommand::CopyFiles),
@@ -940,10 +965,10 @@ impl crate::app::App {
                 ContextMenuSurface::Fullscreen,
                 MenuCommand::CopyEditedImageToClipboard,
             ),
-            _ => return,
+            _ => return false,
         };
         if !self.grid_item_input_allowed() {
-            return;
+            return false;
         }
         let idx = match surface {
             ContextMenuSurface::Grid => self.selected.or_else(|| {
@@ -954,9 +979,9 @@ impl crate::app::App {
             }),
             ContextMenuSurface::Fullscreen => self.fullscreen_idx,
         };
-        let Some(idx) = idx else { return };
+        let Some(idx) = idx else { return false };
         let Some(item) = self.items.get(idx).cloned() else {
-            return;
+            return false;
         };
         let has_checked = surface == ContextMenuSurface::Grid && !self.checked.is_empty();
         let target = self.context_menu_target(idx, item, false, has_checked, None, surface, None);
@@ -965,9 +990,10 @@ impl crate::app::App {
         let Some(command) =
             command.or_else(|| (action == GridCopyFiles).then_some(MenuCommand::CopyFiles))
         else {
-            return;
+            return false;
         };
         dispatch(self, ctx, command, &target);
+        true
     }
 
     #[cfg(test)]
@@ -1044,11 +1070,16 @@ impl crate::app::App {
             index,
             context_id: self.collection_grid_context_id(),
             items_generation: self.items_generation,
+            combine_target_count: self.image_combine_target_count(
+                (index != usize::MAX).then_some(index),
+                index == usize::MAX,
+            ),
         }
     }
 
     pub(crate) fn grid_context_menu_owner_is_current(&self, owner: GridContextMenuOwner) -> bool {
-        (owner.index == usize::MAX || self.grid_item_input_allowed())
+        !self.detached_viewer_editing_blocks_grid_input()
+            && (owner.index == usize::MAX || self.grid_item_input_allowed())
             && owner.context_id == self.collection_grid_context_id()
             && owner.items_generation == self.items_generation
     }
@@ -1423,15 +1454,23 @@ impl crate::app::App {
                 NativeGridContextMenuOutcome::Consumed {
                     nav: None,
                     close_fullscreen: false,
+                    script_slot: None,
                 }
             }
             NativeContextMenuResult::MivCommand(command) => {
                 let close_fullscreen =
                     native_menu_command_closes_fullscreen(&command, target.surface);
-                let nav = self.dispatch_native_grid_context_command(ctx, command, target);
+                let script_slot =
+                    self.take_fullscreen_context_script_slot(&command, target.surface);
+                let nav = if script_slot.is_some() {
+                    None
+                } else {
+                    self.dispatch_native_grid_context_command(ctx, command, target)
+                };
                 NativeGridContextMenuOutcome::Consumed {
                     nav,
                     close_fullscreen,
+                    script_slot,
                 }
             }
             NativeContextMenuResult::Fallback { reason } => {
@@ -1617,6 +1656,19 @@ impl crate::app::App {
                     local: availability(crate::ui_pinned_search::PinnedSearchKind::Local),
                 }
             });
+        let combine_target_count = if target.surface == ContextMenuSurface::Grid {
+            self.context_menu_idx
+                .filter(|owner| {
+                    owner.index == target.item_index.unwrap_or(usize::MAX)
+                        && self.grid_context_menu_owner_is_current(*owner)
+                })
+                .map_or_else(
+                    || self.image_combine_target_count(target.item_index, target.is_folder_context),
+                    |owner| owner.combine_target_count,
+                )
+        } else {
+            0
+        };
         let input = ContextMenuInput {
             search_by_name,
             kind: ContextMenuItemKind::from_grid_item(&target.item),
@@ -1633,6 +1685,15 @@ impl crate::app::App {
             checked_count: target.checked_count,
             checked_file_operation_selection: target.checked_file_operation_selection,
             can_use_folder_commands: target.folder_command_target.is_some(),
+            combine_target_count,
+            combine_disabled_reason: if target.surface == ContextMenuSurface::Grid {
+                self.combine_disabled_reason_for_count(combine_target_count)
+            } else {None},
+            combine_reopen_visible: target.surface == ContextMenuSurface::Grid
+                && self.image_combine_reopen_visible(target.item_index, target.is_folder_context),
+            combine_reopen_disabled_reason: self.image_combine_reopen_disabled_reason(
+                target.item_index, target.is_folder_context,
+            ),
             caption_creation_disabled_reason: if target.surface == ContextMenuSurface::Grid {
                 self.caption_creation_disabled_reason(target.is_folder_context)
                     .map(str::to_owned)
@@ -1700,6 +1761,8 @@ impl crate::app::App {
                     ),
                 };
                 crate::context_menu_model::ContextMenuShortcutLabels {
+                    combine: self.keymap.first_chord_label(crate::keymap::KeyAction::GridCombineSelection),
+                    combine_reopen: self.keymap.first_chord_label(crate::keymap::KeyAction::GridCombineReopen),
                     cut: cut.and_then(|action| self.keymap.first_chord_label(action)),
                     copy: copy.and_then(|action| self.keymap.first_chord_label(action)),
                     organize: (target.surface == ContextMenuSurface::Grid)
@@ -1744,6 +1807,21 @@ impl crate::app::App {
                     disabled_reason: (!enabled)
                         .then(|| "現在開いている書庫・PDF・EPUB の本で使えます".to_owned()),
                 },
+            );
+        }
+        // Both renderers and both surfaces share these dynamic slot rows.
+        // The bookmark browser deliberately has no script submenu.
+        if !(target.surface == ContextMenuSurface::Grid && self.items_are_bookmark_view)
+            && self.settings.operation_script_enabled
+            && let crate::operation_script::OperationScriptState::Ready(script) =
+                &self.operation_script.state
+        {
+            crate::context_menu_model::append_script_slot_menu(
+                &mut nodes,
+                script
+                    .slots
+                    .iter()
+                    .map(|slot| (slot.number, slot.label.clone())),
             );
         }
         nodes
@@ -1901,6 +1979,31 @@ impl crate::app::App {
         ),
         G: FnOnce(&mut Self, &egui::Context, PathBuf),
     {
+        if target.surface == ContextMenuSurface::Grid
+            && self.detached_viewer_editing_blocks_grid_input()
+        {
+            self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+            return None;
+        }
+        if let MenuCommand::ScriptSlot(slot) = command {
+            if target.surface != ContextMenuSurface::Grid {
+                return None;
+            }
+            // Both native and egui selections enter here. End this menu owner
+            // before admission/evaluation, without carrying work to another frame.
+            self.context_menu_idx = None;
+            return match self.run_script_slot(
+                ctx,
+                slot,
+                crate::app::operation_script_runtime::ScriptInputSurface::Grid,
+                false,
+            ) {
+                crate::app::operation_script_runtime::ScriptRunResult::Grid { nav, .. } => {
+                    nav.map(ContextMenuAction::ScriptNavigation)
+                }
+                _ => None,
+            };
+        }
         if self.image_folder_zip_operation.is_some() {
             return None;
         }
@@ -1923,6 +2026,7 @@ impl crate::app::App {
             return None;
         }
         match command {
+            MenuCommand::ScriptSlot(_) => unreachable!("script slots are dispatched above"),
             MenuCommand::SearchByNameEverything
             | MenuCommand::SearchByNameMetadata
             | MenuCommand::SearchByNameLocal => {
@@ -1978,6 +2082,26 @@ impl crate::app::App {
             MenuCommand::DeleteTranscripts => {
                 if target.surface == ContextMenuSurface::Grid {
                     self.request_delete_transcripts(ctx, target.is_folder_context);
+                }
+                None
+            }
+            MenuCommand::CombineSelection => {
+                if target.surface == ContextMenuSurface::Grid {
+                    self.open_image_combine_context_dialog(
+                        ctx,
+                        target.item_index,
+                        target.is_folder_context,
+                    );
+                }
+                None
+            }
+            MenuCommand::CombineReopen => {
+                if target.surface == ContextMenuSurface::Grid {
+                    self.open_image_combine_reopen_context_dialog(
+                        ctx,
+                        target.item_index,
+                        target.is_folder_context,
+                    );
                 }
                 None
             }
@@ -2437,27 +2561,28 @@ impl crate::app::App {
 
     /// フルスクリーン表示中のコンテキストメニューを表示する。
     /// 移動なし右クリックでトリガーされる。
-    /// アプリケーション起動によりフルスクリーンを閉じるべき場合は true を返す。
-    pub(crate) fn show_fs_context_menu(&mut self, ctx: &egui::Context) -> bool {
+    /// 閉じる要求とスクリプトのスロットを描画の所有者へ返す。
+    pub(crate) fn show_fs_context_menu(&mut self, ctx: &egui::Context) -> FsContextMenuResult {
         if !self.fs_context_menu_presented() {
             self.fs_context_menu_idx = None;
-            return false;
+            return FsContextMenuResult::default();
         }
         let idx = match self.fs_context_menu_idx {
             Some(i) => i,
-            None => return false,
+            None => return FsContextMenuResult::default(),
         };
 
         let item = match self.items.get(idx) {
             Some(item) => item.clone(),
             None => {
                 self.fs_context_menu_idx = None;
-                return false;
+                return FsContextMenuResult::default();
             }
         };
 
         let mut close = false;
         let mut close_fullscreen = false;
+        let mut script_slot = None;
         let pos = self.fs_context_menu_pos;
         let explorer_folder = context_explorer_folder(&item, false, false, None);
 
@@ -2473,11 +2598,16 @@ impl crate::app::App {
             ContextMenuSurface::Fullscreen,
         ) {
             NativeGridContextMenuOutcome::Consumed {
-                close_fullscreen, ..
+                close_fullscreen,
+                script_slot,
+                ..
             } => {
                 self.fs_context_menu_idx = None;
                 ctx.request_repaint();
-                return close_fullscreen;
+                return FsContextMenuResult {
+                    close: close_fullscreen,
+                    script_slot,
+                };
             }
             NativeGridContextMenuOutcome::Fallback => {}
         }
@@ -2522,13 +2652,34 @@ impl crate::app::App {
             // フォールバックメニューにも同じ判断が別々に書かれていた (しかも
             // OpenWithAssociation は surface を見ずに常に閉じていた)。共有の述語へ寄せる。
             close_fullscreen = native_menu_command_closes_fullscreen(&command, target.surface);
-            let _ = self.dispatch_native_grid_context_command(ctx, command, &target);
+            script_slot = self.take_fullscreen_context_script_slot(&command, target.surface);
+            if script_slot.is_none() {
+                let _ = self.dispatch_native_grid_context_command(ctx, command, &target);
+            }
             close = true;
         }
         if close || !open {
             self.fs_context_menu_idx = None;
         }
-        close_fullscreen
+        FsContextMenuResult {
+            close: close_fullscreen,
+            script_slot,
+        }
+    }
+
+    fn take_fullscreen_context_script_slot(
+        &mut self,
+        command: &MenuCommand,
+        surface: ContextMenuSurface,
+    ) -> Option<u8> {
+        if surface == ContextMenuSurface::Fullscreen
+            && let MenuCommand::ScriptSlot(slot) = command
+        {
+            self.fs_context_menu_idx = None;
+            Some(*slot)
+        } else {
+            None
+        }
     }
     /// チェック済みアイテムの Shell ファイル操作対象 (idx, path) を収集する。
     ///
@@ -4538,6 +4689,327 @@ mod raw_clipboard_tests {
                 image.dimensions(),
                 (info.developed_dims[0], info.developed_dims[1])
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod operation_script_grid_menu_tests {
+    use super::*;
+
+    fn app_with_script() -> crate::app::AppTestEnvForTest {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.operation_script_enabled = true;
+        app.operation_script.state = crate::operation_script::OperationScriptState::Ready(Box::new(
+            crate::operation_script::CompiledOperationScript::compile(
+                r#"fn slots() { [#{slot:1,label:"一覧の操作",run:"entry"},#{slot:2,label:"",run:"entry"}] }
+                   fn entry(s) { if s.context == "grid" { #{run:[],notice:"一覧メニューから実行"} } else { [] } }"#,
+            )
+            .unwrap(),
+        ));
+        app.items = vec![GridItem::Folder(PathBuf::from(r"C:\media\folder"))];
+        app.selected = Some(0);
+        app
+    }
+
+    fn target(app: &crate::app::App, surface: ContextMenuSurface) -> NativeGridContextMenuTarget {
+        app.context_menu_target(0, app.items[0].clone(), false, false, None, surface, None)
+    }
+
+    #[test]
+    fn script_menu_is_shared_by_surfaces_and_renderers_and_excludes_bookmarks_and_off() {
+        let mut app = app_with_script();
+        let ctx = egui::Context::default();
+        let grid_target = target(&app, ContextMenuSurface::Grid);
+        let nodes = app.context_menu_nodes(&ctx, &grid_target, false);
+        assert!(nodes.iter().any(|node| matches!(
+            node,
+            MenuNode::Submenu { label, children }
+                if label == "スクリプト" && children == &vec![MenuNode::Item {
+                    command: MenuCommand::ScriptSlot(1),
+                    label: "スクリプト操作 1: 一覧の操作".into(),
+                    enabled: true,
+                    disabled_reason: None,
+                }]
+        )));
+        let fullscreen_target = target(&app, ContextMenuSurface::Fullscreen);
+        let fullscreen_nodes = app.context_menu_nodes(&ctx, &fullscreen_target, false);
+        assert!(fullscreen_nodes.iter().any(|node| matches!(node,
+            MenuNode::Submenu { label, .. } if label == "スクリプト")));
+        for (bookmark, enabled, menu_target) in
+            [(true, true, &grid_target), (false, false, &grid_target)]
+        {
+            app.items_are_bookmark_view = bookmark;
+            app.settings.operation_script_enabled = enabled;
+            let nodes = app.context_menu_nodes(&ctx, menu_target, false);
+            assert!(!nodes.iter().any(
+                |node| matches!(node, MenuNode::Submenu { label, .. } if label == "スクリプト")
+            ));
+        }
+        app.settings.operation_script_enabled = true;
+        app.operation_script.state =
+            crate::operation_script::OperationScriptState::Failed("読み込み失敗".into());
+        assert!(
+            !app.context_menu_nodes(&ctx, &grid_target, false)
+                .iter()
+                .any(
+                    |node| matches!(node, MenuNode::Submenu { label, .. } if label == "スクリプト")
+                )
+        );
+    }
+
+    #[test]
+    fn native_and_egui_grid_script_selection_close_menu_before_same_frame_evaluation() {
+        for native in [false, true] {
+            let mut app = app_with_script();
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput::default());
+            app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+            // The pre-input phase can already have classified this menu owner.
+            // Script admission must use the state after ending the chosen menu.
+            let _ = app.keyboard_owner_for_pass(&ctx);
+            let target = target(&app, ContextMenuSurface::Grid);
+            if native {
+                assert!(matches!(
+                    app.dispatch_native_context_menu_result(
+                        &ctx,
+                        NativeContextMenuResult::MivCommand(MenuCommand::ScriptSlot(1)),
+                        &target,
+                    ),
+                    NativeGridContextMenuOutcome::Consumed {
+                        nav: None,
+                        close_fullscreen: false,
+                        script_slot: None
+                    }
+                ));
+            } else {
+                // show_context_menu's egui selected-command branch uses this same handler.
+                assert!(
+                    app.dispatch_native_grid_context_command(
+                        &ctx,
+                        MenuCommand::ScriptSlot(1),
+                        &target
+                    )
+                    .is_none()
+                );
+            }
+            assert!(app.context_menu_idx.is_none());
+            assert!(
+                app.fs_feedback_toast
+                    .as_ref()
+                    .unwrap()
+                    .0
+                    .contains("一覧メニューから実行"),
+                "native={native}"
+            );
+            let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
+        }
+    }
+
+    #[test]
+    fn fullscreen_script_menu_native_and_egui_selection_return_slot_after_closing() {
+        for native in [false, true] {
+            let mut app = app_with_script();
+            let ctx = egui::Context::default();
+            app.fullscreen_idx = Some(0);
+            app.fs_context_menu_idx = Some(0);
+            let target = target(&app, ContextMenuSurface::Fullscreen);
+            let before = app.settings.grid_cols;
+            let slot = if native {
+                match app.dispatch_native_context_menu_result(
+                    &ctx,
+                    NativeContextMenuResult::MivCommand(MenuCommand::ScriptSlot(1)),
+                    &target,
+                ) {
+                    NativeGridContextMenuOutcome::Consumed {
+                        nav: None,
+                        close_fullscreen: false,
+                        script_slot,
+                    } => script_slot,
+                    other => panic!("unexpected result: {other:?}"),
+                }
+            } else {
+                app.take_fullscreen_context_script_slot(&MenuCommand::ScriptSlot(1), target.surface)
+            };
+            assert_eq!(slot, Some(1));
+            assert!(app.fs_context_menu_idx.is_none());
+            assert_eq!(
+                app.settings.grid_cols, before,
+                "only the drawing owner may evaluate"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_media_script_menu_uses_named_rows_and_evaluates_only_after_selection_closes() {
+        for music in [false, true] {
+            let mut app = app_with_script();
+            let path = PathBuf::from(if music {
+                r"C:\script-menu\audio.mp3"
+            } else {
+                r"C:\script-menu\video.mp4"
+            });
+            app.items = vec![if music {
+                GridItem::Audio(path.clone())
+            } else {
+                GridItem::Video(path.clone())
+            }];
+            app.visible_indices = vec![0];
+            app.current_folder = Some(r"C:\script-menu".into());
+            app.fullscreen_idx = Some(0);
+            app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+            app.fs_cache.insert(
+                0,
+                crate::fs_animation::FsCacheEntry::Video {
+                    player: Box::new(
+                        crate::video::VideoPlayer::stream_ready_disconnected_for_test(path),
+                    ),
+                    load_seq: 0,
+                },
+            );
+            app.operation_script.state =
+                crate::operation_script::OperationScriptState::Ready(Box::new(
+                    crate::operation_script::CompiledOperationScript::compile(
+                        r#"fn slots() { [#{slot:1,label:"再生音",run:"entry"}] }
+                       fn entry(s) { if s.context != "fs_video" { s.api / 0; }
+                         #{run:["VideoMute"],notice:"menu video done"} }"#,
+                    )
+                    .unwrap(),
+                ));
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput::default());
+            app.fs_context_menu_idx = Some(0);
+            let menu_target = target(&app, ContextMenuSurface::Fullscreen);
+            let nodes = app.context_menu_nodes(&ctx, &menu_target, false);
+            assert!(nodes.iter().any(|node| matches!(node,
+                MenuNode::Submenu { label, children }
+                    if label == "スクリプト" && children.iter().any(|node| matches!(node,
+                        MenuNode::Item { command: MenuCommand::ScriptSlot(1), label, .. }
+                            if label.contains("再生音"))))));
+            let _ = app.keyboard_owner_for_pass(&ctx);
+            let slot = match app.dispatch_native_context_menu_result(
+                &ctx,
+                NativeContextMenuResult::MivCommand(MenuCommand::ScriptSlot(1)),
+                &menu_target,
+            ) {
+                NativeGridContextMenuOutcome::Consumed {
+                    script_slot: Some(slot),
+                    close_fullscreen: false,
+                    nav: None,
+                } => slot,
+                other => panic!("unexpected selection: {other:?}"),
+            };
+            assert!(app.fs_context_menu_idx.is_none());
+            assert!(!app.video_session_muted, "selection only returns a request");
+            let result = app.run_script_slot(
+                &ctx,
+                slot,
+                crate::app::operation_script_runtime::ScriptInputSurface::Viewer,
+                false,
+            );
+            if music {
+                assert!(matches!(
+                    result,
+                    crate::app::operation_script_runtime::ScriptRunResult::Fullscreen {
+                        rejected: false,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    crate::app::operation_script_runtime::ScriptRunResult::NativeVideo {
+                        rejected: false
+                    }
+                ));
+            }
+            assert!(app.video_session_muted);
+            assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, "menu video done");
+            ctx.end_pass().drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn shared_copy_dispatch_reports_accepted_and_unsupported_targets() {
+        let mut app = app_with_script();
+        let ctx = egui::Context::default();
+        let mut called = false;
+        assert!(!app.dispatch_copy_key_action_with(
+            &ctx,
+            crate::keymap::KeyAction::GridCopyImage,
+            |_, _, _, _| called = true,
+        ));
+        assert!(!called);
+        assert!(app.dispatch_copy_key_action_with(
+            &ctx,
+            crate::keymap::KeyAction::GridCopyPath,
+            |_, _, command, _| {
+                called = true;
+                assert_eq!(command, MenuCommand::CopyPath);
+            },
+        ));
+        assert!(called);
+        app.selected = None;
+        assert!(!app.dispatch_copy_key_action_with(
+            &ctx,
+            crate::keymap::KeyAction::GridCopyPath,
+            |_, _, _, _| panic!("no selection must not dispatch"),
+        ));
+    }
+
+    #[test]
+    fn grid_script_menu_returns_navigation_to_existing_context_dispatcher() {
+        for native in [false, true] {
+            let mut app = app_with_script();
+            let destination = PathBuf::from(r"C:\script-menu-target");
+            app.settings.favorites = vec![crate::settings::FavoriteEntry::new(
+                "移動先".into(),
+                destination.clone(),
+            )];
+            app.operation_script.state =
+                crate::operation_script::OperationScriptState::Ready(Box::new(
+                    crate::operation_script::CompiledOperationScript::compile(
+                        r#"fn slots() { [#{slot:1,label:"移動",run:"entry"}] }
+                       fn entry(s) { ["GridOpenFavorite1"] }"#,
+                    )
+                    .unwrap(),
+                ));
+            let ctx = egui::Context::default();
+            ctx.begin_pass(egui::RawInput::default());
+            app.context_menu_idx = Some(app.capture_grid_context_menu_owner(0));
+            let target = target(&app, ContextMenuSurface::Grid);
+            let folder_before = app.current_folder.clone();
+            let nav = if native {
+                match app.dispatch_native_context_menu_result(
+                    &ctx,
+                    NativeContextMenuResult::MivCommand(MenuCommand::ScriptSlot(1)),
+                    &target,
+                ) {
+                    NativeGridContextMenuOutcome::Consumed {
+                        nav,
+                        close_fullscreen: false,
+                        script_slot: None,
+                    } => nav,
+                    other => panic!("unexpected menu result: {other:?}"),
+                }
+            } else {
+                app.dispatch_native_grid_context_command(&ctx, MenuCommand::ScriptSlot(1), &target)
+            };
+            assert!(
+                matches!(
+                    nav,
+                    Some(ContextMenuAction::ScriptNavigation(crate::ui_main::AddressBarNav::WorkerFavorite(path)))
+                        if path == destination
+                ),
+                "native={native}"
+            );
+            assert!(app.context_menu_idx.is_none());
+            assert!(
+                app.current_folder == folder_before,
+                "navigation must remain with the caller"
+            );
+            let _ = crate::test_ui::headless_paint_output(ctx.end_pass());
         }
     }
 }
@@ -7610,7 +8082,8 @@ mod search_by_name_menu_tests {
                     ),
                     NativeGridContextMenuOutcome::Consumed {
                         nav: None,
-                        close_fullscreen: false
+                        close_fullscreen: false,
+                        script_slot: None
                     }
                 ));
                 assert_draft_only(&app, kind);

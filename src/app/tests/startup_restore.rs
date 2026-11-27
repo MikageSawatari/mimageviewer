@@ -66,6 +66,7 @@ fn assert_physical(app: &App, path: &Path, prefix: Option<&str>) {
 
 fn settle_book(app: &mut App) {
     phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(app);
+    app.finish_direct_navigation_scan_for_test();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while app.zip_enumerate_pending.is_some() {
         app.poll_zip_enumerate();
@@ -129,7 +130,7 @@ fn book_env() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf) {
     env.settings.startup_folder_mode = crate::settings::StartupFolderMode::Previous;
     env.settings.auto_fullscreen_zip_pdf = true;
     env.settings.restore_last_cursor = true;
-    env.load_folder(parent.clone());
+    env.load_folder_and_finish_for_test(parent.clone());
     env.finish_page_identity_preparation_for_test();
     assert_physical(&env, &parent, None);
     (env, parent, book)
@@ -456,6 +457,7 @@ fn section1335_single_image_startup_and_required_page_scan_do_not_adopt_parent_l
                 OpenRequestOwner::Navigation,
                 StartupListIntent::PageContinuation
             ));
+            env.finish_direct_navigation_scan_for_test();
             env.finish_page_identity_preparation_for_test();
             env.open_fullscreen(0, HistoryTrigger::UserChosen);
             env.open_required_fullscreen_location(
@@ -558,7 +560,7 @@ fn section1335_subfolder_scan_reinstall_and_read_close_preserve_parent_cursor() 
     std::fs::create_dir_all(&child).unwrap();
     let page = child.join("aggregate.png");
     std::fs::write(&page, png_bytes()).unwrap();
-    env.load_folder(parent.clone());
+    env.load_folder_and_finish_for_test(parent.clone());
     env.finish_page_identity_preparation_for_test();
     env.selected = env
         .items
@@ -1012,6 +1014,7 @@ fn section1335_collection_root_child_and_descendant_use_adopted_physical_locatio
                 StartupListIntent::ExplicitList
             }
         ));
+        env.finish_direct_navigation_scan_for_test();
         env.finish_page_identity_preparation_for_test();
         assert_eq!(env.effective_folder().as_ref(), Some(&child));
         if direct {
@@ -1034,6 +1037,7 @@ fn section1335_collection_root_child_and_descendant_use_adopted_physical_locatio
             OpenRequestOwner::CollectionGridPhysical(owner),
             StartupListIntent::ExplicitList
         ));
+        env.finish_direct_navigation_scan_for_test();
         env.finish_page_identity_preparation_for_test();
         assert_eq!(env.effective_folder().as_ref(), Some(&descendant));
         assert_physical(&env, &descendant, None);
@@ -1137,6 +1141,7 @@ fn section1335_flat_filename_stack_acceptance_never_persists_member_name_as_aggr
         OpenRequestOwner::Navigation,
         StartupListIntent::PageContinuation
     ));
+    env.finish_direct_navigation_scan_for_test();
     env.finish_page_identity_preparation_for_test();
     assert_physical(&env, &parent, None);
     let view = std::sync::Arc::new(StackView::build(
@@ -1219,6 +1224,7 @@ fn section1335_tray_persistence_and_restore_keep_reading_session_and_parent_list
         OpenRequestOwner::Navigation,
         StartupListIntent::PageContinuation
     ));
+    env.finish_direct_navigation_scan_for_test();
     env.finish_page_identity_preparation_for_test();
     let index = env
         .items
@@ -1305,7 +1311,7 @@ fn direct_tray_book_env() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf) {
     env.settings.video_in_window_mode = false;
     env.settings.detached_viewer_open_images_in_window = false;
     env.settings.book_open_resume = crate::settings::ResumeMode::Resume;
-    env.load_folder(parent.clone());
+    env.load_folder_and_finish_for_test(parent.clone());
     env.finish_page_identity_preparation_for_test();
     let index = env
         .items
@@ -1557,7 +1563,7 @@ fn section1335_grid_folder_candidate_classifies_mixed_and_image_only_without_mai
         if mixed {
             std::fs::create_dir_all(child.join("nested")).unwrap();
         }
-        env.load_folder(parent.clone());
+        env.load_folder_and_finish_for_test(parent.clone());
         env.finish_page_identity_preparation_for_test();
         env.settings.detached_viewer_open_images_in_window = true;
         env.settings.auto_fullscreen_image_folders = true;
@@ -1694,6 +1700,7 @@ fn section1335_native_back_to_list_caller_rejects_repeat_and_accepts_explicit_pr
         OpenRequestOwner::Navigation,
         StartupListIntent::PageContinuation
     ));
+    env.finish_direct_navigation_scan_for_test();
     env.finish_page_identity_preparation_for_test();
     let index = env
         .items
@@ -1825,6 +1832,7 @@ fn section1335_required_virtual_zip_exact_page_success_and_missing_page_keep_par
             OpenRequestOwner::Navigation,
             StartupListIntent::PageContinuation
         ));
+        env.finish_direct_navigation_scan_for_test();
         env.finish_page_identity_preparation_for_test();
         env.open_fullscreen(0, HistoryTrigger::UserChosen);
         let before = env.settings.startup_list_restore.clone();
@@ -1931,6 +1939,7 @@ fn section1335_reading_empty_normal_folder_then_inner_zip_keeps_restore_at_each_
         OpenRequestOwner::Navigation,
         StartupListIntent::PageContinuation
     ));
+    env.finish_direct_navigation_scan_for_test();
     assert_eq!(env.current_folder.as_ref(), Some(&folder));
     assert!(
         env.items
@@ -2060,7 +2069,7 @@ fn section1335_pending_grid_candidate_setting_change_uses_completed_scan_main_in
         let child = parent.join("slow-image-candidate");
         std::fs::create_dir_all(&child).unwrap();
         std::fs::write(child.join("page.png"), png_bytes()).unwrap();
-        env.load_folder(parent.clone());
+        env.load_folder_and_finish_for_test(parent.clone());
         env.finish_page_identity_preparation_for_test();
         env.settings.detached_viewer_open_images_in_window = true;
         env.settings.auto_fullscreen_image_folders = true;
@@ -2128,6 +2137,7 @@ fn section1335_filtered_search_with_retained_physical_path_keeps_parent_cursor_o
         OpenRequestOwner::Navigation,
         StartupListIntent::PageContinuation
     ));
+    env.finish_direct_navigation_scan_for_test();
     let before = env.settings.startup_list_restore.clone();
     env.open_global_search();
     env.global_search
@@ -2182,7 +2192,7 @@ fn section1335_departing_same_items_page_open_captures_list_cursor_before_page_n
             for name in &names {
                 std::fs::write(folder.join(name), png_bytes()).unwrap();
             }
-            env.load_folder(folder.clone());
+            env.load_folder_and_finish_for_test(folder.clone());
             env.finish_page_identity_preparation_for_test();
             folder
         };
@@ -2295,7 +2305,7 @@ fn section1335_synthetic_install_captures_changed_physical_departure_without_man
         for index in 0..18 {
             std::fs::write(folder.join(format!("page-{index:02}.png")), png_bytes()).unwrap();
         }
-        env.load_folder(folder.clone());
+        env.load_folder_and_finish_for_test(folder.clone());
         env.finish_page_identity_preparation_for_test();
         let selected = env
             .items
@@ -2417,7 +2427,7 @@ fn section1335_similar_exact_page_move_preserves_accepted_departure_before_physi
     let requested = target.join("requested.png");
     std::fs::write(&requested, png_bytes()).unwrap();
     std::fs::write(target.join("other.png"), png_bytes()).unwrap();
-    env.load_folder(source.clone());
+    env.load_folder_and_finish_for_test(source.clone());
     env.finish_page_identity_preparation_for_test();
     env.selected = Some(12);
     set_departure_grid_geometry(&mut env);
@@ -2477,7 +2487,7 @@ fn section1335_favorite_reading_sibling_fallbacks_preserve_last_accepted_physica
         let (mut env, parent, old_book) = book_env();
         let departing_page = parent.join("departing.png");
         std::fs::write(&departing_page, png_bytes()).unwrap();
-        env.load_folder(parent.clone());
+        env.load_folder_and_finish_for_test(parent.clone());
         env.finish_page_identity_preparation_for_test();
         env.selected = env
             .items
@@ -2567,6 +2577,7 @@ fn section1335_collection_root_return_from_page_b_retains_departing_list_page_a(
         OpenRequestOwner::CollectionGridPhysical(owner),
         StartupListIntent::ExplicitList,
     ));
+    env.finish_direct_navigation_scan_for_test();
     env.finish_page_identity_preparation_for_test();
     env.selected = env.items.iter().position(|item| item.name() == "a.png");
     assert!(
@@ -2753,6 +2764,7 @@ fn section1335_bookshelf_compiled_folder_direct_read_and_explicit_list_restart_d
         env.settings.auto_fullscreen_zip_pdf = true;
         env.settings.auto_fullscreen_image_folders = direct;
         env.open_books_root();
+        env.finish_direct_navigation_scan_for_test();
         env.finish_page_identity_preparation_for_test();
         assert_eq!(env.current_folder.as_ref(), Some(&root));
         assert!(env.fullscreen_idx.is_none());
@@ -2763,24 +2775,22 @@ fn section1335_bookshelf_compiled_folder_direct_read_and_explicit_list_restart_d
             .position(|item| matches!(item, GridItem::Folder(path) if path == &child))
             .unwrap();
         env.selected = Some(index);
-        let Some(crate::ui_main::AddressBarNav::Direct(path, restore_intent)) =
+        let Some(crate::ui_main::AddressBarNav::GridFolder(intent)) =
             env.handle_gamepad_grid_accept(&egui::Context::default())
         else {
             panic!("compiled Folder uses ordinary accepted main-grid direct navigation");
         };
         let root_departure = env.settings.startup_list_restore.clone();
         assert_eq!(restore_cursor(&env).unwrap().name, "Compiled");
-        assert_eq!(env.pending_auto_fs_open, direct);
+        // §6.6(11a): admission now gives the reservation to the typed request;
+        // it must not leak through App while a worker is waiting or the request is dropped.
+        assert_eq!(intent.effects.auto_fullscreen, direct);
+        assert!(!env.pending_auto_fs_open);
         // Use the same accepted Folder dispatch as the main input tail. Explicit archive-only
         // PageList/PageFullscreen commands do not accept Folder rows.
-        env.open_direct_navigation_target(
-            path,
-            None,
-            OpenRequestOwner::Navigation,
-            None,
-            None,
-            restore_intent,
-        );
+        assert!(env.apply_fullscreen_close_nav_immediate(
+            crate::ui_main::AddressBarNav::GridFolder(intent)
+        ));
         settle_book(&mut env);
         assert_eq!(env.current_folder.as_ref(), Some(&child));
         assert!(
@@ -2873,26 +2883,23 @@ fn section1335_collection_and_rating_folder_carriers_keep_owner_and_open_intent(
         for auto in [true, false] {
             let nav = env.grid_physical_navigation(index, child.clone(), auto);
             let expected = StartupListIntent::container_open(auto);
-            match &nav {
-                crate::ui_main::AddressBarNav::CollectionSource {
-                    path,
-                    owner,
-                    restore_intent,
-                } => {
+            let crate::ui_main::AddressBarNav::GridFolder(intent) = &nav else {
+                panic!("physical Folder must carry its deferred effects");
+            };
+            let path = &intent.path;
+            let restore_intent = StartupListIntent::container_open(intent.effects.auto_fullscreen);
+            match &intent.source {
+                GridVirtualOpenSource::Collection(owner) => {
                     assert!(collection);
                     assert_eq!(path, &child);
                     assert!(env.collection_grid_physical_load_owner_is_current(owner, path));
-                    assert_eq!(restore_intent, &expected);
+                    assert_eq!(restore_intent, expected);
                 }
-                crate::ui_main::AddressBarNav::RatingSource {
-                    path,
-                    owner,
-                    restore_intent,
-                } => {
+                GridVirtualOpenSource::Rating(owner) => {
                     assert!(!collection);
                     assert_eq!(path, &child);
                     assert!(env.rating_physical_load_owner_is_current(owner, path));
-                    assert_eq!(restore_intent, &expected);
+                    assert_eq!(restore_intent, expected);
                 }
                 _ => panic!("physical Folder retains its Collection or Rating owner"),
             }
@@ -2947,16 +2954,34 @@ fn section1335_rating_folder_auto_request_records_the_actual_settled_physical_li
         env.handle_gamepad_grid_accept(&egui::Context::default())
             .is_some()
     );
-    assert!(env.pending_auto_fs_open);
+    // §6.6(11a): the reservation belongs to each GridFolder request, not App.
+    assert!(!env.pending_auto_fs_open);
     let nav = env.grid_physical_navigation(index, child.clone(), true);
     assert!(matches!(
         &nav,
-        crate::ui_main::AddressBarNav::RatingSource {
-            restore_intent: StartupListIntent::ClassifyFolder,
-            ..
-        }
+        crate::ui_main::AddressBarNav::GridFolder(intent)
+            if matches!(intent.source, GridVirtualOpenSource::Rating(_))
+                && StartupListIntent::container_open(intent.effects.auto_fullscreen)
+                    == StartupListIntent::ClassifyFolder
     ));
     assert!(env.apply_fullscreen_close_nav_immediate(nav));
+    let Some(HistoryNavigationTransition::Physical(request)) =
+        env.top_level_grid_view.history_navigation_transition()
+    else {
+        panic!("Rating Folder keeps its staged physical landing");
+    };
+    assert!(matches!(
+        request.intent,
+        PhysicalHistoryIntent::Rating { .. }
+    ));
+    assert_eq!(request.restore_intent, StartupListIntent::ClassifyFolder);
+    assert!(
+        request
+            .grid_open_effects
+            .as_ref()
+            .is_some_and(|effects| effects.auto_fullscreen),
+        "capture preserves the requested auto-open intent; the Rating Folder adoption keeps its released list policy"
+    );
     assert_eq!(env.settings.startup_list_restore, before);
     assert_physical(&env, &parent, None);
     settle_book(&mut env);
@@ -2965,6 +2990,7 @@ fn section1335_rating_folder_auto_request_records_the_actual_settled_physical_li
         env.fullscreen_idx.is_none(),
         "released Rating Folder execution settles as a list"
     );
+    assert!(!env.pending_auto_fs_open);
     assert_physical(&env, &child, None);
     let adopted = env.settings.startup_list_restore.clone();
     env.on_exit_inner();
@@ -3141,6 +3167,7 @@ fn section1335_video_ring_close_accepts_current_folder_list_for_exit_and_restart
         OpenRequestOwner::Navigation,
         StartupListIntent::PageContinuation,
     ));
+    env.finish_direct_navigation_scan_for_test();
     env.finish_page_identity_preparation_for_test();
     let index = env
         .items
@@ -3209,6 +3236,7 @@ fn extra_video_close_env() -> (phase_c_support::AppTestEnv, PathBuf, PathBuf, us
         OpenRequestOwner::Navigation,
         StartupListIntent::PageContinuation,
     ));
+    env.finish_direct_navigation_scan_for_test();
     env.finish_page_identity_preparation_for_test();
     let index = env
         .items
@@ -3421,7 +3449,7 @@ fn section1335_tray_converted_book_returns_logical_source_parent_and_preserves_r
             false,
         )
         .unwrap();
-    env.load_folder(parent.clone());
+    env.load_folder_and_finish_for_test(parent.clone());
     env.finish_page_identity_preparation_for_test();
     env.selected = env
         .items
@@ -3469,7 +3497,7 @@ fn section1335_tray_direct_book_with_unrelated_saved_parent_keeps_book_list_and_
     let (mut env, parent, book) = book_env();
     let unrelated = env.tmp.path().join("unrelated-parent");
     std::fs::create_dir_all(&unrelated).unwrap();
-    env.load_folder(unrelated.clone());
+    env.load_folder_and_finish_for_test(unrelated.clone());
     env.finish_page_identity_preparation_for_test();
     let before = env.settings.startup_list_restore.clone();
     open_zip(&mut env, &book, true);
@@ -3551,16 +3579,23 @@ fn section1335_tray_smart_book_with_matching_physical_parent_keeps_book_list_and
 #[cfg(windows)]
 fn open_selected_image_folder_book(app: &mut App, book: &Path) {
     app.finish_page_identity_preparation_for_test();
-    let Some(crate::ui_main::AddressBarNav::Direct(path, intent)) =
+    let Some(crate::ui_main::AddressBarNav::GridFolder(intent)) =
         app.handle_gamepad_grid_accept(&egui::Context::default())
     else {
         panic!("an ordinary image Folder uses accepted main-grid direct navigation");
     };
-    assert_eq!(path, book);
-    assert_eq!(intent, StartupListIntent::ClassifyFolder);
-    assert!(app.pending_auto_fs_open);
+    assert_eq!(intent.path, book);
+    assert_eq!(
+        StartupListIntent::container_open(intent.effects.auto_fullscreen),
+        StartupListIntent::ClassifyFolder
+    );
+    // §6.6(11a): the request owns the reservation until its accepted scan completes.
+    assert!(intent.effects.auto_fullscreen);
+    assert!(!app.pending_auto_fs_open);
     // Match App::update's Folder dispatch and its existing completed-scan book classifier.
-    app.open_direct_navigation_target(path, None, OpenRequestOwner::Navigation, None, None, intent);
+    assert!(
+        app.apply_fullscreen_close_nav_immediate(crate::ui_main::AddressBarNav::GridFolder(intent))
+    );
     settle_book(app);
     assert_eq!(app.current_folder.as_deref(), Some(book));
     assert!(app.fullscreen_idx.is_some());
@@ -3593,7 +3628,7 @@ fn direct_tray_image_folder_book_env() -> (phase_c_support::AppTestEnv, PathBuf,
     env.settings.detached_viewer_open_images_in_window = false;
     env.settings.video_in_window_mode = false;
     env.settings.sort_order = crate::settings::SortOrder::FileName;
-    env.load_folder(parent.clone());
+    env.load_folder_and_finish_for_test(parent.clone());
     env.finish_page_identity_preparation_for_test();
     let index = env
         .items
@@ -3646,7 +3681,7 @@ fn section1795_off_image_folder_book_resumes_and_closes_to_same_list() {
     phase_c_support::wait_for_book_resume_write(&env, &book);
     assert_eq!(env.book_resume_db.as_ref().unwrap().get(&book), Some(1));
     env.select_after_load = Some("book".into());
-    env.load_folder(parent);
+    env.load_folder_and_finish_for_test(parent);
     env.finish_page_identity_preparation_for_test();
     open_selected_image_folder_book(&mut env, &book);
     assert_eq!(env.fullscreen_idx, Some(1));
@@ -3801,12 +3836,14 @@ fn section1335_tray_image_folder_book_setting_changed_in_f12_returns_parent_and_
     assert_eq!(env.grid_scroll.row_anchor(), Some(2));
     assert_eq!(env.settings.startup_list_restore, before);
     // A later open uses the new preference, while the saved reading position survives.
-    let Some(crate::ui_main::AddressBarNav::Direct(path, intent)) =
+    let Some(crate::ui_main::AddressBarNav::GridFolder(intent)) =
         env.handle_gamepad_grid_accept(&egui::Context::default())
     else {
         panic!("image folder reopen is ordinary grid navigation");
     };
-    env.open_direct_navigation_target(path, None, OpenRequestOwner::Navigation, None, None, intent);
+    assert!(
+        env.apply_fullscreen_close_nav_immediate(crate::ui_main::AddressBarNav::GridFolder(intent))
+    );
     settle_book(&mut env);
     assert_eq!(env.current_folder.as_ref(), Some(&book));
     assert!(env.fullscreen_idx.is_none());

@@ -19,15 +19,76 @@ Remote 取得では明示入力だけ延期し、既定の場所は既存の返�
 main の走査中だけ旧一覧の項目入力を止め、500 ms 後に既存の移動待ち表示を出す。解決中と兄弟 context は止めない。
 400 ms のパス確認通知は解決中だけとし、走査とその継続はブックマークの45秒の解決期限に数えない。
 検索外の `dispatch_location_jump` / `dispatch_address_input` の Physical も既存 `DirectNavigation` worker に載せる。
-通常の一覧フォルダ open・親移動・読み直し・「元の場所へ」は今回変更しない。
+§1.853 の C・D・E は、`load_folder_with_scan_claimed_with_search_origin` の唯一の未走査分岐で
+main の既定を worker へ反転した。フォルダを開く・親移動・コレクションの物理元・ダイアログ・本棚・
+検索の戻り／兄弟移動・合成一覧からの退出・ZIP 作成後の親・「元の場所へ」も、同じ呼び出しの引数を
+`DirectNavigationContinuation` に保持し、走査済みの同じ呼び出しで採用する。受付と test-script の要求数は一度だけ。
+走査の前後と採用前の policy／Susie 世代の照合は起動 resolver と共有し、不一致は同じ要求の受信口だけを交換する。
+実フォルダの読み直しは mtime が無い場合も既存の staged preflight を使う。
+フォルダを開く効果と検索の積み上げは採用時だけ確定し、合成一覧の表示状態も退出の採用まで保つ。
+待ちの間の一覧のキーは捨て、移動の入力は後勝ちにする（2026-11-26 利用者決定）。
+全画面から親へ戻る C5 は同じ worker を使い、全画面のまま `CloseReturn` sequence で待つ。
+読み込み中の表示は出さず、ページ送り・ジャンプ・スクロールは断る。拡大・回転・★は現在のページへ適用する。
+完了は通常の末尾に加え embedded／native の全画面の合流点でも回収する。
+同期の例外は理由付きの TrayClose・変換キャッシュの読直し・SnapshotLeafOpen・PlayTest・ReleaseCheck。
+main 以外の context は従来の同期経路を維持する。★固定の葉を開いて再開する続きは別項目で、
+C5・検索の戻り・合成一覧の退出は今回の対象である。
 `nav/startup_resolve_scan` に解決・走査時間と件数・source/outcome を記録する。Rust 検証・実機計測は未実施。
-詳細は [設計書 §1・§3](ui-sync-853-plan.md)。貼り付け (§1.859) の worker 化は本書 §4 と同設計書 §2 を参照。
+詳細は [設計書 §1・§3・§6](ui-sync-853-plan.md)。C・D・E のコンパイル・自動テスト・実機計測は未実施。
+貼り付け (§1.859) の worker 化は本書 §4 と同設計書 §2 を参照。
 
 ヘルプの「AI で調べる」（§1.894）の型付き AI アプリ URL と、AI 連携の窓の Codex 設定も同じ
 `external-open-*` worker に乗せる。Web の AI はその worker 内で、画像コピーと共有する世代照合付きの
 テキスト書き込みを終え、結果を App の共通受信口へ送ってから開く。UI は世代の予約だけで mutex を待たない。
 登録検出はサブメニュー描画から AI 連携の窓と共通の worker を始め、結果の採用も描画時の `try_recv` だけで行う。
 追加部分の自動検証と実行時の挙動は未確認。共有 runner とサブ PC で確認予定。
+
+## 操作スクリプトの準備（§1.363 段1〜5）
+
+起動時・設定ON時の本文読み込み、コンパイル、`slots()` の評価と、Open/Resetのファイル操作は
+Appのloader所有の単一FIFO workerで行う。読み込みも同じ列へ入れ、書き換えとその後のReloadの順序を保つ。
+AppのROOT passは要求投入と全状態での結果drain、Loading世代の照合、失敗通知だけを行う。
+環境設定のページはメモリ上の状態・最大20スロット・on_event有無を毎frame写して表示する。
+存在確認・create_new・読み書き・エディタ起動・コンパイルをUIへ持ち込まず、完了待ち・終了join・ファイル監視はしない。
+有効化・初回確認は環境設定の下書き→OKで確定し、2つの子モーダルの間は親の入力・窓操作を止める。
+状態の写しの変換と並びの検査は保持済みの値だけを使う。段5の自動検証・独立レビュー・実機は未確認。
+ファイル処理の所有・順序・世代・終了は[非同期設計](async-architecture.md)を参照。
+
+段2aの入力受付は `App::run_script_slot` に集約する。読み込み済みASTだけをUIで評価し、
+段1の上限内で返した並びを同じフレームで既存キーと共用の実行関数へ渡す。
+状態の写しと対象の比較は在メモリ値だけを読み、レーティング・タグ・回転のcache missでDBを読まない。
+見開き・分割の境界が採用済み構成から確定しない場合は `()` を渡す。
+`script/run` は所要ms・Rhai操作数・評価結果を記録する。新しい待機・pending・周期起床は作らない。
+
+段3の動画・音声も同じ実行境界を使う。状態の写しはキャッシュ中のplayerの再生状態・時計・
+取得済みinfoの長さだけを読み、読み込み中の長さは未確定とする。nativeの入力可否は既存overlayの
+snapshotを読む。操作は既存のキー実行関数と保存・シーク・キャプチャworker受付を共有し、
+新しい同期I/O・デコード・GPUアップロード・待ち・常設のpendingを追加しない。
+
+段4のr11〜r13イベントは、一覧ROOT・viewer所有pass・native ROOTでキーより前に検出する。
+OFF／on_event無しは利用資格・native playerのsnapshot・識別の収集を行わない。main専用baseline・ROOT frame番号・
+直近10実行時刻はbundle外で、別context・利用不可のpassからは更新しない。状態が変わらないframeにも検出済み番号を記録する。
+イベント識別はtyped item由来の入れ物と共用scalar、強いcomposition Arcのみ。reader order列・Search条件・展開rootsを
+毎frame複製しない。同じcomposition allocationはO(1)、別allocationの時だけ意味の全件比較を行い、等しくても新Arcへ
+基準を進める。prepared rotationsのCOWで外側Arcが変わった場合も1回は意味の比較が必要。
+`script/event_detect` は利用資格通過後の識別構築と比較のms・eventsを記録し、Rhai評価・操作の時間は含まない。
+イベントがある時だけ既存snapshot（navigation列の複製を含む）を作って評価し、全件validate後に共用のAを実行、同frameで
+識別を取り直す。r12のOpenOnly2操作は検出集合のopenを事前検査し、openを含まない遅れPageからの再実行を許さない。新しい識別や追跡状態は足さない。
+rolling 1秒10起動の超過はそのframe分を捨て、後で再生しない。検出に新しいI/O・decode・GPU upload・待ちは無い。
+実行はr13の利用者決定により、既存キーと同じsettings.save/spread_db同期更新をUIスレッドのI/O禁止の例外として保つ。
+イベントからの呼び出しは1秒10回まで、1回の並びは最大16操作。保存の回数と費用は返された操作の並びによる。
+イベントからもキーと同じ保存の費用を払い、重い保存環境では短い引っかかりが起こり得る。保存経路をworkerへ移す変更は行わない。
+`script/event_execute`はsnapshot・Rhai評価を含め、全件validate前から操作（同期保存を含む）と同frame取り直し完了までのms/actionsを記録する。
+actionsは実dispatcherへの呼出し回数（拒否された呼出しを含む・未実行suffixを除く）で、評価/validation拒否は0。
+途中rejectも取り直し後に終端を記録する。無効時は追加timerのInstantを取得せず、検出無し/上限dropでは区間を出さない。
+r13の動画9操作（再生/ループ/全シーク）はEOF/次採用を促進し得るため不可。後方3種もEOFから再生を始めるため、条件を増やさず一律不可とする設計担当の決定を反映した。
+残る動画4操作はMute/VolumeUp/VolumeDown/SeekStripToggle（音楽のStripは既存非対応）。
+既存の段2b要求照合は従来のO(N)識別を維持し、scalar生成だけ共用する。旧release計測（指示書共有cf1fce276、5万件）は
+構築1.1〜2.2ms（p95最大3.4ms）、保持heap概算約15MB、比較1〜1.5msで、イベント検出へその列を持ち込まない根拠である。
+既存ignored `perf_operation_script_page_identity` に5万件の変更なしevent識別の構築＋比較（μs）の行を追加した。
+ClaudeCodeの791529cf1 release計測では、変更なしevent識別が中央値0.8〜0.9μs・p95最大2.1μs。設計担当共有では初回はテストのimport誤りでコンパイルできず、importのみ修正後に8377e5fb7で関連252テスト成功。
+r13の後、47fdcb264で関連253テスト成功（設計担当がrun-heavyで実行）、独立実装レビューは3回目でACCEPT。event_execute費用の実測・実機は未実施。入れ物表、A監査、テスト依頼は
+[操作スクリプト計画§16](operation-script-plan.md#operation-script-stage4) を参照。
 
 ## スタック用スクリプトのファイル操作（§1.843）
 
@@ -674,6 +735,13 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 ---
 
 ## 4. 新機能追加時のチェックリスト
+
+画像の結合 (§1.904 stage B) はbatchと同じsnapshotの1件関数・6ms予算を使い、準備失敗を対象ごとに保持する。
+既知のsnapshot同期読込 (§1.177) を広げず、decode・合成・縮小・フォント計測・描画・encode・保存は専用workerへ置く。
+プレビューは長辺1600px以内、generation一致の結果を1回だけtextureへ送る。設定・並びの変更はRenderを間引き、素材は読み直さない。
+明示操作のプリセット保存は既存のsave_checkedと同じ扱い。layout / preview_load / preview_render / item / encodeのperfイベントを置く。
+今回の実行測定・コンパイル・自動検証は共有runnerへ引き継ぐ。
+
 
 §1.362 段 A の一括エクスポートは、出力先の作成・正規化・衝突判定、元の日時、
 デコード・編集合成・リサイズ・メタデータ検査・エンコード・書き込みを既存の専用workerに置く。

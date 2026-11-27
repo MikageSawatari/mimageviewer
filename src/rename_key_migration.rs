@@ -38,7 +38,7 @@
 //! - 本の操作は **移行元優先**。全旧キーを一時キーへ退避し、移行先の 3 面を削除して戻す。
 //!   移行元に行が無ければ移行先も空にする。1 descriptor の値更新・移動・コピーは一つの
 //!   transaction 内で行い、コピーは移動後のキーを読む。汎用改名・内容同一性復元の先勝は変えない。
-//! - コピーは同じ表の `copies_with_book_page` に従い、従来の編集・★・タグの 8 種だけを写す。
+//! - コピーは同じ表の `copies_with_book_page` に従い、編集・★・タグ・結合の構成を写す。
 //!   写さないストアもコピー先を初期化する。本単位キーはページ mapping には一致しない。
 //! - resume の Image / Archive / Document identity、pin の相対画像参照、ratings の source_path も更新する。
 //!   通常 resume 行と内部本の名前空間行は別々の所有経路で一度だけ書き換える。
@@ -74,6 +74,8 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 mod converted_archives;
+#[cfg(test)]
+mod image_combine_tests;
 pub(crate) use converted_archives::{
     collect_converted_archive_rels, converted_archive_cache_pairs,
 };
@@ -264,6 +266,7 @@ pub struct StoreMutationEffects {
     book_composition_changed: bool,
     caption_display_stale: bool,
     transcript_display_stale: bool,
+    combine_index_stale: bool,
     derived_text_changed: bool,
     rotation_keys: BTreeSet<String>,
 }
@@ -285,6 +288,7 @@ impl StoreMutationEffects {
             book_composition_changed: false,
             caption_display_stale: false,
             transcript_display_stale: false,
+            combine_index_stale: false,
             derived_text_changed: false,
             rotation_keys: BTreeSet::new(),
         }
@@ -303,6 +307,7 @@ impl StoreMutationEffects {
         self.record_completed(descriptor);
         self.book_composition_changed |= descriptor.file == "book_composition.db" && rows > 0;
         self.derived_text_changed |= descriptor.derived_text.is_some() && rows > 0;
+        self.combine_index_stale |= descriptor.file == "combine.db" && rows > 0;
         if rows > 0 {
             self.record_display_cache_stale(descriptor);
         }
@@ -333,6 +338,10 @@ impl StoreMutationEffects {
         self.derived_text_changed
     }
 
+    pub(crate) fn combine_index_stale(&self) -> bool {
+        self.combine_index_stale
+    }
+
     pub(crate) fn rotation_keys(&self) -> &BTreeSet<String> {
         &self.rotation_keys
     }
@@ -347,6 +356,7 @@ impl StoreMutationEffects {
         self.caption_display_stale |= other.caption_display_stale;
         self.transcript_display_stale |= other.transcript_display_stale;
         self.derived_text_changed |= other.derived_text_changed;
+        self.combine_index_stale |= other.combine_index_stale;
         self.rotation_keys.extend(other.rotation_keys);
     }
 
@@ -1357,6 +1367,15 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         "comic.db",
         "comic_entries",
         "page_path",
+        true,
+        StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        true,
+    ),
+    store(
+        "combine.db",
+        "combine_recipes",
+        "output_key",
         true,
         StoreKeyNormalization::KeepDrive,
         BookStorePolicy::Follow,
@@ -3639,9 +3658,9 @@ fn move_exact_with_collision(
             rusqlite::params![new_key, old_key],
         )?;
         let deleted = tx.execute(&format!("DELETE FROM {table} WHERE {col} = ?1"), [old_key])?;
-        // A composition source discarded in favor of an existing destination is
-        // still a real scope mutation; keep the other stores' historical counts.
-        n + if table == "book_compositions" {
+        // A composition or combine recipe discarded in favor of an existing
+        // destination still mutates its scope/index. Keep other stores' historical counts.
+        n + if matches!(table, "book_compositions" | "combine_recipes") {
             deleted
         } else {
             0
@@ -5387,6 +5406,7 @@ mod tests {
                 "conceal_entries",
                 "local_adjust_pages",
                 "comic_entries",
+                "combine_recipes",
                 "export_crop_pages",
                 "item_tags",
                 "tag_item_state"
@@ -6386,10 +6406,10 @@ mod tests {
             .count();
         assert_eq!(
             STORES.len(),
-            33,
+            34,
             "folder order、watched、endpoint / page-alone preference、logical shift と文字起こしを含む現行 descriptor 数"
         );
-        assert_eq!(covered, 30);
+        assert_eq!(covered, 31);
         assert_eq!(report.rows, covered * 2);
         assert_eq!(report.committed_thumbnail_pins, 4);
         let rotation_store = STORES

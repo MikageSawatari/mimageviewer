@@ -366,7 +366,7 @@ fn image_fixture() -> (Harness, PathBuf) {
                 .unwrap();
         }
     }
-    env.load_folder(folder.clone());
+    env.load_folder_and_finish_for_test(folder.clone());
     let mut h = Harness::new(env);
     h.adopt(&folder, 3);
     (h, folder)

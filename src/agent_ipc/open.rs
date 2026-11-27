@@ -50,7 +50,13 @@ pub(crate) enum UiOpenOutcome {
     Read(mimageviewer_agent_ipc::ViewState),
     Settings(mimageviewer_agent_ipc::SettingsPage),
     Operations(mimageviewer_agent_ipc::OperationsPage),
-    StackScriptAdmitted { enabled: bool },
+    StackScriptAdmitted {
+        enabled: bool,
+    },
+    OperationScriptAdmitted {
+        snapshot: super::operation_script::AdmissionSnapshot,
+        queued: Result<(), String>,
+    },
     Written(Result<mimageviewer_agent_ipc::Payload, AgentError>),
     Refused(AgentError),
 }
@@ -76,6 +82,7 @@ pub(crate) enum UiRequestKind {
     },
     SetFavorite(super::favorite::PreparedFavorite),
     StackScriptAdmission,
+    OperationScript(crate::operation_script::AgentScriptRequest),
     TagWrite(super::metadata_write::PreparedTags),
     RatingWrite(super::metadata_write::PreparedRatings),
 }
@@ -325,6 +332,81 @@ impl OpenController {
         }
     }
 
+    pub(super) fn execute_operation_script(
+        self: &Arc<Self>,
+        source: Option<String>,
+        part: Option<u32>,
+        expected_sha256: Option<String>,
+        ctx: &super::ReadContext,
+        client_name: String,
+        dispatch: Arc<UiRequestDispatch>,
+        changes: &super::changes::ChangeController,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        super::operation_script::validate_arguments(
+            source.as_deref(),
+            part,
+            expected_sha256.as_deref(),
+        )?;
+        let writing = source.is_some();
+        if writing {
+            super::operation_script::check_write_budget()?;
+        }
+        ctx.checkpoint()?;
+        let (reply, receive) = mpsc::channel();
+        let job = crate::operation_script::AgentScriptRequest {
+            source,
+            expected_sha256: expected_sha256.clone(),
+            reply,
+        };
+        let admission = self.dispatch_request(&ctx.cancel, dispatch, UI_REPLY_TIMEOUT, || {
+            Ok(UiRequestKind::OperationScript(job))
+        })?;
+        match admission {
+            UiOpenOutcome::OperationScriptAdmitted { snapshot, queued } => {
+                // Only this worker waits. Claimed requests retain their eventual
+                // result even if the outer deadline or cancellation has passed.
+                let outcome = queued.and_then(|()| {
+                    receive.recv().map_err(|_| {
+                        "操作のスクリプトのworkerが結果を返さず終了しました".to_owned()
+                    })?
+                });
+                let result = if writing {
+                    super::operation_script::complete_write(
+                        outcome.and_then(|value| match value {
+                            crate::operation_script::AgentScriptOutcome::Write(value) => Ok(value),
+                            _ => Err("操作のスクリプトの書き込み結果を確認できません".into()),
+                        }),
+                        &snapshot,
+                        &client_name,
+                        changes,
+                    )
+                } else {
+                    match outcome {
+                        Ok(crate::operation_script::AgentScriptOutcome::Read(document)) => {
+                            super::operation_script::read_result(
+                                &document,
+                                &snapshot,
+                                part,
+                                expected_sha256.as_deref(),
+                            )
+                            .map(mimageviewer_agent_ipc::Payload::OperationScript)
+                        }
+                        _ => {
+                            crate::logger::log("agent_ipc: tool=operation_script read_failed");
+                            Err(super::error(
+                                ErrorCode::Internal,
+                                "操作のスクリプトを読み込めませんでした",
+                            ))
+                        }
+                    }
+                };
+                Ok(UiOpenOutcome::Written(result))
+            }
+            UiOpenOutcome::Refused(error) => Ok(UiOpenOutcome::Refused(error)),
+            _ => Err(super::internal()),
+        }
+    }
+
     fn stack_script_admission(
         self: &Arc<Self>,
         cancel: &AtomicBool,
@@ -522,7 +604,8 @@ fn outcome_result(reply: UiOpenOutcome) -> Result<OpenResult, AgentError> {
         | UiOpenOutcome::Read(_)
         | UiOpenOutcome::Operations(_)
         | UiOpenOutcome::Settings(_)
-        | UiOpenOutcome::StackScriptAdmitted { .. } => Err(open_failed()),
+        | UiOpenOutcome::StackScriptAdmitted { .. }
+        | UiOpenOutcome::OperationScriptAdmitted { .. } => Err(open_failed()),
     }
 }
 

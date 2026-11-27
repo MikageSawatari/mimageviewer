@@ -934,7 +934,13 @@ impl WgpuWinitRunning<'_> {
             integration.pre_update();
 
             if let Some(raw_input) = raw_input.as_mut() {
-                raw_input.time = Some(integration.beginning.elapsed().as_secs_f64());
+                let input_now = web_time::Instant::now();
+                raw_input.time = Some(
+                    input_now
+                        .duration_since(integration.beginning)
+                        .as_secs_f64(),
+                );
+                raw_input.input_clock = Some(egui_winit::input_clock::at(input_now));
                 raw_input.viewports = viewports
                     .iter()
                     .map(|(id, viewport)| (*id, viewport.info.clone()))
@@ -1750,7 +1756,9 @@ impl super::frame_output::ImmediateViewportBackend for NativeWgpuImmediateBacken
             .iter()
             .map(|(id, viewport)| (*id, viewport.info.clone()))
             .collect();
-        input.time = Some(self.beginning.elapsed().as_secs_f64());
+        let input_now = web_time::Instant::now();
+        input.time = Some(input_now.duration_since(self.beginning).as_secs_f64());
+        input.input_clock = Some(egui_winit::input_clock::at(input_now));
         self.timings.input_max_tex = input.max_texture_side;
         self.timings.input_ms = self.started.elapsed().as_secs_f64() * 1000.0;
         Some((egui_ctx.clone(), input))

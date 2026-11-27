@@ -1514,40 +1514,70 @@ impl App {
 
     /// Enter and pointer activation share the main-grid container admission effects.
     /// Callers retain their input guards, stack/detached-book routing and pointer-only drill-in.
-    /// ZIP/PDF effects remain owned by GridVirtual and commit at visible adoption.
+    /// Folder and ZIP/PDF effects stay with their navigation and commit at visible adoption.
     pub(crate) fn accept_grid_container_open(
         &mut self,
         ctx: &egui::Context,
         index: usize,
     ) -> Option<crate::ui_main::AddressBarNav> {
-        let (path, folder) = match self.items.get(index)? {
-            GridItem::Folder(path) => (path.clone(), true),
-            GridItem::ZipFile(path) | GridItem::PdfFile(path) => (path.clone(), false),
-            _ => return None,
+        self.accept_grid_container_open_with_admission(ctx, index).0
+    }
+
+    pub(crate) fn accept_grid_container_open_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        index: usize,
+    ) -> (
+        Option<crate::ui_main::AddressBarNav>,
+        super::ActionAdmission,
+    ) {
+        let path = match self.items.get(index) {
+            Some(GridItem::Folder(path) | GridItem::ZipFile(path) | GridItem::PdfFile(path)) => {
+                path.clone()
+            }
+            _ => return (None, super::ActionAdmission::Rejected),
         };
         #[cfg(test)]
         GRID_CONTAINER_OPEN_ACCEPT_COUNT.with(|count| count.set(count.get() + 1));
         let auto_fullscreen = self.should_auto_fullscreen_grid_container(index);
         #[cfg(windows)]
         if auto_fullscreen && !self.park_active_detached_context_for_new_grid_open(ctx, index) {
-            return None;
+            return (None, super::ActionAdmission::Rejected);
         }
-        if self.begin_smart_grid_container_navigation(
+        let route = self.begin_smart_grid_container_navigation_with_admission(
             index,
             path.clone(),
             auto_fullscreen,
             super::StartupListIntent::container_open(auto_fullscreen),
-        ) {
-            return None;
+        );
+        if route.handled {
+            return (None, route.admission);
         }
-        if folder {
-            self.note_reading_history_open(index);
-            self.maybe_suppress_rating_filter_for_opened_container(index);
-            if auto_fullscreen {
-                self.pending_auto_fs_open = true;
-            }
+        (
+            Some(self.grid_physical_navigation(index, path, auto_fullscreen)),
+            super::ActionAdmission::Accepted,
+        )
+    }
+
+    /// Capture source-grid decisions without changing the still-visible list.
+    /// Folders retain physical facet scope; only ZIP/PDF grid opens suppress facets.
+    fn capture_grid_folder_open_effects(
+        &mut self,
+        index: usize,
+        path: &std::path::Path,
+        auto_fullscreen: bool,
+    ) -> super::GridVirtualOpenEffects {
+        super::GridVirtualOpenEffects {
+            reading_history_return_from: self
+                .capture_reading_history_book_return(path)
+                .map(Box::new),
+            suppress_rating_filter: false,
+            rating_suppression: self
+                .capture_rating_filter_suppression_for_opened_container(index)
+                .map(Box::new),
+            suppress_facet_filter: false,
+            auto_fullscreen,
         }
-        Some(self.grid_physical_navigation(index, path, auto_fullscreen))
     }
 
     #[cfg(test)]
@@ -1580,32 +1610,30 @@ impl App {
                 path: path.clone(),
                 source,
                 effects: super::GridVirtualOpenEffects {
-                    reading_history_return_from: self.capture_reading_history_book_return(&path),
+                    reading_history_return_from: self
+                        .capture_reading_history_book_return(&path)
+                        .map(Box::new),
                     suppress_rating_filter: true,
+                    rating_suppression: None,
                     // Grid activation only exposes rows accepted by the current facet filter.
                     suppress_facet_filter: self.facet_filter_active(),
                     auto_fullscreen,
                 },
             });
         }
-        match self.collection_grid_physical_load_owner(index, &path) {
-            Some(owner) => crate::ui_main::AddressBarNav::CollectionSource {
-                path,
-                owner,
-                restore_intent: super::StartupListIntent::container_open(auto_fullscreen),
-            },
+        let source = match self.collection_grid_physical_load_owner(index, &path) {
+            Some(owner) => super::GridVirtualOpenSource::Collection(owner),
             None => match self.rating_view_physical_load_owner(&path) {
-                Some(owner) => crate::ui_main::AddressBarNav::RatingSource {
-                    path,
-                    owner,
-                    restore_intent: super::StartupListIntent::container_open(auto_fullscreen),
-                },
-                None => crate::ui_main::AddressBarNav::Direct(
-                    path,
-                    super::StartupListIntent::container_open(auto_fullscreen),
-                ),
+                Some(owner) => super::GridVirtualOpenSource::Rating(owner),
+                None => super::GridVirtualOpenSource::Direct,
             },
-        }
+        };
+        let effects = self.capture_grid_folder_open_effects(index, &path, auto_fullscreen);
+        crate::ui_main::AddressBarNav::GridFolder(super::GridVirtualOpenIntent {
+            path,
+            source,
+            effects,
+        })
     }
 
     pub(crate) fn collection_grid_physical_load_owner_is_current(
@@ -4126,6 +4154,146 @@ mod tests {
     use crate::grid_item::ThumbnailState;
 
     #[test]
+    fn grid_folder_enter_and_gamepad_defer_visible_effects_until_adoption() {
+        for gamepad in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().join("history-folder");
+            std::fs::create_dir(&folder).unwrap();
+            app.settings.detached_viewer_open_images_in_window = false;
+            // Image-folder auto-open also requires the master container auto-open setting.
+            app.settings.auto_fullscreen_zip_pdf = true;
+            app.settings.auto_fullscreen_image_folders = true;
+            app.install_new_items(vec![GridItem::Folder(folder.clone())], vec![None]);
+            app.visible_indices = vec![0];
+            app.selected = Some(0);
+            crate::app::tests::install_reading_history_surface_for_test(&mut app);
+            let previous = crate::app::tests::reading_history_return_for_test(
+                app.tmp.path().join("previous-book.zip"),
+            );
+            app.reading_history_return_from = Some(previous.clone());
+            app.settings.rating_filter = [false, false, false, false, false, true];
+            app.rating_cache.insert(0, 5);
+            app.settings.facet_filter.exts.insert("jpg".into());
+            let expected_return = app.capture_reading_history_book_return(&folder);
+            let facet = app.settings.facet_filter.clone();
+            let route = app.facet_navigation.clone();
+            let history = app.folder_nav_history_snapshot();
+            let ctx = egui::Context::default();
+
+            let nav = if gamepad {
+                app.handle_gamepad_grid_accept(&ctx)
+            } else {
+                app.accept_grid_container_open(&ctx, 0)
+            };
+            let Some(crate::ui_main::AddressBarNav::GridFolder(intent)) = nav else {
+                panic!("folder activation must carry deferred effects (gamepad={gamepad})");
+            };
+            assert_eq!(intent.path, folder);
+            assert!(matches!(
+                intent.source,
+                super::super::GridVirtualOpenSource::Direct
+            ));
+            assert_eq!(
+                intent
+                    .effects
+                    .reading_history_return_from
+                    .as_deref()
+                    .cloned(),
+                expected_return
+            );
+            assert_eq!(
+                intent.effects.rating_suppression.as_deref().cloned(),
+                Some((folder, app.settings.rating_filter))
+            );
+            assert!(!intent.effects.suppress_rating_filter);
+            assert!(!intent.effects.suppress_facet_filter);
+            assert!(intent.effects.auto_fullscreen);
+            // Dropping a losing candidate must leave the still-visible surface intact.
+            drop(intent);
+            assert_eq!(app.reading_history_return_from, Some(previous));
+            assert!(app.rating_filter_suppressed_at.is_none());
+            assert!(!app.pending_auto_fs_open);
+            assert_eq!(app.settings.facet_filter, facet);
+            assert_eq!(app.facet_navigation, route);
+            assert_eq!(app.folder_nav_back_stack, history.back_stack);
+            assert_eq!(app.folder_nav_forward_stack, history.forward_stack);
+        }
+    }
+
+    #[test]
+    fn grid_folder_rating_suppression_uses_admitted_session_value_at_commit() {
+        for (admitted, later) in [(5, 0), (0, 5)] {
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().join("session-rated-folder");
+            app.install_new_items(vec![GridItem::Folder(folder.clone())], vec![None]);
+            app.settings.rating_filter = [false, false, false, false, false, true];
+            // Session writes override both the mounted cache and the shared DB.
+            let key = app.rating_path_key(0).unwrap();
+            app.rating_db.as_ref().unwrap().set(&key, later).unwrap();
+            app.rating_cache.insert(0, later);
+            app.record_rating_session_write(key.clone(), admitted, true);
+            let effects = app.capture_grid_folder_open_effects(0, &folder, false);
+            assert_eq!(
+                effects.rating_suppression.as_deref().cloned(),
+                (admitted == 5).then(|| (folder.clone(), app.settings.rating_filter))
+            );
+            app.record_rating_session_write(key.clone(), later, true);
+            app.rating_db.as_ref().unwrap().set(&key, later).unwrap();
+            app.rating_cache.insert(0, later);
+            app.commit_grid_virtual_open_effects(&folder, effects);
+            assert_eq!(
+                app.rating_filter_suppressed_at,
+                (admitted == 5).then(|| (folder.clone(), app.settings.rating_filter)),
+                "adoption must not repeat the path/DB or session rating decision"
+            );
+        }
+    }
+
+    #[test]
+    fn grid_collection_folder_carries_owner_without_applying_effects() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("registered-folder");
+        std::fs::create_dir(&folder).unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        app.active_quick_folder_slot = None;
+        app.settings.detached_viewer_open_images_in_window = false;
+        let collection =
+            collection_with_sources(&client, &[(folder.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(collection.collection_id(), None);
+        wait_for_grid(&mut app, collection.collection_id());
+        app.settings.rating_filter = [false, false, false, false, false, true];
+        app.rating_cache.insert(0, 5);
+        let previous = crate::app::tests::reading_history_return_for_test(
+            temp.path().join("previous-book.zip"),
+        );
+        app.reading_history_return_from = Some(previous.clone());
+        let expected_owner = app.collection_grid_physical_load_owner(0, &folder).unwrap();
+
+        let crate::ui_main::AddressBarNav::GridFolder(intent) =
+            app.grid_physical_navigation(0, folder.clone(), false)
+        else {
+            panic!("Collection folder must carry deferred effects");
+        };
+        let super::super::GridVirtualOpenSource::Collection(owner) = intent.source else {
+            panic!("Collection folder must keep its physical load owner");
+        };
+        assert_eq!(owner.stamp, expected_owner.stamp);
+        assert_eq!(owner.anchor, expected_owner.anchor);
+        assert!(app.collection_grid_physical_load_owner_is_current(&owner, &folder));
+        assert!(intent.effects.reading_history_return_from.is_none());
+        assert!(!intent.effects.suppress_facet_filter);
+        assert_eq!(app.reading_history_return_from, Some(previous));
+        assert!(app.rating_filter_suppressed_at.is_none());
+        app.commit_grid_virtual_open_effects(&folder, intent.effects);
+        assert!(app.reading_history_return_from.is_none());
+        assert_eq!(
+            app.rating_filter_suppressed_at,
+            Some((folder, app.settings.rating_filter))
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
     fn g1_collection_real_handler_reopen_preserves_vertical_flow_and_book_return() {
         use crate::app::book_materialization::{ExtractedSurface, ProjectionRecipe};
         use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
@@ -4145,7 +4313,7 @@ mod tests {
         for page in &pages {
             image::RgbImage::new(2, 3).save(page).unwrap();
         }
-        app.load_folder(book.clone());
+        app.load_folder_and_finish_for_test(book.clone());
         app.settle_open_path_classification_for_test();
         app.finish_page_identity_preparation_for_test();
         assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));
@@ -5205,7 +5373,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn direct_navigation_sync_preserves_collection_physical_owner() {
+    fn direct_navigation_worker_preserves_collection_physical_owner() {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let child = temp.path().join("child");
@@ -5225,9 +5393,17 @@ mod tests {
             None,
             crate::app::StartupListIntent::ExplicitList,
         );
+        // §6.6(11b): this previously unmarked Collection route now scans on the
+        // worker; the adopted owner, rows and Collection identity remain unchanged.
         assert_eq!(
             super::super::folder_scan::caller_scan_count_for_test(),
-            before + 1
+            before
+        );
+        assert!(app.direct_navigation_scan_pending());
+        app.finish_direct_navigation_scan_for_test();
+        assert_eq!(
+            super::super::folder_scan::caller_scan_count_for_test(),
+            before
         );
         assert!(app.folder_pane_open_pending.is_none());
         app.finish_page_identity_preparation_for_test();
@@ -5240,6 +5416,64 @@ mod tests {
                 .collection_id,
             snapshot.collection_id()
         );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn direct_navigation_worker_rejects_collection_owner_staled_after_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(child.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let owner = app.collection_grid_physical_load_owner(0, &child).unwrap();
+        let rows = app.items.clone();
+        let generation = app.items_generation;
+        app.pending_auto_fs_open = true;
+        app.select_after_load = Some("stale-request-selection".into());
+        let before = super::super::folder_scan::caller_scan_count_for_test();
+        app.open_direct_navigation_target(
+            child.clone(),
+            None,
+            super::super::OpenRequestOwner::CollectionGridPhysical(owner.clone()),
+            None,
+            None,
+            crate::app::StartupListIntent::ExplicitList,
+        );
+        assert!(app.direct_navigation_scan_pending());
+        assert!(!app.pending_auto_fs_open);
+        assert!(app.select_after_load.is_none());
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .wanted_revision += 1;
+        assert!(!app.collection_grid_physical_load_owner_is_current(&owner, &child));
+        app.finish_direct_navigation_scan_for_test();
+        assert_eq!(
+            super::super::folder_scan::caller_scan_count_for_test(),
+            before
+        );
+        assert_eq!(app.items, rows);
+        assert_eq!(app.items_generation, generation);
+        assert!(app.current_folder.is_none());
+        assert!(matches!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .position,
+            CollectionGridPosition::Root
+        ));
+        let unrelated = temp.path().join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        std::fs::write(unrelated.join("page.jpg"), b"fixture").unwrap();
+        app.load_folder_and_finish_for_test(unrelated.clone());
+        assert_eq!(app.current_folder.as_ref(), Some(&unrelated));
+        assert!(app.fullscreen_idx.is_none());
+        assert!(app.select_after_load.is_none());
         app.shutdown_collection_runtime_for_exit();
     }
 
@@ -5745,19 +5979,16 @@ mod tests {
         app.open_collection_grid(collection.collection_id(), None);
         wait_for_grid(&mut app, collection.collection_id());
         app.selected = Some(0);
-        let Some(crate::ui_main::AddressBarNav::CollectionSource { path, owner, .. }) =
-            history_grid_key(&mut app, egui::Key::Enter)
-        else {
+        let Some(nav) = history_grid_key(&mut app, egui::Key::Enter) else {
             panic!("Enter must route the Collection root row to its physical child");
         };
-        let scan =
-            super::super::folder_scan::scan_directory_with_settings(&path, &app.settings).unwrap();
-        assert!(app.load_folder_with_scan_owned(
-            path,
-            Some(scan),
-            super::super::OpenRequestOwner::CollectionGridPhysical(owner),
-            crate::app::StartupListIntent::ExplicitList,
+        assert!(matches!(
+            &nav,
+            crate::ui_main::AddressBarNav::GridFolder(intent)
+                if matches!(intent.source, super::super::GridVirtualOpenSource::Collection(_))
         ));
+        assert!(app.apply_fullscreen_close_nav_immediate(nav));
+        poll_real_history_load(&mut app, Some(&child), None);
         let child_target = app.folder_nav_current_target().expect("adopted child");
         let root_target = app
             .folder_history_back_target()
@@ -5944,12 +6175,15 @@ mod tests {
             .expect("Rating child row");
         let rated_child = app.items[row].drag_source_path().unwrap().to_path_buf();
         app.selected = Some(row);
-        let Some(crate::ui_main::AddressBarNav::RatingSource { owner, .. }) =
-            history_grid_key(&mut app, egui::Key::Enter)
-        else {
+        let Some(nav) = history_grid_key(&mut app, egui::Key::Enter) else {
             panic!("Enter must route the Rating row to its physical child");
         };
-        assert!(app.start_rating_physical_open(owner, crate::app::StartupListIntent::ExplicitList));
+        assert!(matches!(
+            &nav,
+            crate::ui_main::AddressBarNav::GridFolder(intent)
+                if matches!(intent.source, super::super::GridVirtualOpenSource::Rating(_))
+        ));
+        assert!(app.apply_fullscreen_close_nav_immediate(nav));
         poll_real_history_load(&mut app, Some(&rated_child), None);
         let child_target = app.folder_nav_current_target().expect("Rating child");
         assert_eq!(app.folder_history_back_target(), Some(&root_target));
@@ -6128,6 +6362,7 @@ mod tests {
         let mut seeded = false;
         loop {
             app.settle_open_path_classification_for_test();
+            app.post_render_main_navigation(&ctx, Default::default());
             seed_real_pdf_preflight_if_ready(app, pdf_pages, &mut seeded);
             app.poll_collection_ui(&ctx);
             seed_real_pdf_preflight_if_ready(app, pdf_pages, &mut seeded);
@@ -6153,6 +6388,7 @@ mod tests {
                     && app.rating_view_pending.is_none()
                     && app.pdf_enumerate_pending.is_none()
                     && !app.sidecar_restore_active()
+                    && !app.direct_navigation_scan_pending()
                 {
                     assert!(
                         pdf_pages.is_none() || seeded,
@@ -8130,7 +8366,7 @@ mod tests {
         app.active_quick_folder_slot = None;
         app.settings.sidecar_backup_enabled = false;
         app.settings.tag_sidecar_backup_enabled = false;
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         poll_real_history_load(&mut app, Some(&origin), None);
         let entrance = app.capture_top_level_origin().unwrap();
         let collection = collection_with_sources(
@@ -8281,12 +8517,21 @@ mod tests {
         wait_for_grid(&mut app, snapshot.collection_id());
         let before = app.folder_nav_history_snapshot();
 
-        assert!(!app.load_folder_with_scan_owned(
-            temp.path().join("missing-folder"),
-            None,
-            super::super::OpenRequestOwner::Navigation,
-            crate::app::StartupListIntent::ExplicitList,
+        // §6.3(1): main accepts the request before its worker can discover a missing path.
+        // The bool wrapper also accepts Classifying; failure is a completion outcome.
+        assert!(matches!(
+            app.load_folder_with_scan_owned_outcome(
+                temp.path().join("missing-folder"),
+                None,
+                super::super::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
+            ),
+            crate::app::FolderOpenOutcome::Classifying
         ));
+        app.finish_direct_navigation_scan_for_test();
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text.contains("フォルダを読み取れませんでした")
+        }));
         assert!(matches!(
             app.top_level_grid_view.surface(),
             TopLevelGridSurface::Collection(identity)
@@ -10130,7 +10375,7 @@ mod tests {
             .unwrap()
             .set_pdf_meta("warm-book.epub", generation_id, generation_size, 2, false)
             .unwrap();
-        app.load_folder(temp.path().to_path_buf());
+        app.load_folder_and_finish_for_test(temp.path().to_path_buf());
         poll_until(&mut app, "EPUB parent hydration did not finish", |_| true);
         let source = app.folder_nav_current_target();
         assert!(app.peek_pdf_meta_cache(&epub, false).is_some());
@@ -10204,7 +10449,7 @@ mod tests {
             }));
             app.active_quick_folder_slot = None;
             app.settings.follow_document_reading_direction = true;
-            app.load_folder(old.clone());
+            app.load_folder_and_finish_for_test(old.clone());
             poll_until(
                 &mut app,
                 "ordinary EPUB parent hydration did not finish",
@@ -10254,7 +10499,7 @@ mod tests {
         assert!(stamp.generation_catalog_pair().is_some());
         let (mut app, _) = start_ready_app(&temp.path().join("collection.db"));
         app.settings.follow_document_reading_direction = true;
-        app.load_folder(old.clone());
+        app.load_folder_and_finish_for_test(old.clone());
         poll_until(&mut app, "EPUB slot A hydration did not finish", |_| true);
         app.set_quick_folder_slot_target(super::super::QuickFolderSlotId::A, old.clone());
         app.set_quick_folder_slot_target(super::super::QuickFolderSlotId::B, source.clone());
@@ -11283,7 +11528,9 @@ mod tests {
                     .unwrap();
                 assert!(matches!(
                     &nav,
-                    crate::ui_main::AddressBarNav::CollectionSource { .. }
+                    crate::ui_main::AddressBarNav::GridFolder(intent)
+                    | crate::ui_main::AddressBarNav::GridVirtual(intent)
+                        if matches!(intent.source, super::super::GridVirtualOpenSource::Collection(_))
                 ));
                 assert!(app.apply_fullscreen_close_nav_immediate(nav));
             } else {
@@ -11736,12 +11983,21 @@ mod tests {
         let held_address = app.address.clone();
         let held_source = app.items[0].drag_source_path().unwrap().to_path_buf();
 
-        assert!(!app.load_folder_with_scan_owned(
-            temp.path().join("missing"),
-            None,
-            crate::app::OpenRequestOwner::Navigation,
-            crate::app::StartupListIntent::ExplicitList,
+        // §6.3(1): admission succeeds without synchronous I/O; the missing path
+        // fails only when the worker completes, leaving the installed root intact.
+        assert!(matches!(
+            app.load_folder_with_scan_owned_outcome(
+                temp.path().join("missing"),
+                None,
+                crate::app::OpenRequestOwner::Navigation,
+                crate::app::StartupListIntent::ExplicitList,
+            ),
+            crate::app::FolderOpenOutcome::Classifying
         ));
+        app.finish_direct_navigation_scan_for_test();
+        assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+            text.contains("フォルダを読み取れませんでした")
+        }));
         assert!(matches!(
             app.top_level_grid_view.surface(),
             TopLevelGridSurface::Collection(identity)

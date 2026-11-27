@@ -18,6 +18,7 @@
 /// The owner which blocks grid item input. Physical scan waits also suppress legacy stack keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GridItemInputBlock {
+    DetachedViewerEditing,
     BookStructuralOperation,
     ImageFolderZip,
     LocationNavigation,
@@ -25,6 +26,9 @@ pub(crate) enum GridItemInputBlock {
     ViewOrderRefreshScan,
     StackRefresh,
 }
+
+pub(crate) const DETACHED_VIEWER_EDITING_GRID_NOTICE: &str =
+    "別ウィンドウで編集中です。別ウィンドウで Esc を押して編集を終えると、一覧を使えます";
 
 impl GridItemInputBlock {
     /// Refreshing the order keeps the current location's non-item controls usable.
@@ -1431,6 +1435,9 @@ impl crate::app::App {
             rule,
             error,
         } = ready;
+        // Finishing an outgoing draft advances page-edit stamps. Do this before
+        // validating the candidate, so a pre-save projection is prepared again.
+        self.end_page_edit_tools_for_viewer_item_change("stack_grouping");
         let valid = read
             .result
             .as_ref()
@@ -2197,11 +2204,24 @@ impl crate::app::App {
         agg_idx: usize,
         from_double_click: bool,
     ) -> bool {
+        self.stack_try_open_from_grid_with_admission(ctx, agg_idx, from_double_click)
+            .handled
+    }
+
+    pub(crate) fn stack_try_open_from_grid_with_admission(
+        &mut self,
+        ctx: &egui::Context,
+        agg_idx: usize,
+        from_double_click: bool,
+    ) -> crate::app::ActionRouteResult {
         if !self.grid_item_input_allowed() {
-            return true;
+            return crate::app::ActionRouteResult::new(true, crate::app::ActionAdmission::Rejected);
         }
         if !self.stack_mode_aggregated() {
-            return false;
+            return crate::app::ActionRouteResult::new(
+                false,
+                crate::app::ActionAdmission::Rejected,
+            );
         }
         let flat_idx = self
             .stack_view
@@ -2209,7 +2229,10 @@ impl crate::app::App {
             .and_then(|sv| sv.flat_index_for_aggregated(agg_idx));
         let Some(flat_idx) = flat_idx else {
             // passthrough コンテナ → フルスクリーンでなく通常ナビへ。
-            return false;
+            return crate::app::ActionRouteResult::new(
+                false,
+                crate::app::ActionAdmission::Rejected,
+            );
         };
         #[cfg(not(windows))]
         let _ = ctx;
@@ -2217,8 +2240,10 @@ impl crate::app::App {
         // 判定する。別 media/still のときだけ現 active context を先に park する。
         // (review-v2.3.0 追補4: stack flat grid open)
         #[cfg(windows)]
-        if !self.prepare_detached_context_for_grid_open(ctx, agg_idx) {
-            return true;
+        if let std::ops::ControlFlow::Break(admission) =
+            self.prepare_detached_context_for_grid_open_with_admission(ctx, agg_idx)
+        {
+            return crate::app::ActionRouteResult::new(true, admission);
         }
         // 開幕ガード (通常の grid open 経路と同じ):
         // - Enter で開いた同フレームに fullscreen 側が同じ Enter を拾って即 close するのを防ぐ
@@ -2235,7 +2260,7 @@ impl crate::app::App {
         }
         self.capture_main_list_restore_cursor();
         self.stack_enter_flat_fullscreen(ctx, flat_idx);
-        true
+        crate::app::ActionRouteResult::new(true, crate::app::ActionAdmission::Accepted)
     }
 
     /// フラット読書ビュー (全画像を展開した並び) へ `self.items` を差し替え、`flat_idx` を
@@ -2394,6 +2419,10 @@ impl crate::app::App {
             if self.stack_view.as_ref().is_some_and(|current| Arc::ptr_eq(current, view)))
         {
             Some(GridItemInputBlock::StackRefresh)
+        } else if self.detached_viewer_editing_blocks_grid_input() {
+            // The open boundary exempts only this reason. Existing ownership
+            // barriers must keep precedence when editing overlaps their wait.
+            Some(GridItemInputBlock::DetachedViewerEditing)
         } else {
             None
         }
@@ -2402,6 +2431,65 @@ impl crate::app::App {
     /// All item input (key, pointer, touch, ring, gamepad and menu) shares this gate.
     pub(crate) fn grid_item_input_allowed(&self) -> bool {
         self.grid_item_input_block().is_none()
+    }
+
+    /// The App-wide draft belongs to the foreground context, never a temporarily mounted sibling.
+    pub(crate) fn detached_viewer_editing_blocks_grid_input(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.page_edit_tools_owned_by_projected_context()
+                && self.current_viewer_session_is_detached_or_switching()
+                && !self.detached_viewer_independent_active
+                && self.is_overlay_edit_mode_active()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
+    /// Called only when an input was rejected. Merely querying the gate must stay silent.
+    pub(crate) fn notify_detached_viewer_editing_grid_input_blocked(
+        &mut self,
+        ctx: &eframe::egui::Context,
+    ) {
+        let frame = ctx.cumulative_frame_nr();
+        let already_notified = ctx.data_mut(|data| {
+            let id = eframe::egui::Id::unique("detached_viewer_editing_grid_notice_frame");
+            let already = data.get_temp::<u64>(id) == Some(frame);
+            data.insert_temp(id, frame);
+            already
+        });
+        if already_notified {
+            return;
+        }
+        self.show_feedback_toast_on(
+            DETACHED_VIEWER_EDITING_GRID_NOTICE.to_owned(),
+            crate::app::ActionSurface::MainWindow,
+        );
+    }
+
+    pub(crate) fn notify_detached_viewer_editing_grid_key_input(
+        &mut self,
+        ctx: &eframe::egui::Context,
+    ) {
+        if !self.shortcuts_blocked_by_text_input(ctx)
+            && !self.ime_input_active(ctx)
+            && ctx.input(|input| {
+                input.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        eframe::egui::Event::Key {
+                            pressed: true,
+                            repeat: false,
+                            ..
+                        }
+                    )
+                })
+            })
+        {
+            self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+        }
     }
 
     fn swap_stack_view_items(
@@ -2529,7 +2617,7 @@ mod tests {
             image::RgbImage::new(1, 1)
                 .save(folder.join("b_1.jpg"))
                 .unwrap();
-            app.load_folder(folder.clone());
+            app.load_folder_and_finish_for_test(folder.clone());
             app.finish_page_identity_preparation_for_test();
             app.stack_mode_requested = true;
             app.spawn_stack_script_worker(
@@ -2606,10 +2694,10 @@ mod tests {
         StackGroupReady,
         std::sync::mpsc::Sender<Result<Option<StackGroupReady>, String>>,
     ) {
-        app.load_folder_with_scan(folder.clone(), None);
+        app.load_folder_and_finish_for_test(folder.clone());
         finish_list_hydration_for_test(app, ctx);
         app.stack_mode_requested = true;
-        app.load_folder_with_scan(folder, None);
+        app.load_folder_and_finish_for_test(folder);
         finish_list_hydration_for_test(app, ctx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !matches!(
@@ -2637,6 +2725,78 @@ mod tests {
         pending.rx = rx;
         app.stack_script_pending = Some(StackPreparePending::Grouping(pending));
         (ready, deliver)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_edit_920_stack_grouping_saves_old_key_before_stamp_check_and_same_index_replacement() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let folder = app.tmp.path().join("page-edit-stack-group");
+        std::fs::create_dir(&folder).unwrap();
+        for name in ["111_p0.png", "111_p1.png", "222_p0.png", "222_p1.png"] {
+            image::RgbImage::new(2, 2).save(folder.join(name)).unwrap();
+        }
+        app.settings.stack_separator = '_';
+        app.settings.stack_script_enabled = false;
+        let (ready, deliver) = hold_stack_grouping_completion(&mut app, &ctx, folder);
+        let old_item = app.items[0].clone();
+        let old_key = app.page_path_key(0).unwrap();
+        assert_ne!(
+            ready.read.order.items[0], old_item,
+            "the producer replaces the same index"
+        );
+        assert!(
+            ready
+                .read
+                .result
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .stamps_current()
+        );
+        app.fullscreen_idx = Some(0);
+        app.selected = Some(0);
+        app.viewer_presentation = crate::app::ViewerPresentation::DetachedWindow;
+        app.detached_viewer_independent_active = false;
+        app.conceal_mode = true;
+        app.conceal_mask_size = [2, 2];
+        app.conceal_mask = Some(vec![true, false, true, false]);
+        app.conceal_shapes.clear();
+        deliver.send(Ok(Some(ready))).unwrap();
+        app.poll_stack_script(&ctx);
+        assert!(!app.conceal_mode);
+        assert_eq!(
+            app.items[0], old_item,
+            "stale pre-save edits must not be installed"
+        );
+        assert!(matches!(
+            app.stack_script_pending,
+            Some(StackPreparePending::Retry(_))
+        ));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.stack_script_pending.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "saved stack projection did not settle"
+            );
+            app.poll_stack_script(&ctx);
+            std::thread::yield_now();
+        }
+        assert!(app.stack_view.is_some());
+        assert_ne!(app.items[0], old_item);
+        let (mask, _, dimensions) = app
+            .conceal_db
+            .as_ref()
+            .unwrap()
+            .get_full_checked(&old_key)
+            .unwrap()
+            .expect("old item owns the saved draft");
+        assert_eq!(dimensions, [2, 2]);
+        assert_eq!(mask, vec![true, false, true, false]);
+        assert!(!app.conceal_mode);
     }
 
     #[test]
@@ -2890,7 +3050,7 @@ mod tests {
         app.settings.default_spread_mode = crate::settings::SpreadMode::RtlCover;
         app.settings.default_reading_flow = crate::settings::ReadingFlow::Vertical;
         app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.settle_open_path_classification_for_test();
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
@@ -3010,6 +3170,8 @@ mod tests {
         app.stack_reconcile_after_fullscreen_close(&ctx);
         app.exit_subfolder_expansion_view();
         app.settle_open_path_classification_for_test();
+        // §1.853 D3: the original Book returns only when its directory scan is adopted.
+        app.finish_direct_navigation_scan_for_test();
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
         assert!(app.extracted_result_surface().is_none());
@@ -3132,10 +3294,10 @@ mod tests {
                     .unwrap();
             }
             app.settings.sort_order = initial;
-            app.load_folder_with_scan(folder.clone(), None);
+            app.load_folder_and_finish_for_test(folder.clone());
             finish_list_hydration_for_test(&mut app, &ctx);
             app.stack_mode_requested = true;
-            app.load_folder_with_scan(folder, None);
+            app.load_folder_and_finish_for_test(folder);
             finish_list_hydration_for_test(&mut app, &ctx);
             let Some(StackPreparePending::Extracting(pending)) = app.stack_script_pending.as_ref()
             else {
@@ -3205,7 +3367,7 @@ mod tests {
                 .set_user_rating(&crate::adjustment_db::normalize_path(&path), stars, None)
                 .unwrap();
         }
-        app.load_folder_with_scan(folder.clone(), None);
+        app.load_folder_and_finish_for_test(folder.clone());
         finish_list_hydration_for_test(&mut app, &ctx);
         app.stack_mode_requested = true;
         let spec = crate::rating_sort::RatingSortSpec {
@@ -3213,7 +3375,7 @@ mod tests {
             unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
         };
         crate::rating_sort::with_test_rating_order(spec, || {
-            app.load_folder_with_scan(folder.clone(), None)
+            app.load_folder_and_finish_for_test(folder.clone())
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while (app.stack_view.is_none() || app.sidecar_restore_active())
@@ -3305,7 +3467,7 @@ mod tests {
         );
 
         crate::rating_sort::with_test_rating_order(spec, || {
-            app.load_folder_with_scan(folder, None)
+            app.load_folder_and_finish_for_test(folder)
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while (app.stack_view.is_none() || app.sidecar_restore_active())
@@ -3340,7 +3502,7 @@ mod tests {
         for name in ["a_1.jpg", "a_2.jpg", "b_1.jpg", "b_2.jpg"] {
             std::fs::write(folder.join(name), b"image").unwrap();
         }
-        app.load_folder_with_scan(folder.clone(), None);
+        app.load_folder_and_finish_for_test(folder.clone());
         finish_list_hydration_for_test(&mut app, &ctx);
         let db_path = app.tmp.path().join("stack-failed-rating.db");
         app.rating_db = Some(crate::rating_db::RatingDb::open_at(&db_path).unwrap());
@@ -3354,7 +3516,7 @@ mod tests {
             unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
         };
         crate::rating_sort::with_test_rating_order(spec, || {
-            app.load_folder_with_scan(folder, None)
+            app.load_folder_and_finish_for_test(folder)
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while (app.stack_view.is_none() || app.sidecar_restore_active())
@@ -3396,7 +3558,7 @@ mod tests {
             std::fs::write(folder.join(name), b"image").unwrap();
         }
         app.settings.sort_order = SortOrder::FileNameDesc;
-        app.load_folder_with_scan(folder.clone(), None);
+        app.load_folder_and_finish_for_test(folder.clone());
         finish_list_hydration_for_test(&mut app, &ctx);
         let db_path = app.tmp.path().join("rating-stack-name-fallback.db");
         app.rating_db = Some(crate::rating_db::RatingDb::open_at(&db_path).unwrap());
@@ -3410,7 +3572,7 @@ mod tests {
             unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
         };
         crate::rating_sort::with_test_rating_order(spec, || {
-            app.load_folder_with_scan(folder, None)
+            app.load_folder_and_finish_for_test(folder)
         });
         finish_list_hydration_for_test(&mut app, &ctx);
         let names = |items: &[GridItem]| {

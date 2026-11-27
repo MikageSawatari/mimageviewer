@@ -2,7 +2,11 @@
 use super::*;
 use crate::settings::FullscreenPrimaryClickMode;
 
+mod close_900_tests;
+mod scrub_907_tests;
+mod stall_919_tests;
 mod suppression_906_tests;
+mod timestamp_919_tests;
 
 fn viewport() -> egui::Rect {
     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))
@@ -81,6 +85,16 @@ struct Canvas {
 
 impl Canvas {
     fn new() -> Self {
+        let mut canvas = Self::without_pointer_pass();
+        canvas.plan(
+            vec![egui::Event::PointerMoved(canvas_pos())],
+            Options::default(),
+        );
+        canvas
+    }
+
+    /// Let a child viewport own the first pointer pass instead of priming ROOT.
+    fn without_pointer_pass() -> Self {
         let ctx = egui::Context::default();
         page_turn::install(&ctx);
         install_fs_navigator_input_tracking(&ctx);
@@ -89,16 +103,11 @@ impl Canvas {
         app.settings.fullscreen_navigator_visible = false;
         app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
         app.fs_focus_regained_at = None;
-        let mut canvas = Self {
+        Self {
             ctx,
             app,
             time: 0.0,
-        };
-        canvas.plan(
-            vec![egui::Event::PointerMoved(canvas_pos())],
-            Options::default(),
-        );
-        canvas
+        }
     }
 
     fn plan(&mut self, events: Vec<egui::Event>, options: Options) -> Outcome {
@@ -109,6 +118,7 @@ impl Canvas {
             egui::RawInput {
                 screen_rect: Some(viewport()),
                 time: Some(self.time),
+                input_clock: Some(self.time),
                 focused: true,
                 events,
                 ..Default::default()
@@ -237,6 +247,7 @@ impl Canvas {
             viewport_id,
             screen_rect: Some(viewport()),
             time: Some(self.time),
+            input_clock: Some(self.time),
             focused,
             events,
             ..Default::default()

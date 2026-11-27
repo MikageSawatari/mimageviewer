@@ -555,6 +555,15 @@ struct AxisLevel {
     delivered: f32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PadNeutralGate {
+    #[default]
+    None,
+    Directional,
+    /// A rejected grid session also owns trigger-driven scrolling until neutral.
+    GridNavigation,
+}
+
 pub struct GamepadInputState {
     buttons: HashMap<PadButton, ButtonLevel>,
     axes: [AxisLevel; 6],
@@ -563,7 +572,7 @@ pub struct GamepadInputState {
     y_modifier_used: bool,
     west_ring_direction: Option<RingDirection>,
     west_tap_suppressed: bool,
-    directional_neutral_required: bool,
+    neutral_gate: PadNeutralGate,
     analog_last_tick: Option<Instant>,
     left_stick_next_step: Option<Instant>,
     trigger_next_step: Option<Instant>,
@@ -579,7 +588,7 @@ impl Default for GamepadInputState {
             y_modifier_used: false,
             west_ring_direction: None,
             west_tap_suppressed: false,
-            directional_neutral_required: false,
+            neutral_gate: PadNeutralGate::None,
             analog_last_tick: None,
             left_stick_next_step: None,
             trigger_next_step: None,
@@ -665,7 +674,7 @@ impl GamepadInputState {
         }
         self.y_modifier_used = false;
         self.reset_west_ring_state();
-        self.directional_neutral_required = false;
+        self.neutral_gate = PadNeutralGate::None;
     }
 
     /// 保持している入力が何も無いか。終端処理を毎フレーム空振りさせないための述語で、
@@ -681,7 +690,7 @@ impl GamepadInputState {
             && !self.y_modifier_used
             && self.west_ring_direction.is_none()
             && !self.west_tap_suppressed
-            && !self.directional_neutral_required
+            && !self.directional_neutral_required()
             && self.analog_last_tick.is_none()
             && self.left_stick_next_step.is_none()
             && self.trigger_next_step.is_none()
@@ -696,7 +705,7 @@ impl GamepadInputState {
         self.repeat_next.clear();
         self.y_modifier_used = false;
         self.reset_west_ring_state();
-        self.directional_neutral_required = false;
+        self.neutral_gate = PadNeutralGate::None;
         self.analog_last_tick = None;
         self.left_stick_next_step = None;
         self.trigger_next_step = None;
@@ -854,7 +863,9 @@ impl GamepadInputState {
     }
 
     pub fn require_directional_neutral(&mut self) {
-        self.directional_neutral_required = true;
+        if self.neutral_gate == PadNeutralGate::None {
+            self.neutral_gate = PadNeutralGate::Directional;
+        }
         self.left_stick_next_step = None;
         self.analog_last_tick = None;
         for button in DPAD_BUTTONS {
@@ -863,11 +874,21 @@ impl GamepadInputState {
     }
 
     pub fn clear_directional_neutral_required(&mut self) {
-        self.directional_neutral_required = false;
+        self.neutral_gate = PadNeutralGate::None;
     }
 
     pub fn directional_neutral_required(&self) -> bool {
-        self.directional_neutral_required
+        self.neutral_gate != PadNeutralGate::None
+    }
+
+    pub(crate) fn require_grid_navigation_neutral(&mut self) {
+        self.require_directional_neutral();
+        self.neutral_gate = PadNeutralGate::GridNavigation;
+        self.trigger_next_step = None;
+    }
+
+    pub(crate) fn grid_navigation_neutral_required(&self) -> bool {
+        self.neutral_gate == PadNeutralGate::GridNavigation
     }
 
     pub fn dpad_direction_down(&self) -> bool {

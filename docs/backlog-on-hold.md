@@ -50,14 +50,6 @@
 - 検討範囲: まず文字情報のある PDF (変換後に文字が残る EPUB を含む) だけを対象にする案と、EPUB の元の文章を読む案を比較する。PDFium の文字抽出を追加し、音声合成・停止 / 再開・ページ移動との連携・読書位置の保存をどこまで含めるか決めてから規模を見積もる。縦書き・段組み・ルビ・ページの見出し等の読む順番や読み方も確認し、抽出できれば自然な朗読になるとは扱わない。
 - 別範囲: 画像のみのスキャン本や漫画は OCR と読み順の推定が必要。初版へ暗黙に含めず、必要な実データと評価方法を決める。動画・音声の文字起こしは逆方向の機能で、既存の文字起こし実装だけでは朗読にならない。調査・検討と実装着手は区別する。
 
-### 1.734 ZIP 内のフォルダ移動を、フォルダ履歴の戻る/進むで辿れるようにするか — メール報告、当面は仕様 (2026-11-07 利用者判断)
-
-- 状態: **当面は今の仕様のまま** (利用者判断 2026-11-07)。同じ要望が重なったら下の小さい案から検討する。
-- 報告 (報告者の観測、v4.11.0): フォルダ A → AAA.zip → ZIP 内のフォルダ B と進んでから履歴の ← を押すと、AAA.zip ではなくフォルダ A へ戻る。「v4.4.0 は違った気がする」とのこと。
-- 現状 (コード): ←/→・マウスの戻る/進むは `dispatch_main_folder_history_input` (`src/app.rs`) に集まり、ZIP 内の階層 (`zip_nav`) を見ない。ZIP 内の移動 (`zip_nav_enter`) は外側の履歴に積まない。設計書の規則 ([folder-history-location-plan.md](folder-history-location-plan.md) の「ZIP/PDF の内部階層は外側履歴では一地点」) どおりで、`real_zip_internal_and_outer_history_from_rating` / `_from_collection` が固定している。v4.4.0 のコードも同じで、v4.4.0〜v4.11.0 にこの動きを変えた変更は無い。BS は ZIP 内を 1 段ずつ上がる。Ctrl+↑↓ も書庫を 1 冊として隣へ移るので、書庫を 1 地点とする扱いは一貫している。
-- 判断の理由: エクスプローラーは ZIP を普通のフォルダとして履歴に積むので、一般的には履歴に残るほうが自然。ただ外側の履歴に ZIP 内の位置まで持たせると大きい (推定): 履歴の行き先 9 種への位置の追加、戻る/進むで書庫を開き直した後に記録した階層まで降りる処理を「確定まで前の一覧を変えない」仕組みの中に入れること、選択の復元 (§1.328)・レーティング絞り込みの復元 (§1.671)・A/B ごとの履歴との整合。
-- 小さい案 (小〜中、推定): ZIP 内で 1 段以上降りているときだけ ← を ZIP 内の 1 段戻りにし、→ 用に ZIP 内だけの進む記録を `ZipNavState` (`src/zip_tree.rs`) に持たせる (書庫を出たら捨てる)。外側の履歴の型は変えない。欠点は、ZIP 内では ← が BS とほぼ同じになることと、書庫の外へ出てから → で戻ると一番上から開き直すこと。採るなら設計書の「一地点」の規則に例外として書き足す。
-
 ### 1.692 Everything の検索条件を保存し、呼び出すたびに検索する — 5ch >>718 (2026-11-02)
 
 - 状態: **仕様検討・採否判断待ち。§1.690 (次の版) の「検索要求」の型が入った後で、同じ版に加えるかを決める (利用者 2026-11-10)。まず簡易版として検索欄の入力履歴 (本体 §1.756、既定オン) を次の版に入れる**。>>718 は `dupe: zip:`、`dm:last5days pic:` 等を名前付きで保存して再利用したいという要望。>>722 で固定ファイル一覧のコレクションとの違いを説明し、「保存した検索」として扱う方法も含め設計を検討すると回答済み。実装・時期の確約はない。
@@ -74,29 +66,12 @@
 - Everything の `SearchAccepted::Everything` は確定クエリ、`Arc<EverythingDataset>`、Root/PhysicalChildの位置を既に持つ。ただし全検索が同じ保持方式ではないため、Everythingだけの初版か、メタ情報・お気に入り・タグ等も同時に対象とするかを先に決める。旧セッションの非同期完了・入力・帰路を新しい履歴へ流用しない。再検索しない復元でも、消失した実ファイルを開けると保証しない。
 - 関連: [検索設計](search-architecture.md)、[最上位一覧](top-level-grid-view.md)、[Everything設計](everything-search-plan.md)。規模: 中〜大（全検索の共通化は増加）/ 優先度: P3。保存した検索条件の呼出し §1.692 と区別する。
 
-### 1.665 本を開いた直後に、画像ウィンドウ内のページ一覧を表示するオプション — 5ch >>669、追加採用は保留 (2026-10-31、2026-11-02更新)
-
-- 状態: **報告者は解決と回答、追加オプションの採否は保留**。[>>669](https://egg.5ch.io/test/read.cgi/software/1782419551/669) の「ZIPをフォルダ扱いにし、全画面の前にサムネイルを挟みたい」に対し、[>>673](https://egg.5ch.io/test/read.cgi/software/1782419551/673)（同内容の>>674・675）で既存設定と代案を案内し、用途に合うか質問した。その後の >>688 を下に追記。実装確約・時期指定はしない。
-- 案内済み: フル機能ウィンドウでは「本の表示モード → 開いたとき、ページ一覧を表示」でメインのページ一覧を開ける。複数ウィンドウでは本を直接ページ表示するが、Oキーで画像ウィンドウ内の簡易ページ一覧を開ける。この一覧はページを選んで開くためのもので、メインと同じ削除・チェック・ファイル操作は持たない。
-- 提案: 仮称「本を開いたとき、画像ウィンドウ内のページ一覧を表示する」を追加し、複数ウィンドウで本を開いた最初の表示をOキーの一覧にする。再検討時はページ選択用一覧で足りるか、ファイル操作を伴うメイン相当の一覧なのかを区別する。既存の本の表示モードを勝手に読み替えない。
-- 2026-11-02 照合: >>688 で「669のzipをサムネイル表示も解決」と報告済み。上の追加オプション自体の採用を求める返答ではなく、これを未解決の不具合として再質問しない。追加の需要・採用判断があれば再検討する。
-- 採用時の確認: 本のページ列・表示先・現在ページが確定した境界から既存 `open_page_overview_for_viewer` へ接続できるか調べる。画像が先に一瞬見えること、初期ページの読み込み待ち、変換・パスワード・取消、Oで一覧を閉じたときの行き先を整理する。単にキー入力を自動送信する処理や新たな並列状態を足さず、通常のページ選択・読書位置・メイン非干渉を保つ。実装可能性の検証と実機確認は未実施。
-- 関連: [画像ウィンドウ内のページ一覧計画](detached-book-page-overview-plan.md)、[detached計画 §2](detached-rework-plan.md)、`src/ui_fullscreen/page_overview.rs`。追加の需要があり仕様を採用する場合に本体バックログへ移す。規模: 採用範囲を決めてから見積り。
-
 ### 1.463 外部アプリから開いた閲覧を閉じた後、元の作業へ戻れるようにする — 5ch >>477・479 (2026-09-28 要望、2026-10-28 記録補完)
 
 - 状態: **検討・動作方針待ち、実装時期未定**。[>>477](https://egg.5ch.io/test/read.cgi/software/1782419551/477) で、別ソフトから mIV を呼び出し、画像を閉じた後はサムネイル一覧を前面に残さず元のソフトへ戻りたいと要望。[>>479](https://egg.5ch.io/test/read.cgi/software/1782419551/479) で、毎回終了・起動する代わりに既存のトレイ常駐を利用して閲覧終了時に窓を隠す案を検討すると回答した。
 - 未決事項: 通常の閲覧と外部アプリから指定して開いた閲覧をどう区別するか。起動済みインスタンスへのファイル転送、閲覧中の追加 open、キャンセル、複数窓における対象を整理する。起動オプションで区別する案はあるが未採用で、通常操作の終了・最小化設定を一律に変えない。
 - 現状: 通常の最小化・トレイ格納はあるが、外部から開いた特定の閲覧の終了にだけ結び付ける機能はない。同じデータ保存先での多重起動制限は解除せず、既に開いている普段の mIV を終了させない方法を優先する。元アプリへフォーカスを戻せる範囲も Windows の制約を確認する。
 - 再検討時: 既存の open / close / tray の所有経路に接続できる最小の仕様を決める。利用者へは用途が回答済みなので同じ質問を繰り返さない。関連: [ナビゲーション仕様](fullscreen-navigation-consistency.md)、[別窓リワーク計画](detached-rework-plan.md)。規模 / 優先度: 方針確定後に見積り / P3。
-
-### 1.336 大きいデータ (runtime 展開・モデル・DB・キャッシュ) を Roaming の %APPDATA% に置いている — 当面維持 (2026-10-06 利用者判断)
-
-- 現状 (コード): インストーラ版・単体exe版は runtime/<version> (1 版あたり約 540 MB)、AI モデル、各種 DB、キャッシュをすべて `%APPDATA%\mimageviewer` (Roaming) に置く。Windows の作法では大きいデータやキャッシュは `%LOCALAPPDATA%` (Local) に置く。
-- 影響しうる環境: ドメインの移動プロファイル (ログオン／ログオフ時の同期が重くなる) と、AppData をネットワーク共有へ向けるフォルダリダイレクト (初回展開や SQLite がネットワーク越しになり、遅延やロックが起き得る)。個人利用でこうした管理環境に当たる可能性は低い。
-- 2026-10-06 の検討 (Microsoft Store の v4.3.0 認定却下 §1.241 の原因候補として): 移動プロファイルの同期はアプリ起動時ではなくログオン／ログオフ時なので、起動が終わらない原因にはなりにくい。リダイレクト環境なら起こり得るが、審査機がそうである根拠はない。**利用者判断で当面は保存先を変えない。**
-- 将来移す場合: リリース済みの保存先なので既存データの移行 (設定バックアップ、複数保存先、portable の `<exe_dir>\data` は対象外) が要る。起動の診断ログに保存先がネットワーク上か (UNC・ドライブ種別) を残せば、この環境かどうかは見分けられる。
-- 経緯メモ: 利用者は以前にも「個人利用では可能性が低いので対応しない」と判断した記憶があるが、記録は見つからなかった。今回の判断をここに残す。
 
 ### 1.268 Z ズーム中、ホイールでページ送りした後にカーソルを次ページの右上へ移すか — 操作感の検証待ち (2026-09-23)
 
@@ -109,81 +84,9 @@
 
 ---
 
-### 1.265 背面の PDF document open 同時実行を、前面の open が待っている間だけ絞るか — 効果未測定 (2026-09-22)
-
-- 出どころ: v4.0.0 公開前の実機確認。利用者が「複数ウィンドウで PDF を開くのに時間がかかることがある」と報告し、
-  公開担当が perf ログ (`%APPDATA%\mimageviewer\logs\perf_events.jsonl`、2026-09-22 20:16) を解析した。
-- **測って分かったこと**: `pdf/pool_open_request` 79 件の `open_ms` は中央値 654ms / p90 6,393ms / 最大 13,677ms。
-  最悪例は `open_ms=12358.95` / `priority=Critical` / `open_in_flight=3` で、`pool_dispatch` の `wait_ms` は 0.016ms。
-  **キュー待ちではなく document open 自体の実時間**で、遅い open は Normal / HighNormal / Critical に散らばる。
-  優先度の逆転ではない。同一文書の 2 回目以降は `doc_reused=true` で 21〜24ms。
-- **未測定の可能性**: 最悪例の時点で `open_in_flight=3`。前面の open が待っている間だけ背面 (grid サムネイル) の
-  document open を絞れば、前面の open が速くなるかもしれない。**これは推測であり、測っていない。**
-- 利用者判断 (2026-09-22): **今回は見送り**。「ウィンドウが開いて、そこで読み込み中になれば、背面 open が
-  少し遅延するのは一旦は許容してもよい」。前面を先に見せる対処を v4.0.0 に入れたため、体感上の問題は塞がる。
-- 着手するときの順序: **先に「絞ると前面が速くなるか」を測る**。効果が無ければ入れない。
-  絞ることで背面のサムネイル生成が遅くなる副作用と釣り合うかも同時に見る。
-- 規模 / 優先度: 不明 (効果測定から) / P3。
-
 ---
 
-### 1.264 全画面で Ctrl+↑↓ したとき、上下の HUD が一瞬出る — 再現待ち (2026-09-22)
-
-- 出どころ: 利用者が v4.0.0 の公開前スモーク中に実機で観測 (2026-09-22)。同じセッションで
-  「Ctrl+↑↓ が遅くなった」「画面がちらつく」とも報告があったが、**そのうち速度と中央ダイアログは
-  別の説明が付いた** (下記)。HUD だけが未説明のまま残る。
-- **その後、利用者が操作を続けるうちに再現しなくなった。** 何が再現条件だったかは不明。
-  利用者は「一時的な状態で何かあったのかもしれない」としている。
-- **エージェントの観測は無い** (製品バイナリを起動しないため)。perf ログでも判定できない:
-  **HUD の可視状態には perf 計装が無く**、上下 HUD がいつ出たかを記録したイベントが存在しない。
-- 説明が付いた分 (この節の対象外):
-  - 中央のダイアログ = サイドカー復元のモーダル ([sidecar_restore.rs](../src/app/sidecar_restore.rs) の
-    `SIDECAR_RESTORE_MODAL_GRACE` = 100ms 超で表示)。仕組みも閾値も v3.10.0 より前 (`06a256a24`)。
-    比較に使われた前版はポータブル版で data フォルダが別なので、復元の重さが違って当然。
-  - 速度: perf ログ (`perf_events.1.jsonl`、2026-09-22 のスモーク) で全画面 Ctrl+↑↓ の
-    入力→反映完了が p50 10ms / p95 21ms / 最大 23ms、実処理 1.5〜2ms。退行は見当たらない。
-- コード上分かっていること: 全画面の Ctrl+↑↓ は毎回 `close_fullscreen` (`was_open: true`) を通り、
-  旧表示は holdover が保つ。HUD の可視状態がこの閉じ／開き直しをまたいで保たれるかは未調査。
-  v3.10.0 で直した §1.233 (設定復元まわりの全画面ちらつき) と同じ経路に触れるので、
-  調べるときはまずそちらの設計を読む。
-- 着手するときの順序: **先に HUD 可視状態の perf 計装を足す**。計装の無いまま実機往復を
-  繰り返さない (CLAUDE.md「観測の出どころを落とさない」と、再現手段を先に作る方針)。
-- 規模 / 優先度: 不明 (再現条件が分かるまで見積もれない) / P3。
-
 ---
-
-### 1.258 本棚削除が途中で失敗した場合の移行待ちメタデータ整合 — コードレビュー、範囲判断待ち (2026-09-20)
-
-- 出典: M-2 独立レビューのコード調査。実機での発生報告・再現ではない。
-  `books::delete_book` の `remove_dir_all` は一部を削除してから失敗する可能性があるが、
-  現在の結果は途中まで削除できた個々のパスを伝えない。
-- 削除処理中の新規 generic migration は待機させるが、削除エラー後には再開するため、
-  既に消えたページへ移行待ちのメタデータを再作成する可能性が残る。
-  M-2 では完全成功時の削除パスの invalidation と、読めない旧復旧記録の保護を扱う。
-- 部分成功のパス報告、または失敗後の再照合を含む削除処理の設計が別途必要。
-  今回の M-2 へ拡大せず、障害注入による影響確認と対応範囲の判断を後続へ残す。
-  [M-2 の設計・検証記録](collection-migration-journal-recovery.md) を参照。
-
-### 1.252 動画字幕のデコード・表示 — >>429、当面見送り (2026-09-17)
-
-- 出典: >>429。音声トラック切り替えとあわせて、動画字幕のON/OFFが欲しいとの要望。
-- 判断: **当面は見送る**。複数音声は §1.251 として字幕から分離して検討する。
-- **2 件目の要望 (2026-09-30、利用者メール、v4.2.0)**: 複数音声の選択と字幕の ON/OFF が
-  できれば「mpv での外部再生はほぼ不要になる」。同日、**対応予定が無い旨を回答済み**
-  (理由は下記の構造。**手元に素材が無いことは理由にしない** — 字幕付き動画は容易に作れるため、
-  ts / mts の見送り理由とは性質が違う)。
-- **再検討条件との関係**: 要望は 2 件になったが、**形式と表示範囲を限定する材料にはなっていない**
-  (どの字幕形式を、どこまで表示できればよいかが示されていない)。件数だけでは再検討条件を満たさない。
-- 現状、mIVに動画字幕の列挙・デコード・同期・描画経路は無い。native presenter内の `subtitle` という名前は
-  ナビゲーション案内の副テキストであり、メディア字幕ではない。動画エンジンの設計上も字幕はスコープ外。
-- 対応する場合は、少なくとも次を一体で設計する必要がある:
-  - 埋め込み字幕trackの列挙とOFFを含む選択、seek / source切り替え時のflushと時刻同期。
-  - SRT等のtext字幕、ASS/SSAのstyle・font・配置、PGS等のbitmap字幕をどこまで対象にするか。
-  - native D3D11動画、F12別ウィンドウ・複数ウィンドウ、回転・360度表示、capture / Remoteにおける合成範囲。
-  - 日本語・縦書き・複数行・欠落fontを含む合法的な自作テスト素材と、依存ライブラリを追加する場合の配布・license確認。
-- 再検討条件: 字幕形式と表示範囲を限定できる具体的な利用例が複数集まるか、字幕rendererを安全に統合できる
-  動画描画基盤の見直しを行うとき。単にON/OFF UIだけを追加して部分対応にはしない。
-- 規模 / 優先度: Large / P3 / 保留。
 
 ### 1.213 通常動画のナビゲーターを出せるか — 描画経路が静止画と違う (2026-09-11)
 
@@ -349,99 +252,6 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
 - 利用者へは「検討する」と回答済み (2026-09-02)。
 - 規模 / 優先度: Small〜Medium / P3 (方針決定が先)。
 
-### 1.247 EPUB を PDF へ変換して読む — 漫画用途を中心に技術検証する (2026-09-16、方針更新 2026-09-17)
-
-- 出典: 利用者からの EPUB 対応要望 → 競合の対応状況調査 → suzunia の実装解析
-  (2026-09-16 の相談) → mIV スレ >>434 で用途を確認 (2026-09-17)。
-- **方針更新 (2026-09-17)**: 汎用 EPUB ビューアを新設する案は引き続き採らない。一方、利用者の
-  主用途が漫画で、文字サイズ・フォント・余白の変更、テキスト選択・コピーはいずれも不要と
-  確認できたため、**DRM のない EPUB を固定レイアウトの PDF へ変換し、既存の PDF 経路で読む
-  方式を技術検証する**。スパイク結果を見て実装採否を決める。
-- 対象範囲:
-  - 漫画用途を優先し、まず `rendition:layout=pre-paginated` と画像中心の EPUB で、ページ順・
-    右開き・画質・変換時間を確認する。
-  - DRM 付き EPUB の解除・変換は扱わない。利用者側で DRM のない EPUB を用意する前提。
-  - 変換後はページサイズと組版を固定し、文字サイズ・フォント・余白の変更、テキスト選択・
-    コピーは提供しない。
-  - 漫画以外のリフロー型 EPUB は、縦書き・ルビ・改ページが実用になるかを追加確認するが、
-    初期検証の成立条件にはしない。
-- 判断材料として新しく分かったこと:
-  1. 国内の現役競合 suzunia が EPUB へ対応した (同梱 CHANGELOG の `### 2026.08.09.`)。
-  2. その実装は**リアルタイムに文字を組み直すビューアではなく、固定レイアウトで組版して
-     画像で持つ方式**だった (下記)。
-  3. ウィンドウをリサイズしてもページ周囲の余白が増えるだけ (**利用者の観測、2026-09-16**)。
-  4. 競合の対応状況: NeeView / YACReader / ImageGlass / nomacs / QuickViewer はソース検索で 0 件、
-     BandiView は公式の対応形式一覧に無し、OpenComic は未リリースの v1.7.0 のみ。
-     SumatraPDF / Komga / Kavita は対応 (いずれもレンダリングエンジンを持つ製品)。
-- suzunia の実装 (2026-09-16 の**静的解析**。配布バイナリの import と文字列を読んだだけで、
-  **実行していない**):
-  - `WebView2Loader.dll` を同梱し、`CreateCoreWebView2EnvironmentWithOptions` を動的ロード。
-  - 展開した EPUB を `SetVirtualHostNameToFolderMapping` で WebView2 へ渡す。
-  - CSS / JS を注入して組版する。バイナリ内に実物がある:
-    `function isV(el) { return !!el && getComputedStyle(el).writingMode.indexOf('vertical') === 0; }`
-    で**縦書きを検出して分岐**し、横書き側は `html{width:Wpx}` `body{width:Wpx;padding:Mpx;font-size:…}`
-    + `column-gap:(2*M)px;column-fill:auto` でページへ割る。W / H / M (幅・高さ・余白) がパラメータ。
-  - `CapturePreview` で画像化し、`EpubLayoutCache` に保存 (README の「ページ数把握の為に最初に
-    開く際は時間が掛かります」と整合)。`png-cache hit` というログ文字列もある。
-  - **つまり「変換して画像で持つ」方式**。本項の案と設計思想は同じで、違うのは出力先だけ。
-- 検証する方式 (2026-09-16 利用者の選択: 画像 ZIP ではなく **PDF**、2026-09-17 検証着手を決定):
-  - **EPUB を PDF へ変換してキャッシュし、既存の PDF 経路で読む**。変換は WebView2 の
-    `PrintToPdf` (ページサイズ・余白を指定し、ヘッダ / フッタは抑止)。
-  - 初期スパイクは出力を PDF に統一する。**画像で構成された EPUB**
-    (`rendition:layout=pre-paginated`、spine の実体が画像) も、spine 順・ページ寸法・右開きを
-    保って PDF 化できるかを先に確かめる。画像を無圧縮 ZIP へ直接展開する最適化は、方式が
-    成立した後の候補とし、初期スパイクでは二経路を持たない。
-  - リフロー型は**文字サイズもレイアウトも固定**になる。テキスト選択・コピーは提供しない。
-  - キャッシュは変換済みアーカイブキャッシュと同じ扱い (容量上限で古いものから破棄)。
-  - `page-progression-direction` から**右開きを自動設定**できる。
-  - DRM 付きは変換時に検出して明示的にエラーにする (無言で空の本にしない)。
-- 画像 ZIP ではなく PDF にする理由:
-  - `CapturePreview` は表示矩形で撮るため、**画面より大きいページを撮れるか (クランプされないか)
-    が不明**。PDF ならベクタで出るのでこの問題が消え、mIV 側は PDFium で任意倍率に描ける。
-  - ページ分割を Chromium の印刷改ページに任せられる。自前のスクロール制御が要らない。
-  - 出力が数 MB で済む。画像 ZIP は 300 ページで数十 MB 以上になる (**測っていない見積もり**)。
-  - 着地点が既存の PDF 経路なので、ページ列挙・並列レンダ・ズーム再レンダ・サムネイルの
-    **下流作業がゼロ**。
-- 実装の当たり所 (2026-09-16 のコード確認):
-  - `do_convert` が format で分岐して `expand_*` を呼ぶ構造 (`src/archive_converter.rs:782`)。
-    `ArchiveFormat` へ `Epub` を足して `expand_epub` を生やす形に嵌まる。
-  - `quick-xml = "0.41"` が既に依存にある (`Cargo.toml:393`)。container.xml / OPF / spine の解析に使う。
-  - **容量上限つきキャッシュは既存**: `prune_to_size_limit_locked` (`src/archive_cache.rs:475`)、
-    設定 `archive_cache_max_bytes` (`src/settings.rs:4153`)、キャッシュ管理 UI。
-  - 変換ダイアログ・進捗・キャンセル・`.part` からの atomic publish・検証も既存。
-  - `reserve_cache_zip_path` (`src/archive_cache.rs:542`) が ZIP 前提なので、PDF 出力を置けるように
-    する小改修が要る。
-  - 拡張子の認識: `is_convertible_archive_path` (`src/folder_tree.rs:173`) は `from_extension` へ
-    委譲しているので enum を足せば自動で通る。個別に列挙しているのは
-    `src/archive_cache.rs:591`、`src/app.rs:74620` / `74859`、`src/reading_history_db.rs:501`、
-    `src/app/grid_paint.rs:1474` (バッジ)、`crates/remote-web/src/store.rs:321`。
-  - **WebView2 ワーカーは新規 exe**。`Cargo.toml` に webview2 / wry の依存は無い。Susie 32bit
-    ワーカーや PDF ワーカーと同じ子プロセス方式にすれば、GUI 側が COM と Chromium のクラッシュを
-    背負わない。別 crate にすれば `windows` crate の版も本体と独立に選べる。変換は一度きりの
-    バッチなので、PDF プールのような優先度レーン / epoch / harvest は要らない。
-  - 配布への追加は Susie ワーカーと同じ形: `build.rs` の vendor 検査 (`build.rs:493` 付近)、
-    launcher の `include_bytes!`、`scripts/build-portable.ps1`、`scripts/sign-files.ps1`、
-    `scripts/check-vcrt-pe-dependencies.ps1`、`scripts/bootstrap-vendor.sh`。
-- **技術検証 (スパイク 2〜3 日。いずれも未検証)**:
-  1. 漫画 EPUB を PDF 化したとき、spine 順・ページ寸法・右開き・見開きが保持され、画像が
-     不要に再圧縮・縮小されないか。
-  2. `PrintToPdf` が**縦書き** (`writing-mode: vertical-rl`) とルビを実用的に改ページするか。
-     これは漫画用途の成立後に確認する副次項目で、失敗しても漫画対応までは否定しない。
-  3. `@media print` による見た目の変化と、ヘッダ / フッタの抑止。
-  4. WebView2 Runtime が無い環境での失敗の出し方 (Windows 11 は同梱だが、無い環境はあり得る)。
-  5. WebView2 のユーザーデータフォルダの置き場 (APPDATA / ポータブルの `data`) と後始末。
-  - 画像化 (`CapturePreview`) 方式を採る場合は、加えて**画面より大きいページを撮れるか**を
-    確かめる必要がある。
-- 未決事項:
-  - 組版パラメータ (幅・高さ・余白・文字サイズ) を決め打ちにするか設定にするか。設定にするなら
-    キャッシュの鍵へ入れて、変更時は再変換する。初版は決め打ち + 「再変換」で足りる見込み。
-  - **対外的な名乗り方**。「EPUB 対応」と書くと DRM 付きの購入書籍と、リフロー時の文字サイズ変更を
-    期待される。実装する場合も「DRM のない EPUB を固定レイアウトへ変換して閲覧」と明記する。
-- テスト素材: DRM のない漫画 EPUB を優先する。縦書き・ルビの副次確認は青空文庫の EPUB で組める。
-- 規模 / 優先度: スパイクが順当なら Medium (1〜2 週間)、画像化方式を採るなら 2〜3 週間。P3
-  (まずスパイク、実装採否は結果待ち)。**この数字は測っていない見立て**で、WebView2 側の
-  スパイク結果で変わる。
-
 ---
 
 ## 2. 再現・確認待ち — こちらからは進められない
@@ -472,14 +282,6 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
 - 再開条件・候補: 開発側の再現環境、wgpu/eguiやAMD側の該当修正、既存の異常終了診断から得られるdevice lossと最初のエラーの相関など、原因を狭める材料が得られたとき。HAGS・オーバーレイはローカル調査の候補条件として保持するだけで、報告者への追加試験一式にはしない。staging失敗より前のGPUエラー/要求を調べ、必要な診断追加や依存部品の変更も証拠と範囲を先に設計する。device再生成でアプリを復旧する話とPC全体の停止防止は分け、包括的な復旧機構を既定タスクにしない。
 - 関連: [GPU初期化方針](gpu-init-fallback-plan.md)、`src/wgpu_backend_policy.rs`、`src/render_failure_diagnostics.rs`、`src/previous_run_diagnostics.rs`、vendor egui-wgpu。動画HUD点滅の本体 §1.387 とは別報告。規模: 原因特定後 / 優先度: P2 monitor。
 
-### 1.468 終了後もポータブル版フォルダの名前変更・exe の上書きができない — 5ch >>64〜71 (2026-07-17 報告、2026-10-28 記録補完)
-
-- 状態: **原因未確定・再現条件待ち**。mIV 起因と確定した不具合でも、修正を確約した項目でもない。古い報告が台帳に残っていなかったため記録する。
-- 報告者の確認済み事項: [>>64〜71](https://egg.5ch.io/test/read.cgi/software/1782419551/64-71) では、終了後に exe 自体の名前変更はできても親フォルダの名前変更と `mimageviewer.exe` / `mimageviewer-susie32.exe` の上書きが失敗。mIV 名のプロセスは残っておらず、File Locksmith も検出なし。Explorer の再起動でも変わらず、起動中は File Locksmith が検出することも確認済み。開発側では再現せず、報告者はセキュリティソフト側を調べるとしていた。
-- 他報告との区別: 後の >>532・550 は NAS 上のポータブル版で起き、ローカルでは起きないと確認されたため、>>551 でローカル exe / data の利用を案内済み。7月の報告では保存先条件が分からないので、同じ原因・解決済みとは断定しない。NAS 上の DB 利用対応を約束する項目にはしない。
-- 再調査の条件: 新しい再現条件、対象ファイルとロック保持元を特定できる証拠、または開発側の再現手段が得られたとき。プロセス残存の未確認な仮説を診断へ変えず、確認済みの試験を再度一式頼まない。
-- 規模 / 優先度: 原因が分かってから見積り / P3 monitor。
-
 ### 1.469 直読み RAR などのサムネイル一括作成を追加するか — 5ch >>335・338 (2026-09-03 相談、2026-10-28 記録補完)
 
 - 状態: **対象形式・需要の確認待ち、採用未決定**。実装するとの確約ではない。[>>335](https://egg.5ch.io/test/read.cgi/software/1782419551/335) は圧縮ファイルの一括作成についての質問で、形式は書かれていない。
@@ -496,45 +298,6 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
 
 
 再現手段が無い、利用者の確認を待っている、実機計測を待っている、原因が未確定のもの。
-
-### 1.391 ui-smoke `NativeTopPanoramaClick` が 1 回だけ、押下の受領を確認できずに止まった — 原因不明、再現待ち (2026-10-17)
-
-- 経緯: 押下の前に止まっていた原因 (パノラマボタンの中心へカーソルを動かす手順が無かった) は、ボタン中心への 2 回目の MouseMove と
-  移動後の観測で押下先を決め直す修正で解消した (`47b65285e`、master 取り込み `d34978975`)。
-- 残り (原因不明): 修正後の実入力 1 回目 (2026-10-17 14:09、利用者了承、ClaudeCode の隔離 portable 実行) で、Down は挿入されたが App が
-  LeftButtonDown の受領を確認できず、31 秒で `button_receipt_wait` の timeout (EnvironmentFailure)。当時の WndProc の記録は MouseMove
-  専用で、Down がどこに届き、どこで外れたかは決められない。実行後、左ボタンは離れていた (ClaudeCode が `GetAsyncKeyState` で確認)。
-  証跡は作業ツリー `G:/home/mimageviewer-panclick` の `target/ui-smoke-runs/20261017T050904742Z-84168-NativeTopPanoramaClick-c019ac0e`
-  にあったが、作業ツリーの撤去で消えるので、要点はこの節に残す。
-- その後、Down/Up の入口・照合・処分 (activate-and-eat、touch 破棄、capture 変更など) と、補助プログラム側の tag・挿入・受け手を
-  記録する計装を足した (`f62103b45`、test-script 限定、製品の挙動は不変)。2 回目 (16:42) は PASS (zoom=1.0)。2 回は表示位置が違う
-  (presenter の画面原点が 1 回目 (159,193)、2 回目 (463,497)。ボタン中心は同じ client (1239,41))。独立レビューの見立てでは、
-  計装でタイミングが変わって競合が隠れた可能性は排除できない。残る候補は、入力先の違い・activation による破棄・照合 / 配送の経路。
-- 再開の条件: 次に NativeTopPanoramaClick が受領の timeout で落ちたら、計装の記録 (runner-events.log の `button helper input trace` と
-  App ログの button edge の処分) から原因を決め、本体のバックログへ戻す。実入力の試験なので、実行は毎回利用者の了承を得る。
-- 規模 / 優先度: Small / P3。
-
-### 1.388 別ウィンドウの promote で `plan_promote` のアサーションが落ちる — panic.log の記録、操作不明 (2026-10-16 起票)
-
-- 出どころ: v4.7.1 のリリース前の `check-panic-log.ps1` で見つかった未分類の 1 件。
-  `%APPDATA%\mimageviewer\logs\panic.log` に、2026-10-15 17:33 (日本時間) の
-  `PANIC at src\app\viewer_context_registry.rs:590:9: assertion left == right failed` (`left: ViewerContextId(0)`、
-  `right: ViewerContextId(1)`) が 1 回だけ記録されている。スタックはシンボル無し。
-- コード参照: 該当行は `plan_promote` の `assert_eq!(stashed, self.main)`。表示中 (Mounted) の context が 0、
-  main として記録されている context が 1 で食い違ったまま promote が始まった。この行は v4.7.0 と v4.7.1 で同じ。
-- 何の操作で起きたかは不明。その時点の通常ログ (`mimageviewer.log`) は残っておらず、どのビルド (開発版か v4.7.0 か) かも分からない。
-  同じ日に §1.384 (倍率の違うモニターで、別ウィンドウの動画の promote / F11 / F12 を試していた) の実機観測があり、
-  関係する可能性はあるが未確認。
-- 分類 (detached リワーク §2): projection と main の所有が別々に記録されている前提の破れで、BA-7 の候補。未確定。
-- 次に必要なもの: 再発したときの `mimageviewer.log` (promote の前後) と操作手順。症状パッチ (アサーションを外す、
-  食い違いを黙って直す) は入れない。
-
-### 1.348 H.265 動画だけ一覧サムネイルが出ない — mIV スレ >>522、>>524、環境情報待ち (2026-10-07)
-
-- 動画再生は mIV の FFmpeg 経路、一覧サムネイルは Windows Shell の `IShellItemImageFactory` を使う別経路。再生できても Windows 側が抽出できなければサムネイルは出ない。H.265 自体を再生対象外にしているわけではない。
-- 報告者へ、同じファイルがエクスプローラーではサムネイル表示されるか質問済み。mIV では再生中のフレームを P キーで代表サムネイルとして保存する代替手段を案内済み。
-- 返答でエクスプローラーには出る場合、`video shell FAIL` の stage / HRESULT と動画の拡張子を確認し、mIV 固有の取得失敗・キャッシュ問題を調べる。エクスプローラーにも出ない場合は Windows のサムネイル抽出環境との関係を調べる。
-- 規模 / 優先度: 原因未確定 / P3 (報告者の返答待ち)。
 
 ### 1.338 EffeTune のビジュアライザーに曲情報を表示する / 起動時に Visualizer を表示する — 作者の対応待ち (2026-10-06)
 
@@ -611,347 +374,54 @@ fn build_nav_indices(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize
 - 規模 / 優先度: Medium / P1 (実害あり)。**整理待ち**。
 - **v3.2.0 からは外すと確定 (利用者判断 2026-08-22)。** 着手条件 (キー入力所有権の整理) が
   未達で、症状パッチを入れれば整理時に解きほぐす手間が増えるため。次リリースの筆頭候補として残す。
-
-### 1.0f 別ウィンドウの動画で、gamepad の十字キーによるシークが効かないことがある — 再現待ち (2026-08-30)
-
-> 元の節は「実機確認で見つかった 3 件」。(a) F12 連打で別ウィンドウが閉じる件は v3.3.1 で修正済み
-> (`edf1c5ed`、内部 teardown で Close を送らず、terminal になった ViewportId を再利用しない)。
-> (c) R-02 の症状は利用者環境で再現せず、[review §10.2](review-v3.3.0/README.md) の記述を弱めて閉じた。
-> **残っているのは下の (b) だけ**で、効かない状況の再現待ち。
-
-**(b) 動画を別ウィンドウで開いているとき、gamepad の十字キーでシーク操作ができない。**
-利用者報告 (2026-08-30、v3.2.0 / v3.3.0 で同じなので退行ではない)。静止画では動く。
-
-- **当初の見立て「動画面の分岐に入っていない」は否定済み** (`75cdfd9b0`、v3.4.0)。十字キーの
-  配り先を `DpadRoute` の 1 値へ集約したうえで計装したところ、mount 済みの detached context が
-  動画を `fullscreen_idx` に持つ状態では、判定は正しく `Video` を返していた。
-  **この前提で調べると空振りする。**
-- **2026-09-04 の実機ログでは、右キーでシークできている**。利用者が「今は効く」と報告し、
-  `mimageviewer.log` に裏付けがあった:
-
-  ```
-  [gamepad] dpad route: Video(10) surface=Viewer fs_idx=Some(10) is_music=false
-            detached_context_at_rest=false session_detached_or_switching=true
-  [native-video-key] seq=1 virtual_key=0x27 ... fs_idx=10 presentation=detached
-            outcome=action:seek_forward_5s
-  ```
-
-  **`session_detached_or_switching=true` かつ `at_rest=false`** — root projection が
-  `fullscreen_idx` を持ったまま detached 表示している側では、配り先も下流も通っている。
-- **残る疑いは `at_rest=true` の側**。active viewer context が AtRest のとき、batch は root では
-  配られず、`gamepad_batch_goes_to_active_context()` (= `at_rest && surface == Viewer`) を通って
-  `update_active_viewer_context` が mount した中で配られる。**この経路を通ったときの
-  `dpad route:` 行は、まだ 1 度も記録されていない。**
-- **次にやること**: 効かない状況を再現し、`[gamepad] dpad route:` を見る。Video 行が出なければ
-  batch が mount 済み context へ届いていない (行に並ぶ述語が、どれで落ちたかを示す)。Video 行が
-  出ていれば下流で、`[native-video-key]` の `outcome=` が続きを語る。**どちらか分かるまで
-  直さない。** 窓が 2 つ以上あるとき / 直前にメインを触ったとき / F12 直後かどうかで
-  `at_rest` は変わるので、再現時はその条件も記録する。
-
-### 1.30 native video Stage 5 の再投入条件 (revert 済み、原因未確定)
-
-- 出典: 2026-08-01。Stage 5 (`726f838d`) を入れたところ UI が完全停止する P1 が再現し、
-  `737c5234` で **revert 済み**。v2.9.1 は Stage 5 を含めずに出す。§1.28 のカーソル問題は
-  既知の問題として残る。
-- 症状: 動画をフルスクリーン再生中に VST エディタを開閉すると UI が完全に固まる。**動画・音声の
-  再生は継続し、EOF で次の動画へも進む。UI だけが死ぬ。**終了も右クリックも不能。2 回再現
-  (t=178s / t=18s)。
-- 停止点 (cdb `-pv` で採取): main スレッドが `SendMessageW` 経由の wndproc の中で
-  `eframe run_ui_and_paint` → `egui_wgpu paint_and_update_textures` →
-  `wgpu_hal::dx12::Surface::acquire_texture` → `WaitForSingleObjectEx`。
-  他スレッドは全て健全 (`vst-owner-dispatch` は recv で idle、pump は sleep、render / demux /
-  decode は稼働)。
-- **原因は未確定。候補 2 つとも潰れていない**:
-  1. **VST owner handoff**: owner / z-order / visibility の変更が同期メッセージを撃つ。
-     ただし hidden anchor は published fullscreen host の破棄時のみ通り、C++ は
-     `old_owner == new_owner` で早期 return し、owner 付け替え自体は Stage 5 以前から存在する。
-  2. **カーソル所有**: 新実装は pump から **8ms ごとに `WindowFromPoint`** を呼ぶ。同 API は
-     hit-test のため対象の wndproc へ **`WM_NCHITTEST` を同期送信**し、相手は UI スレッドの窓や
-     **別プロセスの VST エディタ**になり得る。pump からの無制限な cross-thread / cross-process
-     同期呼び出しであり、**Stage 4 の「pump は時間上限を保証できない処理を持たない」原則に抵触する**。
-     「窓を作らないから同期メッセージを撃たない」は成立しない。
-- 次回に取るべき証拠 (今回取れていない):
-  - `acquire_texture` の wait が**本当に無限か**。wgpu-core 27.0.3 は **1000ms timeout** を渡し、
-    wgpu-hal は `WAIT_TIMEOUT` を `Ok(false)` にして先へ進む。スタック 1 枚では
-    「デッドロック」と「1 秒待ちを繰り返す飢餓」を区別できない。**wait の `dwMilliseconds` が
-    `0x3e8` か `0xffffffff` かを読み、1.2 秒以上あけて複数回 break する**。
-  - 停止直前に main が実際に受けた `msg` (どの同期メッセージが再入描画を起こしたか)。
-    スタックにある `in_window_resize_subclass_proc` は全メッセージを通る常設 subclass なので、
-    **resize が起きた証拠にはならない**。
-  - `old_owner != new_owner` / anchor handoff / presenter retirement が実際に発生したかのログ。
-- 再投入の条件: **同一 release profile** で 4 分割 A/B を通すこと。
-  (a) Stage 4 baseline / (b) cursor のみ / (c) owner のみ / (d) Stage 5 全体。
-  今回の A/B は `dev-runtime` 対 `release` で、出荷判断には十分だが**原因帰属としては profile 差が
-  残る**。(b) が VST 開閉 soak を通ることを出荷条件にする。
-- 診断用の回避策 (`MIV_WGPU_FRAME_LATENCY=2`、`WGPU_DX12_USE_FRAME_LATENCY_WAITABLE_OBJECT=DontWait`)
-  は**出荷修正にしない**。症状が消えても wndproc 内 GPU wait と Win32 同期依存は残る。
-- VST 側の長期案: editor を transient な presenter HWND へ付け替えるのではなく、**editor lifetime
-  全体で安定した専用 owner proxy** を使い、topmost / focus / visibility を別の ordered transaction
-  として扱う。owner request の dedupe と一括適用も要る。
-- **保留 (2026-08-13、利用者判断)**。revert 後は**一度も再現していない**。原因未確定のまま
-  再投入の A/B に工数を割く段階ではない、として棚上げする。再発したら上の「次回に取るべき
-  証拠」から再開する (特に `dwMilliseconds` が `0x3e8` か `0xffffffff` かの確認)。
-  §1.28 のカーソル問題は既知の問題として残したまま。
-- 規模 / 優先度: Large / **P2 (保留)**。カーソル (§1.28) の修正はこれが片付くまで入らない。
-
-### 1.102 動画のシークストリップ — 実素材で確認できていない経路 (素材待ち / 再現待ち)
-
-**機能そのものは完了・出荷済み**。v3.3.0 でサムネイル列と音声波形、v3.5.0 で全体表示。
-設計と実測の正本は [video-seek-strip-plan.md](video-seek-strip-plan.md)。ここに残すのは
-**こちらからは進められない 2 点**だけ。
-
-- **MPEG-TS など `TimeGrid` 経路を実素材で確認できていない**。索引を持たない代表格の素材が
-  手元に無い。22,811 ファイルの sweep で `TimeGrid` 軸自体は通っているが、MPEG-TS は含まれて
-  いなかった。素材が手に入ったら `seek_strip_batch.exe --json <folder>` を回す
-  (`dev-tools` feature の bin、アプリの実ワーカーと軸解決を駆動する)。
-- **「末尾 4 セルが黒い」という利用者報告を再現できていない**。HW / SW とも、独立した復号でも
-  黒くならなかった。D25 の 12 秒診断 (輝度・分散・channel range) を仕掛けてあるので、次に出たら
-  `%APPDATA%\mimageviewer\logs\mimageviewer.log` に理由が残る。**推測で直さない。**
-  なお D23 で「終端に達したセルには最後に復号できたフレームを充てる」ようにしたため、申告尺が
-  中身より長い素材では同じ最終フレームが複数セルに並ぶ。フェードアウトする動画なら同じ
-  見え方が出やすくなる点は意識しておく (これが原因だと断定はしない)。
-- 実素材 sweep は 2026-08-26 に利用者判断で打ち切り済み (残り 19 件 = 22,811 件中 0.08%、
-  いずれもファイル末尾へ seek できない類で素材側の問題)。再開するなら同書の
-  「実素材 sweep の打ち切り」節から。一覧は `C:\home\miv-batch-runner\remaining-failures.txt`。
-
-### 1.137 F12 で別ウィンドウへ入るときだけ、中身の無いホストが 380ms 先に見える — R2b + retire follow-up 実装済み、実機計測待ち
-
-> ⚠ detached viewer リワーク中の領域。症状パッチ (delay / guard / 追加 repaint) を入れない。
-
-- 出典: 2026-08-28、利用者の観察「F12 を押すと、動画のウィンドウサイズをいちど
-  真っ白に表示してから、最大化して、その後再生しているように見える」を
-  ログで裏付けたもの。**§1.115 の font atlas resync を撤去した後も残るちらつきの主因候補**。
-
-#### 実測 (build C = font work 撤去後のログ)
-
-```
-33.192  [native-video] defer placement switch until detached host is ready: target=DetachedWindow
-33.192  [native-video-key] F12 (seq=13)
-33.489  [detached-viewer] registered host hwnd=0x2280fde        <- ホストはもう見えている
-33.568  [native-video] resume deferred detached placement switch after 376.5ms
-33.574  [native-video] window created-hidden: hwnd=0x4982e4e rect=(0,34 3840x2054)
-33.701  [native-video] window shown: hwnd=0x4982e4e visible=true
-```
-
-**ON 側だけが非対称に遅い**。OFF (→ Fullscreen) には遅延が無く、押下から 7ms で
-presenter window を作り、`placement switched ... total=139.0ms` で完了する。
-
-内訳: ホスト viewport の生成・登録に約 297ms、登録を検知して resume するまでに約 79ms。
-
-#### 見立て (未検証)
-
-ホストの viewport は `activate=true` で**先に可視になり**、その時点では動画がまだ attach
-されていないので中身が無い。376ms 後に全画面サイズの presenter window が上に乗るので、
-「白 → 最大化 → 再生」と見える。直すなら**見せる順序の所有権** (presenter が publish するまで
-ホストを見せない) を決める形になる。**遅延を短くする・待ちを入れる等の症状パッチは不可**。
-
-#### 同じ根を持つもう一つの症状: タスクバーの明滅 (2026-08-28 利用者報告)
-
-同じログ (約 115 秒の 1 セッション) でのウィンドウ生成回数:
-
-| 契機 | ホスト生成 |
-| --- | --- |
-| 起動時の動画フルスクリーン | gen=1 |
-| **F12 を 12 回 = 6 往復** | gen=2〜7 (**1 往復につき 1 個**) |
-| その後の別のフルスクリーン操作 (F12 ではない) | gen=8〜13 |
-
-native-video window は 15 (`detached-viewer-child` 9 + `fullscreen-borderless` 6)。
-
-**回数が多いのではない** —— F12 1 往復につきホスト 1 個で、無意味な繰り返しは無い。
-問題は **F12 OFF でウィンドウを捨てている**こと。そのため 1 往復でタスクバーボタンが
-「消える」「現れる」の 2 回変化し、6 往復で 12 回の変化になる。隠して再利用すれば 0 回。
-
-> 調査中に `open_fullscreen` が 155ms で 4 回出ているのを一度異常と見たが、**誤り**。
-> `idx=1 → 3 → 5 → 7` で `input_seq` も 17→20 と進んでおり、PDF の見開きページ送り。
-> ウィンドウは作られていない (この間のホストは gen=9 の 1 個だけ)。
-
-detached ホストの builder は `.with_taskbar(true)` ([ui_fullscreen.rs](../src/ui_fullscreen.rs))。
-つまり **F12 のたびにトップレベルウィンドウを破棄して作り直しており、タスクバーボタンが
-消えては現れる**。白いウィンドウと同じ根 (= ウィンドウを再利用せず毎回新規に作る)
-なので、別起票にせずここで扱う。
-
-修正の方向も共通で、「**ウィンドウの寿命を F12 のトグルと切り離す**」か、
-少なくとも「**見せる順序の所有権を決める**」ことになる。リワークの
-`DetachedWindowRuntime` / 状態 enum が扱う領域なので、先にプラン §2 を読むこと。
-
-#### 測定: タスクバー自体が 1 フレームごとに出入りする (2026-08-28)
-
-利用者の「タスクバーが何度も明滅する。**アプリのアイコンではなくタスクバー自体**」という
-指摘を受けて、キャプチャの下端 18px をフレームごとに分類した (明るい = タスクバー可視)。
-**F12 1 往復で 16 回反転していた**。
-
-| 遷移 | 区間 | 反転回数 |
-| --- | --- | --- |
-| F12 #1 (→ fullscreen) | 6.233ー6.567s (334ms) | **9** |
-| (安定) | 6.567ー9.567s | 0 |
-| F12 #2 (→ detached) | 9.600ー9.933s (333ms) | **7** |
-
-ほぼ 1 フレーム (33ms) ごとの交互。利用者には「3 回くらいの点滅」と見えていた。
-
-ログとの対応 (F12 間隔がログ 3.47s / キャプチャ 3.37s で一致):
-
-- **F12 #1**: fullscreen 窓の生成→表示→`placement switched` (138ms) の前後に集中。
-- **F12 #2**: **押下からホスト viewport が表示されるまで**の 333ms に集中し、
-  動画の子ウィンドウが作られる前に終わっている。
-
-つまり閃光の正体は「DWM が再合成している」という漠然としたものではなく、
-**遷移中に「全画面を覆うウィンドウがある / ない」が毎フレーム入れ替わっている**こと。
-上の白いホストと同じ 330〜380ms の窓で起きている。
-
-対応する geometry: `fullscreen-borderless` = (0,0 3840x2160) はタスクバーを含む全面、
-`detached-viewer-child` = (0,34 3840x2054) は含まない。遷移中は両方が短時間共存し、
-z-order / show / raise / destroy のたびにどちらが手前かが入れ替わる。
-
-> 注: タスクバーボタン (アイコン) の出入りではない。動画窓は 2 つとも
-> `native_window_owner_for_placement` で owner 付き (= タスクバーに出ない)。
-> ボタンを持つのは detached ホスト viewport (`with_taskbar(true)`) だけで、1 往復 2 回。
-> 当初私はこのボタン側を数えており、**利用者の指摘で対象を間違えていたことが分かった**。
-- 関連: §1.115 (font atlas 側。**別機構**。破棄フレームは 14 → 0 になったがちらつきは残った)。
-- 規模 \ 優先度: Medium ～ Large / P2。
-
-#### R2b 実装結果 (2026-08-28)
-
-- `pending_detached_video_host_switch` と `native_video_mode_switch` を廃止し、context-owned
-  `PresentationTransitionOwner` (`Stable → Preparing → Ready → Committing → Stable`) へ統合した。
-  current / target / request generation / activation intent と candidate/prior HWND を 1 request が
-  所有し、F12 再入力、failure、Esc、window close、player end、stale Ready/Commit を reducer で
-  解決する。
-- native contract は hidden candidate の create/attach/prime を `Ready` までに済ませ、`Commit` で
-  初めて publish する。`NativeCommitted` で host `Visible/Focus` を先に発行し、同じ effect batch で
-  outgoing を retire する。incoming host の OS visibility poll は retire の前提にしない。
-  fixed-ms commit / forced recovery は無い。failure/abort は hidden candidate だけを cleanup する。
-- host `Visible/Focus/Destroy` と native `Publish/Destroy` を reducer effect に限定し、遷移中の
-  presenter/HUD/VST/focus recovery は同じ permit を読む。実 action は transition id / target / HWND
-  付き `[presentation-transition]` ログに出る。既存 `[ui-frame-gap]` / `[atlas-probe]` は変更していない。
-- 自動回帰は両方向、abort、F12 再入力、Esc、window close、player end、stale generation を含む。
-  出荷判定前に実機 1 往復で **outgoing presenter raise 0 / cover change 各方向 1 /
-  content-ready 前 host activation 0** を画面キャプチャとログで照合する。
-
-#### build I: publish 済み outgoing presenter の retire が UI sleep に依存 (2026-08-28 follow-up)
-
-```
-18.726  Publish incoming presenter
-18.727  placement committed
-18.732  host Visible / Focus
-19.216  shared output pool exhausted (以後約500msごと)
-24.630  [ui-frame-gap] 5899.4ms
-24.632  Destroy outgoing presenter        <- window click 直後
-24.661  placement retired
-```
-
-`Committing::AwaitingHostVisible` が、次の `App::update` による `IsWindowVisible(host)` の level poll まで
-`RetirePlacement` を出さなかった。native `PlacementCommitted` / `PlacementRetired` は lossless event bus
-から root viewport を wake するが、その間の `HostVisible` は UI-only event である。poll 末尾の
-`request_repaint` と visibility / focus / redraw の window event が次 pass を起こす想定だった。
-build F の約 70ms 完了も第2 pass は必要で、incidental window event に起こされただけだった。
-
-`DetachedHostDisposition` はこの依存を導入していない。問題の `Fullscreen → DetachedWindow` では
-disposition は `None` で、変更差分にも `AwaitingHostVisible` の変更は無い。build I は偶発 wake の
-無いスケジュールで既存の依存を露出させた。
-
-candidate は `NativeCommitted` が届く時点で create / attach / current-frame prime / pump publish 済み。
-ここを presenter ownership の cutover とし、commit effect を
-`ApplyPresentation → Visible → Focus → RetireOutgoing` に変更した。host command は先行させるが、
-OS visibility confirmation を retire の前提にはしない。`AwaitingHostVisible` / `HostVisible` poll は
-撤去し、timeout / retry / settle window / 追加 repaint は入れていない。
-
-GPU output pool は 16 slot、source queue は最大 8、copy-fence retire queue は最大 4 で、candidate
-prime の短い二重生存は設計内。二 presenter の zero-overlap 制約ではなく、5.9秒残った旧 fence owner
-が pool exhaustion を起こした。容量 tuning ではなく lifecycle ordering の correctness defect である。
-
-回帰テスト
-`fullscreen_to_detached_retires_on_native_commit_without_waiting_for_host_visibility` は commit batch の
-順序と `AwaitingRetire` を固定する。retire を incoming host event の後ろへ戻す killing mutation では
-commit batch から `RetireOutgoing` が消えて失敗する。
-
-次 run では `shared output pool exhausted waiting for free slot` の連続、同区間の約5.9秒
-`[ui-frame-gap]` が無いことを確認する。`Destroy outgoing` は `placement committed` の直後、
-同じ UI pass で送った retire command の pump / WM teardown 分だけ後に並ぶ。固定msを受け入れ条件には
-しないが、build F と同じ数十ms級で、秒単位や user input 待ちにならないことを timeline で照合する。
-
-R4 に残るのは `show_viewport_deferred`、single render entry、host persistence。今回も F12 OFF は
-terminal に host HWND を破棄するため、次の ON では約 300ms の hidden host 作成を待つ。
-この待ち時間自体の短縮、F12 を跨ぐ taskbar button/host identity の永続化は本項の R2b close には
-含めず、R4 gate C の仕様決定後に扱う。
-
-### 1.168 詳細表示の列ヘッダを右クリックすると、アイテムメニューが出ることがある — 再現待ち
-
-- 出典: 利用者報告 (2026-09-02、§1.143(b) の実機確認中)。詳細表示の列ヘッダを右クリック
-  すると、列カスタマイズメニューではなく**アイテムのメニュー**が出て、そのあと左クリック
-  すると列メニューが出る。スクリーンショットで「パスをコピー」「代表サムネ固定を解除」
-  「ペイント編集を反映して開く」を確認済みなので、フォルダ背景メニューでも列メニューでもなく
-  単一アイテムのメニューで確定。右ドラッグはマウスジェスチャに設定。
-- **再現していない**。同じバイナリで再度試すと出なくなった。**間欠**である。
-- **単純な当たり判定の話ではない**。`render_details_list` をそのまま描く kittest harness
-  ([ui_main.rs](../src/ui_main.rs) `details_header_right_click_tests`) を作り、マウス
-  ジェスチャ ON / OFF の両方でヘッダ帯を右クリックしたが、`context_menu_idx` は `None` の
-  まま。行の右クリックでは従来どおり開く。ヘッダは内側縦スクロールの外に確保されるので、
-  行の rect とも背景判定の `body_inner_rect` とも重ならない。
-- **次に見る場所**: `context_menu_idx` に値を入れるのはコード全体で 3 か所しかない。
-  [ui_main.rs](../src/ui_main.rs) の cell 経路 (`handle_cell_interaction` 内)、右ドラッグ
-  短押し経路 (`open_grid_right_drag_short_tap_menu`)、フォルダ背景経路
-  (`open_current_folder_context_menu_at`)。この 3 か所には**どれが発火したかを記録する
-  `[ctxmenu-probe]` ログを入れてある**ので、再現したら
-  `%APPDATA%\mimageviewer\logs\mimageviewer.log` を `ctxmenu-probe` で grep すれば経路と
-  クリック座標が一意に決まる。**推測で直しに行かず、まずこのログを取ること。**
-- 状態依存の可能性 (未検証): 直前の操作で残った `context_menu_idx` / クリックのペアリング
-  状態、sticky popup の開閉、ジェスチャ短押し判定の時間しきい値。
-- レーン A の右クリックメニュー刷新より前から在ったかは不明。該当 3 経路の最終更新は
-  2026-07-12 / 07-24 / 08-05 でレーン A より前だが、間欠なので断定しない。
-- 規模 / 優先度: 不明 (原因未特定) / P3。実害は「メニューをもう一度開き直す」程度。
-
-### 2.6 ZIP / RAR のダブルクリックが時々無反応 — 原因確定・修正済み、利用者の確認待ち
-
-- 報告条件: サムネイル表示、ZIP / RAR、Enter では開ける。最初のダブルクリックでは開かず、
-  そのまま待つだけでも開かないが、しばらくして再度ダブルクリックすると開くことがある
-  (専用スレ >>257 で訂正)。RAR はローカル上の直読み対象。
-- **原因確定 (2026-08-19、報告環境の perf log)**: egui は
-  `count = if triple_click { 3 } else if double_click { 2 } else { 1 }` で数え、`is_double()` は
-  **`count == 2` の完全一致**。`triple_click` は `max_double_click_delay * 2` を**前々回のクリック**から
-  測る (`egui-0.33.3/src/input_state/mod.rs:1213-1222`, `1006-1011`)。つまり **3 回目のクリックは
-  triple になり `double_clicked()` が false になる**。1 回目で開かなかった利用者はもう一度
-  クリックするので、その 3 回目がちょうどここに落ちていた。
-  - 実測 (idx 9、同一セル、同一座標): 離す時刻 165.735 / 166.384 / 166.612。3 回目は前回から
-    **228ms** で double 成立圏内だが、前々回から **877ms** で `2 x 500ms` の内側 → triple 判定。
-    同 session の成功例は 400ms 間隔の 2 回目。**400ms が成立して 228ms が成立しない**という
-    逆転がこれで説明できる。
-  - v3.1.2 のダブルクリック時間の OS 追従はこれを**悪化させた** (triple 窓 600ms → 1000ms) が、
-    原因ではない。300ms でも 600ms 以内に 3 回クリックすれば同じで、**本項は v3.1.1 以前からあった**。
-- **修正 (v3.1.2)**: グリッドは egui の click count を起動判定に使わず、`response.clicked()` で
-  click 成立だけを受け取る。同じ `items_generation`・同じセル idx・OS 由来のダブルクリック時間内に
-  ある 2 click を自前の単一 pairing state で対にし、item activation 後・セル以外の primary click・
-  一覧世代変更で対を切る。「開く → Esc → 単発クリック」で再度開いてしまう追補も同時に閉じた。
-  egui 本体は変更していない (triple click は text field の行選択が使うため)。
-- **状態: 利用者の再確認待ち**。再発報告が来なければ close する。再発した場合に使える観測手段:
-  - `grid/cell_signal` が成功 / 失敗を問わず `time_since_last_click`、`max_double_click_delay`、
-    `clicked_by_primary`、`double_clicked_by_primary` を出す。失敗例だけを見ず、同じ session の
-    成功例を control として比較する。
-  - `grid/activation_request accepted=true` と `grid/activation_dispatch_complete` があれば click は
-    成立しているので、以降の dispatch / open 側を疑う。`double_clicked_by_primary=false` かつ
-    `first_click=true` なら pointer click として成立していない側を疑う。
-  - 依頼手順: 開発者で性能ログ ON → 再起動 → 症状再現 → **再起動せず**「ログを zip にする」→
-    診断 ZIP を送付。ログにファイル名 / path が含まれる既存の注意書きも案内する。
-- 優先度: P2。原因が確定するまで guard / retry / 閾値再調整の症状修正を入れなかった方針は、
-  再発時も維持する。
-
-### 3.2 補正パラメータ変更後に AI アップスケールキャッシュが優先される疑い (再現待ち)
-
-- 背景: 5ch レス 792 の追跡項目。「画像補正パラメータを変更しても AI アップスケールキャッシュが
-  優先され、ページを行き来すると変更が効いていないように見える」という報告。
-- 現状 (2026-06-18): 通常環境と v1.7.0 ポータブル版の追加テストで再現せず。現在の設計では、
-  色調補正や AI 設定の変更は final AI / final composite cache のキー差分または明示クリアで反映される。
-  一方、最終段スマートシャープなど post-filter 系は final AI cache を再利用して final composite だけを
-  作り直す。さらに AI アップスケール出力にはスマートシャープを適用しない固定仕様なので、
-  操作内容によっては「変わらない」ように見える場合がある。
-- 方針: 具体的な再現手順が出るまではコード修正しない。再報告時は、変更したパラメータが色調補正 /
-  AI ON/OFF / デノイズ / post-filter / スマートシャープのどれかを最初に切り分ける。
-- 優先度: P3 monitor / 再現待ち。
+- **2026-11-26 追試: 今も起きる (観測者: サブ PC の Claude、master 6d274aa72、記録 `C:\home\mimageviewer-subpc\v590b\results\notes.md`、画面録画・前面の記録・ログ抜き出し付き)。**
+  - 起動後 1 本目の動画に入る瞬間、3 回とも前面が後ろの空のメモ帳へ約 260〜380 ms 移った。ログの順序は `main cloak=true` → 動画の窓を隠して作成 → `window shown` → `main cloak=false`。押しっぱなしの ↓ (SendInput で自動リピートを模したもの) は、前面が戻った後に 7 回まとめて受け、次の動画へ進んだ。メモ帳の中身は空のままだが、↓ は文字を入れないので、メモ帳がキーを受けたかは未確認。
+  - 1 回目は動画の終了後、マウスを動かしてもカーソルが非表示のまま固まった (Esc で一覧へ戻ると戻った)。キーで動画に入った直後は、全画面の動画の上にタスクバーが見えた。
+  - 別に見えたこと (未調査、別項目にするかは未決): 一覧から 4K の動画を全画面で開いたとき、画面全体が約 0.4 秒真っ黒になった (録画 2.5〜2.9 秒)。
+  - 着手条件 (キー入力所有権の整理待ち) と症状パッチを入れない方針は、上のままである。
 
 ---
 
 ## 3. 見送り / 将来 — 現時点で着手しない判断
 
 「次の版の後に回す」「見送り」「現状維持」と決めた項目を、2026-10-21 に本体のバックログから移した。
+
+### 1.734 ZIP 内のフォルダ移動を、フォルダ履歴の戻る/進むで辿れるようにするか — メール報告、当面は仕様 (2026-11-07 利用者判断)
+
+- 状態: **当面は今の仕様のまま** (利用者判断 2026-11-07)。同じ要望が重なったら下の小さい案から検討する。
+- 報告 (報告者の観測、v4.11.0): フォルダ A → AAA.zip → ZIP 内のフォルダ B と進んでから履歴の ← を押すと、AAA.zip ではなくフォルダ A へ戻る。「v4.4.0 は違った気がする」とのこと。
+- 現状 (コード): ←/→・マウスの戻る/進むは `dispatch_main_folder_history_input` (`src/app.rs`) に集まり、ZIP 内の階層 (`zip_nav`) を見ない。ZIP 内の移動 (`zip_nav_enter`) は外側の履歴に積まない。設計書の規則 ([folder-history-location-plan.md](folder-history-location-plan.md) の「ZIP/PDF の内部階層は外側履歴では一地点」) どおりで、`real_zip_internal_and_outer_history_from_rating` / `_from_collection` が固定している。v4.4.0 のコードも同じで、v4.4.0〜v4.11.0 にこの動きを変えた変更は無い。BS は ZIP 内を 1 段ずつ上がる。Ctrl+↑↓ も書庫を 1 冊として隣へ移るので、書庫を 1 地点とする扱いは一貫している。
+- 判断の理由: エクスプローラーは ZIP を普通のフォルダとして履歴に積むので、一般的には履歴に残るほうが自然。ただ外側の履歴に ZIP 内の位置まで持たせると大きい (推定): 履歴の行き先 9 種への位置の追加、戻る/進むで書庫を開き直した後に記録した階層まで降りる処理を「確定まで前の一覧を変えない」仕組みの中に入れること、選択の復元 (§1.328)・レーティング絞り込みの復元 (§1.671)・A/B ごとの履歴との整合。
+- 小さい案 (小〜中、推定): ZIP 内で 1 段以上降りているときだけ ← を ZIP 内の 1 段戻りにし、→ 用に ZIP 内だけの進む記録を `ZipNavState` (`src/zip_tree.rs`) に持たせる (書庫を出たら捨てる)。外側の履歴の型は変えない。欠点は、ZIP 内では ← が BS とほぼ同じになることと、書庫の外へ出てから → で戻ると一番上から開き直すこと。採るなら設計書の「一地点」の規則に例外として書き足す。
+
+### 1.336 大きいデータ (runtime 展開・モデル・DB・キャッシュ) を Roaming の %APPDATA% に置いている — 当面維持 (2026-10-06 利用者判断)
+
+- 現状 (コード): インストーラ版・単体exe版は runtime/<version> (1 版あたり約 540 MB)、AI モデル、各種 DB、キャッシュをすべて `%APPDATA%\mimageviewer` (Roaming) に置く。Windows の作法では大きいデータやキャッシュは `%LOCALAPPDATA%` (Local) に置く。
+- 影響しうる環境: ドメインの移動プロファイル (ログオン／ログオフ時の同期が重くなる) と、AppData をネットワーク共有へ向けるフォルダリダイレクト (初回展開や SQLite がネットワーク越しになり、遅延やロックが起き得る)。個人利用でこうした管理環境に当たる可能性は低い。
+- 2026-10-06 の検討 (Microsoft Store の v4.3.0 認定却下 §1.241 の原因候補として): 移動プロファイルの同期はアプリ起動時ではなくログオン／ログオフ時なので、起動が終わらない原因にはなりにくい。リダイレクト環境なら起こり得るが、審査機がそうである根拠はない。**利用者判断で当面は保存先を変えない。**
+- 将来移す場合: リリース済みの保存先なので既存データの移行 (設定バックアップ、複数保存先、portable の `<exe_dir>\data` は対象外) が要る。起動の診断ログに保存先がネットワーク上か (UNC・ドライブ種別) を残せば、この環境かどうかは見分けられる。
+- 経緯メモ: 利用者は以前にも「個人利用では可能性が低いので対応しない」と判断した記憶があるが、記録は見つからなかった。今回の判断をここに残す。
+
+### 1.252 動画字幕のデコード・表示 — >>429、当面見送り (2026-09-17)
+
+- 出典: >>429。音声トラック切り替えとあわせて、動画字幕のON/OFFが欲しいとの要望。
+- 判断: **当面は見送る**。複数音声は §1.251 として字幕から分離して検討する。
+- **2 件目の要望 (2026-09-30、利用者メール、v4.2.0)**: 複数音声の選択と字幕の ON/OFF が
+  できれば「mpv での外部再生はほぼ不要になる」。同日、**対応予定が無い旨を回答済み**
+  (理由は下記の構造。**手元に素材が無いことは理由にしない** — 字幕付き動画は容易に作れるため、
+  ts / mts の見送り理由とは性質が違う)。
+- **再検討条件との関係**: 要望は 2 件になったが、**形式と表示範囲を限定する材料にはなっていない**
+  (どの字幕形式を、どこまで表示できればよいかが示されていない)。件数だけでは再検討条件を満たさない。
+- 現状、mIVに動画字幕の列挙・デコード・同期・描画経路は無い。native presenter内の `subtitle` という名前は
+  ナビゲーション案内の副テキストであり、メディア字幕ではない。動画エンジンの設計上も字幕はスコープ外。
+- 対応する場合は、少なくとも次を一体で設計する必要がある:
+  - 埋め込み字幕trackの列挙とOFFを含む選択、seek / source切り替え時のflushと時刻同期。
+  - SRT等のtext字幕、ASS/SSAのstyle・font・配置、PGS等のbitmap字幕をどこまで対象にするか。
+  - native D3D11動画、F12別ウィンドウ・複数ウィンドウ、回転・360度表示、capture / Remoteにおける合成範囲。
+  - 日本語・縦書き・複数行・欠落fontを含む合法的な自作テスト素材と、依存ライブラリを追加する場合の配布・license確認。
+- 再検討条件: 字幕形式と表示範囲を限定できる具体的な利用例が複数集まるか、字幕rendererを安全に統合できる
+  動画描画基盤の見直しを行うとき。単にON/OFF UIだけを追加して部分対応にはしない。
+- 規模 / 優先度: Large / P3 / 保留。
 
 ### 1.846 漫画の翻訳 (TASlation の取り込み) — 利用者要望 (2026-11-22)
 
@@ -979,6 +449,12 @@ terminal に host HWND を破棄するため、次の ON では約 300ms の hid
 
 - 状態: **当面は現状維持・採否未定**。[>>785](https://egg.5ch.io/test/read.cgi/software/1782419551/785) の自動サムネイル要望に対し、まずは EPUB を複数選択し、右クリック →「変換」→「PDF ファイルに変換」でまとめて変換できることを案内する。元 EPUB は保持され、別の PDF が同じフォルダに作られる。未変換 EPUB のアイコンを、既存設定で表紙にできるとは案内しない。
 - 再検討時: 別の PDF を作らず EPUB のまま一覧で判別したい需要を確認する。表紙に明示指定された内部画像を読むだけの案もあるが、その指定は [EPUB 3](https://www.w3.org/TR/epub-33/) では任意で、読書順とも独立している。現仕様では変換済み EPUB の代表は既定で変換結果の先頭ページなので、両者が違う本では内部変換前後で一覧画像が変わり得る。採用する場合は、変換前後の優先順・表紙未指定時の表示と、既存の手動指定との整合を先に決める。
+
+### 1.348 H.265 動画だけ一覧サムネイルが出ない — 見送り、回避策は P キー (mIV スレ >>522・524、2026-10-07、2026-11-26 に見送りへ移動)
+
+- 状態: **見送り** (報告者の返答なしのまま 7 週間、利用者判断 2026-11-26)。一覧の動画サムネイルは Windows Shell (`IShellItemImageFactory`) だけで作る (`src/video_thumb.rs`)。FFmpeg 経由の代替は無い。再生は FFmpeg 経路なので、再生できても Shell が抽出できなければサムネイルは出ない。原因は報告者環境の Shell 側 (コーデック等) と見られるが、エクスプローラーでの表示結果は返っておらず未確認。
+- 回避策 (案内済み): 再生中のフレームを P キーで代表サムネイルとして保存する。
+- 技術的には、Shell 失敗時に既存の FFmpeg 1 フレーム抽出 (`src/video/thumbnail.rs`、`tile_thumbnails.rs`) で代替できる。一覧の表示中にデコードを走らせる負荷の判断が要るので、再要望が来たら方針から決める。再要望時は `video shell FAIL` の stage / HRESULT と拡張子を先に確認する。
 
 ### 1.465 一覧でドラッグによる範囲選択をできるようにするか — 5ch >>112・113・116 (2026-07-24 要望、2026-10-28 見送り記録を補完)
 
@@ -1022,7 +498,7 @@ terminal に host HWND を破棄するため、次の ON では約 300ms の hid
 - 規模 / 優先度: Medium / P3。
 
 ### 1.363 操作のスクリプト (複数機能の連続実行・状況に応じた動作の切り替え) — 利用者要望 (2026-10-10)
-- **実装に着手 (2026-11-24、v5.7.0 の次の版向け、利用者決定「次の版向けに始める」、担当 script-363)。設計は docs/operation-script-plan.md r5 (独立レビュー ACCEPT、設計ブランチ script-363)**。以前: 次の版の後で検討 (利用者 2026-10-12)。
+- **実装中 (2026-11-24 着手、ブランチ `script-363-impl`、v5.7.0 の次の版向け、利用者決定「次の版向けに始める」)**。設計は [operation-script-plan.md](operation-script-plan.md)。利用者の判断 7 問を反映 (§12)、独立設計レビュー (§13)。イベントから D・E を呼べないことは利用者が確定 (2026-11-23)。以前: 次の版の後で検討 (利用者 2026-10-12)。
 - **利用者決定 (2026-10-10)**: 次のリリースの後に検討する。
 - 経緯: 利用者が別セッションで NeeView のスクリプト機能 (`.nvjs`、JavaScript) の使われ方を調べた。出どころはその会話の要約で、ClaudeCode は NeeView 側を確認していない。挙がった実例: 最終ページでもう一度押すと次の本へ、全画面なら解除・通常なら終了確認、決まったフォルダへのワンタッチ保存、パス名で開き方向を自動設定、PNG なら市松背景、閲覧中の本を移動して次の本へ、画像と動画で操作を切り替え。キー・マウス・ジェスチャへの割り当てと、起動時・本を開いたとき・ページ変更時などのイベントで動く。NeeView は外部プログラム実行 (`system()`) やファイル操作の API も公開しており、第三者のスクリプトを入れる危険がある、という整理だった。
 - mIV の既存の仕組み (コードの参照): ファイル名スタックの分割ルールを Rhai スクリプトで変えられる (`src/filename_stack_script.rs`、設計 `docs/filename-stack-scripting-plan.md`)。純関数で I/O なし、`io` / `os` / `eval` を公開しない deny-by-default、操作数・呼び出し深さ・文字列 / 配列の上限、キャンセル付き、失敗時は内蔵ルールへ戻す。ほかに開発用の UI 自動操作スクリプトも Rhai (`src/test_script.rs`、`test-script` feature 限定)。
@@ -1073,24 +549,6 @@ mIV から X へ指定時刻に自動投稿する。**X 専用**。予約は `x_
 - pixiv は規約を読んだうえで見送り。理由は plan §11.1 に記録済み (再提案しない)。
 
 - 規模 / 優先度: Large / P2 (利用者本人の運用要望。閲覧機能の不具合より後)。
-
-### 1.287 常に最前面 ON で、VST プラグイン画面にフォーカスがある状態で VST ボタンを押すと中途半端な状態になる — §1.250 の追補 (2026-09-27) — v4.2.0 で出荷、残り: VST ボタン 1 回で閉じるかの将来検討
-
-- 出典: 利用者 (開発者本人) が §1.250 の実機確認で観測。常に最前面 ON で HUD の VST ボタンからプラグイン画面を開き
-  (動画は右上 1/4、プラグイン一覧パネル表示)、プラグイン画面をクリックしてから VST ボタンを押すと、プラグイン画面だけが
-  消え、動画は右上 1/4 のまま、一覧パネルも出たままになる。OFF では 1 回目のクリックで mIV にフォーカスが戻り、
-  2 回目で正常に切り替わる。
-- 調査 (読み取り専用の Sol、コードから): presenter の復帰処理が、ブリッジ (`mimageviewer-vst3-host.exe`) のプラグイン
-  画面を「外部の前面ウィンドウ」と判定し、HUD の mouse-down で presenter の focus / raise を要求する。VST 側の前面判定は
-  ブリッジを mIV の一部として扱っており、2 か所で判定が食い違う。プラグイン画面が「裏に回った」のか「隠れた」のか、
-  OFF で起きない理由は未確定 (実機の HWND 記録が必要)。
-- 対応: 判定を 1 か所に集約して修正し、VST ボタン操作時の HWND 状態を通常ログに記録する (実装中、2026-09-27)。
-  VST ブリッジは portable smoke に同梱しないため、確認は利用者の実機で行う。
-- **進捗 (2026-09-27)**: 修正済み (VST プラグイン画面を mIV の UI の一部として 1 か所で判定)。**利用者が実機で確認** (ON/OFF とも)。
-  残る違和感: プラグイン画面にフォーカスがあるとき、VST ボタンは 1 回目で mIV にフォーカスが戻り 2 回目で閉じる。
-  従来からの動きなので利用者判断で現状維持 (1 回で閉じるかは将来の検討)。
-- 規模 / 優先度: Small〜Medium / P2 (常に最前面と VST を併用すると操作できなくなる)。
-
 
 ### 1.334 MIDI 再生 (KAREN 風の演奏画面 + MIDI 出力) — 外部要望、調査済み・保留 (2026-10-05)
 
@@ -1257,64 +715,6 @@ mIV は画像ビューアでキーボード専従ではなく、日本語が効�
 AI プロンプトはほぼ英語、EXIF はほぼ英数。**得られるものに対して、ライセンス運用と
 Ctrl+G の作り替えが釣り合わない。**
 
-### 1.141 Susie のクラッシュ対象 ID が「エントリ名 + 長さ」止まり
-
-- 出典: 2026-08-27 の出荷前レビュー (Codex、機能別評価の Susie 行)。
-- 機構: [susie_loader.rs](../src/susie_loader.rs) の `decode_bytes` は、クラッシュした
-  入力を二度と同じプラグインへ渡さないための識別子を
-  `format!("{filename_hint}#{}", bytes.len())` で作る。ZIP 内画像はパスを持たないため、
-  名前だけでは別書庫の同名エントリを巻き添えにする — その対策として長さを足した経緯が
-  コメントに残っている。
-- 残る穴: **同名かつ同サイズで中身が違う**エントリは、まだ同一視される。
-  片方でプラグインが落ちると、もう片方も開かれなくなる。
-- 実害の大きさ: 落ちるのは既にクラッシュした後の話で、結果は「開けたはずの 1 枚が
-  開かれない」。クラッシュや破損ではない。**同名同サイズは再配布された同一ファイルである
-  ことが多く、その場合は巻き添えではなく正しい判断**になる。
-- 直し方の候補: バイト列のハッシュを識別子に含める。全体ハッシュは decode 経路 (数 MB) に
-  数ミリ秒を足す。先頭 + 末尾の固定長だけを混ぜる案なら実質ゼロだが、**どちらも実際の
-  クラッシュを再現できないと検証できない**。
-- 2026-08-27 の判断: **出荷前には入れない。** 失敗は限定的で自己修復可能 (再起動で解除)、
-  一方で修正は decode のホットパスに触れ、実機で確かめる手段が無い。
-- 規模 / 優先度: 小 / **P3**。
-
-### 1.140 超広幅ウィンドウで波形ストリップの鮮鋭さが落ちる (分割描画の検討)
-
-- 出典: 2026-08-27 の出荷前レビュー (Codex P2) をきっかけに判明。
-- 経緯: `WaveSpanRequest::pixel_width` は「可視幅そのものが GPU 上限 (8192px) を超えても
-  丸めない」を明示的な設計としており、コメントは**「テクスチャ生成側の責務として残す」**と
-  書いていた。しかし [render_core.rs](../src/video/native_presenter/render_core.rs) の
-  `sync_seek_strip_textures` は分割も縮小もせず `load_texture` を呼ぶだけで、
-  **その責務は実装されないまま残っていた**。到達すれば必ずレンダースレッドが
-  パニックし、以後どの動画も再生できなくなる (§1.135 と同じ終わり方)。
-- 2026-08-27 の対応: 上限を要求側で無条件に効かせた
-  (`an_oversized_visible_width_is_capped_at_the_texture_ceiling`)。
-  **パニックは消えるが、可視幅が 8192px を超える構成では波形がわずかにぼやける** (伸縮のため)。
-  位置は時刻由来の UV で決まるのでずれない。
-- 残っていること: 鮮鋭さを取り戻すなら**分割描画**しかない。RGBA を N 枚のテクスチャへ分け、
-  `waveform_texture_slice` の UV をタイル境界で割り、N 回 `painter.image` する。
-  継ぎ目と、raster revision ごとの N 枚アップロードのコストを見る必要がある。
-- 到達条件: 可視ストリップ幅 (物理ピクセル) が 8192 を超える構成。4K 2 面 (7680) では届かず、
-  3 面またぎや 8K で届く。**開発機の仮想デスクトップ幅は 6001px なので、ここでは再現しない。**
-- 規模 / 優先度: 中 / **P3** (パニックは解消済み。残るのは限られた構成での画質)。
-
-### 2.1 folder pane scan worker の thread 構成判断
-
-- 背景: `scan_real_subfolders` はノードごとに短命 thread を spawn する。
-- 現状: `folder_pane/scan_subfolders` perf event で ms / entry 数 / dir 数 / cancel / error を記録済み。
-  cancel 付きで thread leak は見えていない。
-- 方針:
-  - 低速共有や大量ノード展開で遅い scan / concurrent scan が見えた場合だけ、dispatcher / pool 方式へ寄せる。
-- 優先度: P3。
-
-### 3.1 local-adjust layers の入場時同期 DB 読み
-
-- 背景: フルスクリーン入場初回フレームで `LocalAdjustDb::get_layers` を同期実行する。
-- 現状: フォルダ open 一括読みを避けるための意図的 tradeoff。
-- 方針:
-  - 数十 MB 級ページで hitch が報告 / 計測された場合に worker 化する。
-  - read-only 経路の not-loaded は現状どおり None 返しを維持する。
-- 優先度: P3 monitor。
-
 ### 3.4 2x AIアップスケールモデルを追加するか比較する — 専用スレ >>392 (2026-09-14)
 
 - 要望: 4x より処理負荷を抑えられる 2x の AI アップスケールを選びたい。
@@ -1334,21 +734,6 @@ Ctrl+G の作り替えが釣り合わない。**
     ライセンス表記、旧版との設定互換を確認する。
 - 関連: [AI処理のサイズしきい値計画](ai-processing-size-threshold-plan.md#将来の-2x-モデル候補)。
 - 規模 / 優先度: 比較 Small〜Medium、採用 Medium / P3。現時点では比較・採否判断待ち。
-
-### 1.227 最大化したF12別窓を開く直後、画像とHUDが一瞬横へ伸びる — 利用者報告 (2026-09-12)
-
-- メイン・別窓ともタイトルバー最大化で画像を開くと、最初だけ横に引伸ばされてから正常fitへ戻る。
-  録画17:00:35.527/.561の2フレーム、.594から正常。旧§1.115の連続ちらつきとは区別する。
-- ログはwindow_id=123、復元サイズ1180×1140/maximized=true、hidden host1792×1766、次frameまで74.1ms。
-  復元サイズのpresent→maximizeによるclient拡大→次のsurface resize/paintまでDWMで旧描画を拡大する
-  仮説がHUD全体の変形と整合する。GPU/DWM traceによる厳密な因果確認は未実施。
-- 修正には最大化後の物理サイズ・host/surface世代・present成功・可視化の状態管理が必要となり得る。
-  maximize/visible順の入替だけでは既存の白露出防止を崩すリスクがある。共通native lifecycleに及ぶ中〜高リスク。
-- 利用者は単発のため低優先、リスクが高ければ次版から除外することを希望。親と独立レビューは保留で合意。
-  製品コード変更なし。§1.115の旧連続ちらつき非再現・完了判断は維持する。
-- [調査記録](section227-maximized-first-frame-stretch.md)。次のリリースには含めない。
-
-判断とその理由を残す。方針が変わったときに、同じ議論をやり直さないため。
 
 ### 1.149 製本フォルダごとに上限ピクセルサイズを設定して自動縮小 — 見送り (2026-09-02)
 

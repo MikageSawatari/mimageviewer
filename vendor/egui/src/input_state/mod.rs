@@ -697,7 +697,7 @@ impl InputState {
         if self.any_touches() && !self.pointer.is_decidedly_dragging() {
             // We need to wake up and check for press-and-hold for the context menu.
             if let Some(press_start_time) = self.pointer.press_start_time {
-                let press_duration = self.time - press_start_time;
+                let press_duration = self.time - press_start_time.1.observed();
                 if self.options.max_click_duration.is_finite()
                     && press_duration < self.options.max_click_duration
                 {
@@ -982,12 +982,55 @@ pub(crate) enum PointerEvent {
     Pressed {
         position: Pos2,
         button: PointerButton,
+        time: EdgeTime,
     },
     Released {
         click: Option<Click>,
         button: PointerButton,
         position: Option<Pos2>,
+        time: EdgeTime,
     },
+}
+
+/// The pass clock and, when known, the actual input time on that same clock.
+/// Only two known input times may be compared on the input clock. Mixed pairs
+/// retain the integration's original pass-time behavior.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+pub struct EdgeTime {
+    pub pass: f64,
+    pub input: Option<f64>,
+}
+
+impl EdgeTime {
+    /// Signed elapsed time; callers retain their own interval bounds.
+    pub fn since(self, earlier: Self) -> f64 {
+        match (self.input, earlier.input) {
+            (Some(later), Some(earlier)) => later - earlier,
+            _ => self.pass - earlier.pass,
+        }
+    }
+
+    /// Wall time for ongoing drag/long-press/tooltip observations.
+    fn observed(self) -> f64 {
+        self.input.unwrap_or(self.pass)
+    }
+}
+
+impl From<f64> for EdgeTime {
+    fn from(pass: f64) -> Self {
+        Self { pass, input: None }
+    }
+}
+
+/// A button edge adjudicated by egui, in raw input order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointerButtonEdge {
+    pub button: PointerButton,
+    pub pressed: bool,
+    pub time: EdgeTime,
+    pub pos: Option<Pos2>,
+    pub click: Option<(Pos2, u32)>,
 }
 
 /// Ordered physical button facts. A release without a position ends its hold
@@ -1076,7 +1119,7 @@ pub struct PointerState {
 
     /// When did the current click/drag originate?
     /// `None` if no mouse button is down.
-    press_start_time: Option<f64>,
+    press_start_time: Option<(PointerButton, EdgeTime)>,
 
     /// Set to `true` if the pointer has moved too much (since being pressed)
     /// for it to be registered as a click.
@@ -1101,11 +1144,11 @@ pub struct PointerState {
 
     /// When did the pointer get click last?
     /// Used to check for double-clicks.
-    last_click_time: f64,
+    last_click_time: EdgeTime,
 
     /// When did the pointer get click two clicks ago?
     /// Used to check for triple-clicks.
-    last_last_click_time: f64,
+    last_last_click_time: EdgeTime,
 
     /// When was the pointer last moved?
     /// Used for things like showing hover ui/tooltip with a delay.
@@ -1138,8 +1181,8 @@ impl Default for PointerState {
             started_decidedly_dragging: false,
             press_click_count: 0,
             last_click_pos: None,
-            last_click_time: f64::NEG_INFINITY,
-            last_last_click_time: f64::NEG_INFINITY,
+            last_click_time: f64::NEG_INFINITY.into(),
+            last_last_click_time: f64::NEG_INFINITY.into(),
             last_move_time: f64::NEG_INFINITY,
             pointer_events: vec![],
             options: Default::default(),
@@ -1186,7 +1229,43 @@ impl PointerState {
         }
 
         let mut clear_history_after_velocity_calculation = false;
+        let mut annotation = None;
         for event in &new.events {
+            let edge_time = match event {
+                Event::PointerButtonTime {
+                    button,
+                    pressed,
+                    time,
+                } => {
+                    annotation = Some((*button, *pressed, *time));
+                    continue;
+                }
+                Event::PointerInputProvenance(_) => continue,
+                Event::PointerButton {
+                    button, pressed, ..
+                } => {
+                    let mut input = annotation
+                        .take()
+                        .and_then(|(b, p, input)| (b == *button && p == *pressed).then_some(input))
+                        .zip(new.input_clock)
+                        .and_then(|(input, clock)| {
+                            let converted = time - (clock - input);
+                            converted.is_finite().then_some(converted.min(time))
+                        });
+                    if !pressed
+                        && let Some((press_button, start)) = self.press_start_time
+                        && press_button == *button
+                        && let (Some(release), Some(press)) = (input, start.input)
+                    {
+                        input = Some(release.max(press).min(time));
+                    }
+                    EdgeTime { pass: time, input }
+                }
+                _ => {
+                    annotation = None;
+                    time.into()
+                }
+            };
             match event {
                 Event::PointerMoved(pos) => {
                     let pos = *pos;
@@ -1224,25 +1303,26 @@ impl PointerState {
 
                     if pressed {
                         self.press_origin = Some(pos);
-                        self.press_start_time = Some(time);
+                        self.press_start_time = Some((button, edge_time));
                         self.has_moved_too_much_for_a_click = false;
 
                         // Would a click ending this press be a double- or triple-click?
-                        self.press_click_count = self.click_count(time, pos);
+                        self.press_click_count = self.click_count(edge_time, pos);
 
                         self.pointer_events.push(PointerEvent::Pressed {
                             position: pos,
                             button,
+                            time: edge_time,
                         });
                     } else {
                         // Released
-                        let clicked = self.could_any_button_be_click();
+                        let clicked = self.could_any_button_be_click_at(edge_time);
 
                         let click = if clicked {
-                            let count = self.click_count(time, pos);
+                            let count = self.click_count(edge_time, pos);
 
                             self.last_last_click_time = self.last_click_time;
-                            self.last_click_time = time;
+                            self.last_click_time = edge_time;
                             self.last_click_pos = Some(pos);
 
                             Some(Click {
@@ -1258,6 +1338,7 @@ impl PointerState {
                             click,
                             button,
                             position: Some(pos),
+                            time: edge_time,
                         });
 
                         self.press_origin = None;
@@ -1275,6 +1356,7 @@ impl PointerState {
                         click: None,
                         button,
                         position: None,
+                        time: time.into(),
                     });
                     self.down[button as usize] = false;
                     self.press_origin = None;
@@ -1381,7 +1463,7 @@ impl PointerState {
     /// `None` if no mouse button is down.
     #[inline(always)]
     pub fn press_start_time(&self) -> Option<f64> {
-        self.press_start_time
+        self.press_start_time.map(|(_, time)| time.observed())
     }
 
     /// Latest reported pointer position.
@@ -1438,7 +1520,7 @@ impl PointerState {
     /// How long has it been (in seconds) since the pointer was clicked?
     #[inline(always)]
     pub fn time_since_last_click(&self) -> f32 {
-        (self.time - self.last_click_time) as f32
+        (self.time - self.last_click_time.observed()) as f32
     }
 
     /// How many clicks (1, 2 or 3) a click at the given time and place would count as,
@@ -1446,15 +1528,15 @@ impl PointerState {
     ///
     /// Used both when a button is pressed (for [`Self::press_click_count`])
     /// and when it is released (for [`Click::count`]), so that the two always agree.
-    fn click_count(&self, time: f64, pos: Pos2) -> u32 {
+    fn click_count(&self, time: EdgeTime, pos: Pos2) -> u32 {
         let click_dist_sq = self
             .last_click_pos
             .map_or(0.0, |last_pos| last_pos.distance_sq(pos));
 
-        let double_click = (time - self.last_click_time) < self.options.max_double_click_delay
+        let double_click = time.since(self.last_click_time) < self.options.max_double_click_delay
             && click_dist_sq < self.options.max_click_dist * self.options.max_click_dist;
         let triple_click = double_click
-            && (self.last_click_time - self.last_last_click_time)
+            && self.last_click_time.since(self.last_last_click_time)
                 < self.options.max_double_click_delay;
 
         if triple_click {
@@ -1510,7 +1592,9 @@ impl PointerState {
     /// terminal before a new press cannot terminate or authorize the new hold.
     pub fn button_events(&self) -> impl DoubleEndedIterator<Item = PointerButtonEvent> + '_ {
         self.pointer_events.iter().filter_map(|event| match *event {
-            PointerEvent::Pressed { position, button } => Some(PointerButtonEvent::Pressed {
+            PointerEvent::Pressed {
+                position, button, ..
+            } => Some(PointerButtonEvent::Pressed {
                 button,
                 pos: position,
             }),
@@ -1623,6 +1707,37 @@ impl PointerState {
         })
     }
 
+    /// Canonical edge facts, including positionless hold termination. Cancelled
+    /// buttons are removed from this same record by `cancel_button`.
+    pub fn button_edges(&self) -> impl DoubleEndedIterator<Item = PointerButtonEdge> + '_ {
+        self.pointer_events.iter().filter_map(|event| match event {
+            PointerEvent::Pressed {
+                position,
+                button,
+                time,
+            } => Some(PointerButtonEdge {
+                button: *button,
+                pressed: true,
+                time: *time,
+                pos: Some(*position),
+                click: None,
+            }),
+            PointerEvent::Released {
+                click,
+                button,
+                position,
+                time,
+            } => Some(PointerButtonEdge {
+                button: *button,
+                pressed: false,
+                time: *time,
+                pos: *position,
+                click: click.as_ref().map(|click| (click.pos, click.count)),
+            }),
+            PointerEvent::Moved(_) => None,
+        })
+    }
+
     /// Was the button given double clicked this frame?
     pub fn button_double_clicked(&self, button: PointerButton) -> bool {
         self.pointer_events.iter().any(|event| {
@@ -1685,7 +1800,7 @@ impl PointerState {
             }
 
             if let Some(press_start_time) = self.press_start_time
-                && self.time - press_start_time > self.options.max_click_duration
+                && self.time - press_start_time.1.observed() > self.options.max_click_duration
             {
                 return false;
             }
@@ -1694,6 +1809,14 @@ impl PointerState {
         } else {
             false
         }
+    }
+
+    fn could_any_button_be_click_at(&self, time: EdgeTime) -> bool {
+        (self.any_down() || self.any_released())
+            && !self.has_moved_too_much_for_a_click
+            && self
+                .press_start_time
+                .is_none_or(|start| time.since(start.1) <= self.options.max_click_duration)
     }
 
     /// Just because the mouse is down doesn't mean we are dragging.
@@ -1721,7 +1844,7 @@ impl PointerState {
             && !self.has_moved_too_much_for_a_click
             && self.button_down(PointerButton::Primary)
             && self.press_start_time.is_some_and(|press_start_time| {
-                self.time - press_start_time > self.options.max_click_duration
+                self.time - press_start_time.1.observed() > self.options.max_click_duration
             })
     }
 
@@ -1895,6 +2018,9 @@ impl PointerState {
         ui.label(format!("pointer_events: {pointer_events:?}"));
     }
 }
+
+#[cfg(test)]
+mod timestamp_tests;
 
 #[cfg(test)]
 mod tests {

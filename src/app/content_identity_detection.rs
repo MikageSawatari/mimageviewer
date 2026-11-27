@@ -53,6 +53,9 @@ impl App {
         &mut self,
         effects: crate::rename_key_migration::StoreMutationEffects,
     ) {
+        if effects.combine_index_stale() {
+            self.image_combine.index.mark_stale();
+        }
         self.caption_display
             .invalidate_rotation_keys(effects.rotation_keys().iter().map(String::as_str));
         if effects.derived_text_changed() {

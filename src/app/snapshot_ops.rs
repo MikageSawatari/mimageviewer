@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::app::{App, FsPageTransfer};
+use crate::app::{App, DirectoryScanRoute, FsPageTransfer, UiThreadScanReason};
 use crate::grid_item::GridItem;
 use crate::snapshot::{
     FilterState, SnapshotEntry, SnapshotKey, SnapshotSourceLabel, SnapshotState, is_inside_fs,
@@ -943,6 +943,15 @@ impl App {
             self.show_feedback_warning("固定する items がありません".into());
             return;
         }
+        let continue_local = self.local_page_edit_survives_items_adoption(
+            self.visible_indices
+                .iter()
+                .copied()
+                .filter(|idx| self.direct_media_basis_allows_index(*idx))
+                .filter_map(|idx| self.items.get(idx))
+                .filter(|item| snapshot_key_from_grid_item(item).is_some()),
+        );
+        self.end_page_edit_tools_for_item_adoption("snapshot_activate", continue_local);
         self.normalize_direct_media_basis_for_snapshot();
         let accepted_policy = self.page_identity_index.policy.clone();
         let source_had_exact_page_edits = self.page_edit_snapshot.is_some();
@@ -1356,6 +1365,13 @@ impl App {
     /// origin と一致する場合のみ復元、不一致の場合は current_folder の items を維持する。
     /// 物理 child に手動順の記録が有り得る場合だけ、Read 後の通常 reload へ渡す。
     pub(crate) fn deactivate_snapshot(&mut self) {
+        if let Some(snapshot) = self.snapshot.as_ref() {
+            let continue_local = self.current_folder.as_ref().is_some_and(|path| {
+                snapshot_key_from_path(path) == snapshot_key_from_path(&snapshot.origin)
+            }) && snapshot.pre_snapshot_search_origin.is_none()
+                && self.local_page_edit_survives_items_adoption(&snapshot.saved_items);
+            self.end_page_edit_tools_for_item_adoption("snapshot_deactivate", continue_local);
+        }
         let Some(snap) = self.snapshot.take() else {
             return;
         };
@@ -2013,7 +2029,10 @@ impl App {
             }
             SnapshotArchiveCacheDestination::Grid => {
                 self.snapshot_internal_nav = true;
-                self.load_folder(cached);
+                self.load_folder_with_scan_route(
+                    cached,
+                    DirectoryScanRoute::UiThread(UiThreadScanReason::SnapshotLeafOpen),
+                );
                 self.snapshot_internal_nav = false;
                 if self.rating_filter_suppressed_at.is_some() {
                     self.rebuild_visible_indices();
@@ -2222,7 +2241,10 @@ impl App {
         }
         // guard bypass
         self.snapshot_internal_nav = true;
-        self.load_folder(folder_path);
+        self.load_folder_with_scan_route(
+            folder_path,
+            DirectoryScanRoute::UiThread(UiThreadScanReason::SnapshotLeafOpen),
+        );
         self.snapshot_internal_nav = false;
         // ★一時解除中の自動発動は `maybe_restore_rating_filter_if_out_of_scope`
         // (= load_folder 末尾で呼ばれる) が現在 folder の★を見て自動再評価するので、
@@ -2364,6 +2386,9 @@ impl App {
         self.stop_projected_slideshow_playback();
         self.cancel_sidecar_restore_fullscreen_reopen();
         self.cancel_required_fullscreen_folder_open();
+        // Admission of a new close retires only this context's C5 request.
+        // Content-only teardown (including deferred TerminalClose) never calls this.
+        self.cancel_main_fullscreen_close_return_scan();
         self.cancel_inflight_order_dependent_folder_nav();
         if self.fs_nav_after_pdf_enumerate.is_some() || self.pdf_password_request.is_some() {
             self.pdf_enumerate_pending = None;
@@ -2957,7 +2982,10 @@ impl App {
                 _ => return false,
             };
             self.snapshot_internal_nav = true;
-            self.load_folder(target_path);
+            self.load_folder_with_scan_route(
+                target_path,
+                DirectoryScanRoute::UiThread(UiThreadScanReason::SnapshotLeafOpen),
+            );
             self.snapshot_internal_nav = false;
             if self.rating_filter_suppressed_at.is_some() {
                 self.rebuild_visible_indices();
@@ -3194,7 +3222,10 @@ mod tests {
         app.activate_snapshot(SnapshotSourceLabel::Mixed);
         app.finish_page_identity_preparation_for_test();
         app.snapshot_internal_nav = true;
-        app.app.load_folder(child.clone());
+        app.load_folder_with_scan_route(
+            child.clone(),
+            DirectoryScanRoute::UiThread(UiThreadScanReason::SnapshotLeafOpen),
+        );
         app.snapshot_internal_nav = false;
         app.finish_page_identity_preparation_for_test();
         assert!(app.is_snapshot_active());
@@ -3352,7 +3383,10 @@ mod tests {
         app.finish_page_identity_preparation_for_test();
         assert!(app.is_snapshot_active());
         app.snapshot_internal_nav = true;
-        app.app.load_folder(child.clone());
+        app.load_folder_with_scan_route(
+            child.clone(),
+            DirectoryScanRoute::UiThread(UiThreadScanReason::SnapshotLeafOpen),
+        );
         app.snapshot_internal_nav = false;
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.current_folder.as_deref(), Some(child.as_path()));
@@ -4760,7 +4794,8 @@ mod tests {
                 ),
             )
             .unwrap();
-        app.load_folder(book.clone());
+        // §1.853: the source Book must be adopted before snapshot captures its presentation.
+        app.load_folder_and_finish_for_test(book.clone());
         app.settle_open_path_classification_for_test();
         app.finish_page_identity_preparation_for_test();
         let original_recipe = ProjectionRecipe::Book(BookScope::ImageFolder(book));
@@ -5833,7 +5868,7 @@ mod tests {
         app.settings.browser_view_output_dir = Some(folder.clone());
         app.settings.default_spread_mode = SpreadMode::RtlCover;
         app.settings.apply_default_spread_to_plain_folders = true;
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.finish_page_identity_preparation_for_test();
         let source = app.spread_presentation_source.clone();
         assert_eq!(
@@ -5893,8 +5928,12 @@ mod tests {
                 .mode,
             Some(SpreadMode::Ltr)
         );
-        app.load_folder(folder);
-        app.finish_page_identity_preparation_for_test();
+        app.app.load_folder(folder);
+        // A plain directory reload now admits a worker scan. Identity preparation
+        // alone cannot adopt it or restore the browser directory's NON_BOOK default.
+        assert!(app.direct_navigation_scan_pending());
+        assert_eq!(app.spread_mode, SpreadMode::Ltr);
+        app.finish_direct_navigation_scan_for_test();
         assert_eq!(app.spread_mode, SpreadMode::Single);
     }
 }

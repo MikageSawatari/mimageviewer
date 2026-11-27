@@ -144,7 +144,7 @@ fn configure_fixture(
         Some(2)
     );
     assert_eq!(app.book_resume_db.as_ref().unwrap().get(&target), Some(2));
-    app.load_folder(source.clone());
+    app.load_folder_and_finish_for_test(source.clone());
     app.finish_page_identity_preparation_for_test();
     app.fullscreen_idx = Some(0);
     (source, target, snapshot)
@@ -179,6 +179,7 @@ fn replace_pdf_preflight(app: &mut App) {
 fn finish_reopen(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while app.top_level_grid_view.open_path_classification().is_some()
+        || app.direct_navigation_scan_pending()
         || app
             .top_level_grid_view
             .history_navigation_transition()
@@ -190,6 +191,7 @@ fn finish_reopen(app: &mut App, ctx: &egui::Context) {
         || app.fullscreen_idx.is_none()
     {
         app.settle_open_path_classification_for_test();
+        app.poll_direct_navigation_scan_for_test(ctx);
         app.poll_history_navigation_transition_for_test(ctx);
         app.poll_zip_enumerate();
         app.poll_pdf_enumerate();

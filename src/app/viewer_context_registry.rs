@@ -461,6 +461,9 @@ enum PendingTransition {
 /// not published before a successful finalizer (I8).
 struct ContextTable<P> {
     projection: Projection,
+    /// The foreground owner remains unchanged while service callbacks project other payloads.
+    /// Only the outermost scoped mount records and clears this identity.
+    scoped_mount_original: Option<ViewerContextId>,
     slots: HashMap<ViewerContextId, Slot<P>>,
     main: ViewerContextId,
     window_of: HashMap<ViewerContextId, u64>,
@@ -476,6 +479,7 @@ impl<P> ContextTable<P> {
         let main = ViewerContextId(0);
         Self {
             projection: Projection::Mounted(main),
+            scoped_mount_original: None,
             slots: HashMap::new(),
             main,
             window_of: HashMap::new(),
@@ -504,6 +508,29 @@ impl<P> ContextTable<P> {
         match self.projection {
             Projection::Mounted(id) => Some(id),
             Projection::Building { .. } => None,
+        }
+    }
+
+    fn foreground_id(&self) -> Option<ViewerContextId> {
+        assert!(self.pending.is_none());
+        self.scoped_mount_original.or_else(|| self.mounted_id())
+    }
+
+    /// Returns whether this scope owns the record and must clear it after restoring its mount.
+    fn enter_mount_scope(&mut self, original: ViewerContextId) -> bool {
+        assert!(self.pending.is_none());
+        if self.scoped_mount_original.is_some() {
+            false
+        } else {
+            self.scoped_mount_original = Some(original);
+            true
+        }
+    }
+
+    fn leave_mount_scope(&mut self, original: ViewerContextId, outermost: bool) {
+        assert_eq!(self.mounted_id(), Some(original));
+        if outermost {
+            assert_eq!(self.scoped_mount_original.take(), Some(original));
         }
     }
 
@@ -1052,6 +1079,11 @@ fn reset_audio_art_terminal_rows(
 }
 
 impl App {
+    /// App-wide edit drafts belong to the foreground owner, not a temporary service projection.
+    pub(crate) fn page_edit_tools_owned_by_projected_context(&self) -> bool {
+        self.foreground_viewer_context_id() == Some(self.projected_viewer_context_id())
+    }
+
     /// Includes buffered read results; inspection never mounts a context or drains it.
     pub(super) fn has_tag_prewarm_work(&self) -> bool {
         if self
@@ -5502,6 +5534,10 @@ impl App {
         self.viewer_contexts.table.mounted_id()
     }
 
+    pub(in crate::app) fn foreground_viewer_context_id(&self) -> Option<ViewerContextId> {
+        self.viewer_contexts.table.foreground_id()
+    }
+
     /// Identity of the payload currently projected onto `App`, including a context being built.
     pub(in crate::app) fn projected_viewer_context_id(&self) -> ViewerContextId {
         self.viewer_contexts.table.projected_id()
@@ -6058,6 +6094,7 @@ impl App {
         let ops = self.viewer_contexts.table.plan_mount(id)?;
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_mount();
+        let outermost = self.viewer_contexts.table.enter_mount_scope(original);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         let ops = self
             .viewer_contexts
@@ -6066,6 +6103,9 @@ impl App {
             .expect("mounted viewer-context owner disappeared");
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_mount();
+        self.viewer_contexts
+            .table
+            .leave_mount_scope(original, outermost);
         match result {
             Ok(value) => Ok(value),
             Err(payload) => std::panic::resume_unwind(payload),
@@ -6515,6 +6555,10 @@ impl App {
         ViewerContextId::single_context()
     }
 
+    pub(in crate::app) fn foreground_viewer_context_id(&self) -> Option<ViewerContextId> {
+        Some(ViewerContextId::single_context())
+    }
+
     pub(in crate::app) fn with_viewer_context<R>(
         &mut self,
         id: ViewerContextId,
@@ -6695,6 +6739,201 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    #[test]
+    fn page_edit_920_scoped_mount_keeps_outer_foreground_through_nested_reentry() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.viewer_context_main();
+        app.address = "foreground".into();
+        let first = app.build_window_context_for_test(19201, |owner| {
+            owner.address = "first".into();
+        });
+        let second = app.build_window_context_for_test(19202, |owner| {
+            owner.address = "second".into();
+        });
+        app.conceal_mode = true;
+        assert!(app.page_edit_tools_owned_by_projected_context());
+
+        app.with_viewer_context_state(first, |owner| {
+            assert_eq!(owner.mounted_viewer_context_id(), Some(first));
+            assert_eq!(owner.foreground_viewer_context_id(), Some(main));
+            assert!(!owner.page_edit_tools_owned_by_projected_context());
+            assert_eq!(owner.address, "first");
+            assert!(
+                owner.conceal_mode,
+                "the draft mode remains foreground-owned"
+            );
+            owner
+                .with_viewer_context_state(second, |nested| {
+                    assert_eq!(nested.projected_viewer_context_id(), second);
+                    assert_eq!(nested.foreground_viewer_context_id(), Some(main));
+                    assert!(!nested.page_edit_tools_owned_by_projected_context());
+                    assert_eq!(nested.address, "second");
+                })
+                .unwrap();
+            owner
+                .with_viewer_context_state(first, |nested| {
+                    assert_eq!(nested.foreground_viewer_context_id(), Some(main));
+                    assert!(!nested.page_edit_tools_owned_by_projected_context());
+                })
+                .unwrap();
+            owner
+                .with_viewer_context_state(main, |nested| {
+                    assert_eq!(nested.foreground_viewer_context_id(), Some(main));
+                    assert!(nested.page_edit_tools_owned_by_projected_context());
+                    assert_eq!(nested.address, "foreground");
+                })
+                .unwrap();
+            assert_eq!(owner.foreground_viewer_context_id(), Some(main));
+            assert!(!owner.page_edit_tools_owned_by_projected_context());
+        })
+        .unwrap();
+
+        assert_eq!(app.mounted_viewer_context_id(), Some(main));
+        assert_eq!(app.foreground_viewer_context_id(), Some(main));
+        assert!(app.page_edit_tools_owned_by_projected_context());
+        assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+        assert!(app.conceal_mode);
+        assert_eq!(app.address, "foreground");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_edit_920_scoped_mount_panic_restores_and_clears_only_outer_scope() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.viewer_context_main();
+        let first = app.build_window_context_for_test(19203, |_| {});
+        let second = app.build_window_context_for_test(19204, |_| {});
+        app.with_viewer_context_state(first, |owner| {
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                let _ = owner.with_viewer_context_state(second, |nested| {
+                    assert_eq!(nested.foreground_viewer_context_id(), Some(main));
+                    panic!("nested page edit owner panic");
+                });
+            }));
+            assert!(panic.is_err());
+            assert_eq!(owner.projected_viewer_context_id(), first);
+            assert_eq!(owner.foreground_viewer_context_id(), Some(main));
+            assert_eq!(
+                owner.viewer_contexts.table.scoped_mount_original,
+                Some(main)
+            );
+        })
+        .unwrap();
+        assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = app.with_viewer_context(first, |owner| {
+                owner
+                    .with_viewer_context_state(second, |_| {
+                        panic!("unwind through both mount scopes");
+                    })
+                    .unwrap();
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(app.mounted_viewer_context_id(), Some(main));
+        assert_eq!(app.foreground_viewer_context_id(), Some(main));
+        assert!(app.page_edit_tools_owned_by_projected_context());
+        assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_edit_920_rejected_mount_leaves_foreground_scope_unchanged() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.viewer_context_main();
+        let first = app.build_window_context_for_test(19205, |_| {});
+        let retiring = app.build_window_context_for_test(19206, |_| {});
+        app.viewer_contexts.table.begin_retire(retiring).unwrap();
+        let unknown = ViewerContextId::for_test(u64::MAX);
+        for id in [retiring, unknown] {
+            assert!(
+                app.with_viewer_context_state(id, |_| panic!("rejected callback"))
+                    .is_err()
+            );
+            assert_eq!(app.foreground_viewer_context_id(), Some(main));
+            assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+        }
+        app.with_viewer_context_state(first, |owner| {
+            for id in [retiring, unknown] {
+                assert!(
+                    owner
+                        .with_viewer_context_state(id, |_| panic!("rejected nested callback"))
+                        .is_err()
+                );
+                assert_eq!(owner.projected_viewer_context_id(), first);
+                assert_eq!(owner.foreground_viewer_context_id(), Some(main));
+                assert_eq!(
+                    owner.viewer_contexts.table.scoped_mount_original,
+                    Some(main)
+                );
+            }
+        })
+        .unwrap();
+        assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_edit_920_build_commit_abort_and_promote_follow_mounted_owner_without_scope() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.viewer_context_main();
+        let built = app
+            .build_viewer_context("page_edit_920_commit", |owner, reserved| {
+                assert_eq!(owner.mounted_viewer_context_id(), None);
+                assert_eq!(owner.projected_viewer_context_id(), reserved);
+                assert_eq!(owner.foreground_viewer_context_id(), None);
+                assert!(!owner.page_edit_tools_owned_by_projected_context());
+                assert!(
+                    owner
+                        .with_viewer_context_state(main, |_| panic!("building callback"))
+                        .is_err()
+                );
+                assert!(owner.viewer_contexts.table.scoped_mount_original.is_none());
+                BuildOutcome::Commit
+            })
+            .unwrap();
+        assert_eq!(app.foreground_viewer_context_id(), Some(main));
+        assert!(app.page_edit_tools_owned_by_projected_context());
+        assert_eq!(
+            app.build_viewer_context("page_edit_920_abort", |owner, _| {
+                assert_eq!(owner.foreground_viewer_context_id(), None);
+                assert!(!owner.page_edit_tools_owned_by_projected_context());
+                BuildOutcome::Abort("page_edit_920_test")
+            }),
+            None
+        );
+        assert_eq!(app.foreground_viewer_context_id(), Some(main));
+
+        // A persistent mount is not a service scope and must establish its own foreground.
+        let ops = app.viewer_contexts.table.plan_mount(built).unwrap();
+        app.execute_viewer_context_ops(ops, None);
+        app.viewer_contexts.table.finish_mount();
+        assert_eq!(app.foreground_viewer_context_id(), Some(built));
+        assert!(app.page_edit_tools_owned_by_projected_context());
+        assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+        app.with_viewer_context_state(main, |owner| {
+            assert_eq!(owner.foreground_viewer_context_id(), Some(built));
+            assert!(!owner.page_edit_tools_owned_by_projected_context());
+        })
+        .unwrap();
+        let ops = app.viewer_contexts.table.plan_mount(main).unwrap();
+        app.execute_viewer_context_ops(ops, None);
+        app.viewer_contexts.table.finish_mount();
+        assert_eq!(app.foreground_viewer_context_id(), Some(main));
+
+        assert_eq!(
+            app.stash_mounted_and_start_fresh("page_edit_920_promote"),
+            main
+        );
+        let fresh = app.viewer_context_main();
+        assert_ne!(fresh, main);
+        assert_eq!(app.foreground_viewer_context_id(), Some(fresh));
+        assert!(app.page_edit_tools_owned_by_projected_context());
+        assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+    }
 
     #[cfg(windows)]
     #[test]
@@ -9522,7 +9761,7 @@ mod tests {
         let mut rating = crate::app::setup_app_for_test();
         let source = tempfile::tempdir().unwrap();
         std::fs::write(source.path().join("keep.jpg"), []).unwrap();
-        rating.load_folder(source.path().to_path_buf());
+        rating.load_folder_and_finish_for_test(source.path().to_path_buf());
         rating.enter_rating_view(5);
         assert!(rating.rating_view_pending.is_some());
         let rating_address = rating.address.clone();

@@ -99,6 +99,7 @@ struct GridDropDisplay {
     layer: egui::LayerId,
     clip: egui::Rect,
     folders: Vec<DropRow>,
+    input_blocked: Option<String>,
 }
 
 fn grid_drop_display_id() -> egui::Id {
@@ -124,10 +125,17 @@ impl App {
         folders: Vec<DropRow>,
     ) {
         let eligible = self.is_physical_folder_listing() && self.grid_item_input_allowed();
+        let editing = self.detached_viewer_editing_blocks_grid_input();
         let display = GridDropDisplay {
             pass: ui.ctx().cumulative_pass_nr(),
             layer: ui.layer_id(),
-            clip: if eligible { clip } else { egui::Rect::NOTHING },
+            clip: if eligible || editing {
+                clip
+            } else {
+                egui::Rect::NOTHING
+            },
+            input_blocked: editing
+                .then(|| crate::filename_stack_ui::DETACHED_VIEWER_EDITING_GRID_NOTICE.to_owned()),
             folders: if eligible {
                 folders
                     .into_iter()
@@ -257,6 +265,16 @@ impl App {
         let drops = std::mem::take(&mut self.main_drop.borrow_mut().drops);
         for request in drops {
             match request {
+                DropRequest::GridInputBlocked(message) => {
+                    if message == crate::filename_stack_ui::DETACHED_VIEWER_EDITING_GRID_NOTICE {
+                        self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+                    } else {
+                        self.show_feedback_toast_on(message, super::ActionSurface::MainWindow);
+                    }
+                }
+                DropRequest::GridFiles(_) if self.detached_viewer_editing_blocks_grid_input() => {
+                    self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+                }
                 DropRequest::GridFiles(paths) if self.sidecar_restore_active() => {
                     crate::logger::log(format!(
                         "file_drop: discarded {} path(s) during sidecar restore",
@@ -264,7 +282,14 @@ impl App {
                     ));
                 }
                 DropRequest::GridFiles(paths) => grid(self, paths),
-                DropRequest::FolderTransfer(request) => self.submit_shell_transfer(ctx, request),
+                DropRequest::FolderTransfer(_, DropPlace::Grid)
+                    if self.detached_viewer_editing_blocks_grid_input() =>
+                {
+                    // A previously presented grid folder can still be the native drop target.
+                    // Do not execute that queued transfer after editing took ownership.
+                    self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+                }
+                DropRequest::FolderTransfer(request, _) => self.submit_shell_transfer(ctx, request),
                 DropRequest::Failed(message) => {
                     crate::logger::log(format!("main_drop: {message}"));
                     self.show_feedback_warning(message);
@@ -311,6 +336,7 @@ impl App {
             tree_clip: egui::Rect::NOTHING,
             rows: Vec::new(),
             grid_clip: egui::Rect::NOTHING,
+            grid_input_blocked: None,
             grid_folders: Vec::new(),
             grid_blocked: Vec::new(),
             client_size_px: metrics.client_size_px,
@@ -324,6 +350,7 @@ impl App {
             .filter(|display| display.pass == ctx.cumulative_pass_nr())
         {
             geometry.grid_clip = display.clip;
+            geometry.grid_input_blocked = display.input_blocked;
             geometry.grid_folders = display.folders;
             grid_layer = Some(display.layer);
         }

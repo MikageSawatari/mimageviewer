@@ -861,6 +861,8 @@ pub(crate) enum AddressBarNav {
     RecentFolder(PathBuf),
     ZipListReturn(crate::app::ZipListReturnRequest),
     Direct(PathBuf, crate::app::StartupListIntent),
+    /// A grid folder activation carries its admission effects until visible adoption.
+    GridFolder(crate::app::GridVirtualOpenIntent),
     GridVirtual(crate::app::GridVirtualOpenIntent),
     RatingSource {
         path: PathBuf,
@@ -1161,7 +1163,7 @@ fn grid_primary_input_events(
         .unwrap_or_else(|| ctx.pointer_button_targets());
     let mut witnesses = witnesses.into_iter();
     ctx.input(|input| {
-        let mut releases = input.pointer.released_buttons_with_click_counts();
+        let mut edges = input.pointer.button_edges();
         let mut ordinal = 0;
         let mut events = Vec::new();
         for event in &input.events {
@@ -1175,10 +1177,14 @@ fn grid_primary_input_events(
                 egui::Event::PointerButtonReleased { button, .. } => {
                     // This release has no widget witness or click position. It
                     // still occupies its adjudicated release and primary ordinal.
-                    let Some((released_button, click)) = releases.next() else {
+                    let Some(edge) = edges.next() else {
                         return vec![GridPrimaryInput::Cancelled];
                     };
-                    if released_button != button || click.is_some() {
+                    if edge.button != button
+                        || edge.pressed
+                        || edge.pos.is_some()
+                        || edge.click.is_some()
+                    {
                         return vec![GridPrimaryInput::Cancelled];
                     }
                     if button == egui::PointerButton::Primary {
@@ -1202,17 +1208,15 @@ fn grid_primary_input_events(
                         }
                         _ => return vec![GridPrimaryInput::Cancelled],
                     };
-                    let click = if !pressed {
-                        let Some((released_button, click)) = releases.next() else {
-                            return vec![GridPrimaryInput::Cancelled];
-                        };
-                        if released_button != button {
-                            return vec![GridPrimaryInput::Cancelled];
-                        }
-                        click
-                    } else {
-                        None
+                    let Some(edge_time) = edges.next() else {
+                        return vec![GridPrimaryInput::Cancelled];
                     };
+                    if (edge_time.button, edge_time.pressed, edge_time.pos)
+                        != (button, pressed, Some(pos))
+                    {
+                        return vec![GridPrimaryInput::Cancelled];
+                    }
+                    let click = edge_time.click;
                     if button != egui::PointerButton::Primary {
                         events.push(if button == egui::PointerButton::Secondary {
                             GridPrimaryInput::Secondary {
@@ -1243,6 +1247,7 @@ fn grid_primary_input_events(
                     } else {
                         ordinal += 1;
                         events.push(GridPrimaryInput::Release {
+                            at: edge_time.time,
                             click,
                             modifiers,
                             source,
@@ -1264,7 +1269,7 @@ fn grid_primary_input_events(
         }
         // Earlier input owners can consume raw events. Never join a remaining raw
         // edge to a different adjudicated release or carry its old click pair on.
-        if releases.next().is_some() || witnesses.next().is_some() {
+        if edges.next().is_some() || witnesses.next().is_some() {
             return vec![GridPrimaryInput::Cancelled];
         }
         events
@@ -8964,7 +8969,7 @@ mod fixed_sort_control_tests {
                 } else {
                     ToolbarSectionDisplay::Buttons
                 };
-                app.load_folder_with_scan(folder, None);
+                app.load_folder_and_finish_for_test(folder);
                 // Production sanitizes pointer input during hydration; this harness must settle it first.
                 app.finish_page_identity_preparation_for_test();
                 assert!(app.grid_sort_lock_reason().is_none());
@@ -10750,8 +10755,11 @@ impl App {
                         }
                         TopMenuId::Tools => {
                             let response = ui.menu_button(TopMenuId::Tools.label(), |ui| {
-                                // Resolve targets only while the menu body is open, not on idle frames.
+                                let combine_reason = self.combine_tools_menu_disabled_reason();
+                                let combine_reopen_reason = self.image_combine_reopen_disabled_reason(self.selected, false);
                                 let state = crate::ui_tools_menu::ToolsMenuState {
+                                    combine_disabled_reason: combine_reason.as_deref(),
+                                    combine_reopen_disabled_reason: combine_reopen_reason.as_deref(),
                                     convert_enabled: self.grid_item_input_allowed() && convert_target_count > 0
                                         && self.archive_convert.is_none()
                                         && self.batch_convert.is_none()
@@ -10764,9 +10772,14 @@ impl App {
                                 };
                                 crate::ui_tools_menu::draw(ui, &resolved_top_menu.commands, &self.keymap, state)
                             });
+                            if response.inner.is_none() {
+                                self.image_combine.tools_menu_owner = None;
+                            }
                             if let Some(Some(command)) = response.inner {
                                 match command {
                                     MenuCommandId::ConvertToZip => self.start_batch_convert_to_zip(),
+                                    MenuCommandId::ToolsCombineImages => self.open_image_combine_dialog(ctx),
+                                    MenuCommandId::ToolsCombineReopen => self.open_image_combine_reopen_context_dialog(ctx, self.selected, false),
                                     MenuCommandId::ToolsCreateAiCaptions => self.request_create_ai_captions(ctx, false),
                                     MenuCommandId::ToolsShowCaptionProgress => self.show_caption_progress = true,
                                     MenuCommandId::ToolsCreateTranscripts => self.request_create_transcripts(ctx, false),
@@ -17799,7 +17812,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     | Some(AddressBarNav::CollectionSource { path: p, .. }) => {
                                         format!("親フォルダへ [BS]\n{}", p.to_string_lossy())
                                     }
-                                    Some(AddressBarNav::GridVirtual(intent)) => {
+                                    Some(AddressBarNav::GridFolder(intent))
+                                    | Some(AddressBarNav::GridVirtual(intent)) => {
                                         format!(
                                             "親フォルダへ [BS]\n{}",
                                             intent.path.to_string_lossy()
@@ -20212,12 +20226,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     &effective_event
                 }
                 GridPrimaryInput::Release {
+                    at,
                     click,
                     modifiers,
                     source,
                     suppressed,
                 } => {
                     effective_event = GridPrimaryInput::Release {
+                        at: *at,
                         click: *click,
                         modifiers: *modifiers,
                         source: *source,
@@ -20234,7 +20250,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             let accepted = self.grid_click_pairing.accept_primary_input(
                 context,
                 frame,
-                ctx.input(|input| input.time),
                 options.max_double_click_delay,
                 options.max_click_dist,
                 selected_event,
@@ -22549,6 +22564,23 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         let nav = egui::CentralPanel::default()
             .show(root_ui, |ui| -> Option<AddressBarNav> {
+                if self.detached_viewer_editing_blocks_grid_input() {
+                    // Preserve the disabled list's extent for native drop hit-testing,
+                    // including empty and filtered-empty early returns below.
+                    self.record_main_drop_grid_geometry(ui, ui.max_rect(), Vec::new());
+                    let presses = ctx.input(|input| input.events.iter().filter_map(|event| match event {
+                        egui::Event::PointerButton { pos, pressed: true, .. }
+                        | egui::Event::Touch { pos, phase: egui::TouchPhase::Start, .. } => {
+                            ui.max_rect().contains(*pos).then_some(*pos)
+                        }
+                        _ => None,
+                    }).collect::<Vec<_>>());
+                    if ctx.viewport_id() == egui::ViewportId::ROOT
+                        && presses.iter().any(|pos| ctx.layer_id_at(*pos) == Some(ui.layer_id()))
+                    {
+                        self.notify_detached_viewer_editing_grid_input_blocked(ctx);
+                    }
+                }
                 self.gate_main_grid_item_input_at(ui, now);
                 let suppress_primary_pointer = self.begin_grid_right_drag_primary_frame(ctx);
                 // Preserve the grid-owned pending click for this frame's cell check, while
@@ -34608,6 +34640,94 @@ mod grid_reclick_open_tests {
             .collect()
     }
 
+    fn timestamp_919_grid_pass(
+        harness: &mut Harness<'static, HandlerState>,
+        pos: egui::Pos2,
+        pass: f64,
+        stamps: Option<(f64, f64)>,
+    ) {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        for (pressed, time) in [(true, stamps.map(|s| s.0)), (false, stamps.map(|s| s.1))] {
+            if let Some(time) = time {
+                events.push(egui::Event::PointerButtonTime {
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    time,
+                });
+            }
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let raw = harness.input_mut();
+        raw.time = Some(pass);
+        raw.input_clock = Some(pass);
+        raw.events = events;
+        // Keep annotations and button events in the same RawInput; event() would
+        // split them into independent egui passes.
+        harness.step();
+    }
+
+    #[test]
+    fn grid_919_timestamped_stall_opens_cell_but_unstamped_does_not() {
+        for known in [false, true] {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+            harness
+                .ctx
+                .options_mut(|o| o.input_options.max_double_click_delay = 0.5);
+            let pos = cell_rect(0).center();
+            harness.hover_at(pos);
+            harness.run();
+            timestamp_919_grid_pass(&mut harness, pos, 1.08, known.then_some((1.0, 1.08)));
+            assert_eq!(harness.state().activations, 0);
+            timestamp_919_grid_pass(&mut harness, pos, 1.8, known.then_some((1.25, 1.33)));
+            assert_eq!(harness.state().activations, usize::from(known));
+        }
+    }
+
+    #[test]
+    fn grid_919_timestamped_stall_pairs_background_but_unstamped_does_not() {
+        for known in [false, true] {
+            let mut harness = background_harness(GridClickSelectionMode::Explorer);
+            harness
+                .ctx
+                .options_mut(|o| o.input_options.max_double_click_delay = 0.5);
+            let pos = egui::pos2(30.0, 170.0);
+            harness.hover_at(pos);
+            harness.run();
+            timestamp_919_grid_pass(&mut harness, pos, 1.08, known.then_some((1.0, 1.08)));
+            assert!(harness.state().background_navs.is_empty());
+            timestamp_919_grid_pass(&mut harness, pos, 1.8, known.then_some((1.25, 1.33)));
+            assert_eq!(harness.state().background_navs.len(), usize::from(known));
+        }
+    }
+
+    #[test]
+    fn grid_919_mixed_timestamp_pairs_retain_pass_interval_in_both_orders() {
+        for first_known in [false, true] {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+            harness
+                .ctx
+                .options_mut(|o| o.input_options.max_double_click_delay = 0.5);
+            let pos = cell_rect(0).center();
+            harness.hover_at(pos);
+            harness.run();
+            timestamp_919_grid_pass(&mut harness, pos, 1.08, first_known.then_some((1.0, 1.08)));
+            timestamp_919_grid_pass(
+                &mut harness,
+                pos,
+                1.8,
+                (!first_known).then_some((1.25, 1.33)),
+            );
+            assert_eq!(harness.state().activations, 0);
+        }
+    }
+
     fn section1680_double_click(harness: &mut Harness<'static, HandlerState>, pos: egui::Pos2) {
         harness.hover_at(pos);
         harness.run();
@@ -35803,6 +35923,7 @@ mod grid_reclick_open_tests {
                         OpenRequestOwner::Navigation,
                         StartupListIntent::ExplicitList,
                     ));
+                    app.finish_direct_navigation_scan_before_hydration_for_test();
                     app.finish_page_identity_preparation_for_test();
                     if !stacked {
                         app.move_grid_cursor(Some(3), crate::app::GridCursorIntent::Automatic);
@@ -37160,7 +37281,7 @@ mod section207_tests {
             only_folder_and_tree(&mut env);
             let folder = env.tmp.path().join("physical-parent-button");
             std::fs::create_dir_all(&folder).unwrap();
-            env.load_folder_with_scan(folder, None);
+            env.load_folder_and_finish_for_test(folder);
             let app = Rc::new(RefCell::new(env));
             let render = Rc::clone(&app);
             let settings_menu = Rc::new(Cell::new(false));
@@ -38033,7 +38154,7 @@ mod section207_tests {
                         let folder = app.tmp.path().join("snapshot-label");
                         std::fs::create_dir_all(&folder).unwrap();
                         std::fs::write(folder.join("image.jpg"), b"fixture").unwrap();
-                        app.load_folder_with_scan(folder, None);
+                        app.load_folder_and_finish_for_test(folder);
                         app.finish_page_identity_preparation_for_test();
                         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
                         app.finish_page_identity_preparation_for_test();
@@ -38148,7 +38269,7 @@ mod section207_tests {
                 let folder = env.tmp.path().join("reported-controls");
                 std::fs::create_dir_all(&folder).unwrap();
                 std::fs::write(folder.join("image.jpg"), b"fixture").unwrap();
-                env.load_folder_with_scan(folder.clone(), None);
+                env.load_folder_and_finish_for_test(folder.clone());
                 let item = env.items[0].clone();
                 env.items.resize(674, item);
                 env.visible_indices = (0..674).collect();
@@ -38334,7 +38455,7 @@ mod section207_tests {
                                 std::fs::write(folder.join(name), b"fixture").unwrap();
                             }
                             env.settings.skip_duplicate_images = true;
-                            env.load_folder_with_scan(folder, None);
+                            env.load_folder_and_finish_for_test(folder);
                             env.selected = Some(0);
                             // Representative state for the existing cached status badge.
                             env.current_folder_rating_cache = Some(5);
@@ -38406,7 +38527,12 @@ mod section207_tests {
                 std::fs::write(target.join(name), []).unwrap();
                 std::fs::write(source.join(name), []).unwrap();
             }
-            env.load_folder_with_scan(source.clone(), None);
+            // This fixture inspects hydration before it completes; keep its scan prepared
+            // rather than using the shared helper that also finishes page identities.
+            let scan =
+                crate::app::folder_scan::scan_directory_with_settings(&source, &env.settings)
+                    .unwrap();
+            env.load_folder_with_scan(source.clone(), Some(scan));
             assert_eq!(
                 env.modal_dialog_block_reason(),
                 Some("sidecar_restore"),
@@ -38480,7 +38606,7 @@ mod section207_tests {
         for path in [&source, &middle, &oldest] {
             std::fs::create_dir_all(path).unwrap();
         }
-        env.load_folder(source.clone());
+        env.load_folder_and_finish_for_test(source.clone());
         env.folder_nav_back_stack = vec![
             FolderNavHistoryTarget::Path(oldest.clone()).into(),
             FolderNavHistoryTarget::Path(middle.clone()).into(),
@@ -38609,7 +38735,7 @@ mod section207_tests {
                 target
             });
             env.active_quick_folder_slot = None;
-            env.load_folder(source);
+            env.load_folder_and_finish_for_test(source);
             env.recent_folders = targets.to_vec();
             let app = Rc::new(RefCell::new(env));
             let render = Rc::clone(&app);
@@ -39199,7 +39325,7 @@ mod section292_tests {
         for name in ["a.jpg", "b.jpg"] {
             std::fs::write(folder.join(name), b"image").unwrap();
         }
-        app.load_folder_with_scan(folder, None);
+        app.load_folder_and_finish_for_test(folder);
         // Production sanitizes pointer input during hydration; this harness must settle it first.
         app.finish_page_identity_preparation_for_test();
         app.settings.show_toolbar_sort = true;
@@ -39333,7 +39459,7 @@ mod section292_tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, b"image").unwrap();
         }
-        app.load_folder_with_scan(root.join("a"), None);
+        app.load_folder_and_finish_for_test(root.join("a"));
         app.finish_page_identity_preparation_for_test();
         app.settings.show_toolbar_sort = false;
         app.settings.show_facet_sort = true;

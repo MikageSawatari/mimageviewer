@@ -1,5 +1,18 @@
 # 動画再生サブシステム アーキテクチャ
 
+## 操作スクリプトと動画キーの共有（§1.363 段3）
+
+`App::execute_video_key_action` は解決済みの `KeyAction` を受け、native・egui動画・egui音楽の
+既存の操作本体を実行する。VK照合とその順序・repeat判定・ログ分類はnativeキー処理側に残す。
+nativeの前後移動・閉じるは既存の即時経路で完了し、スクリプトへ受付可否だけを返す。
+eguiは既存の `FsKeyAction` を所有者へ返す。レーティングは共通の結果付き実行関数で適用し、
+native側のログ対象・HUD更新とegui側のRebased/Closedをそれぞれ既存の形へ戻す。
+音楽表示には既存のキー操作がないキャプチャ・シークストリップ切替を広げない。
+通常native動画の右クリックメニューは、main描画がメニュー処理前に戻る現行経路を変更せず、
+設計担当の判断で段3の実行対象から外す。共通モデルのスクリプト行と選択後のスロット返却は保持する。
+画像専用のコピーKeyActionも動画スクリプトの許可表には加えない。
+詳細は [操作スクリプト設計 §5.2](operation-script-plan.md#52-実行方法-キーと共用の実行関数を同じフレームで呼ぶ)。
+
 ## 独立メディアから静止画への表示ホスト交換 (§1.767)
 
 フル機能 + `effective_media_in_media_window()` の独立 Video / Audio から静止画へ進む採用境界で、
@@ -167,6 +180,15 @@ Remote の音声 decoder は対象3 demuxerの開始時だけ、`InvalidData` �
 契約・割り切りと受入条件の正本は [MPEG keyframe seek の設計](mpeg-keyframe-seek-plan.md)。
 
 ## 採用アーキテクチャ: native presenter (独立 HWND + D3D11 swap chain) 必須
+
+§1.853 C5 の対象変更は `NativeVideoTargetAdmission` で新規入力と受付済みの続きに分ける。
+Home/End は `open_native_video_fullscreen_from_input`、HUD の NavigateItem、通常 wheel、前後キー、
+native HWND の wheel、swap 待ちの出力回収は `navigate_native_video_fullscreen` から同じ `NewInput` の受付を通る。
+selection と swap の変更より前に既存の sequence／nav lock を評価するので、全画面の閉じ戻りと Ctrl+↑↓ の待ちの間も断る。
+検証済みの非同期完了と EOF の続きは既存の `open_native_video_fullscreen_from_navigation` 系から
+`AcceptedContinuation` として再審査せず進める。待ちの無い操作と swap 中の後続 delta の保持は従来どおり。
+native の背景フレームも C5 の pane 完了を回収する。[設計 §6.12](ui-sync-853-plan.md#612-c5-全画面から戻る経路-全画面の-ctrl-の待ちと同じ扱い-利用者決定-61r6)。
+この追補のコンパイル・テスト・native 実機動作は未確認。
 
 旧版では「DX12 wgpu backend なら egui_wgpu callback で zero-copy GPU 描画、それ以外
 なら CPU readback + `ctx.load_texture` で egui::Image 描画」の二経路 + 自動フォール

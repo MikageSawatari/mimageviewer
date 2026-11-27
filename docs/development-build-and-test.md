@@ -35,8 +35,18 @@ fallback／診断として残す。[正規手順と採用証跡](release-check-a
 テスト名フィルタは実行するテストを絞るだけで、Cargo がコンパイルする target の種類は
 減らさない。反復を短くしたい場合は `--lib`、`--bin`、`--test` も指定して target を絞る。
 本体の全モジュールとアプリ固有テストは `--lib`、`tests/<name>.rs` は
-`--test <name>` を使う。`mimageviewer-core` bin は `mimageviewer::run()` を呼ぶだけなので、
+`--test integration <name>::` を使う。`mimageviewer-core` bin は `mimageviewer::run()` を呼ぶだけなので、
 通常は bin 単独のテストを選ぶ必要はない。
+
+本体の統合テストは `tests/integration.rs` にまとめている (§1.908)。過去の文書にある
+`cargo test -p mimageviewer --test <name>` は
+`cargo test -p mimageviewer --test integration <name>::` と読み替える
+(package 指定のない旧コマンドも同様)。**integration 全体は nextest で流し、cargo test は
+モジュールで絞る**。絞らないと、以前は別ファイルだったテストが同じプロセスに入り、
+プロセス単位のロガーや data_dir の初期化が競合し得る。全体は `test-full.ps1`、
+integration だけなら `cargo nextest run -p mimageviewer --test integration` を使う。
+別 crate の `crates/*/tests/` と vendor の target 名は変わらない。
+理由と制約は [テストのビルドメモリ対策 §2.1](test-build-memory-plan.md#21-1908-統合テストを-1-つのテスト-crate-にまとめる) を参照。
 
 MCP の同梱ヘルプ (§1.843 A) は `htdocs/mimageviewer/manual/*.html` と
 `manual/sound/*.html` (`changelog.html` を除く) からビルド時に生成する。
@@ -239,10 +249,11 @@ DXGI / VRAM / SM の情報照会だけ、wgpu Instance 作成だけのテスト�
 製品側の device / session 作成点にも `#[cfg(test)]` 限定で `assert_gpu_test_group()` を置く。
 テスト専用入口も検査する。nextest 上で `gpu` 以外から到達すると、設定への追加を促して
 生成前にテストプロセスを非ゼロ終了させ、background workerのpanic握り潰しも防ぐ。
-既存 helper の新しい呼び出し元も所属を確認する。スナップショット等の4統合テストは
-binary 全体を選び、混在するCPUテストも含める。通常の `cargo test` では入口検査を行わない。
+既存 helper の新しい呼び出し元も所属を確認する。スナップショット等の旧4統合テストは
+`integration` binary 内の対応する4モジュールのprefixで選び、混在するCPUテストも含める。
+通常の `cargo test` では入口検査を行わない。
 `cfg(test)` はdependencyへ伝播しないため、別integration / 別crateから通常libを呼ぶGPU経路は、
-そのbinaryの所属または自crate側の検査でも覆う。製品ビルドの動作は変えない。
+そのテストの所属または自crate側の検査でも覆う。製品ビルドの動作は変えない。
 group 内だけの実行では group 外の呼び出し漏れは検証できず、取り込み後の全件実行で検出する。
 経路別の対象・継承・一覧照合と時間見積もりは [GPU test-group](gpu-test-groups.md) を参照。
 workspaceの全package・補助bin・integrationと、standalone vendorのegui／egui-winit／egui-wgpu／
@@ -301,9 +312,11 @@ nextest対象外のworkspace doctestは同じfeatureで別段の `cargo test --d
   上記以外のignored入力は検知しない。その条件が変わったときは `-Force`。
   判読できない入力や入れ子Git repositoryがあれば再利用を止め、通常実行する。
 - focusedはHEAD（または`-Base <commit>`）と作業ツリーの差分＋未追跡ファイルから選ぶ。
-  `src/foo/bar.rs`→`test(~foo::bar::)`、`mod.rs`は親module、`tests/name.rs`はそのintegration target、
+  `src/foo/bar.rs`→`test(~foo::bar::)`、`mod.rs`は親module、ルートpackageの `tests/name.rs` は
+  `--test integration` + `test(/^name::/)`、
   他workspace crateはそのpackage全target。`-Path src/foo.rs`で明示選択、`-PlanOnly`で実行前の確認も可能。
-  `lib.rs` / `app.rs` / `src/app/tests.rs`、Cargo/build/runner設定、vendor、共通test support・snapshotは
+  `lib.rs` / `app.rs` / `src/app/tests.rs`、Cargo/build/runner設定、vendor、
+  `tests/integration.rs`・`tests/common/`・`tests/support/`・`tests/snapshots/` は
   広域として扱う。それ以外も`testdata/**`、`scripts/**`、workspace外patch crate、文書など、
   対応付けできない変更が1つでもあれば全該当パスを表示し、部分実行せずexit 2で
   `test-lib-full.ps1`と必要な専用検査を案内する。自動で全件へ拡大しない。
@@ -639,6 +652,14 @@ runner自体は `powershell -NoProfile -File scripts/test-live-windows-runner.ps
 段0aの監査と検証結果は [検証台帳](egui-0.37-stage0a-verification.md) を参照。
 
 ### 自動 gate の実行内容
+
+ビルドの同時数はスクリプト内で上限 **8** に制限する (§1.910)。呼び出し側の
+`CARGO_BUILD_JOBS` が 8 以下の正の整数ならその小さい値を優先し、未設定・上限超過・
+不正な値は 8 にする。不正な値の置き換えと実際に使う値を `[test-full]` の行に表示し、
+終了時は成功・失敗とも元の環境変数へ戻す (未設定なら未設定)。テストの実行並列数は変更しない。
+`build-dist.ps1` が別プロセスで呼ぶ全体テストにも効くため、手動で上限を付ける必要はない。
+release のビルドと、本体 lib だけを対象にする `test-lib-full.ps1` には上限を追加しない。
+根拠は [テストのビルドメモリ対策 §2.3・§3](test-build-memory-plan.md#23-1910-ビルドの同時数の上限) を参照。
 
 `test-full.ps1` はnextestの存在を確認してから次のコマンドを順に実行する。
 未導入なら `cargo install cargo-nextest --locked` を案内して非ゼロ終了し、cargo testへ代替しない。

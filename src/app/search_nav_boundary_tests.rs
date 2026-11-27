@@ -110,7 +110,7 @@ fn fixture(kind: usize, child: bool) -> AppTestEnv {
     if child {
         let child = app.tmp.path().join("result-child");
         std::fs::create_dir_all(&child).unwrap();
-        app.load_folder(origin);
+        app.load_folder_and_finish_for_test(origin);
         super::section375_tests::settle(&mut app, &egui::Context::default());
         super::search_nav_entry_inventory_tests::admit_search_result_child(
             &mut app,
@@ -230,6 +230,7 @@ fn dispatch(app: &mut App, ctx: &egui::Context, nav: Option<crate::ui_main::Addr
 
 fn poll(app: &mut App, ctx: &egui::Context) {
     app.settle_open_path_classification_for_test();
+    app.poll_direct_navigation_scan_for_test(ctx);
     app.poll_book_op_pending(ctx);
     app.poll_collection_ui(ctx);
     app.poll_saved_group_open(ctx);
@@ -245,6 +246,7 @@ fn settle(app: &mut App, ctx: &egui::Context, accepted: impl Fn(&App) -> bool) {
     loop {
         poll(app, ctx);
         if accepted(app)
+            && !app.direct_navigation_scan_pending()
             && !app.sidecar_restore_active()
             && app
                 .top_level_grid_view

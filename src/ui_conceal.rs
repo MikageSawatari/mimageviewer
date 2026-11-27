@@ -173,6 +173,7 @@ impl App {
         let fs_idx = target_idx;
         let [w, h] = pixels.size;
 
+        self.stop_projected_slideshow_playback();
         self.conceal_mode = true;
         self.conceal_preview_active = false;
         self.conceal_preview_hold = Default::default();
@@ -623,6 +624,7 @@ impl App {
             return Default::default();
         }
         let action = FsKeyAction {
+            script_slot: None,
             page_transition: Default::default(),
             close: false,
             close_to_page_list: false,

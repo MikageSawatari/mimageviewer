@@ -1797,18 +1797,8 @@ impl App {
             self.cancel_subfolder_expansion_pending();
             if should_return_to_root {
                 if let Some(target) = return_target {
-                    // The installed expansion stays owned until the physical open adopts.
-                    // start_loading_items clears its snapshot and surface at that boundary.
-                    self.load_folder(target);
-                } else {
-                    self.clear_subfolder_expansion_view_state();
-                }
-            } else {
-                self.clear_subfolder_expansion_view_state();
-                if let Some(current) = self.current_folder.clone() {
-                    self.address = self
-                        .book_address_label_for_path(&current)
-                        .unwrap_or_else(|| current.to_string_lossy().to_string());
+                    // Keep the installed expansion owner until the physical listing adopts.
+                    self.load_folder_after_temporary_view_exit(target);
                 }
             }
             self.show_feedback_toast("サブ展開をキャンセルしました".into());
@@ -1987,12 +1977,10 @@ impl App {
             .subfolder_expansion_saved_folder
             .clone()
             .or_else(|| self.subfolder_expansion_root.clone());
+        self.cancel_subfolder_expansion_pending();
         if let Some(target) = target {
-            // Keep the old items and their expansion owner together while the open worker
-            // reads the destination order. Successful installation clears both together.
-            self.load_folder(target);
-        } else {
-            self.clear_subfolder_expansion_view_state();
+            // The successful install retires the expansion owner with its items.
+            self.load_folder_after_temporary_view_exit(target);
         }
     }
 
@@ -3121,10 +3109,10 @@ mod tests {
                 .save(child.join("a.png"))
                 .unwrap();
             app.load_folder(root.clone());
-            app.settle_open_path_classification_for_test();
+            app.finish_direct_navigation_scan_for_test();
             app.finish_page_identity_preparation_for_test();
-            // A recorded return target must retain the expansion owner until
-            // its actor read is adopted, even when the record index is ready.
+            // The shared scan worker must read the recorded return target
+            // before the physical listing replaces the expansion owner.
             let listing_order: Vec<_> = app.items.iter().filter_map(physical_item_key).collect();
             assert!(!listing_order.is_empty());
             let actor = app.folder_order_handle().unwrap();
@@ -3171,12 +3159,134 @@ mod tests {
             assert_eq!(app.current_folder, old_folder);
             assert_eq!(app.items_generation, old_generation);
             assert_eq!(app.items, old_items);
-            app.settle_open_path_classification_for_test();
+            app.finish_direct_navigation_scan_for_test();
             app.finish_page_identity_preparation_for_test();
             assert_eq!(app.current_folder.as_deref(), Some(root.as_path()));
             assert!(!app.items_are_subfolder_expansion_view);
             assert!(app.subfolder_expansion_snapshot.is_none());
             assert_eq!(app.items_generation, old_generation + 1);
+        }
+    }
+
+    #[test]
+    fn section1853_subfolder_exit_and_toggle_keep_visible_state_until_return_install() {
+        for action in ["exit", "toggle", "cancel-refresh"] {
+            let mut app = crate::app::setup_app_for_test();
+            app.active_quick_folder_slot = None;
+            let root = app.tmp.path().join("subfolder-return");
+            let child = root.join("child");
+            std::fs::create_dir_all(&child).unwrap();
+            let snapshot = SubfolderExpansionSnapshot {
+                file_type_visibility: app.settings.file_type_visibility.clone(),
+                root: root.clone(),
+                roots: vec![root.clone()],
+                scan_filter: Default::default(),
+                entries: Arc::new(Vec::new()),
+                video_thumb_overrides: HashMap::new(),
+                diag: Default::default(),
+                stack_rating_source: Default::default(),
+                stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                    crate::settings::SortOrder::FileName,
+                ),
+            };
+            app.current_folder = Some(subfolder_expansion_synthetic_path());
+            app.items = vec![GridItem::Folder(child.clone())];
+            app.thumbnails = vec![ThumbnailState::Failed];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.items_are_subfolder_expansion_view = true;
+            app.top_level_grid_view.replace_surface(
+                super::super::top_level_grid_view::TopLevelGridSurface::SubfolderExpansion,
+            );
+            app.subfolder_expansion_root = Some(root.clone());
+            app.subfolder_expansion_roots = vec![root.clone()];
+            app.subfolder_expansion_saved_folder = Some(root.clone());
+            app.subfolder_expansion_snapshot = Some(snapshot.clone());
+            app.subfolder_expansion_removed_paths = HashSet::from(["old tombstone".into()]);
+            app.subfolder_expansion_diag = Some(Default::default());
+            app.address = "Subfolder display before return".into();
+            let refresh_cancel = Arc::new(AtomicBool::new(false));
+            let (refresh_tx, refresh_rx) = mpsc::channel();
+            if action == "cancel-refresh" {
+                app.subfolder_expansion_pending = Some(SubfolderExpansionPending {
+                    navigation: None,
+                    root: root.clone(),
+                    roots: vec![root.clone()],
+                    cancel: Arc::clone(&refresh_cancel),
+                    rx: refresh_rx,
+                });
+                app.subfolder_expansion_progress = Some(Default::default());
+            }
+            let scans = super::super::folder_scan::caller_scan_count_for_test();
+            if action == "exit" {
+                app.exit_subfolder_expansion_view();
+            } else {
+                app.toggle_subfolder_expansion_view();
+            }
+            assert!(app.direct_navigation_scan_pending(), "{action}");
+            assert!(
+                app.folder_pane_open_pending
+                    .as_ref()
+                    .unwrap()
+                    .navigation
+                    .as_ref()
+                    .unwrap()
+                    .exits_temporary_view()
+            );
+            assert!(app.subfolder_expansion_pending.is_none());
+            assert!(app.subfolder_expansion_progress.is_none());
+            if action == "cancel-refresh" {
+                assert!(refresh_cancel.load(Ordering::Relaxed));
+                assert!(refresh_tx.send(SubfolderExpansionEvent::Cancelled).is_err());
+            }
+            app.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+            assert!(app.items_are_subfolder_expansion_view);
+            assert_eq!(
+                app.current_folder,
+                Some(subfolder_expansion_synthetic_path())
+            );
+            assert_eq!(app.items, vec![GridItem::Folder(child.clone())]);
+            assert_eq!(app.address, "Subfolder display before return");
+            assert_eq!(app.subfolder_expansion_root.as_ref(), Some(&root));
+            assert_eq!(app.subfolder_expansion_roots, vec![root.clone()]);
+            assert_eq!(app.subfolder_expansion_saved_folder.as_ref(), Some(&root));
+            assert!(Arc::ptr_eq(
+                &app.subfolder_expansion_snapshot.as_ref().unwrap().entries,
+                &snapshot.entries,
+            ));
+            assert_eq!(
+                app.subfolder_expansion_removed_paths,
+                HashSet::from(["old tombstone".into()])
+            );
+            assert!(app.subfolder_expansion_diag.is_some());
+            assert!(matches!(
+                app.top_level_grid_view.surface(),
+                super::super::top_level_grid_view::TopLevelGridSurface::SubfolderExpansion
+            ));
+
+            app.exit_subfolder_expansion_view();
+            app.finish_direct_navigation_scan_for_test();
+            assert_eq!(
+                super::super::folder_scan::caller_scan_count_for_test(),
+                scans
+            );
+            assert_eq!(app.current_folder.as_ref(), Some(&root));
+            assert_eq!(app.address, root.to_string_lossy());
+            assert!(app.items.contains(&GridItem::Folder(child)));
+            assert!(!app.items_are_subfolder_expansion_view);
+            assert!(app.subfolder_expansion_root.is_none());
+            assert!(app.subfolder_expansion_roots.is_empty());
+            assert!(app.subfolder_expansion_saved_folder.is_none());
+            assert!(app.subfolder_expansion_snapshot.is_none());
+            assert!(app.subfolder_expansion_removed_paths.is_empty());
+            assert!(app.subfolder_expansion_install_pending.is_none());
+            assert!(app.subfolder_expansion_confirm_pending.is_none());
+            assert!(app.subfolder_expansion_progress.is_none());
+            assert!(app.subfolder_expansion_diag.is_none());
+            assert!(matches!(
+                app.top_level_grid_view.surface(),
+                super::super::top_level_grid_view::TopLevelGridSurface::Folder
+            ));
         }
     }
 
@@ -3339,7 +3449,8 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .get_state_with_fallback(&synthetic, None);
-            app.load_folder(book.clone());
+            // §1.853: adopt the source directory before reading its stored Book presentation.
+            app.load_folder_and_finish_for_test(book.clone());
             app.settle_open_path_classification_for_test();
             app.finish_page_identity_preparation_for_test();
             assert_eq!(app.spread_mode, SpreadMode::RtlCover);
@@ -3388,6 +3499,7 @@ mod tests {
             );
             app.exit_subfolder_expansion_view();
             app.settle_open_path_classification_for_test();
+            app.finish_direct_navigation_scan_for_test();
             app.finish_page_identity_preparation_for_test();
             assert_eq!(app.current_folder.as_deref(), Some(book.as_path()));
             assert!(app.extracted_result_surface().is_none());

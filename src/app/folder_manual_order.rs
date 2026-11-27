@@ -616,8 +616,16 @@ mod tests {
         assert!(handle.record_is_known_absent(&destination));
         let reads = handle.read_request_count_for_test();
         let generation = app.items_generation;
+        // Exercise the explicit synchronous exception retained by section 1.853.
         assert!(matches!(
-            app.app.load_folder_or_convert_archive(destination.clone()),
+            app.app
+                .load_folder_or_convert_archive_with_auto_fullscreen_owned_at_scan_route(
+                    destination.clone(),
+                    false,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                    DirectoryScanRoute::UiThread(UiThreadScanReason::PlayTest),
+                ),
             FolderOpenOutcome::Loaded
         ));
         assert_eq!(app.current_folder.as_deref(), Some(destination.as_path()));
@@ -666,8 +674,16 @@ mod tests {
         let reads = handle.read_request_count_for_test();
         let generation = app.items_generation;
         let items = app.items.clone();
+        // Exercise the explicit synchronous exception retained by section 1.853.
         assert!(matches!(
-            app.app.load_folder_or_convert_archive(destination.clone()),
+            app.app
+                .load_folder_or_convert_archive_with_auto_fullscreen_owned_at_scan_route(
+                    destination.clone(),
+                    false,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                    DirectoryScanRoute::UiThread(UiThreadScanReason::PlayTest),
+                ),
             FolderOpenOutcome::Classifying
         ));
         assert_eq!(app.current_folder.as_deref(), Some(origin.as_path()));
@@ -699,8 +715,16 @@ mod tests {
         assert!(!handle.record_is_known_absent(&destination));
         let generation = app.items_generation;
         let items = app.items.clone();
+        // Exercise the explicit synchronous exception retained by section 1.853.
         assert!(matches!(
-            app.app.load_folder_or_convert_archive(destination.clone()),
+            app.app
+                .load_folder_or_convert_archive_with_auto_fullscreen_owned_at_scan_route(
+                    destination.clone(),
+                    false,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                    DirectoryScanRoute::UiThread(UiThreadScanReason::PlayTest),
+                ),
             FolderOpenOutcome::Classifying
         ));
         assert_eq!(app.current_folder.as_deref(), Some(origin.as_path()));
@@ -887,6 +911,97 @@ mod tests {
     }
 
     #[test]
+    fn folder_manual_order_open_routes_read_once_and_reuse_prepared_input() {
+        for route in ["main-worker", "suffix", "prepared-read", "prepared-unread"] {
+            for recorded in [false, true] {
+                let (mut app, _) = fixture();
+                let destination = app.tmp.path().join(if route == "suffix" {
+                    "destination.epub"
+                } else {
+                    "destination"
+                });
+                std::fs::create_dir(&destination).unwrap();
+                let a = folder_key(&destination.join("a.jpg"));
+                let b = folder_key(&destination.join("b.jpg"));
+                for name in ["a.jpg", "b.jpg"] {
+                    std::fs::write(destination.join(name), b"fixture").unwrap();
+                }
+                let handle = app.folder_order_handle().unwrap();
+                if recorded {
+                    handle
+                        .save(
+                            &destination,
+                            FolderOrderSave {
+                                listing_order: vec![b.clone(), a.clone()],
+                                inventory: [a.clone(), b.clone()].into_iter().collect(),
+                                revision: 71,
+                            },
+                        )
+                        .unwrap();
+                }
+                let reads = handle.read_request_count_for_test();
+                let pre_scan = route.starts_with("prepared").then(|| {
+                    let mut scan = app.folder_scan_policy().scan(&destination, None).unwrap();
+                    if route == "prepared-read" {
+                        scan.folder_order_input =
+                            FolderOrderListingInput::read_worker(Some(&handle), &destination);
+                    }
+                    scan
+                });
+                let scans = folder_scan::caller_scan_count_for_test();
+                let generation = app.items_generation;
+                app.app.load_folder_with_scan(destination.clone(), pre_scan);
+                if route == "main-worker" {
+                    assert!(app.direct_navigation_scan_pending());
+                    assert!(app.top_level_grid_view.open_path_classification().is_none());
+                    assert_eq!(app.items_generation, generation);
+                }
+                app.settle_open_path_classification_for_test();
+                app.finish_direct_navigation_scan_for_test();
+                app.finish_page_identity_preparation_for_test();
+                // An unread prepared scan needs no actor request only when the index
+                // proves absence; a completed Read is always reused, including Read(None).
+                // The shared classifier also reads suffix directories once, although
+                // their legacy page-order lock prevents applying manual order.
+                let expected_reads = usize::from(route != "prepared-unread" || recorded);
+                assert_eq!(
+                    handle.read_request_count_for_test(),
+                    reads + expected_reads,
+                    "route={route}, recorded={recorded}"
+                );
+                assert_eq!(
+                    folder_scan::caller_scan_count_for_test(),
+                    scans,
+                    "route={route}, recorded={recorded}"
+                );
+                assert_eq!(
+                    app.current_folder.as_ref(),
+                    Some(&destination),
+                    "route={route}, recorded={recorded}"
+                );
+                assert_eq!(
+                    app.items_generation,
+                    generation + 1,
+                    "route={route}, recorded={recorded}"
+                );
+                assert_eq!(
+                    keys(&app),
+                    if recorded && route != "suffix" {
+                        vec![b, a]
+                    } else {
+                        vec![a, b]
+                    },
+                    "route={route}, recorded={recorded}"
+                );
+                assert!(
+                    app.folder_order.input.is_read(),
+                    "route={route}, recorded={recorded}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn folder_manual_order_sync_entry_preserves_source_and_adopts_read_once() {
         let (mut app, source) = fixture();
         let destination = app.tmp.path().join("destination");
@@ -910,8 +1025,11 @@ mod tests {
             .unwrap();
         let generation = app.items_generation;
         let source_keys = keys(&app);
-        // Call App directly: the old fixture convenience method waits for adoption.
-        app.app.load_folder(destination.clone());
+        // Keep the explicit synchronous tail and its provisional classifier observable.
+        app.app.load_folder_with_scan_route(
+            destination.clone(),
+            DirectoryScanRoute::UiThread(UiThreadScanReason::PlayTest),
+        );
         assert_eq!(app.current_folder.as_ref(), Some(&source));
         assert_eq!(keys(&app), source_keys);
         assert_eq!(app.items_generation, generation);

@@ -224,7 +224,7 @@ fn section1375_c1_promoted_physical_reader_ignores_actual_change_and_late_restar
         .restart_requested = true;
     assert!(app.promote_active_detached_video_for_main_context_change());
     let main = app.viewer_context_main();
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     settle(&mut app, &ctx);
     app.ensure_current_folder_watch(&ctx);
     settle(&mut app, &ctx);

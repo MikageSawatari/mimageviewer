@@ -257,6 +257,30 @@ impl App {
                 continue;
             }
             match &request.kind {
+                crate::agent_ipc::open::UiRequestKind::OperationScript(job) => {
+                    let outcome = match self.admit_agent_settings_write() {
+                        Ok(()) => {
+                            let snapshot =
+                                crate::agent_ipc::operation_script::AdmissionSnapshot::capture(
+                                    self.settings.operation_script_enabled,
+                                    &self.operation_script.state,
+                                );
+                            // Admission and FIFO submission share this UI turn.
+                            // The loader owns the only file-worker sender.
+                            let queued = self.operation_script.enqueue_agent_script(
+                                job.clone(),
+                                &crate::data_dir::get(),
+                                ctx,
+                            );
+                            crate::agent_ipc::open::UiOpenOutcome::OperationScriptAdmitted {
+                                snapshot,
+                                queued,
+                            }
+                        }
+                        Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                    };
+                    request.complete(outcome);
+                }
                 crate::agent_ipc::open::UiRequestKind::StackScriptAdmission => {
                     let outcome = match self.admit_agent_settings_write() {
                         Ok(()) => crate::agent_ipc::open::UiOpenOutcome::StackScriptAdmitted {
@@ -1036,12 +1060,9 @@ impl App {
 
         match recv {
             Ok(result) => {
-                if result
-                    .scan_policy
-                    .as_ref()
-                    .is_some_and(|policy| *policy != self.folder_scan_policy())
-                    || result.scan_policy_mixed
-                {
+                if result.scan_policy.as_ref().is_some_and(|policy| {
+                    !policy.result_is_current(result.scan_policy_mixed, &self.folder_scan_policy())
+                }) {
                     self.continue_startup_scan(result, ctx);
                     return;
                 }
@@ -2090,7 +2111,7 @@ impl App {
                         .unwrap_or_else(|| super::StartupListIntent::container_open(auto_fullscreen)),
                     navigation,
                     MainListRequestStage::Continuation,
-                    super::DirectoryScanRoute::UiThread,
+                    super::DirectoryScanRoute::MainWorker,
                 ) {
                 FolderOpenOutcome::Loaded
                 | FolderOpenOutcome::Classifying
@@ -2255,7 +2276,7 @@ impl App {
             if let Some(navigation) = navigation.as_mut() {
                 // Adoption publishes the request-owned hint before installing the list.
                 // Writing App here would be overwritten by that earlier captured value.
-                navigation.selection_after_load = selection;
+                navigation.set_selection_after_load(selection);
             } else {
                 self.select_after_load = selection;
             }
@@ -2285,7 +2306,7 @@ impl App {
                 restore_intent,
                 navigation,
                 MainListRequestStage::Continuation,
-                super::DirectoryScanRoute::UiThread,
+                super::DirectoryScanRoute::MainWorker,
             );
         if restore_default_cursor
             && matches!(
@@ -2700,6 +2721,7 @@ impl App {
         if startup_file_idx(&self.items, &requested).is_some() {
             return Some(crate::snapshot::SnapshotTarget::Fs(requested));
         }
+        self.end_page_edit_tools_for_viewer_item_change("direct_media_reader");
         let return_origin = self.current_top_level_restore_snapshot().map(|restore| {
             top_level_grid_view::TopLevelGridOrigin {
                 restore,
@@ -3331,17 +3353,16 @@ fn scan_startup_resolved_target(
         let span = correlation.map(|id| {
             event_span(Lane::Navigation, Stage::InitialTargetScan, id).watched_optional(watch)
         });
-        let before = crate::susie_loader::pool_revision();
         let path = &result.resolved.as_ref().unwrap().path;
-        let scan = policy.scan(path, Some(cancel)).map(|mut scan| {
+        let (scan, mixed) = policy.scan_checked(path, Some(cancel));
+        let scan = scan.map(|mut scan| {
             scan.folder_order_input = crate::folder_order::FolderOrderListingInput::read_worker(
                 folder_order_handle,
                 path,
             );
             scan
         });
-        let after = crate::susie_loader::pool_revision();
-        result.scan_policy_mixed = before != after || before != policy.susie_pool_revision;
+        result.scan_policy_mixed = mixed;
         if let Some(span) = span {
             span.finish(if cancel.load(Ordering::Relaxed) {
                 Outcome::Cancelled
@@ -3419,6 +3440,36 @@ mod startup_default_tests;
 mod tests {
     use super::*;
 
+    // A controlled resolver completion must include the same directory scan as
+    // the real resolver worker. Resolving the path alone leaves a second async
+    // open and skips the resolver's Loaded-only explicit-file continuation.
+    fn resolved_startup_result_for_test(
+        app: &App,
+        requested: PathBuf,
+        source: StartupOpenPathSource,
+        scan_main: bool,
+        ctx: &egui::Context,
+    ) -> StartupOpenPathResolveResult {
+        let mut result = resolve_startup_open_path(requested, source, None, true);
+        let resolve_ms = result.elapsed_ms;
+        let folder_order_handle = app.folder_order_handle();
+        scan_startup_resolved_target(
+            &mut result,
+            app.folder_scan_policy(),
+            folder_order_handle.as_ref(),
+            scan_main,
+            &AtomicBool::new(false),
+            &StartupScanPhase::new(),
+            ctx,
+            None,
+            None,
+            "controlled-test",
+            app.input_seq,
+            resolve_ms,
+        );
+        result
+    }
+
     #[test]
     #[cfg(windows)]
     fn browser818_open_owner_initial_activation_and_agent_keep_intent_through_restore() {
@@ -3491,6 +3542,13 @@ mod tests {
                     }
                     _ => unreachable!(),
                 }
+                let result = resolved_startup_result_for_test(
+                    &app,
+                    requested.clone(),
+                    source,
+                    true,
+                    &egui::Context::default(),
+                );
                 let pending = app.startup_open_path_resolve_pending.as_mut().unwrap();
                 assert_eq!(
                     pending.owner.viewer_open_adoption().request(),
@@ -3500,13 +3558,7 @@ mod tests {
                 // The original worker's dropped receiver cannot affect the accepted owner.
                 let (tx, rx) = mpsc::channel();
                 pending.rx = rx;
-                tx.send(resolve_startup_open_path(
-                    requested.clone(),
-                    source,
-                    None,
-                    true,
-                ))
-                .unwrap();
+                tx.send(result).unwrap();
                 app.poll_startup_open_path_resolve(&egui::Context::default());
                 assert!(app.startup_open_path_resolve_pending.is_none());
                 assert!(
@@ -3659,26 +3711,34 @@ mod tests {
     fn section1419_complete_resolver(app: &mut App, ctx: &egui::Context) {
         let pending = app
             .startup_open_path_resolve_pending
-            .as_mut()
+            .as_ref()
             .expect("B resolver");
         let path = pending.requested.to_path_buf();
         let source = pending.owner.source();
+        let scan_main = unresolved_open_owner_is_main(&pending.owner);
+        let result = resolved_startup_result_for_test(app, path, source, scan_main, ctx);
+        let pending = app.startup_open_path_resolve_pending.as_mut().unwrap();
         pending.cancel.store(true, Ordering::Relaxed);
         pending.cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         pending.rx = rx;
-        tx.send(resolve_startup_open_path(path, source, None, true))
-            .unwrap();
+        tx.send(result).unwrap();
         app.poll_startup_open_path_resolve(ctx);
         app.finish_history_restore_preparation_for_test();
         app.finish_page_identity_preparation_for_test();
         let _ = app.with_active_viewer_context(|reader| {
+            let policy = reader.folder_scan_policy();
             if let Some(pending) = reader.folder_pane_open_pending.as_mut() {
                 let path = pending.path.clone();
                 pending.cancel.store(true, Ordering::Relaxed);
                 pending.cancel = Arc::new(AtomicBool::new(false));
                 let (tx, rx) = mpsc::channel();
-                tx.send(Ok(scan_directory(&path))).unwrap();
+                tx.send(FolderOpenScanResult {
+                    scan: Ok(scan_directory(&path)),
+                    policy,
+                    policy_mixed: false,
+                })
+                .unwrap();
                 pending.rx = rx;
                 assert!(matches!(
                     reader.poll_detached_physical_folder_open(ctx),
@@ -4098,7 +4158,12 @@ mod tests {
                     let late_a = |app: &mut App| {
                         if let Some((tx, cancel)) = &pane {
                             assert!(cancel.load(Ordering::Relaxed));
-                            assert!(tx.send(Ok(scan_directory(&a))).is_err());
+                            assert!(
+                                tx.send(
+                                    app.folder_open_scan_reply_for_test(Ok(scan_directory(&a)))
+                                )
+                                .is_err()
+                            );
                             assert!(app.poll_folder_pane_open(&ctx).is_none());
                         }
                         if let Some((tx, cancel)) = &classification {
@@ -4379,11 +4444,12 @@ mod tests {
                     }
                     _ => None,
                 };
-                b_tx.send(resolve_startup_open_path(
+                b_tx.send(resolved_startup_result_for_test(
+                    &app,
                     destination.clone(),
                     StartupOpenPathSource::Activation,
-                    None,
                     true,
+                    &ctx,
                 ))
                 .unwrap();
                 app.poll_startup_open_path_resolve(&ctx);
@@ -4616,7 +4682,10 @@ mod tests {
         result.resolved = None;
         b_tx.send(result).unwrap();
         app.poll_startup_open_path_resolve(&ctx);
-        assert!(tx.send(Ok(scan_directory(&a))).is_err());
+        assert!(
+            tx.send(app.folder_open_scan_reply_for_test(Ok(scan_directory(&a))))
+                .is_err()
+        );
         assert!(app.poll_folder_pane_open(&ctx).is_none());
         assert_eq!(app.current_folder.as_ref(), Some(&origin));
     }
@@ -4748,7 +4817,7 @@ mod tests {
         app.poll_deferred_startup_open_path(&ctx);
         assert_eq!(app.startup_open_path.as_deref(), Some(target.as_path()));
         app.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Abort);
-        app.load_folder(other.clone());
+        app.load_folder_and_finish_for_test(other.clone());
         assert!(app.startup_open_path.is_none());
         app.poll_deferred_startup_open_path(&ctx);
         assert!(app.startup_open_path_resolve_pending.is_none());
@@ -4760,12 +4829,12 @@ mod tests {
         let mut app = setup_app_for_test();
         let folder = app.tmp.path().join("adopted");
         std::fs::create_dir(&folder).unwrap();
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         let target = app.tmp.path().join("initial");
         app.set_startup_open_path(target.clone());
         app.reload_current_folder_preserving_override();
         assert_eq!(app.startup_open_path.as_deref(), Some(target.as_path()));
-        app.load_folder(folder);
+        app.load_folder_and_finish_for_test(folder);
         assert!(app.startup_open_path.is_none());
     }
 
@@ -4815,7 +4884,7 @@ mod tests {
         let target = app.tmp.path().join("initial");
         std::fs::create_dir(&folder).unwrap();
         std::fs::create_dir(&target).unwrap();
-        app.load_folder(folder);
+        app.load_folder_and_finish_for_test(folder);
         let (tx, cancel) = section1285_resolver(
             &mut app,
             StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
@@ -4825,6 +4894,9 @@ mod tests {
         assert!(!cancel.load(Ordering::Relaxed));
         tx.send(section1285_result(&target)).unwrap();
         app.poll_startup_open_path_resolve(&egui::Context::default());
+        // This resolver fixture supplies no scan; finish the directory worker
+        // admitted by its continuation before checking the adopted destination.
+        app.finish_direct_navigation_scan_for_test();
         assert_eq!(app.current_folder.as_ref(), Some(&target));
     }
 
@@ -4859,7 +4931,7 @@ mod tests {
         let target = app.tmp.path().join("initial");
         std::fs::create_dir(&folder).unwrap();
         std::fs::create_dir(&target).unwrap();
-        app.load_folder(folder);
+        app.load_folder_and_finish_for_test(folder);
         let (_tx, cancel) = section1285_resolver(
             &mut app,
             StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
@@ -5029,7 +5101,8 @@ mod tests {
         pending.cancel.store(true, Ordering::Relaxed);
         pending.cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
-        tx.send(Ok(scan_directory(path))).unwrap();
+        tx.send(app.folder_open_scan_reply_for_test(Ok(scan_directory(path))))
+            .unwrap();
         pending.rx = rx;
         app.folder_pane_open_pending = Some(pending);
         app.post_render_main_navigation(
@@ -5227,6 +5300,7 @@ mod tests {
         );
         tx.send(section1285_result(&target)).unwrap();
         app.poll_startup_open_path_resolve(&egui::Context::default());
+        app.finish_direct_navigation_scan_for_test();
         assert_eq!(app.current_folder.as_ref(), Some(&target));
         assert!(
             cancel.load(Ordering::Relaxed),
@@ -5288,9 +5362,10 @@ mod tests {
                 .file_type_visibility
                 .excluded_extensions
                 .insert("png".into());
-            let result = resolve_startup_open_path(requested.clone(), source, None, true);
-            assert!(result.direct_media.is_some());
             let ctx = egui::Context::default();
+            let result =
+                resolved_startup_result_for_test(&app, requested.clone(), source, true, &ctx);
+            assert!(result.direct_media.is_some());
             let owner = match source {
                 StartupOpenPathSource::InitialStartup => {
                     StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences())
@@ -5545,11 +5620,12 @@ mod tests {
             image::RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30]))
                 .save(parent.join("1.jpg"))
                 .unwrap();
-            let result = resolve_startup_open_path(
+            let result = resolved_startup_result_for_test(
+                &app,
                 target.clone(),
                 StartupOpenPathSource::Activation,
-                None,
                 true,
+                &ctx,
             );
             app.finish_startup_open_path_resolve(
                 StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),

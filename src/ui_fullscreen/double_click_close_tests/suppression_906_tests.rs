@@ -5,7 +5,7 @@ use FullscreenPrimarySuppressionDecision::{Allow, Preserve, Suppress};
 use FullscreenPrimarySuppressionReason::{FocusRestore, Other};
 
 #[cfg(windows)]
-fn page_canvas() -> Canvas {
+pub(super) fn page_canvas() -> Canvas {
     let mut canvas = Canvas::for_focus_restore();
     canvas.app.settings.fullscreen_primary_click = FullscreenPrimaryClickMode::PageTurn;
     canvas
@@ -252,7 +252,7 @@ fn suppression_906_right_drag_same_and_split_click_stops_only_that_flow() {
 }
 
 #[cfg(windows)]
-fn scrub_key(down: bool) {
+pub(super) fn scrub_key(down: bool) {
     use crate::key_input::{SyntheticKeyCommand, SyntheticNavigationKey};
     let now = std::time::Instant::now();
     let command = if down {
@@ -323,12 +323,12 @@ fn suppression_906_viewer_scrub_same_frame_and_held_until_release() {
             assert_eq!(canvas.app.fs_primary_suppression, PointerStream(Other));
             assert!(canvas.app.fs_middle_zoom_drag.is_some());
         } else {
-            // A complete click clears egui's press_origin in this pass, so
-            // scrub never starts and no suppression is armed. The existing
-            // page-turn result of that fast chord-click is a separate issue;
-            // deliberately do not assert `first` for this control case.
-            assert_eq!(canvas.app.fs_primary_suppression, Idle);
+            // §1.907: a completed physical flow starts and ends scrub in this
+            // pass, preserving the suppression only until the next draw pass.
+            assert_eq!(first, (false, false));
+            assert_eq!(canvas.app.fs_primary_suppression, ReleasedThisPass(Other));
             assert!(canvas.app.fs_middle_zoom_drag.is_none());
+            assert_eq!(canvas.app.fs_zoom, 1.0);
         }
         scrub_key(false);
         expected_held.set(false);

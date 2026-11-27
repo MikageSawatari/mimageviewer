@@ -16,7 +16,7 @@
 //!
 //! ## 実行
 //! ```
-//! cargo test --target x86_64-pc-windows-msvc --test susie_integration -- --test-threads=1
+//! cargo test -p mimageviewer --target x86_64-pc-windows-msvc --test integration susie_integration:: -- --test-threads=1
 //! ```
 //! pool は `OnceLock` のグローバルを共有するため、環境変数を `set_var` するタイミングで
 //! race しないよう `--test-threads=1` を推奨。

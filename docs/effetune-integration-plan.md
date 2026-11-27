@@ -417,7 +417,7 @@ enum EffectiveState {
 
 派生版の配置・版・承認は [派生版計画 §7](effetune-fork-plan.md#7-派生版のソースとビルド) が正本で、
 手順は [mIV Sound のビルド・確認・承認](miv-sound-build.md#build-verify-approve)。
-公開説明書は版番号なしの `manual/sound/` に生成し、版は目次本文だけに示す。
+公開説明書は版番号なしの `manual/sound/` に生成し、目次を含む公開ページに版を表示しない (§1.905)。
 旧 `manual/effetune/` の入口・版付き URL と Sound の版付き URL は固定 URL へ 301 で転送する。
 F4 のポータブル版は署名済み host と mIV Sound を exe 隣へ同梱し、保存は `data/effetune`、旧共有先からの移行は対象外。
 以下の旧 bundle 名・配置はサンプル版の履歴。
@@ -784,8 +784,8 @@ F4 ではこの制限を撤去した。音響調整とユーザー VST は通常
 
 説明書の正本は [派生版計画 §10](effetune-fork-plan.md#10-マニュアル製品ページ公開文書)。
 公開 URL は版番号なしの `manual/sound/` に固定する。`config/miv-sound.rs` の `VERSION` に
-`v` を付けた版は目次本文の1か所だけに表示し、`DOCS_VERSION` は元の上流説明書の版として分ける。
-両方を snapshot の `SOURCE.md` と照合する。版だけの更新では目次以外のページ・URL・転送規則は変わらない。
+`v` を付けた版と `DOCS_VERSION` (元の上流説明書の版) は snapshot の `SOURCE.md` との照合に使う。
+目次を含む公開ページに版を表示しない (§1.905)。版だけの更新では生成物・URL・転送規則は変わらない。
 
 1. 承認版に対応する上流 snapshot と `SOURCE.md` を確認し、訂正ルールを派生版の実装と照合する。
    [再生成の説明](effetune-docs-overrides/README.md) に従い、原文・LICENSE・画像は改変しない。

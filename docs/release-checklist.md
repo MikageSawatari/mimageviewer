@@ -7,7 +7,7 @@
 mIV Sound の名称・クレジット・保存先・初回移行・公開文書は [派生版計画 §2・§4・§5・§10](effetune-fork-plan.md) が正本。
 公開前に `python scripts/gen-effetune-docs.py --check`、`python scripts/test_gen_effetune_docs.py`、
 `python scripts/check_site_cards.py` と、htdocs コミット後の sitemap 再生成・検査を行う。
-説明書は版番号なしの `manual/sound/` に上書きし、版は目次本文だけに示す。版だけの更新では URL・転送規則は不変。
+説明書は版番号なしの `manual/sound/` に上書きし、目次を含む公開ページに版を表示しない (§1.905)。版は `SOURCE.md` との照合に使い、版だけの更新では生成物・URL・転送規則は不変。
 固定 URL への移行時は残存版ディレクトリ・旧生成物を明示的に除き、旧 URL からの1回の301と同時反映する。
 F3・F4 統合後のポータブル文言・Counter・説明書の照合記録は同計画 §19 を参照。
 
@@ -722,7 +722,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
     `changelog_markdown::tests::the_newest_changelog_entry_only_uses_markup_this_renderer_handles`
     が CHANGELOG.md の最新節を読み、更新通知ダイアログの描画器が解釈できない記法
     (リンク・画像・閉じ忘れた `**` など) が混ざっていないかを機械的に見る。
-    `cargo test` で毎回走るので、**公開前**に落ちる。
+    `scripts/test-full.ps1` の本体 lib テストで毎回走るので、**公開前**に落ちる。
     - 以前はここを「公開後に別マシンで目視」としていたが、目視は体裁しか見られず、
       しかも公開してからでないと試せなかった (2026-08-30 に廃止)。
     - 短縮版を使った場合だけは、目玉の新機能が 8KB で切れていないかを別途見る

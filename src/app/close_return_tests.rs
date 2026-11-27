@@ -983,7 +983,7 @@ fn settle_source(app: &mut App, ctx: &egui::Context) {
 /// transport and the metadata search worker completion are replaced by immutable results.
 fn enter_source(env: &mut AppTestEnvForTest, ctx: &egui::Context, source: &str, book: &Path) {
     let root = env.tmp.path().to_path_buf();
-    env.load_folder(root.clone());
+    env.load_folder_and_finish_for_test(root.clone());
     env.finish_page_identity_preparation_for_test();
     let row = GridItem::Folder(book.to_path_buf());
     match source {
@@ -1330,6 +1330,7 @@ fn close_return_real_fullfeature_media_is_shared_until_promote_or_live_fork() {
                     matches!(
                         env.pending_return_to_parent,
                         FullscreenCloseContinuation::Live
+                            | FullscreenCloseContinuation::LiveWithPresentation(_)
                     ),
                     "fork must keep main's live return"
                 );

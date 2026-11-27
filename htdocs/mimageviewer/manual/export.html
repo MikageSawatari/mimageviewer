@@ -59,6 +59,7 @@
         <a href="conceal.html">隠蔽加工</a>
         <a href="annotation.html">テキスト注釈</a>
         <a href="export.html" class="active">エクスポート</a>
+        <a href="image-combine.html">画像の結合</a>
         <a href="clipboard-capture.html">クリップボード取り込み</a>
         <a href="browser-integration.html">ブラウザ連携</a>
         <a href="metadata-transfer.html">メタ情報の移行</a>
@@ -69,6 +70,7 @@
         <a href="search.html">検索機能</a>
         <a href="remote.html">リモート閲覧</a>
         <a href="ai-integration.html">AI アプリとの連携</a>
+        <a href="operation-script.html">操作のスクリプト</a>
         <a href="shortcuts.html">キーボードショートカット</a>
         <a href="gamepad.html">ゲームパッド操作</a>
         <a href="settings.html">設定リファレンス</a>
@@ -85,6 +87,8 @@
     <h1 class="page-title">エクスポート</h1>
     <p class="page-desc">フルスクリーンで表示している静止画を、補正・消しゴム・補正レイヤー・隠蔽加工・テキスト注釈を反映した別ファイルとして書き出します。</p>
     <p class="note">ページ単位表示でのみ利用できます。縦連結・横連結の連結表示中は画像補正パネルのエクスポートアイコンが無効になり、アイコンにマウスを重ねるか <kbd>Ctrl</kbd>+<kbd>E</kbd> を押すと理由が表示されます。</p>
+
+    <p>複数の画像を並べて1枚にする場合は、一覧の右クリックまたはツールメニューの<a href="image-combine.html">画像の結合</a>を使います。</p>
 
     <h2>開き方</h2>
     <p>画像・ZIP 内画像・PDF ページをフルスクリーン表示中に <kbd>Ctrl</kbd>+<kbd>E</kbd> を押します。</p>
@@ -104,7 +108,7 @@
           <tr><td>ファイル名</td><td>既定は元の名前に <code>_edited</code> を付けた名前です。拡張子は形式に合わせて自動で付きます</td></tr>
           <tr><td>保存先</td><td>既定は元画像と同じフォルダです。別フォルダを選んだ場合は次回の候補として記憶されます</td></tr>
           <tr><td>形式</td><td>JPEG / PNG / WebP から選べます。元形式がそのまま書き出せない場合は JPEG または PNG に切り替えます</td></tr>
-          <tr><td>メタデータ保持</td><td>同じ形式で書き出せる場合、元画像の EXIF や XMP などを引き継げます。EXIF の縮小画像は外し、外せなかったときや XMP などに縮小画像が残っていそうなときは、書き出しの後で知らせます</td></tr>
+          <tr><td>メタデータ保持</td><td>同じ形式で書き出せる場合、元画像の EXIF や XMP、RGB の色プロファイル (ICC) などを引き継げます。EXIF の縮小画像は外し、外せなかったときや XMP などに縮小画像が残っていそうなときは、書き出しの後で知らせます</td></tr>
           <tr><td>出力サイズ</td><td>そのまま / 1/2 / 1/4、または長辺を指定した px 以下に縮小して書き出せます。AI アップスケールで大きくなった画像を一定サイズに収めたいときに便利です（指定より小さい画像は拡大しません）</td></tr>
           <tr><td>バリエーション</td><td>現在の表示設定と、隠蔽加工プリセット 1〜4 を選んで一括出力できます</td></tr>
         </tbody>

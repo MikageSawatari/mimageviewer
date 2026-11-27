@@ -29,6 +29,7 @@ fn open(app: &mut App, path: &Path) {
         OpenRequestOwner::Navigation,
         StartupListIntent::ExplicitList,
     ));
+    app.finish_direct_navigation_scan_for_test();
     app.finish_page_identity_preparation_for_test();
 }
 
@@ -70,11 +71,15 @@ fn stack_entry_fixture(restore: bool) -> (phase_c_support::AppTestEnv, PathBuf) 
 fn finish_stack_entry(app: &mut App) {
     let ctx = egui::Context::default();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while app.stack_script_pending.is_some() || app.sidecar_restore_active() {
+    while app.stack_script_pending.is_some()
+        || app.sidecar_restore_active()
+        || app.direct_navigation_scan_pending()
+    {
         assert!(
             std::time::Instant::now() < deadline,
             "stack entry did not settle"
         );
+        app.poll_direct_navigation_scan_for_test(&ctx);
         app.poll_stack_script(&ctx);
         app.finish_page_identity_preparation_for_test();
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -168,6 +173,7 @@ fn section1795_off_stack_load_hints_survive_final_aggregation() {
             OpenRequestOwner::Navigation,
             intent
         ));
+        env.finish_direct_navigation_scan_for_test();
         env.finish_page_identity_preparation_for_test();
         assert_eq!(env.selected, Some(3), "hint={hint}");
         finish_stack_entry(&mut env);
@@ -270,6 +276,7 @@ fn section1804_stack_hidden_load_hints_do_not_request_deselection() {
                 OpenRequestOwner::Navigation,
                 intent,
             ));
+            env.finish_direct_navigation_scan_for_test();
             env.finish_page_identity_preparation_for_test();
             assert!(env.stack_script_pending.is_some());
             assert_eq!(env.selected, None, "restore={restore}, hint={hint}");
@@ -414,6 +421,7 @@ fn section1804_stack_internal_install_keeps_departure_recording() {
         OpenRequestOwner::Navigation,
         StartupListIntent::InternalInstall,
     ));
+    env.finish_direct_navigation_scan_for_test();
     env.finish_page_identity_preparation_for_test();
     env.grid_scroll.set_position(250.0);
     finish_stack_entry(&mut env);
@@ -596,6 +604,7 @@ fn section1795_off_bookshelf_root_starts_first_but_compiled_book_keeps_positions
                 .unwrap();
         }
         env.open_books_root();
+        env.finish_direct_navigation_scan_for_test();
         env.finish_page_identity_preparation_for_test();
         assert!(matches!(
             env.projection_recipe,
@@ -605,6 +614,7 @@ fn section1795_off_bookshelf_root_starts_first_but_compiled_book_keeps_positions
         env.grid_scroll.set_position(420.0);
         open(&mut env, &other);
         env.open_books_root();
+        env.finish_direct_navigation_scan_for_test();
         env.finish_page_identity_preparation_for_test();
         assert_eq!(env.current_folder.as_ref(), Some(&shelf));
         assert_position(
@@ -765,6 +775,7 @@ fn section1795_off_startup_cursor_remains_independent() {
                 StartupListIntent::ExplicitList
             };
             assert!(env.load_folder_with_scan_owned(a, None, OpenRequestOwner::Navigation, intent));
+            env.finish_direct_navigation_scan_for_test();
             env.finish_page_identity_preparation_for_test();
             assert_position(&env, Some(if restore_last { 28 } else { 0 }), 0.0);
             if previous && restore_last {

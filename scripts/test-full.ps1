@@ -16,6 +16,19 @@ param(
     [switch] $SuppressCrashDialogs
 )
 
+function Get-MivTestBuildJobs {
+    param([AllowNull()] [AllowEmptyString()] [string] $Value)
+    # Section 1.910: one cap for every Cargo stage of the full test gate.
+    $maxJobs = 8
+    if ([string]::IsNullOrEmpty($Value)) { return $maxJobs }
+    $jobs = 0
+    if (-not [int]::TryParse($Value, [ref] $jobs) -or $jobs -le 0) {
+        Write-Host "[test-full] CARGO_BUILD_JOBS='$Value' is not a positive integer; using $maxJobs."
+        return $maxJobs
+    }
+    return [Math]::Min($jobs, $maxJobs)
+}
+
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 . (Join-Path $PSScriptRoot 'vst3-host-vcrt.ps1')
@@ -25,8 +38,11 @@ Assert-MivVst3HostVcrt -RepoRoot $repoRoot
 $restoreErrorMode = $false
 $modeBefore = [uint32]0
 $gateExit = 1
+$buildJobsBefore = [Environment]::GetEnvironmentVariable('CARGO_BUILD_JOBS', 'Process')
 
 try {
+    $env:CARGO_BUILD_JOBS = (Get-MivTestBuildJobs $buildJobsBefore).ToString()
+    Write-Host "[test-full] build concurrency: CARGO_BUILD_JOBS=$env:CARGO_BUILD_JOBS"
     if ($SuppressCrashDialogs) {
         Add-Type -TypeDefinition @'
 using System.Runtime.InteropServices;
@@ -140,6 +156,7 @@ public static class MivTestErrorMode
         Pop-Location
     }
 } finally {
+    [Environment]::SetEnvironmentVariable('CARGO_BUILD_JOBS', $buildJobsBefore, 'Process')
     if ($restoreErrorMode) {
         [void][MivTestErrorMode]::SetErrorMode($modeBefore)
         $restoredMode = [MivTestErrorMode]::GetErrorMode()

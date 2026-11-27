@@ -510,8 +510,8 @@ pub use self::{
     id::{Id, IdMap, IdSet},
     id_salt::{AsIdSalt, IdSalt, IdSaltMap, IdSaltSet},
     input_state::{
-        InputOptions, InputState, MultiTouchInfo, PointerButtonEvent, PointerState,
-        SurrenderFocusOn,
+        EdgeTime, InputOptions, InputState, MultiTouchInfo, PointerButtonEdge, PointerButtonEvent,
+        PointerState, SurrenderFocusOn,
     },
     layers::{LayerId, Order},
     layout::Layout,

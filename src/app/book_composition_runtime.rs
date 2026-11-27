@@ -318,6 +318,14 @@ impl App {
     // The pending request retains its old presentation until atomic adoption.
     // Keep that large origin on the heap, without a second state or owner.
     fn retained_composed_projection(&self) -> Option<&AcceptedCompositionProjection> {
+        self.retained_composed_projection_input().map(Arc::as_ref)
+    }
+
+    /// Borrow the same accepted input allocation, including the retained refresh origin.
+    /// Readers that keep a semantic input snapshot can share it without copying its maps.
+    pub(crate) fn retained_composed_projection_input(
+        &self,
+    ) -> Option<&Arc<AcceptedCompositionProjection>> {
         match &self.book_composition {
             ViewerBookComposition::Accepted {
                 layout: CompositionProjectionOutcome::Composed(projection),
@@ -1215,6 +1223,9 @@ impl App {
             &reply.rows.composition,
             CompositionProjectionOutcome::Composed(_)
         ));
+        if replaces_rows {
+            self.end_page_edit_tools_before_items_adoption("book_projection", &reply.rows.items);
+        }
         if replaces_rows
             && (reply.rotation_invalidation_revision != self.rotation_cache.invalidation_revision()
                 || reply.saved_trim != self.pending_composition_trim_batch()
@@ -1854,6 +1865,9 @@ fn prepare_book_projection(
         saved_trim,
     })
 }
+#[cfg(test)]
+#[path = "page_edit_composition_tests.rs"]
+mod page_edit_composition_tests;
 #[cfg(test)]
 #[path = "spread_step_projection_tests.rs"]
 mod spread_step_projection_tests;

@@ -5,15 +5,17 @@ use super::*;
 mod release_tests;
 
 impl App {
-    pub(super) fn dispatch_viewer_middle_short_click(&mut self, ctx: &egui::Context) {
-        if let Some(nav) = self.apply_mouse_button(
+    pub(super) fn dispatch_viewer_middle_short_click(&mut self, ctx: &egui::Context) -> Option<u8> {
+        let result = self.dispatch_mouse_button(
             ctx,
             crate::ring_shortcut::MouseButtonSlot::Middle,
             crate::app::ActionSurface::Viewer,
             "fullscreen-middle-mouse",
-        ) {
+        );
+        if let Some(nav) = result.navigation {
             self.mouse_ring_nav = Some(nav);
         }
+        result.script_slot
     }
     pub(super) fn advance_viewer_primary_pointer_frame(
         &mut self,

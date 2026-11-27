@@ -7,6 +7,8 @@ use crate::ui_helpers::HoverTipExt;
 #[derive(Clone, Copy)]
 pub(crate) struct ToolsMenuState<'a> {
     pub convert_enabled: bool,
+    pub combine_disabled_reason: Option<&'a str>,
+    pub combine_reopen_disabled_reason: Option<&'a str>,
     pub caption_disabled_reason: Option<&'a str>,
     pub caption_progress_available: bool,
     pub transcript_disabled_reason: Option<&'a str>,
@@ -17,7 +19,7 @@ pub(crate) struct ToolsMenuState<'a> {
 fn group(command: MenuCommandId) -> Option<u8> {
     use MenuCommandId::*;
     match command {
-        ConvertToZip => Some(0),
+        ConvertToZip | ToolsCombineImages | ToolsCombineReopen => Some(0),
         ToolsCreateAiCaptions
         | ToolsShowCaptionProgress
         | ToolsCreateTranscripts
@@ -47,6 +49,8 @@ pub(crate) fn draw(
             MenuCommandId::ConvertToZip => (!state.convert_enabled).then_some(
                 "RAR/CBR/7z/CB7/LZH/LHA ファイルを選択してください (スペースキーで複数選択可)",
             ),
+            MenuCommandId::ToolsCombineImages => state.combine_disabled_reason,
+            MenuCommandId::ToolsCombineReopen => state.combine_reopen_disabled_reason,
             MenuCommandId::ToolsCreateAiCaptions => state.caption_disabled_reason,
             MenuCommandId::ToolsShowCaptionProgress => {
                 (!state.caption_progress_available).then_some("作成中の AI 説明文はありません")
@@ -83,6 +87,79 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
+    fn image_combine_tools_entry_uses_disabled_reason() {
+        for reason in [
+            None,
+            Some("結合の操作中です"),
+            Some("エクスポート中です"),
+            Some("結合できるのは 100 枚までです (101 枚選択中)"),
+        ] {
+            let mut h = harness(
+                ToolsMenuState {
+                    convert_enabled: false,
+                    combine_reopen_disabled_reason: reason,
+                    combine_disabled_reason: reason,
+                    caption_disabled_reason: None,
+                    caption_progress_available: false,
+                    transcript_disabled_reason: None,
+                    transcript_progress_available: false,
+                    video_selected: false,
+                },
+                true,
+            );
+            h.run_steps(4);
+            for label in ["画像を結合...", "結合をやり直す..."] {
+                assert_eq!(
+                    h.get_by_label(label).accesskit_node().is_disabled(),
+                    reason.is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn image_combine_reopen_tools_reason_is_independent_of_new_combine() {
+        for reopen in [false, true] {
+            let mut h = harness(
+                ToolsMenuState {
+                    convert_enabled: false,
+                    combine_disabled_reason: reopen.then_some("結合できる対象がありません"),
+                    combine_reopen_disabled_reason: (!reopen)
+                        .then_some("この画像には結合の構成がありません"),
+                    caption_disabled_reason: None,
+                    caption_progress_available: false,
+                    transcript_disabled_reason: None,
+                    transcript_progress_available: false,
+                    video_selected: false,
+                },
+                true,
+            );
+            h.run_steps(4);
+            assert_eq!(
+                h.get_by_label("画像を結合...")
+                    .accesskit_node()
+                    .is_disabled(),
+                reopen
+            );
+            assert_eq!(
+                h.get_by_label("結合をやり直す...")
+                    .accesskit_node()
+                    .is_disabled(),
+                !reopen
+            );
+            if !reopen {
+                h.get_by_label("結合をやり直す...").hover();
+                h.run();
+                assert!(
+                    h.get_by_label("この画像には結合の構成がありません")
+                        .rect()
+                        .is_positive()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tools_menu_catalog_order_and_group_separators() {
         use MenuCommandId::*;
         let commands = menu_commands_for_parent(TopMenuId::Tools)
@@ -92,6 +169,8 @@ mod tests {
             commands,
             [
                 ConvertToZip,
+                ToolsCombineImages,
+                ToolsCombineReopen,
                 ToolsCreateAiCaptions,
                 ToolsShowCaptionProgress,
                 ToolsCreateTranscripts,
@@ -104,6 +183,8 @@ mod tests {
         assert_eq!(
             commands.iter().copied().map(group).collect::<Vec<_>>(),
             [
+                Some(0),
+                Some(0),
                 Some(0),
                 Some(1),
                 Some(1),
@@ -130,7 +211,7 @@ mod tests {
         let keymap = Keymap::from_settings(&KeymapSettings::default());
         let fonts_ready = Cell::new(false);
         crate::test_ui::builder()
-            .with_size(egui::vec2(370.0, 300.0))
+            .with_size(egui::vec2(370.0, 330.0))
             .build_ui(move |ui| {
                 let ctx = &ui.ctx().clone();
                 crate::os_theme::apply_resolved(
@@ -163,6 +244,8 @@ mod tests {
         ] {
             let mut harness = harness(
                 ToolsMenuState {
+                    combine_reopen_disabled_reason: None,
+                    combine_disabled_reason: None,
                     convert_enabled: convert,
                     caption_disabled_reason: (!caption)
                         .then_some(crate::context_menu_model::CAPTION_NO_TARGET_REASON),
@@ -181,6 +264,7 @@ mod tests {
                 let row = harness.get_by_label(&label);
                 let enabled = match command {
                     MenuCommandId::ConvertToZip => convert,
+                    MenuCommandId::ToolsCombineImages | MenuCommandId::ToolsCombineReopen => true,
                     MenuCommandId::ToolsCreateAiCaptions
                     | MenuCommandId::ToolsCreateTranscripts => caption,
                     MenuCommandId::ToolsShowCaptionProgress
@@ -212,6 +296,8 @@ mod tests {
         for dark in [true, false] {
             let mut harness = harness(
                 ToolsMenuState {
+                    combine_reopen_disabled_reason: None,
+                    combine_disabled_reason: None,
                     convert_enabled: false,
                     caption_disabled_reason: None,
                     caption_progress_available: true,
@@ -237,6 +323,8 @@ mod tests {
         for transcript in [false, true] {
             let mut harness = harness(
                 ToolsMenuState {
+                    combine_reopen_disabled_reason: None,
+                    combine_disabled_reason: None,
                     convert_enabled: false,
                     caption_disabled_reason: transcript.then_some("説明文の対象なし"),
                     caption_progress_available: !transcript,

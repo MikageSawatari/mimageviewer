@@ -7,6 +7,7 @@ use egui_kittest::{
 };
 use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
+mod export_refresh_book_root_tests;
 mod preset_tests;
 mod watermark_tests;
 
@@ -72,6 +73,7 @@ fn pending() -> (ExportPending, mpsc::Sender<ExportEvent>) {
     let (tx, rx) = mpsc::channel();
     (
         ExportPending {
+            origin: crate::export_dialog::ExportOrigin::Batch,
             cancel: Arc::new(AtomicBool::new(false)),
             rx,
             total: 100,

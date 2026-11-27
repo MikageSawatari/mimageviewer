@@ -1,4 +1,4 @@
-//! 単枚・一括の転記と縮小画像の検出。profile ごとの転記対象と向きの扱いを保つ。
+//! 単枚・一括の転記と縮小画像の検出。RGB ICC は共通、EXIF は profile ごとの扱いを保つ。
 use super::*;
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
@@ -43,17 +43,11 @@ pub(super) fn transfer(
                 true
             });
             notice.xmp = jpeg_xmp_thumbnail(&segments);
-            if batch {
-                segments.extend(jpeg_rgb_icc_segments(src)?);
-            }
+            segments.extend(jpeg_rgb_icc_segments(src)?);
             splice_jpeg_app1_segments(encoded, &segments)?
         }
         SrcFormat::Png => {
-            let chunks = if batch {
-                extract_png_metadata_chunks(src)?
-            } else {
-                extract_png_text_chunks_raw(src)?
-            };
+            let chunks = extract_png_metadata_chunks(src)?;
             let mut total = 0;
             let mut retained = Vec::new();
             let mut raw_app1_xmp = Vec::new();
@@ -61,6 +55,9 @@ pub(super) fn transfer(
                 let kind = chunk[4..8].to_vec();
                 match kind.as_slice() {
                     b"eXIf" => {
+                        if !batch {
+                            continue;
+                        }
                         let Some((tiff, maker)) = clean_exif(&chunk[8..chunk.len() - 4], true)
                         else {
                             continue;
@@ -116,7 +113,7 @@ pub(super) fn transfer(
                 Some(result)
             });
             notice.xmp = xmp.as_deref().is_some_and(has_thumbnail);
-            let icc = icc.filter(|p| !batch || rgb_icc(p));
+            let icc = icc.filter(|p| rgb_icc(p));
             if icc.is_some() || exif.is_some() || xmp.is_some() {
                 inject_webp_metadata(encoded, icc, exif, xmp)?
             } else {

@@ -626,6 +626,15 @@ fn depth_transform_middle_and_scrub_start_on_canvas_but_not_on_panel() {
                         (app.fs_zoom, app.fs_pan, app.fs_free_rotation),
                         before_transform
                     );
+                    if scrub && !panel {
+                        assert_eq!(
+                            app.fs_primary_suppression,
+                            FullscreenPrimarySuppression::ReleasedThisPass(
+                                FullscreenPrimarySuppressionReason::Other
+                            ),
+                            "a completed canvas scrub claims its flow, even across the panel boundary"
+                        );
+                    }
                 } else {
                     for (pos, edge) in [(returned, None), (returned, Some(false))] {
                         let mut events = vec![
@@ -923,5 +932,96 @@ fn depth_transform_drag_start_follows_press_origin_across_panel() {
             assert_eq!(state.ready().unwrap().resource_id, resource_id);
         }
     }
+    crate::key_input::clear_test_frame();
+}
+
+#[test]
+fn depth_transform_907_middle_admission_uses_its_own_press_not_primary() {
+    let _input = crate::key_input::lock_test_input();
+    for middle_on_panel in [false, true] {
+        let mut app = crate::app::setup_app_for_test();
+        let mut viewer = RootDepthViewer::new(&mut app);
+        viewer.ready(&mut app);
+        app.window_visible = false;
+        for _ in 0..3 {
+            viewer.frame(&mut app, vec![]);
+        }
+        app.fs_focus_regained_at = None;
+        let panel = app.visible_depth_panel_rect(&viewer.ctx).unwrap();
+        let inside = panel.min + egui::vec2(15.0, 60.0);
+        let outside = egui::pos2(panel.left() - 40.0, inside.y);
+        let primary = if middle_on_panel { outside } else { inside };
+        let middle = if middle_on_panel { inside } else { outside };
+        let edge = |pos, button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        viewer.frame(
+            &mut app,
+            vec![
+                edge(primary, egui::PointerButton::Primary, true),
+                edge(primary, egui::PointerButton::Primary, false),
+                edge(middle, egui::PointerButton::Middle, true),
+                egui::Event::PointerMoved(primary),
+            ],
+        );
+        assert_eq!(app.fs_middle_zoom_drag.is_some(), !middle_on_panel);
+        viewer.frame(
+            &mut app,
+            vec![edge(middle, egui::PointerButton::Middle, false)],
+        );
+        assert!(app.fs_middle_zoom_drag.is_none());
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[test]
+fn depth_transform_907_primary_semantic_origin_survives_release_after_crossing_panel() {
+    let _input = crate::key_input::lock_test_input();
+    let mut app = crate::app::setup_app_for_test();
+    let mut viewer = RootDepthViewer::new(&mut app);
+    viewer.ready(&mut app);
+    app.window_visible = false;
+    for _ in 0..3 {
+        viewer.frame(&mut app, vec![]);
+    }
+    app.fs_focus_regained_at = None;
+    let panel = app.visible_depth_panel_rect(&viewer.ctx).unwrap();
+    let inside = panel.min + egui::vec2(15.0, 60.0);
+    let outside = egui::pos2(panel.left() - 60.0, inside.y);
+    let before = (app.fs_zoom, app.fs_pan, app.fs_free_rotation);
+    viewer.frame_with_before(
+        &mut app,
+        vec![
+            egui::Event::PointerButton {
+                pos: inside,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerMoved(outside),
+            egui::Event::PointerButton {
+                pos: outside,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+        |_, ctx| {
+            assert!(ctx.input(|input| input.pointer.press_origin()).is_none());
+            assert_eq!(
+                ctx.input(|input| crate::ui_helpers::button_press_origin(
+                    input,
+                    egui::PointerButton::Primary
+                )),
+                Some(inside)
+            );
+        },
+    );
+    assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), before);
+    assert!(app.fs_pan_drag_start.is_none());
+    assert!(app.fs_rotation_drag_start.is_none());
     crate::key_input::clear_test_frame();
 }

@@ -536,6 +536,26 @@ impl RingDirection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RingActionId {
     None,
+    ScriptSlot1,
+    ScriptSlot2,
+    ScriptSlot3,
+    ScriptSlot4,
+    ScriptSlot5,
+    ScriptSlot6,
+    ScriptSlot7,
+    ScriptSlot8,
+    ScriptSlot9,
+    ScriptSlot10,
+    ScriptSlot11,
+    ScriptSlot12,
+    ScriptSlot13,
+    ScriptSlot14,
+    ScriptSlot15,
+    ScriptSlot16,
+    ScriptSlot17,
+    ScriptSlot18,
+    ScriptSlot19,
+    ScriptSlot20,
     AddToBook,
     AddToCollection,
     PinRepresentativeThumb,
@@ -755,6 +775,128 @@ impl RingActionId {
             || self
                 .page_overview_key_action()
                 .is_some_and(|action| actions.contains(&action))
+    }
+
+    const SCRIPT_SLOTS: &'static [(Self, &'static str, crate::keymap::KeyAction); 20] = &[
+        (
+            Self::ScriptSlot1,
+            "script_slot_1",
+            crate::keymap::KeyAction::ScriptSlot1,
+        ),
+        (
+            Self::ScriptSlot2,
+            "script_slot_2",
+            crate::keymap::KeyAction::ScriptSlot2,
+        ),
+        (
+            Self::ScriptSlot3,
+            "script_slot_3",
+            crate::keymap::KeyAction::ScriptSlot3,
+        ),
+        (
+            Self::ScriptSlot4,
+            "script_slot_4",
+            crate::keymap::KeyAction::ScriptSlot4,
+        ),
+        (
+            Self::ScriptSlot5,
+            "script_slot_5",
+            crate::keymap::KeyAction::ScriptSlot5,
+        ),
+        (
+            Self::ScriptSlot6,
+            "script_slot_6",
+            crate::keymap::KeyAction::ScriptSlot6,
+        ),
+        (
+            Self::ScriptSlot7,
+            "script_slot_7",
+            crate::keymap::KeyAction::ScriptSlot7,
+        ),
+        (
+            Self::ScriptSlot8,
+            "script_slot_8",
+            crate::keymap::KeyAction::ScriptSlot8,
+        ),
+        (
+            Self::ScriptSlot9,
+            "script_slot_9",
+            crate::keymap::KeyAction::ScriptSlot9,
+        ),
+        (
+            Self::ScriptSlot10,
+            "script_slot_10",
+            crate::keymap::KeyAction::ScriptSlot10,
+        ),
+        (
+            Self::ScriptSlot11,
+            "script_slot_11",
+            crate::keymap::KeyAction::ScriptSlot11,
+        ),
+        (
+            Self::ScriptSlot12,
+            "script_slot_12",
+            crate::keymap::KeyAction::ScriptSlot12,
+        ),
+        (
+            Self::ScriptSlot13,
+            "script_slot_13",
+            crate::keymap::KeyAction::ScriptSlot13,
+        ),
+        (
+            Self::ScriptSlot14,
+            "script_slot_14",
+            crate::keymap::KeyAction::ScriptSlot14,
+        ),
+        (
+            Self::ScriptSlot15,
+            "script_slot_15",
+            crate::keymap::KeyAction::ScriptSlot15,
+        ),
+        (
+            Self::ScriptSlot16,
+            "script_slot_16",
+            crate::keymap::KeyAction::ScriptSlot16,
+        ),
+        (
+            Self::ScriptSlot17,
+            "script_slot_17",
+            crate::keymap::KeyAction::ScriptSlot17,
+        ),
+        (
+            Self::ScriptSlot18,
+            "script_slot_18",
+            crate::keymap::KeyAction::ScriptSlot18,
+        ),
+        (
+            Self::ScriptSlot19,
+            "script_slot_19",
+            crate::keymap::KeyAction::ScriptSlot19,
+        ),
+        (
+            Self::ScriptSlot20,
+            "script_slot_20",
+            crate::keymap::KeyAction::ScriptSlot20,
+        ),
+    ];
+
+    fn script_slot_entry(&self) -> Option<(&'static str, crate::keymap::KeyAction)> {
+        Self::SCRIPT_SLOTS
+            .iter()
+            .find(|entry| &entry.0 == self)
+            .map(|entry| (entry.1, entry.2))
+    }
+
+    /// Keyboard identity for the same script slot; execution is wired in a later stage.
+    pub fn script_slot_key_action(&self) -> Option<crate::keymap::KeyAction> {
+        self.script_slot_entry().map(|entry| entry.1)
+    }
+
+    pub fn for_script_slot_key_action(action: crate::keymap::KeyAction) -> Option<Self> {
+        Self::SCRIPT_SLOTS
+            .iter()
+            .find(|entry| entry.2 == action)
+            .map(|entry| entry.0.clone())
     }
 
     const COLLECTION_SLOTS: &'static [(Self, &'static str, crate::keymap::KeyAction); 20] = &[
@@ -1268,6 +1410,9 @@ impl RingActionId {
     }
 
     pub fn as_str(&self) -> &str {
+        if let Some(entry) = self.script_slot_entry() {
+            return entry.0;
+        }
         if let Some(entry) = self.saved_group_slot_entry() {
             return entry.0;
         }
@@ -1300,7 +1445,27 @@ impl RingActionId {
             Self::CollectionNext => "collection_next",
             Self::BookPrev => "book_prev",
             Self::BookNext => "book_next",
-            Self::OpenCollection1
+            Self::ScriptSlot1
+            | Self::ScriptSlot2
+            | Self::ScriptSlot3
+            | Self::ScriptSlot4
+            | Self::ScriptSlot5
+            | Self::ScriptSlot6
+            | Self::ScriptSlot7
+            | Self::ScriptSlot8
+            | Self::ScriptSlot9
+            | Self::ScriptSlot10
+            | Self::ScriptSlot11
+            | Self::ScriptSlot12
+            | Self::ScriptSlot13
+            | Self::ScriptSlot14
+            | Self::ScriptSlot15
+            | Self::ScriptSlot16
+            | Self::ScriptSlot17
+            | Self::ScriptSlot18
+            | Self::ScriptSlot19
+            | Self::ScriptSlot20
+            | Self::OpenCollection1
             | Self::OpenCollection2
             | Self::OpenCollection3
             | Self::OpenCollection4
@@ -1479,6 +1644,12 @@ impl RingActionId {
 
     pub fn from_str(s: &str) -> Option<Self> {
         let key = s.trim().to_ascii_lowercase();
+        if let Some(entry) = Self::SCRIPT_SLOTS
+            .iter()
+            .find(|entry| entry.1 == key.as_str())
+        {
+            return Some(entry.0.clone());
+        }
         if let Some(entry) = Self::COLLECTION_SLOTS
             .iter()
             .chain(Self::BOOK_SLOTS.iter())
@@ -1615,6 +1786,9 @@ impl RingActionId {
     }
 
     pub fn label_for_context(&self, context: RingShortcutContext) -> &'static str {
+        if let Some(action) = self.script_slot_key_action() {
+            return action.description();
+        }
         if let Some(action) = self.saved_group_key_action() {
             return action.description();
         }
@@ -1667,6 +1841,26 @@ impl RingActionId {
             | Self::CollectionNext
             | Self::BookPrev
             | Self::BookNext
+            | Self::ScriptSlot1
+            | Self::ScriptSlot2
+            | Self::ScriptSlot3
+            | Self::ScriptSlot4
+            | Self::ScriptSlot5
+            | Self::ScriptSlot6
+            | Self::ScriptSlot7
+            | Self::ScriptSlot8
+            | Self::ScriptSlot9
+            | Self::ScriptSlot10
+            | Self::ScriptSlot11
+            | Self::ScriptSlot12
+            | Self::ScriptSlot13
+            | Self::ScriptSlot14
+            | Self::ScriptSlot15
+            | Self::ScriptSlot16
+            | Self::ScriptSlot17
+            | Self::ScriptSlot18
+            | Self::ScriptSlot19
+            | Self::ScriptSlot20
             | Self::OpenCollection1
             | Self::OpenCollection2
             | Self::OpenCollection3
@@ -1845,7 +2039,7 @@ impl RingActionId {
     }
 
     pub fn is_valid_for_context(&self, context: RingShortcutContext) -> bool {
-        if self.is_location_navigation_action() {
+        if self.is_location_navigation_action() || self.script_slot_key_action().is_some() {
             return true;
         }
         match context {
@@ -2154,6 +2348,7 @@ impl RingActionId {
             ],
         };
         actions.extend(Self::location_navigation_actions());
+        actions.extend(Self::SCRIPT_SLOTS.iter().map(|entry| entry.0.clone()));
         actions
     }
 
@@ -2176,7 +2371,9 @@ pub fn ring_bindings_for_key_action(
     action: crate::keymap::KeyAction,
 ) -> Vec<(RingShortcutContext, RingActionId)> {
     let mut out = Vec::new();
-    if let Some(ring_action) = RingActionId::for_saved_group_key_action(action) {
+    if let Some(ring_action) = RingActionId::for_script_slot_key_action(action)
+        .or_else(|| RingActionId::for_saved_group_key_action(action))
+    {
         for &context in RingShortcutContext::all() {
             push_ring_binding_if_available(&mut out, context, ring_action.clone());
         }
@@ -5188,6 +5385,121 @@ mod saved_group_action_tests {
                 loaded, settings,
                 "{id}: every supported assignment must survive sanitize"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod script_slot_action_tests {
+    use super::*;
+    use crate::keymap::KeyAction;
+
+    #[test]
+    fn script_slot_actions_round_trip_and_match_global_key_actions() {
+        assert_eq!(RingActionId::SCRIPT_SLOTS.len(), 20);
+        for (index, (action, id, key_action)) in RingActionId::SCRIPT_SLOTS.iter().enumerate() {
+            assert_eq!(*id, format!("script_slot_{}", index + 1));
+            assert_eq!(key_action.ini_name(), format!("ScriptSlot{}", index + 1));
+            assert_eq!(action.as_str(), *id);
+            assert_eq!(RingActionId::from_str(id), Some(action.clone()));
+            assert_eq!(
+                serde_json::from_str::<RingActionId>(&serde_json::to_string(action).unwrap())
+                    .unwrap(),
+                *action
+            );
+            assert_eq!(action.script_slot_key_action(), Some(*key_action));
+            assert_eq!(
+                RingActionId::for_script_slot_key_action(*key_action),
+                Some(action.clone())
+            );
+            for &context in RingShortcutContext::all() {
+                assert_eq!(action.label_for_context(context), key_action.description());
+            }
+        }
+        for &key_action in KeyAction::all() {
+            let expected = RingActionId::SCRIPT_SLOTS
+                .iter()
+                .find(|entry| entry.2 == key_action)
+                .map(|entry| entry.0.clone());
+            assert_eq!(
+                RingActionId::for_script_slot_key_action(key_action),
+                expected
+            );
+        }
+        for action in [
+            RingActionId::None,
+            RingActionId::OpenBook1,
+            RingActionId::OpenFavorite1,
+        ] {
+            assert_eq!(action.script_slot_key_action(), None);
+        }
+        for id in ["script_slot_0", "script_slot_21"] {
+            assert_eq!(RingActionId::from_str(id), None);
+        }
+    }
+
+    #[test]
+    fn script_slot_candidates_cover_all_assignment_contexts_but_not_page_overview() {
+        for (action, _, _) in RingActionId::SCRIPT_SLOTS {
+            for &context in RingShortcutContext::all() {
+                assert!(action.is_valid_for_context(context));
+                assert_eq!(
+                    RingActionId::available_for_context(context)
+                        .iter()
+                        .filter(|candidate| *candidate == action)
+                        .count(),
+                    1
+                );
+                assert!(action.is_valid_for_mouse_button_context(context));
+                assert!(RingActionId::available_for_mouse_button_context(context).contains(action));
+            }
+            for &context in RightDragContext::all() {
+                assert!(action.is_valid_for_right_drag_context(context));
+                assert!(RingActionId::available_for_right_drag_context(context).contains(action));
+            }
+            assert_eq!(action.page_overview_key_action(), None);
+            assert!(!action.is_executable_in_page_overview(KeyAction::all()));
+        }
+    }
+
+    #[test]
+    fn script_slot_assignments_survive_settings_serde_and_sanitize_without_new_defaults() {
+        let defaults = RingShortcutSettings::default();
+        for (action, id, _) in RingActionId::SCRIPT_SLOTS {
+            let mut settings = defaults.clone();
+            for &context in RingShortcutContext::all() {
+                assert!(!defaults.profile(context).slots.contains(action));
+                settings.profile_mut(context).slots[0] = action.clone();
+                for slot in [
+                    MouseButtonSlot::Back,
+                    MouseButtonSlot::Forward,
+                    MouseButtonSlot::Middle,
+                ] {
+                    assert_ne!(defaults.mouse_button_profile(context).action(slot), *action);
+                }
+                let mouse = settings.mouse_button_profile_mut(context);
+                mouse.back = action.clone();
+                mouse.forward = action.clone();
+                mouse.middle = action.clone();
+            }
+            for &context in RightDragContext::all() {
+                assert!(
+                    !defaults
+                        .mouse_gesture_profile(context)
+                        .bindings
+                        .iter()
+                        .any(|binding| binding.action == *action)
+                );
+                settings.mouse_gesture_profile_mut(context).bindings =
+                    vec![MouseGestureBinding::new(
+                        vec![MouseGestureDirection::Up],
+                        action.clone(),
+                    )];
+            }
+            let mut loaded: RingShortcutSettings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            loaded.sanitize();
+            assert_eq!(loaded, settings, "{id}");
         }
     }
 }

@@ -101,13 +101,15 @@ fn settle(app: &mut App, ctx: &egui::Context) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     loop {
         app.settle_open_path_classification_for_test();
+        app.poll_direct_navigation_scan_for_test(ctx);
         app.poll_history_navigation_transition_for_test(ctx);
         app.poll_zip_enumerate();
         app.poll_pdf_enumerate();
         app.poll_sidecar_restore(ctx);
         app.poll_book_composition_service_for_test(ctx);
         app.poll_book_presentation_permission(ctx);
-        if app.top_level_grid_view.open_path_classification().is_none()
+        if !app.direct_navigation_scan_pending()
+            && app.top_level_grid_view.open_path_classification().is_none()
             && app
                 .top_level_grid_view
                 .history_navigation_transition()
@@ -327,7 +329,7 @@ fn tag_list_order_adoption_replaces_only_matching_run_and_row() {
         vec![a.clone()],
         "preparation cannot mutate return route"
     );
-    app.commit_staged_search_navigation_effects(&b, false, admission, None);
+    app.commit_staged_search_navigation_effects(&b, None, admission, None);
     assert_eq!(app.tag_view.nav_stack, vec![b.clone()]);
     assert!(app.address.ends_with("a-next"));
     for admission in [
@@ -342,7 +344,7 @@ fn tag_list_order_adoption_replaces_only_matching_run_and_row() {
         TagViewNavAdmission::Descend,
     ] {
         app.tag_view.nav_stack = vec![a.clone()];
-        app.commit_staged_search_navigation_effects(&b, false, Some(admission), None);
+        app.commit_staged_search_navigation_effects(&b, None, Some(admission), None);
         assert_eq!(app.tag_view.nav_stack, vec![a.clone(), b.clone()]);
     }
 }
@@ -540,7 +542,7 @@ fn tag_list_order_grid_request_supersedes_direct_navigation_scan() {
         None,
         StartupListIntent::ExplicitList,
         MainListRequestStage::Admission,
-        DirectoryScanRoute::Worker,
+        DirectoryScanRoute::MainWorker,
     );
     assert!(app.direct_navigation_scan_pending());
     assert!(!app.main_list_folder_navigation_adoption_pending());
@@ -795,8 +797,8 @@ fn tag_list_order_blocked_item_keyboard_tree_and_sibling_use_result_order() {
         app.handle_stack_refresh_keyboard(
             &ctx,
             true,
-            0,
-            0,
+            Default::default(),
+            Default::default(),
             crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan,
         );
         ctx.end_pass().drop_without_applying_deltas();

@@ -31,8 +31,8 @@ python scripts/gen-sitemap-xml.py
 python scripts/gen-sitemap-xml.py --check
 ```
 
-版の正本は `config/miv-sound.rs`。`VERSION` に `v` を付けた版を目次本文の1か所だけに表示し、`--version` より優先する。
-公開 URL は版番号なしの `manual/sound/` に固定する。版だけの更新では目次以外のページ・URL・転送規則は変わらない。
+版の正本は `config/miv-sound.rs`。`VERSION` に `v` を付けた版を `SOURCE.md` との照合に使い、`--version` より優先する。目次を含む公開ページには版を表示しない (§1.905)。
+公開 URL は版番号なしの `manual/sound/` に固定する。版だけの更新では目次を含む生成物・URL・転送規則は変わらない。
 `DOCS_VERSION` は元の上流説明書の版。`SOURCE.md` の `mIV Sound` と `Docs version` の両方を照合し、
 同じ snapshot の無審査の付け替えを拒否する。本文・title・description の「EffeTune」は訂正後に「mIV Sound」へ置換する。
 上流サービスの案内は訂正で「上流の Web アプリ」などにしてから置換し、URL・拡張子・上流のクレジットを保つ。

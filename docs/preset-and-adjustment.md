@@ -1832,7 +1832,7 @@ OFF にすると **読み書き両方スキップ** (既存 `.dat` は削除し�
 - **手動 E2E**: フルスクリーン UI 経由での編集→フォルダ移動→復元までは
   [docs/e2e-smoke-test.md](e2e-smoke-test.md) を参照。
 
-統合テストは `cargo test --test sidecar_import` で 1 秒程度で走る。
+統合テストは `cargo test -p mimageviewer --test integration sidecar_import::` で 1 秒程度で走る。
 GUI 起動を含まないため CI でも実行可能。テストの多くは
 `AdjustmentDb::open_at` / `MaskDb::open_at` で一時 DB を作って隔離している
 (デフォルトの `open()` は `%APPDATA%` を使うのでテスト用途には不向き)。

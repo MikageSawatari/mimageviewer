@@ -90,6 +90,7 @@ fn open(app: &mut App, ctx: &egui::Context, row: &GridItem, auto: bool) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !app.everything_has_physical_child() {
         app.settle_open_path_classification_for_test();
+        app.poll_direct_navigation_scan_for_test(ctx);
         if matches!(row, GridItem::PdfFile(_)) {
             // Inject only enumeration completion, retaining production open/install ownership.
             if let Some(pending) = app.pdf_enumerate_pending.as_mut() {

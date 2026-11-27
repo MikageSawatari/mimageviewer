@@ -153,6 +153,34 @@ panic・backend再試行・依存ライブラリの保存ログ対象拡大は�
 同名画像の使用と一覧からの省略は動画の既存設定を共有し、既存の OFF を引き継ぐ。画像上の音声マークは音楽アイコン (既定) / 文字バッジ / なしの三択。画像なしは音楽アイコンのまま。Audio の再生・操作・分類を変更せず、再生画面の表紙、画像の手動 pin、貼付 / upload は追加しない。Remote 外部編集反映は明示 refresh。[仕様・制限](audio-album-art-plan.md)。
 
 
+## 操作のスクリプト（§1.363 段1〜5・§17）
+
+`operation_scripts.rhai` はデータフォルダの独立ファイル。環境設定だけが実行許可と初回確認を下書きからOKで確定する。
+チェック直後の初回説明は「使う」で両方を下書きへ保存し、「やめる」では変更しない。親のキャンセルでも確認は残らない。
+Open / Reload / Resetは下書きと無関係に即時投入し、Reloadは確定済みenabledがtrueのときだけ受ける。
+Resetは子モーダルで確認してから既定本文へ置換し、自動reloadしない。UIは確定済みのDisabled / Loading / Ready / Failedと
+Readyのスロット番号・label・関数名・on_eventの有無を毎frameメモリから写す。
+LoadとOpenは欠落時だけcreate_newで雛形を作り、既存本文・空ファイルを上書きしない。ファイル削除は停止手段にならず、停止はenabledをOFFにする。
+Load / Open / Reset / AI読み取り / AI書き込みはAppのloader所有の単一FIFOで直列化し、順序と世代照合は[非同期設計](async-architecture.md)に従う。
+手動のScriptSlot1〜20はGlobal / Press / 既定キーなし。操作カスタマイズ名は固定で、labelは環境設定と右クリックだけに表示する。
+mainの一覧／画像／動画・音声に限定し、編集・ページ一覧・モーダル・TextEdit/IME・Remote取得中は実行しない。
+イベント可は同期32（画像7・動画4・一覧21）とopen限定2。動画の再生/ループ/全シーク9操作はイベント不可。
+画像の `FsDepthParallax` / `FsSlideshow` も種別Aとして手動起動から使える (イベント不可)。
+状態api=1に `view.depth` / `view.slideshow` (viewer面)、`video.muted` / `video.volume_db`
+(再生器がある動画・音声)、`grid.columns` / `grid.details` (一覧面) を公開する。
+対象外の面と未取得値は `()`、音量は既存変換のdB値 (-80.0〜+18.0) を渡し、写しのためのI/Oは行わない。
+詳細な状態・許可表・上限は[確定設計](operation-script-plan.md)と[公開マニュアル](../htdocs/mimageviewer/manual/operation-script.html)。
+段5と§17のMCP追加は実装済み。自動検証・独立実装レビュー・設計担当の検収・実機確認は未実施。
+MCPの `operation_script { source?, part?, expected_sha256? }` は読み取り以上 + 設定許可で本文を読む・書く。
+ファイル欠落時の読み取りは作成せず雛形を返す。本文全体のSHA-256を返し、2 part目以降と書き込みは一致を必須とする。
+読み書きの上限はUTF-8 256 KiB。書き込みは同じFIFOの仕事で照合・コンパイル・slots評価・置き換えを行い、
+成功した本文だけを通常のLoadとは別のAiWrite結果で返す。受付で状態・世代は変えず、現世代かつReady / Failedなら採用する。
+拒否・失敗は稼働本文を保つ。後のReload / OFF / 再ONで古い結果の採用は失効する。OFFなら保存だけで、有効化時に読む。
+応答のenabledと読み込み状態は受付時点の写しで、返したSHA-256の本文を採用した結果ではない。
+有効化と初回確認は利用者だけが環境設定で確定し、AIは変更できない。スロットの割り当ては `set_operations` を使う。
+本文はAIアプリの提供元へ渡る。有効時の書き換えはイベントの自動表示操作と1入力の複合操作も変え得る。
+通知・変更記録・ログは前後の行数だけで本文を記録しない。agent IPCは8、版7の凍結fixtureを保持する。
+
 ## 1. アプリケーション概要
 
 Windows 11向けネイティブ画像ビューワー。
@@ -2516,7 +2544,7 @@ IME 変換中の Enter は確定に使わず、Esc ではセットアップを�
   PC 固有パス、フォント・外部ツール・LUT・Susie / VST3、性能 tuning、接続・自動通信、
   操作カスタマイズ、環境設定外の一覧・ツールバー・再生状態は対象外。
   履歴保持件数、EXIF 非表示タグ、動画下部バーの固定、詳細表示下部バーのモード、
-  `stack_rules.rhai` に依存するスタック script の有効化も除外する。
+  `stack_rules.rhai` に依存するスタック script の有効化と、操作スクリプトの実行許可・初回確認記録も除外する。
 - 形式は UTF-8 JSON、`format="mimageviewer.preferences"`、`format_version=1`、
   `preferences` object を必須とし、参考情報 `app_version` は任意。推奨名は
   `preferences.mivprefs.json`。Settings 全体の JSON・DB・操作カスタマイズ JSON は受け付けない。
@@ -2729,6 +2757,8 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `subfolder_expansion_filter_size_preset` | Option\<FacetSizePreset\> | None | サブ展開の走査時にファイルへ適用するサイズ条件。従来 4 区分または数値 + KB / MB / GB の最小 / 最大範囲を保存し、片側だけも許す。ZIP / PDF 本体には適用し、画像フォルダ本には適用しない。None は条件なし。この設定キー自体が未リリースのため旧版向け stash は持たない |
 | `stack_separator` | char | `_` | ファイル名スタックの **フォールバック用** 区切り文字。グループ分けは常にスクリプト (ワーカー) で行うが、スクリプトがコンパイル/実行に失敗したときだけ、この区切り文字で「末尾区切りの前」で畳む組み込みルールへフォールバックする (例 `_`: `12345678_p0.jpg` → `12345678`)。スタックモードの ON/OFF 自体は transient で永続化しない。詳細は [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
 | `stack_script_enabled` | bool | false | ファイル名スタックの分類にユーザー定義スクリプトを使うか。**false でも内蔵既定スクリプト (mXD/末尾連番/先頭連番/連写のカスケード) で分類する** (常にワーカー実行)。true のときユーザーの `<data_dir>/stack_rules.rhai` (無ければ内蔵既定) を使う。どちらも失敗時は `stack_separator` の組み込みルールへフォールバック。詳細は [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
+| `operation_script_enabled` | bool | false | 操作スクリプトのローカル実行許可。環境設定「拡張と診断 → 操作のスクリプト」の下書きで変更し、OKで確定。転送・AI設定変更の対象外 |
+| `operation_script_notice_confirmed` | bool | false | 初回説明を確認した端末内の記録。初回「使う」でenabledとともに下書きだけを更新し、環境設定OKで一緒に確定。キャンセルでは両方破棄。転送・AI設定変更の対象外 |
 | `show_address_bar_stack_toggle` | bool | true | フォルダバーに「スタック」表示トグルボタンを出すか。フォルダバー左端「フォルダ:」の右クリックメニューで切替 |
 | `favorites` | Vec\<FavoriteEntry\> | [] | お気に入りフォルダ。最大 100 件 (`id: Uuid` + name + path + `auto_index_structure` / `auto_index_metadata` / `auto_index_thumbs` / `auto_index_similar` の 4 フラグ)。`auto_index_similar` は欠落時 false の加算フィールド。キー割り当てで直接開ける番号枠は 1〜20 |
 | `smart_folders` | Vec\<SmartFolderDefinition\> | [] | 任意の複数実フォルダを横断する保存済み snapshot view。定義 UUID、名前、ルールごとの検索元 UUID/path/enabled、保存フィルタ、相対フォルダの並び単位を保持。通常一覧と共通のソート順・サムネイル / 詳細表示は保持せず、索引 / watcher も持たない。開く・更新時に再走査する |
@@ -3425,7 +3455,7 @@ SourceURL と画像候補のある HTML を検出して小窓へ通知する。�
 - 出力名は既定で `<元名>_edited`。バッチ出力では `_0` (現在の設定) / `_1`〜`_4` (隠蔽プリセット) を付ける。同じ名前が存在する場合はセッション単位で `_0001` などを挟み、上書きしない。
 - 出力形式は JPEG 95 / PNG / WebP。元形式が書き出し非対応の場合は `Settings::export_fallback_format` に従う。形式変換、PDF、見開き合成ではメタデータ保持は無効。
 - 出力サイズは「そのまま」「1/2 サイズ」「1/4 サイズ」から選ぶ。crop / 見開き / 隠蔽プリセット合成後の画像を基準に Lanczos3 で縮小し、既定値は `Settings::export_default_scale` に保存する。
-- JPEG / PNG / WebP の同形式出力では、`Settings::export_embed_metadata` が有効なら元画像の EXIF / XMP / PNG text / WebP metadata を転記する。ZIP 内画像は worker がエントリバイトを読み、パスの無いメタデータ元として扱う。JPEG の Orientation は表示で回転済みの画素と一致するよう正規化し、WebP の Orientation は変えない。JPEG・WebP と PNG の Raw profile テキスト内の EXIF の縮小画像 (IFD1) は外す。読めない EXIF は従来どおり転記して「EXIF (外せませんでした)」と警告する。XMP の縮小画像、隠す編集 (snapshot の消しゴム・隠蔽・切り取り・注釈・補正レイヤー、または出力ごとの SNS 分割枠) がある出力の MakerNote も検出し、書き出し後の共通警告画面に残す。転記対象・既定 ON・チェックボックスの文言は変えない。詳細は [単ページの縮小画像の設計](single-export-thumbnail-plan.md)。
+- JPEG / PNG / WebP の同形式出力では、`Settings::export_embed_metadata` が有効なら元画像の EXIF / XMP / PNG text / WebP metadata を転記する。ICC は一括と共通で RGB のものだけを残す (JPEG の APP2、PNG の `iCCP`、WebP の `ICCP`)。PNG の `eXIf` は転記しない。ZIP 内画像は worker がエントリバイトを読み、パスの無いメタデータ元として扱う。JPEG の Orientation は表示で回転済みの画素と一致するよう正規化し、WebP の Orientation は変えない。JPEG・WebP と PNG の Raw profile テキスト内の EXIF の縮小画像 (IFD1) は外す。読めない EXIF は従来どおり転記して「EXIF (外せませんでした)」と警告する。XMP の縮小画像、隠す編集 (snapshot の消しゴム・隠蔽・切り取り・注釈・補正レイヤー、または出力ごとの SNS 分割枠) がある出力の MakerNote も検出し、書き出し後の共通警告画面に残す。既定 ON・チェックボックスの文言は変えない。詳細は [単ページの縮小画像の設計](single-export-thumbnail-plan.md)。
 - 永続化設定は `Settings::export_embed_metadata` (メタデータ保持)、`Settings::export_last_directory` (前回保存先)、`Settings::export_batch_selection` (現在 / プリセット 1〜4 のチェック状態)、`Settings::export_fallback_format` (非対応元形式の JPEG / PNG 選択)、`Settings::export_default_scale` (出力サイズ)、`Settings::bake_stage_export` (焼き込む段)。一覧からの一括エクスポートは別系統の設定を持つ (下記)。
 - 保存は `ctrl-e-export` worker で順次実行する。元画像の decode、選択段までの合成、隠蔽プリセットの差し替え、見開き結合、画像エンコード、メタデータ転記、ファイル書き込みはいずれも worker 側で行い、UI は進捗モーダルを `try_recv` で更新する。キャンセルは合成中と次のエントリ開始前に反映する。
 - 現在表示中の実フォルダへ保存した場合は、フルスクリーンを抜けて一覧へ戻ったタイミングでフォルダを再読み込みし、新しい出力ファイルのサムネイルを反映する。ZIP / PDF / 検索結果などの仮想フォルダでは自動再読み込みしない。
@@ -3889,5 +3919,16 @@ Remoteは構成適用後にも従来の応答制限を使い、省略ページ�
 AI の書き込みと環境設定のリセット・エディタで開く操作は、単一 FIFO worker で受付順に行う。
 環境設定のボタンは仕事を渡すだけで、UI は I/O・完了待ち・監視を行わない。
 変更後はスタック表示の開き直し・フォルダ再読込で反映し、表示中のスタックは直ちに分け直さない。
+操作スクリプトの本文も同じ設定許可の `operation_script` で読み書きする。有効化と初回確認はAIから変更できず、
+有効時の成功した書き込みだけをloaderの世代照合で自動反映する。詳細は上の「操作のスクリプト」節。
 使い方の説明は同梱マニュアルから返し、無効・本体未起動でも利用できる。
 受付・通知・変更記録・対象項目の正本と検証状況は[設計](mcp-guide-settings-plan.md)を参照。
+
+## 画像の結合 (§1.904 stage B)
+
+一覧のチェック優先選択 (なければカーソル) の画像・ZIP内画像・PDFページを1〜100件結合する。
+右クリックとツールメニューの「画像を結合...」、既定キーなしのGridCombineSelectionを同じ受付へ通す。
+配置・余白・角丸・枠線・画像ごとの番号/説明をプレビューで設定し、PNG/JPEG/WebPへメタデータなしで保存する。
+前回値・プリセットはCombineOptionsだけで、画像ごとのラベル・出力名は含めず、設定の持ち運びから除外する。
+操作はCombineSessionが所有し、Dialog中は一覧と外からの開くを停止する。書き出し中は共通進捗へ移る。
+構成保存・再編集・置き換えはstage Cに分離しており、この段ではDBを作らない。詳細は[設計](image-combine-plan.md)。

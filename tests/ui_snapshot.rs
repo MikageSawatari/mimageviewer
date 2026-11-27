@@ -9,16 +9,16 @@
 //! ## 実行
 //!
 //! ```
-//! cargo test --test ui_snapshot
+//! cargo test -p mimageviewer --test integration ui_snapshot::
 //! ```
 //!
 //! ## スナップショット更新 (意図的に見た目を変えたとき)
 //!
 //! ```
-//! UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot
+//! UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --test integration ui_snapshot::
 //! ```
 //!
-//! 更新後は `tests/snapshots/ui_snapshot/*.png` の差分を目視確認してからコミットする。
+//! 更新後は `tests/snapshots/*.png` の差分を目視確認してからコミットする。
 //!
 //! ## 参考
 //!
@@ -27,6 +27,110 @@
 
 use egui_kittest::kittest::NodeT;
 use egui_kittest::{Harness, kittest::Queryable};
+
+#[test]
+fn image_combine_dialog_default_light() {
+    image_combine_snapshot(
+        "image_combine_dialog_default_light",
+        false,
+        true,
+        1.0,
+        false,
+    );
+}
+
+#[test]
+fn image_combine_dialog_transparent_light() {
+    image_combine_snapshot_with_background(
+        "image_combine_dialog_transparent_light",
+        false,
+        true,
+        1.0,
+        false,
+        true,
+    );
+}
+
+#[test]
+fn image_combine_dialog_band_dark() {
+    image_combine_snapshot("image_combine_dialog_band_dark", true, false, 1.0, false);
+}
+
+#[test]
+fn image_combine_dialog_small_200() {
+    image_combine_snapshot("image_combine_dialog_small_200", true, false, 2.0, false);
+}
+
+#[test]
+fn image_combine_dialog_reopen_replace_light() {
+    image_combine_snapshot(
+        "image_combine_dialog_reopen_replace_light",
+        false,
+        true,
+        1.0,
+        true,
+    );
+}
+
+fn image_combine_snapshot(name: &str, band: bool, light: bool, scale: f32, reopen: bool) {
+    image_combine_snapshot_with_background(name, band, light, scale, reopen, false);
+}
+
+fn image_combine_snapshot_with_background(
+    name: &str,
+    band: bool,
+    light: bool,
+    scale: f32,
+    reopen: bool,
+    transparent: bool,
+) {
+    let mut ready = false;
+    let mut harness = test_ui::builder()
+        .with_size(egui::vec2(1093.0, 614.0))
+        .build_ui(move |ui| {
+            let ctx = &ui.ctx().clone();
+            mimageviewer::os_theme::apply_resolved(
+                ctx,
+                if light {
+                    mimageviewer::os_theme::ResolvedTheme::Light
+                } else {
+                    mimageviewer::os_theme::ResolvedTheme::Dark
+                },
+            );
+            if !ready {
+                install_app_fonts(ctx);
+                mimageviewer::settings::apply_ui_scale_factor(ctx, scale);
+                ready = true;
+                ctx.request_repaint();
+                return;
+            }
+            test_ui::full_viewport_ui(ui, |ui| {
+                egui::CentralPanel::default().show(ui, |_| {});
+            });
+            if reopen {
+                mimageviewer::draw_image_combine_reopen_snapshot_fixture(ctx);
+            } else if transparent {
+                mimageviewer::draw_image_combine_transparent_snapshot_fixture(ctx);
+            } else {
+                mimageviewer::draw_image_combine_snapshot_fixture(ctx, band);
+            }
+        });
+    harness.run_steps(12);
+    for label in ["書き出す", "キャンセル", "Close window"] {
+        assert!(
+            harness
+                .ctx
+                .content_rect()
+                .contains_rect(harness.get_by_label(label).rect())
+        );
+    }
+    if reopen {
+        let notice = harness
+            .get_by_label_contains("元の結合画像を置き換えます (元に戻せません): 商品1_結合.jpg");
+        assert!(harness.ctx.content_rect().contains_rect(notice.rect()));
+    }
+    harness.snapshot(name);
+}
 
 #[test]
 fn cover_crop_small_100_light() {
@@ -684,13 +788,7 @@ fn ai_failure_feedback_hover_small_light() {
     );
 }
 
-#[path = "support/gpu_test_group.rs"]
-mod test_gpu_group;
-#[path = "support/ui_harness.rs"]
-mod test_ui;
-
-#[path = "support/logical_bounds.rs"]
-mod logical_bounds;
+use crate::{logical_bounds, test_ui};
 
 #[test]
 fn depth_parallax_panel_dark() {

@@ -12,6 +12,9 @@ mod reclick_stage2;
 #[path = "folder_pane_input_gate_tests.rs"]
 mod input_gate;
 
+#[path = "folder_pane_timestamp_919_tests.rs"]
+mod timestamp_919;
+
 // These UI fixtures represent the main pane after startup admission. The
 // headless App constructor never drives NotStarted into a terminal indexer
 // outcome, so explicitly select the no-indexer outcome at fixture creation.
@@ -324,7 +327,7 @@ fn navigation_tree_fixture() -> (AppTestEnvForTest, egui::Context, u64, PathBuf,
         std::fs::create_dir_all(path).unwrap();
     }
     app.folder_pane.test_scan_subtree(root.clone());
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     settle(&mut app, &ctx);
     app.set_folder_tree_pane_visible(true);
     // Navigation arbitration needs only this subtree. Host TEMP ancestors can
@@ -366,7 +369,7 @@ fn scrollable_tree_click_fixture(
     let clicked = children[34].clone();
     let grandchild = clicked.join("child");
     std::fs::create_dir(&grandchild).unwrap();
-    app.load_folder(children[40].clone());
+    app.load_folder_and_finish_for_test(children[40].clone());
     settle(&mut app, &ctx);
     app.set_folder_tree_pane_visible(true);
     app.folder_pane = FolderPaneState::test_tree(&root, children.clone());
@@ -2141,7 +2144,7 @@ fn folder_pane_label_req40_completed_navigation_collapses_prior_ancestors() {
     }
     app.folder_pane = FolderPaneState::default();
     app.folder_pane.test_scan_subtree(root);
-    app.load_folder(prior.join("leaf-1"));
+    app.load_folder_and_finish_for_test(prior.join("leaf-1"));
     settle(&mut app, &ctx);
     const HEIGHT: f32 = 1400.0; // All rows fit; ancestor removal must move X, not restore an offset.
     // Default state is suspended. Only a real drawing boundary resumes it and
@@ -2349,7 +2352,7 @@ fn label_double_click_scenario(scenario: &str) {
             .test_scan_subtree(b.parent().unwrap().to_path_buf());
     }
     if ancestor || scenario == "active" {
-        app.load_folder(if ancestor { child.clone() } else { b.clone() });
+        app.load_folder_and_finish_for_test(if ancestor { child.clone() } else { b.clone() });
         settle(&mut app, &ctx);
         app.sync_folder_pane_state(&ctx);
     }
@@ -2967,7 +2970,7 @@ fn frame_end_tree_toggle_scenario(case: &str) {
         std::fs::write(active.join(format!("img{index}.png")), png.get_ref()).unwrap();
     }
     app.folder_pane.test_scan_subtree(root);
-    app.load_folder(active.clone());
+    app.load_folder_and_finish_for_test(active.clone());
     settle(&mut app, &ctx);
     app.settings.folder_tree_pane_visible = false;
     let mut frame = 0;
@@ -3808,7 +3811,7 @@ fn folder_pane_reported_delete_is_reflected_after_main_list_acceptance_without_t
     let (mut app, folder, ctx) = fixture(&["a.jpg"]);
     let aaa = folder.join("aaa");
     std::fs::create_dir(&aaa).unwrap();
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     settle(&mut app, &ctx);
     app.folder_pane = FolderPaneState::test_tree(&folder, vec![aaa.clone()]);
     app.folder_pane.test_seed_listing(&aaa, vec![], true);

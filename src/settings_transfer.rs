@@ -650,6 +650,8 @@ preferences_policy! {
         subfolder_expansion_filter_size_preset => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         stack_separator => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         stack_script_enabled => @prefs("分類ルールをスクリプト (カスタム) で行う", "folder/stack-script", |_, _| true, plain, plain) "移行先のローカルスクリプト実行方針を保持";
+        operation_script_enabled => "環境設定だけが確定するローカルスクリプトの実行許可。転送やAIによる設定変更では変更しない";
+        operation_script_notice_confirmed => "環境設定のOKで確定する第三者スクリプトの端末内の確認記録。別端末へ転送しない";
         thumb_px => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         text_preview_scale => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         text_smart_snap_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -746,6 +748,8 @@ preferences_policy! {
         export_batch_directory => "起動・保存・整理先の PC 固有パス";
         export_batch_template => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         export_batch_format => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        combine_options => "環境設定外で管理する結合の前回値 (PC 固有パスを含む)";
+        combine_presets => "環境設定外で管理する結合のプリセット (PC 固有パスを含む)";
         export_batch_options => "環境設定外で管理する一括書き出しの前回値 (PC 固有パスを含む)";
         export_batch_presets => "環境設定外で管理する一括書き出しのプリセット (保存先・ロゴの PC 固有パスを含む)";
         export_batch_scale => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -2666,7 +2670,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 522);
+        assert_eq!(entries.len(), 526);
         assert_eq!(
             entries
                 .iter()
@@ -2679,7 +2683,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            348
+            352
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2722,7 +2726,12 @@ mod tests {
                 .any(|(field, reason)| *field == "export_batch_presets" && reason.is_some())
         );
         assert!(!wire.contains(&"export_batch_presets"));
-        for key in ["agent_show_current_view", "agent_allow_settings"] {
+        for key in [
+            "agent_show_current_view",
+            "agent_allow_settings",
+            "operation_script_enabled",
+            "operation_script_notice_confirmed",
+        ] {
             assert!(
                 entries
                     .iter()
@@ -2749,6 +2758,39 @@ mod tests {
                 .collect::<HashSet<_>>(),
             wire.into_iter().collect()
         );
+    }
+
+    #[test]
+    fn image_combine_paths_and_presets_are_excluded_from_transfer() {
+        let entries = classifications();
+        let wire = wire_keys();
+        for field in ["combine_options", "combine_presets"] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(name, reason)| *name == field && reason.is_some())
+            );
+            assert!(!wire.contains(&field));
+        }
+        let mut live = Settings::default();
+        live.combine_options = Some(crate::image_combine::CombineOptions {
+            margin: 20,
+            background_color: [12, 34, 56],
+            transparent_background: true,
+            ..Default::default()
+        });
+        live.combine_presets
+            .push(crate::image_combine::CombinePreset {
+                name: "sample".into(),
+                options: Default::default(),
+            });
+        let mut draft = Settings::default();
+        draft.overwrite_non_preferences_from(&mut live);
+        let options = draft.combine_options.unwrap();
+        assert_eq!(options.margin, 20);
+        assert_eq!(options.background_color, [12, 34, 56]);
+        assert!(options.transparent_background);
+        assert_eq!(draft.combine_presets[0].name, "sample");
     }
 
     #[test]

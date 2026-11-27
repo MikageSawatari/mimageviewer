@@ -1,5 +1,12 @@
 # egui 0.37.0 のローカル変更（段2a-1／2a-2／2a-3）
 
+## §1.919: Native button time (2026-11-27)
+
+`PointerButtonTime` と `RawInput.input_clock` で入力時刻を pass の時計へ変換する。
+`EdgeTime::since` は両端に入力時刻があるときだけその差を使い、片端でも不明なら pass 差へ戻す。
+`PointerState::button_edges` は判定済みの押す・離す・位置・クリック回数を同じ内部記録から返す。
+時間注釈とボタンの間に許されるのは provenance だけ。cancel 後の edge は返さない。
+
 ## 依頼55 独立レビュー: 位置のない物理button終端（2026-11-15）
 
 再レビューの規則を反映し、位置なし終端は保持だけを終え、click／tap／短押し／drop／seek／closeの

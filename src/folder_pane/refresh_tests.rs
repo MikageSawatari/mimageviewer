@@ -262,7 +262,7 @@ fn folder_pane_reclick_rechecks_demand_without_changing_presentation_or_gesture(
             pos: egui::pos2(50.0, 80.0),
             toggled: false,
         },
-        time: 10.0,
+        time: 10.0.into(),
     };
     state.label_display = Some(FolderPaneLabelDisplay {
         pass: 7,

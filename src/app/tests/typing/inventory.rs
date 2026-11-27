@@ -43,6 +43,12 @@ const fn exempt(
 // address field. Their separate adapters exercise its callers through App frames.
 const INPUT_TESTS: &[Entry] = &[
     tested(
+        "src/ui_dialogs/image_combine.rs",
+        "show_singleline(ui, text,",
+        1,
+        "typing_image_combine_label_preview_ascii",
+    ),
+    tested(
         "src/ui_history_field.rs",
         "show_singleline(ui, text,",
         1,
@@ -94,6 +100,12 @@ const INPUT_TESTS: &[Entry] = &[
 
 const EXEMPTIONS: &[Entry] = &[
     exempt(
+        "src/app/page_edit_grid_tests.rs",
+        "show_singleline(ui, &mut text,",
+        2,
+        "一覧の拒否通知が文字入力・IME の Esc を奪わないことを検査するテスト用入力欄。入力で検索や候補更新は行わない",
+    ),
+    exempt(
         "src/ui_dialogs/export_batch/watermark.rs",
         "&mut options.text",
         1,
@@ -122,6 +134,12 @@ const EXEMPTIONS: &[Entry] = &[
         "show_singleline(ui, &mut text,",
         2,
         "ドロップと入力所有の境界を検査する fixture",
+    ),
+    exempt(
+        "src/app/operation_script_runtime/tests.rs",
+        "show_singleline(ui, &mut text, Some(&mut focus)",
+        1,
+        "文字入力中に操作スクリプトを起動しない入力所有を検査する fixture",
     ),
     exempt(
         "src/app/pinned_search/history_tests.rs",
@@ -386,6 +404,18 @@ const EXEMPTIONS: &[Entry] = &[
         "add_singleline(ui, &mut text,",
         2,
         "ページ内スクロールの入力所有 fixture",
+    ),
+    exempt(
+        "src/ui_fullscreen/operation_script_event_tests.rs",
+        "show_singleline(ui, &mut text, Some(&mut focus)",
+        1,
+        "文字入力中に操作スクリプトのイベントを検出しない入力所有を検査する fixture",
+    ),
+    exempt(
+        "src/ui_fullscreen/operation_script_owner_tests.rs",
+        "show_singleline(ui, &mut text, Some(&mut focus)",
+        2,
+        "文字入力中に全画面の操作スクリプトを起動しない入力所有を検査する fixture",
     ),
     exempt(
         "src/ui_metadata_panel/exif_copy_tests.rs",

@@ -1,5 +1,19 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.363 段1〜5実装: `ScriptSlot1..20` はGlobal / Press / 既定キーなし。
+操作カスタマイズの表示名は固定の「スクリプト操作 N」とし、同じ番号の `RingActionId` とキー行を共用する。
+キー・リング等から共通の利用資格と実行経路へ接続する。キーの自動繰り返しでは起動しない。
+スクリプトの `label` は環境設定「拡張と診断 → 操作のスクリプト」と右クリックメニューだけに表示する。
+有効化と初回確認は環境設定の下書き → OKで確定し、割り当て自体は操作カスタマイズで行う。
+2つの確認モーダルのEnter / Escapeは既存のdialog helperを使い、親へ漏らさない。
+Enterでは既定確定せず、Escapeは子だけを取り消す。ダイアログの入力なのでKeyAction追加の対象外。
+通常native動画の右クリックからの実行は未対応。検証状況と境界は [設計](operation-script-plan.md)。
+
+§17.2追補: 既存の `FsDepthParallax` / `FsSlideshow` を画像のスクリプトの種別Aへ追加する
+(どちらもイベント不可)。キーの位置・既定割り当てを保ち、受付の純粋判定と既存のトグル本体を共有する。
+Sのconsume・360°の判定・実行の間、およびDの直後に見られる状態の評価時点は移動しない。
+新しいキー操作やカスタマイズ項目は追加しない。
+
 §1.476: 閲覧中のタグ欄の検索確定は、既存の固定 TextEdit Enter 受付を共用する。
 通常の欄とフォーカス予約からの受付を `submit_tag_search_input` にそろえ、IME・modal の拒否条件と
 egui/native の入力所有を保つ。新しい KeyAction・割当・pending 状態は追加しない。
@@ -765,6 +779,11 @@ ini 出力のみ `;` / `#` を含む表記を KeySlot の別名に置換し、`S
 - GridColumnCount1..10 `Alt+1`..`Alt+0`、GridColumnCount11..20 は既定キーなし、GridToggleDetailsView `Alt+-` (P)
 
 ### Grid (Ph4)
+- `GridCombineSelection` は Grid / Press、既定未割り当て、ini 名 `grid_combine_selection`。
+  一覧の右クリック・ツールメニューと同じ結合受付を使う。結合ダイアログの Enter は書き出しに使わない。
+- `GridCombineReopen` も Grid / Press、既定未割り当て、ini 名 `grid_combine_reopen`。
+  1件の通常画像の保存済み構成を開く「結合をやり直す...」へ合流し、新規結合とは別に割り当てられる。
+
 - GridSearchNameEverything / GridSearchNameMetadata / GridSearchNameLocal は既定なしのPress（§1.690）。
   既存の検索欄へ名前を入れるだけで、検索を始めない。
 - GridCursorRight/Left/Up/Down `矢印` (P)(予約候補) / GridOpenSelected `Enter` (P) / GridOpenExternalPlayer `Shift+Enter` (P) /

@@ -31,6 +31,7 @@ fn settle(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         app.poll_open_path_classification(ctx);
+        app.poll_direct_navigation_scan_for_test(ctx);
         app.poll_collection_history_transition(ctx);
         app.poll_zip_enumerate();
         app.poll_sidecar_restore(ctx);
@@ -43,6 +44,7 @@ fn settle(app: &mut App, ctx: &egui::Context) {
                 .history_navigation_transition()
                 .is_none()
             && !app.sidecar_restore_active()
+            && !app.direct_navigation_scan_pending()
             && !app.book_composition.is_pending()
             && !app.book_composition_permission.pending()
             && !app.fs_nav_deferred_reopen_wait_active()
@@ -1223,7 +1225,7 @@ fn section1675_snapshot_zipdir_keeps_explicit_list_navigation() {
     let book = shelf.join("outer.zip");
     write_pages(&book, &["A/001.png", "A/002.png", "B/001.png"]);
     app.indexer_init = IndexerInit::Unavailable;
-    app.load_folder(shelf);
+    app.load_folder_and_finish_for_test(shelf);
     settle(&mut app, &ctx);
     app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
     settle(&mut app, &ctx);
@@ -1430,7 +1432,7 @@ fn section1676_physical_history_roundtrip_does_not_restore_list_choice() {
             .chosen_list_return_plan()
             .is_some()
     );
-    app.load_folder(other.clone());
+    app.load_folder_and_finish_for_test(other.clone());
     settle(&mut app, &ctx);
     assert!(app.zip_nav.is_none());
     app.dispatch_folder_history_input_for_test(FolderHistoryDirection::Back);
@@ -1675,6 +1677,7 @@ fn section1676_collection_live_and_terminal_close_preserve_owner_and_back_out() 
             OpenRequestOwner::CollectionGridPhysical(shelf_owner),
             StartupListIntent::ExplicitList,
         ));
+        app.finish_direct_navigation_scan_for_test();
         settle(&mut app, &ctx);
         let book_idx = app
             .items
@@ -1807,10 +1810,12 @@ fn section1676_reading_history_owner_survives_chosen_live_and_terminal_return() 
 fn settle_rating(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
+        app.poll_direct_navigation_scan_for_test(ctx);
         app.poll_rating_view();
         app.poll_collection_history_transition(ctx);
         app.poll_sidecar_restore(ctx);
         if app.rating_view_pending.is_none()
+            && !app.direct_navigation_scan_pending()
             && !app.sidecar_restore_active()
             && app
                 .top_level_grid_view
@@ -1877,11 +1882,13 @@ fn section1676_rating_owner_survives_chosen_live_and_terminal_return() {
 fn settle_smart(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
+        app.poll_direct_navigation_scan_for_test(ctx);
         app.poll_smart_folder(ctx);
         app.poll_collection_history_transition(ctx);
         app.poll_zip_enumerate();
         app.poll_sidecar_restore(ctx);
         if !app.smart_folder_busy()
+            && !app.direct_navigation_scan_pending()
             && !app.sidecar_restore_active()
             && app.zip_enumerate_pending.is_none()
             && app
@@ -1972,7 +1979,7 @@ fn section1676_subfolder_origin_keeps_existing_physical_backout_after_chosen_clo
         app.active_quick_folder_slot = None;
         app.settings.auto_fullscreen_zip_pdf = false;
         app.settings.detached_viewer_open_images_in_window = false;
-        app.load_folder(shelf.clone());
+        app.load_folder_and_finish_for_test(shelf.clone());
         settle(&mut app, &ctx);
         app.start_subfolder_expansion_scan_roots(shelf.clone(), vec![shelf.clone()]);
         let deadline = Instant::now() + Duration::from_secs(30);

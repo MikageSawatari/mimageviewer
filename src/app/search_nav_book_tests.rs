@@ -50,7 +50,7 @@ fn search_nav_book_retained_result_child_records_saved_origin_route_and_real_bac
         std::fs::create_dir_all(&child).unwrap();
         let target = configure_target(&mut app, KeyAction::GridOpenActiveBook);
         let ctx = egui::Context::default();
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         super::section375_tests::settle(&mut app, &ctx);
 
         // A genuine saved lineage has more than a root scope. Flattening every
@@ -551,6 +551,7 @@ fn initialized_collection_runtime(path: PathBuf) -> CollectionStoreRuntime {
 fn settle_target(app: &mut App, ctx: &egui::Context, target: &Target) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
+        app.poll_direct_navigation_scan_for_test(ctx);
         app.poll_book_op_pending(ctx);
         app.poll_collection_ui(ctx);
         app.poll_saved_group_open(ctx);
@@ -558,6 +559,7 @@ fn settle_target(app: &mut App, ctx: &egui::Context, target: &Target) {
         app.poll_history_navigation_transition_for_test(ctx);
         app.poll_sidecar_restore(ctx);
         if target_adopted(app, target)
+            && !app.direct_navigation_scan_pending()
             && app.saved_group_open_request_id_for_test().is_none()
             && app
                 .top_level_grid_view

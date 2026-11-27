@@ -431,6 +431,10 @@ function Get-MivChangedPaths {
 
 # Add a field's drawing/input/result-adoption files here when adding a typing adapter.
 $script:MivTypingProductPaths = @(
+    "src/ui_dialogs/image_combine.rs",
+    "src/ui_dialogs/image_combine/options_ui.rs",
+    "src/ui_dialogs/image_combine/presets.rs",
+    "src/image_combine/worker.rs",
     'src/ui_dialogs/preferences/browser_integration.rs',
     'src/browser_integration/mod.rs',
     'src/browser_integration/backend.rs',
@@ -507,7 +511,7 @@ function Get-MivFocusedPlan {
             }
             continue
         }
-        if ($path -match '(^|/)(Cargo\.(toml|lock)|build\.rs)$|^src/(lib|main|app)\.rs$|^src/app/tests\.rs$|^(\.cargo/|\.config/|vendor/|tests/(support|snapshots)/)') {
+        if ($path -match '(^|/)(Cargo\.(toml|lock)|build\.rs)$|^src/(lib|main|app)\.rs$|^src/app/tests\.rs$|^tests/integration\.rs$|^(\.cargo/|\.config/|vendor/|tests/(support|common|snapshots)/)') {
             $broad.Add($path); continue
         }
         $package = $null
@@ -530,8 +534,8 @@ function Get-MivFocusedPlan {
             $selection += '--lib'
             $filter = 'test(~' + ($components -join '::') + '::)'
         } elseif ($path -match '^tests/([A-Za-z_][A-Za-z0-9_-]*)\.rs$') {
-            $selection += @('--test', $Matches[1])
-            $filter = 'kind(test)'
+            $selection += @('--test', 'integration')
+            $filter = 'test(/^' + $Matches[1] + '::/)'
         } elseif ($path -match '^tests/') {
             $broad.Add($path); continue
         } else { $broad.Add($path); continue }
