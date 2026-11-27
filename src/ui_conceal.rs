@@ -2624,7 +2624,13 @@ impl App {
                                         });
                                         ui.separator();
 
-                                        if ui.add_enabled(self.mask_detect_available(crate::app::MaskDetectTool::Conceal), egui::Button::new("自動検出…")).clicked() {
+                                        let detect = ui.add_enabled(self.mask_detect_available(crate::app::MaskDetectTool::Conceal), egui::Button::new("自動検出…"));
+                                        #[cfg(test)]
+                                        {
+                                            let test_response = (detect.id, detect.rect, detect.clicked());
+                                            ctx.data_mut(|data| data.insert_temp(egui::Id::unique("mask_detect_conceal_start_rect"), test_response));
+                                        }
+                                        if detect.clicked() {
                                             self.open_mask_detect_dialog(crate::app::MaskDetectTool::Conceal);
                                         }
                                         // ツールパレット。筆/囲みはビットマップ下地、線/矩形/楕円は
@@ -2651,14 +2657,20 @@ impl App {
                                                 for &(kind, base_label) in *row {
                                                     let label =
                                                         self.conceal_tool_label(base_label, kind);
-                                                    if panel_toggle_button(
+                                                    let response = panel_toggle_button(
                                                         ui,
                                                         label.as_str(),
                                                         tool == kind,
                                                         Some(btn_size),
                                                         None,
-                                                    )
-                                                    .clicked()
+                                                    );
+                                                    #[cfg(test)]
+                                                    if kind == ConcealTool::Brush {
+                                                        // Response::clicked may lock its Context; snapshot before data_mut.
+                                                        let test_response = (response.id, response.rect, response.clicked());
+                                                        ctx.data_mut(|data| data.insert_temp(egui::Id::unique("mask_detect_conceal_brush_rect"), test_response));
+                                                    }
+                                                    if response.clicked()
                                                     {
                                                         tool = kind;
                                                     }

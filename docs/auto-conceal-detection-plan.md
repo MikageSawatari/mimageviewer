@@ -120,8 +120,11 @@
 描画後は Context の Light / Dark 両 Style と theme preference を復元する。
 両 Window は `Order::Foreground` とし、表示中は毎フレーム、その Window の Area と同じ LayerId を
 `set_modal_layer` に登録する（egui の Modal と同じ方式）。背面のツールパネルへの入力を egui の層でも止め、
-既存の `mask_detect_active` による入力遮断も維持する。初回／再表示時の最前面化は Area 自身の処理を使い、
-アプリから毎フレーム／開く時点の `move_to_top` は追加しない。tooltip と発火面付きトーストは Tooltip 段で窓より上に描く。
+既存の `mask_detect_active` による入力遮断も維持する。自分が前面モーダルで popup が無く、
+自分より上に見えている Foreground の Area がツールパネルだけの場合は、パネルより上という不変条件を毎 pass 確かめる。
+順序が逆のときだけ `move_to_top` と再描画要求を行う（§23.10 の B 案）。正しい順序なら何もしない。
+別の上位モーダル・Area・popup は追い越さず、それらが閉じて条件を満たせば再判定で順序を直す。表示開始の pass を記録する状態は持たない。
+tooltip と発火面付きトーストは Tooltip 段で窓より上に描く。
 ダイアログから開いた menu / combo の popup は Foreground 内で親より上になり、モーダルの入力制限を通る。
 設定窓の Escape は `top_modal_layer` が自分の場合、または初回でまだ登録が無い（`None`）場合だけ受け付ける。
 そのうえで既存の `dialog_escape_pressed` による IME・popup の判定を通す。他の Modal が上にある場合は背面の設定窓を閉じない。
@@ -1345,7 +1348,7 @@ mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_during
   `is_above_modal_layer` / `allows_interaction` と `layer_id_at` が背面への押下・focus を遮断し、パネルがクリックで上がるのを防ぐ。
   段 1 のパネル・キー・キャンバスの入力遮断も残し、egui の層による遮断で置き換えていない。
 - 初回／再表示の順序は `Area::begin` が `!visible_last_frame` のとき自動で最前面化し、`Areas::end_pass` が描画順へ反映する。
-  このソース上の仕組みを採用し、開く操作時の追加の最前面化も毎フレームの後追いも不要と判断した。
+  r11 時点ではこの仕組みだけで十分と判断したが、同じ pass でパネルも最前面化を求める場合は不足すると §23.10 で確認した。
   r8・r10 の回帰を、パネル押下直後・別ツールからの再表示・検出中の押下について、開いた最初のフレームから各フレームの
   層順序を検査するよう拡張した（修正後は未実行なので、最初のフレームの合格を確認した記録ではない）。
   egui の modal layer は次の pass へ引き継がれる標準の仕組みで、定常時の modal id・背面の interaction 拒否も検査する。
@@ -1428,3 +1431,178 @@ mask_detect_settings_escape_closes_without_other_modal_on_first_and_later_frames
   - 利用者の操作でないモーダルが初めて出る 1 フレームに Escape が届く場合だけなので、pass をまたいだ Escape の所有の仕組みは
     足さない (設計の簡素化)。
 - 設計担当の run-heavy: cargo check 成功、filter 180 件成功、実モデル照合成功 (e600c22df)。
+
+### 23.10 同じ pass の押下・離しで開き直す場合の層順序（実行検証待ち）
+
+- 観測者はサブ PC の Claude。`f078d1172` の再確認で、隠蔽加工の選択中の［筆 [B]］をクリックしてすぐ［自動検出…］を
+  クリックする b-2 だけ、パネルが窓の上に残り、0.3 秒後・1.8 秒後も変わらなかったとの報告。Ctrl+M 直後の b-1 と
+  検出中にパネルを押す b-3 は期待どおりとの報告。今回の実装担当自身の実機観測・起動ではない。
+- 設計担当の見立てはソース上で一致する。`Area::begin` はパネル上の press と窓の再表示でそれぞれ `move_to_top` を求める。
+  `Areas::end_pass` の `(order, wants_to_be_on_top)` による安定ソートは、両方が true なら元の上下を維持する。
+  同じ RawInput に press / release が入ると実ボタンの clicked で窓を同じ pass に開けるため、以前の Window Id がパネルより下なら
+  同点のままになる。次の pass 以降は modal layer がパネルの press を遮断するだけで、既に逆になった描画順を直す契機は無い。
+  これまでのテストはボタンを押した後で `open_mask_detect_dialog` を直接呼ぶか、窓を先に描いており、この同時要求を作っていなかった。
+- 再現テストは同じ Context で実際の各ツールの［自動検出…］から一度開き、［閉じる］で閉じ、選択済みの実際の［筆］へ press / release
+  を送る。Brush の Response が clicked になったことと、保存された Window の層が筆のパネルより下になった前提を確認したうえで、
+  実ボタンから同じ RawInput の press / release で再び開き、後続の pass の順序を検査する。分離した press / release も 3 ツールで検査する。
+  消しゴム・隠蔽加工では筆と検出が同じパネルなので、修正前の形では上記の同点が保たれ、後続 pass の「窓がパネルより上」の検査が
+  失敗するはずというソース上の根拠がある。補正レイヤーは筆と検出が別パネルで、この前提が異なる（下の r17 後の記録を参照）。
+  cargo の実行禁止により、この失敗も修正後の成功も実装担当は実行確認していない。
+- r14 の初案 A は表示開始の次の pass に限る 1 回の最前面化。egui の一時データに viewport Id + Window Id ごとの
+  `First(pass)` / `Visible(pass)` を持ち、連続する次の pass にだけ `ctx.move_to_top` を要求する。
+  同じ pass の二重呼び出しは無視し、非表示の間隙・明示的な閉じる操作・設定窓と進行窓の切替では表示開始を取り直す。
+  表示開始時だけ次の repaint を要求し、定常時には最前面化・追加の repaint を行わない。App や viewer context bundle へ新しい field は足さない。
+- 初案ではその 1 回を `top_modal_layer` が自分のときだけ許し、さらに自分より上に見えている別の Foreground の Area があれば見送る
+  （既知の 4 つのツールパネルだけは追い越してよい）。これにより modal 登録が 1 pass 古くても、最初の表示 pass に既に上へ出た別の
+  Modal を追い越さない。popup が開いている場合も見送る。見送った要求はその場で消費し、上位 Modal が閉じた後の再試行はしない。
+  Foreground を維持するため Tooltip の通知・説明も覆わない。R4 の Escape 所有と R6 の標準の 1 pass の遅れの判断は変更しない。
+- 進行窓も同じ Area の並べ替え規則を使うので初案は同じ表示 helper を使った。通常の［検出］からの遷移では設定窓の modal layer が既にパネルを
+  止めるため、パネルとの同時 press は作られないが、再表示と上位 Modal に対する同じ 1 回の処理を、結果注入で作った進行窓でも検査する。
+  対象照合・検出要求・worker・Undo・ツール側の入力遮断には変更を加えていない。
+- 初案で退けたもの: 同じ pass にその場でもう一度 `move_to_top` しても要求は集合なので同点を崩せない。毎 pass **無条件**に上げる形は
+  上位 UI の入力を奪い続ける。Debug は R3 の通知・tooltip 遮蔽を再発する。`set_sublayer` は複数パネルと popup の親子関係を新たに
+  固定し、1 段だけの sublayer の制約にも触れる。以下の比較で、無条件に上げる形と、不変条件の違反時だけ直す B は異なると整理した。
+- 追加テスト（未実行、既存 filter の `test(/mask_detect/)` に含まれる）:
+
+```text
+mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_three_tools
+mask_detect_front_layer_invariant_repairs_after_upper_modal_closes_for_settings_and_progress
+```
+
+  後者は A 用の `mask_detect_deferred_raise_yields_to_upper_modal_once_for_settings_and_progress` を B の検査へ置き換えたもの。
+  実際の別の Modal が最初の表示 pass に上へ出る場合に追い越さないこと、上位 Modal が閉じた後は再表示せずに順序を直せること、
+  表示開始から時間が経って起きた順序の逆転も直すことを検査する。3 パネルの変更は実ボタンの矩形・clicked を読む `cfg(test)` の計装と
+  Response の名前付けだけで、表示内容・操作・文字列は変更していない。
+
+#### 標準 Modal の順序保持の確認（r14 後の設計比較）
+
+- `vendor/egui/src/containers/modal.rs` の `default_area` は Foreground・interactable・`Sense::hover()` の Area を作る。
+  `Modal::show` は毎 pass `set_modal_layer(area.layer())` で入力所有を登録するが、自身では `move_to_top` を呼ばない。
+  最前面化は `area.rs` の `Area::begin` にある、move Response の clicked / dragged、`pointer_pressed_on_area`、
+  `!visible_last_frame` の条件に従う。Modal の hover の親 Response は通常 clicked / dragged を生じないが、押下判定と再表示の条件は残る。
+- backdrop は同じ Area の層に属する、`content_rect` 全体の CLICK / DRAG の child UI。背面への入力を受け止め、clicked は
+  `ModalResponse::should_close` の理由になる。そこで受けた押下が Area の `pointer_pressed_on_area` の条件を満たせば最前面化の契機にもなるが、
+  backdrop による別の層・無入力 pass ごとの最前面化・安定ソートの同点を崩す特別処理は無い。
+  `set_modal_layer` と `should_close` の前面判定も、描画順を直接並べ替えるものではない。
+- したがって標準 Modal でも、保存済みの層がパネルより下にあり、表示する pass にパネルと Modal の Area の両方が最前を求めれば、
+  `Areas::end_pass` の安定ソートで下のまま残り得る。これはソースからの判断で、標準 Modal 自体の実行再現は未実施。
+  `Modal` の doc comment も、複数の Modal が同じフレームに新しく出る場合の前後は未定義としている。
+
+#### A・B の比較と採用する不変条件
+
+| 観点 | A: 表示開始の次の pass に 1 回 | B: 各 pass で必要な順序を検査 |
+|---|---|---|
+| タイミング | 特定の次の pass だけが修復の機会。その pass に保留条件や同点があると失う | 表示開始の時点に依存せず、修復可能な pass で違反を直す。再び同点なら以後も検査する |
+| 「最前」の範囲 | 上位 modal / Area / popup を保護する guard が必要 | 同じ guard が必要。Foreground 全体を無条件に追い越す意味ではなく、ツールパネルとの順序を不変条件にする |
+| 状態 | viewport + Window ごとの First / Visible、pass 番号、閉じる／切替の初期化、見送った要求を消費する規則 | 本番用の一時状態なし。現在の modal・popup・可視層の順序から判定する |
+| パネルの識別 | 既知の 4 パネルを追い越してよい対象として識別 | 同じ識別を残す。状態は減るが、同じ Foreground のパネルと正当な上位 UI の区別は省けない |
+| 見送った後 | 上位 Modal 等が閉じても、自分を開き直さなければ直らない | 上位 Modal 等が閉じれば再表示せずに直る。表示開始後の別の逆転も対象になる |
+| 正常時の費用 | 状態の読み書きを毎 pass 行う | viewport 内の少数の層を確認するだけ。正常時は最前面化も追加の repaint も無い |
+
+- A が「次の pass」に頼る点は認める必要がある。次の pass にパネルが最前を求めないという根拠は、通常は同じ RawInput の
+  press / release が既に終わっていること。modal 登録だけでは十分ではない。誤った描画順でパネルが modal より上なら
+  `Memory::is_above_modal_layer` はパネルを上位と判定するため、Area の押下まで必ず遮断されるわけではない。
+  App の `ui.disable` はパネルのボタン操作を止めるが、Area 自身の `pointer_pressed_on_area` とは別である。
+- **結論: B の方が構造として正しいため、A から B に変更する。** 不変条件は「自分が前面 modal で popup が無く、
+  自分より上の可視 Foreground Area がツールパネルだけなら、窓をそれらのパネルより上へ戻す」。
+  他の Foreground Area が 1 つでも上にあれば上げないため、別の Modal や窓自身の menu / combo popup を毎 pass 追い越す形にはしない。
+  `top_modal_layer` は 1 pass 古いので、modal の照合と可視 Area の照合を両方残す。popup の有無も確認する。
+  Tooltip は別の上位 Order なので修復対象外で、通知・説明は窓より上のまま。
+- B も egui の pass の観測と end_pass の並べ替えを使う。直したい pass に別の同点要求が来ればその pass 内で直る保証は無いが、
+  違反が残れば次の pass も確認するため、A のように 1 回の機会を失って固定されない。R6 の標準の 1 pass の modal 所有の扱いは変えない。
+- 実装は `maintain_mask_detect_window_layer` を設定窓・進行窓で呼ぶだけとし、First / Visible・pass 番号・表示の cleanup・
+  次の pass のためだけの repaint を削除した。逆転を見つけて `move_to_top` したときだけ repaint を要求して再確認し、正しければ何もしない。
+  本番用の状態は追加していない（テスト専用の呼出回数の記録は本番に含まれない）。汎用の modal 管理機構や新しい callback は作らない。
+- 回帰は 3 ツールの実ボタンによる同じ RawInput / 分離した press・release を維持した。加えて設定窓／進行窓の順序を表示開始とは別の
+  後続 pass で意図的に逆転させ、上位の実 Modal を追い越さず、閉じた後に再表示なしで直すことを検査する。
+  既存の `mask_detect_foreground_modal_allows_menu_and_combo_popup_selection` に、実 popup の層が親より上で保たれ、項目をクリックでき、
+  親窓の追加の最前面化が発生しないことの検査も加えた。正常な順序に戻った後の複数 pass で追加の最前面化が無いことも検査する。
+  これらの追加・変更後の cargo 検証は未実行。全件が既存の `test(/mask_detect/)` に含まれる。
+
+#### r15 のテスト計装の Context 再入の修正
+
+- 設計担当からの共有 runner の報告: r15 は cargo check 成功、filter は 182 件中 181 件成功。
+  `mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_three_tools` だけ、egui の write lock を
+  10 秒取得できず debug panic になった。
+- 原因は 3 ツールの筆ボタンに追加した `cfg(test)` の計装。`ctx.data_mut` の closure 内で `(response.rect, response.clicked())` を
+  評価していた。`Response::clicked` は pointer のクリック成立時に `clicked_by` → `self.ctx.input` を呼び、
+  `Context::input` は読み取り用の API 名でも内部で `self.write` を使う。`data_mut` が保持する同じ Context の write lock へ再入していた。
+  CLICKED が無い pass は短絡評価で `ctx.input` を呼ばないため、実際の筆ボタンのクリックで初めて止まる。
+  テストは消しゴムから始まるので、最初の該当箇所は消しゴムの計装で、隠蔽加工・補正レイヤーにも同じ誤りがあった。
+- 3 箇所とも `response.clicked()` をロックの外で評価した tuple を作り、`data_mut` 内では値の保存だけを行うよう修正した。
+  この計装は `cfg(test)` なので本番にはコンパイルされず、今回の再入はテスト専用。通常の clicked 判定はもともと closure の外にあり維持する。
+- 本番でも到達する経路は別に確認した。`maintain_mask_detect_window_layer` の `memory` closure は Memory の値だけを読み、
+  popup 判定・`move_to_top`・repaint は closure の外。2 つの呼出箇所も Context のロック closure 内には無い。
+  `with_dark_context_style` の guard は Context の clone と Style の Arc を持つだけで、ロックを保持せずに callback を呼ぶ。
+  egui の `root_ui` / Area の `show` も、UI callback の実行時に Context のロックを保持しない。
+  テスト内の `memory` / `data` / `input` closure と残りの関連計装も確認し、矩形・bool・層の値の読み書きだけで再入は見つからなかった。
+  `Ui::is_enabled` / `Ui::visuals` / `Response::enabled` は Ui の保持値や flags の参照で、`Response::clicked` とは異なる。
+- 同じ回帰テストを維持する（`test(/mask_detect/)` に含まれる）。構造は 3 ツール × 同一／分離入力の 6 ケース、
+  各 28／29 回の有限な headless フレームで、待機 loop・sleep・blocking recv は無い。テストが保持する Loading の sender により
+  一覧の再読込は runtime 準備の前で return し、ONNX・一覧の worker は起動しない。画像は 8×8 の fixture。
+  10 秒の固定 lock 待ちを生む経路は除去したが、修正後の実行と「10 秒以内」の実測は cargo 実行禁止のため未確認。共有 runner へ引き継ぐ。
+- 実行: `cargo fmt`（引数なし）・`git diff --check` は終了コード 0、glyph 検査は危険 glyph 0。cargo の build / test / check / clippy / nextest、確認用 binary の build、
+  アプリ起動、git add / commit は依頼に従い未実行。共有 runner での再現／修正後の検証とサブ PC の実機確認は設計担当へ引き継ぐ。
+
+#### r15 の実ボタンクリックの fixture 修正
+
+- 設計担当からの共有 runner の報告: Context の再入による待ちは解消し、filter は 182 件中 181 件成功。
+  同じ回帰テストが `Conceal, together=true: real button must open the Window` で失敗した。
+  loop は Erase → Conceal → LocalAdjust、各ツールは together=true → false の順なので、消しゴムの両ケースは最後まで通過済み。
+  隠蔽加工の true は初回の分離入力での開閉・筆の clicked・古い層順の検査まで通過した。
+  隠蔽加工の false と補正レイヤーの両ケースは未到達であり、成功とは扱わない。
+- コード上の判定はテストの入力生成と検査の誤り（依頼の b）。旧 fixture は、窓の［閉じる］の位置から筆へ
+  PointerMoved と press を同じ RawInput で送り、release は次のフレームへ送っていた。
+  `PointerState::begin_pass` の delta は press より前の移動も含むフレーム間の差で、
+  `hit_test` は click 専用の筆と、その下の drag 専用 ScrollArea の両方を返す。
+  `interaction::interact` は drag 専用の背景を press 直後から dragged とし、隠蔽パネルの `DragScroll::Always` の native 経路は
+  その delta を `ScrollArea::begin` でスクロールへ渡す。本文はその更新より前の offset で配置されるため、
+  次の release フレームでは本文が動く一方、clicked は前の pass の widget ID によって成立し得る。
+  筆の clicked が通っても、次に使う［自動検出…］の描画矩形が clip 内にある保証はなかった。
+  製品の検出ボタンは 3 ツールとも普通の Button の clicked から共通の open へ進み、同一 RawInput の press / release を
+  除外する分岐は無い。egui の interaction 自身も、同一フレーム内で完了するクリックを drag としない。
+- fixture は各ボタンの位置へボタンを離したまま PointerMoved を 1 フレーム送り、次に静止したクリックを送る形へ直した。
+  スクロール状態のリセット、待ち時間、製品のスクロール・クリック処理の変更は加えない。
+  筆を押す前後で検出ボタンの矩形が動かないこと、実 widget ID の Response が enabled で、その中心が
+  clip 後の interact_rect 内かつ当該パネルの層にあることを検査する。
+  再表示時は引き続き **1 つの RawInput に press と release の両方**を入れるケースと、分離するケースを 3 ツールで検査する。
+  両 edge の hit-test の宛先が実検出ボタンの ID で入力可能であること、実 Response の clicked、窓の open、
+  後続の層順・不要な追加前面化が無いことまで検査する。sizing の再 pass があっても、クリックの証跡は同じ run_ui 内で保持する。
+  各ケースの完了も eprintln! に出し、途中失敗時の到達範囲を判別できるようにした。
+- 変更は既存の `mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_three_tools` と
+  3 パネルの cfg(test) の計装・本記録だけ。本番の処理は変更しない。Context の再入を避けるため、clicked は
+  data_mut の外で評価し、read_response・入力の宛先の取得も data / memory の closure の外で行う。
+  有限な 6 ケース・各 32 / 33 headless フレームで、worker・待機 loop・sleep は無い。
+  修正後の cargo 検証は未実行であり、スクロール量・修正後の実ボタンの成立の実測は共有 runner に引き継ぐ。
+- 実行: `cargo fmt`（引数なし）・`git diff --check` は終了コード 0、`python scripts/check_ui_glyphs.py` は危険 glyph 0。
+  cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動、git add / commit は未実行。
+
+#### r17 後の補正レイヤーのパネル配置に合わせた期待の修正
+
+- 設計担当からの共有 runner の報告: r17 後は消しゴム・隠蔽加工のケースが成功。
+  補正レイヤーの together=true の筆の層の検査だけ、実際の `local_adjust_panel` に対して
+  `local_adjust_tool_panel` を期待して失敗した。loop 順から前 2 ツールの 4 ケースは最後まで完了し、
+  補正レイヤーの true は初回の開閉後の筆の露出確認で停止、false は未到達。
+- コードで実際の配置を確認した。左の Foreground の Area `local_adjust_panel` は
+  `draw_local_adjust_left_panel` → `draw_local_adjust_manual_tool_selector` → `draw_local_manual_mask_tool_panel` で［筆］を描く。
+  右の別 Area `local_adjust_tool_panel` は、選択中のレイヤーの詳細の直前に［自動検出…］を描く。
+  筆が右パネルに覆われている製品の不具合ではなく、両ボタンが同じ層だとしたテストの誤り。
+- 一度窓を開いて閉じた後は両パネルより上にその Window Id の順序が残る。左の筆を押した後は下から
+  「右パネル < 窓 < 左パネル」で、検出のある右パネルは窓より下のまま。
+  右の検出ボタンの press / release と窓の再表示が同じ pass なら、前面化を要求する右パネルと窓の同点は
+  「右パネル < 窓」の順を保ち、要求しない左パネルはその下になる。
+  同じパネルの筆が検出パネル自身を窓より上にする消しゴム・隠蔽加工とは異なる。
+  これがサブ PC の Claude が補正レイヤーで重なりを観測しなかった経路と整合する理由。
+  補正レイヤーが常に逆転しないという一般的な保証とはしない。右パネルの別操作などで順序が変わる場合も、
+  既存の `maintain_mask_detect_window_layer` が左右両パネルを対象に不変条件を維持する設計は変えない。
+- テストは各ボタンの所属する LayerId を明示して、Response 自身の layer_id とポインター位置の hit test の両方を検査する。
+  筆の後は「筆のパネル > 窓」を 3 ツールで検査し、検出のパネルが窓より上なのは消しゴム・隠蔽加工だけと確認する。
+  補正レイヤーも同一 RawInput / 分離した press・release の両方で実検出ボタンへの両 edge の到達・clicked・open を検査し、
+  同一 RawInput の開いたフレームの終了時点と後続の複数フレームで窓が左右両パネルより上にあることを検査する。
+  この経路では不要な追加前面化が 0 回、消しゴム・隠蔽加工の同一 RawInput の同点修復は 1 回と期待を分ける。
+- 今回の変更は `src/app/mask_detect/input_tests.rs` と本記録。本番処理に新しい不具合は見つからず、変更していない。
+  既存の `mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_three_tools` を拡張し、
+  `test(/mask_detect_reopened_from_real_panel_click/)`（従来の `test(/mask_detect/)` にも含まれる）で選択できる。
+  修正後の cargo 検証・実機確認は未実行。共有 runner での検証は設計担当へ引き継ぐ。
+- 実行: `cargo fmt`（引数なし）・`git diff --check` は終了コード 0。UI 文字列・マニュアルの変更は無い。
+  cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動、git add / commit は未実行。

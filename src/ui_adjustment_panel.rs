@@ -4758,15 +4758,25 @@ fn draw_local_manual_mask_tool_panel(
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for &(tool, label) in row {
-                if local_adjust_panel_toggle_button(
+                let response = local_adjust_panel_toggle_button(
                     ui,
                     label,
                     *mask_tool == tool,
                     Some(btn_size),
                     false,
-                )
-                .clicked()
-                {
+                );
+                #[cfg(test)]
+                if tool == LocalAdjustMaskTool::Brush {
+                    // Response::clicked may lock its Context; snapshot before data_mut.
+                    let test_response = (response.id, response.rect, response.clicked());
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::unique("mask_detect_local_brush_rect"),
+                            test_response,
+                        )
+                    });
+                }
+                if response.clicked() {
                     *mask_tool = tool;
                 }
             }
@@ -16064,15 +16074,24 @@ impl App {
                                 ui.set_min_width(LOCAL_ADJUST_TOOL_PANEL_W);
                                 ui.set_max_width(LOCAL_ADJUST_TOOL_PANEL_W);
                                 if let Some(layer) = layers.get(selected_layer) {
-                                    if ui
-                                        .add_enabled(
-                                            self.mask_detect_available(
-                                                crate::app::MaskDetectTool::LocalAdjust,
-                                            ),
-                                            egui::Button::new("自動検出…"),
-                                        )
-                                        .clicked()
+                                    let detect = ui.add_enabled(
+                                        self.mask_detect_available(
+                                            crate::app::MaskDetectTool::LocalAdjust,
+                                        ),
+                                        egui::Button::new("自動検出…"),
+                                    );
+                                    #[cfg(test)]
                                     {
+                                        let test_response =
+                                            (detect.id, detect.rect, detect.clicked());
+                                        ctx.data_mut(|data| {
+                                            data.insert_temp(
+                                                egui::Id::unique("mask_detect_local_start_rect"),
+                                                test_response,
+                                            )
+                                        });
+                                    }
+                                    if detect.clicked() {
                                         self.open_mask_detect_dialog(
                                             crate::app::MaskDetectTool::LocalAdjust,
                                         );

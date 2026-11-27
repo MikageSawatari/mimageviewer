@@ -17,6 +17,56 @@ pub(crate) enum MaskDetectTool {
     LocalAdjust,
 }
 
+/// Reconcile the front modal's order against tool panels, without overtaking
+/// popups/other foreground UI. No display-start timer or pending repair state.
+fn maintain_mask_detect_window_layer(ctx: &egui::Context, layer: egui::LayerId) {
+    if egui::Popup::is_any_open(ctx) {
+        return;
+    }
+    let needs_raise = ctx.memory(|memory| {
+        if memory.top_modal_layer() != Some(layer) {
+            return false;
+        }
+        // top_modal_layer is one pass old. Also respect another visible Area
+        // above us, including a Modal that appeared in the previous pass.
+        let panels = [
+            "erase_tool_panel",
+            "conceal_panel",
+            "local_adjust_panel",
+            "local_adjust_tool_panel",
+        ]
+        .map(egui::Id::unique);
+        let mut found = false;
+        let mut panel_above = false;
+        for candidate in memory.layer_ids() {
+            if candidate == layer {
+                found = true;
+                continue;
+            }
+            if found
+                && candidate.order == egui::Order::Foreground
+                && memory.areas().is_visible(&candidate)
+            {
+                if !panels.contains(&candidate.id) {
+                    return false;
+                }
+                panel_above = true;
+            }
+        }
+        panel_above
+    });
+    if needs_raise {
+        ctx.move_to_top(layer);
+        ctx.request_repaint(); // Recheck after the stable sort, only on a repair.
+        #[cfg(test)]
+        {
+            let key = egui::Id::unique(("mask_detect_window_raises", ctx.viewport_id(), layer.id));
+            let pass = ctx.cumulative_pass_nr();
+            ctx.data_mut(|data| data.get_temp_mut_or_default::<Vec<u64>>(key).push(pass));
+        }
+    }
+}
+
 impl MaskDetectTool {
     fn name(self) -> &'static str {
         match self {
@@ -1089,11 +1139,11 @@ impl App {
         self.poll_mask_detect_catalog(ctx);
         if self.mask_detect_pending.is_some() {
             let id = egui::Id::unique("mask_detect_progress");
+            let layer = egui::LayerId::new(egui::Order::Foreground, id);
             // Like egui::Modal: block lower layers without covering Tooltip.
-            // Window::id is also its Area id; Area raises itself on reappearance.
-            ctx.memory_mut(|memory| {
-                memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, id))
-            });
+            // Window::id is also its Area id.
+            ctx.memory_mut(|memory| memory.set_modal_layer(layer));
+            maintain_mask_detect_window_layer(ctx, layer);
             crate::os_theme::with_dark_context_style(ctx, || {
                 egui::Window::new("検出中")
                     .id(id)
@@ -1132,6 +1182,7 @@ impl App {
         let mut reload = false;
         let mut folder = false;
         ctx.memory_mut(|memory| memory.set_modal_layer(layer));
+        maintain_mask_detect_window_layer(ctx, layer);
         let _window = crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("自動検出")
                 .id(id)

@@ -40,6 +40,20 @@ fn key(key: egui::Key) -> egui::Event {
     }
 }
 
+fn draw_mask_detect_real_panel(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    tool: MaskDetectTool,
+    transform: &DisplayedImageTransform,
+) {
+    match tool {
+        MaskDetectTool::Erase => app.draw_erase_overlay(ui, ctx, transform),
+        MaskDetectTool::Conceal => app.draw_conceal_panel(ctx, transform.viewport_rect),
+        MaskDetectTool::LocalAdjust => app.draw_local_adjust_panel(ctx, transform.viewport_rect),
+    }
+}
+
 fn draw_mask_detect_layer_frame(
     app: &mut App,
     ctx: &egui::Context,
@@ -57,13 +71,7 @@ fn draw_mask_detect_layer_frame(
             // Draw the real panels after the dialog too: Order, not call order or
             // the most recently clicked Area, must keep the dialog above them.
             app.show_mask_detect_dialog(ctx);
-            match tool {
-                MaskDetectTool::Erase => app.draw_erase_overlay(ui, ctx, transform),
-                MaskDetectTool::Conceal => app.draw_conceal_panel(ctx, transform.viewport_rect),
-                MaskDetectTool::LocalAdjust => {
-                    app.draw_local_adjust_panel(ctx, transform.viewport_rect)
-                }
-            }
+            draw_mask_detect_real_panel(app, ui, ctx, tool, transform);
         },
     )
     .drop_without_applying_deltas();
@@ -121,6 +129,393 @@ fn assert_mask_detect_layer_above(ctx: &egui::Context, dialog_id: &str, lower_id
         checked_overlap,
         "fixture must actually overlap the dialog and a lower surface"
     );
+}
+
+fn mask_detect_raise_count(ctx: &egui::Context, name: &str) -> usize {
+    let key = egui::Id::unique((
+        "mask_detect_window_raises",
+        ctx.viewport_id(),
+        egui::Id::unique(name),
+    ));
+    ctx.data(|data| data.get_temp::<Vec<u64>>(key).unwrap_or_default().len())
+}
+
+#[test]
+fn mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_three_tools() {
+    let _input = crate::key_input::lock_test_input();
+    for tool in [
+        MaskDetectTool::Erase,
+        MaskDetectTool::Conceal,
+        MaskDetectTool::LocalAdjust,
+    ] {
+        for together in [true, false] {
+            let mut app = mask_detect_fixture(tool);
+            app.erase_tool = EraseTool::Brush;
+            app.conceal_tool = crate::conceal::ConcealTool::Brush;
+            app.local_adjust_mask_tool = LocalAdjustMaskTool::Brush;
+            let (_catalog_tx, rx) = mpsc::channel();
+            *app.mask_detect_catalog = DetectorCatalogState::Loading {
+                cancel: Arc::new(AtomicBool::new(false)),
+                rx,
+            };
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let transform = transform();
+            let (start_id, brush_id, start_panel_id, brush_panel_id, panels): (
+                _,
+                _,
+                _,
+                _,
+                &[&str],
+            ) = match tool {
+                MaskDetectTool::Erase => (
+                    "mask_detect_erase_start_rect",
+                    "mask_detect_erase_brush_rect",
+                    "erase_tool_panel",
+                    "erase_tool_panel",
+                    &["erase_tool_panel"],
+                ),
+                MaskDetectTool::Conceal => (
+                    "mask_detect_conceal_start_rect",
+                    "mask_detect_conceal_brush_rect",
+                    "conceal_panel",
+                    "conceal_panel",
+                    &["conceal_panel"],
+                ),
+                MaskDetectTool::LocalAdjust => (
+                    "mask_detect_local_start_rect",
+                    "mask_detect_local_brush_rect",
+                    "local_adjust_tool_panel",
+                    "local_adjust_panel",
+                    &["local_adjust_panel", "local_adjust_tool_panel"],
+                ),
+            };
+            let start_panel =
+                egui::LayerId::new(egui::Order::Foreground, egui::Id::unique(start_panel_id));
+            let brush_panel =
+                egui::LayerId::new(egui::Order::Foreground, egui::Id::unique(brush_panel_id));
+            let button_snapshot = |name| {
+                ctx.data(|data| {
+                    data.get_temp::<(egui::Id, egui::Rect, bool)>(egui::Id::unique(name))
+                })
+                .unwrap()
+            };
+            let frame = |app: &mut App, events| {
+                let mut start_clicked = false;
+                let mut targets = Vec::new();
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(transform.viewport_rect),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        // Production order: the real panel button opens the Window
+                        // before the Window is drawn later in this SAME pass.
+                        draw_mask_detect_real_panel(app, ui, &ctx, tool, &transform);
+                        // Keep witnesses across any sizing/discard pass. Inspect
+                        // clicked before registering the newly opened modal.
+                        start_clicked |= button_snapshot(start_id).2;
+                        targets.extend(ctx.pointer_button_targets());
+                        app.show_mask_detect_dialog(&ctx);
+                    },
+                )
+                .drop_without_applying_deltas();
+                (start_clicked, targets)
+            };
+            let button = |name, panel| {
+                let (id, rect, _) = button_snapshot(name);
+                // A layout rect can lie outside a ScrollArea's clip. Require
+                // the actual enabled widget to cover the point we will click.
+                let response = ctx.read_response(id).unwrap();
+                let point = rect.center();
+                assert_eq!(response.rect, rect);
+                assert_eq!(response.layer_id, panel, "{tool:?}: {name} widget layer");
+                assert!(
+                    response.enabled() && response.interact_rect.contains(point),
+                    "{tool:?}, together={together}: {name} must be clickable: {response:?}"
+                );
+                assert_eq!(
+                    ctx.layer_id_at(point),
+                    Some(panel),
+                    "{tool:?}, together={together}: {name} must be exposed"
+                );
+                point
+            };
+            for _ in 0..4 {
+                frame(&mut app, Vec::new());
+            }
+            let start = button(start_id, start_panel);
+            frame(&mut app, vec![egui::Event::PointerMoved(start)]);
+            for pressed in [true, false] {
+                frame(&mut app, mask_detect_pointer(start, pressed));
+            }
+            assert_eq!(app.mask_detect_dialog, Some(tool));
+            for _ in 0..4 {
+                frame(&mut app, Vec::new());
+            }
+            assert_mask_detect_layer_above(&ctx, "mask_detect_settings", panels);
+            let close = ctx
+                .data(|data| {
+                    data.get_temp::<Vec<egui::Rect>>(egui::Id::unique("mask_detect_actions"))
+                })
+                .unwrap()[1]
+                .center();
+            frame(&mut app, vec![egui::Event::PointerMoved(close)]);
+            for pressed in [true, false] {
+                frame(&mut app, mask_detect_pointer(close, pressed));
+            }
+            assert!(app.mask_detect_dialog.is_none());
+            for _ in 0..3 {
+                frame(&mut app, Vec::new());
+            }
+            let start_before_brush = button_snapshot(start_id).1;
+            let brush = button(brush_id, brush_panel);
+            // Moving from Close to Brush in the press frame gives the native
+            // drag-scroll background that entire pointer delta. Move with the
+            // button up first, so this fixture clicks rather than scrolls.
+            frame(&mut app, vec![egui::Event::PointerMoved(brush)]);
+            assert_eq!(button(brush_id, brush_panel), brush);
+            for pressed in [true, false] {
+                frame(&mut app, mask_detect_pointer(brush, pressed));
+            }
+            assert!(
+                button_snapshot(brush_id).2,
+                "the selected brush button must receive the click"
+            );
+            assert_eq!(
+                button_snapshot(start_id).1,
+                start_before_brush,
+                "{tool:?}: a stationary brush click must not move the detection button"
+            );
+            // The brush raises its own panel above the retained Window. Local
+            // adjustment puts detection in a DIFFERENT panel, still below the
+            // Window; raising that panel and the Window together preserves the
+            // correct order instead of requiring a tie repair.
+            let layers: Vec<_> = ctx.memory(|memory| memory.layer_ids().collect());
+            let window_index = layers
+                .iter()
+                .position(|layer| layer.id == egui::Id::unique("mask_detect_settings"))
+                .unwrap();
+            let brush_panel_index = layers
+                .iter()
+                .position(|layer| *layer == brush_panel)
+                .unwrap();
+            assert!(
+                window_index < brush_panel_index,
+                "{tool:?}: the brush must raise its panel above the retained Window"
+            );
+            let start_panel_index = layers
+                .iter()
+                .position(|layer| *layer == start_panel)
+                .unwrap();
+            let needs_tie_repair = window_index < start_panel_index;
+            assert_eq!(
+                needs_tie_repair,
+                tool != MaskDetectTool::LocalAdjust,
+                "{tool:?}: only same-panel Brush and Detect recreate the stale opening order"
+            );
+            let before = mask_detect_raise_count(&ctx, "mask_detect_settings");
+            let start = button(start_id, start_panel);
+            frame(&mut app, vec![egui::Event::PointerMoved(start)]);
+            assert_eq!(button(start_id, start_panel), start);
+            let start_widget = button_snapshot(start_id).0;
+            let mut received_click = false;
+            let mut click_targets = Vec::new();
+            if together {
+                let mut events = mask_detect_pointer(start, true);
+                events.extend(mask_detect_pointer(start, false));
+                let (clicked, targets) = frame(&mut app, events);
+                received_click |= clicked;
+                click_targets.extend(targets);
+            } else {
+                for pressed in [true, false] {
+                    let (clicked, targets) = frame(&mut app, mask_detect_pointer(start, pressed));
+                    received_click |= clicked;
+                    click_targets.extend(targets);
+                }
+            }
+            assert_eq!(
+                click_targets,
+                vec![
+                    (
+                        start,
+                        egui::PointerButton::Primary,
+                        true,
+                        Some(start_widget),
+                        true
+                    ),
+                    (
+                        start,
+                        egui::PointerButton::Primary,
+                        false,
+                        Some(start_widget),
+                        true
+                    ),
+                ],
+                "{tool:?}, together={together}: both edges must target the real detection button"
+            );
+            assert!(
+                received_click,
+                "{tool:?}, together={together}: the real detection Response must be clicked"
+            );
+            assert_eq!(
+                app.mask_detect_dialog,
+                Some(tool),
+                "{tool:?}, together={together}: real button must open the Window"
+            );
+            if tool == MaskDetectTool::LocalAdjust && together {
+                // Detect's right panel was below the Window before reopening.
+                // The stable tie already puts the Window above BOTH panels in
+                // the opening frame, without a corrective move_to_top.
+                assert_mask_detect_layer_above(&ctx, "mask_detect_settings", panels);
+            }
+            // Area may tie with the panel in the opening pass. Reconciliation
+            // repairs the wrong order and stops once the invariant holds.
+            for _ in 0..6 {
+                frame(&mut app, Vec::new());
+                assert_mask_detect_layer_above(&ctx, "mask_detect_settings", panels);
+            }
+            let repaired = mask_detect_raise_count(&ctx, "mask_detect_settings");
+            if together || !needs_tie_repair {
+                assert_eq!(repaired, before + usize::from(needs_tie_repair));
+            } else {
+                assert!(repaired <= before + 1);
+            }
+            for _ in 0..4 {
+                frame(&mut app, Vec::new());
+            }
+            assert_eq!(
+                mask_detect_raise_count(&ctx, "mask_detect_settings"),
+                repaired,
+                "do not raise an already-correct Window"
+            );
+            eprintln!("{tool:?}, together={together}: real panel click and layer checks completed");
+        }
+    }
+}
+
+#[test]
+fn mask_detect_front_layer_invariant_repairs_after_upper_modal_closes_for_settings_and_progress() {
+    let _input = crate::key_input::lock_test_input();
+    for progress in [false, true] {
+        let mut app = mask_detect_fixture(MaskDetectTool::Erase);
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let name = if progress {
+            "mask_detect_progress"
+        } else {
+            "mask_detect_settings"
+        };
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::unique(name));
+        let upper = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("external_tool_preparing"),
+        );
+        let panel = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("erase_tool_panel"),
+        );
+        let transform = transform();
+        let open = |app: &mut App| {
+            if progress {
+                let request = app
+                    .capture_mask_detect_request(MaskDetectTool::Erase)
+                    .unwrap();
+                mask_detect_queue(app, request, mask_detect_output());
+            } else {
+                app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+            }
+        };
+        let frame = |app: &mut App, upper_visible, disrupt| {
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(transform.viewport_rect),
+                    ..Default::default()
+                },
+                |ui| {
+                    draw_mask_detect_real_panel(app, ui, &ctx, MaskDetectTool::Erase, &transform);
+                    app.show_mask_detect_dialog(&ctx);
+                    if upper_visible {
+                        egui::Modal::new(upper.id).show(&ctx, |ui| {
+                            crate::external_tool::draw_external_tool_preparing_body(ui, 1);
+                        });
+                    }
+                    if disrupt {
+                        // Inject a wrong order independently of display start.
+                        // Keep the legitimate upper Modal above both layers.
+                        ctx.move_to_top(panel);
+                        if upper_visible {
+                            ctx.move_to_top(upper);
+                        }
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
+        };
+        open(&mut app);
+        for _ in 0..6 {
+            frame(&mut app, false, false);
+        }
+        assert_mask_detect_layer_above(&ctx, name, &["erase_tool_panel"]);
+        let before = mask_detect_raise_count(&ctx, name);
+        app.cancel_mask_detect();
+        for _ in 0..3 {
+            frame(&mut app, false, false);
+        }
+        open(&mut app);
+        // Keep the earlier regression too: another Modal becomes visible on
+        // the same pass that this retained Window id reappears.
+        for pass in 0..6 {
+            frame(&mut app, true, false);
+            let layers: Vec<_> = ctx.memory(|memory| memory.layer_ids().collect());
+            assert!(
+                layers.iter().position(|l| *l == layer).unwrap()
+                    < layers.iter().position(|l| *l == upper).unwrap()
+            );
+            if pass >= 1 {
+                assert_eq!(ctx.memory(|memory| memory.top_modal_layer()), Some(upper));
+            }
+        }
+        frame(&mut app, true, true);
+        let layers: Vec<_> = ctx.memory(|memory| memory.layer_ids().collect());
+        assert!(
+            layers.iter().position(|l| *l == layer).unwrap()
+                < layers.iter().position(|l| *l == panel).unwrap()
+        );
+        assert!(
+            layers.iter().position(|l| *l == panel).unwrap()
+                < layers.iter().position(|l| *l == upper).unwrap()
+        );
+        for _ in 0..6 {
+            frame(&mut app, true, false);
+        }
+        assert_eq!(
+            mask_detect_raise_count(&ctx, name),
+            before,
+            "never overtake the upper Modal to repair panel order"
+        );
+        for _ in 0..6 {
+            frame(&mut app, false, false);
+        }
+        assert_mask_detect_layer_above(&ctx, name, &["erase_tool_panel"]);
+        assert_eq!(
+            mask_detect_raise_count(&ctx, name),
+            before + 1,
+            "repair when the upper Modal is gone, without reopening"
+        );
+        // A later violation is repaired too; no First/Visible phase is needed.
+        frame(&mut app, false, true);
+        for _ in 0..6 {
+            frame(&mut app, false, false);
+        }
+        assert_mask_detect_layer_above(&ctx, name, &["erase_tool_panel"]);
+        assert_eq!(
+            mask_detect_raise_count(&ctx, name),
+            before + 2,
+            "repair a later violation, then stop raising once correct"
+        );
+    }
 }
 
 #[test]
@@ -533,6 +928,7 @@ fn mask_detect_foreground_modal_allows_menu_and_combo_popup_selection() {
         for _ in 0..4 {
             button = frame(&mut app, Vec::new()).0;
         }
+        let raises_before_popup = mask_detect_raise_count(&ctx, "mask_detect_settings");
         for pressed in [true, false] {
             frame(&mut app, mask_detect_pointer(button.center(), pressed));
         }
@@ -543,6 +939,12 @@ fn mask_detect_foreground_modal_allows_menu_and_combo_popup_selection() {
         let (item_rect, layer) = popup.expect("real egui popup must open");
         assert_ne!(layer, dialog);
         assert_eq!(layer.order, egui::Order::Foreground);
+        let layers: Vec<_> = ctx.memory(|memory| memory.layer_ids().collect());
+        assert!(
+            layers.iter().position(|l| *l == dialog).unwrap()
+                < layers.iter().position(|l| *l == layer).unwrap(),
+            "a dialog's own popup must stay above it"
+        );
         assert!(ctx.memory(|memory| memory.allows_interaction(layer)));
         assert_eq!(ctx.layer_id_at(item_rect.center()), Some(layer));
         let mut accepted = false;
@@ -552,6 +954,11 @@ fn mask_detect_foreground_modal_allows_menu_and_combo_popup_selection() {
         assert!(
             accepted,
             "menu={menu}: popup item must receive the click above the modal"
+        );
+        assert_eq!(
+            mask_detect_raise_count(&ctx, "mask_detect_settings"),
+            raises_before_popup,
+            "do not chase the dialog's own popup"
         );
     }
 }

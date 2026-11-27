@@ -2816,7 +2816,13 @@ impl App {
                             egui::RichText::new("ビットマップ:")
                                 .color(egui::Color32::from_gray(200)),
                         );
-                        if ui.add_enabled(self.mask_detect_available(crate::app::MaskDetectTool::Erase), egui::Button::new("自動検出…")).clicked() {
+                        let detect = ui.add_enabled(self.mask_detect_available(crate::app::MaskDetectTool::Erase), egui::Button::new("自動検出…"));
+                        #[cfg(test)]
+                        {
+                            let test_response = (detect.id, detect.rect, detect.clicked());
+                            ctx.data_mut(|data| data.insert_temp(egui::Id::unique("mask_detect_erase_start_rect"), test_response));
+                        }
+                        if detect.clicked() {
                             self.open_mask_detect_dialog(crate::app::MaskDetectTool::Erase);
                         }
                         let bitmap_rows: &[&[(&str, EraseTool)]] = &[
@@ -2828,14 +2834,20 @@ impl App {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 for &(base_label, tool) in *row {
                                     let label = self.erase_tool_label(base_label, tool);
-                                    if panel_toggle_button(
+                                    let response = panel_toggle_button(
                                         ui,
                                         label.as_str(),
                                         self.erase_tool == tool,
                                         Some(btn_size),
                                         None,
-                                    )
-                                    .clicked()
+                                    );
+                                    #[cfg(test)]
+                                    if tool == EraseTool::Brush {
+                                        // Response::clicked may lock its Context; snapshot before data_mut.
+                                        let test_response = (response.id, response.rect, response.clicked());
+                                        ctx.data_mut(|data| data.insert_temp(egui::Id::unique("mask_detect_erase_brush_rect"), test_response));
+                                    }
+                                    if response.clicked()
                                     {
                                         let toast = format!("[{}]", label);
                                         self.switch_erase_tool(tool, &toast);
