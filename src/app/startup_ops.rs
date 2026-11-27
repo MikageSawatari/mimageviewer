@@ -257,6 +257,30 @@ impl App {
                 continue;
             }
             match &request.kind {
+                crate::agent_ipc::open::UiRequestKind::OperationScript(job) => {
+                    let outcome = match self.admit_agent_settings_write() {
+                        Ok(()) => {
+                            let snapshot =
+                                crate::agent_ipc::operation_script::AdmissionSnapshot::capture(
+                                    self.settings.operation_script_enabled,
+                                    &self.operation_script.state,
+                                );
+                            // Admission and FIFO submission share this UI turn.
+                            // The loader owns the only file-worker sender.
+                            let queued = self.operation_script.enqueue_agent_script(
+                                job.clone(),
+                                &crate::data_dir::get(),
+                                ctx,
+                            );
+                            crate::agent_ipc::open::UiOpenOutcome::OperationScriptAdmitted {
+                                snapshot,
+                                queued,
+                            }
+                        }
+                        Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                    };
+                    request.complete(outcome);
+                }
                 crate::agent_ipc::open::UiRequestKind::StackScriptAdmission => {
                     let outcome = match self.admit_agent_settings_write() {
                         Ok(()) => crate::agent_ipc::open::UiOpenOutcome::StackScriptAdmitted {

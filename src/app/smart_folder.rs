@@ -2754,11 +2754,28 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
     ) -> bool {
+        self.begin_smart_grid_container_navigation_with_admission(
+            index,
+            path,
+            auto_fullscreen,
+            restore_intent,
+        )
+        .handled
+    }
+
+    pub(crate) fn begin_smart_grid_container_navigation_with_admission(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        auto_fullscreen: bool,
+
+        restore_intent: crate::app::StartupListIntent,
+    ) -> super::ActionRouteResult {
         if self.top_level_grid_view.smart_folder_session().is_none() {
-            return false;
+            return super::ActionRouteResult::new(false, super::ActionAdmission::Rejected);
         }
         if self.document_open_modal_admission_blocked() {
-            return true;
+            return super::ActionRouteResult::new(true, super::ActionAdmission::Rejected);
         }
         if super::App::path_needs_open_classification(&path) {
             return match self.start_open_path_classification(
@@ -2770,17 +2787,19 @@ impl App {
                     auto_fullscreen,
                 },
             ) {
-                super::OpenAdmission::Accepted => true,
+                super::OpenAdmission::Accepted => {
+                    super::ActionRouteResult::new(true, super::ActionAdmission::Accepted)
+                }
                 super::OpenAdmission::Refused(reason) => {
                     self.show_open_admission_refusal(reason);
-                    true
+                    super::ActionRouteResult::new(true, super::ActionAdmission::Rejected)
                 }
                 super::OpenAdmission::NotApplicable => {
                     unreachable!("the path was checked before classification")
                 }
             };
         }
-        self.begin_smart_grid_container_navigation_classified(
+        self.begin_smart_grid_container_navigation_classified_with_admission(
             index,
             path,
             auto_fullscreen,
@@ -2804,11 +2823,36 @@ impl App {
         navigation: Option<super::MainListNavigation>,
         stage: MainListRequestStage,
     ) -> bool {
+        self.begin_smart_grid_container_navigation_classified_with_admission(
+            index,
+            path,
+            auto_fullscreen,
+            classified_kind,
+            pre_scan,
+            restore_intent,
+            navigation,
+            stage,
+        )
+        .handled
+    }
+
+    pub(in crate::app) fn begin_smart_grid_container_navigation_classified_with_admission(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        auto_fullscreen: bool,
+        classified_kind: super::OpenPathKind,
+        pre_scan: Option<super::ScannedDir>,
+
+        restore_intent: crate::app::StartupListIntent,
+        navigation: Option<super::MainListNavigation>,
+        stage: MainListRequestStage,
+    ) -> super::ActionRouteResult {
         if self.top_level_grid_view.smart_folder_session().is_none() {
-            return false;
+            return super::ActionRouteResult::new(false, super::ActionAdmission::Rejected);
         }
         let Some(item) = self.items.get(index) else {
-            return false;
+            return super::ActionRouteResult::new(false, super::ActionAdmission::Rejected);
         };
         // The classified request captured this row's path before the worker ran. Never read
         // a shifted successor's kind or source effects from the old index during handoff.
@@ -2816,14 +2860,14 @@ impl App {
             .container_path()
             .is_some_and(|source| crate::folder_tree::path_eq(source, &path))
         {
-            return false;
+            return super::ActionRouteResult::new(false, super::ActionAdmission::Rejected);
         }
         let kind = match item {
             GridItem::Folder(_) => SmartChildKind::Folder,
             GridItem::PdfFile(_) => SmartChildKind::Pdf,
             GridItem::ZipFile(_) => SmartChildKind::Zip,
             GridItem::ConvertibleArchive { .. } => SmartChildKind::ConvertibleArchive,
-            _ => return false,
+            _ => return super::ActionRouteResult::new(false, super::ActionAdmission::Rejected),
         };
         let kind = if classified_kind == super::OpenPathKind::Directory {
             SmartChildKind::Folder
@@ -2834,7 +2878,7 @@ impl App {
             && self.settings.archive_file_handling_ignores_convertible()
         {
             self.show_feedback_warning("設定により変換が必要な本を無視しています".into());
-            return true;
+            return super::ActionRouteResult::new(true, super::ActionAdmission::Rejected);
         }
         if kind == SmartChildKind::Pdf
             && self.settings.epub_file_handling_ignores_epub()
@@ -2844,7 +2888,7 @@ impl App {
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("epub"))
         {
             self.show_feedback_warning("設定により EPUB を無視しています".into());
-            return true;
+            return super::ActionRouteResult::new(true, super::ActionAdmission::Rejected);
         }
         if self
             .begin_smart_physical_navigation_with_navigation(
@@ -2860,12 +2904,12 @@ impl App {
             .is_err()
         {
             self.show_feedback_warning("コンテナの読み取りを開始できませんでした".into());
-            return true;
+            return super::ActionRouteResult::new(true, super::ActionAdmission::Rejected);
         }
         if kind == SmartChildKind::ConvertibleArchive {
             self.start_smart_archive_conversion_current();
         }
-        true
+        super::ActionRouteResult::new(true, super::ActionAdmission::Accepted)
     }
 
     /// Conversion belongs to the staged request, including a history target whose root has

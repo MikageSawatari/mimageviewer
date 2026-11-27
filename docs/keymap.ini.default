@@ -63,6 +63,28 @@
 # ClearBookResumePositions = none ; 本の読書位置をすべてクリア
 # UndoLastAction = Ctrl+Z ; 直前の操作を元に戻す
 # HelpShowContextShortcuts = ? ; 現在のコンテキストで使えるショートカット一覧を表示する
+# スクリプト操作1〜20の表示名は固定。labelは環境設定と右クリックだけに表示。
+# 有効化: 環境設定 > 拡張と診断 > 操作のスクリプト（既定OFF）。
+# ScriptSlot1 = none ; スクリプト操作 1
+# ScriptSlot2 = none ; スクリプト操作 2
+# ScriptSlot3 = none ; スクリプト操作 3
+# ScriptSlot4 = none ; スクリプト操作 4
+# ScriptSlot5 = none ; スクリプト操作 5
+# ScriptSlot6 = none ; スクリプト操作 6
+# ScriptSlot7 = none ; スクリプト操作 7
+# ScriptSlot8 = none ; スクリプト操作 8
+# ScriptSlot9 = none ; スクリプト操作 9
+# ScriptSlot10 = none ; スクリプト操作 10
+# ScriptSlot11 = none ; スクリプト操作 11
+# ScriptSlot12 = none ; スクリプト操作 12
+# ScriptSlot13 = none ; スクリプト操作 13
+# ScriptSlot14 = none ; スクリプト操作 14
+# ScriptSlot15 = none ; スクリプト操作 15
+# ScriptSlot16 = none ; スクリプト操作 16
+# ScriptSlot17 = none ; スクリプト操作 17
+# ScriptSlot18 = none ; スクリプト操作 18
+# ScriptSlot19 = none ; スクリプト操作 19
+# ScriptSlot20 = none ; スクリプト操作 20
 
 [Grid] ; サムネイル一覧
 # GlobalEverythingSearch = Ctrl+R ; Everything でファイル名を検索する

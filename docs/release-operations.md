@@ -235,7 +235,9 @@ perf/idle検証および実アプリsmokeの実行前に適用する。必須検
 - **フレーク対策**: lib unittest に並列 / リソース感受性のフレークが複数ある
   (共有グローバル Win32 フレーム依存のキーマップテスト、多数同時オープンの索引テスト、
   transient なキャンセルテスト等)。いずれも単体では通る。高負荷時に別々のテストが順に
-  落ちたら、個別に潰す前に **`cargo test --no-fail-fast -- --test-threads=1` で確定検証**する。
+  落ちたら、個別に潰す前に対象を絞った nextest を1並列で確認する:
+  `cargo nextest run -p mimageviewer --lib -E 'test(/<対象のテスト名>/)' --test-threads 1 --retries 0 --no-fail-fast --no-tests fail`。
+  全体確認は上記の `scripts\test-full.ps1` を使い、統合テスト全体を `cargo test` で同じプロセスに入れない。
 - stale テストは「設計が変わった (期待が古い)」のか「実バグ」かを切り分けてから直す。
 - 単体テストと hitch 検査だけでは、短い work を高速で再投入する「速い無限ループ」を
   検出できない。**毎リリースの正規手順はReleaseChecks suite**（2026-10-11利用者採用）。

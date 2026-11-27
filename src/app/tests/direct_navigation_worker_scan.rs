@@ -914,8 +914,14 @@ fn direct_navigation_worker_block_reason_keeps_non_item_shortcuts_available() {
             });
             assert!(!app.shortcuts_blocked_by_text_input(&ctx));
             assert!(
-                app.handle_stack_refresh_keyboard(&ctx, true, 0, 0, block)
-                    .is_none()
+                app.handle_stack_refresh_keyboard(
+                    &ctx,
+                    true,
+                    Default::default(),
+                    Default::default(),
+                    block,
+                )
+                .is_none()
             );
             let output = ctx.end_pass();
             let maximized = output

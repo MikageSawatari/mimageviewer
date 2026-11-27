@@ -287,8 +287,8 @@ UI 回帰テストを置いている。配色・レイアウトを変える修�
 「意図しない見た目変化」を `cargo test` 段階で検知するのが目的。
 
 ```bash
-cargo test --test ui_snapshot              # 既存スナップショットと比較
-UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot  # 意図的な見た目変更の反映
+cargo test -p mimageviewer --test integration ui_snapshot::  # 既存スナップショットと比較
+UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --test integration ui_snapshot::  # 意図的な見た目変更の反映
 ```
 
 更新後は `tests/snapshots/*.png` を目視で確認してから PNG とコード変更を
@@ -330,7 +330,7 @@ exit 2 を返しても、それだけで全件へ広げない)。全件は統括
 cargo check -p mimageviewer --bin mimageviewer-core
 .\scripts\test-focused.ps1          # 変更ファイルから選んだテストを nextest で実行
 cargo nextest run -p mimageviewer --lib -E 'test(/<filter>/)'
-cargo test -p mimageviewer --test <integration-test-name>
+cargo test -p mimageviewer --test integration <file>::
 .\scripts\build-dev.ps1
 ```
 

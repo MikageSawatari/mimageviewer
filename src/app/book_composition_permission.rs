@@ -1404,7 +1404,33 @@ impl App {
         viewer_adoption: super::ViewerOpenAdoption,
         landing: Option<crate::ui_fullscreen::FsPageLanding>,
     ) -> bool {
-        self.defer_book_composition_target_route_with_landing(
+        self.defer_book_composition_fullscreen_open_with_admission(
+            idx,
+            history_trigger,
+            materialization,
+            contract,
+            purpose,
+            metadata_boundary,
+            resume_notice,
+            viewer_adoption,
+            landing,
+        )
+        .handled
+    }
+
+    pub(super) fn defer_book_composition_fullscreen_open_with_admission(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        materialization: FsOpenMaterialization,
+        contract: FsPageLoadContract,
+        purpose: BookTargetPurpose,
+        metadata_boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: super::ViewerOpenAdoption,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> super::ActionRouteResult {
+        self.defer_book_composition_target_route_with_admission(
             idx,
             history_trigger,
             materialization,
@@ -1814,9 +1840,9 @@ impl App {
         &mut self,
         intent: OpenIntent,
         demand: Vec<PresentationOccurrence>,
-    ) {
+    ) -> super::ActionAdmission {
         let Some(service) = self.book_composition_service.clone() else {
-            return;
+            return super::ActionAdmission::Rejected;
         };
         let demand = intent.presentation_demand(demand);
         let mut candidates = Vec::with_capacity(demand.len());
@@ -1824,7 +1850,7 @@ impl App {
             let Some(candidate) = self.presentation_candidate(occurrence.item_index) else {
                 self.show_feedback_warning("開こうとしたページが見つかりません".into());
                 self.book_composition_permission.open = OpenPermission::Idle;
-                return;
+                return super::ActionAdmission::Rejected;
             };
             let correlation = self
                 .book_composition_permission
@@ -1842,6 +1868,7 @@ impl App {
             });
         }
         self.book_composition_permission.open = OpenPermission::Checking { intent, candidates };
+        super::ActionAdmission::Accepted
     }
 
     fn defer_book_composition_target_route(
@@ -1877,6 +1904,30 @@ impl App {
         navigation_origin: Vec<crate::book_resume_db::ReadingPosition>,
         landing: Option<crate::ui_fullscreen::FsPageLanding>,
     ) -> bool {
+        self.defer_book_composition_target_route_with_admission(
+            idx,
+            history_trigger,
+            materialization,
+            contract,
+            purpose,
+            route,
+            navigation_origin,
+            landing,
+        )
+        .handled
+    }
+
+    fn defer_book_composition_target_route_with_admission(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        materialization: FsOpenMaterialization,
+        contract: FsPageLoadContract,
+        purpose: BookTargetPurpose,
+        route: BookTargetRoute,
+        navigation_origin: Vec<crate::book_resume_db::ReadingPosition>,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> super::ActionRouteResult {
         let context_id = self.spread_shift_context_id().serial();
         self.book_composition_permission
             .bind(context_id, self.items_generation);
@@ -1886,10 +1937,10 @@ impl App {
             && self.composed_book_layout().is_none()
         {
             self.book_composition_permission.open = OpenPermission::Idle;
-            return true;
+            return super::ActionRouteResult::new(true, super::ActionAdmission::Rejected);
         }
         if self.book_composition_service.is_none() || self.presentation_candidate(idx).is_none() {
-            return false;
+            return super::ActionRouteResult::new(false, super::ActionAdmission::Rejected);
         }
         let mut intent = OpenIntent {
             context_id,
@@ -1949,7 +2000,7 @@ impl App {
         if matches!(&self.book_composition_permission.open, OpenPermission::Ready { intent: accepted, candidates } | OpenPermission::Resuming { intent: accepted, candidates } if accepted.context_id == intent.context_id && accepted.items_generation == intent.items_generation && accepted.idx == intent.idx && accepted.history_trigger == intent.history_trigger && accepted.landing == intent.landing && candidates.iter().map(|candidate| candidate.occurrence()).eq(demand.iter().copied()))
         {
             if self.book_composition.is_pending() {
-                return true;
+                return super::ActionRouteResult::new(true, super::ActionAdmission::Accepted);
             }
             let Some(snapshot) = self
                 .book_composition_service
@@ -1957,13 +2008,13 @@ impl App {
                 .unwrap()
                 .current_candidate_snapshot()
             else {
-                self.begin_qualified_book_unit(intent, demand);
-                return true;
+                let admission = self.begin_qualified_book_unit(intent, demand);
+                return super::ActionRouteResult::new(true, admission);
             };
             let current = matches!(&self.book_composition_permission.open, OpenPermission::Ready { candidates, .. } | OpenPermission::Resuming { candidates, .. } if candidates.iter().all(|candidate| candidate.is_current(&snapshot)));
             if !current {
-                self.begin_qualified_book_unit(intent, demand);
-                return true;
+                let admission = self.begin_qualified_book_unit(intent, demand);
+                return super::ActionRouteResult::new(true, admission);
             }
             if !matches!(
                 route,
@@ -1974,11 +2025,11 @@ impl App {
             ) {
                 self.book_composition_permission.open = OpenPermission::Idle;
             }
-            return false;
+            return super::ActionRouteResult::new(false, super::ActionAdmission::Rejected);
         }
         if matches!(&self.book_composition_permission.open, OpenPermission::Checking { intent: pending, candidates } if *pending == intent && candidates.iter().map(|candidate| candidate.occurrence()).eq(demand.iter().copied()))
         {
-            return true;
+            return super::ActionRouteResult::new(true, super::ActionAdmission::Accepted);
         }
         if let Some(candidates) = self.qualify_book_unit_from_current_projection(&intent, &demand) {
             self.publish_qualified_book_candidates(&candidates);
@@ -1989,10 +2040,10 @@ impl App {
                 }
                 _ => OpenPermission::Resuming { intent, candidates },
             };
-            return false;
+            return super::ActionRouteResult::new(false, super::ActionAdmission::Rejected);
         }
-        self.begin_qualified_book_unit(intent, demand);
-        true
+        let admission = self.begin_qualified_book_unit(intent, demand);
+        super::ActionRouteResult::new(true, admission)
     }
 
     pub(crate) fn poll_book_presentation_permission(&mut self, ctx: &egui::Context) {

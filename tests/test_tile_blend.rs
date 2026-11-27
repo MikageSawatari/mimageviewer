@@ -4,14 +4,13 @@
 //! アップスケール結果のタイル境界付近で濃淡差がないか数値的に検証する。
 //!
 //! 実行方法:
-//!   cargo test --test test_tile_blend -- --nocapture
+//!   cargo test -p mimageviewer --test integration test_tile_blend:: -- --nocapture
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-#[path = "support/gpu_test_group.rs"]
-mod test_gpu_group;
+use crate::test_gpu_group;
 
 fn find_models_dir() -> PathBuf {
     let cwd_models = std::env::current_dir().unwrap().join("models");

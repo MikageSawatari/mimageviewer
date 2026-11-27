@@ -1457,6 +1457,26 @@ pub enum KeyAction {
     ClearBookResumePositions,
     UndoLastAction,
     HelpShowContextShortcuts,
+    ScriptSlot1,
+    ScriptSlot2,
+    ScriptSlot3,
+    ScriptSlot4,
+    ScriptSlot5,
+    ScriptSlot6,
+    ScriptSlot7,
+    ScriptSlot8,
+    ScriptSlot9,
+    ScriptSlot10,
+    ScriptSlot11,
+    ScriptSlot12,
+    ScriptSlot13,
+    ScriptSlot14,
+    ScriptSlot15,
+    ScriptSlot16,
+    ScriptSlot17,
+    ScriptSlot18,
+    ScriptSlot19,
+    ScriptSlot20,
     GridFavoritePrev,
     GridFavoriteNext,
     GridManageFavorites,
@@ -2086,6 +2106,26 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ClearBookResumePositions,
     KeyAction::UndoLastAction,
     KeyAction::HelpShowContextShortcuts,
+    KeyAction::ScriptSlot1,
+    KeyAction::ScriptSlot2,
+    KeyAction::ScriptSlot3,
+    KeyAction::ScriptSlot4,
+    KeyAction::ScriptSlot5,
+    KeyAction::ScriptSlot6,
+    KeyAction::ScriptSlot7,
+    KeyAction::ScriptSlot8,
+    KeyAction::ScriptSlot9,
+    KeyAction::ScriptSlot10,
+    KeyAction::ScriptSlot11,
+    KeyAction::ScriptSlot12,
+    KeyAction::ScriptSlot13,
+    KeyAction::ScriptSlot14,
+    KeyAction::ScriptSlot15,
+    KeyAction::ScriptSlot16,
+    KeyAction::ScriptSlot17,
+    KeyAction::ScriptSlot18,
+    KeyAction::ScriptSlot19,
+    KeyAction::ScriptSlot20,
     KeyAction::GridFavoritePrev,
     KeyAction::GridFavoriteNext,
     KeyAction::GridManageFavorites,
@@ -4392,6 +4432,26 @@ impl KeyAction {
             ClearBookResumePositions => "ClearBookResumePositions",
             UndoLastAction => "UndoLastAction",
             HelpShowContextShortcuts => "HelpShowContextShortcuts",
+            ScriptSlot1 => "ScriptSlot1",
+            ScriptSlot2 => "ScriptSlot2",
+            ScriptSlot3 => "ScriptSlot3",
+            ScriptSlot4 => "ScriptSlot4",
+            ScriptSlot5 => "ScriptSlot5",
+            ScriptSlot6 => "ScriptSlot6",
+            ScriptSlot7 => "ScriptSlot7",
+            ScriptSlot8 => "ScriptSlot8",
+            ScriptSlot9 => "ScriptSlot9",
+            ScriptSlot10 => "ScriptSlot10",
+            ScriptSlot11 => "ScriptSlot11",
+            ScriptSlot12 => "ScriptSlot12",
+            ScriptSlot13 => "ScriptSlot13",
+            ScriptSlot14 => "ScriptSlot14",
+            ScriptSlot15 => "ScriptSlot15",
+            ScriptSlot16 => "ScriptSlot16",
+            ScriptSlot17 => "ScriptSlot17",
+            ScriptSlot18 => "ScriptSlot18",
+            ScriptSlot19 => "ScriptSlot19",
+            ScriptSlot20 => "ScriptSlot20",
             GridOpenCurrentDriveRoot => "GridOpenCurrentDriveRoot",
             GridFavoritePrev => "GridFavoritePrev",
             GridFavoriteNext => "GridFavoriteNext",
@@ -5178,6 +5238,26 @@ impl KeyAction {
             ClearBookResumePositions => "本の読書位置をすべてクリア",
             UndoLastAction => "直前の操作を元に戻す",
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
+            ScriptSlot1 => "スクリプト操作 1",
+            ScriptSlot2 => "スクリプト操作 2",
+            ScriptSlot3 => "スクリプト操作 3",
+            ScriptSlot4 => "スクリプト操作 4",
+            ScriptSlot5 => "スクリプト操作 5",
+            ScriptSlot6 => "スクリプト操作 6",
+            ScriptSlot7 => "スクリプト操作 7",
+            ScriptSlot8 => "スクリプト操作 8",
+            ScriptSlot9 => "スクリプト操作 9",
+            ScriptSlot10 => "スクリプト操作 10",
+            ScriptSlot11 => "スクリプト操作 11",
+            ScriptSlot12 => "スクリプト操作 12",
+            ScriptSlot13 => "スクリプト操作 13",
+            ScriptSlot14 => "スクリプト操作 14",
+            ScriptSlot15 => "スクリプト操作 15",
+            ScriptSlot16 => "スクリプト操作 16",
+            ScriptSlot17 => "スクリプト操作 17",
+            ScriptSlot18 => "スクリプト操作 18",
+            ScriptSlot19 => "スクリプト操作 19",
+            ScriptSlot20 => "スクリプト操作 20",
             GridFavoritePrev => "前のお気に入りへ移動する",
             GridFavoriteNext => "次のお気に入りへ移動する",
             GridManageFavorites => "お気に入りの管理を開く",
@@ -5804,7 +5884,27 @@ impl KeyAction {
             | ClearVideoMediaMemory
             | ClearBookResumePositions
             | UndoLastAction
-            | HelpShowContextShortcuts => KeyContext::Global,
+            | HelpShowContextShortcuts
+            | ScriptSlot1
+            | ScriptSlot2
+            | ScriptSlot3
+            | ScriptSlot4
+            | ScriptSlot5
+            | ScriptSlot6
+            | ScriptSlot7
+            | ScriptSlot8
+            | ScriptSlot9
+            | ScriptSlot10
+            | ScriptSlot11
+            | ScriptSlot12
+            | ScriptSlot13
+            | ScriptSlot14
+            | ScriptSlot15
+            | ScriptSlot16
+            | ScriptSlot17
+            | ScriptSlot18
+            | ScriptSlot19
+            | ScriptSlot20 => KeyContext::Global,
             GlobalEverythingSearch
             | GridFavoritePrev
             | GridFavoriteNext
@@ -6376,6 +6476,26 @@ impl KeyAction {
             | ClearBookResumePositions
             | UndoLastAction
             | HelpShowContextShortcuts
+            | ScriptSlot1
+            | ScriptSlot2
+            | ScriptSlot3
+            | ScriptSlot4
+            | ScriptSlot5
+            | ScriptSlot6
+            | ScriptSlot7
+            | ScriptSlot8
+            | ScriptSlot9
+            | ScriptSlot10
+            | ScriptSlot11
+            | ScriptSlot12
+            | ScriptSlot13
+            | ScriptSlot14
+            | ScriptSlot15
+            | ScriptSlot16
+            | ScriptSlot17
+            | ScriptSlot18
+            | ScriptSlot19
+            | ScriptSlot20
             | GlobalEverythingSearch
             | GridFavoritePrev
             | GridFavoriteNext
@@ -6971,9 +7091,29 @@ impl KeyAction {
             GlobalEverythingSearch => ChordList::one(Chord::ctrl(R)),
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
             ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
-            ToggleAlwaysOnTop | ClearVideoMediaMemory | ClearBookResumePositions => {
-                ChordList::EMPTY
-            }
+            ToggleAlwaysOnTop
+            | ClearVideoMediaMemory
+            | ClearBookResumePositions
+            | ScriptSlot1
+            | ScriptSlot2
+            | ScriptSlot3
+            | ScriptSlot4
+            | ScriptSlot5
+            | ScriptSlot6
+            | ScriptSlot7
+            | ScriptSlot8
+            | ScriptSlot9
+            | ScriptSlot10
+            | ScriptSlot11
+            | ScriptSlot12
+            | ScriptSlot13
+            | ScriptSlot14
+            | ScriptSlot15
+            | ScriptSlot16
+            | ScriptSlot17
+            | ScriptSlot18
+            | ScriptSlot19
+            | ScriptSlot20 => ChordList::EMPTY,
             UndoLastAction => ChordList::one(Chord::ctrl(Z)),
             HelpShowContextShortcuts => ChordList::one(Chord::shift(Slash)),
             GridFavoritePrev
@@ -7879,7 +8019,44 @@ fn native_video_shortcut_action(action: KeyAction) -> bool {
                 | KeyAction::ToggleAlwaysOnTop
                 | KeyAction::ClearVideoMediaMemory
                 | KeyAction::ClearBookResumePositions
+        ) || matches!(
+            action,
+            KeyAction::ScriptSlot1
+                | KeyAction::ScriptSlot2
+                | KeyAction::ScriptSlot3
+                | KeyAction::ScriptSlot4
+                | KeyAction::ScriptSlot5
+                | KeyAction::ScriptSlot6
+                | KeyAction::ScriptSlot7
+                | KeyAction::ScriptSlot8
+                | KeyAction::ScriptSlot9
+                | KeyAction::ScriptSlot10
+                | KeyAction::ScriptSlot11
+                | KeyAction::ScriptSlot12
+                | KeyAction::ScriptSlot13
+                | KeyAction::ScriptSlot14
+                | KeyAction::ScriptSlot15
+                | KeyAction::ScriptSlot16
+                | KeyAction::ScriptSlot17
+                | KeyAction::ScriptSlot18
+                | KeyAction::ScriptSlot19
+                | KeyAction::ScriptSlot20
         ))
+}
+
+#[test]
+fn operation_script_slots_are_native_shortcuts_without_expanding_other_globals() {
+    for action in KeyAction::all()
+        .iter()
+        .copied()
+        .filter(|action| action.ini_name().starts_with("ScriptSlot"))
+    {
+        assert!(native_video_shortcut_action(action), "{action:?}");
+    }
+    assert!(!native_video_shortcut_action(KeyAction::GlobalLocalSearch));
+    assert!(!native_video_shortcut_action(
+        KeyAction::FsPageOverviewToggle
+    ));
 }
 
 fn is_overlay_edit_scope(scope: CommandScope) -> bool {
@@ -9781,6 +9958,14 @@ impl Keymap {
                 .copied()
                 .filter(|action| action.context() == section && action.is_user_facing())
             {
+                if matches!(kind, IniTemplateKind::DefaultReference)
+                    && action == KeyAction::ScriptSlot1
+                {
+                    out.push_str("# スクリプト操作1〜20の表示名は固定。labelは環境設定と右クリックだけに表示。\n");
+                    out.push_str(
+                        "# 有効化: 環境設定 > 拡張と診断 > 操作のスクリプト（既定OFF）。\n",
+                    );
+                }
                 let description = action.description();
                 let defaults: Vec<String> = action
                     .default_chords()
@@ -12333,6 +12518,7 @@ mod tests {
             "BookPrev".to_string(),
             "BookNext".to_string(),
         ]);
+        add_numbered_names(&mut key_handled, "ScriptSlot", 1..=20);
         add_numbered_names(&mut key_handled, "OpenCollection", 1..=20);
         add_numbered_names(&mut key_handled, "OpenBook", 1..=20);
         add_numbered_names(&mut key_handled, "OpenFavorite", 1..=20);
@@ -14578,6 +14764,55 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn script_slot_actions_are_global_press_commands_with_empty_defaults_and_independent_overrides()
+    {
+        let defaults = Keymap::default();
+        let actions: Vec<_> = KeyAction::all()
+            .iter()
+            .copied()
+            .filter(|action| action.ini_name().starts_with("ScriptSlot"))
+            .collect();
+        assert_eq!(actions.len(), 20);
+        for (index, action) in actions.iter().copied().enumerate() {
+            let number = index + 1;
+            let name = format!("ScriptSlot{number}");
+            assert_eq!(action.ini_name(), name);
+            assert_eq!(action.description(), format!("スクリプト操作 {number}"));
+            assert_eq!(KeyAction::from_ini_name(&name), Some(action));
+            assert_eq!(KeyAction::parse_ini_name(&name), Some(action));
+            assert_eq!(action.context(), KeyContext::Global);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.is_user_facing());
+            assert!(action.default_chords().is_empty());
+            assert!(defaults.effective_chords(action).is_empty());
+
+            let configured = Keymap::from_ini_str(&format!("[Global]\n{name} = F13\n"));
+            assert!(configured.warnings().is_empty(), "{action:?}");
+            let mut saved = KeymapSettings::default();
+            saved.set_override_chords(action, vec![Chord::key(KeyName::F13)]);
+            let loaded: KeymapSettings =
+                serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+            let restored = Keymap::from_settings(&loaded);
+            assert!(restored.warnings().is_empty(), "{action:?}");
+            for &other in &actions {
+                let expected = if other == action {
+                    vec![Chord::key(KeyName::F13)]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(configured.effective_chords(other), expected, "{other:?}");
+                assert_eq!(restored.effective_chords(other), expected, "{other:?}");
+            }
+            let disabled = Keymap::from_ini_str(&format!("[Global]\n{name} = none\n"));
+            assert!(disabled.warnings().is_empty());
+            assert!(disabled.effective_chords(action).is_empty());
+        }
+        for name in ["ScriptSlot0", "ScriptSlot21"] {
+            assert_eq!(KeyAction::from_ini_name(name), None);
+        }
     }
 
     #[test]

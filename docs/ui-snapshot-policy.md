@@ -16,9 +16,20 @@ App・実ファイル・worker は使わない。設計担当が生成・目視�
 (630×500) の4定義を追加する。環境設定の本体 renderer と実際のセル painter を使う。
 セル見本は代表画像あり・アイコンのみ・検索結果・選択中・画像・書庫内フォルダ・チェック中・本・ドライブを描く。
 App・実ファイル・worker は使わず、代表画像はメモリ内の単色テクスチャ。
-PNG の生成・目視・通常比較は未実施で、ClaudeCode が行う。integration の `ui_snapshot` binary は既存の gpu group 対象。
+PNG の生成・目視・通常比較は未実施で、ClaudeCode が行う。`integration` の `ui_snapshot::` モジュールは既存の gpu group 対象。
 
 # UI スナップショットテスト運用方針
+
+§1.363 段5は、環境設定の本体rendererへ固定の読み込み結果を渡す
+`ui_dialogs::preferences::operation_script::tests::operation_script_preferences_snapshot_light` /
+`operation_script_preferences_snapshot_dark` の2件（560×690）を追加する。App・実ファイル・workerは使わない。
+libの2件はnextestのgpu groupへ登録する。設計担当が初回の2枚を生成・目視し、レイアウトの崩れがないと報告した。
+自動で動く処理の説明とボタン名の括弧を変更した後も、設計担当が `UPDATE_SNAPSHOTS=1` で再生成し2件成功と報告した。
+今回の同一フレーム入力テストの変更では描画・PNGを変更していない。変更後のテストと更新指定なしの画像比較は実装担当では未実行。
+下書きの確定・子の確認・ファイル操作の順序・狭い画面の到達性は別の回帰テストで検査する。
+同一フレームの入力は `Harness::input_mut().events` にまとめる。kittest 0.37の `.click()` / `key_press()` は
+キューの各イベントを別フレームで処理するため、それらを続けても同一フレームにならない。
+ポインタのhoverとpressを先に成立させ、トリガーを動かすreleaseとキーを同じRawInputへ渡す。
 
 §1.890 / §1.857 の変更は `prefs-890-857-862-plan.md` を参照。低コントラスト確認の PNG は追加せず、文言と遷移を headless テストで検査する。既定色の4枚は変更なしの見込み。狭幅の折り返しとラベル付きコンボの分離は既存 fixture の比較が必要で、PNG の生成・比較・目視は未実施 (コンパイル禁止の委任条件)。変更が出たものだけ設計担当が生成して目視する。
 
@@ -41,12 +52,12 @@ disabled / read は新しいチェックをOFF、open / organize / records はON
 強調対象のパスと場所、外部だけの強調、変更時だけの再描画は別の headless 回帰で検査する。
 **PNG は未生成・未目視、比較も未実行**。設計担当が共有 runner で対象2件を生成し、
 明暗の塗り・枠・文字の判読性と欠け・重なりを確認してから、更新指定なしで比較する。
-integration の `ui_snapshot` binary は既存の `gpu` group 対象である。
+`integration` の `ui_snapshot::` モジュールは既存の `gpu` group 対象である。
 
 §1.818 段階7のブラウザ連携は、純粋 renderer に固定の worker snapshot と入力文字列を渡す。
 `browser818_preferences_light`、`browser818_preferences_dark_long_path`、
 `browser818_preferences_unavailable`、`browser818_preferences_processing` の4定義（560×460）を追加した。
-App・実環境・レジストリ・フォルダ picker は使用しない。integration の `ui_snapshot` binary は既存の gpu group 対象。
+App・実環境・レジストリ・フォルダ picker は使用しない。`integration` の `ui_snapshot::` モジュールは既存の gpu group 対象。
 PNG は未生成・未目視。設計担当が対象4件だけ `UPDATE_SNAPSHOTS=1` で生成し、欠け・重なり・明暗・長いパスを目視後、通常比較を行う。
 設定の採用、worker 完了の回収、場所▼の条件と順序は別の状態／handler 回帰で検査する。
 
@@ -280,10 +291,10 @@ egui の描画結果を PNG スナップショットとして保存し、意図�
 
 ```bash
 # 通常実行 (既存スナップショットと比較)
-cargo test --test ui_snapshot
+cargo test -p mimageviewer --test integration ui_snapshot::
 
 # 意図的に見た目を変更した場合のスナップショット更新
-UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot
+UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --test integration ui_snapshot::
 ```
 
 更新後は `tests/snapshots/*.png` の差分を必ず目視確認してからコミットする。
@@ -594,7 +605,7 @@ PNGは初回設定/書庫変換確認の1093×614・100%/200%の代表4枚と、
 1. 対象の UI コードが `fn(ui: &mut egui::Ui, ...)` の形になっていることを確認。
    そうでなければ先に `ui_*` モジュールに切り出す (ui_susie_diagnostic.rs を参考に)。
 2. `tests/ui_snapshot.rs` に新しい `#[test]` を追加。
-3. `UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot` で PNG を生成。
+3. `UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --test integration ui_snapshot::` で PNG を生成。
 4. 生成された PNG を目視で確認 (想定通りの描画か)。
 5. PNG と `.rs` の変更を一緒にコミット。
 

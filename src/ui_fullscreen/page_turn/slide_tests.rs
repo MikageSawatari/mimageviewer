@@ -19,6 +19,129 @@ fn draw(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> SubmittedUnitR
     receipt
 }
 
+#[test]
+fn operation_script_event_animation_toggle_commits_only_original_input_once_with_control() {
+    use crate::app::operation_script_runtime::ScriptInputSurface;
+    use crate::operation_script::{CompiledOperationScript, OperationScriptState};
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let _clock = TestClock::at(Instant::now());
+    for toggle in [false, true] {
+        // Sequential fixtures: never acquire the global data-dir mutex twice.
+        take_test_events();
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.settings.page_turn_animation_style = PageTurnAnimationStyle::Slide;
+        seed_leaf(&ctx, &mut app);
+        let mut late = None;
+        frame(&ctx, |ui, ctx| {
+            let operation = ViewerOperationId::Slideshow(next_operation_batch());
+            app.page_turn_external_operation(ctx, operation, OperationPhase::Press, "slideshow");
+            app.handle_fs_navigation_with_operation(
+                ctx,
+                false,
+                false,
+                None,
+                None,
+                None,
+                FsPageNav::Target(2),
+                None,
+                1,
+                Some(operation),
+            );
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert!(!draw(&mut app, ui, ctx).curl);
+            ctx.with_plugin(|plugin: &mut SubmissionPlugin| {
+                late = plugin.pending.remove(&ctx.viewport_id());
+            });
+        });
+        let original = app
+            .page_turn_presentation
+            .continuation_operation_for_test()
+            .unwrap();
+        assert_eq!(original.1, 2);
+        let late = late.unwrap();
+        assert!(!late.receipt.was_accepted());
+        app.settings.operation_script_enabled = true;
+        let commands = if toggle {
+            r#"["FsPageTurnAnimationToggle"]"#
+        } else {
+            "[]"
+        };
+        app.operation_script.state = OperationScriptState::Ready(Box::new(CompiledOperationScript::compile(&format!(
+            r#"fn slots() {{ [] }} fn on_event(s) {{ if "open" in s.events {{ #{{run:{commands},notice:"initial event"}} }} else if "page" in s.events {{ #{{run:[],notice:"original input page"}} }} else {{ [] }} }}"#
+        )).unwrap()));
+        frame(&ctx, |_, ctx| {
+            app.detect_operation_script_events(ctx, ScriptInputSurface::Viewer);
+            assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, "initial event");
+        });
+        assert_eq!(app.settings.page_turn_animation_enabled, !toggle);
+        assert_eq!(
+            app.page_turn_presentation.continuation_operation_for_test(),
+            Some(original)
+        );
+        let immediate = app.collect_operation_script_event_identity(ScriptInputSurface::Viewer);
+        // Late old receipt is insufficient after settings cancellation. In the
+        // control it is also withheld; both must accept a real current flat.
+        adopt_interrupted_target(&ctx, &mut app);
+        assert_eq!(
+            app.collect_operation_script_event_identity(ScriptInputSurface::Viewer),
+            immediate
+        );
+        take_test_events();
+        frame(&ctx, |ui, ctx| {
+            app.detect_operation_script_events(ctx, ScriptInputSurface::Viewer);
+            assert!(matches!(
+                app.begin_page_turn_viewer_frame(ctx, false, None),
+                PageTurnFrameEntry::Continue {
+                    committed: true,
+                    ..
+                }
+            ));
+            assert_eq!(app.fullscreen_idx, Some(2));
+            draw(&mut app, ui, ctx);
+        });
+        assert!(
+            app.page_turn_presentation
+                .continuation_operation_for_test()
+                .is_none()
+        );
+        frame(&ctx, |ui, ctx| {
+            app.detect_operation_script_events(ctx, ScriptInputSurface::Viewer);
+            assert_eq!(
+                app.fs_feedback_toast.as_ref().unwrap().0,
+                "original input page"
+            );
+            assert!(!app.commit_page_turn_continuation(ctx));
+            assert_eq!(app.fullscreen_idx, Some(2));
+            draw(&mut app, ui, ctx);
+        });
+        app.fs_feedback_toast = None;
+        frame(&ctx, |ui, ctx| {
+            app.detect_operation_script_events(ctx, ScriptInputSurface::Viewer);
+            assert!(!app.commit_page_turn_continuation(ctx));
+            assert_eq!(app.fullscreen_idx, Some(2));
+            assert!(
+                app.page_turn_presentation
+                    .continuation_operation_for_test()
+                    .is_none()
+            );
+            draw(&mut app, ui, ctx);
+        });
+        assert!(app.fs_feedback_toast.is_none());
+        assert_eq!(app.settings.page_turn_animation_enabled, !toggle);
+        assert_eq!(
+            take_test_events()
+                .iter()
+                .filter(|(fact, kind, reason)| fact.operation_id == original.0
+                    && *kind == "skip"
+                    && *reason == "stage1_continuation_instant")
+                .count(),
+            1
+        );
+    }
+}
+
 fn styled_events() -> Vec<(&'static str, &'static str, PageTurnAnimationStyle)> {
     TEST_STYLED_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
 }

@@ -3014,7 +3014,10 @@ fn key_action_detail_label(action: KeyAction) -> &'static str {
 }
 
 fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext) -> &'static str {
-    if let Some(key_action) = action.saved_group_key_action() {
+    if let Some(key_action) = action
+        .script_slot_key_action()
+        .or_else(|| action.saved_group_key_action())
+    {
         return key_action_detail_label(key_action);
     }
     match action {
@@ -13566,6 +13569,62 @@ mod tests {
         assert!(command_key_labels_match_filter(&key_labels, "f11"));
         assert!(command_key_labels_match_filter(&key_labels, "numpad9"));
         assert!(!command_key_labels_match_filter(&key_labels, "F12"));
+    }
+
+    #[test]
+    fn script_slot_ring_assignments_share_global_key_rows_and_descriptions() {
+        let mut state = zoom_key_editor_state();
+        let keymap = crate::keymap::Keymap::default();
+        let actions: Vec<_> = RingActionId::available_for_context(RingShortcutContext::Grid)
+            .into_iter()
+            .filter(|action| action.script_slot_key_action().is_some())
+            .collect();
+        assert_eq!(actions.len(), 20);
+        for ring in actions {
+            let key = ring.script_slot_key_action().unwrap();
+            let bindings = ring_bindings_for_key_action(key);
+            assert_eq!(bindings.len(), 3);
+            assert_eq!(compact_key_action_label(key), key.description());
+            for &context in RingShortcutContext::all() {
+                assert!(bindings.contains(&(context, ring.clone())));
+                assert!(super::ring_action_has_key_action(context, &ring));
+                assert_eq!(
+                    super::ring_action_detail_label(&ring, context),
+                    super::key_action_detail_label(key)
+                );
+            }
+        }
+        let ring = RingActionId::ScriptSlot1;
+        for &context in RingShortcutContext::all() {
+            state.settings.ring_shortcuts.profile_mut(context).slots[0] = ring.clone();
+            state.settings.ring_shortcuts.set_right_drag_mode(
+                super::right_drag_context_for_ring_context(context),
+                crate::ring_shortcut::RightDragMode::RingShortcut,
+            );
+        }
+        let rows = super::command_overview_rows(&state, &keymap, &Default::default());
+        let row = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.target,
+                    super::OperationOverviewTarget::Key(KeyAction::ScriptSlot1)
+                )
+            })
+            .unwrap();
+        for category in ["リング", "パッド"] {
+            let labels = &row
+                .assignments
+                .iter()
+                .find(|(name, _)| *name == category)
+                .unwrap()
+                .1;
+            assert_eq!(labels.len(), 3, "{category}: {labels:?}");
+        }
+        assert!(!rows.iter().any(|row| matches!(
+            &row.target,
+            super::OperationOverviewTarget::Ring { action, .. } if *action == ring
+        )));
     }
 
     #[test]

@@ -1521,6 +1521,39 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 - detached の分類・記述子・viewport・placement は変えない。実装前に §2 を読み、設計 r3 の main 投影と lease 除外を
   実装の根拠とした。受けていない独立実装レビューの合意・検証結果は記載しない。コンパイル・Rust テストは未実施。
 
+### 2026-11-24: 操作のスクリプトはメインウィンドウの context だけで実行・イベント検出する (§1.363、設計の段階。実装はこれから)
+
+- 正本は [operation-script-plan.md](operation-script-plan.md) §3.2「凍結の決まり (detached リワーク) との照合」。キー・リング・右クリック等からスクリプトの操作の並びを実行し、本を開いた・ページが変わった等のイベントでも動く機能。
+- detached に触れる範囲: 入口の関数 (全画面のキー処理・`apply_ring_action`・右クリックメニュー) とイベントの検出点 (`render_fs_body`) は、別ウィンドウの context を取り付けている間も走る。本機能は 1 つの利用資格の関数を `run_script_slot` の冒頭とイベントの検出の冒頭の 2 か所から呼び、既存の述語を読むだけで判断する: 今の context がメインか (`projected_viewer_context_id() == viewer_context_main()`、§1.733 と同じ)、全画面の viewer の面では今の viewer の表示先が別ウィンドウか・そこへ切り替え中か (`current_viewer_session_is_detached_or_switching`。F12 の別ウィンドウ表示はメインの context のままでも起きるため)。メインウィンドウの一覧の面はメインの viewer の表示先を見ない。別ウィンドウの述語・viewport・窓の寿命・placement・context の取り付けと bundle の入れ替えは変えない。App に足す状態はメインの context 用で、bundle には入れない。
+- 合意: 独立設計レビュー (GPT-6.1 Sol / xhigh、read-only) の r6 では、方針 (メイン専用の所有範囲を既存の context・表示先・遷移の事実で定義する) は「症状パッチではなく構造的な決定」と評価されたが、具体案 (context ID の比較だけ) には合意が無かった。r7 で表示先・遷移の事実を加え、r7 のレビューで合意を得た。レビュー担当の言葉:「r7 が、既存の context・現在の表示先・遷移先・入力面によってメイン専用の所有範囲を定義することは、症状パッチではなく構造的な決定であることに合意します。detached の寿命・placement・取り付けを変更せず、メイン専用状態を bundle 外で保持する方針も、憲法と context 所有規則に整合します。」設計担当 ClaudeCode も、症状パッチではなく「メインウィンドウだけの機能」という所有の範囲を既存の事実で表す構造的な決定であることに同意する。設計の残りの指摘 (detached 以外) を r8・r9 で直し、r9 で ACCEPT WITH CHANGES (文言 1 件、反映済み)。r8・r9 でも合意は変わらないことを確かめた。
+- 実装の段 2a (2026-11-25、cd48a44fc・f106e2e3f、ブランチ script-363-impl): 利用資格の関数は `src/app/operation_script_runtime.rs` の `eligibility_from_facts` (125 行) と `operation_script_eligibility` (307 行)。上の既存の述語を読むだけで、一覧の面は表示先を見ない。描画の前と中の区別は呼び出しの引数と戻り値だけで運び、App の pending や bundle の項目を足していない。
+  - 段 2a のレビューの P3 (`GridOpenSelected` が開けなかった場合も成功を返す) の修正で、一覧から開く処理の「受け付けたか」を返すために、別ウィンドウへ開く経路の関数にも戻り値を足した。`src/app.rs` の `prepare_detached_context_for_grid_open(_with_admission)` (73038・73050 行)・`activate_existing_detached_viewer_for_grid_open(_with_admission)` (72931・72941 行)・`raise_active_detached_media_for_grid_open(_with_admission)` (72850・72860 行)・`open_grid_item_in_detached_book_context(_classified)(_with_admission)` (69687〜69765 行)・`execute_detached_grid_item_open_plan(_with_admission)` (69799・69810 行)・`open_bookmark_browser_row_with_admission` の別ウィンドウの読み込みの開始 (55246 行〜、`start_detached_bookmark_loading_context` の呼び出し 55359・55452 行)。呼び出し元は `src/app.rs` 2804・74019 行、`src/app/archive_inner_book.rs` 222 行、`src/filename_stack_ui.rs` 2227 行。既存の関数は同じ名前の bool を返す形で残し、`_with_admission` が受付の結果を足して返す。判定の順序 (Remote の拒否 → 既存の別ウィンドウの前面化 → 退避して新しく開く)・早期 return・副作用・非同期の開始の条件は変えていない。
+  - 合意: 段 2a の実装の独立レビュー (GPT-6 Astra / medium、read-only、新しい会話) で、初回 (cd48a44fc) は「既存のcontext・現在の表示先・遷移先・入力面でメイン専用の所有範囲を定義する、症状パッチではない構造的な決定」と合意 (判定は別の指摘で REVISE)。修正後の再確認 (f106e2e3f、同じ会話の続き) で、レビュー担当の言葉:「変更範囲は受付結果の伝搬まで広がりましたが、寿命・placement・contextの取り付け・bundleの所有境界を変えず、既存の判断結果を明示する構造的修正です。症状パッチではありません。」判定 ACCEPT WITH CHANGES (この記録の追補だけ)。設計担当 ClaudeCode も、既存の判断の結果を戻り値で明示するだけの構造的な修正であることに同意する。
+- 実装の段 2b (2026-11-25、38d42f4c9〜e4447cd07): 全画面の描画の中の入口 (通常・転送のキー処理、secondary 入力のジェスチャー・リング、右ドラッグ、中ボタン、全画面の右クリックメニュー) は、別ウィンドウの context を取り付けている間も走る経路。これらはスクリプトの要求をその場で実行せず、描画の所有 pass (`render_fs_body`) のローカル変数へ返し、末尾の 1 か所で段 2a の利用資格の関数を通して実行する。別ウィンドウの述語・viewport の生成・窓の寿命・context の取り付け・bundle は変えていない。App の pending や bundle の項目は足していない。
+  - 合意: 段 2b の実装の独立レビュー (GPT-6 Astra / medium、read-only、新しい会話、対象 e4447cd07、判定 ACCEPT) で、レビュー担当の言葉:「既存の context・表示先・遷移の述語によってメイン専用の利用範囲を定義する構造的な決定であり、症状パッチではありません。今回の差分は detached の述語、viewport、窓の寿命、context の取り付け、bundle の所有境界を変更していません。」設計担当 ClaudeCode も、要求を描画の所有者へ返して既存の判定で実行するだけの構造的な修正であることに同意する。
+- 実装の段 3 (2026-11-25、adc256441〜13558102f): native 動画のリング・ジェスチャーの、既存の別ウィンドウの命令へ委ねる経路 (`queue_recognized_detached_right_drag_command` 等) は変えず、`ScriptSlot*` に解決された要求は共通の利用資格の関数で拒否される。native 動画の入口 (キー・Browser キー・XButton・中ボタン・リング) と egui の動画・音楽の表示は、同じ利用資格を通してから実行する。別ウィンドウの述語・viewport・窓の寿命・context の取り付け・bundle は変えていない。App の pending や bundle の項目は足していない。
+  - 合意: 段 3 の実装の独立レビュー (GPT-6 Astra / medium、read-only、新しい会話、対象 13558102f、判定 ACCEPT WITH CHANGES、指摘は設計書の文書の P3 だけ) で、レビュー担当の言葉:「今回の触れ方は、既存の context・表示先・遷移の事実でメイン専用の利用範囲を定める構造的な決定であり、症状パッチではありません。detached の述語、viewport、窓の寿命、context の取り付け、bundle の所有境界は変更していません。」設計担当 ClaudeCode も同意する。
+- 実装の段 4 (2026-11-25〜26、c7627e6fc〜47fdcb264): イベントの検出はメインの context だけで行う。基準・覚えておく本の構成の `Arc`・フレームの番号 (ROOT の `cumulative_frame_nr_for`)・時刻は App 側に置き、bundle に入れない。取り付け中の別の context からの検出は、基準を更新する前に共通の利用資格で拒否する。別ウィンドウの述語・viewport・窓の寿命・context の取り付け・bundle は変えていない。
+  - 合意: 段 4 の実装の独立レビュー (GPT-6 Astra / medium、read-only、1 回目は新しい会話・対象 cf856ebba、3 回目の 47fdcb264 で ACCEPT) で、レビュー担当の言葉 (1 回目):「既存の context・表示先・遷移の述語でメイン専用の所有範囲を定める構造的な決定であり、症状パッチではありません。」3 回目も「既存の所有境界に沿う構造的な決定であり、症状パッチではありません。今回もdetachedの述語・viewport・窓の寿命・contextの取り付け・bundleは変更されていません。」設計担当 ClaudeCode も同意する。
+- 実装の段 5 (2026-11-26、4d8bfbf93〜9e46c1127): 環境設定のページ・設定の確定との接続・状態の写し・App が持つ loader の中のファイルの worker (読み込み・開く・既定に戻すを 1 本の FIFO)。別ウィンドウの述語・viewport・窓の寿命・context の取り付け・bundle には触れていない。読み込みの状態は段 1 から App が持ち bundle に入れていない (変わらない)。
+  - 合意: 段 5 の実装の独立レビュー (GPT-6 Astra / medium、read-only、新しい会話、2 回目の 9e46c1127 で ACCEPT) で、レビュー担当の言葉 (1 回目):「段5はApp所有のloader内でファイル要求を直列化し、環境設定から接続する変更です。別ウィンドウの述語・viewport・寿命・context取り付け・bundleを変更せず、段1〜4の利用資格も維持しています。症状を隠す追加条件ではなく、既存の所有境界を保つ構造的な決定です。」設計担当 ClaudeCode も同意する。
+- 段 4 (イベント) の実装の後に独立レビューを受け、結果をここに足す。
+
+### 2026-11-26: 3D 写真・スライドショーのキーの受付条件を判定の関数にし、操作のスクリプトと共用する (§1.363 の v5.9.0 の追加)
+
+- 正本は [操作のスクリプトの設計](operation-script-plan.md) §17.2。`FsDepthParallax`・`FsSlideshow` をスクリプトの許可リスト (種別 A、イベント不可) に足すため、
+  `ui_fullscreen.rs` のキーの受付の条件を純粋な判定の関数 (`fullscreen_depth_input_allowed`・`fullscreen_slideshow_input_allowed`・`fullscreen_slideshow_view_allowed`) にした。
+  キーは consume・条件の評価・実行の位置を 1 つも動かさず、式を関数の呼び出しに置き換えただけ。スクリプトは共用の入口 (`apply_fullscreen_shared_key_action`) で同じ判定を評価し、
+  同じ本体 (`toggle_depth_parallax`・`toggle_fullscreen_slideshow`) を呼ぶ。スクリプトの実行は今までどおりメインの context だけ。
+- detached の述語・viewport の選択と配送・窓の寿命・context の取り付け・bundle は変えていない。guard・delay・retry・一括 reset・silent fallback は足していない。
+  同じ判定は別ウィンドウの viewer のキーからも、その viewer の値で評価される (今と同じ)。
+- 合意 (設計の段階): 設計担当 ClaudeCode と独立設計レビュー (GPT-6 Astra / medium) は、条件の評価の時点を保つ形なら症状パッチではなく構造的修正であることに合意。
+  レビュー担当の言葉:「§17.2 は、上記2の条件評価時点も保存する形なら、既存の context 所有を維持した実行入口の共用化であり、症状パッチではなく構造的な修正であることに明示的に同意します。」
+- 合意 (実装): 独立実装レビュー (GPT-6 Astra / medium、対象 `521accf85..9e71c99f1`) で ACCEPT。レビュー担当の言葉:「主張に明示的に同意します。
+  §11 の2026-11-26記録と実装は一致しています。前半は評価時点と context 所有を維持した構造的な共用化であり、症状パッチではありません。後半も App の
+  loader と agent 受付に閉じ、detached の述語・viewport・寿命・context 取り付け・bundle を変更していません。」
+- 同じ追加の MCP tool `operation_script` (§17.5) は App の loader と agent の受付だけで、detached に触れない (同じレビューで同意)。
+
 ### 2026-11-23: ブラウザ閲覧の保存先のフォルダはページ構成の既定を単ページにする (§1.870、設計の段階。実装はこれから)
 
 - 正本は [browser-view-single-page-plan.md](browser-view-single-page-plan.md)。ブラウザから開いた画像が、保存先の月のフォルダの関係のない画像と見開きになる件。

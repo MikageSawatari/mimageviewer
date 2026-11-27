@@ -6,13 +6,7 @@ use egui_kittest::{
 use mimageviewer::book_composition::{PageOverride, PageSide, ReadingDirection, SinglePlacement};
 use mimageviewer::ui_composition_editor::*;
 
-#[path = "support/gpu_test_group.rs"]
-mod test_gpu_group;
-#[path = "support/ui_harness.rs"]
-mod test_ui;
-
-#[path = "support/logical_bounds.rs"]
-mod logical_bounds;
+use crate::{logical_bounds, test_ui};
 
 fn fixture(phase: EditorPhase) -> EditorView {
     let pages = (0..600)
