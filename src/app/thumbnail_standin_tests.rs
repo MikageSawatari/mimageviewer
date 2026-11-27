@@ -578,8 +578,8 @@ fn thumbnail_standins_image_and_video_keep_painted_index_rotation_after_reindex(
     app.bump_items_generation();
     for index in 0..4 {
         let key = physical_item_key(&app.items[index]).unwrap();
-        app.thumbnail_standins
-            .attach(index, &key, app.image_metas[index], &captured);
+        let stamp = app.image_metas[index];
+        app.thumbnail_standins.attach(index, &key, stamp, &captured);
         app.rotation_cache.insert(index, Rotation::Cw180);
     }
     let reads = crate::rotation_db::read_operations_for_test();
