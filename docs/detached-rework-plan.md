@@ -1458,7 +1458,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
-### 2026-11-27: 編集中の画像の交代と前面 context の所有境界 (§1.920、実装済み・自動検証と独立実装レビューは実施予定)
+### 2026-11-27: 編集中の画像の交代と前面 context の所有境界 (§1.920、実装済み・自動検証済み・実機未確認)
 
 - 正本: [page-edit-item-change-plan.md](page-edit-item-change-plan.md) §3・§5。
   linked の別ウィンドウで 6 編集ツールを使う間は一覧の共通の門で項目操作を拒否し、操作時だけ案内する。
@@ -1473,10 +1473,13 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   App に detached 用の bool / Option は追加しない。
 - detached の既存の述語の意味・viewport・窓の所有・session の開始・park の退出・見開き内の左右切り替えは変更しない。
   BA-7 の下書きと寿命を決める遷移の所有を結ぶ構造的修正であり、遅延・再試行・追加 repaint による症状パッチではない。
-- 合意: ClaudeCode (設計担当) と独立設計レビュー r1〜r4 (GPT-6.1 Sol / xhigh)。実装の独立レビューは未実施。
-  所有者を読む経路・close の所有条件・スマートフォルダの固定結果は正本 §3.4 の追記に従う。
-- 検証: 状態遷移・handler-level の回帰テストを追加。利用者指示により cargo のビルド・自動テストは実行せず、
-  ClaudeCode が自動テストと独立実装レビューを実施予定。実機未確認。
+- 合意: ClaudeCode (設計担当) と独立設計レビュー r1〜r5 (GPT-6.1 Sol / xhigh、r4 ACCEPT、r5 で所有者の経路と
+  close の所有条件を追補)。実装の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh、r1 ACCEPT + P3 → r2・r3 REVISE
+  (補正レイヤーの継続判定の対象) → r4 ACCEPT、`7dd968445..e20097823`) も、構造的修正であることに AGREE。
+  所有者を読む経路・close の所有条件・スマートフォルダの固定結果・補正レイヤーの例外・同じ画像の open の消しゴムは
+  正本 §3.4 の追記に従う。
+- 検証: 状態遷移・handler-level の回帰テストを追加。ClaudeCode が run-heavy 経由で本体 lib 全件を実行し
+  21448 件すべて成功 (`e20097823`)。実機未確認。
 - スマートフォルダは RootReady・install・resident 復帰の検証と ChildReady の旧 root 捕捉より前に終了する。
   session が無い間は保存後の既存 revision 検証で再準備し、session がある間は固定結果を維持する。
   保存後に再利用 metadata のバッジが古く見え得る点は Esc と同じ既存挙動として範囲外。新たな失効・再検索は足さない。
