@@ -48,7 +48,9 @@ impl Drop for ClipboardCapture {
 
 fn dispatch(app: &mut crate::app::App, ctx: &egui::Context, entry: usize) {
     match entry {
-        0 => app.execute_copy_key_action(ctx, KeyAction::FsCopyImage),
+        0 => {
+            app.execute_copy_key_action(ctx, KeyAction::FsCopyImage);
+        }
         1 => {
             let idx = app.fullscreen_idx.unwrap();
             let target = app.context_menu_target(
