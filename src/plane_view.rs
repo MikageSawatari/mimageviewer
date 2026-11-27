@@ -787,12 +787,24 @@ pub(crate) fn camera_sample(
     let mut offset = p - c;
     let mut fish_point = p;
     if k > 1.0e-7 {
-        let theta = lens.theta(k * r).unwrap_or_else(|| {
-            valid = false;
-            0.
-        });
-        let sigma = if r < 1.0e-6 { k } else { theta.sin() / r };
-        let d = [sigma * u.x, sigma * u.y, theta.cos()];
+        let (sigma, cosine) = if !tilt.is_exact_identity() && lens == PlaneLensKind::EquisolidAngle
+        {
+            // g(theta)=2*sin(theta/2): avoid asin followed by sin/cos before a
+            // projective division can magnify their independent approximation errors.
+            let kr = k * r;
+            valid = kr.is_finite() && kr >= 0. && kr <= 2.;
+            let safe_kr = if valid { kr } else { 0. };
+            let squared = safe_kr * safe_kr;
+            let sine = safe_kr * (1. - 0.25 * squared).max(0.).sqrt();
+            (if r < 1.0e-6 { k } else { sine / r }, 1. - 0.5 * squared)
+        } else {
+            let theta = lens.theta(k * r).unwrap_or_else(|| {
+                valid = false;
+                0.
+            });
+            (if r < 1.0e-6 { k } else { theta.sin() / r }, theta.cos())
+        };
+        let d = [sigma * u.x, sigma * u.y, cosine];
         valid &= d[2] > 1.0e-6;
         let t = 1. / d[2].max(1.0e-6);
         offset = Vec2::new(t * d[0], t * d[1]) * (r_scale / k);

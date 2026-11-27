@@ -44,11 +44,21 @@ fn rotate_uv(p:vec2<f32>)->vec2<f32> {
     var theta=kr; var valid=true;
     if params.lens.w>0.5 && params.lens.w<1.5 { theta=2.*atan(0.5*kr); }
     if params.lens.w>1.5 {
-        valid=kr<=2.; theta=2.*asin(clamp(0.5*kr,0.,1.));
+        valid=kr<=2.;
+        if params.camera.z>0.5 { theta=2.*asin(clamp(0.5*kr,0.,1.)); }
     } else { valid=theta<3.141592653589793; }
     theta=select(0.,theta,valid);
-    let sigma=select(sin(theta)/max(r,1.e-6),k,r<1.e-6);
-    let d=vec3(sigma*u,cos(theta));
+    var sigma=select(sin(theta)/max(r,1.e-6),k,r<1.e-6);
+    var cosine=cos(theta);
+    if params.camera.z<0.5 && params.lens.w>1.5 {
+        // Same equisolid half-angle identities as the CPU camera. Preserve the exact-I
+        // revision-1/2 path, but avoid an inverse-trig round trip before perspective.
+        let safe_kr=select(0.,kr,valid); let squared=safe_kr*safe_kr;
+        let sine=safe_kr*sqrt(max(1.-0.25*squared,0.));
+        sigma=select(sine/max(r,1.e-6),k,r<1.e-6);
+        cosine=1.-0.5*squared;
+    }
+    let d=vec3(sigma*u,cosine);
     // Stage one retains the untilted revision-1/2 arithmetic and its k~=0 identity path.
     let den=d.z; valid=valid && den>1.e-6;
     let t=1./max(den,1.e-6);

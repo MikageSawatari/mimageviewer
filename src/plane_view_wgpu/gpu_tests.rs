@@ -197,6 +197,95 @@ fn set_tilt(
     });
 }
 
+/// Independent f64 forward-board homography inverted as a 2x2 system. This does not
+/// reuse the product's normal/dot/t inverse or its f32 inverse-trigonometric path.
+fn equisolid_forward_board_reference(params: PlaneRenderParams, p: egui::Pos2) -> [f64; 2] {
+    let canvas = params.values[0];
+    let lens = params.values[1];
+    let center = [
+        f64::from(canvas[0]) + f64::from(lens[0]) * f64::from(canvas[2]),
+        f64::from(canvas[1]) + f64::from(lens[1]) * f64::from(canvas[3]),
+    ];
+    let v = [f64::from(p.x) - center[0], f64::from(p.y) - center[1]];
+    let radius = 0.5 * f64::from(canvas[2].min(canvas[3]));
+    let k = f64::from(params.values[2][0]);
+    let kr = k * v[0].hypot(v[1]) / radius;
+    let squared = kr * kr;
+    let w = (1. - 0.25 * squared).sqrt() / (1. - 0.5 * squared);
+    let offset = [v[0] * w, v[1] * w];
+    let focal = f64::from(params.values[2][1]);
+    let nx = params.values[13].map(f64::from);
+    let ny = params.values[14].map(f64::from);
+    let a = focal * nx[0] - offset[0] * nx[2];
+    let b = focal * ny[0] - offset[0] * ny[2];
+    let c = focal * nx[1] - offset[1] * nx[2];
+    let d = focal * ny[1] - offset[1] * ny[2];
+    let det = a * d - b * c;
+    let x = focal * (offset[0] * d - b * offset[1]) / det;
+    let y = focal * (a * offset[1] - offset[0] * c) / det;
+    assert!(
+        focal + nx[2] * x + ny[2] * y > 0.,
+        "the reference point must be in front of the camera"
+    );
+    [center[0] + x, center[1] + y]
+}
+
+#[test]
+fn plane_tilt_equisolid_yaw100_edge_uses_closed_form_before_projective_division() {
+    let gpu = OffscreenGpu::new();
+    let mut cache = PlaneRendererCache::default();
+    let material = material(&gpu, &mut cache, 950, false);
+    let canvas = Rect::from_min_size(egui::pos2(23., 41.), Vec2::new(48., 36.));
+    let transform = transform(canvas, 1.);
+    let lens = PlaneLensKind::EquisolidAngle;
+    let tilt = PlaneTilt::from_rotation_vector([0., 100_f32.to_radians(), 0.]);
+    let mut request = request_for_transform(
+        &gpu,
+        &mut cache,
+        material,
+        &transform,
+        canvas,
+        Vec2::splat(0.5),
+        lens,
+        0.75,
+    );
+    set_tilt(&mut request, &transform, canvas, lens, 0.75, tilt);
+    let p = canvas.min + Vec2::new(28.5, 3.5);
+    let reference = equisolid_forward_board_reference(request.snapshot.params, p);
+    let paint = transform.paint_rect;
+    assert!(
+        reference[0] < f64::from(paint.left()),
+        "the independently inverted board maps this ray outside its left edge: {reference:?}, {paint:?}"
+    );
+    assert!(reference[1] > f64::from(paint.top()) && reference[1] < f64::from(paint.bottom()));
+    let (point, valid) = camera_sample(
+        p,
+        canvas,
+        Vec2::splat(0.5),
+        request.snapshot.params.values[2][0],
+        lens,
+        tilt,
+    );
+    assert!(valid && point.is_finite());
+    assert!(
+        (f64::from(point.x) - reference[0]).abs() < 0.001
+            && (f64::from(point.y) - reference[1]).abs() < 0.001,
+        "stabilized inverse {point:?} must match the independent forward homography {reference:?}"
+    );
+    assert!(
+        texture_point(point, &transform, full_uv(), full_uv()).is_none(),
+        "CPU {point:?}, independent {reference:?}"
+    );
+    let rgba = request.render().unwrap();
+    let [width, _] = request.size;
+    let pixel = &rgba[((3 * width + 28) * 4) as usize..((3 * width + 28) * 4 + 4) as usize];
+    assert_eq!(
+        pixel,
+        &[13, 23, 37, 255],
+        "CPU {point:?}, independent {reference:?}, paint {paint:?}"
+    );
+}
+
 #[test]
 fn plane_tilt_gpu_all_pixels_match_two_stage_cpu_including_backfaces_and_edge_on() {
     let gpu = OffscreenGpu::new();
@@ -294,7 +383,7 @@ fn plane_tilt_gpu_all_pixels_match_two_stage_cpu_including_backfaces_and_edge_on
                                 assert_eq!(
                                     pixel,
                                     &[13, 23, 37, 255],
-                                    "{lens:?}, {tilt:?}, ({x},{y})"
+                                    "{lens:?}, {tilt:?}, density {density}, strength {strength}, ({x},{y}), CPU {q:?}, valid {valid}, paint {bounds:?}, edge distance {edge_distance}"
                                 );
                             }
                             assert_eq!(pixel[3], 255);

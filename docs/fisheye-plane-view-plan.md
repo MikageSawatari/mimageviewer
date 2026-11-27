@@ -1147,6 +1147,20 @@ cargo nextest run -p mimageviewer --lib -E 'test(/plane_view|plane_tilt|fisheye|
 cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen|in_page_scroll|page_turn|depth|ui_erase|keymap|search_nav_entry_inventory/)'
 ```
 
+### 段 2 の実装記録 (最初の関連試験の3件への対応)
+
+着手時 `94f7887a0`。設計担当の共通実行口のログ `s2-test1.log` (2928件中2925件成功) と各入力・fixture・式を照合した。修正後のRust/GPU試験は実装担当では実行していない。
+
+1. **真横近傍の帯 (テストの前提)**: 失敗文言の89は回転角、1530は板から色を取れた画素数であり、17列×90行に相当する。「1度手前ならcanvas面積の10%未満」という旧期待値には§18.2の根拠がなかった。このfixtureは板の局所半幅a=160・半高さb=90、canvas160×90、対角50度のfであり、前方投影は `v.x = f cosθ X / (f − sinθ X)`、`v.y = f Y / (f − sinθ X)`。手前側の遠近拡大を含むためcosθだけから面積は決められない。±aの投影から帯の両辺を求め、全画素の素材内外を照合する試験へ置き換えた。`f > a` と `f b / (f + a) > 45` を確認して全90行が含まれる根拠を置き、解析した列数×90との完全一致を要求する。幅 `2 f² a |cosθ| / (f² − a² sin²θ)` の単調縮小と真横への収束、帯内/両外の連続点も検査する。真横全面マスク・無効点の有限性の旧検査は維持した。期待値の変更は§18.2の遠近と「前後では細い帯」という仕様に基づく。
+
+2. **等立体角・裏側の素材縁 (製品の数値計算経路)**: CPUはRustのasin→sin/cos、WGSLは各intrinsicを通してから遠近の除算をしていた。裏側100度・density1・strength0.75・画素(28,3)について、逆三角/三角の往復の数値差が素材縁の判定へ増幅され得る経路を除去した。非exact-Iの等立体角だけ、`r_k = k r` から `sinθ = r_k sqrt(1 − r_k²/4)`、`cosθ = 1 − r_k²/2` をCPU/WGSL共通の演算で求める。数学上は§18.2の同じ放射状写像であり、傾き恒等の旧演算順とk近傍ゼロの経路は保持する。GPU色の[24,34,50]は強いLODの端sampleでも生じるが、微分は最後の素材内外のboolを変えないため、色だけから座標差の大きさは断定しない。微分・符号付きdenの代用値・tの無効判定・素材のマスク条件と既存1/64の縁の許容値は変更していない。独立したf64半角式＋板の前方ホモグラフィの2×2逆行列で、失敗画素が左辺外となること、CPU座標との一致、実GPUの背景色を要求する専用回帰を追加した。元ログだけでdriverのasinやFMAのどれが誤差を生んだかは特定しておらず、修正後の実GPUでの成否も設計担当の再実行を待つ。
+
+3. **画面snapshotの内側の色 (テストの前提)**: RootDepthViewerは最初の白いDepth fixtureの後、`source_texture_test_support::seed` で[60,120,180,255]の不変sourceを入れている。報告の実画素は板の内側の正しい素材色で、白という旧期待値が誤りだった。入力pixelsがその色であることと、無回転/トリムなし/全素材のfixture条件を明示して、内側の期待値をそのsource色へ修正した。§18.2のk=0のピンホールの前方写像から独立に2×2逆行列を解き、光線の有効性と板の内外をCPUの交点・source写像と照合する。各Canvas/capture/exportで内側と外側の両方を必ず検査し、内側はsource色、外側は背景色との厳密な画素一致を要求する。§18.2の6〜9と§18.4の「同じ素材・snapshotの出力」に基づく期待値の訂正で、出力経路は変更していない。
+
+**設計との差分**: 数学的な写像と仕様の差分はない。変更した期待値の根拠は上記の§18.2/§18.4。変更ファイルは `src/plane_view.rs`、`src/plane_view/tilt_tests.rs`、`src/plane_view_wgpu.rs`、`src/plane_view_wgpu/gpu_tests.rs`、`src/ui_fullscreen/plane_view_tests/gpu_tests/tilt_input_tests.rs`、本書§11。追加した回帰は `plane_tilt_near_edge_on_band_matches_forward_projection_and_converges` と `plane_tilt_equisolid_yaw100_edge_uses_closed_form_before_projective_division`。再検証は上の関連filterで行える。コンパイル、WGSL検証、GPUの修正後の画素、実機の見た目と性能は未確認。ビルド・test・check・clippy・算術用スクリプト・コミット・アプリ起動は行っていない。
+
+今回の許可された検査は `cargo fmt` 正常終了、UI字形は危険な字形なし、サイトは54カード・超過0、`git diff --check` 正常終了。追加した算術・画素のassertは未実行の検証条件であり、成功を確認した結果ではない。
+
 ## 12. 文書
 
 - [display-pipeline.md](display-pipeline.md): PlaneView の節 (§5 の要約と §6 の出口)。

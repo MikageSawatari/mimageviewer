@@ -196,6 +196,12 @@ fn plane_tilt_edge_on_is_fully_masked_and_invalid_ray_coordinates_stay_finite() 
         assert!(q.is_finite());
         assert!(!valid);
     }
+}
+
+#[test]
+fn plane_tilt_near_edge_on_band_matches_forward_projection_and_converges() {
+    let canvas = canvas();
+    let c = canvas.center();
     let cover = super::revision_tests::fixture(canvas, vec2(800., 450.));
     let material = cover
         .resolve(
@@ -204,37 +210,128 @@ fn plane_tilt_edge_on_is_fully_masked_and_invalid_ray_coordinates_stay_finite() 
             crate::displayed_image_transform::RectPixelFit::Proportional,
         )
         .unwrap();
-    for degrees in [89., 91., 269., 271.] {
-        let mut count = 0;
-        for y in 0..90 {
-            for x in 0..160 {
-                let p = canvas.min + vec2(x as f32 + 0.5, y as f32 + 0.5);
-                let (q, valid) = camera_sample(
-                    p,
-                    canvas,
-                    Vec2::splat(0.5),
-                    0.,
-                    PlaneLensKind::Equidistant,
-                    axis(1, degrees),
-                );
-                assert!(q.is_finite());
-                if valid
-                    && texture_point(
-                        q,
-                        &material,
-                        cover.material.coverage,
-                        cover.material.sampler_roi,
-                    )
-                    .is_some()
-                {
-                    count += 1;
+    assert_eq!(
+        material.paint_rect,
+        Rect::from_center_size(c, vec2(320., 180.))
+    );
+    let a = f64::from(material.paint_rect.width()) * 0.5;
+    let b = f64::from(material.paint_rect.height()) * 0.5;
+    // Independent forward projection of the finite board, not the inverse camera under test:
+    // camera position = (cos(theta) X, Y, f - sin(theta) X), |X| <= a, |Y| <= b.
+    // Thus screen x = f cos(theta) X / (f - sin(theta) X). Its two X endpoints
+    // give the exact horizontal band, including the near-side perspective expansion.
+    // A fixed percentage of the canvas (the old 10% assertion) is not its width.
+    let f = f64::from(canvas.width()).hypot(f64::from(canvas.height())) * 0.5
+        / 25_f64.to_radians().tan();
+    assert!(f > a, "the whole fixture stays in front of the pinhole");
+    // The least projected half-height over all X and all these rotations is still larger
+    // than the canvas half-height. Therefore each included column includes ALL 90 rows.
+    assert!(f * b / (f + a) > f64::from(canvas.height()) * 0.5);
+    let width_per_cos_bound = 2. * f * f * a / (f * f - a * a);
+    for edge in [90_f32, 270.] {
+        for side in [-1_f32, 1.] {
+            let mut previous_width = f64::INFINITY;
+            let mut previous_count = usize::MAX;
+            for offset in [1_f32, 0.5, 0.1, 0.01] {
+                let degrees = edge + side * offset;
+                let (sin, cos) = f64::from(degrees).to_radians().sin_cos();
+                let project_x = |x: f64| f * cos * x / (f - sin * x);
+                let endpoints = [project_x(-a), project_x(a)];
+                let left = endpoints[0].min(endpoints[1]);
+                let right = endpoints[0].max(endpoints[1]);
+                let width = right - left;
+                let closed_width = 2. * f * f * a * cos.abs() / (f * f - a * a * sin * sin);
+                assert!((width - closed_width).abs() < 1.0e-10);
+                assert!(width > 0. && width < previous_width);
+                // This analytic bound tends to zero with |cos(theta)| at 90/270 degrees.
+                assert!(width <= width_per_cos_bound * cos.abs() * (1. + f64::EPSILON * 8.));
+                previous_width = width;
+
+                let in_band = |x: f32| {
+                    let dx = f64::from(x) - f64::from(c.x);
+                    dx >= left && dx <= right
+                };
+                let expected_columns = (0..160)
+                    .filter(|x| in_band(canvas.min.x + *x as f32 + 0.5))
+                    .count();
+                let mut count = 0;
+                for y in 0..90 {
+                    for x in 0..160 {
+                        let p = canvas.min + vec2(x as f32 + 0.5, y as f32 + 0.5);
+                        let (q, valid) = camera_sample(
+                            p,
+                            canvas,
+                            Vec2::splat(0.5),
+                            0.,
+                            PlaneLensKind::Equidistant,
+                            axis(1, degrees),
+                        );
+                        assert!(q.is_finite());
+                        let samples_material = valid
+                            && texture_point(
+                                q,
+                                &material,
+                                cover.material.coverage,
+                                cover.material.sampler_roi,
+                            )
+                            .is_some();
+                        assert_eq!(
+                            samples_material,
+                            in_band(p.x),
+                            "forward-projected material band: degrees={degrees}, pixel=({x},{y}), band=({left},{right}), q={q:?}",
+                        );
+                        count += usize::from(samples_material);
+                    }
+                }
+                assert_eq!(count, expected_columns * 90);
+                assert!(count <= previous_count);
+                previous_count = count;
+
+                // Probe continuous points too: when no pixel center hits a very thin band,
+                // it must still have an interior, with rejected points just outside each edge.
+                for (x, expected) in [
+                    ((left + right) * 0.5, true),
+                    (left - 1., false),
+                    (right + 1., false),
+                ] {
+                    let p = c + vec2(x as f32, 0.);
+                    let (q, valid) = camera_sample(
+                        p,
+                        canvas,
+                        Vec2::splat(0.5),
+                        0.,
+                        PlaneLensKind::Equidistant,
+                        axis(1, degrees),
+                    );
+                    assert!(q.is_finite());
+                    assert_eq!(
+                        valid
+                            && texture_point(
+                                q,
+                                &material,
+                                cover.material.coverage,
+                                cover.material.sampler_roi,
+                            )
+                            .is_some(),
+                        expected,
+                        "band probe at {degrees}: {x}"
+                    );
+                }
+                if offset == 1. {
+                    assert!(
+                        count > 0,
+                        "one-degree band must contain real material pixels"
+                    );
+                }
+                if offset == 0.01 {
+                    assert!(left > -0.5 && right < 0.5);
+                    assert_eq!(
+                        count, 0,
+                        "band has converged between the two central pixel columns"
+                    );
                 }
             }
         }
-        assert!(
-            count > 0 && count < 160 * 90 / 10,
-            "near edge-on must leave a finite narrow band: {degrees}, {count}"
-        );
     }
 }
 

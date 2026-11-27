@@ -744,6 +744,17 @@ fn plane_tilt_front_and_back_snapshots_capture_and_export_the_same_board() {
     for back in [false, true] {
         let mut app = crate::app::setup_app_for_test();
         let mut viewer = viewer(&mut app);
+        // RootDepthViewer replaces the original white depth fixture with this canonical source.
+        let source_rgba = [60, 120, 180, 255];
+        let Some(FsCacheEntry::Static { pixels, .. }) = app.fs_cache.get(&0) else {
+            panic!("canonical still source")
+        };
+        assert!(
+            pixels
+                .pixels
+                .iter()
+                .all(|pixel| pixel.to_array() == source_rgba)
+        );
         enter_tilt(&mut viewer, &mut app);
         let orientation = if back {
             PlaneTilt {
@@ -778,6 +789,13 @@ fn plane_tilt_front_and_back_snapshots_capture_and_export_the_same_board() {
             .transform;
         let canvas = drawn.viewport_rect;
         let pose = app.plane_view_pose().unwrap();
+        let unit = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.));
+        assert!(drawn.rotation.is_none());
+        assert_eq!(drawn.free_rotation_rad, 0.);
+        assert_eq!(drawn.paint_rect, drawn.full_image_rect);
+        assert_eq!(drawn.uv_rect, unit);
+        assert_eq!(frozen.material.description.coverage, unit);
+        assert_eq!(frozen.material.description.sampler_roi, unit);
         let crate::capture::CapturePixelWork::PlaneView {
             request: capture, ..
         } = app.prepare_capture_pixel_work(&viewer.ctx, 0).unwrap()
@@ -800,6 +818,8 @@ fn plane_tilt_front_and_back_snapshots_capture_and_export_the_same_board() {
             assert!(Arc::ptr_eq(&request.snapshot, &frozen));
             let rgba = request.render().unwrap();
             let [w, h] = request.size;
+            let mut inside_pixels = 0;
+            let mut outside_pixels = 0;
             for (fx, fy) in [(0.2, 0.2), (0.4, 0.4), (0.5, 0.5), (0.6, 0.6), (0.8, 0.8)] {
                 let x = (fx * w as f32) as u32;
                 let y = (fy * h as f32) as u32;
@@ -809,15 +829,52 @@ fn plane_tilt_front_and_back_snapshots_capture_and_export_the_same_board() {
                         (x as f32 + 0.5) * canvas.width() * ppp / w as f32,
                         (y as f32 + 0.5) * canvas.height() * ppp / h as f32,
                     );
-                let expected = camera_point(
+                // Invert the forward pinhole homography independently of camera_point's
+                // ray/plane intersection. k=0 here, and the uncropped paint rectangle is Q.
+                let physical_canvas = canvas * ppp;
+                let c = physical_canvas.min + pose.lens_center * physical_canvas.size();
+                let v = p - c;
+                let focal = 0.5
+                    * f64::from(physical_canvas.width()).hypot(f64::from(physical_canvas.height()))
+                    / 25_f64.to_radians().tan();
+                let [nx, ny, n] = orientation.matrix().map(|column| column.map(f64::from));
+                let [vx, vy] = [f64::from(v.x), f64::from(v.y)];
+                let den = n[0] * vx + n[1] * vy + n[2] * focal;
+                let epsilon = 1.e - 6 * (vx * vx + vy * vy + focal * focal).sqrt();
+                let analytic = if n[2].abs() <= 1.e - 6 || den.abs() <= epsilon {
+                    None
+                } else {
+                    let a = nx[0] - vx / focal * nx[2];
+                    let b = ny[0] - vx / focal * ny[2];
+                    let c_y = nx[1] - vy / focal * nx[2];
+                    let d = ny[1] - vy / focal * ny[2];
+                    let determinant = a * d - b * c_y;
+                    let x = (vx * d - b * vy) / determinant;
+                    let y = (a * vy - vx * c_y) / determinant;
+                    let depth = focal + nx[2] * x + ny[2] * y;
+                    (depth > 0.).then(|| c + egui::vec2(x as f32, y as f32))
+                };
+                let mapped = camera_point(
                     p,
                     canvas * ppp,
                     pose.lens_center,
                     0.,
                     app.settings.plane_view_lens,
                     orientation,
-                )
-                .and_then(|q| {
+                );
+                assert_eq!(
+                    mapped.is_some(),
+                    analytic.is_some(),
+                    "back={back}, pixel=({x},{y})"
+                );
+                if let (Some(mapped), Some(analytic)) = (mapped, analytic) {
+                    assert!(
+                        (mapped - analytic).length() <= 1. / 64.,
+                        "independent pinhole inverse, back={back}, pixel=({x},{y})"
+                    );
+                }
+                let expected_inside = analytic.is_some_and(|q| drawn.paint_rect.contains(q / ppp));
+                let source_uv = mapped.and_then(|q| {
                     texture_point(
                         q / ppp,
                         &drawn,
@@ -825,14 +882,28 @@ fn plane_tilt_front_and_back_snapshots_capture_and_export_the_same_board() {
                         frozen.material.description.sampler_roi,
                     )
                 });
+                assert_eq!(
+                    source_uv.is_some(),
+                    expected_inside,
+                    "material support, back={back}, pixel=({x},{y})"
+                );
                 let pixel = &rgba[((y * w + x) * 4) as usize..((y * w + x) * 4 + 4) as usize];
-                if expected.is_some() {
-                    assert_eq!(pixel, &[255, 255, 255, 255]);
+                if expected_inside {
+                    inside_pixels += 1;
+                    assert_eq!(
+                        pixel, &source_rgba,
+                        "inside the projected board, back={back}, pixel=({x},{y})"
+                    );
                 } else {
+                    outside_pixels += 1;
                     let bg = app.settings.fullscreen_image_margin_color;
                     assert_eq!(pixel, &[bg[0], bg[1], bg[2], 255]);
                 }
             }
+            assert!(
+                inside_pixels > 0 && outside_pixels > 0,
+                "both the board and margin must be sampled"
+            );
         }
     }
 }
