@@ -2620,6 +2620,38 @@ mIV の側:
 - 追加の一覧に出ない 2 つ (SoundFont Player・Distortion Correction) と mIV 版で外した 2 つは載せない。
 - 意味の説明は mIV Sound の説明書 (`get_help`、§2) に任せ、ここには 1 行だけ置く。
 
+##### 21.4.1.1 値の形と範囲 (2026-11-27 改訂。統括経由の指示「一覧に出す単位と範囲を、保存の形と合わせる」)
+
+- **見つかったずれ**: 一覧の `min`・`max`・`unit` は、画面のつまみか DSP の自動化の説明 (`dsp-params.generated.js` の descriptor) から取っていた。
+  これは画面が見せる形で、state に保存する形 (AI が `apply` で書く値) と違う鍵がある。
+  - 例: Tilt EQ の `f0` は保存では Hz の自然対数で、既定は 6.91、mIV Sound は 3.0〜9.9 に丸める (`tilt_eq.js:186`・pack の丸め)。
+    一覧には「Hz・20.09〜19930」と出るので、AI が 1000 と書くと基準が約 20 kHz になる。
+  - 設計担当が DSP の pack の丸めと機械的に照らせた数値の鍵は 611 で、そのうち 7 が食い違った (`TiltEQPlugin.f0`・`SimpleJitterPlugin.rj`・
+    `StereoBalancePlugin.bl`・`AdaptivePredictionEffectPlugin.weightDecay`・`CompressorPlugin.rl`・`ExpanderPlugin.rl`・`BrickwallLimiterPlugin.sm`)。
+    残りの数値の鍵 (約 106) と、配列・object の中の値は、pack の丸めが無いので照らせていない。
+- **決定**:
+  1. 一覧の `min`・`max`・`step`・`unit`・`default` は、すべて**保存の形**にそろえる。AI が書く値は保存の形だけ。mIV は値を変換しない
+     (2 つの形を受けると、同じ数がどちらの形かで意味が変わる。値の形の書き手を 1 つにする)。§21.3 の 8 (範囲は検査しない) は変えない。
+  2. 画面が別の形で見せる鍵だけ、`display: { unit, min, max, formula }` を足す。`formula` は保存の値 `v` から画面の値を出す式
+     (例 `exp(v)`・`0.001*10^(v/20)`・`100*v`)。AI が画面の数 (例 1 kHz) から保存の値を求められるようにする。
+     `scale: "log"` は画面のつまみの動き方で、値の形ではない (一覧の注記に書く)。上流の `value` (保存の範囲) の項目は、
+     `min`・`max` に移したうえで出さない (同じ意味を 2 か所に書かない)。
+  3. 範囲は **mIV Sound が保つ範囲**にする。保存の形での JS の丸め (`setParameters` など) と DSP の pack の丸めの両方が分かる鍵は、
+     その共通部分にする。どちらの丸めも見つからない鍵は今の目安のままにし、`range_verified: false` を付ける (照らせた鍵には付けない)。
+  4. 生成は機械的に出せる所を機械的に出す。
+     - DSP の descriptor の `transform` (`naturalLog`・`log10`・`decibelsFromReference`) と pack の丸めから、保存の範囲と `display` を出す。
+     - 上流の scaled のつまみは、上流が持つ保存の範囲を使う。
+     - JS の中だけで変換する鍵は、生成 script の小さな上書きの表 (effect・鍵・保存の範囲・`display`) に置く。各行に根拠のファイル:行を書く。
+  5. **全部の鍵の照合**は実装担当が行う。対象は全エフェクトの数値の鍵で、配列・object の中の要素も含む。各プラグインの JS
+     (`setParameters`・UI の変換・DSP へ渡す値) と照らし、結果を `docs/mcp-sound-catalog-value-audit.md` に残す。
+     その文書には方法・件数・変換や食い違いのある鍵の表・照らせなかった鍵の表を書く。
+  6. テスト:
+     - pack の丸めがある数値の鍵すべてで、一覧の範囲がその丸めの範囲に収まる。
+     - 既定値が範囲の中にある。
+     - `display` がある鍵では、`formula` に既定値を入れた値が `display` の範囲の中にある。
+     - 上書きの表の各行が、今の一覧にある鍵を指している。
+  7. `sound_effects` の応答の `range_note` と tool の説明に、「値は保存の形。`display` があれば画面の見え方と換算の式」を短く書く。
+
 #### 21.4.2 `sound_chain { action, … }`
 
 許可は「設定の確認と変更を AI に任せる」(§3)。mIV Sound の並びとプリセットは、利用者が mIV の画面 (音響調整の窓) で変えられる設定で、
