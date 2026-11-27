@@ -384,16 +384,47 @@ fn mask_detect_settings_roundtrip_and_missing_key_defaults_are_shared() {
     settings.mask_detect.ellipse = false;
     settings.mask_detect.margin_percent = 27.0;
     settings.mask_detect.threshold = 0.7;
+    settings.mask_detect.face_selected = false;
+    settings.mask_detect.contour_margin_percent = 0.9;
+    settings.mask_detect.detectors.insert(
+        "remembered".into(),
+        crate::settings::ExternalDetectorSettings {
+            selected: true,
+            classes: Some(vec!["chosen".into()]),
+            shape: Some(DetectorShape::Contour),
+            threshold: Some(0.35),
+        },
+    );
     let mut stored = serde_json::to_value(&settings).unwrap();
     let restored: crate::settings::Settings = serde_json::from_value(stored.clone()).unwrap();
     assert!(!restored.mask_detect.ellipse);
     assert_eq!(restored.mask_detect.margin_percent, 27.0);
     assert_eq!(restored.mask_detect.threshold, 0.7);
+    assert!(!restored.mask_detect.face_selected);
+    assert_eq!(restored.mask_detect.contour_margin_percent, 0.9);
+    let detector = &restored.mask_detect.detectors["remembered"];
+    assert!(detector.selected);
+    assert_eq!(
+        detector.classes.as_deref(),
+        Some(["chosen".into()].as_slice())
+    );
+    assert_eq!(detector.shape, Some(DetectorShape::Contour));
+    assert_eq!(detector.threshold, Some(0.35));
+    let missing: crate::settings::MaskDetectSettings =
+        serde_json::from_str(r#"{"detectors":{"remembered":{"selected":true}}}"#).unwrap();
+    assert!(missing.face_selected);
+    assert_eq!(missing.contour_margin_percent, 0.6);
+    assert!(missing.detectors["remembered"].classes.is_none());
+    assert!(missing.detectors["remembered"].shape.is_none());
+    assert!(missing.detectors["remembered"].threshold.is_none());
     stored.as_object_mut().unwrap().remove("mask_detect");
     let defaults: crate::settings::Settings = serde_json::from_value(stored).unwrap();
     assert!(defaults.mask_detect.ellipse);
     assert_eq!(defaults.mask_detect.margin_percent, 15.0);
     assert_eq!(defaults.mask_detect.threshold, 0.6);
+    assert!(defaults.mask_detect.face_selected);
+    assert_eq!(defaults.mask_detect.contour_margin_percent, 0.6);
+    assert!(defaults.mask_detect.detectors.is_empty());
 }
 
 #[test]
@@ -588,9 +619,17 @@ fn mask_detect_open_cancel_and_zero_keep_book_append_undo_receipt() {
 fn mask_detect_expanded_dialog_keeps_actions_outside_scroll_at_small_screen() {
     use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
     let _input = crate::key_input::lock_test_input();
-    for scale in [1.0_f32, 2.0] {
+    // The stage-2 folder controls and license notice are part of the body.
+    // With details expanded they fit at 100%, but require scrolling at 200%.
+    for (scale, expected_height) in [
+        (1.0_f32, HeightExpectation::Fits),
+        (2.0, HeightExpectation::Scrolls),
+    ] {
         let mut app = mask_detect_fixture(MaskDetectTool::Erase);
         app.open_mask_detect_dialog(MaskDetectTool::Erase);
+        // Exercise the normal empty catalog, independently of worker timing or
+        // the fixture's disconnected receiver and its error-message layout.
+        *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(Vec::new()));
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         ctx.set_pixels_per_point(scale);
@@ -638,13 +677,18 @@ fn mask_detect_expanded_dialog_keeps_actions_outside_scroll_at_small_screen() {
         let body = ctx
             .data(|d| d.get_temp::<ScrollLayout>(egui::Id::unique("mask_detect_body_layout")))
             .unwrap();
-        body.assert_height(HeightExpectation::Fits, screen, scale);
+        body.assert_height(expected_height, screen, scale);
         let actions = ctx
             .data(|d| d.get_temp::<Vec<egui::Rect>>(egui::Id::unique("mask_detect_actions")))
             .unwrap();
         let window = ctx
             .data(|d| d.get_temp::<egui::Rect>(egui::Id::unique("mask_detect_window")))
             .unwrap();
+        assert!(
+            screen.expand(1.0 / scale).contains_rect(window),
+            "scale={scale}, window={window:?}, screen={screen:?}"
+        );
+        assert_eq!(actions.len(), 2);
         for action in actions {
             assert!(
                 screen.contains_rect(action),

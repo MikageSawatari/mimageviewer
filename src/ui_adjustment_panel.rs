@@ -13127,6 +13127,7 @@ impl App {
         edit_target: LocalAdjustMaskEditTarget,
         size: [usize; 2],
         shapes: Vec<crate::mask_db::Shape>,
+        patches: &[crate::ai::detect::MaskPatch],
     ) {
         let before = self.local_page_edit_document_for_producer(owner, document);
         let mut after = before.clone();
@@ -13141,6 +13142,10 @@ impl App {
         ) else {
             return;
         };
+        if !patches.is_empty() {
+            let alpha = prepared.mask.alpha_mut();
+            Self::apply_detect_mask_patches(patches, size, |index| alpha[index] = 1.0);
+        }
         for shape in shapes {
             let shape = match shape {
                 crate::mask_db::Shape::Rect {
@@ -13164,7 +13169,7 @@ impl App {
                         rotation_rad: 0.0,
                     }
                 }
-                _ => unreachable!("face detections contain boxes only"),
+                _ => unreachable!("detections contain boxes only"),
             };
             prepared.mask.shapes.push(shape);
         }
@@ -13173,7 +13178,7 @@ impl App {
             &owner.target,
             before,
             after,
-            "顔の検出".into(),
+            "自動検出".into(),
         );
         // Like a hand-drawn shape or bucket fill, reveal the adopted mask edit.
         // The request owner calls this only after validating a nonempty result.

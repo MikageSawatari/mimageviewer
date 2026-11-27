@@ -15,11 +15,14 @@ Date: 2026-05-31
 >   [v2.8.1 S1 監査](review-v2.8.1/s1-local-adjust.md)に記録済み。通常の local / conceal
 >   materialization は worker 化・context ownership 済みだが、この preview lane の注記は残す。
 
-## 顔の自動検出（§1.914 段 1b、実装、cargo検証待ち）
+## マスクの自動検出（§1.914 段 2、実装・検証状況は §23）
 
-共通の [自動検出…] は同梱 YuNet で顔を検出し、`effective_local_mask_edit_target` で解決した
+共通の [自動検出…] は同梱 YuNet と追加の Ultralytics detect / segment を使い、`effective_local_mask_edit_target` で解決した
 手動ベース / 追加 / 削除マスクへ楕円または矩形を足す（既定は楕円、余白 15%、詳細の閾値 0.6）。
-余白は検出した幅・高さの指定 % を各辺の外側へ足す。
+箱の余白は検出した幅・高さの指定 % を各辺の外側へ足す。輪郭に沿う場合は、長辺の指定割合（既定 0.6%、最小 2px）で
+太らせたパッチ範囲を alpha 1.0 として足す。`alpha_mut()` はパッチのループ外で 1 回だけ呼ぶ。
+Raster → RasterVector 変換、未作成の追加 / 削除マスクの準備、パッチ書き込みと図形の末尾追加を 1 回の Undo に含める。
+ビットマップの下地 → 図形の作成順は維持するので、既存の消去図形と重なる輪郭は抜けたままになる。
 設定は消しゴム・隠蔽加工と共有し、入力は `current_local_adjust_source_pixels` を使う。
 開始時の `PageEditOwner` と文書を捕捉し、受信時は最新受付済み文書も含めて一致を確かめる。
 有効な結果だけを既存の `set_local_adjust_layers_for_target_with_undo` に 1 回渡し、既存 worker で保存・再計算する。
@@ -27,7 +30,7 @@ Date: 2026-05-31
 0 件・取消・照合不一致では、表示が OFF なら OFF のまま維持する。
 削除マスクへの追加は効果を除く範囲を広げる。0 件・取消・不一致では空マスクの作成や Raster の変換も行わない。
 検出中は両パネルとキャンバスの新規操作を止め、被写体マスク・LUT の生成待ち中は開始しない。
-詳細と未実施の検証は [自動検出計画 §4.3・§7・§19](auto-conceal-detection-plan.md) を参照。
+詳細と未実施の検証は [自動検出計画 §4.3・§6・§7・§23](auto-conceal-detection-plan.md) を参照。
 
 ## 1. 実装前の背景 (設計経緯)
 

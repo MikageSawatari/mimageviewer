@@ -24,6 +24,12 @@ pub(super) fn mask_detect_output() -> MaskDetectOutput {
 
 pub(super) fn mask_detect_fixture(tool: MaskDetectTool) -> AppTestEnvForTest {
     let mut app = setup_app_for_test();
+    // Ordinary ownership/UI fixtures never initialize ORT or inspect real files.
+    let (_tx, rx) = mpsc::channel();
+    *app.mask_detect_catalog = DetectorCatalogState::Loading {
+        cancel: Arc::new(AtomicBool::new(false)),
+        rx,
+    };
     let path = app.tmp.path().join("mask-detect.png");
     image::RgbaImage::from_pixel(8, 8, image::Rgba([70, 100, 130, 255]))
         .save(&path)
@@ -342,7 +348,15 @@ fn mask_detect_local_raster_conversion_and_absent_overrides_are_one_undo() {
                 if zero {
                     mask_detect_boxes(Vec::new(), &Default::default())
                 } else {
-                    mask_detect_output()
+                    let mut output = mask_detect_output();
+                    output.patches.push(MaskPatch {
+                        x: 1,
+                        y: 0,
+                        w: 2,
+                        h: 2,
+                        bits: vec![true, false, false, true],
+                    });
+                    output
                 },
             );
             if zero {
@@ -356,7 +370,10 @@ fn mask_detect_local_raster_conversion_and_absent_overrides_are_one_undo() {
                     let LocalMask::RasterVector(mask) = &layer.mask else {
                         panic!("raster base must become raster-vector");
                     };
-                    assert_eq!(mask.alpha.as_slice(), &[0.25; 64]);
+                    let mut expected = vec![0.25; 64];
+                    expected[1] = 1.0;
+                    expected[10] = 1.0;
+                    assert_eq!(mask.alpha.as_slice(), expected.as_slice());
                     mask
                 }
                 LocalAdjustMaskEditTarget::OverrideAdd => {
@@ -369,6 +386,11 @@ fn mask_detect_local_raster_conversion_and_absent_overrides_are_one_undo() {
             };
             assert_eq!([mask.width, mask.height], [8, 8]);
             assert_eq!(mask.shapes.len(), 1);
+            assert_eq!(mask.alpha[1], 1.0);
+            assert_eq!(mask.alpha[10], 1.0);
+            if target != LocalAdjustMaskEditTarget::Base {
+                assert_eq!(mask.alpha[0], 0.0);
+            }
             assert_eq!(app.meta_undo.undo_len(), history.2 + 1);
             app.apply_meta_undo();
             assert_eq!(app.local_adjust_page_layers[&0], before);

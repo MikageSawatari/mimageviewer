@@ -316,8 +316,17 @@ pub(crate) fn black_flatten_if_transparent(img: &egui::ColorImage) -> Option<egu
 const UNDO_MAX: usize = 20;
 
 impl App {
-    pub(crate) fn apply_mask_detect_to_erase(&mut self, shapes: Vec<Shape>) {
+    pub(crate) fn apply_mask_detect_to_erase(
+        &mut self,
+        shapes: Vec<Shape>,
+        patches: &[crate::ai::detect::MaskPatch],
+    ) {
         self.push_undo_snapshot();
+        if let Some(mask) = self.erase_mask.as_mut() {
+            Self::apply_detect_mask_patches(patches, self.erase_mask_size, |index| {
+                mask[index] = true
+            });
+        }
         self.erase_shapes.extend(shapes);
         self.erase_selected_shape = None;
         self.erase_mask_texture = None;

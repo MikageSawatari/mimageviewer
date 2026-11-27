@@ -1,8 +1,9 @@
 # マスクを検出で自動作成する (消しゴム・隠蔽加工・補正レイヤー共通) — 設計案 (§1.914)
 
-> ステータス: **段 1b の実装、cargo 検証待ち (2026-11-26 起票)**。設計担当 = ClaudeCode Opus 5.5。
+> ステータス: **段 2 の実装、cargo 検証待ち (2026-11-27)**。設計担当 = ClaudeCode Opus 5.5。
 > 隠蔽加工だけを対象にした版で Sol の独立レビュー R1〜R3 を受け、R3 で ACCEPT。その後の利用者の判断 (§13) で
 > **3 つのマスクツール共通**に広げ、広げた部分も R4〜R5 で ACCEPT (§16)。段 0 の記録は §17、段 1a の引き継ぎは §18、段 1b の実装範囲と未実施の検証は §19。
+> 段 1 のその後の記録は §20〜§22、段 2 の実装引き継ぎは §23。段 1 の独立レビュー・全件テスト・実機確認の完了は今回の利用者報告による。
 > ファイル名は起票時のまま (`auto-conceal-…`) にしている。
 > 旧案 [archive/ai/auto-mask-detection-plan.md](archive/ai/auto-mask-detection-plan.md) (2026-05、v1.1.0 期、未着手)
 > の方針を引き継ぎ、現在のコードと 2026-11 時点の公開モデルの調査に合わせて作り直したもの。旧案の行番号・型名は古い。
@@ -130,6 +131,9 @@
 
 - 設定 (選んだ検出器・分類・形・余白) は 3 ツールで共有する 1 組にする。ツールごとに別の設定は持たない
   (状態を増やさない。ツールを変えても同じ検出がかかる)。
+- BYO の設定は表示名を鍵にして選択・分類名の選択・形・閾値の上書き `Option<f32>` を保存する。
+  一覧に無い検出器の設定も残す。上書きなしは分類別 json → 共通 json / threshold.json → 0.25。
+  選択した検出器の設定だけを行の下に展開し、閾値は詳細内に置く。
 - 各検出器の行には、ファイル名・分類の数・種類 (箱 / 輪郭)・ONNX に書かれたライセンス文字列 (あれば) を出す。
 - 文言は処理内容だけを書く (例:「顔を検出して楕円のマスクを追加します」)。「投稿用」などの用途判定の語は使わない。
 - 読めなかったファイルは灰色の行で理由を出す (例:「出力の形式を読めません」)。黙って隠さない。
@@ -165,8 +169,8 @@
 | 形式 | 出力 | 読み方 |
 |---|---|---|
 | `YuNet` | stride 8/16/32 ごとの cls・obj・bbox・kps | OpenCV の `FaceDetectorYN` と同じ式。5 点は v1 では使わない |
-| `UltralyticsDetect` | `[1, 4+C, N]` (xywh + 分類ごとの確からしさ) | 転置 → 閾値 → 分類ごとの重なり除去 (IoU 0.5) |
-| `UltralyticsSegment` | `[1, 4+C+32, N]` と元マスク `[1, 32, H/4, W/4]` | 上と同じ + 32 係数 × 元マスク → 0 以上を内側 → 箱で切り抜く |
+| `UltralyticsDetect` | `[1, 4+C, N]` (xywh + 分類ごとの確からしさ) | 転置 → 最大の分類 1 つ → 選択と閾値 → 分類ごとの重なり除去 (IoU 0.7、最大 300 件) |
+| `UltralyticsSegment` | `[1, 4+C+32, N]` と元マスク `[1, 32, H/4, W/4]` | 上と同じ + 32 係数 × 元マスクのロジットを元画像の画素中心で双線形に読む → 0 より大きければ内側 → 箱で切り抜く |
 
 - **形式は上の 3 つだけにする** (段 0 の結果、§17)。YOLO26 も既定の書き出しは従来形式 (`end2end = False`、出力は
   v8 / 11 と同じ並び) で、調べた BYO の候補 5 つもすべて従来形式だった。重なり除去済みの書き出し
@@ -182,9 +186,11 @@
 - **Ultralytics 系 (段 0 で ultralytics 本体と一致を確認、§17)**: 入力の大きさ `S` はメタデータの `imgsz` →
   同じ場所の `model_artifacts.json` の `args.imgsz` → 入力の形が固定ならその大きさ → 640 の順で決める。
   ultralytics の `LetterBox` と同じ計算にする: `r = min(S/h, S/w)`、縮めた大きさ `(round(w·r), round(h·r))`、
-  縮小は双線形、余白 `dw = (S - 新しい幅) / 2` を左 `round(dw - 0.1)`・右 `round(dw + 0.1)` (上下も同じ) に分け、
+  縮小・拡大とも cv2.INTER_LINEAR と同じ 2×2 だけの双線形（半画素の座標、端は切り詰め）を使う。
+  image crate の Triangle は縮小で範囲を広げるので使わない。余白 `dw = (S - 新しい幅) / 2` を左 `round(dw - 0.1)`・右 `round(dw + 0.1)` (上下も同じ) に分け、
   灰色 (114) で埋める。RGB、0..1、NCHW。出力は転置して `(cx, cy, w, h)` + 分類ごとの確からしさ (既に 0..1)。
-  確からしさ ≥ 閾値で残し、**分類ごとに** 重なりを除く (IoU 0.7、ultralytics の既定)、多くて 300 個。
+  各候補で確からしさが最大の分類 1 つだけを取り、未選択なら捨てる（multi_label なし、sigmoid なし）。
+  確からしさ ≥ その分類の閾値で残し、**分類ごとに** 重なりを除く (IoU 0.7、ultralytics の既定)、確からしさ順に多くて 300 個。
   座標は余白を引いて `r` で割り、画像の範囲に切り詰める。
 - **輪郭**: 32 係数 × 元マスクで元マスクの解像度の値 (ロジット) を作る。**元の画像の箱の中の各画素について、
   画素の中心を letterbox の座標 → 元マスクの座標へ写し、ロジットを双線形で読んで 0 より大きければ内側**とする
@@ -215,16 +221,27 @@
 
 - 置き場は **`<data_dir>\detectors\`** に固定する (ポータブル版・`--data-dir` でも data_dir に従う)。
   フォルダを変える設定は v1 では作らない (状態を増やさない)。
-- 1 つの検出器 = `<名前>.onnx` + 任意の `<名前>.json`。json は分類名・既定の閾値・既定の形を上書きするためのもの:
+- 1 つの検出器は (a) `<名前>.onnx` + 任意の `<名前>.json`、または (b) `<フォルダ名>\model.onnx` と同じフォルダの
+  任意の `labels.json`（分類名の配列）・`threshold.json`（全分類で 1 つの `threshold`）・`model_artifacts.json`（`args.imgsz`）・
+  `model.json`（a の json と同じ）。1 階層だけを見て再帰しない。表示名・設定の鍵は a の stem / b のフォルダ名。
+  json は分類名・分類別／全体の閾値・既定の形を上書きする。項目はすべて任意、不明キーは無視し、壊れた書式は読めない理由として出す:
 
   ```json
-  { "names": ["anus", "penis", "vagina"], "thresholds": {"anus": 0.15}, "shape": "rect" }
+  { "names": ["分類 A", "分類 B"], "thresholds": {"分類 A": 0.15}, "threshold": 0.25, "shape": "rect" }
   ```
 
 - 分類名は、json → ONNX のメタデータ `names` → deepghs 形式の `labels.json` (同名フォルダ内) の順で探す。
   どこにも無ければ「分類 0」「分類 1」… と出す (使えるが、利用者には分かりにくいことを表示する)。
+- ONNX の `names` は Python dict リテラルの小さな parser で読む（単引用符・二重引用符とエスケープ、名前内の `,` / `:`）。
+  キーは 0 からの連番だけを受け付け、式の評価はしない。
 - フォルダの読み込み (read_dir・ONNX のメタデータの読み取り) は **worker** で行う。ダイアログを開いたときと
   [一覧を読み直す] で走らせ、結果が来るまでは「読み込み中」と出す。UI スレッドで ONNX を開かない。
+- 一覧は App 共通の単一 owner に持ち、context bundle には入れない。`ai_runtime_init` の準備を待ち、CPU・最適化なしの
+  一時 Session で読み、閉じる。外部モデル表には入れない。動的な分類数は名前の数で決め、名前も無い場合だけ
+  その Session に灰色 114 の 640×640 を 1 回入れて形を確かめる。決まらなければ読めない扱い。
+- 検出要求は使う一覧情報（外部モデル鍵・形式・分類・閾値・入力サイズ）を複製する。worker が Session を使う前に
+  `ExternalModelKey` と同じサイズ・更新時刻を照合し、変化は型付きエラー「検出器のファイルが変わりました。一覧を読み直してください」。
+  照合と読み込みの間の入れ替わりはまれな失敗として割り切る。
 - ファイルを選んで取り込むボタン (コピーで登録) は v1 では作らない。[フォルダを開く] で足りるかを使ってから決める。
 
 ### 6.2 推論セッション (`AiRuntime` の外部モデル)
@@ -536,7 +553,7 @@ YuNet の同梱、外部モデルのセッション、検出 worker とモーダ
 
 ### 段 2 — 追加の検出器 (BYO)
 
-検出器フォルダと一覧の worker、Ultralytics の 3 形式の読み取り、分類の選択、輪郭パッチ、json による上書き、
+検出器フォルダと一覧の worker、Ultralytics の 2 形式（detect / segment）の読み取り、分類の選択、輪郭パッチ、json による上書き、
 読めないファイルの表示、マニュアルの検出器の表 (§8)。
 
 ### 段 3 — 複数の画像への一括適用 (後で決める)
@@ -928,3 +945,233 @@ mask_detect_parked_empty_receiver_keeps_root_poll_awake_until_result
 - Window と共有テストデータのキーはグローバルな Id なので `Id::unique` に揃え、テストの読み取りも同じ呼び出しにする。
   ローカルな ScrollArea の `id_salt` は既存の書き方を維持する。`Id::new` は `Id::unique` への互換呼び出しだったので hash は変わらない。
 - `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。コンパイル・テストの再実行は設計担当へ引き継ぎ、git add / commit は実行していない。
+
+## 23. 段 2 の実装引き継ぎ (2026-11-27、未コンパイル・未テスト)
+
+### 23.1 実装した範囲
+
+- `ai::detector_catalog` に直下の ONNX + 同名 json と、1 階層のフォルダ内 `model.onnx` + 任意の sidecar を追加した。
+  配置形式を明示して扱い、直下の `model.onnx` をフォルダ形式と取り違えない。別の検出器の json を横取りして読まない。
+  worker 内の `entry.file_type()`、差し替え可能な ONNX reader、型付きの読めない理由、分類名と入力サイズ・閾値の優先順位、
+  Python dict の名前 parser、動的分類数の名前からの解決 / 1 回の灰色推論を持つ。
+- `runtime` の一覧専用 helper は CPU・最適化なしの一時 Session を作り、外部モデル表には入れない。
+  既存の `ExternalModelKey` のパス・サイズ・更新時刻を一覧情報と検出要求で共有する。
+- 一覧 owner は App 共通の boxed `DetectorCatalogState`。ダイアログの open / 再読込で worker を開始し、
+  ランタイムの準備待ちから読込の終了まで活動 lease を保持する。UI は Loading と結果の表示・受信だけ。
+  context bundle・detached の述語と viewport 経路は変更しない。フォルダの作成と Explorer 起動も worker に置き、
+  失敗通知には既存の外部操作の通知 channel を使う。
+- `ai::detect::ultralytics` は RGB / NCHW の LetterBox、縮小・拡大とも半画素の 2×2 双線形、最大分類の選択、
+  選択分類・分類別閾値、分類ごとの IoU 0.7 の NMS と全体 300 件上限を実装する。
+  segment は箱の中の元画像の画素中心から元マスクへ写し、ロジットを双線形に読んで 0 より大きければ内側とする。
+  ロジットの計算・確保は、箱に必要な双線形の隣接画素を含む元マスクの範囲に限る。
+  正方形近傍の太らせを separable な線形走査で行い、この形を単体テストに固定した。
+  推論ごとに出力数・形式・分類数を検査し、ファイル identity の変化は型付き `DetectorChanged` で全体を中止する。
+- `MaskDetectRequest` は検出器情報・選択・形・閾値・余白を複製して固定し、一覧再読込と独立させた。
+  worker は顔と選ばれた BYO を順に実行し、検出器間の NMS はしない。箱・輪郭パッチ・分類ごとの件数をまとめる。
+  UI の対象照合は段 1 のまま、検出器のファイル照合は worker 側だけに置く。
+- 3 ツールの既存 apply 関数で、Undo の区切り → パッチ範囲の OR / alpha 1.0 → 図形の末尾追加 → 後処理を行う。
+  補正レイヤーの `alpha_mut()` はパッチループ外で 1 回。Raster の変換・未作成 override の準備も同じ Undo に含める。
+  パッチだけ・図形だけの結果も採用し、0 件・取消・照合不一致では文書・マスク・Undo・表示状態を変えない。
+- `Settings.mask_detect` は 3 ツール共有の 1 キーを維持し、顔の選択、輪郭の余白、検出器名ごとの選択・分類・形・閾値を追加した。
+  未リリースなので移行なし。設定転送の除外は維持する。保存してある輪郭指定で箱のモデルへ入れ替えた場合は矩形を使い、
+  保存値自体は残す。
+- ダイアログに読める / 読めない行、分類・形・詳細の閾値、フォルダ操作、配布とライセンスの説明を追加した。
+  20 行の混在した一覧で 1093×614・100% / 200% の操作行を検査する headless テストを追加した。PNG の追加・生成はしていない。
+- マニュアル `detectors.html` と、目次・サイドバー・3 ツールからのリンクを追加した。形式を確かめた 5 件、配布元とライセンス、
+  JSON、余白・形・閾値、見落としと合成順を説明する。製品ページと Store 文言は変更していない。
+
+### 23.2 設計本文の整合と参照テスト
+
+- §5.2 の古い表の IoU 0.5 / 0 以上、§11 の Ultralytics 3 形式という記述を、§5.3・段 0 と今回の依頼に合わせて
+  IoU 0.7 / 0 より大きい / detect と segment の 2 形式へ訂正した。§4〜§6 に配置形式・設定・不変な要求・CPU 一覧読取を明記した。
+  製品機能を減らす設計変更は行っていない。段 3 の一括適用は実装していない。
+- ignored `detect_ultralytics_reference_matches_external_models` は `MIV_DETECT_REFERENCE` の外部 JSON を読み、
+  外部モデルの実セッション経路で検出し、同分類・箱 IoU ≥ 0.5 の全組を IoU 降順に貪欲に 1 対 1 に対応させる。
+  対応箱は全組 IoU ≥ 0.85・score 差 ≤ 0.05、かつ全ケースの全組を合わせて 95% 以上が IoU ≥ 0.95 とする（ケースごとの割合の平均ではない）。
+  未対応は両側とも score < 閾値 + 0.03 だけ許す。輪郭は対応箱の IoU ≥ 0.95 なら IoU ≥ 0.9、それ未満なら IoU ≥ 0.8 を検査する。
+  参照 PNG は Ultralytics の余白前の結果なので、同じ推論・読取経路の private 入口から半径 0 を渡して比較する。
+  製品入口の余白は常に最小 2px で、正方形の太らせと端の切詰めは別の単体テストで検査する。
+  ONNX・画像・参照 JSON は追加していない。この ignored テストは既存の nextest `gpu` group に登録した。
+- **設計担当の判断による基準の変更**: CPU と DirectML の推論・縮小の固定小数点の差で、確からしさの低い大きな箱の縁が動く数値差を許容する。
+  設計担当が TurboJPEG 入力で照合した case 4 の分類 5 では、score 約 0.40 の大きな箱が IoU 0.910382 となり、他の対応はすべて 0.98 以上だったとの報告に基づく。
+  各ケースの件数・対応数・境目の許容数・IoU 0.95 未満の組数・各最小 IoU、最後に全体の組数・0.95 以上の割合・箱と輪郭の最小 IoU を出してから失敗をまとめる。
+- 参照テストの JPEG は既存の `thumb_loader::decode_jpeg_turbo_scaled_from_path(path, u32::MAX)` で等倍・EXIF 向き未適用の画素を読む。通常 fullscreen の canonical 経路は `image::open` と向き適用を行うため使わず、依頼で許可された既存 TurboJPEG helper を使う（製品コードは変更しない）。
+  未対応箱は両側とも、本人の分類・score・xyxy と、相手側全箱の最大 IoU の箱の分類・score・IoU をケース名付きで出す。今回の基準変更後の実モデル照合は実装担当では未実行。
+
+### 23.3 追加・拡張したテストと実行の引き継ぎ
+
+以下の追加テスト名は成功の記録ではない。すべて既存のフィルター
+`test(/mask_detect|^ai::detect::/)` に含まれる。実モデル参照だけは ignored のため明示実行が必要。
+
+`src/ai/detector_catalog.rs`:
+
+```text
+mask_detect_catalog_placements_are_one_level_and_errors_remain_visible
+mask_detect_catalog_root_model_uses_file_name_and_its_override
+mask_detect_catalog_file_sidecars_do_not_read_sibling_package_metadata
+mask_detect_catalog_names_thresholds_shape_and_license_priority
+mask_detect_catalog_malformed_relevant_json_is_not_hidden_by_priority
+mask_detect_catalog_python_dict_handles_quotes_escapes_punctuation_and_sequential_keys
+mask_detect_catalog_dynamic_channels_use_names_or_probe_once
+mask_detect_catalog_validates_format_class_count_and_all_tensor_types
+mask_detect_catalog_scalar_threshold_overrides_package_default_but_not_class_values
+mask_detect_catalog_mixed_dynamic_spatial_axes_keep_fixed_input_contract
+mask_detect_catalog_input_size_priority_and_fixed_shape_consistency
+```
+
+`src/ai/detect/ultralytics/tests.rs`:
+
+```text
+detect_ultralytics_letterbox_python_round_padding_and_roundtrip
+detect_ultralytics_resize_is_two_by_two_halfpixel_in_both_directions
+detect_ultralytics_selects_max_class_before_selection_and_class_threshold
+detect_ultralytics_nms_uses_point_seven_per_class_and_caps_globally
+detect_ultralytics_nms_precedes_original_coordinate_clipping
+detect_ultralytics_mask_multiplies_all_coefficients_and_interpolates_logits_before_threshold
+detect_ultralytics_mask_sampling_uses_original_centers_and_replicated_edges
+detect_ultralytics_mask_accepts_nonquarter_prototypes_and_computes_only_box_roi
+detect_ultralytics_crop_original_box_before_square_dilation_and_clip_patch
+detect_ultralytics_square_dilation_matches_naive_neighborhood
+detect_ultralytics_runtime_shapes_and_nonfinite_data_return_errors
+detect_ultralytics_changed_file_rejects_catalog_identity_without_onnx_load
+detect_ultralytics_rejects_invalid_options_and_honors_cancel
+detect_ultralytics_reference_matches_external_models
+detect_ultralytics_reference_matching_is_global_iou_greedy_with_half_iou_cutoff
+detect_ultralytics_reference_box_quality_enforces_floor_and_pair_weighted_global_ratio
+detect_ultralytics_reference_mask_quality_uses_matched_box_iou_threshold
+detect_ultralytics_reference_jpeg_uses_full_size_without_exif_orientation
+detect_ultralytics_reference_unmatched_diagnostic_searches_all_opposite_classes
+detect_ultralytics_reference_allows_only_strict_boundary_unmatched_on_either_side
+detect_ultralytics_reference_enforces_one_to_one_class_iou_and_score_difference
+```
+
+`src/app/mask_detect/stage2_tests.rs`:
+
+```text
+mask_detect_mixed_patch_and_box_patch_only_and_box_only_undo_as_one_edit
+mask_detect_settings_preserve_missing_detectors_and_all_class_semantics
+mask_detect_selection_requires_face_or_readable_selected_nonempty_classes_and_captures_options
+mask_detect_catalog_loading_worker_runs_off_ui_and_retains_activity_until_terminal
+mask_detect_summary_omits_zero_counts_and_limits_detail
+mask_detect_replacing_segment_with_detect_keeps_saved_shape_but_uses_rect
+mask_detect_many_readable_and_unreadable_rows_scroll_with_visible_actions
+mask_detect_unselected_face_collapses_shape_and_details_but_keeps_shared_margin
+mask_detect_loading_row_disables_reload_without_changing_selection
+mask_detect_patch_writes_only_true_bits_with_clipped_bounds
+mask_detect_cancelled_or_stale_mixed_results_preserve_masks_document_undo_and_visibility
+mask_detect_chosen_detector_uses_json_defaults_and_explicit_class_threshold_shape
+```
+
+既存の `mask_detect_local_raster_conversion_and_absent_overrides_are_one_undo` は混合結果を受け取るように広げ、
+`mask_detect_settings_roundtrip_and_missing_key_defaults_are_shared` は追加設定と各欠損キーの既定も検査するよう広げた。
+その他の段 1 の所有・照合・入力・Undo テストは維持する。
+共有 runner で通常 filter の実行、本体 check、必要な全件 gate を行い、参照 JSON を用意できたら次も実行する（今回未実行）:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/mask_detect|^ai::detect::/)'
+cargo nextest run -p mimageviewer --lib --run-ignored ignored-only -E 'test(=ai::detect::ultralytics::tests::detect_ultralytics_reference_matches_external_models)'
+```
+
+### 23.4 この実装担当が実行した検証
+
+- cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリの起動は、今回の依頼によって未実行。
+  コンパイル・テスト・実モデル照合・実機確認・性能測定の結果は設計担当へ引き継ぐ。
+- git add / commit は未実行。他の worktree・リポジトリ外のファイルは変更していない。
+- `cargo fmt`（引数なし）は終了コード 0。`python scripts/check_ui_glyphs.py` は危険 glyph 0、
+  `python scripts/check_site_cards.py` は 55 cards・超過 0。`git diff --check` は終了コード 0。
+  新規マニュアルのローカルリンク 42 件は参照先ファイルが存在した（外部ページの取得・照合はしていない）。
+- 実装担当は作業の中で、別のコンテキストにソースの確認を依頼した。そこで指摘された `ModelMetadata` の借用が
+  Session の移動まで残る問題は、内側のスコープで借用を終える形へ直した。**これは実装担当の内部の確認で、
+  設計担当が依頼する独立レビューではない** (独立レビューは §23.6 に記録する)。
+
+- **共有 runner の実行後のテスト期待値修正（設計担当報告）**:
+  `cargo check -p mimageviewer --bin mimageviewer-core` は成功、
+  `test(/mask_detect|^ai::detect|detector_catalog|external_model|settings_transfer/)` は 154 件中 153 件成功・1 件失敗との報告を受けた。
+  失敗は `mask_detect_expanded_dialog_keeps_actions_outside_scroll_at_small_screen` の両倍率に `Fits` を期待した箇所。
+  報告された本文高 267pt / 表示領域 179pt は、段 2 で追加したフォルダ操作・説明を含む本文が
+  200% の 546.5×307pt の画面に収まらないことと整合する。本文上限は画面・利用可能高から操作行ぶんを引き、
+  操作行は ScrollArea の外で描くため、今回の修正では製品コードを変えない。
+  空の一覧を明示した fixture で、詳細展開時の期待を 100% = `Fits` / 200% = `Scrolls` に分け、
+  両倍率で Window が画面内、2 個の操作ボタンが画面内・Window 内・本文下端より下にあることを検査する。
+  多数の読める / 読めない行を並べる stage2 テストは両倍率で `Scrolls` を検査する別の規模として維持する。
+  その後、設計担当から修正後の同フィルター 154 件すべて成功との報告を受けた。実装担当は cargo check / nextest を実行していない。
+
+### 23.5 変更ファイル一覧
+
+実装・設定・テスト:
+
+```text
+.config/nextest.toml
+src/ai/detect.rs
+src/ai/detect/ultralytics.rs
+src/ai/detect/ultralytics/tests.rs
+src/ai/detector_catalog.rs
+src/ai/mod.rs
+src/ai/runtime.rs
+src/app.rs
+src/app/mask_detect.rs
+src/app/mask_detect/input_tests.rs
+src/app/mask_detect/stage2_tests.rs
+src/app/mask_detect/tests.rs
+src/external_links.rs
+src/settings.rs
+src/ui_adjustment_panel.rs
+src/ui_conceal.rs
+src/ui_erase.rs
+```
+
+設計・運用文書:
+
+```text
+docs/README.md
+docs/architecture-overview.md
+docs/async-architecture.md
+docs/auto-conceal-detection-plan.md
+docs/conceal-feature-plan.md
+docs/gpu-test-groups.md
+docs/local-adjustment-layer-v1.1.0-plan.md
+docs/preset-and-adjustment.md
+docs/spec.md
+docs/ui-responsiveness.md
+```
+
+マニュアル（本文・目次・共通ナビ）:
+
+```text
+htdocs/mimageviewer/manual/adjustment.html
+htdocs/mimageviewer/manual/ai-integration.html
+htdocs/mimageviewer/manual/analysis.html
+htdocs/mimageviewer/manual/annotation.html
+htdocs/mimageviewer/manual/books.html
+htdocs/mimageviewer/manual/browser-integration.html
+htdocs/mimageviewer/manual/changelog.html
+htdocs/mimageviewer/manual/clipboard-capture.html
+htdocs/mimageviewer/manual/collections.html
+htdocs/mimageviewer/manual/conceal.html
+htdocs/mimageviewer/manual/detectors.html
+htdocs/mimageviewer/manual/effetune.html
+htdocs/mimageviewer/manual/erase.html
+htdocs/mimageviewer/manual/export.html
+htdocs/mimageviewer/manual/external-tools.html
+htdocs/mimageviewer/manual/faq.html
+htdocs/mimageviewer/manual/formats.html
+htdocs/mimageviewer/manual/fullscreen.html
+htdocs/mimageviewer/manual/gamepad.html
+htdocs/mimageviewer/manual/getting-started.html
+htdocs/mimageviewer/manual/grid.html
+htdocs/mimageviewer/manual/index.html
+htdocs/mimageviewer/manual/known-issues.html
+htdocs/mimageviewer/manual/local-adjustment.html
+htdocs/mimageviewer/manual/metadata-transfer.html
+htdocs/mimageviewer/manual/music-video.html
+htdocs/mimageviewer/manual/music.html
+htdocs/mimageviewer/manual/remote.html
+htdocs/mimageviewer/manual/search.html
+htdocs/mimageviewer/manual/settings.html
+htdocs/mimageviewer/manual/shortcuts.html
+htdocs/mimageviewer/manual/stack.html
+htdocs/mimageviewer/manual/tags.html
+htdocs/mimageviewer/manual/troubleshooting.html
+htdocs/mimageviewer/manual/tutorial.html
+htdocs/mimageviewer/manual/video.html
+```

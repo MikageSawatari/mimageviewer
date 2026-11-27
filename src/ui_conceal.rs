@@ -62,8 +62,17 @@ fn conceal_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f
 }
 
 impl App {
-    pub(crate) fn apply_mask_detect_to_conceal(&mut self, shapes: Vec<Shape>) {
+    pub(crate) fn apply_mask_detect_to_conceal(
+        &mut self,
+        shapes: Vec<Shape>,
+        patches: &[crate::ai::detect::MaskPatch],
+    ) {
         self.push_conceal_undo();
+        if let Some(mask) = self.conceal_mask.as_mut() {
+            Self::apply_detect_mask_patches(patches, self.conceal_mask_size, |index| {
+                mask[index] = true
+            });
+        }
         self.conceal_shapes.extend(shapes);
         self.conceal_selected_shape = None;
         self.conceal_mask_texture = None;

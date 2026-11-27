@@ -108,6 +108,7 @@ impl OpenTarget {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExternalOpenFailure {
+    DetectorFolder,
     GoogleMaps,
     ClaudeApp,
     ChatGptApp,
@@ -119,6 +120,7 @@ pub(crate) enum ExternalOpenFailure {
 impl ExternalOpenFailure {
     pub(crate) fn message(self) -> &'static str {
         match self {
+            Self::DetectorFolder => "検出器フォルダを開けませんでした",
             Self::GoogleMaps => "Google マップを開けませんでした",
             Self::ClaudeApp => "Claude Desktop を開けませんでした",
             Self::ChatGptApp => "ChatGPT のアプリを開けませんでした",

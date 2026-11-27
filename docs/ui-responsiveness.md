@@ -675,16 +675,21 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
-顔の自動検出（§1.914 段 1b、実装、cargo検証待ち）は同梱 YuNet を使い、モデルの準備・前処理・推論・後処理を検出 worker に置く。
+マスクの自動検出（§1.914 段 2、実装・検証状況は §23）は同梱 YuNet と追加の Ultralytics detect / segment を使い、モデルの準備・前処理・推論・後処理を検出 worker に置く。
+検出器一覧の `read_dir`（各 entry は `file_type()` を使う）・json・ONNX メタデータと形の読み取りは別の一覧 worker に置く。
+CPU・最適化なしの一時 Session は worker 内で作って閉じ、動的分類数の確認推論もそこでだけ行う。
+一覧の結果は App 共通の owner に保持し、UI は「読み込み中」の表示と受信だけを行う。フォルダの作成と Explorer 起動も worker。
 UI が捕捉するソース画素は Arc の clone だけとし、受信は `try_recv`、取消はフラグで行って完了を待たない。
-結果の図形追加、Undo の複製と表示用マスクの更新は既存の手描き 1 操作と同じ経路で、検出 1 回につき 1 回だけ行う。
+結果の図形追加と輪郭パッチの範囲書き込み、Undo の複製と表示用マスクの更新は既存の手描き 1 操作と同じ経路で、検出 1 回につき 1 回だけ行う。
+パッチのための画像全体走査を足さず、補正レイヤーの `alpha_mut()` はパッチのループ外で 1 回だけ呼ぶ。
 再合成・補完・保存も各ツールの既存 worker を使い、消しゴムの検出完了では補完を始めない。
 推論層の計装に加え、`mask_detect/start`・`mask_detect/apply` と共有の `mask/texture_rebuild` を記録する。
 開始・セッション準備・推論・後処理・追加は共通の `trace_label`（呼出元のツール名）で追う。
 `ai/external_session_prepare` は worker 内のファイル照合・独立 lock 待ち・cache 取得 / load を計り、推論 callback は含めない。
 `cache=hit/loaded` で取得と新規 load を区別し、準備失敗も記録する。検出層は label の値を解釈しない。
 補正レイヤーの既存 `mask_preview_rebuild` も継続する。大画像での反映費用と実機の応答性は未測定。
-詳細と未実施の検証は [自動検出計画 §7.4・§10・§19](auto-conceal-detection-plan.md) を参照。
+Ultralytics は `ai/detect_ultralytics_preprocess`・`_inference`・`_postprocess` に形式・入力サイズ・件数・ms と共通 label を記録する。
+詳細と未実施の検証は [自動検出計画 §6.1・§7.4・§10・§23](auto-conceal-detection-plan.md) を参照。
 
 画像の結合 (§1.904 stage B) はbatchと同じsnapshotの1件関数・6ms予算を使い、準備失敗を対象ごとに保持する。
 既知のsnapshot同期読込 (§1.177) を広げず、decode・合成・縮小・フォント計測・描画・encode・保存は専用workerへ置く。

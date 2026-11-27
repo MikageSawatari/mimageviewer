@@ -2,16 +2,32 @@
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct MaskDetectSettings {
+    pub face_selected: bool,
     pub ellipse: bool,
     pub margin_percent: f32,
+    pub contour_margin_percent: f32,
     pub threshold: f32,
+    pub detectors: BTreeMap<String, ExternalDetectorSettings>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ExternalDetectorSettings {
+    pub selected: bool,
+    /// None means every class, including classes first seen after a reload.
+    pub classes: Option<Vec<String>>,
+    pub(crate) shape: Option<crate::ai::detector_catalog::DetectorShape>,
+    pub threshold: Option<f32>,
 }
 impl Default for MaskDetectSettings {
     fn default() -> Self {
         Self {
+            face_selected: true,
             ellipse: true,
             margin_percent: 15.0,
+            contour_margin_percent: 0.6,
             threshold: 0.6,
+            detectors: BTreeMap::new(),
         }
     }
 }

@@ -46,7 +46,7 @@ Linux の WGSL 検査とは分け、Windows の GPU gate で必ず実行する�
 | `D3D11CreateDevice(WARP)` | NIS draw、Anime4K draw、ignored compile benchmark の3件。実 D3D device を使い、件数も少ないため含む（通常2件・ignored 1件） |
 | D3D11 hardware / DComp | ignored timestamp benchmark、native-window pump と thread-spike の ignored stall テスト。実 hardware / DComp device を作る |
 | FFmpeg hardware encoder | clockless EOF 2件、ignored encoder probe、深度MP4出力4件、musicvideo-editorの実worker開始1件。`hw_decode=false` やCPU frameでも encoder がAutoならNVENC / QSV / AMF / MF 経路を試す |
-| ORT DirectML EP session | AI upscale / tile-blend 統合テスト6件、ignored DA3 oracle、ignored `ai_crash_655_headless_zip_navigation`。後者は隔離先へ出荷モデルをコピーする。runtime / ORT environment の初期化だけとは区別する |
+| ORT DirectML EP session | AI upscale / tile-blend 統合テスト6件、ignored DA3 oracle、ignored `ai_crash_655_headless_zip_navigation`、ignored `ai::detect::ultralytics::tests::detect_ultralytics_reference_matches_external_models`。自動検出の参照照合は `MIV_DETECT_REFERENCE` が指定されたときだけ外部モデルで推論する。runtime / ORT environment の初期化だけとは区別する |
 | VLM worker の実 Vulkan 推論 | `real_model_serve_matches_v1_0_on_all_26_images_when_configured`。環境変数で実モデルを指定すると GPU 実行へ進む |
 | vendored egui-wgpu / eframe | egui-wgpu の capture / renderer / winit の実 state 14件。eframe は `retirement_texture_delivery_wgpu_startup_before_full_and_free_only` と ignored 実窓 `synchronous_damage_returns_before_outer_paint_gate` の2件 |
 

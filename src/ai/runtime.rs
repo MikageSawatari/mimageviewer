@@ -521,14 +521,14 @@ fn ensure_ort_initialized(requested: AiBackend) -> Result<&'static InitializedOr
 
 /// Canonical file identity, read only on workers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExternalModelKey {
-    path: PathBuf,
-    size: u64,
-    modified: SystemTime,
+pub(crate) struct ExternalModelKey {
+    pub(crate) path: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) modified: SystemTime,
 }
 
 impl ExternalModelKey {
-    fn read(path: &Path) -> Result<Self, AiError> {
+    pub(crate) fn read(path: &Path) -> Result<Self, AiError> {
         let path = std::fs::canonicalize(path)?;
         let metadata = std::fs::metadata(&path)?;
         Ok(Self {
@@ -537,6 +537,20 @@ impl ExternalModelKey {
             modified: metadata.modified()?,
         })
     }
+}
+
+/// Worker-only catalog inspection. This temporary CPU session never enters the
+/// external inference cache and does not register GPU providers.
+pub(crate) fn temporary_detector_catalog_session(path: &Path) -> Result<Session, AiError> {
+    let initialized = ensure_ort_initialized(AiBackend::Cpu)?;
+    Session::builder(&initialized.environment)
+        .map_err(|e| AiError::ort_status(&e, format!("catalog session builder: {e}")))?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Disable)
+        .map_err(|e| AiError::ort_status(&e, format!("catalog optimization: {e}")))?
+        .with_intra_threads(4)
+        .map_err(|e| AiError::ort_status(&e, format!("catalog threads: {e}")))?
+        .commit_from_file(path)
+        .map_err(|e| AiError::ort_status(&e, format!("catalog load {}: {e}", path.display())))
 }
 
 /// FIFO by load time, capped at two even during construction.

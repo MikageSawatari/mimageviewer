@@ -1,4 +1,4 @@
-//! Worker 専用の検出層。ツール・マスクの形・余白・UI 状態は扱わない。
+//! Worker 専用の検出層。ツールや UI 状態を知らず、箱と輪郭パッチを返す。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,6 +6,11 @@ use std::time::Instant;
 
 use super::AiError;
 use super::runtime::AiRuntime;
+
+mod ultralytics;
+pub(crate) use ultralytics::{
+    MaskPatch, UltralyticsOutput, UltralyticsParams, detect_ultralytics_with_trace,
+};
 
 /// 画像座標 (元の画像の px)。左上と右下。
 #[derive(Debug, Clone, PartialEq)]
@@ -37,6 +42,7 @@ pub enum DetectError {
     InferenceFailed(AiError),
     OutputShape(String),
     InvalidInput(String),
+    DetectorChanged,
     Cancelled,
 }
 
@@ -48,6 +54,7 @@ impl std::fmt::Display for DetectError {
             Self::InferenceFailed(error) => write!(f, "Detection inference failed: {error}"),
             Self::OutputShape(detail) => write!(f, "Unexpected detection output: {detail}"),
             Self::InvalidInput(detail) => write!(f, "Invalid detection input: {detail}"),
+            Self::DetectorChanged => write!(f, "Detection model changed; reload the detector list"),
             Self::Cancelled => write!(f, "Detection cancelled"),
         }
     }

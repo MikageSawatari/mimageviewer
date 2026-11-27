@@ -18962,6 +18962,7 @@ pub struct App {
     /// Rare, captured detection state lives on the heap, including its document claim.
     pub(crate) mask_detect_pending: Option<Box<MaskDetectPending>>,
     pub(crate) mask_detect_dialog: Option<MaskDetectTool>,
+    mask_detect_catalog: Box<mask_detect::DetectorCatalogState>,
     pub(crate) erase_session: u64,
     pub(crate) conceal_session: u64,
     /// 補正レイヤー領域分割の色差許容。
@@ -21994,6 +21995,7 @@ impl App {
             local_adjust_segmentation_pending: None,
             mask_detect_pending: None,
             mask_detect_dialog: None,
+            mask_detect_catalog: Box::default(),
             erase_session: 0,
             conceal_session: 0,
             local_adjust_region_color_tolerance: 42.0,
