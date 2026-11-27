@@ -122,6 +122,230 @@ fn assert_switched_a_saved(app: &mut App, key: &str, draft: &LocalAdjustmentLaye
     );
 }
 
+const UNOWNED_MASK_TOOLS: [LocalAdjustMaskTool; 7] = [
+    LocalAdjustMaskTool::Lasso,
+    LocalAdjustMaskTool::Polygon,
+    LocalAdjustMaskTool::Line,
+    LocalAdjustMaskTool::VertLine,
+    LocalAdjustMaskTool::HorizLine,
+    LocalAdjustMaskTool::Rect,
+    LocalAdjustMaskTool::Ellipse,
+];
+
+type UnownedMaskState = (Vec<[f32; 2]>, Option<[f32; 2]>, Option<[f32; 2]>);
+
+fn unowned_mask_state(app: &App) -> UnownedMaskState {
+    (
+        app.local_adjust_mask_lasso_points.clone(),
+        app.local_adjust_mask_shape_drag_start,
+        app.local_adjust_mask_shape_drag_end,
+    )
+}
+
+struct UnownedMaskFixture {
+    app: AppTestEnv,
+    a_key: String,
+    b_key: String,
+    a_saved: LocalAdjustmentLayers,
+    b_saved: LocalAdjustmentLayers,
+    gesture: UnownedMaskState,
+}
+
+fn unowned_mask_after_spread_switch(tool: LocalAdjustMaskTool) -> UnownedMaskFixture {
+    let ctx = egui::Context::default();
+    let mut app = fixture();
+    let b_target = app.page_adjustment_target_for_idx(0).unwrap();
+    let b_saved = LocalAdjustmentLayers::new(vec![LocalAdjustmentLayer::new(
+        "B",
+        LocalMask::RasterVector(local_adjust_core::RasterVectorMask::empty(4, 3)),
+        LocalEffect::None,
+    )]);
+    app.set_local_adjust_layers_for_target(&b_target, b_saved.clone());
+    begin_local(&mut app);
+    let a_key = app.page_path_key(1).unwrap();
+    let b_key = app.page_path_key(0).unwrap();
+    let a_saved = app.local_adjust_page_layers[&1].clone();
+    app.commit_local_adjust_pending_edits();
+    // A writable document can outlive its completed gesture. Starting the next
+    // page's unowned shape does not rebind that document through begin_local_page_edit.
+    assert!(app.begin_local_page_edit(1));
+    assert!(!app.has_pending_local_adjust_edit());
+    app.local_adjust_spread_ctx = app.capture_local_page_edit_pivot(pivot());
+    for idx in [0, 1] {
+        let pixels = Arc::new(egui::ColorImage::filled([4, 3], egui::Color32::WHITE));
+        let tex = ctx.load_texture(
+            format!("unowned-mask-side-{idx}"),
+            pixels.clone(),
+            Default::default(),
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
+                tex,
+                pixels,
+                source_dims: Some([4, 3]),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+    }
+    app.switch_local_adjust_target_in_spread(&ctx, 0);
+    assert_eq!(app.fullscreen_idx, Some(0));
+    app.local_adjust_mask_tool = tool;
+    app.local_adjust_mask_edit_target = LocalAdjustMaskEditTarget::Base;
+    let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0));
+    let transform = crate::displayed_image_transform::DisplayedImageTransform::resolve(
+        crate::displayed_image_transform::DisplayedImageTransformInput {
+            pixel_fit: crate::displayed_image_transform::RectPixelFit::Texels,
+            page_idx: 0,
+            viewport_rect: egui::Rect::from_min_size(
+                egui::pos2(400.0, 100.0),
+                egui::vec2(400.0, 400.0),
+            ),
+            source_size: egui::vec2(4.0, 3.0),
+            texture_size: egui::vec2(4.0, 3.0),
+            rotation: crate::rotation_db::Rotation::None,
+            free_rotation_rad: 0.0,
+            content_bbox: None,
+            fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                crate::settings::FullscreenFitMode::Page,
+            ),
+            fit_scale_limits: crate::displayed_image_transform::FullscreenFitScaleLimits::default(),
+            pixels_per_point: 1.0,
+            placement: crate::displayed_image_transform::ResolvedDisplayPlacement::Normal {
+                zoom_pan: None,
+            },
+        },
+    )
+    .unwrap();
+    let start = egui::pos2(440.0, 190.0);
+    assert!(transform.contains_screen(start));
+    assert!(!app.local_adjust_panel_rect(full_rect).contains(start));
+    assert!(!app.local_adjust_tool_panel_rect(full_rect).contains(start));
+    for events in [
+        vec![egui::Event::PointerButton {
+            pos: start,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        }],
+        vec![egui::Event::PointerMoved(egui::pos2(520.0, 240.0))],
+    ] {
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(full_rect),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                app.handle_local_adjust_canvas_input(
+                    ctx,
+                    full_rect,
+                    &transform,
+                    Default::default(),
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+    assert!(app.local_adjust_mode, "{tool:?}");
+    assert!(app.local_adjust_shape_key_edit.is_none());
+    assert!(app.local_adjust_shape_drag.is_none());
+    assert!(app.local_adjust_canvas_drag.is_none());
+    assert!(app.local_adjust_mask_brush_stroke.is_none());
+    let gesture = unowned_mask_state(&app);
+    match tool {
+        LocalAdjustMaskTool::Lasso | LocalAdjustMaskTool::Polygon => {
+            assert!(!gesture.0.is_empty(), "{tool:?}")
+        }
+        _ => assert!(gesture.1.is_some() && gesture.2.is_some(), "{tool:?}"),
+    }
+    let LocalPageEditDocument::Editing { owner, .. } = &app.local_page_edit_document else {
+        panic!("the real unowned gesture must leave the retained A document untouched: {tool:?}")
+    };
+    assert_eq!(owner.target.page_key, a_key);
+    UnownedMaskFixture {
+        app,
+        a_key,
+        b_key,
+        a_saved,
+        b_saved,
+        gesture,
+    }
+}
+
+fn assert_unowned_mask_lifetime(fixture: &mut UnownedMaskFixture, b_survives: bool) {
+    assert_eq!(fixture.app.local_adjust_mode, b_survives);
+    if b_survives {
+        assert_eq!(fixture.app.fullscreen_idx, Some(0));
+        assert_eq!(
+            fixture.app.page_path_key(0).as_deref(),
+            Some(fixture.b_key.as_str())
+        );
+        assert_eq!(
+            unowned_mask_state(&fixture.app),
+            fixture.gesture,
+            "B's unfinished input must survive"
+        );
+        assert!(fixture.app.local_adjust_spread_ctx.is_some());
+    } else {
+        assert_eq!(unowned_mask_state(&fixture.app), (Vec::new(), None, None));
+        assert!(fixture.app.local_adjust_spread_ctx.is_none());
+    }
+    assert_switched_a_saved(&mut fixture.app, &fixture.a_key, &fixture.a_saved);
+    assert_eq!(
+        fixture
+            .app
+            .local_adjust_db
+            .as_ref()
+            .unwrap()
+            .get_layers(&fixture.b_key)
+            .as_deref(),
+        Some(fixture.b_saved.as_slice()),
+        "uncommitted geometry must not be saved to either page"
+    );
+}
+
+#[test]
+fn page_edit_920_unowned_gesture_adoption_keeps_b_when_old_document_a_disappears() {
+    for tool in UNOWNED_MASK_TOOLS {
+        let mut fixture = unowned_mask_after_spread_switch(tool);
+        let items = vec![fixture.app.items[0].clone(), fixture.app.items[2].clone()];
+        fixture.app.replace_search_view_items(items, vec![None; 2]);
+        assert_unowned_mask_lifetime(&mut fixture, true);
+    }
+}
+
+#[test]
+fn page_edit_920_unowned_gesture_adoption_ends_b_when_only_old_document_a_remains() {
+    for tool in UNOWNED_MASK_TOOLS {
+        let mut fixture = unowned_mask_after_spread_switch(tool);
+        let items = vec![fixture.app.items[1].clone(), fixture.app.items[2].clone()];
+        fixture.app.replace_search_view_items(items, vec![None; 2]);
+        assert_unowned_mask_lifetime(&mut fixture, false);
+    }
+}
+
+#[test]
+fn page_edit_920_unowned_gesture_removal_keeps_b_when_old_document_a_is_deleted() {
+    for tool in UNOWNED_MASK_TOOLS {
+        let mut fixture = unowned_mask_after_spread_switch(tool);
+        fixture.app.remove_items_batch(&[1]);
+        assert_unowned_mask_lifetime(&mut fixture, true);
+    }
+}
+
+#[test]
+fn page_edit_920_unowned_gesture_removal_ends_b_when_old_document_a_is_not_deleted() {
+    for tool in UNOWNED_MASK_TOOLS {
+        let mut fixture = unowned_mask_after_spread_switch(tool);
+        fixture.app.remove_items_batch(&[0]);
+        assert_unowned_mask_lifetime(&mut fixture, false);
+    }
+}
+
 #[test]
 fn page_edit_920_spread_switch_adoption_keeps_b_when_previous_owner_a_disappears() {
     let ctx = egui::Context::default();

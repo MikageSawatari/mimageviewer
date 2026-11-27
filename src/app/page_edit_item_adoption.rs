@@ -3,9 +3,10 @@ use super::*;
 
 impl App {
     fn local_page_edit_owner_before_adoption(&self) -> Option<PageEditOwner> {
-        // A live gesture owns the current edit even while streaming adoption is
-        // reindexing its reader. Completed selections and async producers do not:
-        // a spread-side switch commits them before displaying the other page.
+        // Only a gesture with an explicit captured owner can identify an edit
+        // while streaming adoption reindexes its reader. Lasso/polygon points
+        // and new line/rectangle/ellipse endpoints have no captured owner: they
+        // belong to the displayed page, not a retained document from another side.
         let live_owner = self
             .local_adjust_shape_key_edit
             .as_ref()
@@ -24,15 +25,6 @@ impl App {
                 self.local_adjust_mask_brush_stroke
                     .as_ref()
                     .map(|session| &session.owner)
-            })
-            .or_else(|| {
-                if !self.local_page_edit_gesture_active() {
-                    return None;
-                }
-                match &self.local_page_edit_document {
-                    LocalPageEditDocument::Editing { owner, .. } => Some(owner),
-                    LocalPageEditDocument::Selection { .. } | LocalPageEditDocument::Idle => None,
-                }
             })
             .filter(|owner| self.page_edit_owner_is_current(owner));
         if let Some(owner) = live_owner {
