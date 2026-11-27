@@ -379,6 +379,7 @@ fn pending_permit_case(read: bool, terminal: &str, client_end: &str) {
             panic!()
         };
         assert!(permit.is_some(), "real agent admission must carry its slot");
+        let permit = permit.map(|pending| pending.upgrade().unwrap());
         let (ticket, commands, replies, run) = sound_job_with_fake_host(
             request,
             client_name,
@@ -658,6 +659,7 @@ fn sound_chain_pending_load_holds_permit_until_rejection_or_controller_drop() {
                     panic!()
                 };
                 assert!(permit.is_some());
+                let permit = permit.map(|pending| pending.upgrade().unwrap());
                 let ticket = controller.submit_sound(
                     request,
                     &client_name,
@@ -714,6 +716,130 @@ fn sound_chain_pending_load_holds_permit_until_rejection_or_controller_drop() {
                     .result
                     .is_ok()
             );
+        }
+    }
+}
+
+#[test]
+fn sound_chain_unclaimed_cancel_eof_and_admission_deadline_release_queued_permits() {
+    use super::open::UiRequestKind;
+
+    for read in [false, true] {
+        for end in ["cancel", "eof", "admission_deadline"] {
+            let fixture = tests::Fixture::new();
+            crate::settings_db::with_db_result(|db| {
+                let mut settings = db.load_into_settings()?;
+                settings.agent_allow_settings = true;
+                db.save_full(&settings)
+            })
+            .unwrap();
+            let ui = fixture.handlers.open.install(egui::Context::default());
+            let (enqueued, enqueue_rx) = std::sync::mpsc::channel();
+            fixture.handlers.open.set_enqueue_observer(enqueued);
+            let first = fixture.connection();
+            let second = fixture.connection();
+            let third = fixture.connection();
+
+            for connection in [&first, &second] {
+                let command = Command::SoundChain(if read {
+                    SoundChainRequest::Get {
+                        pipeline: None,
+                        offset: 0,
+                        ids: None,
+                    }
+                } else {
+                    SoundChainRequest::Lock {}
+                });
+                let (send, receive) = crossbeam_channel::unbounded();
+                let worker = connection
+                    .request(Request { id: 71, command }, send)
+                    .unwrap();
+                // Observe the enqueue without receiving the UI request. Both
+                // stale entries must remain in the actual queue below.
+                enqueue_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                if end == "eof" {
+                    connection.disconnect();
+                    drop(receive);
+                } else {
+                    if end == "cancel" {
+                        assert!(
+                            fixture
+                                .call(connection, 72, Command::Cancel { request_id: 71 })
+                                .result
+                                .is_ok()
+                        );
+                    }
+                    // admission_deadline uses the real five-second UI budget,
+                    // not the twenty-second outer tool deadline or a sleep.
+                    let reply = receive.recv_timeout(Duration::from_secs(10)).unwrap();
+                    assert!(matches!(reply.policy, ReplyPolicy::Rejected));
+                    let error = reply.wire().result.unwrap_err();
+                    assert_eq!(
+                        error.code,
+                        if end == "cancel" {
+                            ErrorCode::Cancelled
+                        } else {
+                            ErrorCode::Timeout
+                        }
+                    );
+                    if end == "admission_deadline" {
+                        assert_eq!(error.message, "mIV が応答しません");
+                    }
+                }
+                worker.join().unwrap();
+                assert!(connection.running.lock().unwrap().is_none());
+                assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 0);
+            }
+
+            // Status is usable with both cancelled requests still queued.
+            assert!(fixture.call(&third, 73, Command::Status).result.is_ok());
+            let (first_replacement, _) = first.acquire(74).unwrap();
+            let (second_replacement, _) = second.acquire(75).unwrap();
+            assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 2);
+            for index in 0..2 {
+                let stale = ui.recv_timeout(Duration::from_secs(5)).unwrap();
+                let UiRequestKind::SoundChain {
+                    permit: Some(pending),
+                    ..
+                } = &stale.kind
+                else {
+                    panic!("expected a queued sound request with a weak permit");
+                };
+                assert!(pending.upgrade().is_none());
+                if index == 0 {
+                    // The real UI skips a cancelled request at this CAS,
+                    // before it can upgrade the permit or submit any job.
+                    assert!(!stale.try_claim());
+                }
+                // Also cover discarding the other queued request outright.
+                drop(stale);
+                assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 2);
+                assert_eq!(first.running.lock().unwrap().as_ref().unwrap().id, 74);
+                assert_eq!(second.running.lock().unwrap().as_ref().unwrap().id, 75);
+            }
+            assert!(ui.try_recv().is_err());
+            assert!(
+                fixture
+                    .handlers
+                    .changes
+                    .records()
+                    .lock()
+                    .unwrap()
+                    .entries()
+                    .is_empty()
+            );
+            assert_eq!(
+                fixture
+                    .call(&third, 76, Command::Status)
+                    .result
+                    .unwrap_err()
+                    .code,
+                ErrorCode::Busy
+            );
+            drop(first_replacement);
+            drop(second_replacement);
+            assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 0);
+            assert!(fixture.call(&third, 77, Command::Status).result.is_ok());
         }
     }
 }

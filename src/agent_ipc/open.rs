@@ -1,7 +1,7 @@
 //! One agent UI admission owner for Open, state reads, tags and ratings. Open
 //! keeps the existing activation path; metadata targets are prepared on workers.
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -87,7 +87,7 @@ pub(crate) enum UiRequestKind {
     SoundChain {
         request: crate::effetune::sound_service::SoundRequest,
         client_name: String,
-        permit: Option<Arc<super::Permit>>,
+        permit: Option<Weak<super::Permit>>,
     },
     TagWrite(super::metadata_write::PreparedTags),
     RatingWrite(super::metadata_write::PreparedRatings),
@@ -429,11 +429,15 @@ impl OpenController {
     ) -> Result<UiOpenOutcome, AgentError> {
         let request = super::sound_chain::prepare_request(args)?;
         ctx.checkpoint()?;
+        // Keep the strong owner on this worker while the UI decides. Pending
+        // queue entries must not retain a slot after cancellation. If claim
+        // wins the shared CAS, dispatch_request waits for the UI reply, keeping
+        // this owner alive until the UI upgrades it and submits the job.
         let admission = self.dispatch_request(&ctx.cancel, dispatch, UI_REPLY_TIMEOUT, || {
             Ok(UiRequestKind::SoundChain {
                 request,
                 client_name,
-                permit: Some(permit),
+                permit: Some(Arc::downgrade(&permit)),
             })
         })?;
         match admission {

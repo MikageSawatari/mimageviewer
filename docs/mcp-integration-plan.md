@@ -221,6 +221,8 @@ list_changed通知・listChanged広告は削除する。再試行・push・別�
   同時実行枠を保持する。枠は接続ごと 1 件 + core 全体で 2 件。2026-07-28 の stdio では
   取消後にその要求の応答を送らない。
   `sound_chain` は `get` を含め、受付済みの `SoundJob` が応答処理と同じ `Arc<Permit>` を保持する。
+  未claimのUIキューには `Weak<Permit>` だけを渡し、強参照はworkerに残す。既存のclaim/cancelのCASでclaimが勝ったときだけ
+  UIが強参照を取得してジョブへ渡す。cancelが勝った未受付要求は、キューに残っていてもworker終了時に枠を解放する。
   20秒で `Pending` を返した後も、取消・切断・EOFでも、ロード待ち・FIFO待ち・実行中の枠を解放しない。
   成功後の保存・通知・記録、失敗・拒否、bridge終了による `Aborted` またはキュー破棄でジョブが終わり、
   応答処理側も終わった時点で枠を解放する。

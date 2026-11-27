@@ -267,6 +267,13 @@ impl App {
                         else {
                             unreachable!("sound request arm owns its prepared request");
                         };
+                        // try_claim won the shared CAS above. The dispatching
+                        // worker now waits for this reply and retains the owner.
+                        let permit = permit.map(|pending| {
+                            pending
+                                .upgrade()
+                                .expect("claimed sound request retains its worker permit")
+                        });
                         match self.admit_agent_sound_chain(request, client_name, permit, ctx) {
                             Ok(ticket) => {
                                 crate::agent_ipc::open::UiOpenOutcome::SoundChainAdmitted(ticket)
