@@ -290,17 +290,28 @@ fn plane_revision2_delayed_zoom_uses_the_candidate_captured_before_paint() {
     let before = snapshot(&app);
     let old_zoom = app.fs_zoom;
     let mut retained = None;
-    viewer.frame_with_before(
-        &mut app,
-        vec![
-            egui::Event::PointerMoved(egui::pos2(500., 300.)),
-            wheel(0., -40., egui::Modifiers::CTRL),
-            wheel(0., -40., egui::Modifiers::NONE),
-        ],
-        |app, ctx| {
-            ctx.root_ui(|ui| {
+    // Collect input once in this pass. A real viewer frame captures front input itself,
+    // so collecting in frame_with_before would capture the same delivery twice.
+    app.frame_counter += 1;
+    viewer
+        .ctx
+        .run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size)),
+                time: Some(app.frame_counter as f64 / 60.),
+                events: vec![
+                    egui::Event::PointerMoved(egui::pos2(500., 300.)),
+                    wheel(0., -40., egui::Modifiers::CTRL),
+                    wheel(0., -40., egui::Modifiers::NONE),
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                let ctx = ui.ctx().clone();
                 let (mut result, operation) =
-                    crate::ui_fullscreen::wheel_frame_tests::collect_actual_merge(app, ui, false);
+                    crate::ui_fullscreen::wheel_frame_tests::collect_actual_merge(
+                        &mut app, ui, false,
+                    );
                 let mut proposal = result
                     .deferred
                     .take()
@@ -313,23 +324,46 @@ fn plane_revision2_delayed_zoom_uses_the_candidate_captured_before_paint() {
                     .into_iter()
                     .find(|s| !s.input.modifiers.ctrl)
                     .unwrap();
-                crate::wheel_input::consume_wheel_segment(ctx, ordinary_page);
+                crate::wheel_input::consume_wheel_segment(&ctx, ordinary_page);
                 app.claim_fs_wheel_frame_after_ui(&mut proposal);
                 retained = Some((proposal, operation));
-            });
-        },
+            },
+        )
+        .drop_without_applying_deltas();
+    assert!(
+        Arc::ptr_eq(&snapshot(&app), &before),
+        "collection precedes paint"
     );
+    // The retained zoom has not been applied: this pass paints the previous state.
+    viewer.frame(&mut app, vec![]);
     assert_eq!(app.fs_zoom, old_zoom);
     assert_eq!(mode(&app), PlaneFillMode::Auto);
-    assert_eq!(snapshot(&app).params.values, before.params.values);
+    let pending_paint = snapshot(&app);
+    assert!(
+        !Arc::ptr_eq(&pending_paint, &before),
+        "the viewer painted a new frame"
+    );
+    assert_eq!(pending_paint.params.values, before.params.values);
+    assert_eq!(pending_paint.k_fill, before.k_fill);
     app.clear_plane_last_drawn();
     let (proposal, mut operation) = retained.unwrap();
     let result = app.apply_fs_wheel_frame_proposal(proposal, true, &mut operation);
     assert!(result.page_nav.is_none());
     assert!(app.fs_zoom < old_zoom);
     assert_eq!(mode(&app), PlaneFillMode::Locked(before.k_fill));
+    let new_zoom = app.fs_zoom;
     viewer.frame(&mut app, vec![]);
-    assert_eq!(snapshot(&app).k_fill, before.k_fill);
+    assert_eq!(app.fs_zoom, new_zoom);
+    let applied_paint = snapshot(&app);
+    assert_eq!(applied_paint.k_fill, before.k_fill);
+    assert_eq!(
+        applied_paint.params.values[2][0],
+        before.params.values[2][0]
+    );
+    assert_ne!(
+        applied_paint.params.values[3], pending_paint.params.values[3],
+        "the next pass paints the changed image scale"
+    );
 }
 
 #[test]

@@ -1095,6 +1095,14 @@ cargo nextest run -p mimageviewer --lib -E 'test(/plane_view|fisheye|displayed_i
 cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen|in_page_scroll|page_turn|depth|ui_erase|gamepad/)'
 ```
 
+### 改訂 2 の実装記録 (遅延ズーム試験の取り込み境界の修正)
+
+着手時 `607bf573c`。設計担当の153件中1件の失敗をログとソースで照合した。`plane_revision2_delayed_zoom_uses_the_candidate_captured_before_paint` は `frame_with_before` の中で `collect_actual_merge` を呼び、ホイールを消費した後に、同じpassの実viewerがもう一度前面入力を取り込んでいた。そのためbegin-passで保存したnavigatorの3事象と、消費後の前面入力の1事象の所有列が食い違った。製品経路の不具合ではなく、テストが入力の取り込み境界を二重に実行したことが原因。
+
+既存の遅延適用試験と同じく `ctx.run_ui` で予測・保留・入力のclaimを一度行い、通常の `viewer.frame` で旧状態を描画した後に保留したproposalを実適用する形へ変更した。新しい描画snapshotであることと旧uniform全体の一致を確認し、snapshotを消してから適用しても事前の候補でLockedになること、次frameは新しい倍率の配置と固定した `k_fill`/`k` を描くことを検査する。時刻は既存viewerと同じframe_counter由来のf64で単調に進める。製品コードと設計は変更していない。変更は当該試験と本記録のみで、コンパイル・試験の再実行は設計担当へ引き継ぐ。
+
+`cargo fmt` と `git diff --check` は正常終了。Rust/GPU試験は実行していない。
+
 ## 12. 文書
 
 - [display-pipeline.md](display-pipeline.md): PlaneView の節 (§5 の要約と §6 の出口)。
