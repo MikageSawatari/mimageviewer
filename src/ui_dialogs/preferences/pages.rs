@@ -5787,6 +5787,8 @@ pub(super) fn draw_context_menu_layout_settings(
                                             item_text.first_row_min_height = first_line_height;
                                             // Measure the same icon/text layout as Checkbox, then
                                             // give it that Galley so wrapping and row count agree.
+                                            // Mirrors `Checkbox::ui` in vendor/egui/src/widgets/checkbox.rs;
+                                            // keep in step when that layout changes.
                                             let checkbox_id = ui.next_auto_id();
                                             let checkbox_style: CheckboxStyle =
                                                 ui.widget_style(checkbox_id, &Default::default());

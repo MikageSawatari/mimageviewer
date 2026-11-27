@@ -257,5 +257,12 @@ native pixels-per-pointを設定し、Contextの実効値が1.4であること�
 全14場面×720pt/624ptで、短い項目と注記の横並び、非重複、先頭行の中央揃え、注記の間隔、
 横幅と操作の検査を維持する。場面の間引きやPNGの追加・更新はしない。
 
-3回目の変更後のコンパイル・配置/操作検査・PNG目視/比較・関連テストは未実施（設計担当が流す）。
+3回目の実装担当の引き継ぎ時点では、コンパイル・配置/操作検査・PNG目視/比較・関連テストは未実施だった。
 上記の成功・変異検査は `b91578e54` までの記録であり、3回目の変更後の結果には流用しない。
+
+3回目の変更後（`ca7dd7500`）は、設計担当（ClaudeCode）が run-heavy で次を確かめた。
+`ui_dialogs::preferences::` / `context_menu` の518件が成功し、スナップショット3枚に差分は出なかった。
+変異D（判定を `checkbox.rect.height() > first_line_height` に戻す）は
+`preferences_context_menu_layout_fractional_scale_fit_and_controls_work` で失敗した
+（倍率1.4・720pt・`GridImageWithDynamicApps`・`CutFiles` の注記が次の行へ送られた）。
+独立レビューの2回目は ACCEPT（P3: この検証結果の追記）。実機は未確認。
