@@ -1,6 +1,8 @@
 # 編集ツールの途中で表示中の画像が外から替わるときの扱い (§1.920)
 
-作成: 2026-11-27 / ClaudeCode (設計担当)。状態: 設計 r6 (案 A'。r4 ACCEPT の後、実装担当の指摘で所有者の経路を追記し、r5 の指摘 (閉じる経路の所有条件・表の記録の細則) を反映)。
+作成: 2026-11-27 / ClaudeCode (設計担当)。状態: 実装済み (ブランチ conceal-920、`e20097823`)。独立設計レビュー r1〜r5 (r4 ACCEPT の後、実装担当の指摘で所有者の経路を
+追記し、r5 の指摘を反映)、実装中の追記 (スマートフォルダ・補正レイヤーの例外・同じ画像の open の消しゴム)、独立実装レビュー
+r1〜r4 (r4 ACCEPT)。本体 lib 全件成功。実機未確認。
 
 関連: [next-release-backlog.md §1.920](next-release-backlog.md)、[conceal-feature-plan.md](conceal-feature-plan.md)、
 [detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) と §11 (リワーク外からの変更記録)。
