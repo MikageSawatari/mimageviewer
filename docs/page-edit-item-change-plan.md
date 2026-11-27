@@ -1,6 +1,6 @@
 # 編集ツールの途中で表示中の画像が外から替わるときの扱い (§1.920)
 
-作成: 2026-11-27 / ClaudeCode (設計担当)。状態: 設計 r5 (案 A'、r4 ACCEPT の後に実装担当の指摘で所有者の経路を追記)。
+作成: 2026-11-27 / ClaudeCode (設計担当)。状態: 設計 r6 (案 A'。r4 ACCEPT の後、実装担当の指摘で所有者の経路を追記し、r5 の指摘 (閉じる経路の所有条件・表の記録の細則) を反映)。
 
 関連: [next-release-backlog.md §1.920](next-release-backlog.md)、[conceal-feature-plan.md](conceal-feature-plan.md)、
 [detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) と §11 (リワーク外からの変更記録)。
@@ -178,6 +178,19 @@ active の編集に触れず、終えもしない (sibling の書き換えは ac
   ことして評価する (一時投影中の sibling の処理から見て「編集中」と判定しない)。
 - 一時投影中に sibling の処理が `is_overlay_edit_mode_active()` を読むと前面の編集の値が見える問題は今もある。
   本件で足す判定は上の一致を条件にする。既存の読み手の監査は範囲外とし、見つけたものは報告する。
+- **閉じる経路も同じ条件にする (r5 P1)**: close は一時投影中にも走る (`close_and_retire_context_with_close_owner` が
+  `with_viewer_context_state` の中で `close_fullscreen_to_completion` を呼ぶ、`viewer_context_registry.rs:6419`・
+  `app.rs:67823`、全窓の終了では at-rest の active を先に閉じる `app.rs:67959`)。今の `finish_fullscreen_edit_modes`
+  は App 共通の編集を無条件に終えるので、前面 A で編集中に sibling B を投影して閉じると、A の下書きを B の保存先へ
+  書き得る (前倒しの後) か、捨てる (今)。close の context 固有の後始末は必ず行い、**App 共通の前面の編集の保存・
+  終了だけを、投影先が前面の context と一致するときに限る**。B の close の後も A の下書き・モード・保存先が
+  変わらず、A 自身の close では正常に保存されることをテストする。
+- 表の記録の細則 (r5): 入れ子では最も外の元の id を保ち、内側の退出では消さない。記録した外側だけが、元の投影へ
+  戻した後に消す。callback の panic では既存の戻しの後に消してから再送出する。`plan_mount` の受付の失敗では記録を
+  残さない (交換処理そのものの panic に回復は足さない)。Building の間 (scope なし) は mounted の id が `None` なので、
+  予約中の projected の id を前面の所有者として扱わない。scope の外の mount の切り替え (`plan_mount` / `finish_mount`、
+  build / promote) は scope を始めも消しもせず、前面の id は今の mounted の id に従う (古い元の id を残さない)。
+  正常終了・入れ子・callback の panic・受付の失敗・build の commit / abort・promote をテストする。
 
 呼ぶ場所 (どれも「旧項目がまだ有効」な時点):
 
