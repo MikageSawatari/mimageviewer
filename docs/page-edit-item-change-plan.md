@@ -209,6 +209,12 @@ active の編集に触れず、終えもしない (sibling の書き換えは ac
    表示中の項目が残るかどうかで分けない (分けると見開きの退避の付け替えが要る、r1 P2)。同じ項目の
    `content_type` などのメタデータの更新は対象にしない。500 か所の書き込みを個別に直すのではなく、membership /
    index 空間を変える採用の境界に集める。
+   - **補正レイヤーの例外 (全件テストの結果で追記)**: 補正レイヤーは、編集の対象と見開きの退避を
+     `PageEditOwner` で持ち、同じ項目のまま idx が付け替わる採用 (読み込みの差し替え・metadata の stream の再投影・
+     再 index) では `reproject_page_edit_owners` が対象と退避を移して編集を続ける。これはリリース済みの挙動で、
+     既存のテスト (`page_edit_owner_tests`・`page_edit_release_tests`) が固定している。表示中の項目が同じ identity の
+     まま残る付け替えでは、**補正レイヤーだけ**この既存の付け替えで続け、ほかの 5 ツール (数値の idx の退避しか
+     持たない) は終える。表示中の項目の identity が変わる・消える採用では 6 ツールとも終える。
    - **終える時点は、採用が既存の鮮度の検証・状態の捕捉をする前** (r2 P1)。本の構成の採用は、編集の snapshot の
      write epoch の検証 (`book_composition_runtime.rs:1226`)、landing の捕捉 (`:1282`)、補正レイヤーの退避
      (`:1346`) を `install_prepared_aggregate_items` より前に行い、その後 `install_prepared_page_edits` (`:1386`) で
