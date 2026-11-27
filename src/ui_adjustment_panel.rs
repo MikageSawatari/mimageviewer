@@ -11642,10 +11642,11 @@ impl App {
     /// この境界で揃える。終了時の状態が次回起動へ漏れないよう、元画像比較は OFF、
     /// マスク表示は ON から始める。
     pub(crate) fn enter_local_adjust_mode(&mut self, ctx: &egui::Context) {
-        if self
-            .fullscreen_idx
-            .is_some_and(|fs_idx| !self.fullscreen_edit_mode_entry_allowed(fs_idx))
-        {
+        let entry_allowed = match self.fullscreen_idx {
+            Some(fs_idx) => self.fullscreen_edit_mode_entry_allowed(fs_idx),
+            None => self.page_edit_mode_navigation_entry_allowed(),
+        };
+        if !entry_allowed {
             return;
         }
         // 他の 4 ツールと同じく、編集する 1 ページを単独で表示してから始める。
@@ -11677,6 +11678,7 @@ impl App {
             }
         }
         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
+        self.stop_projected_slideshow_playback();
         self.local_adjust_mode = true;
         self.local_adjust_show_source = false;
         self.local_adjust_show_mask = true;
@@ -16161,15 +16163,9 @@ impl App {
         );
 
         if close_clicked {
-            self.cancel_original_material_entry_intents(None);
-            self.cache_current_edit_preview_if_ready();
-            self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::LocalAdjust);
-            self.local_adjust_mode = false;
-            self.fold_local_adjust_edit_state();
-            self.local_adjust_repair_point_pick_active = None;
-            self.local_adjust_add_layer_dialog_open = false;
-            self.local_adjust_change_mask_dialog_open = false;
-            self.local_adjust_effect_picker_dialog_open = false;
+            self.exit_local_adjust_mode(
+                crate::app::page_edit_item_change::LocalAdjustmentExitPreview::CacheCurrent,
+            );
         }
         self.local_adjust_effect_query = effect_query;
         self.local_adjust_mask_edit_target = mask_edit_target;
@@ -16302,6 +16298,8 @@ impl App {
         self.local_adjust_repair_point_pick_active = None;
         self.local_adjust_selective_color_pick_active = false;
 
+        // This switches spread sides while keeping the tool open, so the ordinary
+        // exit helper is not involved; the outgoing page's detection must end here.
         self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::LocalAdjust);
         self.enter_page_edit_single_view(new_idx);
     }

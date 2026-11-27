@@ -127,7 +127,7 @@ fn browser870_directory_books_and_three_favorite_guards_do_not_remember() {
             assert!(crate::folder_tree::is_open_as_container(&folder));
             adopt(&mut app, &folder, true);
         } else {
-            app.load_folder(folder.clone());
+            app.load_folder_and_finish_for_test(folder.clone());
             app.finish_page_identity_preparation_for_test();
         }
         assert_eq!(app.spread_mode, Mode::Single);
@@ -193,7 +193,7 @@ fn browser870_live_root_switch_controls_saving_before_reload_and_retains_old_row
     let b = plain_folder_spread::make_folder(app.tmp.path(), "b");
     save_fixture(&app, &a, Mode::LtrCover);
     app.settings.browser_view_output_dir = Some(b.clone());
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     app.finish_page_identity_preparation_for_test();
     assert_eq!(app.spread_mode, Mode::LtrCover);
     let before = stored(&app, &a);
@@ -204,7 +204,7 @@ fn browser870_live_root_switch_controls_saving_before_reload_and_retains_old_row
         Persistence::NotRemembered
     );
     assert_eq!(stored(&app, &a), before);
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     app.finish_page_identity_preparation_for_test();
     assert_eq!(app.spread_mode, Mode::Single);
     app.settings.browser_view_output_dir = Some(b);
@@ -214,7 +214,7 @@ fn browser870_live_root_switch_controls_saving_before_reload_and_retains_old_row
         Persistence::Saved
     );
     assert_eq!(stored(&app, &a), before);
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     app.finish_page_identity_preparation_for_test();
     assert_eq!(
         app.spread_mode,
@@ -226,7 +226,7 @@ fn browser870_live_root_switch_controls_saving_before_reload_and_retains_old_row
             .unwrap(),
         Persistence::Saved
     );
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     app.finish_page_identity_preparation_for_test();
     assert_eq!(app.spread_mode, Mode::Ltr);
     assert_ne!(stored(&app, &a), before);
@@ -238,7 +238,7 @@ fn browser870_non_directory_and_replacement_do_not_inherit_directory_provenance(
     let root = app.tmp.path().join("browser");
     let folder = plain_folder_spread::make_folder(&root, "month");
     app.settings.browser_view_output_dir = Some(root.clone());
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     app.finish_page_identity_preparation_for_test();
     assert!(!app.remembers_spread_presentation());
     for name in ["book.zip", "document.pdf"] {
@@ -252,7 +252,7 @@ fn browser870_non_directory_and_replacement_do_not_inherit_directory_provenance(
         );
         assert_eq!(stored(&app, &container).mode, Some(Mode::Ltr));
     }
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     app.finish_page_identity_preparation_for_test();
     app.install_new_items(vec![GridItem::Image(folder.join("result.jpg"))], vec![None]);
     assert_eq!(
@@ -281,7 +281,7 @@ fn browser870_metadata_completion_preserves_live_presentation_and_imports_other_
         plain_folder_spread::configure(&mut app, enabled, false);
         let folder = plain_folder_spread::make_folder(app.tmp.path(), "browser");
         app.settings.browser_view_output_dir = Some(folder.clone());
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.finish_page_identity_preparation_for_test();
         let ctx = egui::Context::default();
         app.apply_fullscreen_spread_mode(&ctx, 0, Mode::Ltr);
@@ -395,7 +395,7 @@ fn browser870_load_preserves_non_presentation_preferences() {
         .unwrap();
     db.set_page_alone_preferences(&folder, None, alone).unwrap();
     save_fixture(&app, &folder, Mode::RtlCover);
-    app.load_folder(folder);
+    app.load_folder_and_finish_for_test(folder);
     app.finish_page_identity_preparation_for_test();
     assert_eq!(reading(&app), (Mode::Single, Flow::Paged, Direction::Ltr));
     assert_eq!(app.final_cover_spread_preference, final_cover);

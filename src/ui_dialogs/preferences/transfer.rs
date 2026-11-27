@@ -1273,7 +1273,7 @@ mod tests {
             app.settings.show_toolbar_sort = true;
             app.settings.toolbar_sort_items = vec![SortOrder::RatingDesc];
             app.settings.toolbar_sort_display = ToolbarSectionDisplay::Buttons;
-            app.load_folder_with_scan(folder, None);
+            app.load_folder_and_finish_for_test(folder);
             app.finish_page_identity_preparation_for_test();
             let mut fonts_ready = false;
             let mut harness = crate::test_ui::builder()

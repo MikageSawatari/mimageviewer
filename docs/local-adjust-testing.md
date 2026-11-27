@@ -53,7 +53,7 @@
 検証:
 1. cargo check --workspace
 2. cargo test --lib [追加した test 名]
-3. cargo test 全体
+3. 全体確認は scripts/test-full.ps1 (対象を絞る反復確認は nextest を使う)
 
 このコミットに以下のテストを追加してください:
 
@@ -347,12 +347,13 @@ PrefixPreview / FullComposite / ShowSource × `ensure_final_composite_texture`
 
 ## CI 統合
 
-`.github/workflows/` の test job に何も追加せず動く (= `cargo test` 全体に含まれる)。
+全体確認は `scripts/test-full.ps1` の workspace 段に含まれる。
+統合テスト全体は nextest で流し、`cargo test` は下記のようにモジュールで絞る。
 ローカルでは:
 ```bash
-cargo test --test local_adjust_core_parity  # L3 のみ
+cargo test -p mimageviewer --test integration local_adjust_core_parity::  # L3 のみ
 cargo test --lib local_adjust                # L1 + L2 のみ
-cargo test                                    # 全部
+.\scripts\test-full.ps1                       # 全部 (nextest、doctest は別段)
 ```
 
 ## 追加 / 改廃時のルール

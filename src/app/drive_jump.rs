@@ -496,7 +496,7 @@ impl App {
                 Some(kind),
                 StartupListIntent::ExplicitList,
                 MainListRequestStage::Continuation,
-                DirectoryScanRoute::Worker,
+                DirectoryScanRoute::MainWorker,
             );
         }
     }

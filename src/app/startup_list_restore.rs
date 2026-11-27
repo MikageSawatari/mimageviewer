@@ -421,6 +421,7 @@ impl App {
     }
 
     pub(crate) fn close_fullscreen_to_page_list(&mut self) {
+        self.cancel_main_fullscreen_close_return_scan();
         self.accept_current_page_list_request();
         self.close_fullscreen();
     }
@@ -466,10 +467,14 @@ impl App {
             )
         {
             self.finish_fullscreen_navigation_for_true_close();
-            self.apply_fullscreen_close_nav_immediate(crate::ui_main::AddressBarNav::Direct(
+            let _ = self.load_folder_or_convert_archive_with_auto_fullscreen_owned_at_scan_route(
                 path,
+                false,
+                OpenRequestOwner::Navigation,
                 StartupListIntent::ResumeList { target, cursor },
-            ));
+                DirectoryScanRoute::UiThread(UiThreadScanReason::TrayClose),
+            );
+            self.clear_pending_folder_nav_steps();
             return;
         }
         self.close_fullscreen();
@@ -492,7 +497,15 @@ impl App {
             }
             if let Some(submitted) = local_search {
                 let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
-                self.execute_submitted_local_search(&ctx, submitted.clone());
+                if self.folder_manual_order_applied() {
+                    self.execute_submitted_local_search_with_cursor(
+                        &ctx,
+                        submitted.clone(),
+                        LocalSearchCursorPolicy::Retain,
+                    );
+                } else {
+                    self.execute_submitted_local_search(&ctx, submitted.clone());
+                }
             }
         }
     }

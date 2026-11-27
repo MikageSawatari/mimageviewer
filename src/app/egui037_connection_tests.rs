@@ -874,6 +874,7 @@ fn rescan_fixture(
             FolderRefreshCause::External,
             mtime,
             scan.omitted,
+            scan.folder_order_inventory,
         )
     };
     tx.send(Some(result)).unwrap();
@@ -884,6 +885,7 @@ fn rescan_fixture(
         proof: Some(FolderRescanProof {
             baseline: None,
             projection_key,
+            order_revision: env.folder_order.order_revision,
             subscription: Some((epoch, 7)),
         }),
         cause: FolderRefreshCause::Operation,

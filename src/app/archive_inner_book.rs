@@ -124,10 +124,21 @@ impl App {
         idx: usize,
         ctx: &egui::Context,
     ) -> ZipDirActivationOutcome {
+        self.activate_main_zipdir_with_admission(idx, ctx).0
+    }
+
+    pub(crate) fn activate_main_zipdir_with_admission(
+        &mut self,
+        idx: usize,
+        ctx: &egui::Context,
+    ) -> (ZipDirActivationOutcome, ActionAdmission) {
         if self.projected_viewer_context_id() != self.viewer_context_main()
             || self.items_are_rating_view
         {
-            return ZipDirActivationOutcome::NotApplicable;
+            return (
+                ZipDirActivationOutcome::NotApplicable,
+                ActionAdmission::Rejected,
+            );
         }
         let Some(GridItem::ZipDir {
             zip_path,
@@ -135,10 +146,16 @@ impl App {
             ..
         }) = self.items.get(idx)
         else {
-            return ZipDirActivationOutcome::NotApplicable;
+            return (
+                ZipDirActivationOutcome::NotApplicable,
+                ActionAdmission::Rejected,
+            );
         };
         let Some(nav) = self.zip_nav.as_ref() else {
-            return ZipDirActivationOutcome::NotApplicable;
+            return (
+                ZipDirActivationOutcome::NotApplicable,
+                ActionAdmission::Rejected,
+            );
         };
         if !self.grid_item_input_allowed()
             || !crate::folder_tree::path_eq(zip_path, &nav.tree.zip_path)
@@ -147,7 +164,7 @@ impl App {
                 .as_deref()
                 .is_none_or(|path| !crate::folder_tree::path_eq(path, &nav.tree.zip_path))
         {
-            return ZipDirActivationOutcome::Refused;
+            return (ZipDirActivationOutcome::Refused, ActionAdmission::Rejected);
         }
         let requested_prefix = dir_prefix.clone();
         let segments = requested_prefix
@@ -159,12 +176,12 @@ impl App {
             || !segments.starts_with(nav.current())
             || nav.tree.node_at(&segments).is_none()
         {
-            return ZipDirActivationOutcome::Refused;
+            return (ZipDirActivationOutcome::Refused, ActionAdmission::Rejected);
         }
         if self.is_snapshot_active() {
             self.maybe_suppress_rating_filter_for_opened_zip_book(idx);
             self.zip_nav_enter(&requested_prefix);
-            return ZipDirActivationOutcome::List;
+            return (ZipDirActivationOutcome::List, ActionAdmission::Accepted);
         }
         let mut destination = nav.clone();
         destination.choose_current_list(Some(self.selected_rows_below_view_top(idx)));
@@ -202,7 +219,7 @@ impl App {
                         target: DetachedZipTarget::BookScope(target.clone()),
                         archive_source_override: self.archive_source_override.clone(),
                     };
-                    let opened = self.execute_detached_grid_item_open_plan(
+                    let route = self.execute_detached_grid_item_open_plan_with_admission(
                         ctx,
                         DetachedGridItemOpenPlan::Descriptor {
                             descriptor,
@@ -210,13 +227,13 @@ impl App {
                         },
                         None,
                     );
-                    if !opened {
+                    if !route.handled {
                         self.show_feedback_warning(
                             "内部の本を別ウィンドウで開けませんでした".into(),
                         );
-                        return ZipDirActivationOutcome::Refused;
+                        return (ZipDirActivationOutcome::Refused, ActionAdmission::Rejected);
                     }
-                    return ZipDirActivationOutcome::BookRequested;
+                    return (ZipDirActivationOutcome::BookRequested, route.admission);
                 }
                 ArchiveLevelOpenIntent::UnsupportedBook { .. } | ArchiveLevelOpenIntent::List => {}
             }
@@ -231,7 +248,9 @@ impl App {
             StartupListIntent::ExplicitList
         });
         let target = match intent {
-            ArchiveLevelOpenIntent::List => return ZipDirActivationOutcome::List,
+            ArchiveLevelOpenIntent::List => {
+                return (ZipDirActivationOutcome::List, ActionAdmission::Accepted);
+            }
             ArchiveLevelOpenIntent::Book(target) => target,
             ArchiveLevelOpenIntent::UnsupportedBook {
                 logical_root,
@@ -243,11 +262,11 @@ impl App {
                     "この内部フォルダは本として開けないため、一覧を表示します",
                     crate::feedback::FeedbackKind::Info,
                 );
-                return ZipDirActivationOutcome::List;
+                return (ZipDirActivationOutcome::List, ActionAdmission::Accepted);
             }
         };
         if !self.archive_book_target_is_current(&target) {
-            return ZipDirActivationOutcome::Refused;
+            return (ZipDirActivationOutcome::Refused, ActionAdmission::Rejected);
         }
         let deferred = DeferredFsReopen {
             viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
@@ -260,13 +279,16 @@ impl App {
         };
         self.fs_suppress_enter_close_until_release = true;
         if self.attach_archive_book_index_continuation(deferred) {
-            ZipDirActivationOutcome::BookRequested
+            (
+                ZipDirActivationOutcome::BookRequested,
+                ActionAdmission::Accepted,
+            )
         } else {
             crate::logger::log("archive book open: accepted level has no index continuation");
             self.show_feedback_warning(
                 "本の準備を開始できませんでした。一覧を再読み込みしてください".into(),
             );
-            ZipDirActivationOutcome::Refused
+            (ZipDirActivationOutcome::Refused, ActionAdmission::Rejected)
         }
     }
 

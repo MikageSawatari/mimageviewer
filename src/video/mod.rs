@@ -9271,6 +9271,14 @@ impl VideoPlayer {
     }
 
     #[cfg(test)]
+    pub(crate) fn video_only_disconnected_for_test(path: PathBuf) -> Self {
+        let mut player = Self::stream_ready_disconnected_for_test(path);
+        player.audio = None;
+        player.info.as_mut().unwrap().has_audio = false;
+        player
+    }
+
+    #[cfg(test)]
     pub(crate) fn loading_resume_disconnected_for_test(
         path: PathBuf,
         resume: crate::settings::VideoResumePosition,

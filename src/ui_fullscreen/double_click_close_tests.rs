@@ -4,7 +4,9 @@ use crate::settings::FullscreenPrimaryClickMode;
 
 mod close_900_tests;
 mod scrub_907_tests;
+mod stall_919_tests;
 mod suppression_906_tests;
+mod timestamp_919_tests;
 
 fn viewport() -> egui::Rect {
     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))
@@ -116,6 +118,7 @@ impl Canvas {
             egui::RawInput {
                 screen_rect: Some(viewport()),
                 time: Some(self.time),
+                input_clock: Some(self.time),
                 focused: true,
                 events,
                 ..Default::default()
@@ -137,9 +140,11 @@ impl Canvas {
                     egui::Id::new("double-click-close-canvas"),
                     egui::Sense::click_and_drag(),
                 );
-                self.app
-                    .fs_front_pointer
-                    .accept_backing_click(&response, options.suppressed);
+                self.app.fs_front_pointer.accept_backing_click(
+                    &response,
+                    options.suppressed,
+                    &front,
+                );
                 let zoom = self.app.fs_zoom;
                 let pan = self.app.fs_pan;
                 outcome = self
@@ -169,6 +174,7 @@ impl Canvas {
                         } else {
                             FullscreenPrimarySuppressionDecision::Allow
                         },
+                        false,
                     )
                     .into();
             },
@@ -244,6 +250,7 @@ impl Canvas {
             viewport_id,
             screen_rect: Some(viewport()),
             time: Some(self.time),
+            input_clock: Some(self.time),
             focused,
             events,
             ..Default::default()
@@ -1151,6 +1158,161 @@ fn close_mode_default_page_turn_still_acts_on_each_separate_release() {
     }
 }
 
+#[test]
+fn page_turn_batched_double_and_triple_click_reset_the_moved_canvas() {
+    for clicks in [2, 3] {
+        let mut canvas = Canvas::new();
+        canvas.app.settings.fullscreen_primary_click = FullscreenPrimaryClickMode::PageTurn;
+        canvas.app.fs_zoom = 2.0;
+        let events = (0..clicks)
+            .flat_map(|_| click(canvas_pos(), egui::Modifiers::NONE))
+            .collect();
+        assert_eq!(canvas.plan(events, Options::default()), Outcome::Reset);
+        assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, clicks);
+    }
+}
+
+#[test]
+fn page_turn_list_open_double_click_still_counts_only_the_canvas_release() {
+    let mut canvas = Canvas::new();
+    canvas.app.settings.fullscreen_primary_click = FullscreenPrimaryClickMode::PageTurn;
+    canvas.app.fs_zoom = 2.0;
+    assert_eq!(
+        canvas.plan(
+            click(canvas_pos(), egui::Modifiers::NONE),
+            Options::default()
+        ),
+        Outcome::None
+    );
+    canvas.app.fs_front_pointer = FsFrontPointerOwnership::default();
+    assert_eq!(
+        canvas.plan(
+            click(canvas_pos(), egui::Modifiers::NONE),
+            Options::default()
+        ),
+        Outcome::None
+    );
+    assert_eq!(canvas.raw_click_counts(), [2]);
+    assert_eq!(canvas.app.fs_front_pointer.clicks.current_accepted, 1);
+}
+
+/// Exercise the normal canvas acceptance boundary without native windows or App workers.
+fn fold_backing_frame(
+    ctx: &egui::Context,
+    owner: &mut FsFrontPointerOwnership,
+    time: f64,
+    events: Vec<egui::Event>,
+    front_rects: &[egui::Rect],
+) -> bool {
+    let mut double = false;
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(viewport()),
+            time: Some(time),
+            focused: true,
+            events,
+            ..Default::default()
+        },
+        |ui| {
+            let front = owner.capture(ctx, false, front_rects);
+            // Supply egui's admitted response to test this acceptance boundary;
+            // the production caller separately applies aggregate front suppression.
+            let response = ui.interact(
+                viewport(),
+                egui::Id::unique("page-turn-fold-canvas"),
+                egui::Sense::click_and_drag(),
+            );
+            owner.accept_backing_click(&response, false, &front);
+            let accepted = owner.clicks.current_accepted;
+            // Replanning the same owning pass must not count its releases again.
+            owner.accept_backing_click(&response, false, &front);
+            assert_eq!(owner.clicks.current_accepted, accepted);
+            double = owner.backing_double_clicked(&response);
+        },
+    )
+    .drop_without_applying_deltas();
+    double
+}
+
+#[test]
+fn page_turn_batched_canvas_click_acceptance_is_idempotent() {
+    let ctx = egui::Context::default();
+    let mut owner = FsFrontPointerOwnership::default();
+    fold_backing_frame(&ctx, &mut owner, 0.0, vec![], &[]);
+    assert!(fold_backing_frame(
+        &ctx,
+        &mut owner,
+        0.04,
+        double_click(canvas_pos()),
+        &[]
+    ));
+    assert_eq!(owner.clicks.current_accepted, 2);
+    assert!(!fold_backing_frame(
+        &ctx,
+        &mut owner,
+        0.08,
+        click(canvas_pos(), egui::Modifiers::NONE),
+        &[]
+    ));
+    assert_eq!(
+        owner.clicks.current_accepted, 3,
+        "PageTurn keeps the saturated third-click policy"
+    );
+}
+
+#[test]
+fn page_turn_batched_front_and_canvas_clicks_cannot_form_a_double_click() {
+    for front_first in [false, true] {
+        let ctx = egui::Context::default();
+        let mut owner = FsFrontPointerOwnership::default();
+        let front_pos = egui::pos2(100.0, 180.0);
+        let canvas_pos = front_pos + egui::vec2(3.0, 0.0);
+        let front_rect = egui::Rect::from_center_size(front_pos, egui::vec2(2.0, 20.0));
+        fold_backing_frame(&ctx, &mut owner, 0.0, vec![], &[front_rect]);
+        let (first, second) = if front_first {
+            (front_pos, canvas_pos)
+        } else {
+            (canvas_pos, front_pos)
+        };
+        let mut events = click(first, egui::Modifiers::NONE);
+        events.extend(click(second, egui::Modifiers::NONE));
+        assert!(
+            !fold_backing_frame(&ctx, &mut owner, 0.04, events, &[front_rect]),
+            "front_first={front_first}"
+        );
+        assert_eq!(owner.clicks.current_accepted, u32::from(front_first));
+        assert!(fold_backing_frame(
+            &ctx,
+            &mut owner,
+            1.0,
+            double_click(canvas_pos),
+            &[front_rect]
+        ));
+    }
+}
+
+#[test]
+fn page_turn_batched_clicks_on_both_sides_of_focus_loss_cannot_form_a_double_click() {
+    let ctx = egui::Context::default();
+    let mut owner = FsFrontPointerOwnership::default();
+    fold_backing_frame(&ctx, &mut owner, 0.0, vec![], &[]);
+    let mut events = click(canvas_pos(), egui::Modifiers::NONE);
+    events.extend([
+        egui::Event::WindowFocused(false),
+        egui::Event::WindowFocused(true),
+    ]);
+    events.extend(click(canvas_pos(), egui::Modifiers::NONE));
+    assert!(!fold_backing_frame(&ctx, &mut owner, 0.04, events, &[]));
+    assert_eq!(owner.clicks.current_accepted, 1);
+    assert!(fold_backing_frame(
+        &ctx,
+        &mut owner,
+        1.0,
+        double_click(canvas_pos()),
+        &[]
+    ));
+}
+
 fn fold_frame(
     ctx: &egui::Context,
     owner: &mut FsFrontPointerOwnership,
@@ -1332,7 +1494,7 @@ fn close_mode_focus_restore_899_f1_split_frames_close_on_second_click() {
         canvas.app.fs_primary_suppression,
         FullscreenPrimarySuppression::Idle
     );
-    assert!(canvas.app.fs_pan_drag_start.is_none());
+    assert!(canvas.app.fs_canvas_drag.pan_start().is_none());
     assert_eq!(canvas.app.fullscreen_idx, Some(0));
     assert_eq!(canvas.split_click(egui::Modifiers::NONE), (true, false));
 }

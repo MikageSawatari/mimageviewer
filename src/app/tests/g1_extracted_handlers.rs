@@ -156,7 +156,7 @@ fn exercise_entrance(entrance: Entrance) {
                 )
                 .unwrap();
         }
-        app.load_folder(book.clone());
+        app.load_folder_and_finish_for_test(book.clone());
         app.settle_open_path_classification_for_test();
         app.finish_history_restore_preparation_for_test();
         assert!(matches!(app.projection_recipe, ProjectionRecipe::Book(_)));

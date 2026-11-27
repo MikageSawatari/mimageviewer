@@ -1,5 +1,14 @@
 # eframe 0.37.0 のローカル変更（段2c-1）
 
+## §1.919: Native input timestamp lifetime and pass clock (2026-11-27)
+
+Windows の内部 msg hook は利用者の event_loop_builder より先に設定する。
+既存 NativeWindowAllocationLease が timestamp subclass の設置・退役も所有する。
+ROOT の listener replay 後は vendor の同じ proc/id を remove → install し、timestamp の claim を listener より先にする。
+native の RawInput.time 全5設定点 (通常・非描画・immediate、wgpu / glow) は
+同一 Instant のプロセス input_clock も設定する。保留入力は絶対注釈を保持して既存 append 経路を通る。
+web は Windows 入力注釈を生成しないため input_clock=None の既定を維持する。
+
 原本コミット`83836dd16`を基準に、旧vendor対eframe 0.33.3原本の実差分から既存パッチを付け直した。
 原本のchecksum・VCS・file別hashは[upstream-provenance.json](../upstream-provenance.json)。
 以下は**実装担当の内部確認**であり、正式な独立レビュー・受入れではない。

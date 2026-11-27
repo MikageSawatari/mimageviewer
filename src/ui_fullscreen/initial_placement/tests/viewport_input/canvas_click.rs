@@ -139,13 +139,14 @@ fn planned_click(app: &mut App, is_video: bool, double: bool) -> FsCanvasClickAc
                 ..Default::default()
             },
             |ui| {
-                app.capture_fs_front_pointer_input(&ctx, arrival_viewport());
+                let (front, _) = app.capture_fs_front_pointer_input(&ctx, arrival_viewport());
                 let response = ui.interact(
                     arrival_viewport(),
                     egui::Id::unique("canvas-move-745"),
                     egui::Sense::click_and_drag(),
                 );
-                app.fs_front_pointer.accept_backing_click(&response, false);
+                app.fs_front_pointer
+                    .accept_backing_click(&response, false, &front);
                 action = app.plan_fs_canvas_click(
                     &ctx,
                     &response,
@@ -161,6 +162,7 @@ fn planned_click(app: &mut App, is_video: bool, double: bool) -> FsCanvasClickAc
                     app.fs_pan,
                     None,
                     FullscreenPrimarySuppressionDecision::Allow,
+                    false,
                 );
             },
         )

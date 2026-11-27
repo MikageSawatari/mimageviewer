@@ -16,7 +16,7 @@
 //! ## 実行
 //!
 //! ```
-//! cargo test --test search_metadata_e2e -- --nocapture
+//! cargo test -p mimageviewer --test integration search_metadata_e2e:: -- --nocapture
 //! ```
 //!
 //! notify-rs の発火は Windows の `ReadDirectoryChangesW` 挙動に依存するため、
@@ -24,7 +24,7 @@
 //! 初回走査の前提となる Susie 初期化は common の fixture が明示的に行う。
 //! 初回待ちの失敗ログには manager / supervisor の状態と reader の件数を含める。
 
-mod common;
+use crate::common;
 
 use common::{
     FS_EVENT_TIMEOUT, FixtureRoot, collect_search_hits, delete_file, make_favorite, normalize_path,

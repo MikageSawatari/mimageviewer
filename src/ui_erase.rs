@@ -392,6 +392,8 @@ impl App {
         };
         let base = self.capture_erase_base_source(target_idx, Arc::clone(&pixels));
         self.erase_base_cache.insert(target_idx, base);
+        // Navigation admission and source acquisition have succeeded. Retire the
+        // old tool request before changing its target; playback stops on entry below.
         self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::Erase);
         // ピクセル取得成功 → ここから state mutation。
         if let Some(pivot) = pivot {
@@ -400,6 +402,7 @@ impl App {
         }
         let fs_idx = target_idx;
         let [w, h] = self.erase_working_size(fs_idx, pixels.size);
+        self.stop_projected_slideshow_playback();
         self.erase_session = self.erase_session.wrapping_add(1);
         self.erase_mode = true;
         // 通常表示と消しゴムは UI / Ctrl+Z の文脈が異なるので、メタ Undo スタックを破棄。
@@ -533,7 +536,7 @@ impl App {
         self.erase_panel_body_content_h = None;
         self.erase_shape_drag_start = None;
         self.erase_shape_drag_end = None;
-        self.fs_pan_drag_start = None;
+        self.fs_canvas_drag.set_pan_start(None);
 
         // 見開きから入っていた場合は spread_mode と表示ページを復元する。
         let pivot = self.erase_spread_ctx.take();
@@ -746,6 +749,7 @@ impl App {
             return Default::default();
         }
         let action = FsKeyAction {
+            script_slot: None,
             page_transition: Default::default(),
             close: false,
             close_to_page_list: false,

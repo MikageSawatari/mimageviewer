@@ -516,6 +516,7 @@ impl ExportPageComposite {
 }
 
 pub enum ExportComposite {
+    PlaneView(crate::plane_view_wgpu::PlaneFrameRequest),
     Single(ExportPageComposite),
     Spread {
         left: ExportPageComposite,
@@ -524,9 +525,22 @@ pub enum ExportComposite {
 }
 
 impl ExportComposite {
+    pub(crate) fn output_size(&self, scale: ExportScale, fallback: [usize; 2]) -> [usize; 2] {
+        match self {
+            Self::PlaneView(request) => {
+                let size = request
+                    .with_choice(crate::plane_view_wgpu::PlaneOutputChoice::Export(scale))
+                    .size;
+                [size[0] as usize, size[1] as usize]
+            }
+            _ => scale.scaled_size(fallback),
+        }
+    }
+
     /// プリセット出力 (`_1`〜`_4`) を作れるか = 隠蔽マスクを持つページがあるか。
     pub fn has_conceal_mask(&self) -> bool {
         match self {
+            Self::PlaneView(_) => false,
             Self::Single(page) => page.has_conceal_mask,
             Self::Spread { left, right } => left.has_conceal_mask || right.has_conceal_mask,
         }
@@ -534,6 +548,7 @@ impl ExportComposite {
 
     pub(crate) fn includes_ai_stage(&self) -> bool {
         match self {
+            Self::PlaneView(_) => false,
             Self::Single(page) => page.edits.stage.includes_ai(),
             Self::Spread { left, right } => {
                 left.edits.stage.includes_ai() || right.edits.stage.includes_ai()
@@ -550,6 +565,7 @@ impl ExportComposite {
         crop_override: Option<(crate::export_crop::CropRect, [usize; 2])>,
     ) -> Result<[usize; 2], String> {
         match self {
+            Self::PlaneView(request) => Ok([request.size[0] as usize, request.size[1] as usize]),
             Self::Single(page) => page.render_size_with_crop(crop_override),
             Self::Spread { left, right } => {
                 let [left_w, left_h] = left.render_size_with_crop(crop_override)?;
@@ -808,8 +824,14 @@ fn session_targets_available(
         .all(|suffix| !target_path(output_dir, basename, *suffix, extension).exists())
 }
 
-fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<ExportEvent>) {
+fn run_export(mut request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<ExportEvent>) {
     // ローカル AI 利用中であることを worker 終端まで remote の acquire barrier へ見せる。
+    let plane_view = matches!(&request.composite, ExportComposite::PlaneView(_));
+    if let ExportComposite::PlaneView(frame) = &mut request.composite {
+        *frame = frame.with_choice(crate::plane_view_wgpu::PlaneOutputChoice::Export(
+            request.scale,
+        ));
+    }
     let _local_ai_activity = request.local_ai_activity;
     let output_src_format = request.output_format.to_src_format();
     // 元 WebP がアニメーション WebP かを検査するため、original が WebP のときは
@@ -905,6 +927,7 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
             || edits.local_adjust.is_some()
     };
     let composite_has_hidden_edits = match &request.composite {
+        ExportComposite::PlaneView(_) => false,
         ExportComposite::Single(page) => page_has_hidden_edits(page),
         ExportComposite::Spread { left, right } => {
             page_has_hidden_edits(left) || page_has_hidden_edits(right)
@@ -987,7 +1010,11 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
             let _ = tx.send(ExportEvent::Cancelled);
             return;
         }
-        let pixels = match scale_export_pixels(Cow::Owned(pixels), request.scale) {
+        let pixels = match if plane_view {
+            Ok(Cow::Owned(pixels))
+        } else {
+            scale_export_pixels(Cow::Owned(pixels), request.scale)
+        } {
             Ok(pixels) => pixels,
             Err(message) => {
                 let _ = tx.send(ExportEvent::Failed(ExportFailure {
@@ -1079,6 +1106,7 @@ pub(crate) struct DecodedExportPage<'a> {
 /// decode 結果と、その結果を作ったページ要求を同じ variant に束ねる。
 /// これにより Single / Spread の組み合わせ不一致を型で表現不能にする。
 pub(crate) enum DecodedExportComposite<'a> {
+    PlaneView(crate::plane_view_wgpu::PlaneFrameRequest),
     Single(DecodedExportPage<'a>),
     Spread {
         left: DecodedExportPage<'a>,
@@ -1130,6 +1158,9 @@ pub(crate) fn decode_export_composite<'a>(
     raw: Option<&crate::raw::RawDecodeContext>,
 ) -> Result<DecodedExportComposite<'a>, ExportRenderError> {
     match composite {
+        ExportComposite::PlaneView(request) => {
+            Ok(DecodedExportComposite::PlaneView(request.clone()))
+        }
         ExportComposite::Single(page) => Ok(DecodedExportComposite::Single(decode_export_page(
             page, cancel, raw,
         )?)),
@@ -1147,6 +1178,9 @@ fn render_export_composite(
     cancel: &Arc<AtomicBool>,
 ) -> Result<egui::ColorImage, ExportRenderError> {
     match decoded {
+        DecodedExportComposite::PlaneView(request) => {
+            request.color_image().map_err(ExportRenderError::Failed)
+        }
         DecodedExportComposite::Single(decoded) => render_export_page(
             decoded.edits,
             decoded.image.clone(),
@@ -1181,6 +1215,9 @@ pub(crate) fn render_export_composite_owned(
     cancel: &Arc<AtomicBool>,
 ) -> Result<egui::ColorImage, ExportRenderError> {
     match decoded {
+        DecodedExportComposite::PlaneView(request) => {
+            request.color_image().map_err(ExportRenderError::Failed)
+        }
         DecodedExportComposite::Single(decoded) => {
             render_export_page(decoded.edits, decoded.image, preset, crop_override, cancel)
         }

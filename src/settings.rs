@@ -5396,6 +5396,12 @@ pub struct Settings {
     /// (docs/filename-stack-scripting-plan.md)。
     #[serde(default)]
     pub stack_script_enabled: bool,
+    /// 操作スクリプトを読み込むか。環境設定の下書きからOKで確定するローカル実行許可。
+    #[serde(default)]
+    pub operation_script_enabled: bool,
+    /// 第三者のスクリプトについての初回説明を確認済みか。有効化と同じ下書きでOK時に確定。
+    #[serde(default)]
+    pub operation_script_notice_confirmed: bool,
     /// サムネイルキャッシュの長辺ピクセル数
     #[serde(default = "default_thumb_px")]
     pub thumb_px: u32,
@@ -6142,6 +6148,8 @@ pub struct Settings {
     /// 静止画をホイールで拡大・縮小するときの倍率の刻み。
     #[serde(default)]
     pub fullscreen_wheel_zoom_step: FullscreenWheelZoomStep,
+    #[serde(default)]
+    pub plane_view_lens: crate::plane_view::PlaneLensKind,
     /// ページ内の次へ / 前へスクロールで用いる順序。
     #[serde(default)]
     pub fullscreen_n_scroll_order: FullscreenNScrollOrder,
@@ -8717,6 +8725,7 @@ impl Default for Settings {
             fullscreen_up_down_key_action: FullscreenUpDownKeyAction::default(),
             fullscreen_wheel_action: FullscreenWheelAction::default(),
             fullscreen_wheel_zoom_step: FullscreenWheelZoomStep::default(),
+            plane_view_lens: crate::plane_view::PlaneLensKind::default(),
             fullscreen_n_scroll_order: FullscreenNScrollOrder::default(),
             fullscreen_n_scroll_step_percent: default_fullscreen_n_scroll_step_percent(),
             fullscreen_n_scroll_wrap_step_percent: None,
@@ -8849,6 +8858,8 @@ impl Default for Settings {
             keymap: crate::keymap::KeymapSettings::default(),
             stack_separator: default_stack_separator(),
             stack_script_enabled: false,
+            operation_script_enabled: false,
+            operation_script_notice_confirmed: false,
             folder_thumb_sort: default_folder_thumb_sort(),
             folder_thumb_depth: default_folder_thumb_depth(),
             recent_open_with_apps: Vec::new(),

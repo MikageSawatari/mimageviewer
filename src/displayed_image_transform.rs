@@ -203,6 +203,8 @@ pub(crate) struct DisplayedImageGeometry {
     /// SpecifiedScale demand and captured layout use this A/O-derived extent; a rounded
     /// AI/PDF raster may only alter the contained paint rectangle.
     pub(crate) layout_full_image_rect: egui::Rect,
+    /// Fit placement before sampler containment and physical pixel snapping.
+    pub(crate) placement_frame: egui::Rect,
     /// 実際に texture を paint する矩形。表示 trim 時は bbox 部分だけになる。
     pub(crate) paint_rect: egui::Rect,
     /// ポインタ判定の broad phase。自由回転時は paint quad の AABB。
@@ -491,6 +493,7 @@ impl DisplayedImageGeometry {
         );
         let mut geometry = Self::from_resolved_rect(input, full_image_rect)?;
         geometry.layout_full_image_rect = layout_full_image_rect;
+        geometry.placement_frame = layout_full_image_rect;
         Some(geometry)
     }
 
@@ -513,6 +516,7 @@ impl DisplayedImageGeometry {
         if !total_scale.is_finite() || total_scale <= 0.0 {
             return None;
         }
+        let placement_frame = full_image_rect;
         let full_image_rect = match input.pixel_fit {
             RectPixelFit::Texels => snap_rect_to_physical_pixels(
                 full_image_rect,
@@ -555,6 +559,7 @@ impl DisplayedImageGeometry {
             viewport_rect: input.viewport_rect,
             full_image_rect,
             layout_full_image_rect: full_image_rect,
+            placement_frame,
             paint_rect,
             hit_rect,
             uv_rect,
@@ -569,6 +574,12 @@ impl DisplayedImageGeometry {
             pixels_per_point: input.pixels_per_point,
             pixel_fit: input.pixel_fit,
         })
+    }
+
+    /// Sampler containment must not change the placement frame used for material adoption.
+    pub(crate) fn with_placement_frame(mut self, frame: egui::Rect) -> Self {
+        self.placement_frame = frame;
+        self
     }
 
     /// 貼り先を **平行移動だけ** する。倍率・UV・寸法は動かさない。
@@ -592,6 +603,7 @@ impl DisplayedImageGeometry {
         Self {
             full_image_rect,
             layout_full_image_rect: self.layout_full_image_rect.translate(offset),
+            placement_frame: self.placement_frame.translate(offset),
             paint_rect,
             hit_rect,
             ..self
@@ -1156,12 +1168,23 @@ pub(crate) struct FullscreenPageLayout {
     kind: FullscreenPageLayoutKind,
     pages: Vec<DisplayedPage>,
     pub(crate) drawn_unit: Option<crate::ui_fullscreen::in_page_scroll::FsDrawnUnitStamp>,
+    /// Accepted material geometry, paired with the displayed page rather than viewer state.
+    pub(crate) plane_cover: Option<PlaneCoverRecord>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlaneCoverRecord {
+    pub(crate) anchor: crate::plane_view::PlaneViewAnchor,
+    pub(crate) input: DisplayedImageTransformInput,
+    pub(crate) layout_source_size: Option<egui::Vec2>,
+    pub(crate) material: crate::plane_view_wgpu::PlaneMaterialDescription,
 }
 
 impl FullscreenPageLayout {
     pub(crate) fn begin(&mut self, kind: FullscreenPageLayoutKind) {
         self.pages.clear();
         self.drawn_unit = None;
+        self.plane_cover = None;
         self.kind = kind;
     }
 
@@ -1169,7 +1192,20 @@ impl FullscreenPageLayout {
         self.begin(FullscreenPageLayoutKind::Empty);
     }
 
+    /// Publish one completed paint and its accepted material at the same boundary.
+    pub(crate) fn publish_single(
+        &mut self,
+        transform: DisplayedImageTransform,
+        plane_cover: Option<PlaneCoverRecord>,
+    ) {
+        debug_assert!(plane_cover.is_none_or(|record| record.input.page_idx == transform.page_idx));
+        self.begin(FullscreenPageLayoutKind::Single);
+        self.push(transform);
+        self.plane_cover = plane_cover;
+    }
+
     pub(crate) fn push(&mut self, transform: DisplayedImageTransform) {
+        self.plane_cover = None;
         self.pages.push(DisplayedPage::new(transform));
     }
 
@@ -1178,6 +1214,7 @@ impl FullscreenPageLayout {
         transform: DisplayedImageTransform,
         occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
     ) {
+        self.plane_cover = None;
         self.pages
             .push(DisplayedPage::with_occurrence(transform, occurrence));
     }
@@ -1189,6 +1226,7 @@ impl FullscreenPageLayout {
         side: SingletonSpreadPlacement,
         gap: f32,
     ) {
+        self.plane_cover = None;
         let mut page = DisplayedPage::with_occurrence(transform, occurrence);
         page.spread_gap = Some((side, gap));
         self.pages.push(page);

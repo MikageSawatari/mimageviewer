@@ -2722,6 +2722,74 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_919_canonical_activation_accepts_time_provenance_button_once() {
+        let _input = crate::key_input::lock_test_input();
+        let ctx = Context::default();
+        let scope = canonical_scope(&ctx);
+        let mut owner = DeferredClientActivationGesture::default();
+        let operation = feed_scoped_click(&mut owner, &scope);
+        let pos = pos2(100.0, 100.0);
+        let events = vec![
+            Event::PointerMoved(pos),
+            Event::PointerButtonTime {
+                button: PointerButton::Primary,
+                pressed: true,
+                time: 0.8,
+            },
+            Event::PointerInputProvenance(operation),
+            primary(pos, true),
+            Event::PointerButtonTime {
+                button: PointerButton::Primary,
+                pressed: false,
+                time: 0.88,
+            },
+            primary(pos, false),
+        ];
+        ctx.run_pass(
+            RawInput {
+                screen_rect: Some(geometry().surface),
+                time: Some(1.0),
+                input_clock: Some(1.0),
+                events,
+                focused: true,
+                ..Default::default()
+            },
+            |ctx| {
+                assert_eq!(
+                    ctx.input(|input| input.pointer.button_edges().next().unwrap().time.input),
+                    Some(0.8)
+                );
+                assert_eq!(
+                    owner.capture_for_scope(
+                        ctx,
+                        geometry(),
+                        ClientActivationAvailability::Available,
+                        &scope
+                    ),
+                    Some(ClientActivationSource::MouseClick)
+                );
+                assert!(
+                    owner
+                        .capture_for_scope(
+                            ctx,
+                            geometry(),
+                            ClientActivationAvailability::Available,
+                            &scope
+                        )
+                        .is_none()
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(
+            owner.drain_decisions(),
+            [ClientActivationDecision::Completed(
+                ClientActivationSource::MouseClick
+            )]
+        );
+    }
+
+    #[test]
     fn canonical_scope_fresh_proof_cannot_be_taken_by_older_unproven_input_in_the_same_batch() {
         let _input = crate::key_input::lock_test_input();
         let ctx = Context::default();

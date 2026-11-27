@@ -38,7 +38,7 @@ fn multiwindow_rating_folder_reload_keeps_sibling_order_and_generation() {
         unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
     };
     crate::rating_sort::with_test_rating_order(spec, || {
-        app.load_folder_with_scan(main_folder.clone(), None);
+        app.load_folder_and_finish_for_test(main_folder.clone());
         wait_for_list_hydration(&mut app, &ctx);
     });
     let main_order = app
@@ -53,7 +53,7 @@ fn multiwindow_rating_folder_reload_keeps_sibling_order_and_generation() {
     let detached = app.build_active_context_for_test(Some(902), DetachedSource::Image, |_| {});
     crate::rating_sort::with_test_rating_order(spec, || {
         app.with_viewer_context(detached, |mounted| {
-            mounted.load_folder_with_scan(main_folder.clone(), None);
+            mounted.load_folder_and_finish_for_test(main_folder.clone());
             wait_for_list_hydration(mounted, &ctx);
         })
         .unwrap();
@@ -81,7 +81,7 @@ fn multiwindow_rating_folder_reload_keeps_sibling_order_and_generation() {
         .unwrap();
     crate::rating_sort::with_test_rating_order(spec, || {
         app.with_viewer_context(detached, |mounted| {
-            mounted.load_folder_with_scan(main_folder.clone(), None);
+            mounted.load_folder_and_finish_for_test(main_folder.clone());
             wait_for_list_hydration(mounted, &ctx);
         })
         .unwrap();
@@ -200,7 +200,7 @@ fn rating_publication_reaches_main_and_two_detached_without_reordering_siblings(
     filter[5] = true;
     app.settings.rating_filter = filter;
     crate::rating_sort::with_test_rating_order(spec, || {
-        app.load_folder_with_scan(folder.clone(), None);
+        app.load_folder_and_finish_for_test(folder.clone());
         wait_for_list_hydration(&mut app, &ctx);
     });
     let main_generation = app.items_generation;
@@ -209,7 +209,7 @@ fn rating_publication_reaches_main_and_two_detached_without_reordering_siblings(
     for id in [first, second] {
         crate::rating_sort::with_test_rating_order(spec, || {
             app.with_viewer_context(id, |mounted| {
-                mounted.load_folder_with_scan(folder.clone(), None);
+                mounted.load_folder_and_finish_for_test(folder.clone());
                 wait_for_list_hydration(mounted, &ctx);
             })
             .unwrap();
@@ -261,7 +261,7 @@ fn rating_publication_reaches_main_and_two_detached_without_reordering_siblings(
         .unwrap();
     crate::rating_sort::with_test_rating_order(spec, || {
         app.with_viewer_context(first, |mounted| {
-            mounted.load_folder_with_scan(folder.clone(), None);
+            mounted.load_folder_and_finish_for_test(folder.clone());
             wait_for_list_hydration(mounted, &ctx);
         })
         .unwrap();
@@ -2615,6 +2615,8 @@ fn run_scenario_a(book: ScenarioABook) {
     });
     app.with_active_viewer_context(|active| {
         active.pending_auto_fs_open = true;
+        // Non-main opens still scan synchronously. Leave their real restore
+        // outstanding so the scenario can hold and release its checking owner.
         active.load_folder(source.clone());
     })
     .expect("detached owner mounts for real book open");

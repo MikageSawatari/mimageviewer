@@ -270,6 +270,7 @@ impl Handlers {
                 common: &common,
                 states: &states,
                 ratings: rating_db.as_ref(),
+                folder_order: self.readers.folder_order(),
                 ctx,
                 max_depth: if options.recursive { max_depth } else { 0 },
                 visited: 0,
@@ -473,6 +474,7 @@ struct FolderWalk<'a> {
     common: &'a Settings,
     states: &'a FavoriteStates,
     ratings: Option<&'a crate::rating_db::RatingDb>,
+    folder_order: Option<crate::folder_order::FolderOrderHandle>,
     ctx: &'a ReadContext,
     max_depth: u32,
     visited: usize,
@@ -488,7 +490,14 @@ impl FolderWalk<'_> {
             return Err(traversal_limit());
         }
         let settings = folder_settings(self.common, self.states, path);
-        let rows = physical_folder(path, &settings, self.ctx, self.ratings, depth > 0)?;
+        let rows = physical_folder(
+            path,
+            &settings,
+            self.folder_order.as_ref(),
+            self.ctx,
+            self.ratings,
+            depth > 0,
+        )?;
         // Count the whole base listing even before descending or filtering it.
         if self.max_depth > 0 && self.rows.len() + rows.len() > MAX_RECURSIVE_ROWS {
             return Err(traversal_limit());
@@ -571,6 +580,7 @@ fn enter_reparse_tag(tag: std::io::Result<u32>) -> std::io::Result<bool> {
 fn physical_folder(
     path: &Path,
     settings: &Settings,
+    folder_order: Option<&crate::folder_order::FolderOrderHandle>,
     ctx: &ReadContext,
     ratings: Option<&crate::rating_db::RatingDb>,
     child: bool,
@@ -582,6 +592,17 @@ fn physical_folder(
     );
     ctx.checkpoint()?;
     let scan = scan.map_err(|cause| folder_read_error(path, child, cause))?;
+    // This handler runs on the read worker. The App-owned actor serializes the
+    // read behind accepted saves/renames; this lane never opens folder_order.db.
+    let folder_order =
+        crate::folder_order::FolderOrderListingInput::read_worker(folder_order, path);
+    ctx.checkpoint()?;
+    if let Some(cause) = folder_order.error() {
+        crate::logger::log(format!(
+            "agent_ipc: folder order unavailable for {}: {cause}",
+            path.display()
+        ));
+    }
     let known_metadata = scan
         .precise_stamps
         .iter()
@@ -591,6 +612,7 @@ fn physical_folder(
         path,
         scan,
         settings,
+        folder_order,
         crate::rating_sort::ListingOrderRequest::from_settings(settings),
         |keys| {
             ratings

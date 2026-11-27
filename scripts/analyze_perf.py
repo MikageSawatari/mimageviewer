@@ -2360,6 +2360,23 @@ def cmd_nav(events: list[dict]) -> None:
 
     print_startup_resolve_scans(events)
 
+    print("\n[Folder open scan: purpose / owner / intent / auto_fs / rescan]")
+    scan_groups: dict[tuple[str, ...], list[float]] = defaultdict(list)
+    for event in events:
+        if event.get("cat") != "nav" or event.get("kind") != "folder_open_scan":
+            continue
+        ms = event.get("ms")
+        if not isinstance(ms, (int, float)) or isinstance(ms, bool):
+            continue
+        # Older logs and non-direct purposes have no continuation extras.
+        key = tuple(str(event.get(field, "-")) for field in
+                    ("purpose", "owner", "intent", "auto_fs", "rescan"))
+        scan_groups[key].append(float(ms))
+    for key, values in sorted(scan_groups.items()):
+        stats(" / ".join(key), values)
+    if not scan_groups:
+        print("  (イベントなし)")
+
     print("\n[catalog seed の DB 読み]")
     for kind in ("sli_virtual_seed", "sli_video_pin_seed"):
         rows = [e for e in events if e.get("cat") == "nav" and e.get("kind") == kind]

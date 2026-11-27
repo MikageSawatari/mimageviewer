@@ -756,6 +756,7 @@ impl ServerGuard {
         let container_engine = Arc::new(ContainerEngine::new_with_session_and_raw_executor(
             settings.clone(),
             session_handle.clone(),
+            Arc::clone(&readers),
             raw_develop_executor,
         ));
         let raw_flights = container_engine.raw_flights();

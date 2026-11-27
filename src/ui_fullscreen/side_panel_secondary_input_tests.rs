@@ -485,13 +485,14 @@ fn section1840_lock_only_metadata_panel_left_click_does_not_turn_page() {
                     ..Default::default()
                 },
                 |ui| {
-                    app.capture_fs_front_pointer_input(&ctx, viewport());
+                    let (front, _) = app.capture_fs_front_pointer_input(&ctx, viewport());
                     let response = ui.interact(
                         viewport(),
                         egui::Id::unique("section1840_lock_only_canvas"),
                         egui::Sense::click_and_drag(),
                     );
-                    app.fs_front_pointer.accept_backing_click(&response, false);
+                    app.fs_front_pointer
+                        .accept_backing_click(&response, false, &front);
                     if pass == 2 {
                         assert!(
                             response.clicked(),
@@ -513,6 +514,7 @@ fn section1840_lock_only_metadata_panel_left_click_does_not_turn_page() {
                         egui::Vec2::ZERO,
                         None,
                         FullscreenPrimarySuppressionDecision::Allow,
+                        false,
                     );
                 },
             )

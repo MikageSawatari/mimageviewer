@@ -1527,7 +1527,9 @@ fn mask_detect_mode_exit_and_index_invalidation_cancel_only_owned_request() {
                 match tool {
                     MaskDetectTool::Erase => app.reset_erase_mode(),
                     MaskDetectTool::Conceal => app.reset_conceal_mode(),
-                    MaskDetectTool::LocalAdjust => app.close_fullscreen_content(),
+                    MaskDetectTool::LocalAdjust => app.exit_local_adjust_mode(
+                        crate::app::page_edit_item_change::LocalAdjustmentExitPreview::CacheCurrent,
+                    ),
                 }
             }
             assert!(cancel.load(Ordering::Acquire));

@@ -300,6 +300,7 @@ impl ContextMenuItemId {
             MenuCommand::EditBookComposition
             | MenuCommand::SpecifyCoverCrop
             | MenuCommand::ConvertEpubToPdf
+            | MenuCommand::ScriptSlot(_)
             | MenuCommand::ExternalTool(_)
             | MenuCommand::OpenWithAssociation { .. } => return None,
         })
@@ -569,6 +570,7 @@ impl ContextMenuPreviewScenario {
         ContextMenuInput {
             kind,
             surface,
+            plane_view_copy: false,
             is_folder_context,
             has_checked,
             has_epub_target: false,
@@ -896,6 +898,8 @@ pub enum MenuNode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuCommand {
+    /// A named operation-script slot. Its label is supplied by the loaded script.
+    ScriptSlot(u8),
     /// Context-menu-only representative operation; deliberately has no key binding.
     SpecifyCoverCrop,
     /// Dynamic current-book operation; it has no application key binding.
@@ -1087,6 +1091,8 @@ pub struct AssociatedAppMenuEntry {
 pub struct ContextMenuInput {
     pub kind: ContextMenuItemKind,
     pub surface: ContextMenuSurface,
+    /// Fullscreen copy uses the validated PlaneView frame instead of a source file.
+    pub plane_view_copy: bool,
     pub is_folder_context: bool,
     pub has_checked: bool,
     pub has_epub_target: bool,
@@ -1243,6 +1249,33 @@ fn push_group(nodes: &mut Vec<MenuNode>, group: impl IntoIterator<Item = MenuNod
         nodes.push(MenuNode::Separator);
     }
     nodes.append(&mut group);
+}
+
+/// Dynamic script entries are shared by the native and egui menu renderers.
+/// Keep them outside the saved static-item layout, like the script's slot names.
+pub(crate) fn append_script_slot_menu(
+    nodes: &mut Vec<MenuNode>,
+    slots: impl IntoIterator<Item = (u8, String)>,
+) {
+    let children: Vec<_> = slots
+        .into_iter()
+        .filter(|(_, label)| !label.trim().is_empty())
+        .map(|(slot, label)| {
+            item(
+                MenuCommand::ScriptSlot(slot),
+                format!("スクリプト操作 {slot}: {label}"),
+            )
+        })
+        .collect();
+    if !children.is_empty() {
+        push_group(
+            nodes,
+            [MenuNode::Submenu {
+                label: "スクリプト".to_owned(),
+                children,
+            }],
+        );
+    }
 }
 
 pub(crate) const CAPTION_NO_TARGET_REASON: &str = "AI 説明文を作れる画像ファイルや本がありません。書庫内の画像・フォルダ、本のページ、動画・音声などは対象外です";
@@ -1596,6 +1629,30 @@ pub(crate) fn item_copy_command(
     }
 }
 
+/// PlaneView also renders PDF pages; ordinary source-image copy keeps its eligibility.
+pub(crate) fn surface_item_copy_command(
+    kind: ContextMenuItemKind,
+    has_checked: bool,
+    surface: ContextMenuSurface,
+    plane_view_copy: bool,
+    requested: MenuCommand,
+) -> Option<MenuCommand> {
+    if requested == MenuCommand::CopyImageToClipboard
+        && surface == ContextMenuSurface::Fullscreen
+        && plane_view_copy
+        && !has_checked
+        && matches!(
+            kind,
+            ContextMenuItemKind::Image
+                | ContextMenuItemKind::ZipImage
+                | ContextMenuItemKind::PdfPage
+        )
+    {
+        return Some(requested);
+    }
+    item_copy_command(kind, has_checked, requested)
+}
+
 fn combine_node(input: &ContextMenuInput) -> MenuNode {
     MenuNode::Item {
         command: MenuCommand::CombineSelection,
@@ -1850,7 +1907,15 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
     {
         copy_group.push(item(MenuCommand::CopyPageName, "ページ名をコピー"));
     }
-    if item_copy_command(input.kind, false, MenuCommand::CopyImageToClipboard).is_some() {
+    if surface_item_copy_command(
+        input.kind,
+        false,
+        input.surface,
+        input.plane_view_copy,
+        MenuCommand::CopyImageToClipboard,
+    )
+    .is_some()
+    {
         copy_group.push(item(
             MenuCommand::CopyImageToClipboard,
             "画像をクリップボードにコピー",
@@ -2382,6 +2447,39 @@ mod tests {
     }
 
     #[test]
+    fn script_slot_menu_contains_only_named_slots_and_keeps_slot_numbers() {
+        let mut nodes = vec![item(MenuCommand::CopyPath, "既存の操作")];
+        append_script_slot_menu(
+            &mut nodes,
+            [
+                (1, "最初の操作".into()),
+                (2, "".into()),
+                (9, "末尾へ".into()),
+            ],
+        );
+        assert_eq!(nodes[0], item(MenuCommand::CopyPath, "既存の操作"));
+        assert_eq!(nodes[1], MenuNode::Separator);
+        assert_eq!(
+            nodes[2],
+            MenuNode::Submenu {
+                label: "スクリプト".into(),
+                children: vec![
+                    item(MenuCommand::ScriptSlot(1), "スクリプト操作 1: 最初の操作"),
+                    item(MenuCommand::ScriptSlot(9), "スクリプト操作 9: 末尾へ"),
+                ],
+            }
+        );
+        assert!(ContextMenuItemId::from_command(&MenuCommand::ScriptSlot(9)).is_none());
+
+        let before = nodes.clone();
+        append_script_slot_menu(&mut nodes, [(3, "  ".into())]);
+        assert_eq!(nodes, before);
+        let mut empty = Vec::new();
+        append_script_slot_menu(&mut empty, []);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
     fn context_menu_musicvideo_only_single_real_audio_on_both_surfaces() {
         for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
             for kind in [
@@ -2551,6 +2649,7 @@ mod tests {
         ContextMenuInput {
             kind,
             surface,
+            plane_view_copy: false,
             is_folder_context: false,
             has_checked: false,
             has_epub_target: false,
@@ -2624,6 +2723,54 @@ mod tests {
                 deselect: Some("Ctrl+D".to_string()),
             },
             layout: ContextMenuLayoutSettings::default(),
+        }
+    }
+
+    #[test]
+    fn plane_copy_pdf_eligibility_is_limited_to_the_fullscreen_snapshot() {
+        for kind in [
+            ContextMenuItemKind::Image,
+            ContextMenuItemKind::ZipImage,
+            ContextMenuItemKind::PdfPage,
+            ContextMenuItemKind::Video,
+            ContextMenuItemKind::Stack,
+        ] {
+            for surface in [ContextMenuSurface::Grid, ContextMenuSurface::Fullscreen] {
+                for plane_view_copy in [false, true] {
+                    for checked in [false, true] {
+                        let mut snapshot = input(kind, surface);
+                        snapshot.plane_view_copy = plane_view_copy;
+                        snapshot.has_checked = checked;
+                        snapshot.checked_count = usize::from(checked);
+                        let expected = !checked
+                            && (matches!(
+                                kind,
+                                ContextMenuItemKind::Image | ContextMenuItemKind::ZipImage
+                            ) || (kind == ContextMenuItemKind::PdfPage
+                                && surface == ContextMenuSurface::Fullscreen
+                                && plane_view_copy));
+                        assert_eq!(
+                            surface_item_copy_command(
+                                kind,
+                                checked,
+                                surface,
+                                plane_view_copy,
+                                MenuCommand::CopyImageToClipboard
+                            )
+                            .is_some(),
+                            expected
+                        );
+                        assert_eq!(
+                            command_state(
+                                &build_context_menu(&snapshot),
+                                MenuCommand::CopyImageToClipboard
+                            )
+                            .is_some(),
+                            expected
+                        );
+                    }
+                }
+            }
         }
     }
 

@@ -8,6 +8,8 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [folder-manual-order-plan.md](folder-manual-order-plan.md) | §1.911 フォルダごとの手動順。単一 DB actor と記録索引、context 所有状態、物理一覧の resolver、ソート UI とリセット、サムネイルの並べ替えドラッグ、Remote の読取専用表示。実装記録は各段の小節 |
+| [operation-script-plan.md](operation-script-plan.md) | §1.363 操作のスクリプト。段1〜5実装（段5は実装済み、自動検証・独立実装レビュー・設計担当の検収・実機は未確認）。環境設定の下書きと初回確認、単一FIFOのLoad/Open/Reset、状態表示と公開マニュアル。イベント可は同期32＋open限定2、動画の再生・ループ・全シーク9操作は不可。段4は関連253テスト成功・独立レビューACCEPT、費用の実測と実機は未実施。段5の確定設計は§4.1.1、段4の詳細は§16 |
 | [drive-tabs-793-plan.md](drive-tabs-793-plan.md) | §1.793 ツールバーのドライブ欄 (ドライブ別の最後の場所を常設ボタンから開く)。A/B の記録から導くドライブの集合、キー操作と共有するドライブ移動の worker 解決、置き場所・右クリック・利用者判断。設計段階、未実装 |
 | [folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) | §1.464 ツリー行への D&D と右クリック貼り付け、§1.821 一覧ドロップ。表示済み pass の形・ROOT OLE target・既定操作のボリューム確認・共有受付と転送 owner。generic Shell image と target description を使用。実装記録と未実施の検証は §14〜15 |
 | [grid-folder-drop-and-handle-release-plan.md](grid-folder-drop-and-handle-release-plan.md) | §1.858 B・2 / §1.860 (v5.7.0 予定、設計中)。移動・名前の変更・削除の前に mIV が持つ ZIP / PDF の handle を手放す「変更の囲い」、一覧の実フォルダのセルへのドロップ、外部からのドラッグ中の落とし先の強調と説明のバッジ |
@@ -26,6 +28,7 @@
 | [native-dependencies.md](native-dependencies.md) | CLAUDE.md から分けたネイティブ依存物の管理。vendor/ の復旧、PDFium・ONNX Runtime・Susie・FFmpeg・LibRaw・VST3 bridge の更新やビルド |
 | [release-checklist.md](release-checklist.md) | **リリース手順チェックリストの正本**と配布形態。リリース作業を始めるときに最初に全部読む |
 | [codex-cli-usage.md](codex-cli-usage.md) | Codex CLI でレビュー・実装を依頼するときの手順 (resume・stdin・出力の受け取り) |
+| [test-build-memory-plan.md](test-build-memory-plan.md) | 全体テストのビルドのメモリ対策 (§1.908 統合テストを `tests/integration.rs` の 1 crate に、§1.910 test-full の同時数上限 8、§1.909 は採らない)。計測の方法と結果、`--test <name>` から `--test integration <name>::` への読み替え |
 | [development-build-and-test-native.md](development-build-and-test-native.md) | Windows ネイティブ挙動の実機確認用バイナリと、検証起動時の設定データ保護 |
 | [git-workflow.md](git-workflow.md) | 整形・コミット・共有作業ツリー・worktree 撤去の運用 |
 | [v5-integration.md](v5-integration.md) | v5 系の統合順、merge 衝突の解消、統合後の検証と引き渡しの記録。master は v4 系に維持 |

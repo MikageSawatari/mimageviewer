@@ -2580,6 +2580,7 @@ impl App {
     ) {
         use std::sync::atomic::Ordering;
         debug_assert_eq!(items.len(), image_metas.len());
+        self.end_page_edit_tools_before_items_adoption("search_items", &items);
         // Source rows can still be edited while the first search result is pending.
         self.save_departing_session_grid_positions();
         // 検索ビューに切り替えるのでネスト ZIP ツリーナビ状態を破棄する。
@@ -3622,6 +3623,12 @@ impl App {
                         .is_current(&resources.thumbnail_owner);
                     same_surface &= prepared.metadata.is_current(&resources);
                     if latest && same_surface {
+                        // Exiting the outgoing draft can publish a page-edit write. Do that
+                        // before checking this snapshot or capturing the viewer's old indices.
+                        self.end_page_edit_tools_before_items_adoption(
+                            "search_projection",
+                            &prepared.items,
+                        );
                         if matches!(wish.source, SearchProjection::Everything { .. }) {
                             self.finish_everything_edit_boundary();
                         }
@@ -5209,6 +5216,114 @@ impl App {
 pub(crate) mod tests {
     use super::*;
 
+    #[test]
+    fn page_edit_920_metadata_stream_saves_before_snapshot_check_and_reprepares_badges() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("page-edit-920-stream");
+        std::fs::create_dir(&folder).unwrap();
+        let old_page = folder.join("b.png");
+        let new_page = folder.join("a.png");
+        for page in [&old_page, &new_page] {
+            image::RgbImage::new(2, 2).save(page).unwrap();
+        }
+        app.global_search.aggregate_auto = false;
+        let ctx = egui::Context::default();
+        let stream = section1409_metadata_stream(&mut app, &ctx, "page edit stream");
+        let send = |page: &Path, count| {
+            stream
+                .send(SearchStreamEvent::Batch {
+                    hits: vec![caption_book_hit(page, IndexKind::Image, 0)],
+                    scanned_candidates: count,
+                    valid_hits: count,
+                    visibility_notice: None,
+                })
+                .unwrap();
+        };
+        send(&old_page, 1);
+        section1409_settle_metadata(&mut app, &ctx, |app| {
+            app.items == vec![GridItem::Image(old_page.clone())]
+        });
+        app.fullscreen_idx = Some(0);
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        app.conceal_mode = true;
+        app.conceal_mask_size = [2, 2];
+        app.conceal_mask = Some(vec![true, false, true, false]);
+        let old_key = app.page_path_key(0).unwrap();
+        let generation = app.items_generation;
+        app.global_search.last_sort_at = None;
+        app.hold_next_search_ready_for_test();
+        send(&new_page, 2);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !app.search_ready_is_held_for_test() {
+            app.poll_global_search_events(&ctx);
+            assert!(Instant::now() < deadline, "streamed Ready was not prepared");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let prepare = app.global_search.page_edit_prepare.as_ref().unwrap();
+        let Some(SearchPrepareOutput::Ready(wish, prepared)) = &prepare.held_ready_for_test else {
+            panic!("expected the production streamed Ready");
+        };
+        assert_eq!(prepare.desired.as_ref().unwrap().sequence, wish.sequence);
+        assert_eq!(prepared.items.len(), 2);
+        assert!(prepared.page_edits.projection.conceal.is_empty());
+        let before_save = prepared.page_edits.stamp;
+        assert!(crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(before_save));
+        assert_eq!(app.conceal_db.as_ref().unwrap().dimensions(&old_key), None);
+        let stale_rejections = prepare.metrics.stale_rejections;
+
+        app.release_search_ready_for_test();
+        app.poll_search_page_edit_prepare(&ctx);
+
+        assert!(!app.conceal_mode);
+        assert!(!crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(before_save));
+        let (mask, shapes, dimensions) = app
+            .conceal_db
+            .as_ref()
+            .unwrap()
+            .get_full_checked(&old_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mask, vec![true, false, true, false]);
+        assert!(shapes.is_empty());
+        assert_eq!(dimensions, [2, 2]);
+        assert_eq!(
+            app.items_generation, generation,
+            "the pre-save Ready must be rejected"
+        );
+        assert_eq!(app.items, vec![GridItem::Image(old_page.clone())]);
+        assert!(app.search_prepare_metrics_for_test().stale_rejections > stale_rejections);
+
+        section1409_settle_metadata(&mut app, &ctx, |app| app.items.len() == 2);
+        let old_index = app
+            .items
+            .iter()
+            .position(|item| item == &GridItem::Image(old_page.clone()))
+            .unwrap();
+        let new_index = app
+            .items
+            .iter()
+            .position(|item| item == &GridItem::Image(new_page.clone()))
+            .unwrap();
+        assert_eq!(app.fullscreen_idx, Some(old_index));
+        assert_eq!(app.conceal_pages, HashSet::from([old_index]));
+        assert!(
+            app.page_edit_snapshot
+                .as_ref()
+                .unwrap()
+                .conceal
+                .contains(&old_key)
+        );
+        assert_eq!(
+            app.conceal_db
+                .as_ref()
+                .unwrap()
+                .dimensions(&app.page_path_key(new_index).unwrap()),
+            None
+        );
+        app.reconcile_page_edit_spread_pivots();
+        assert_eq!(app.fullscreen_idx, Some(old_index));
+    }
+
     fn caption_book_hit(path: &Path, kind: IndexKind, stars: u8) -> GlobalHit {
         GlobalHit {
             path: path.to_string_lossy().into_owned(),
@@ -5369,7 +5484,10 @@ pub(crate) mod tests {
                 .unwrap();
             let opened = match app.accept_grid_container_open(&egui::Context::default(), index) {
                 Some(crate::ui_main::AddressBarNav::Direct(open, _)) => open,
-                Some(crate::ui_main::AddressBarNav::GridVirtual(intent)) => intent.path,
+                Some(
+                    crate::ui_main::AddressBarNav::GridVirtual(intent)
+                    | crate::ui_main::AddressBarNav::GridFolder(intent),
+                ) => intent.path,
                 other => panic!("unexpected open route: {other:?}"),
             };
             assert_eq!(opened, *path);
@@ -5626,7 +5744,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 app.accept_grid_container_open(&egui::Context::default(), 0),
-                Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == branch
+                Some(crate::ui_main::AddressBarNav::GridFolder(intent)) if intent.path == branch
             ),
             "retained rows remain physically openable after the search ends"
         );
@@ -5719,7 +5837,7 @@ pub(crate) mod tests {
         for path in &paths {
             image::RgbImage::new(2, 3).save(path).unwrap();
         }
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.settle_open_path_classification_for_test();
         app.finish_page_identity_preparation_for_test();
         let physical = app.grid_scroll.session();
@@ -5875,7 +5993,7 @@ pub(crate) mod tests {
                 section690_streamed_rows_without_applied_conditions(&mut app, &ctx, &path);
             app.drill_into_container(folder.clone(), false);
             app.advance_drilled_current_path(&folder);
-            app.load_folder(folder);
+            app.load_folder_and_finish_for_test(folder);
             app.settle_open_path_classification_for_test();
             app.finish_page_identity_preparation_for_test();
             assert!(!app.items_are_global_search_view);
@@ -6264,7 +6382,7 @@ pub(crate) mod tests {
                     ),
                 )
                 .unwrap();
-            app.load_folder(book.clone());
+            app.load_folder_and_finish_for_test(book.clone());
             app.settle_open_path_classification_for_test();
             app.finish_page_identity_preparation_for_test();
             assert_eq!(

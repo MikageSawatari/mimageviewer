@@ -1618,3 +1618,96 @@ mask_detect_front_layer_invariant_repairs_after_upper_modal_closes_for_settings_
   ツールパネルとの逆転に限って補う理由がある、とレビューは判断した。4 つのパネルの Id は、実ボタンの所属の層とクリックの到達を
   照合するテストで、Id が変わったら検出できる。
 - 設計担当の run-heavy (e8653c246): cargo check 成功、filter 182 件成功、実モデル照合成功。
+
+### 23.12 master 取り込み (e62893dd1)
+
+実装担当による衝突解決とコード上の両立確認。進行中の merge を保持し、git add / commit / merge --abort は行わない。
+取り込み後のコンパイル・テスト・実機検証・独立レビューは **未実施**。設計担当へ引き継ぐ。
+
+#### 衝突の解決
+
+- `ui_conceal.rs` / `ui_erase.rs` の入場は、master のスライドショー停止と §1.914 のツール別取消・session 更新を両方残した。
+  §1.920 の入場受付と素材の取得が成功した後だけ変更する。消しゴムは旧要求を対象の切替前に取り消し、
+  入場の確定時に停止・session 更新を行う。隠蔽加工は非同期の完了の受付を確認してから停止・取消・session 更新を行う。
+  受理済みの移動により入場を断る段階ではこれらを実行しない。コードにも順序の理由を記した。
+- 補正レイヤーのパネルを閉じる処理とキーによる退出は master の `exit_local_adjust_mode` を採り、
+  自動検出の取消を同 helper の先頭へ移した。呼出側に重複した取消は置かない。
+  `switch_local_adjust_target_in_spread` はモードを継続したまま左右を替えるため、対象交代の取消を残す。
+  `toggle_analysis_mode` と `disable_non_paged_fullscreen_modes` は master でも同 helper を通らない専用退出であり、
+  素材・entry intent の処理順と `local_adjust_change_mask_keep_manual_override` の既存の扱いを保つため、
+  既存の退出列とその取消を残した。各箇所に理由を記した。
+- `app/tests.rs` は `mask_detect_pending` と操作スクリプトの heap storage の assert を両方保持した。
+- `settings_transfer.rs` は merge base `a38a3e4a3` の全 524 / 対象 174 / 除外 350 を起点に再集計した。
+  ブランチは `mask_detect` (除外) 1 件、master は `plane_view_lens` (対象) 1 件と
+  `operation_script_enabled` / `operation_script_notice_confirmed` (除外) 2 件を追加している。
+  合成後は **全 528 / 対象 175 / 除外 353**。マクロの通常項目・group 3 項目・除外項目の集合でも数え直し、一致した。
+- architecture / async architecture / detached 計画 §11 は両側の節を保持した。
+  architecture 冒頭の Windows 入力の説明は各機能の節より前へ置いた。同日の記録は各側の節内の順序を保った。
+
+#### §1.920 の終了・項目採用との両立（コード確認）
+
+- `app/page_edit_item_change.rs::end_page_edit_tools` は前面の所有 context だけに作用し、
+  `reset_conceal_mode` / `reset_erase_mode` / `exit_local_adjust_mode` が退出するツールの待ちと設定窓を取り消す。
+  別項目の open は `app.rs::open_fullscreen_with_metadata_boundary_inner` が旧 idx のうちにこの経路へ渡す。
+  同一項目の open は従来どおり消しゴムだけ reset し、他ツールの待ちを取消の巻き添えにしない。
+- items の採用は `app/page_edit_item_adoption.rs` が旧項目の存続を決め、継続しないツールを同じ終了経路へ渡す。
+  `continue_local_adjustment = true` では終了 helper が補正レイヤーと検出待ちを保持するが、items 採用による世代更新で
+  `mask_detect_request_is_current` の先頭の `items_generation` 比較に失敗する。
+  要求は reproject されない。同じページが残る場合でも、表示先が別ページになった場合でも旧結果を足さない。
+  加えて context・page key・ソース Arc・マスク寸法・`PageEditOwner`・最新文書を照合する既存の条件も保持した。
+  採用元も列挙した: 本の構成は `install_prepared_aggregate_items`、検索の採用は通常／準備済み install を経由する。
+  検索・snapshot の開始／復帰・項目削除では、世代更新後の `invalidate_idx_state_and_queues` が待ち自体も取り消す。
+  採用前の検証で中断して items が変わらない場合は、継続中の補正レイヤーと検出要求をそのまま保持してよい。
+- true close は `close_fullscreen_now_for_destination` が旧ページのうちに終了し、
+  `finish_fullscreen_edit_modes_with_preview` も同じ helper と context 固有の `cancel_mask_detect` を通る。
+  全画面終了・park・フォルダ切替・idx 失効の既存の取消を保持し、detached の述語・viewport 経路は変更しない。
+  まれな失敗は既存のログ + 通知の方針のままで、回復の仕組みは増やしていない。
+
+#### モーダル・前後関係・§1.363（コード確認）
+
+- §1.920 の門は `filename_stack_ui.rs::grid_item_input_block` で一覧の項目操作を拒否する。
+  検出窓のボタンからはこの門を呼ばない。案内は `notify_detached_viewer_editing_grid_input_blocked` が
+  拒否時だけ `ActionSurface::MainWindow` へ送り、`draw_feedback_toast` は Tooltip 層で描く。
+  viewer の Foreground の検出窓より下にはならず、面の指定によって viewer との二重描画も起こさない構成である。
+- **未変更の仕様判断候補**: 検出窓の表示中の ROOT キーは、`keyboard_ownership_snapshot` が
+  `any_dialog_open` により Modal 所有とし、`handle_keyboard` の `shortcuts_blocked_by_text_input` が
+  一覧の門より前に戻る。キー案内 helper 自体にも同じ条件があるため、この間の一覧キー操作では
+  §1.920 の案内が出ない。入力の拒否は維持され、トーストが描画順で隠れる問題とは異なる。
+  検出中にも一覧キーの案内を必須とするかは設計担当へ返し、モーダルの既存の所有・案内の優先順位は変更しない。
+- master の追加 UI を確認した。§1.917 のレンズ設定は環境設定内の ComboBox で、専用の Foreground Area は増えていない。
+  §1.363 の `operation_script_confirmation` は標準 Modal (Foreground)、手動順の確認窓は既定 Order の Window。
+  `maintain_mask_detect_window_layer` は既知の 4 パネルだけを追い越す規則のままにし、
+  上位の別 Modal・未知の可視 Foreground・popup があれば持ち上げない。新しい UI をパネルの許可表へ加えていない。
+  上位 Modal と実 popup を追い越さず、上位窓の終了後に順序を直す既存の headless 回帰も保持した。
+- `app/operation_script_runtime.rs::operation_script_eligibility` はツール編集中と `common_modal_dialog_open` の両方を拒否する。
+  自動検出の設定窓・検出待ちは `mask_detect_dialog_visible` を通じて後者へ登録済み。
+  slot 実行は評価前と操作間の再照合で、event は `begin_operation_script_event_detection` と適用時の再照合で同じ資格を読む。
+  自動検出中にスクリプトのページ移動・ツール切替が実行される受付漏れはコード確認では見つからず、製品コードは変更しない。
+- 3 ツールの cfg(test) の Response 計装と `mask_detect/{tests,input_tests,stage2_tests}.rs` の呼出先・fixture を照合した。
+  master で削除された App フィールドの参照や、明らかな旧関数名・旧引数の呼出は見つからなかった。
+  実ボタンの矩形・clip・hit-test と clicked のロック外評価は維持した。型の整合・実行結果はコンパイル待ち。
+
+#### 追加・更新した回帰（未実施）
+
+追加 (`src/app/mask_detect/tests.rs`):
+
+```text
+mask_detect_page_edit_920_exit_boundaries_cancel_three_tools
+mask_detect_page_edit_920_same_item_open_resets_only_erase
+mask_detect_page_edit_920_continuing_local_adoption_discards_old_result
+mask_detect_modal_blocks_operation_script_slots_and_events
+```
+
+既存 `mask_detect_mode_exit_and_index_invalidation_cancel_only_owned_request` は、補正レイヤーの直接の退出を
+`exit_local_adjust_mode` で検査するよう変更した。true close は追加テストと既存 lifecycle 回帰で引き続き扱う。
+継続採用の回帰は、採用後にソースの同じ Arc と編集可能なレイヤーを置き直し、一時的な cache miss に頼らず
+旧結果を捨てることを検査する。同じページの継続と、旧ページが残ったまま別ページを表示する場合の両方を扱う。
+全て既存の `test(/mask_detect/)` の対象。新たな worker・sleep・待機 loop・アプリ起動は加えていない。
+
+本取り込みへの対応で新しい機能制限・保存仕様の変更は加えていない。master の §1.920 の既定仕様
+(別窓の編集中は一覧の項目操作を拒否・入場でスライドショー停止・旧項目への退出保存) を保持する。
+この取り込みに対する独立レビューの結果はまだ無い。
+
+実施した整形・差分確認: `cargo fmt` (引数なし) と `git diff --check` は終了コード 0。
+衝突マーカーは残っていない。git add をしていないため index の unmerged entry と MERGE_HEAD は維持している。
+cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動は未実施。

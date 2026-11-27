@@ -97,7 +97,7 @@ fn section1678_main_and_linked_ctrl_down_end_in_branch_list() {
         env.settings.detached_viewer_open_images_in_window = false;
         env.settings.detached_viewer_enabled = linked;
         env.pending_auto_fs_open = true;
-        env.load_folder(flat);
+        env.load_folder_and_finish_for_test(flat);
         settle(&mut env, &ctx);
         if linked {
             env.viewer_presentation = ViewerPresentation::DetachedWindow;
@@ -121,7 +121,7 @@ fn section1678_direct_main_open_keeps_branch_list_but_wrapper_opens_page() {
         let book = env.tmp.path().join("direct.zip");
         write_zip(&book, &prefixes, 10);
         env.pending_auto_fs_open = true;
-        env.load_folder(book.clone());
+        env.load_folder_and_finish_for_test(book.clone());
         settle(&mut env, &ctx);
         if prefixes.len() == 2 {
             assert_branch_list(&env, &book);

@@ -8131,7 +8131,7 @@ mod tests {
             handle.snapshot().phase,
             super::super::session::RemoteControlPhase::Local
         );
-        app.load_folder(folder);
+        app.load_folder_and_finish_for_test(folder);
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.resume_page_for_container(), Some(1));
     }

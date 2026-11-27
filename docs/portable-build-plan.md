@@ -256,7 +256,7 @@ pub fn init() {
 - 設定: `settings.db` (+ `bak1..10` / `-wal` / `-shm`)、`pdf_passwords.json`、`comic_presets.json`、`comic_recent_stamps.json`
 - DB 群: `rotation.db` / `rating.db` / `adjustment.db` / `conceal.db` / `mask.db` / `local_adjust.db` /
   `comic.db` / `spread.db` / `export_crop.db` / `book_resume.db` / `audio_normalize.db` /
-  `folder_thumb_pins.db` / `auto_aspect_cache.db` / `video_tile_thumbs.db`
+  `folder_thumb_pins.db` / `folder_order.db` (フォルダ手動順、§1.911 段 1・未接続) / `auto_aspect_cache.db` / `video_tile_thumbs.db`
 - 検索: `search_index.db` / `fts_index/` / `fts_meta.db`
 - キャッシュ/生成物: `cache/` (カタログ) / `archive_cache/` + `archive_cache.db` / `captures/` / `debug-pipeline/`
 - AI/拡張: `models/` / `tensorrt/` / `tensorrt-engines/` / `addons/editing/` / `user_fonts/` / `susie_plugins/` / `vst3/`

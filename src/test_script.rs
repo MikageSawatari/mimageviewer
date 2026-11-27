@@ -6162,7 +6162,7 @@ mod tests {
             } else {
                 assert_eq!(app.selected, Some(310));
                 assert!(
-                    matches!(navigation, Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == key)
+                    matches!(navigation, Some(crate::ui_main::AddressBarNav::GridFolder(intent)) if intent.path == key)
                 );
                 // Grid evidence is painted before the click handler, just like the suite's
                 // later-frame adoption barrier. Observe the next pass, without more input.

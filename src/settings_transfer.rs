@@ -498,6 +498,7 @@ preferences_policy! {
         fullscreen_up_down_key_action: FullscreenUpDownKeyAction => ("閲覧表示の上下キー操作", |v, _raw| FullscreenUpDownKeyAction::all().contains(v), plain, plain);
         fullscreen_wheel_action: FullscreenWheelAction => ("閲覧表示の通常ホイール操作", |v, _raw| FullscreenWheelAction::all().contains(v), plain, plain);
         fullscreen_wheel_zoom_step: FullscreenWheelZoomStep => ("ホイールでの拡大・縮小の刻み", |v, _raw| FullscreenWheelZoomStep::all().contains(v), plain, plain);
+        plane_view_lens: crate::plane_view::PlaneLensKind => ("魚眼のレンズ", |v, _raw| crate::plane_view::PlaneLensKind::ALL.contains(v), plain, plain);
         fullscreen_n_scroll_order: FullscreenNScrollOrder => ("ページ内スクロールの読み順", |v, _raw| FullscreenNScrollOrder::all().contains(v), plain, plain);
         fullscreen_n_scroll_step_percent: u32 => ("N 字 / Z 字の移動量", |v, _raw| (10..=100).contains(v), plain, plain);
         fullscreen_n_scroll_wrap_step_percent: Option<u32> => ("N 字 / Z 字の列・段替えの移動量", |v, _raw| v.is_none_or(|v| (10..=100).contains(&v)), plain, plain);
@@ -650,6 +651,8 @@ preferences_policy! {
         subfolder_expansion_filter_size_preset => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         stack_separator => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         stack_script_enabled => @prefs("分類ルールをスクリプト (カスタム) で行う", "folder/stack-script", |_, _| true, plain, plain) "移行先のローカルスクリプト実行方針を保持";
+        operation_script_enabled => "環境設定だけが確定するローカルスクリプトの実行許可。転送やAIによる設定変更では変更しない";
+        operation_script_notice_confirmed => "環境設定のOKで確定する第三者スクリプトの端末内の確認記録。別端末へ転送しない";
         thumb_px => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         text_preview_scale => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         text_smart_snap_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -1571,6 +1574,10 @@ mod tests {
         settings.fullscreen_wheel_zoom_step = different_enum(
             &settings.fullscreen_wheel_zoom_step,
             FullscreenWheelZoomStep::all(),
+        );
+        settings.plane_view_lens = different_enum(
+            &settings.plane_view_lens,
+            &crate::plane_view::PlaneLensKind::ALL,
         );
         settings.fullscreen_n_scroll_order = different_enum(
             &settings.fullscreen_n_scroll_order,
@@ -2633,6 +2640,55 @@ mod tests {
     }
 
     #[test]
+    fn plane_view_lens_transfer_roundtrip_missing_and_invalid_preserve_values() {
+        for &lens in &crate::plane_view::PlaneLensKind::ALL {
+            let source = Settings {
+                plane_view_lens: lens,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings {
+                plane_view_lens: different_enum(&lens, &crate::plane_view::PlaneLensKind::ALL),
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert!(
+                report
+                    .changed_fields
+                    .iter()
+                    .any(|label| label == "魚眼のレンズ")
+            );
+            assert_eq!(destination.plane_view_lens, lens);
+            let report = parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.accepted_count, 0);
+            assert_eq!(destination.plane_view_lens, lens);
+            // Transfer follows the existing enum policy: invalid imports leave the destination intact.
+            for invalid in [
+                json!("FutureLens"),
+                json!("Unknown"),
+                json!(true),
+                json!(50),
+                Value::Null,
+            ] {
+                let report = parse_preferences(&document(json!({
+                    "plane_view_lens": invalid
+                })))
+                .unwrap()
+                .apply_to(&mut destination);
+                assert_eq!(report.accepted_count, 0);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.plane_view_lens, lens);
+            }
+        }
+    }
+
+    #[test]
     fn fullscreen_bound_drag_pan_transfer_roundtrip_missing_and_invalid_preserve_values() {
         for enabled in [false, true] {
             let source = Settings {
@@ -2669,20 +2725,20 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 525);
+        assert_eq!(entries.len(), 528);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            174
+            175
         );
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            351
+            353
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2725,7 +2781,12 @@ mod tests {
                 .any(|(field, reason)| *field == "export_batch_presets" && reason.is_some())
         );
         assert!(!wire.contains(&"export_batch_presets"));
-        for key in ["agent_show_current_view", "agent_allow_settings"] {
+        for key in [
+            "agent_show_current_view",
+            "agent_allow_settings",
+            "operation_script_enabled",
+            "operation_script_notice_confirmed",
+        ] {
             assert!(
                 entries
                     .iter()
@@ -2737,7 +2798,7 @@ mod tests {
                 "AI permissions must not become writable: {key}"
             );
         }
-        assert_eq!(wire.len(), 172);
+        assert_eq!(wire.len(), 173);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

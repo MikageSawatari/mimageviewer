@@ -133,6 +133,168 @@ pub(super) fn mask_detect_queue(
 }
 
 #[test]
+fn mask_detect_page_edit_920_exit_boundaries_cancel_three_tools() {
+    use crate::app::page_edit_item_change::LocalAdjustmentExitPreview;
+
+    for tool in MASK_DETECT_TOOLS {
+        for boundary in 0..4 {
+            let mut app = mask_detect_fixture(tool);
+            let request = app.capture_mask_detect_request(tool).unwrap();
+            let cancel = mask_detect_queue(&mut app, request, mask_detect_output());
+            match boundary {
+                0 => app.end_page_edit_tools_for_viewer_item_change("mask_detect_test"),
+                1 => app.end_page_edit_tools_before_items_adoption("mask_detect_test", &[]),
+                2 => app.end_page_edit_tools_for_fullscreen_exit(
+                    LocalAdjustmentExitPreview::CacheCurrent,
+                ),
+                _ => app.close_fullscreen_content(),
+            }
+            assert!(cancel.load(Ordering::Acquire), "{tool:?}, {boundary}");
+            assert!(!app.mask_detect_active());
+            let before = mask_detect_history(&app);
+            app.poll_mask_detect(&egui::Context::default());
+            assert_eq!(mask_detect_history(&app), before);
+            assert!(app.erase_shapes.is_empty() && app.conceal_shapes.is_empty());
+        }
+    }
+}
+
+#[test]
+fn mask_detect_page_edit_920_same_item_open_resets_only_erase() {
+    for tool in MASK_DETECT_TOOLS {
+        let mut app = mask_detect_fixture(tool);
+        let request = app.capture_mask_detect_request(tool).unwrap();
+        let cancel = mask_detect_queue(&mut app, request, mask_detect_output());
+        assert_eq!(
+            app.open_fullscreen_with_metadata_boundary_inner(
+                0,
+                HistoryTrigger::UserChosen,
+                FsOpenMaterialization::Eager,
+                FsPageLoadContract::Sequential,
+                None,
+                FsMetadataBoundary::Manual,
+                None,
+                ViewerOpenAdoption::ContextContinuation,
+                None,
+            ),
+            ActionAdmission::Accepted,
+        );
+        let exits = tool == MaskDetectTool::Erase;
+        assert_eq!(cancel.load(Ordering::Acquire), exits, "{tool:?}");
+        assert_eq!(app.mask_detect_pending.is_none(), exits, "{tool:?}");
+        assert_eq!(app.is_overlay_edit_mode_active(), !exits, "{tool:?}");
+    }
+}
+
+#[test]
+fn mask_detect_page_edit_920_continuing_local_adoption_discards_old_result() {
+    for change_displayed_page in [false, true] {
+        let mut app = mask_detect_fixture(MaskDetectTool::LocalAdjust);
+        app.local_adjust_show_mask = false;
+        let request = app
+            .capture_mask_detect_request(MaskDetectTool::LocalAdjust)
+            .unwrap();
+        let generation = request.items_generation;
+        let pixels = Arc::clone(&request.source);
+        let cancel = mask_detect_queue(&mut app, request, mask_detect_output());
+        let items = vec![
+            app.items[0].clone(),
+            GridItem::Image(app.tmp.path().join("next-mask-detect.png")),
+        ];
+        assert!(app.local_page_edit_survives_items_adoption(&items));
+        // The real adoption boundary retains local mode but advances the item
+        // generation. The captured request must never be reprojected with it.
+        app.install_new_items(items, vec![None; 2]);
+        assert!(app.local_adjust_mode);
+        assert!(!cancel.load(Ordering::Acquire));
+        assert_ne!(app.items_generation, generation);
+        if change_displayed_page {
+            app.fullscreen_idx = Some(1);
+        }
+        // Publish a ready target again, even reusing the old source Arc. Rejection
+        // must not depend on a temporary cache miss while the new items hydrate.
+        let idx = app.fullscreen_idx.unwrap();
+        let ctx = egui::Context::default();
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
+                tex: ctx.load_texture(
+                    "adopted-source",
+                    pixels.as_ref().clone(),
+                    Default::default(),
+                ),
+                pixels: Arc::clone(&pixels),
+                source_dims: Some([8, 8]),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        if change_displayed_page {
+            let layers = app.local_adjust_page_layers[&0].clone();
+            app.adopt_materialized_local_layers(idx, layers);
+            app.local_adjust_selected_layers.insert(idx, 0);
+        }
+        let (source_idx, source, _, _) =
+            app.mask_detect_source(MaskDetectTool::LocalAdjust).unwrap();
+        assert_eq!(source_idx, idx);
+        assert!(Arc::ptr_eq(&source, &pixels));
+        let layers = app.local_adjust_page_layers.clone();
+        let history = mask_detect_history(&app);
+        app.poll_mask_detect(&egui::Context::default());
+        assert!(app.mask_detect_pending.is_none());
+        assert_eq!(app.local_adjust_page_layers, layers);
+        assert_eq!(mask_detect_history(&app), history);
+        assert!(!app.local_adjust_show_mask);
+    }
+}
+
+#[test]
+fn mask_detect_modal_blocks_operation_script_slots_and_events() {
+    use crate::app::operation_script_runtime::{ScriptEligibility, ScriptInputSurface};
+    use crate::operation_script::{CompiledOperationScript, OperationScriptState};
+
+    let _input = crate::key_input::lock_test_input();
+    for tool in MASK_DETECT_TOOLS {
+        for progress in [false, true] {
+            let mut app = mask_detect_fixture(tool);
+            let ctx = egui::Context::default();
+            app.settings.operation_script_enabled = true;
+            app.operation_script.state = OperationScriptState::Ready(Box::new(
+                CompiledOperationScript::compile("fn slots() { [] } fn on_event(s) { [] }")
+                    .unwrap(),
+            ));
+            if progress {
+                let request = app.capture_mask_detect_request(tool).unwrap();
+                mask_detect_queue(&mut app, request, mask_detect_output());
+            } else {
+                app.mask_detect_dialog = Some(tool);
+            }
+            // Isolate common-modal admission from the independent tool-mode gate.
+            app.erase_mode = false;
+            app.conceal_mode = false;
+            app.local_adjust_mode = false;
+            assert!(app.common_modal_dialog_open());
+            for surface in [ScriptInputSurface::Grid, ScriptInputSurface::Viewer] {
+                assert_eq!(
+                    app.operation_script_eligibility(&ctx, surface),
+                    ScriptEligibility::Silent
+                );
+                assert!(!app.begin_operation_script_event_detection(&ctx, surface));
+            }
+            app.cancel_mask_detect();
+            for surface in [ScriptInputSurface::Grid, ScriptInputSurface::Viewer] {
+                assert!(matches!(
+                    app.operation_script_eligibility(&ctx, surface),
+                    ScriptEligibility::Available(_)
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 fn mask_detect_three_tools_add_one_edit_and_undo_once() {
     for tool in MASK_DETECT_TOOLS {
         let mut app = mask_detect_fixture(tool);

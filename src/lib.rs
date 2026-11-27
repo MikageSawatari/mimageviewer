@@ -242,6 +242,7 @@ mod image_folder_zip;
 mod image_folder_zip_job;
 mod image_folder_zip_metadata;
 mod musicvideo_launch;
+pub mod operation_script;
 pub mod vlm_addon;
 pub mod vlm_addon_download;
 // filename_stack_ui は private な App へ impl を追加する library-internal module。
@@ -249,6 +250,7 @@ mod adjustment_parameter_edit;
 mod everything_ipc;
 mod everything_results;
 mod filename_stack_ui;
+pub(crate) mod folder_order;
 pub mod folder_pane;
 pub mod folder_rating_counter;
 pub mod folder_thumb_pins;
@@ -304,6 +306,7 @@ pub mod depth_parallax;
 pub mod depth_parallax_wgpu;
 pub(crate) mod focus_debug;
 mod fs_exclusive_view;
+mod gpu_color_copy;
 mod manual_mask_tools;
 pub mod margin_fit;
 pub mod mask_db;
@@ -331,6 +334,9 @@ pub mod page_split;
 pub mod panorama;
 pub mod panorama_wgpu;
 pub mod path_key;
+pub mod plane_view;
+pub mod plane_view_wgpu;
+mod pointer_input_time;
 pub mod reading_history_db;
 pub(crate) mod reading_history_thumbnail_sources;
 #[cfg(any(test, feature = "test-script"))]
@@ -909,25 +915,74 @@ static MOUSE_NAV_HOOK_INSTALLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(windows)]
-static PENDING_MOUSE_NAV_BACK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static PENDING_MOUSE_NAV_BACK: PendingMouseNavPresses = PendingMouseNavPresses::new();
 
 #[cfg(windows)]
-static PENDING_MOUSE_NAV_FORWARD: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
+static PENDING_MOUSE_NAV_FORWARD: PendingMouseNavPresses = PendingMouseNavPresses::new();
+
+/// One direction's drained Browser input. Navigation keeps accepting repeats;
+/// script assignments additionally require an actual initial press in this batch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MouseNavPresses {
+    pub count: u32,
+    pub has_non_repeat: bool,
+}
+
+#[cfg(any(windows, test))]
+struct PendingMouseNavPresses(std::sync::atomic::AtomicU64);
+
+#[cfg(any(windows, test))]
+impl PendingMouseNavPresses {
+    const NON_REPEAT: u64 = 1 << 32;
+
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU64::new(0))
+    }
+
+    fn record(&self, repeat: bool) {
+        use std::sync::atomic::Ordering;
+        // Count and initial-press evidence share one atomic owner, so a drain
+        // cannot leave a press's evidence attached to the next batch.
+        let _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                let count = (pending as u32).wrapping_add(1);
+                let initial_press = if repeat { 0 } else { Self::NON_REPEAT };
+                Some(u64::from(count) | (pending & Self::NON_REPEAT) | initial_press)
+            });
+    }
+
+    fn record_keydown(&self, lparam: isize) {
+        self.record(lparam & (1 << 30) != 0);
+    }
+
+    fn take(&self) -> MouseNavPresses {
+        use std::sync::atomic::Ordering;
+        let pending = self.0.swap(0, Ordering::AcqRel);
+        MouseNavPresses {
+            count: pending as u32,
+            has_non_repeat: pending & Self::NON_REPEAT != 0,
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "mouse_nav_pending_tests.rs"]
+mod mouse_nav_pending_tests;
 
 /// App::update がフレーム頭で呼ぶ。前フレーム以降に蓄積した進む/戻る押下回数を取り出す。
-/// 戻り値は (back, forward)。non-Windows では常に (0, 0)。
-pub(crate) fn take_pending_mouse_nav() -> (u32, u32) {
+/// 戻り値は (back, forward)。各方向の回数と非repeat押下の事実を不可分に取り出す。
+/// non-Windows では常に空。
+pub(crate) fn take_pending_mouse_nav() -> (MouseNavPresses, MouseNavPresses) {
     #[cfg(windows)]
     {
-        use std::sync::atomic::Ordering;
-        let back = PENDING_MOUSE_NAV_BACK.swap(0, Ordering::AcqRel);
-        let forward = PENDING_MOUSE_NAV_FORWARD.swap(0, Ordering::AcqRel);
+        let back = PENDING_MOUSE_NAV_BACK.take();
+        let forward = PENDING_MOUSE_NAV_FORWARD.take();
         (back, forward)
     }
     #[cfg(not(windows))]
     {
-        (0, 0)
+        Default::default()
     }
 }
 
@@ -937,7 +992,6 @@ unsafe extern "system" fn mouse_nav_hook_proc(
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
-    use std::sync::atomic::Ordering;
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, HC_ACTION, MSG, WM_APPCOMMAND, WM_KEYDOWN, WM_SYSKEYDOWN,
     };
@@ -976,10 +1030,11 @@ unsafe extern "system" fn mouse_nav_hook_proc(
                         let app_command = cmd_word & 0xFFF;
                         match app_command {
                             1 => {
-                                PENDING_MOUSE_NAV_BACK.fetch_add(1, Ordering::AcqRel);
+                                // WM_APPCOMMAND has no key-repeat flag.
+                                PENDING_MOUSE_NAV_BACK.record(false);
                             }
                             2 => {
-                                PENDING_MOUSE_NAV_FORWARD.fetch_add(1, Ordering::AcqRel);
+                                PENDING_MOUSE_NAV_FORWARD.record(false);
                             }
                             _ => {}
                         }
@@ -987,14 +1042,14 @@ unsafe extern "system" fn mouse_nav_hook_proc(
                     WM_KEYDOWN | WM_SYSKEYDOWN => {
                         // VK_BROWSER_BACK = 0xA6, VK_BROWSER_FORWARD = 0xA7
                         // KEYUP は数えない (1 押下で 1 ナビ)。auto-repeat (lParam bit 30)
-                        // は通すと連続移動できる (キーボードの Ctrl+↑/↓ と同じ感覚)。
+                        // は従来どおり数え、非repeatの事実も割り当て解決まで運ぶ。
                         let vk = (msg.wParam.0 & 0xFF) as u8;
                         match vk {
                             0xA6 => {
-                                PENDING_MOUSE_NAV_BACK.fetch_add(1, Ordering::AcqRel);
+                                PENDING_MOUSE_NAV_BACK.record_keydown(msg.lParam.0);
                             }
                             0xA7 => {
-                                PENDING_MOUSE_NAV_FORWARD.fetch_add(1, Ordering::AcqRel);
+                                PENDING_MOUSE_NAV_FORWARD.record_keydown(msg.lParam.0);
                             }
                             _ => {}
                         }
@@ -1007,6 +1062,27 @@ unsafe extern "system" fn mouse_nav_hook_proc(
     } else {
         unsafe { CallNextHookEx(None, code, wparam, lparam) }
     }
+}
+
+/// Feed the real hook a synthetic message without posting input or installing a hook.
+#[cfg(all(test, windows))]
+pub(crate) fn inject_browser_keydown_for_test(forward: bool, repeat: bool) {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{HC_ACTION, MSG, WM_KEYDOWN};
+    let message = MSG {
+        message: WM_KEYDOWN,
+        wParam: WPARAM(if forward { 0xA7 } else { 0xA6 }),
+        lParam: LPARAM(if repeat { 1 << 30 } else { 0 }),
+        ..Default::default()
+    };
+    // The message remains alive for the callback and its native observer.
+    let _ = unsafe {
+        mouse_nav_hook_proc(
+            HC_ACTION as i32,
+            WPARAM(1),
+            LPARAM((&message as *const MSG) as isize),
+        )
+    };
 }
 
 /// メイン UI スレッドに WH_GETMESSAGE フックを 1 度だけ install する。

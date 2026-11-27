@@ -1084,11 +1084,9 @@ fn restore_family_prefix(root: &str, family: StoreRestoreFamily) -> String {
 
 /// リネームと mIV 内削除成功時 hard purge が共有する path-keyed SQLite 記述子。
 ///
-/// `unique` は rename の衝突処理と content-identity v1 copy の可否に使う。
-/// `false` のストアは path 以外の行 identity 再採番が必要なので copy 対象外。
+/// `unique` は rename の衝突処理に使う。content-identity copy は別に宣言する。
 /// purge は全行を素の `DELETE` にする。
-/// `rename_generic=false` は raw `path` 列も同時更新する閲覧履歴だけで、rename 側は専用処理を
-/// 使うが purge 側は同じ記述子を使う。
+/// `rename_generic=false` のストアはそれぞれの owner が改名し、purge は同じ記述子を使う。
 /// Collision rule selected by the operation owner, shared with service-owned stores.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PathMigrationCollision {
@@ -1101,6 +1099,7 @@ pub(crate) enum BookStorePolicy {
     Follow,
     OwnedByEditPreview,
     ServiceOwned,
+    Excluded,
 }
 
 /// 汎用 store 操作の commit 後に失効させる表示キャッシュ。
@@ -1122,11 +1121,26 @@ pub(crate) struct StoreDescriptor {
     pub(crate) rename_generic: bool,
     pub(crate) book_policy: BookStorePolicy,
     pub(crate) copies_with_book_page: bool,
+    /// Shared by the restorable-row probe, copy loop, and progress accounting.
+    pub(crate) copies_with_content_identity: bool,
+    /// False for actor-owned order records, which must survive queued renames.
+    pub(crate) orphan_cleanup: bool,
     pub(crate) restore_family: StoreRestoreFamily,
     table_availability: StoreTableAvailability,
 }
 
 impl StoreDescriptor {
+    fn is_reading_history(self) -> bool {
+        self.file == "reading_history.db" && self.table == "reading_history" && self.column == "key"
+    }
+
+    const fn folder_order_owned(mut self) -> Self {
+        self.rename_generic = false;
+        self.copies_with_content_identity = false;
+        self.orphan_cleanup = false;
+        self
+    }
+
     const fn derived_text(mut self, kind: crate::derived_text::DerivedTextKind) -> Self {
         self.derived_text = Some(kind);
         self
@@ -1174,6 +1188,8 @@ const fn store(
         rename_generic: true,
         book_policy,
         copies_with_book_page,
+        copies_with_content_identity: unique,
+        orphan_cleanup: true,
         restore_family: StoreRestoreFamily::VirtualPages,
         table_availability: StoreTableAvailability::Required,
     }
@@ -1199,6 +1215,8 @@ const fn optional_legacy_store(
         rename_generic: true,
         book_policy,
         copies_with_book_page,
+        copies_with_content_identity: unique,
+        orphan_cleanup: true,
         restore_family: StoreRestoreFamily::VirtualPages,
         table_availability: StoreTableAvailability::OptionalInLegacySchema,
     }
@@ -1210,6 +1228,26 @@ const fn optional_legacy_store(
 /// hard purge も走査するため、rename と purge の対象が将来ずれない。PDF パスワードだけは
 /// JSON の SHA-256 キーなので、この表と並ぶ専用処理を両経路が共有する。
 pub(crate) const STORES: &[StoreDescriptor] = &[
+    store(
+        "folder_order.db",
+        "folder_order_items",
+        "item_key",
+        true,
+        StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Excluded,
+        false,
+    )
+    .folder_order_owned(),
+    store(
+        "folder_order.db",
+        "folder_order_folders",
+        "folder_key",
+        true,
+        StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Excluded,
+        false,
+    )
+    .folder_order_owned(),
     store(
         "book_composition.db",
         "book_compositions",
@@ -1510,6 +1548,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         rename_generic: false,
         book_policy: BookStorePolicy::Follow,
         copies_with_book_page: false,
+        copies_with_content_identity: true,
+        orphan_cleanup: true,
         restore_family: StoreRestoreFamily::VirtualPages,
         table_availability: StoreTableAvailability::Required,
     },
@@ -1574,7 +1614,7 @@ enum NormalizedStoreCopyMapping {
 }
 
 /// 内容 identity 復元用の path-key copy。呼び出し側 worker が指定した `data_dir` の
-/// DB を直接開き、[`STORES`] のうち `unique` な記述子をすべて走査する。
+/// DB を直接開き、[`STORES`] の `copies_with_content_identity` が有効な記述子を走査する。
 ///
 /// `unique=false` は path 以外の PK 再採番が必要なストアを表すため v1 では対象外。
 /// DB 行は `INSERT OR IGNORE` で複製し、コピー先にある行を常に優先する。
@@ -1704,7 +1744,10 @@ fn copy_stores_impl(
     let mut report = StoreCopyReport::default();
     let total = STORES
         .iter()
-        .filter(|store| store.unique && (include_identity || store.file != "content_identity.db"))
+        .filter(|store| {
+            store.copies_with_content_identity
+                && (include_identity || store.file != "content_identity.db")
+        })
         .count()
         * mappings.len();
     let mut processed = 0;
@@ -1712,11 +1755,10 @@ fn copy_stores_impl(
     let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
     let _rating_write = crate::rating_db::RATING_WRITES.begin();
     let _tag_write = crate::tags_db::TAG_WRITES.begin();
-    for descriptor in STORES
-        .iter()
-        .copied()
-        .filter(|store| store.unique && (include_identity || store.file != "content_identity.db"))
-    {
+    for descriptor in STORES.iter().copied().filter(|store| {
+        store.copies_with_content_identity
+            && (include_identity || store.file != "content_identity.db")
+    }) {
         // Logical archive resume sources retain drives, even when the released
         // physical row would normalize to the same DriveStripped key.
         if descriptor.table == "book_resume" {
@@ -1785,7 +1827,7 @@ fn copy_stores_impl(
 
 /// 復元して実際に何かが起きる key だけを返す。
 ///
-/// 復元が運ぶのは `copy_stores_at` が `STORES` の unique 行を写すことが全てなので、
+/// 復元が運ぶのは `copy_stores_at` が `STORES` の複写可能な行を写すことが全てなので、
 /// 同じ表を同じ正規化で引けば「復元して何か起きるか」と同じ問いになる。行が 1 つも
 /// 無い key は、復元しても no-op にしかならない。
 ///
@@ -1801,11 +1843,9 @@ pub(crate) fn ledger_keys_with_restorable_rows_at(
     if file_keys.is_empty() {
         return backed;
     }
-    for descriptor in STORES
-        .iter()
-        .copied()
-        .filter(|store| store.unique && store.file != crate::content_identity::LEDGER_DB_FILE)
-    {
+    for descriptor in STORES.iter().copied().filter(|store| {
+        store.copies_with_content_identity && store.file != crate::content_identity::LEDGER_DB_FILE
+    }) {
         let pending = file_keys
             .iter()
             .filter(|file_key| !backed.contains(*file_key))
@@ -2073,7 +2113,10 @@ pub(crate) fn migrate_book_paths_at(
         guard.maintenance.invalidate_root_family(new);
     }
     for descriptor in STORES {
-        if descriptor.book_policy == BookStorePolicy::ServiceOwned {
+        if matches!(
+            descriptor.book_policy,
+            BookStorePolicy::ServiceOwned | BookStorePolicy::Excluded
+        ) {
             continue;
         }
         let db_path = data_dir.join(descriptor.file);
@@ -2092,7 +2135,7 @@ pub(crate) fn migrate_book_paths_at(
                 .filter(|(old, new)| old != new)
                 .collect::<Vec<_>>()
         };
-        let store_moves = if descriptor.rename_generic {
+        let store_moves = if !descriptor.is_reading_history() {
             normalized(moves)
         } else {
             normalized(
@@ -2103,7 +2146,7 @@ pub(crate) fn migrate_book_paths_at(
                     .collect::<Vec<_>>(),
             )
         };
-        let store_copies = if descriptor.rename_generic {
+        let store_copies = if !descriptor.is_reading_history() {
             normalized(copies)
         } else {
             Vec::new()
@@ -2722,7 +2765,7 @@ fn migrate_book_store_with_resume(
             .collect::<Vec<_>>();
         // Evacuate every source before replacing any destination (A <-> B included).
         for ((old, _), temp) in moves.iter().zip(&temporary) {
-            if descriptor.rename_generic {
+            if !descriptor.is_reading_history() {
                 changed += migrate_store_family(
                     &tx,
                     descriptor,
@@ -2743,7 +2786,7 @@ fn migrate_book_store_with_resume(
             }
         }
         for ((_, new), temp) in moves.iter().zip(&temporary) {
-            if descriptor.rename_generic {
+            if !descriptor.is_reading_history() {
                 changed += migrate_store_family(
                     &tx,
                     descriptor,
@@ -2792,7 +2835,7 @@ fn migrate_book_store_with_resume(
                 update_rating_source_paths_for_prefix(&tx, &format!("{new}::"))?;
             }
         }
-        if !descriptor.rename_generic {
+        if descriptor.is_reading_history() {
             for (_, new) in raw_moves.iter().filter(|(_, new)| new.is_dir()) {
                 tx.execute(
                     "UPDATE reading_history SET path = ?1 WHERE key = ?2",
@@ -3814,9 +3857,8 @@ fn copy_store_mapping(
                 new_key,
             )
             .map_err(|error| error.to_string())?;
-            if copied > 0 && !descriptor.rename_generic {
-                // 現在の non-generic descriptor は reading_history。`key` と並ぶ raw
-                // `path` も、コピーできた新行だけ destination path へ合わせる。
+            if copied > 0 && descriptor.is_reading_history() {
+                // 閲覧履歴の raw `path` も、コピーできた新行だけ destination path へ合わせる。
                 tx.execute(
                     &format!(
                         "UPDATE {} SET path = ?1 WHERE {} = ?2",
@@ -5198,6 +5240,141 @@ mod tests {
     }
 
     #[test]
+    fn folder_order_store_policies_are_purge_only() {
+        let descriptors = STORES
+            .iter()
+            .filter(|store| store.file == "folder_order.db")
+            .collect::<Vec<_>>();
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(
+            descriptors
+                .iter()
+                .map(|store| (store.table, store.column))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                ("folder_order_items", "item_key"),
+                ("folder_order_folders", "folder_key"),
+            ])
+        );
+        for descriptor in descriptors {
+            assert!(descriptor.unique);
+            assert_eq!(descriptor.normalization, StoreKeyNormalization::KeepDrive);
+            assert_eq!(descriptor.book_policy, BookStorePolicy::Excluded);
+            assert!(!descriptor.rename_generic);
+            assert!(!descriptor.copies_with_content_identity);
+            assert!(!descriptor.copies_with_book_page);
+            assert!(!descriptor.orphan_cleanup);
+            assert!(!descriptor.is_reading_history());
+        }
+        assert!(
+            STORES
+                .iter()
+                .all(|store| !store.copies_with_content_identity || store.unique)
+        );
+        assert_eq!(
+            STORES
+                .iter()
+                .filter(|store| !store.rename_generic && store.is_reading_history())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn folder_order_exclusions_do_not_open_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("folder_order.db");
+        let bytes = b"unreadable folder order database";
+        std::fs::write(&path, bytes).unwrap();
+        let old = PathBuf::from("C:/books/old");
+        let new = PathBuf::from("C:/books/new");
+        let rename = run_at_with_shape(dir.path(), &old, &new, true);
+        assert!(rename.errors.is_empty(), "{:?}", rename.errors);
+        let guard = acquire_store_maintenance(dir.path(), &[]).unwrap();
+        let book = migrate_book_paths_at(
+            dir.path(),
+            &[(old.clone(), new.clone())],
+            &[(old.clone(), new.clone())],
+            &guard,
+        );
+        assert!(book.errors.is_empty(), "{:?}", book.errors);
+        let copied = copy_stores_at_with_maintenance(
+            dir.path(),
+            &[
+                StoreCopyPathMapping::exact(&old, &new),
+                StoreCopyPathMapping::virtual_prefix(&old, &new),
+            ],
+            &guard,
+            |_, _| {},
+        );
+        assert!(copied.errors.is_empty(), "{:?}", copied.errors);
+        assert_eq!(copied.database_opens, 0);
+        assert!(
+            ledger_keys_with_restorable_rows_at(
+                dir.path(),
+                &[crate::path_key::normalize_keep_drive(&old)]
+            )
+            .is_empty()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn folder_order_rows_skip_migrations_and_identity_copy_but_keep_guarded_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(dir.path(), "folder_order.db");
+        conn.execute_batch("CREATE TABLE folder_order_items(item_key TEXT PRIMARY KEY, position INTEGER NOT NULL);
+            CREATE TABLE folder_order_folders(folder_key TEXT PRIMARY KEY, active INTEGER NOT NULL, revision INTEGER NOT NULL);
+            INSERT INTO folder_order_items VALUES ('c:/books/old', 7), ('c:/books/old/a.jpg', 2), ('c:/books/old2/a.jpg', 3);
+            INSERT INTO folder_order_folders VALUES ('c:/books/old', 1, 4), ('c:/books/old/sub', 0, 5), ('c:/books/old2', 1, 6);").unwrap();
+        let old = PathBuf::from("C:/books/old");
+        let new = PathBuf::from("C:/books/new");
+        let rename = run_at_with_shape(dir.path(), &old, &new, true);
+        assert!(rename.errors.is_empty(), "{:?}", rename.errors);
+        let guard = acquire_store_maintenance(dir.path(), &[]).unwrap();
+        let book = migrate_book_paths_at(
+            dir.path(),
+            &[(old.clone(), new.clone())],
+            &[(old.clone(), new.clone())],
+            &guard,
+        );
+        assert!(book.errors.is_empty(), "{:?}", book.errors);
+        let copy = copy_stores_at_with_maintenance(
+            dir.path(),
+            &[StoreCopyPathMapping::exact(&old, &new)],
+            &guard,
+            |_, _| {},
+        );
+        assert!(copy.errors.is_empty(), "{:?}", copy.errors);
+        assert_eq!(copy.rows, 0);
+        assert!(
+            ledger_keys_with_restorable_rows_at(dir.path(), &["c:/books/old".into()]).is_empty()
+        );
+        for table in ["folder_order_items", "folder_order_folders"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, usize>(0))
+                    .unwrap(),
+                3
+            );
+        }
+        drop(guard);
+        let scopes = [crate::delete_worker::DeleteSourceScope::Tree(old)];
+        let guard = acquire_delete_epub_guard(dir.path(), &scopes).unwrap();
+        let purge = purge_removed_scopes_guarded_at(dir.path(), &scopes, &[], &guard);
+        assert!(purge.errors.is_empty(), "{:?}", purge.errors);
+        assert_eq!(purge.rows, 4);
+        for table in ["folder_order_items", "folder_order_folders"] {
+            assert_eq!(
+                conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, usize>(0))
+                    .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn book_store_policies_and_copy_kinds_are_explicit() {
         let services = STORES
             .iter()
@@ -6126,7 +6303,7 @@ mod tests {
                 }
                 let extras = if descriptor.table == "ratings" {
                     ", source_path TEXT"
-                } else if !descriptor.rename_generic {
+                } else if descriptor.is_reading_history() {
                     ", path TEXT"
                 } else {
                     ""
@@ -6155,7 +6332,7 @@ mod tests {
                                 rusqlite::params![key, payload, old_key],
                             )
                             .unwrap();
-                    } else if !descriptor.rename_generic {
+                    } else if descriptor.is_reading_history() {
                         connection
                             .execute(
                                 &format!(
@@ -6223,11 +6400,14 @@ mod tests {
             ],
         );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
-        let covered = STORES.iter().filter(|descriptor| descriptor.unique).count();
+        let covered = STORES
+            .iter()
+            .filter(|descriptor| descriptor.copies_with_content_identity)
+            .count();
         assert_eq!(
             STORES.len(),
-            32,
-            "watched、endpoint / page-alone preference、logical shift と文字起こしを含む現行 descriptor 数"
+            34,
+            "folder order、watched、endpoint / page-alone preference、logical shift と文字起こしを含む現行 descriptor 数"
         );
         assert_eq!(covered, 31);
         assert_eq!(report.rows, covered * 2);
@@ -6252,6 +6432,24 @@ mod tests {
             let connection = open(dir.path(), descriptor.file);
             let old_key = descriptor.normalize_path(old);
             let new_key = descriptor.normalize_path(new);
+            if !descriptor.copies_with_content_identity && descriptor.unique {
+                let count: usize = connection
+                    .query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM {} WHERE {} = ?1",
+                            descriptor.table, descriptor.column
+                        ),
+                        [&new_key],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    count, 0,
+                    "{} is excluded from identity copy",
+                    descriptor.table
+                );
+                continue;
+            }
             if descriptor.unique {
                 for (key, payload) in [
                     (new_key.clone(), "exact"),
@@ -6326,7 +6524,7 @@ mod tests {
                     )
                     .unwrap();
                 assert_eq!(source_rows, 2, "copy は source rows を残す");
-                if !descriptor.rename_generic {
+                if descriptor.is_reading_history() {
                     let raw_path: String = connection
                         .query_row(
                             &format!(
@@ -7032,6 +7230,8 @@ mod tests {
             rename_generic: true,
             book_policy: BookStorePolicy::Follow,
             copies_with_book_page: false,
+            copies_with_content_identity: true,
+            orphan_cleanup: true,
             restore_family: StoreRestoreFamily::VirtualPages,
             table_availability: StoreTableAvailability::Required,
         };
@@ -7108,6 +7308,8 @@ mod tests {
             rename_generic: true,
             book_policy: BookStorePolicy::Follow,
             copies_with_book_page: false,
+            copies_with_content_identity: true,
+            orphan_cleanup: true,
             restore_family: StoreRestoreFamily::VirtualPages,
             table_availability: StoreTableAvailability::Required,
         };

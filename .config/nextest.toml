@@ -53,15 +53,17 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 # tests/support/gpu_test_group.rs and docs/gpu-test-groups.md.
 # Stage 767 callers also cover install_pages/renderer through composition,
 # startup, handoff and dialog helpers; keep mixed CPU modules out of this group.
-# Package/binary predicates reject absent names in standalone vendor graphs.
-# A shared binary regex is valid in workspace and every standalone vendor graph;
-# kind(test) restricts its assignments to the integration targets. Vendor lib
-# alternatives validate the matcher there without grouping their CPU tests.
+# Package/binary predicates reject names absent from a graph, so every binary()
+# regex must match some binary in the workspace graph and in each standalone
+# vendor graph. One shared regex names integration (workspace) and the vendor
+# libs (standalone graphs); kind(test) keeps the vendor libs' CPU tests out, and
+# the module prefix selects the four former GPU binaries inside integration
+# (section 1.908), including their CPU tests.
 [[profile.default.overrides]]
 filter = '''
     test(/(^|::)gpu_tests::/)
     | test(/(^|::)test_gpu_group::tests::/)
-    | (kind(test) & binary(/^(ui_snapshot|book_composition_editor_snapshots|test_ai_upscale|test_tile_blend|egui(_wgpu|_winit)?|epaint|eframe)$/))
+    | (kind(test) & binary(/^(integration|egui(_wgpu|_winit)?|epaint|eframe)$/) & test(/^(ui_snapshot|book_composition_editor_snapshots|test_ai_upscale|test_tile_blend)::/))
     | test(/^app::depth_export::main_window_tests::/)
     | test(/^app::depth_export::tests::/)
     | test(/^app::depth_main_window_tests::/)
@@ -75,6 +77,7 @@ filter = '''
     | test(/^panorama_wgpu::gpu_tests::/)
     | test(/^ui_adjustment_panel::creative_lut_ui_tests::/)
     | test(/^ui_dialogs::preferences::pages::plain_folder_spread_tests::/)
+    | test(/^ui_dialogs::preferences::operation_script::tests::operation_script_preferences_snapshot_(light|dark)$/)
     | test(/^ui_dialogs::preferences::pages::fullscreen_in_page_scroll_setting_tests::fullscreen_in_page_scroll_settings_snapshot_/)
     | test(/^ui_dialogs::preferences::pages::fullscreen_in_page_scroll_setting_tests::fullscreen_(scroll_then_turn_settings_snapshot_light|wheel_zoom_settings_snapshot_dark)$/)
     | test(/^ui_fullscreen::canonical_demand::draw_key_tests::/)
@@ -153,7 +156,7 @@ filter = '''
     | test(/^ui_dialogs::preferences::pages::fullscreen_manual_nav_wrap_setting_tests::(fullscreen_manual_nav_wrap_setting_snapshot_dark_on|fullscreen_manual_nav_wrap_setting_snapshot_light_off)$/)
     | test(/^ui_dialogs::preferences::pages::page_turn_animation_settings_tests::(page_turn_animation_settings_snapshot_dark_off|page_turn_animation_settings_snapshot_light_on|page_turn_animation_settings_snapshot_light_slide)$/)
     | test(=ui_dialogs::preferences::pages::tests::command_chords_catalog_snapshot_dark)
-    | test(/^ui_dialogs::preferences::tests::(auto_view_trim_default_setting_snapshot_dark_on|auto_view_trim_default_setting_snapshot_light_off|clipboard_bake_stage_preferences_snapshot|preferences_context_menu_layout_snapshot|preferences_duplicate_files_epub_option_snapshot)$/)
+    | test(/^ui_dialogs::preferences::tests::(auto_view_trim_default_setting_snapshot_dark_on|auto_view_trim_default_setting_snapshot_light_off|clipboard_bake_stage_preferences_snapshot|preferences_context_menu_layout_snapshot|preferences_context_menu_layout_narrow_pdf_page_snapshot|preferences_duplicate_files_epub_option_snapshot)$/)
     | test(/^ui_dialogs::preferences::tests::(preferences_folder_edit_restore_snapshot|preferences_parallelism_pdf_count_snapshot|preferences_recycle_bin_delete_confirmation_snapshot|preferences_search_results_snapshot|preferences_search_window_hints_snapshot)$/)
     | test(/^ui_dialogs::preferences::tests::preferences_mouse_buttons_snapshot_(page_turn|double_click_close)$/)
     | test(/^ui_dialogs::preferences::tests::(preferences_still_seek_strip_height_settings_snapshot_narrow_width|preferences_still_seek_strip_height_settings_snapshot_regular_width|preferences_video_seek_strip_height_settings_snapshot_narrow_width|preferences_video_seek_strip_height_settings_snapshot_regular_width|preferences_viewer_notice_visibility_snapshot)$/)

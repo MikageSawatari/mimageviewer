@@ -21,7 +21,7 @@ fn harness(facet: bool, view: GridViewMode) -> Harness<'static, phase_c_support:
     env.settings.auto_fullscreen_image_folders = false;
     env.settings.sort_order = SortOrder::FileName;
     env.settings.grid_display_order = Default::default(); // folders before images
-    env.load_folder_with_scan(folder, None);
+    env.load_folder_and_finish_for_test(folder);
     env.finish_page_identity_preparation_for_test();
     env.settings.grid_view_mode = view;
     env.settings.grid_cols = 4;

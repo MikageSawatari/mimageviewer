@@ -188,7 +188,7 @@ fn sort_worker_849_watch_and_refresh_resume_after_navigation_replacement() {
         None,
         StartupListIntent::ExplicitList,
         MainListRequestStage::Admission,
-        DirectoryScanRoute::Worker,
+        DirectoryScanRoute::MainWorker,
     );
     let direct = HeldScan::capture(&mut h.env);
     held.assert_retired();

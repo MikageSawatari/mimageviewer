@@ -511,7 +511,7 @@ function Get-MivFocusedPlan {
             }
             continue
         }
-        if ($path -match '(^|/)(Cargo\.(toml|lock)|build\.rs)$|^src/(lib|main|app)\.rs$|^src/app/tests\.rs$|^(\.cargo/|\.config/|vendor/|tests/(support|snapshots)/)') {
+        if ($path -match '(^|/)(Cargo\.(toml|lock)|build\.rs)$|^src/(lib|main|app)\.rs$|^src/app/tests\.rs$|^tests/integration\.rs$|^(\.cargo/|\.config/|vendor/|tests/(support|common|snapshots)/)') {
             $broad.Add($path); continue
         }
         $package = $null
@@ -534,8 +534,8 @@ function Get-MivFocusedPlan {
             $selection += '--lib'
             $filter = 'test(~' + ($components -join '::') + '::)'
         } elseif ($path -match '^tests/([A-Za-z_][A-Za-z0-9_-]*)\.rs$') {
-            $selection += @('--test', $Matches[1])
-            $filter = 'kind(test)'
+            $selection += @('--test', 'integration')
+            $filter = 'test(/^' + $Matches[1] + '::/)'
         } elseif ($path -match '^tests/') {
             $broad.Add($path); continue
         } else { $broad.Add($path); continue }

@@ -192,6 +192,9 @@ impl App {
         let fs_idx = target_idx;
         let [w, h] = pixels.size;
 
+        // Entry/navigation checks and material acceptance above must succeed before
+        // stopping playback or replacing this tool's detection/edit session.
+        self.stop_projected_slideshow_playback();
         self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::Conceal);
         self.conceal_session = self.conceal_session.wrapping_add(1);
         self.conceal_mode = true;
@@ -322,7 +325,7 @@ impl App {
         self.conceal_line_end = None;
         self.conceal_shape_drag_start = None;
         self.conceal_shape_drag_end = None;
-        self.fs_pan_drag_start = None;
+        self.fs_canvas_drag.set_pan_start(None);
 
         // 見開きから入っていた場合は spread_mode と表示ページを復元
         let pivot = self.conceal_spread_ctx.take();
@@ -646,6 +649,7 @@ impl App {
             return Default::default();
         }
         let action = FsKeyAction {
+            script_slot: None,
             page_transition: Default::default(),
             close: false,
             close_to_page_list: false,

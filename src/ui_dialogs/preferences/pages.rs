@@ -3014,7 +3014,10 @@ fn key_action_detail_label(action: KeyAction) -> &'static str {
 }
 
 fn ring_action_detail_label(action: &RingActionId, context: RingShortcutContext) -> &'static str {
-    if let Some(key_action) = action.saved_group_key_action() {
+    if let Some(key_action) = action
+        .script_slot_key_action()
+        .or_else(|| action.saved_group_key_action())
+    {
         return key_action_detail_label(key_action);
     }
     match action {
@@ -5615,6 +5618,8 @@ pub(super) fn draw_context_menu_layout_settings(
     expanded: &mut HashMap<ContextMenuParentId, bool>,
     view_generation: u64,
 ) {
+    use egui::widget_style::CheckboxStyle;
+
     const ITEM_PREVIEW_WIDTH: f32 = 18.0;
     const ARROW_COLUMN_WIDTH: f32 = 32.0;
     const COLUMN_SPACING: f32 = 8.0;
@@ -5635,6 +5640,8 @@ pub(super) fn draw_context_menu_layout_settings(
                 ui.selectable_value(scenario, *value, value.label());
             }
         });
+    // The already-rendered normal combo owns this frame's first-line height.
+    let first_line_height = scenario_combo.response.rect.height();
     scenario_combo
         .response
         .labelled_by(scenario_label.id)
@@ -5726,16 +5733,25 @@ pub(super) fn draw_context_menu_layout_settings(
                                 .map(|candidate| candidate.label())
                                 .collect::<Vec<_>>()
                                 .join("、");
+                            // Start at the Grid cursor, so the recorded cell rect
+                            // spans all wrapped content without a centered offset.
                             let changed = ui
-                                .allocate_ui_with_layout(
-                                    egui::vec2(item_column_width, row_height),
-                                    egui::Layout::left_to_right(egui::Align::Center),
+                                .scope_builder(
+                                    egui::UiBuilder::new()
+                                        .layout(egui::Layout::left_to_right(egui::Align::Min)),
                                     |ui| {
                                         ui.set_width(item_column_width);
                                         let (preview_rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(ITEM_PREVIEW_WIDTH, row_height),
+                                            egui::vec2(ITEM_PREVIEW_WIDTH, first_line_height),
                                             egui::Sense::hover(),
                                         );
+                                        #[cfg(test)]
+                                        ui.ctx().data_mut(|data| {
+                                            data.insert_temp(
+                                                egui::Id::unique(("context_menu_item_preview", item)),
+                                                preview_rect,
+                                            );
+                                        });
                                         if matches!(
                                             preview_state,
                                             ContextMenuPreviewItemState::Available {
@@ -5756,68 +5772,108 @@ pub(super) fn draw_context_menu_layout_settings(
                                                     .max(ui.spacing().icon_width),
                                             );
                                             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                                            let changed =
-                                                ui.checkbox(&mut visible, item.label()).changed();
-                                            match preview_state {
-                                                ContextMenuPreviewItemState::Unavailable => {
-                                                    let status = ui.label(
-                                                        egui::RichText::new("対象外")
-                                                            .small()
-                                                            .weak(),
-                                                    );
-                                                    status.widget_info(|| {
-                                                        egui::WidgetInfo::labeled(
-                                                            egui::Role::Label,
-                                                            true,
-                                                            format!(
-                                                                "{}はこの場面で対象外",
-                                                                item.label()
-                                                            ),
-                                                        )
-                                                    });
-                                                    status.on_hover_text(format!(
+                                            // Preserve the Checkbox's ordinary font/line spacing;
+                                            // only its first text row shares the controls' height.
+                                            let mut item_text = egui::WidgetText::from(item.label())
+                                                .into_galley(
+                                                    ui,
+                                                    Some(egui::TextWrapMode::Extend),
+                                                    f32::INFINITY,
+                                                    egui::TextStyle::Body,
+                                                )
+                                                .job
+                                                .as_ref()
+                                                .clone();
+                                            item_text.first_row_min_height = first_line_height;
+                                            // Measure the same icon/text layout as Checkbox, then
+                                            // give it that Galley so wrapping and row count agree.
+                                            // Mirrors `Checkbox::ui` in vendor/egui/src/widgets/checkbox.rs;
+                                            // keep in step when that layout changes.
+                                            let checkbox_id = ui.next_auto_id();
+                                            let checkbox_style: CheckboxStyle =
+                                                ui.widget_style(checkbox_id, &Default::default());
+                                            let min_size = checkbox_style.atom_layout.min_size.max(
+                                                egui::vec2(0.0, checkbox_style.checkbox_size),
+                                            );
+                                            let icon_size = egui::vec2(
+                                                checkbox_style.checkbox_size,
+                                                checkbox_style.checkbox_size.max(min_size.y),
+                                            );
+                                            let measured = checkbox_style
+                                                .atom_layout
+                                                .apply(egui::WidgetAtom::new((
+                                                    egui::Atom::custom(
+                                                        egui::IdSalt::new("checkbox_icon"),
+                                                        icon_size,
+                                                    ),
+                                                    item_text,
+                                                )))
+                                                .min_size(min_size)
+                                                .measure(ui, ui.available_size());
+                                            let item_galley = measured
+                                                .container
+                                                .iter_texts()
+                                                .next()
+                                                .expect("the item Checkbox contains one text atom")
+                                                .clone();
+                                            let item_is_multiline = item_galley.rows.len() > 1;
+                                            let checkbox = ui.checkbox(&mut visible, item_galley);
+                                            let status = match preview_state {
+                                                ContextMenuPreviewItemState::Unavailable => Some((
+                                                    "対象外",
+                                                    format!("{}はこの場面で対象外", item.label()),
+                                                    format!(
                                                         "「{}」では使わない項目です。順序を変えても、この場面には追加されません。\n表示される確認場面：{}",
                                                         scenario.label(), available_scenario_labels
-                                                    ));
-                                                }
-                                                ContextMenuPreviewItemState::Hidden => {
-                                                    let status = ui.label(
-                                                        egui::RichText::new("非表示中")
-                                                            .small()
-                                                            .weak(),
-                                                    );
-                                                    status.widget_info(|| {
-                                                        egui::WidgetInfo::labeled(
-                                                            egui::Role::Label,
-                                                            true,
-                                                            format!("{}は項目非表示中", item.label()),
-                                                        )
-                                                    });
-                                                    status.on_hover_text(format!(
+                                                    ),
+                                                )),
+                                                ContextMenuPreviewItemState::Hidden => Some((
+                                                    "非表示中",
+                                                    format!("{}は項目非表示中", item.label()),
+                                                    format!(
                                                         "項目表示を ON にすると、次の確認場面に表示されます。\n{}",
                                                         available_scenario_labels
-                                                    ));
+                                                    ),
+                                                )),
+                                                ContextMenuPreviewItemState::First => Some((
+                                                    "先頭",
+                                                    format!("{}はこの場面で先頭", item.label()),
+                                                    "この場面では同じ階層の先頭にあるため、前に区切り線を表示できません。".to_owned(),
+                                                )),
+                                                ContextMenuPreviewItemState::Available { .. } => None,
+                                            };
+                                            if let Some((text, label, tooltip)) = status {
+                                                let galley = egui::WidgetText::from(
+                                                    egui::RichText::new(text).small().weak(),
+                                                )
+                                                .into_galley(
+                                                    ui,
+                                                    Some(egui::TextWrapMode::Extend),
+                                                    f32::INFINITY,
+                                                    egui::TextStyle::Small,
+                                                );
+                                                if item_is_multiline
+                                                    || galley.size().x
+                                                        > ui.available_size_before_wrap().x
+                                                {
+                                                    // Automatic wrapping carries the tall Checkbox's
+                                                    // row height; end it explicitly for a natural-height note.
+                                                    ui.end_row();
                                                 }
-                                                ContextMenuPreviewItemState::First => {
-                                                    let status = ui.label(
-                                                        egui::RichText::new("先頭")
-                                                            .small()
-                                                            .weak(),
-                                                    );
-                                                    status.widget_info(|| {
-                                                        egui::WidgetInfo::labeled(
-                                                            egui::Role::Label,
-                                                            true,
-                                                            format!("{}はこの場面で先頭", item.label()),
-                                                        )
-                                                    });
-                                                    status.on_hover_text(
-                                                        "この場面では同じ階層の先頭にあるため、前に区切り線を表示できません。",
-                                                    );
-                                                }
-                                                ContextMenuPreviewItemState::Available { .. } => {}
+                                                let status = ui.add(
+                                                    egui::Label::new(galley)
+                                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                                );
+                                                status.widget_info(|| {
+                                                    egui::WidgetInfo::labeled(
+                                                        egui::Role::Label,
+                                                        true,
+                                                        &label,
+                                                    )
+                                                });
+                                                status.on_hover_text(tooltip);
                                             }
-                                            changed
+                                            checkbox.changed()
                                         })
                                         .inner
                                     },
@@ -5827,15 +5883,24 @@ pub(super) fn draw_context_menu_layout_settings(
                                 edit = Some(ContextMenuLayoutEdit::SetVisible(item, visible));
                             }
                             if order.len() > 1 {
+                                // Center controls within the first text row, even when later rows grow.
                                 let up_enabled = index > 0;
-                                let up = ui
-                                    .add_enabled(
-                                        up_enabled,
-                                        egui::Button::new("↑")
-                                            .small()
-                                            .min_size(egui::vec2(ARROW_COLUMN_WIDTH, row_height)),
-                                    )
-                                    .on_hover_text("上へ");
+                                let up = context_menu_control_cell(
+                                    ui,
+                                    ARROW_COLUMN_WIDTH,
+                                    first_line_height,
+                                    |ui| {
+                                        ui.add_enabled(
+                                            up_enabled,
+                                            egui::Button::new("↑").small().min_size(egui::vec2(
+                                                ARROW_COLUMN_WIDTH,
+                                                row_height,
+                                            )),
+                                        )
+                                    },
+                                )
+                                .inner
+                                .on_hover_text("上へ");
                                 up.widget_info(|| {
                                     egui::WidgetInfo::labeled(
                                         egui::Role::Button,
@@ -5847,14 +5912,22 @@ pub(super) fn draw_context_menu_layout_settings(
                                     edit = Some(ContextMenuLayoutEdit::Move(parent, index, -1));
                                 }
                                 let down_enabled = index + 1 < order.len();
-                                let down = ui
-                                    .add_enabled(
-                                        down_enabled,
-                                        egui::Button::new("↓")
-                                            .small()
-                                            .min_size(egui::vec2(ARROW_COLUMN_WIDTH, row_height)),
-                                    )
-                                    .on_hover_text("下へ");
+                                let down = context_menu_control_cell(
+                                    ui,
+                                    ARROW_COLUMN_WIDTH,
+                                    first_line_height,
+                                    |ui| {
+                                        ui.add_enabled(
+                                            down_enabled,
+                                            egui::Button::new("↓").small().min_size(egui::vec2(
+                                                ARROW_COLUMN_WIDTH,
+                                                row_height,
+                                            )),
+                                        )
+                                    },
+                                )
+                                .inner
+                                .on_hover_text("下へ");
                                 down.widget_info(|| {
                                     egui::WidgetInfo::labeled(
                                         egui::Role::Button,
@@ -5869,144 +5942,149 @@ pub(super) fn draw_context_menu_layout_settings(
                                 ui.label("\u{00a0}");
                                 ui.label("\u{00a0}");
                             }
-                            ui.horizontal(|ui| {
-                                ui.set_width(separator_column_width);
-                                let explicit = separator != ContextMenuSeparatorBefore::Inherit;
-                                match preview_state {
-                                    ContextMenuPreviewItemState::Available { separator_before } => {
-                                        let selected = if explicit {
-                                            context_menu_separator_bool_label(separator_before)
-                                                .to_string()
-                                        } else {
-                                            format!(
-                                                "{}（既定）",
+                            context_menu_control_cell(
+                                ui,
+                                separator_column_width,
+                                first_line_height,
+                                |ui| {
+                                    ui.set_width(separator_column_width);
+                                    let explicit = separator != ContextMenuSeparatorBefore::Inherit;
+                                    match preview_state {
+                                        ContextMenuPreviewItemState::Available { separator_before } => {
+                                            let selected = if explicit {
                                                 context_menu_separator_bool_label(separator_before)
+                                                    .to_string()
+                                            } else {
+                                                format!(
+                                                    "{}（既定）",
+                                                    context_menu_separator_bool_label(separator_before)
+                                                )
+                                            };
+                                            let mut chosen = None;
+                                            let combo = egui::ComboBox::from_id_salt((
+                                                "context_menu_separator_before",
+                                                parent,
+                                                item,
+                                            ))
+                                            .width(separator_combo_width)
+                                            .wrap_mode(egui::TextWrapMode::Extend)
+                                            .selected_text(selected)
+                                            .show_ui(ui, |ui| {
+                                                if ui
+                                                    .selectable_label(!separator_before, "非表示")
+                                                    .clicked()
+                                                {
+                                                    chosen = Some(ContextMenuSeparatorBefore::Absent);
+                                                }
+                                                if ui
+                                                    .selectable_label(separator_before, "表示")
+                                                    .clicked()
+                                                {
+                                                    chosen = Some(ContextMenuSeparatorBefore::Present);
+                                                }
+                                            });
+                                            combo.response.widget_info(|| {
+                                                egui::WidgetInfo::labeled(
+                                                    egui::Role::ComboBox,
+                                                    true,
+                                                    format!("{}の前の区切り線", item.label()),
+                                                )
+                                            });
+                                            combo.response.on_hover_text(
+                                                "主表示は選択した場面で実際に描かれる線です。変更は全場面へ共通に適用します。",
+                                            );
+                                            if let Some(chosen) = chosen {
+                                                edit = Some(ContextMenuLayoutEdit::SetSeparatorBefore(
+                                                    item, chosen,
+                                                ));
+                                            }
+                                        }
+                                        ContextMenuPreviewItemState::First => {
+                                            let response = ui
+                                                .add_enabled(
+                                                    false,
+                                                    egui::Button::new("非表示（先頭）"),
+                                                );
+                                            response.widget_info(|| {
+                                                egui::WidgetInfo::labeled(
+                                                    egui::Role::Button,
+                                                    false,
+                                                    format!(
+                                                        "{}の前の区切り線（先頭のため非表示）",
+                                                        item.label()
+                                                    ),
+                                                )
+                                            });
+                                            response.on_disabled_hover_text(
+                                                    "この場面では先頭項目なので、前に線を表示できません。",
+                                                );
+                                        }
+                                        ContextMenuPreviewItemState::Hidden => {
+                                            let response = ui.add_enabled(
+                                                false,
+                                                egui::Button::new("項目が非表示"),
+                                            );
+                                            response.widget_info(|| {
+                                                egui::WidgetInfo::labeled(
+                                                    egui::Role::Button,
+                                                    false,
+                                                    format!(
+                                                        "{}の前の区切り線（項目が非表示）",
+                                                        item.label()
+                                                    ),
+                                                )
+                                            });
+                                            response.on_disabled_hover_text(format!(
+                                                "項目表示を ON にすると、次の確認場面に表示されます。\n{}",
+                                                available_scenario_labels
+                                            ));
+                                        }
+                                        ContextMenuPreviewItemState::Unavailable => {
+                                            let response =
+                                                ui.add_enabled(false, egui::Button::new("対象外"));
+                                            response.widget_info(|| {
+                                                egui::WidgetInfo::labeled(
+                                                    egui::Role::Button,
+                                                    false,
+                                                    format!(
+                                                        "{}の前の区切り線（この場面では対象外）",
+                                                        item.label()
+                                                    ),
+                                                )
+                                            });
+                                            response.on_disabled_hover_text(format!(
+                                                    "「{}」では使わない項目です。\n表示される確認場面：{}",
+                                                    scenario.label(), available_scenario_labels
+                                                ));
+                                        }
+                                    }
+                                    if explicit {
+                                        let reset = ui
+                                            .add(
+                                                egui::Button::new("↶")
+                                                    .small()
+                                                    .min_size(egui::vec2(reset_width, row_height)),
                                             )
-                                        };
-                                        let mut chosen = None;
-                                        let combo = egui::ComboBox::from_id_salt((
-                                            "context_menu_separator_before",
-                                            parent,
-                                            item,
-                                        ))
-                                        .width(separator_combo_width)
-                                        .wrap_mode(egui::TextWrapMode::Extend)
-                                        .selected_text(selected)
-                                        .show_ui(ui, |ui| {
-                                            if ui
-                                                .selectable_label(!separator_before, "非表示")
-                                                .clicked()
-                                            {
-                                                chosen = Some(ContextMenuSeparatorBefore::Absent);
-                                            }
-                                            if ui
-                                                .selectable_label(separator_before, "表示")
-                                                .clicked()
-                                            {
-                                                chosen = Some(ContextMenuSeparatorBefore::Present);
-                                            }
-                                        });
-                                        combo.response.widget_info(|| {
+                                            .on_hover_text("この項目の区切り線を既定に戻す");
+                                        reset.widget_info(|| {
                                             egui::WidgetInfo::labeled(
-                                                egui::Role::ComboBox,
+                                                egui::Role::Button,
                                                 true,
-                                                format!("{}の前の区切り線", item.label()),
+                                                format!(
+                                                    "{}の区切り線を既定に戻す",
+                                                    item.label()
+                                                ),
                                             )
                                         });
-                                        combo.response.on_hover_text(
-                                            "主表示は選択した場面で実際に描かれる線です。変更は全場面へ共通に適用します。",
-                                        );
-                                        if let Some(chosen) = chosen {
+                                        if reset.clicked() {
                                             edit = Some(ContextMenuLayoutEdit::SetSeparatorBefore(
-                                                item, chosen,
+                                                item,
+                                                ContextMenuSeparatorBefore::Inherit,
                                             ));
                                         }
                                     }
-                                    ContextMenuPreviewItemState::First => {
-                                        let response = ui
-                                            .add_enabled(
-                                                false,
-                                                egui::Button::new("非表示（先頭）"),
-                                            );
-                                        response.widget_info(|| {
-                                            egui::WidgetInfo::labeled(
-                                                egui::Role::Button,
-                                                false,
-                                                format!(
-                                                    "{}の前の区切り線（先頭のため非表示）",
-                                                    item.label()
-                                                ),
-                                            )
-                                        });
-                                        response.on_disabled_hover_text(
-                                                "この場面では先頭項目なので、前に線を表示できません。",
-                                            );
-                                    }
-                                    ContextMenuPreviewItemState::Hidden => {
-                                        let response = ui.add_enabled(
-                                            false,
-                                            egui::Button::new("項目が非表示"),
-                                        );
-                                        response.widget_info(|| {
-                                            egui::WidgetInfo::labeled(
-                                                egui::Role::Button,
-                                                false,
-                                                format!(
-                                                    "{}の前の区切り線（項目が非表示）",
-                                                    item.label()
-                                                ),
-                                            )
-                                        });
-                                        response.on_disabled_hover_text(format!(
-                                            "項目表示を ON にすると、次の確認場面に表示されます。\n{}",
-                                            available_scenario_labels
-                                        ));
-                                    }
-                                    ContextMenuPreviewItemState::Unavailable => {
-                                        let response =
-                                            ui.add_enabled(false, egui::Button::new("対象外"));
-                                        response.widget_info(|| {
-                                            egui::WidgetInfo::labeled(
-                                                egui::Role::Button,
-                                                false,
-                                                format!(
-                                                    "{}の前の区切り線（この場面では対象外）",
-                                                    item.label()
-                                                ),
-                                            )
-                                        });
-                                        response.on_disabled_hover_text(format!(
-                                                "「{}」では使わない項目です。\n表示される確認場面：{}",
-                                                scenario.label(), available_scenario_labels
-                                            ));
-                                    }
-                                }
-                                if explicit {
-                                    let reset = ui
-                                        .add(
-                                            egui::Button::new("↶")
-                                                .small()
-                                                .min_size(egui::vec2(reset_width, row_height)),
-                                        )
-                                        .on_hover_text("この項目の区切り線を既定に戻す");
-                                    reset.widget_info(|| {
-                                        egui::WidgetInfo::labeled(
-                                            egui::Role::Button,
-                                            true,
-                                            format!(
-                                                "{}の区切り線を既定に戻す",
-                                                item.label()
-                                            ),
-                                        )
-                                    });
-                                    if reset.clicked() {
-                                        edit = Some(ContextMenuLayoutEdit::SetSeparatorBefore(
-                                            item,
-                                            ContextMenuSeparatorBefore::Inherit,
-                                        ));
-                                    }
-                                }
-                            });
+                                },
+                            );
                             ui.end_row();
                         }
                     });
@@ -6024,6 +6102,22 @@ pub(super) fn draw_context_menu_layout_settings(
     if let Some(edit) = edit {
         apply_context_menu_layout_edit(layout, edit);
     }
+}
+
+// Only single-line controls use this frame. Growable item content starts at the Grid cursor directly.
+fn context_menu_control_cell<R>(
+    ui: &mut egui::Ui,
+    width: f32,
+    first_line_height: f32,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let rect = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, first_line_height));
+    ui.scope_builder(
+        egui::UiBuilder::new()
+            .max_rect(rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        add_contents,
+    )
 }
 
 fn context_menu_separator_bool_label(present: bool) -> &'static str {
@@ -11413,6 +11507,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/wheel-zoom-step", |ui, state| {
         draw_fullscreen_wheel_zoom_step_setting(ui, &mut state.settings.fullscreen_wheel_zoom_step);
     });
+    anchored(ui, state, "spread/plane-view-lens", |ui, state| {
+        draw_plane_view_lens_setting(ui, &mut state.settings.plane_view_lens);
+    });
     anchored(ui, state, "spread/n-scroll-order", |ui, state| {
         draw_fullscreen_n_scroll_order_setting(ui, &mut state.settings.fullscreen_n_scroll_order);
     });
@@ -13569,6 +13666,62 @@ mod tests {
     }
 
     #[test]
+    fn script_slot_ring_assignments_share_global_key_rows_and_descriptions() {
+        let mut state = zoom_key_editor_state();
+        let keymap = crate::keymap::Keymap::default();
+        let actions: Vec<_> = RingActionId::available_for_context(RingShortcutContext::Grid)
+            .into_iter()
+            .filter(|action| action.script_slot_key_action().is_some())
+            .collect();
+        assert_eq!(actions.len(), 20);
+        for ring in actions {
+            let key = ring.script_slot_key_action().unwrap();
+            let bindings = ring_bindings_for_key_action(key);
+            assert_eq!(bindings.len(), 3);
+            assert_eq!(compact_key_action_label(key), key.description());
+            for &context in RingShortcutContext::all() {
+                assert!(bindings.contains(&(context, ring.clone())));
+                assert!(super::ring_action_has_key_action(context, &ring));
+                assert_eq!(
+                    super::ring_action_detail_label(&ring, context),
+                    super::key_action_detail_label(key)
+                );
+            }
+        }
+        let ring = RingActionId::ScriptSlot1;
+        for &context in RingShortcutContext::all() {
+            state.settings.ring_shortcuts.profile_mut(context).slots[0] = ring.clone();
+            state.settings.ring_shortcuts.set_right_drag_mode(
+                super::right_drag_context_for_ring_context(context),
+                crate::ring_shortcut::RightDragMode::RingShortcut,
+            );
+        }
+        let rows = super::command_overview_rows(&state, &keymap, &Default::default());
+        let row = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.target,
+                    super::OperationOverviewTarget::Key(KeyAction::ScriptSlot1)
+                )
+            })
+            .unwrap();
+        for category in ["リング", "パッド"] {
+            let labels = &row
+                .assignments
+                .iter()
+                .find(|(name, _)| *name == category)
+                .unwrap()
+                .1;
+            assert_eq!(labels.len(), 3, "{category}: {labels:?}");
+        }
+        assert!(!rows.iter().any(|row| matches!(
+            &row.target,
+            super::OperationOverviewTarget::Ring { action, .. } if *action == ring
+        )));
+    }
+
+    #[test]
     fn saved_group_ring_assignments_share_key_rows_and_descriptions() {
         let mut state = zoom_key_editor_state();
         let keymap = crate::keymap::Keymap::default();
@@ -15203,6 +15356,62 @@ mod spread_step_assignment_tests {
                 RingShortcutContext::VideoFullscreen,
                 &ring
             ));
+        }
+    }
+}
+
+fn draw_plane_view_lens_setting(ui: &mut egui::Ui, value: &mut crate::plane_view::PlaneLensKind) {
+    ui.horizontal(|ui| {
+        let label = ui.label("魚眼のレンズ");
+        let combo = egui::ComboBox::from_id_salt("plane_view_lens")
+            .selected_text(value.label())
+            .show_ui(ui, |ui| {
+                for lens in crate::plane_view::PlaneLensKind::ALL {
+                    ui.selectable_value(value, lens, lens.label());
+                }
+            });
+        combo.response.labelled_by(label.id);
+    });
+}
+
+#[cfg(test)]
+mod plane_view_lens_tests {
+    mod gpu_tests {
+        fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme) {
+            let mut ready = false;
+            let mut value = crate::plane_view::PlaneLensKind::default();
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(420., 100.))
+                .build_ui(move |root| {
+                    crate::test_ui::full_viewport_ui(root, |root| {
+                        crate::os_theme::apply_resolved(root.ctx(), theme);
+                        if !ready {
+                            crate::ui_fonts::configure_fonts(root.ctx());
+                            ready = true;
+                            root.ctx().request_repaint();
+                            return;
+                        }
+                        egui::CentralPanel::default().show(root, |ui| {
+                            super::super::draw_plane_view_lens_setting(ui, &mut value)
+                        });
+                    });
+                });
+            harness.run();
+            harness.snapshot(name);
+        }
+        #[test]
+        fn plane_view_lens_settings_light() {
+            snapshot(
+                "plane_view_lens_settings_light",
+                crate::os_theme::ResolvedTheme::Light,
+            );
+        }
+        #[test]
+        fn plane_view_lens_settings_dark() {
+            snapshot(
+                "plane_view_lens_settings_dark",
+                crate::os_theme::ResolvedTheme::Dark,
+            );
         }
     }
 }

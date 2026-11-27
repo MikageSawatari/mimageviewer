@@ -274,6 +274,7 @@ impl App {
                     state.thumb_adjust_tex.remove(&idx);
                     state.idle_upgrade_cache_bypass_ineligible.remove(&idx);
                     state.auto_aspect.samples.remove(&idx);
+                    state.thumbnail_standins.remove(idx);
                     if let Some(thumbnail) = state.thumbnails.get_mut(idx) {
                         *thumbnail = ThumbnailState::Evicted;
                     }
@@ -460,6 +461,9 @@ enum PendingTransition {
 /// not published before a successful finalizer (I8).
 struct ContextTable<P> {
     projection: Projection,
+    /// The foreground owner remains unchanged while service callbacks project other payloads.
+    /// Only the outermost scoped mount records and clears this identity.
+    scoped_mount_original: Option<ViewerContextId>,
     slots: HashMap<ViewerContextId, Slot<P>>,
     main: ViewerContextId,
     window_of: HashMap<ViewerContextId, u64>,
@@ -475,6 +479,7 @@ impl<P> ContextTable<P> {
         let main = ViewerContextId(0);
         Self {
             projection: Projection::Mounted(main),
+            scoped_mount_original: None,
             slots: HashMap::new(),
             main,
             window_of: HashMap::new(),
@@ -503,6 +508,29 @@ impl<P> ContextTable<P> {
         match self.projection {
             Projection::Mounted(id) => Some(id),
             Projection::Building { .. } => None,
+        }
+    }
+
+    fn foreground_id(&self) -> Option<ViewerContextId> {
+        assert!(self.pending.is_none());
+        self.scoped_mount_original.or_else(|| self.mounted_id())
+    }
+
+    /// Returns whether this scope owns the record and must clear it after restoring its mount.
+    fn enter_mount_scope(&mut self, original: ViewerContextId) -> bool {
+        assert!(self.pending.is_none());
+        if self.scoped_mount_original.is_some() {
+            false
+        } else {
+            self.scoped_mount_original = Some(original);
+            true
+        }
+    }
+
+    fn leave_mount_scope(&mut self, original: ViewerContextId, outermost: bool) {
+        assert_eq!(self.mounted_id(), Some(original));
+        if outermost {
+            assert_eq!(self.scoped_mount_original.take(), Some(original));
         }
     }
 
@@ -1051,6 +1079,11 @@ fn reset_audio_art_terminal_rows(
 }
 
 impl App {
+    /// App-wide edit drafts belong to the foreground owner, not a temporary service projection.
+    pub(crate) fn page_edit_tools_owned_by_projected_context(&self) -> bool {
+        self.foreground_viewer_context_id() == Some(self.projected_viewer_context_id())
+    }
+
     /// Includes buffered read results; inspection never mounts a context or drains it.
     pub(super) fn has_tag_prewarm_work(&self) -> bool {
         if self
@@ -1521,6 +1554,7 @@ impl App {
                     state.thumb_edit_preview_layers.remove(&idx);
                     state.thumb_adjust_tex.remove(&idx);
                     state.idle_upgrade_cache_bypass_ineligible.remove(&idx);
+                    state.thumbnail_standins.remove(idx);
                     if let Some(thumbnail) = state.thumbnails.get_mut(idx) {
                         *thumbnail = ThumbnailState::Evicted;
                     }
@@ -1607,6 +1641,7 @@ impl App {
                         state.thumb_edit_preview_layers.remove(&idx);
                         state.thumb_adjust_tex.remove(&idx);
                         state.idle_upgrade_cache_bypass_ineligible.remove(&idx);
+                        state.thumbnail_standins.remove(idx);
                         if let Some(thumbnail) = state.thumbnails.get_mut(idx) {
                             *thumbnail = ThumbnailState::Evicted;
                         }
@@ -1948,6 +1983,7 @@ pub(in crate::app) struct ViewerContextBundle {
     archive_source_override: Option<PathBuf>,
     zip_nav: Option<crate::zip_tree::ZipNavState>,
     pub(in crate::app) list_order: Option<Arc<super::ListOrderSnapshot>>,
+    pub(in crate::app) folder_order: Box<crate::folder_order::FolderOrderState>,
     stack_mode_requested: bool,
     stack_view: Option<std::sync::Arc<crate::filename_stack::StackView>>,
     stack_showing_flat: bool,
@@ -1980,6 +2016,7 @@ pub(in crate::app) struct ViewerContextBundle {
     facet_name_cache_pending: Option<facet_name_filter::FacetNameCachePending>,
     facet_name_cache_failed_generation: Option<u64>,
     thumbnails: Vec<ThumbnailState>,
+    thumbnail_standins: Box<super::thumbnail_standin::ThumbnailStandins>,
     image_metas: Vec<Option<(i64, i64)>>,
     video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
     auto_aspect: crate::auto_aspect::AutoAspectState,
@@ -2201,7 +2238,7 @@ pub(in crate::app) struct ViewerContextBundle {
     fs_zoom_factor: f32,
     fs_pdf_rerender_demand: PdfRerenderDemand,
     fs_continuous_fit_reference: crate::ui_fullscreen::ContinuousSpecifiedFitReference,
-    fs_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
+    fs_canvas_drag: crate::plane_view::FsCanvasDrag,
     fs_vertical_scroll: f32,
     fs_seek_drag_active: bool,
     fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture,
@@ -2211,7 +2248,6 @@ pub(in crate::app) struct ViewerContextBundle {
     page_turn_presentation: crate::ui_fullscreen::PageTurnPresentation,
     continuous_page_transitions: std::collections::HashMap<usize, ContinuousPageTransition>,
     fs_free_rotation: f32,
-    fs_rotation_drag_start: Option<(egui::Pos2, f32)>,
     analysis_zoom: f32,
     analysis_pan: egui::Vec2,
     analysis_pan_drag_start: Option<(egui::Pos2, egui::Vec2)>,
@@ -2795,6 +2831,13 @@ impl ContextAsyncOwner {
 
 #[cfg(windows)]
 impl<'a> ContextRef<'a> {
+    pub(in crate::app) fn folder_order(self) -> &'a crate::folder_order::FolderOrderState {
+        match self.source {
+            ContextRefSource::Mounted(app) => &app.folder_order,
+            ContextRefSource::AtRest(bundle) => &bundle.folder_order,
+        }
+    }
+
     pub(in crate::app) fn collection_grid_request_stamp_is_current(
         self,
         context_id: ViewerContextId,
@@ -3269,6 +3312,7 @@ impl ViewerContextBundle {
             self.fullscreen_page_layout.clear();
         }
         self.items_generation = items_generation;
+        self.thumbnail_standins.set_generation(items_generation);
         self.fs_cache.set_items_generation(items_generation);
         self.fs_pending.set_items_generation(items_generation);
         self.raw_pages.set_items_generation(items_generation);
@@ -3282,7 +3326,7 @@ impl ViewerContextBundle {
         self.normalize_auto_scan_suppressed.clear();
     }
 
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         // per-context ロード複合体: 空コンテキストは「誰も繋がっていない」fresh channel と
         // token を持つ (App::new と同じ初期状態。この tx を掴む worker は存在しないので
         // rx は常に Empty を返す)。
@@ -3297,6 +3341,7 @@ impl ViewerContextBundle {
             archive_source_override: None,
             zip_nav: None,
             list_order: None,
+            folder_order: Default::default(),
             stack_mode_requested: false,
             stack_view: None,
             stack_showing_flat: false,
@@ -3325,6 +3370,7 @@ impl ViewerContextBundle {
             facet_name_cache_pending: None,
             facet_name_cache_failed_generation: None,
             thumbnails: Vec::new(),
+            thumbnail_standins: Default::default(),
             image_metas: Vec::new(),
             video_thumb_overrides: std::collections::HashMap::new(),
             auto_aspect: crate::auto_aspect::AutoAspectState::default(),
@@ -3493,7 +3539,7 @@ impl ViewerContextBundle {
             fs_pdf_rerender_demand: PdfRerenderDemand::default(),
             fs_continuous_fit_reference:
                 crate::ui_fullscreen::ContinuousSpecifiedFitReference::Legacy,
-            fs_pan_drag_start: None,
+            fs_canvas_drag: crate::plane_view::FsCanvasDrag::default(),
             fs_vertical_scroll: 0.0,
             fs_seek_drag_active: false,
             fs_seek_gesture: crate::ui_fullscreen::StillSeekGesture::Idle,
@@ -3503,7 +3549,6 @@ impl ViewerContextBundle {
             page_turn_presentation: Default::default(),
             continuous_page_transitions: std::collections::HashMap::new(),
             fs_free_rotation: 0.0,
-            fs_rotation_drag_start: None,
             analysis_zoom: 1.0,
             analysis_pan: egui::Vec2::ZERO,
             analysis_pan_drag_start: None,
@@ -3633,6 +3678,7 @@ impl ViewerContextBundle {
 impl App {
     #[cfg(windows)]
     pub(in crate::app) fn pause_mounted_background_work_keep_current_frame(&mut self) {
+        self.retire_exclusive_view_for_owner_change("context_pause");
         self.grid_scroll.renew_session();
         if let Some(holdover) = self.fs_holdover_tex.as_mut() {
             holdover.finish_navigation_diagnostic("context_parked");
@@ -3744,6 +3790,7 @@ impl App {
             archive_source_override,
             zip_nav,
             list_order,
+            folder_order,
             stack_mode_requested,
             stack_view,
             stack_showing_flat,
@@ -3772,6 +3819,7 @@ impl App {
             facet_name_cache_pending,
             facet_name_cache_failed_generation,
             thumbnails,
+            thumbnail_standins,
             image_metas,
             video_thumb_overrides,
             auto_aspect,
@@ -3934,7 +3982,7 @@ impl App {
             fs_zoom_factor,
             fs_pdf_rerender_demand,
             fs_continuous_fit_reference,
-            fs_pan_drag_start,
+            fs_canvas_drag,
             fs_vertical_scroll,
             fs_seek_drag_active,
             fs_seek_gesture,
@@ -3944,7 +3992,6 @@ impl App {
             page_turn_presentation,
             continuous_page_transitions,
             fs_free_rotation,
-            fs_rotation_drag_start,
             analysis_zoom,
             analysis_pan,
             analysis_pan_drag_start,
@@ -4077,6 +4124,7 @@ impl App {
         swap_field!(archive_source_override);
         swap_field!(zip_nav);
         swap_field!(list_order);
+        swap_field!(folder_order);
         swap_field!(stack_mode_requested);
         swap_field!(stack_view);
         swap_field!(stack_showing_flat);
@@ -4105,6 +4153,7 @@ impl App {
         swap_field!(facet_name_cache_pending);
         swap_field!(facet_name_cache_failed_generation);
         swap_field!(thumbnails);
+        swap_field!(thumbnail_standins);
         swap_field!(image_metas);
         swap_field!(video_thumb_overrides);
         swap_field!(auto_aspect);
@@ -4278,7 +4327,7 @@ impl App {
         swap_field!(fs_zoom_factor);
         swap_field!(fs_pdf_rerender_demand);
         swap_field!(fs_continuous_fit_reference);
-        swap_field!(fs_pan_drag_start);
+        swap_field!(fs_canvas_drag);
         swap_field!(fs_vertical_scroll);
         swap_field!(fs_seek_drag_active);
         swap_field!(fs_seek_gesture);
@@ -4288,7 +4337,6 @@ impl App {
         swap_field!(page_turn_presentation);
         swap_field!(continuous_page_transitions);
         swap_field!(fs_free_rotation);
-        swap_field!(fs_rotation_drag_start);
         swap_field!(analysis_zoom);
         swap_field!(analysis_pan);
         swap_field!(analysis_pan_drag_start);
@@ -4475,7 +4523,10 @@ impl App {
         });
         self.bump_items_generation();
         if record_matches_basis {
-            self.folder_observation.as_mut().unwrap().generation = self.items_generation;
+            let projection_key = self.current_folder_projection_key(&restore.origin);
+            let record = self.folder_observation.as_mut().unwrap();
+            record.generation = self.items_generation;
+            record.projection_key = projection_key;
         }
         self.bump_render_epoch_only();
         self.reconcile_restored_cover_thumbnails();
@@ -4489,12 +4540,7 @@ impl App {
         // Depth belongs to the original main fullscreen identity. Retire its request
         // and callback slot before moving viewer state to a new owner. Panorama's
         // existing state/intent transfer below remains unchanged.
-        if self.fs_exclusive_view.is_depth() {
-            self.set_fs_exclusive_view(
-                crate::fs_exclusive_view::FsExclusiveView::None,
-                "fork_exclusive_owner",
-            );
-        }
+        self.retire_exclusive_view_for_owner_change("fork_exclusive_owner");
         // The transient reader and its return lifetime move as one owner; the main
         // projection receives the unchanged, already prepared physical basis.
         let direct_owner = self.direct_media_reader_active().then(|| {
@@ -4535,6 +4581,7 @@ impl App {
             archive_source_override,
             zip_nav,
             list_order,
+            folder_order,
             stack_mode_requested,
             stack_view,
             stack_showing_flat,
@@ -4563,6 +4610,7 @@ impl App {
             facet_name_cache_pending,
             facet_name_cache_failed_generation,
             thumbnails,
+            thumbnail_standins,
             image_metas,
             video_thumb_overrides,
             auto_aspect,
@@ -4725,7 +4773,7 @@ impl App {
             fs_zoom_factor,
             fs_pdf_rerender_demand,
             fs_continuous_fit_reference,
-            fs_pan_drag_start,
+            fs_canvas_drag,
             fs_vertical_scroll,
             fs_seek_drag_active,
             fs_seek_gesture,
@@ -4735,7 +4783,6 @@ impl App {
             page_turn_presentation,
             continuous_page_transitions,
             fs_free_rotation,
-            fs_rotation_drag_start,
             analysis_zoom,
             analysis_pan,
             analysis_pan_drag_start,
@@ -4838,6 +4885,7 @@ impl App {
             display_epub_source,
             fullscreen_epub_source,
             favorite_view_context,
+            folder_order,
             archive_source_override,
             zip_nav,
             stack_mode_requested,
@@ -4857,6 +4905,7 @@ impl App {
             facet_name_cache_generation,
             facet_name_cache_failed_generation,
             thumbnails,
+            thumbnail_standins,
             image_metas,
             auto_aspect,
             selected,
@@ -4966,7 +5015,7 @@ impl App {
             fs_zoom_factor,
             fs_pdf_rerender_demand,
             fs_continuous_fit_reference,
-            fs_pan_drag_start,
+            fs_canvas_drag,
             fs_vertical_scroll,
             fs_seek_drag_active,
             fs_seek_gesture,
@@ -4976,7 +5025,6 @@ impl App {
             page_turn_presentation,
             continuous_page_transitions,
             fs_free_rotation,
-            fs_rotation_drag_start,
             analysis_zoom,
             analysis_pan,
             analysis_pan_drag_start,
@@ -5158,6 +5206,14 @@ impl App {
             ai_classify_cache,
         );
         if let Some((mut snapshot, surface)) = direct_owner {
+            let mut restored_order = snapshot.saved_folder_order.clone();
+            restored_order.order_revision = self
+                .folder_order
+                .order_revision
+                .max(restored_order.order_revision)
+                .checked_add(1)
+                .expect("folder order revision exhausted");
+            self.folder_order = restored_order;
             self.items = std::mem::take(&mut snapshot.saved_items);
             self.thumbnails = std::mem::take(&mut snapshot.saved_thumbnails);
             self.converted_archive_cache_paths =
@@ -5499,6 +5555,10 @@ impl App {
 
     pub(in crate::app) fn mounted_viewer_context_id(&self) -> Option<ViewerContextId> {
         self.viewer_contexts.table.mounted_id()
+    }
+
+    pub(in crate::app) fn foreground_viewer_context_id(&self) -> Option<ViewerContextId> {
+        self.viewer_contexts.table.foreground_id()
     }
 
     /// Identity of the payload currently projected onto `App`, including a context being built.
@@ -6057,6 +6117,7 @@ impl App {
         let ops = self.viewer_contexts.table.plan_mount(id)?;
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_mount();
+        let outermost = self.viewer_contexts.table.enter_mount_scope(original);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         let ops = self
             .viewer_contexts
@@ -6065,6 +6126,9 @@ impl App {
             .expect("mounted viewer-context owner disappeared");
         self.execute_viewer_context_ops(ops, None);
         self.viewer_contexts.table.finish_mount();
+        self.viewer_contexts
+            .table
+            .leave_mount_scope(original, outermost);
         match result {
             Ok(value) => Ok(value),
             Err(payload) => std::panic::resume_unwind(payload),
@@ -6514,6 +6578,10 @@ impl App {
         ViewerContextId::single_context()
     }
 
+    pub(in crate::app) fn foreground_viewer_context_id(&self) -> Option<ViewerContextId> {
+        Some(ViewerContextId::single_context())
+    }
+
     pub(in crate::app) fn with_viewer_context<R>(
         &mut self,
         id: ViewerContextId,
@@ -6694,6 +6762,201 @@ mod tests {
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
+
+    #[cfg(windows)]
+    #[test]
+    fn page_edit_920_scoped_mount_keeps_outer_foreground_through_nested_reentry() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.viewer_context_main();
+        app.address = "foreground".into();
+        let first = app.build_window_context_for_test(19201, |owner| {
+            owner.address = "first".into();
+        });
+        let second = app.build_window_context_for_test(19202, |owner| {
+            owner.address = "second".into();
+        });
+        app.conceal_mode = true;
+        assert!(app.page_edit_tools_owned_by_projected_context());
+
+        app.with_viewer_context_state(first, |owner| {
+            assert_eq!(owner.mounted_viewer_context_id(), Some(first));
+            assert_eq!(owner.foreground_viewer_context_id(), Some(main));
+            assert!(!owner.page_edit_tools_owned_by_projected_context());
+            assert_eq!(owner.address, "first");
+            assert!(
+                owner.conceal_mode,
+                "the draft mode remains foreground-owned"
+            );
+            owner
+                .with_viewer_context_state(second, |nested| {
+                    assert_eq!(nested.projected_viewer_context_id(), second);
+                    assert_eq!(nested.foreground_viewer_context_id(), Some(main));
+                    assert!(!nested.page_edit_tools_owned_by_projected_context());
+                    assert_eq!(nested.address, "second");
+                })
+                .unwrap();
+            owner
+                .with_viewer_context_state(first, |nested| {
+                    assert_eq!(nested.foreground_viewer_context_id(), Some(main));
+                    assert!(!nested.page_edit_tools_owned_by_projected_context());
+                })
+                .unwrap();
+            owner
+                .with_viewer_context_state(main, |nested| {
+                    assert_eq!(nested.foreground_viewer_context_id(), Some(main));
+                    assert!(nested.page_edit_tools_owned_by_projected_context());
+                    assert_eq!(nested.address, "foreground");
+                })
+                .unwrap();
+            assert_eq!(owner.foreground_viewer_context_id(), Some(main));
+            assert!(!owner.page_edit_tools_owned_by_projected_context());
+        })
+        .unwrap();
+
+        assert_eq!(app.mounted_viewer_context_id(), Some(main));
+        assert_eq!(app.foreground_viewer_context_id(), Some(main));
+        assert!(app.page_edit_tools_owned_by_projected_context());
+        assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+        assert!(app.conceal_mode);
+        assert_eq!(app.address, "foreground");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_edit_920_scoped_mount_panic_restores_and_clears_only_outer_scope() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.viewer_context_main();
+        let first = app.build_window_context_for_test(19203, |_| {});
+        let second = app.build_window_context_for_test(19204, |_| {});
+        app.with_viewer_context_state(first, |owner| {
+            let panic = catch_unwind(AssertUnwindSafe(|| {
+                let _ = owner.with_viewer_context_state(second, |nested| {
+                    assert_eq!(nested.foreground_viewer_context_id(), Some(main));
+                    panic!("nested page edit owner panic");
+                });
+            }));
+            assert!(panic.is_err());
+            assert_eq!(owner.projected_viewer_context_id(), first);
+            assert_eq!(owner.foreground_viewer_context_id(), Some(main));
+            assert_eq!(
+                owner.viewer_contexts.table.scoped_mount_original,
+                Some(main)
+            );
+        })
+        .unwrap();
+        assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = app.with_viewer_context(first, |owner| {
+                owner
+                    .with_viewer_context_state(second, |_| {
+                        panic!("unwind through both mount scopes");
+                    })
+                    .unwrap();
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(app.mounted_viewer_context_id(), Some(main));
+        assert_eq!(app.foreground_viewer_context_id(), Some(main));
+        assert!(app.page_edit_tools_owned_by_projected_context());
+        assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_edit_920_rejected_mount_leaves_foreground_scope_unchanged() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.viewer_context_main();
+        let first = app.build_window_context_for_test(19205, |_| {});
+        let retiring = app.build_window_context_for_test(19206, |_| {});
+        app.viewer_contexts.table.begin_retire(retiring).unwrap();
+        let unknown = ViewerContextId::for_test(u64::MAX);
+        for id in [retiring, unknown] {
+            assert!(
+                app.with_viewer_context_state(id, |_| panic!("rejected callback"))
+                    .is_err()
+            );
+            assert_eq!(app.foreground_viewer_context_id(), Some(main));
+            assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+        }
+        app.with_viewer_context_state(first, |owner| {
+            for id in [retiring, unknown] {
+                assert!(
+                    owner
+                        .with_viewer_context_state(id, |_| panic!("rejected nested callback"))
+                        .is_err()
+                );
+                assert_eq!(owner.projected_viewer_context_id(), first);
+                assert_eq!(owner.foreground_viewer_context_id(), Some(main));
+                assert_eq!(
+                    owner.viewer_contexts.table.scoped_mount_original,
+                    Some(main)
+                );
+            }
+        })
+        .unwrap();
+        assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn page_edit_920_build_commit_abort_and_promote_follow_mounted_owner_without_scope() {
+        let mut app = crate::app::setup_app_for_test();
+        let main = app.viewer_context_main();
+        let built = app
+            .build_viewer_context("page_edit_920_commit", |owner, reserved| {
+                assert_eq!(owner.mounted_viewer_context_id(), None);
+                assert_eq!(owner.projected_viewer_context_id(), reserved);
+                assert_eq!(owner.foreground_viewer_context_id(), None);
+                assert!(!owner.page_edit_tools_owned_by_projected_context());
+                assert!(
+                    owner
+                        .with_viewer_context_state(main, |_| panic!("building callback"))
+                        .is_err()
+                );
+                assert!(owner.viewer_contexts.table.scoped_mount_original.is_none());
+                BuildOutcome::Commit
+            })
+            .unwrap();
+        assert_eq!(app.foreground_viewer_context_id(), Some(main));
+        assert!(app.page_edit_tools_owned_by_projected_context());
+        assert_eq!(
+            app.build_viewer_context("page_edit_920_abort", |owner, _| {
+                assert_eq!(owner.foreground_viewer_context_id(), None);
+                assert!(!owner.page_edit_tools_owned_by_projected_context());
+                BuildOutcome::Abort("page_edit_920_test")
+            }),
+            None
+        );
+        assert_eq!(app.foreground_viewer_context_id(), Some(main));
+
+        // A persistent mount is not a service scope and must establish its own foreground.
+        let ops = app.viewer_contexts.table.plan_mount(built).unwrap();
+        app.execute_viewer_context_ops(ops, None);
+        app.viewer_contexts.table.finish_mount();
+        assert_eq!(app.foreground_viewer_context_id(), Some(built));
+        assert!(app.page_edit_tools_owned_by_projected_context());
+        assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+        app.with_viewer_context_state(main, |owner| {
+            assert_eq!(owner.foreground_viewer_context_id(), Some(built));
+            assert!(!owner.page_edit_tools_owned_by_projected_context());
+        })
+        .unwrap();
+        let ops = app.viewer_contexts.table.plan_mount(main).unwrap();
+        app.execute_viewer_context_ops(ops, None);
+        app.viewer_contexts.table.finish_mount();
+        assert_eq!(app.foreground_viewer_context_id(), Some(main));
+
+        assert_eq!(
+            app.stash_mounted_and_start_fresh("page_edit_920_promote"),
+            main
+        );
+        let fresh = app.viewer_context_main();
+        assert_ne!(fresh, main);
+        assert_eq!(app.foreground_viewer_context_id(), Some(fresh));
+        assert!(app.page_edit_tools_owned_by_projected_context());
+        assert!(app.viewer_contexts.table.scoped_mount_original.is_none());
+    }
 
     #[cfg(windows)]
     #[test]
@@ -7514,6 +7777,7 @@ mod tests {
             proof: Some(FolderRescanProof {
                 baseline: None,
                 projection_key: 0,
+                order_revision: app.folder_order.order_revision,
                 subscription: Some((epoch, 0)),
             }),
             cause,
@@ -8085,6 +8349,7 @@ mod tests {
                 },
                 generation_id: app.items_generation,
                 saved_items: vec![basis.clone()],
+                saved_folder_order: app.folder_order.clone(),
                 saved_projection_recipe: app.projection_recipe.clone(),
                 saved_viewing_state: app.capture_snapshot_viewing_state(),
                 saved_page_identity_index: app.page_identity_index.clone(),
@@ -9519,7 +9784,7 @@ mod tests {
         let mut rating = crate::app::setup_app_for_test();
         let source = tempfile::tempdir().unwrap();
         std::fs::write(source.path().join("keep.jpg"), []).unwrap();
-        rating.load_folder(source.path().to_path_buf());
+        rating.load_folder_and_finish_for_test(source.path().to_path_buf());
         rating.enter_rating_view(5);
         assert!(rating.rating_view_pending.is_some());
         let rating_address = rating.address.clone();

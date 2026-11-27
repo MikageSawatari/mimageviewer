@@ -11,6 +11,9 @@ pub(crate) const DURATION_SORT_UNSUPPORTED: &str =
 pub(crate) const PAGE_COUNT_SORT_UNSUPPORTED: &str =
     "この一覧ではページ数順を使えません。詳細表示のページ数列で並べ替えられます";
 
+const MANUAL_ORDER_UNSUPPORTED: &str =
+    "この一覧では手動順を使えません。本のページ順が固定されていない通常フォルダで使えます";
+
 pub(crate) struct ListingSortContext<'a> {
     pub(crate) surface: &'a TopLevelGridSurface,
     pub(crate) recipe: &'a ProjectionRecipe,
@@ -22,6 +25,7 @@ pub(crate) struct ListingSortContext<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ListingSortCapabilities {
+    pub(crate) manual_order_disabled_reason: Option<&'static str>,
     pub(crate) lazy_metric_allowed: bool,
     pub(crate) sort_locked_reason: Option<GridSortLockReason>,
     rating_disabled_reason: Option<&'static str>,
@@ -99,6 +103,7 @@ pub(crate) fn listing_sort_capabilities(
         None
     };
     ListingSortCapabilities {
+        manual_order_disabled_reason: (!lazy_metric_allowed).then_some(MANUAL_ORDER_UNSUPPORTED),
         lazy_metric_allowed,
         sort_locked_reason,
         rating_disabled_reason,
@@ -118,14 +123,19 @@ impl App {
     }
 
     pub(crate) fn listing_sort_capabilities(&self) -> ListingSortCapabilities {
-        listing_sort_capabilities(ListingSortContext {
+        let mut capabilities = listing_sort_capabilities(ListingSortContext {
             surface: self.top_level_grid_view.surface(),
             recipe: &self.projection_recipe,
             page_order_locked: self.page_order_locked_for_current_view(),
             details_sort_active: self.details_header_sort_active(),
             collection_root: self.collection_grid_root_order().is_some(),
             existing_lock: self.grid_sort_lock_reason(),
-        })
+        });
+        // Manual is a base-list policy. A details header only overlays its
+        // presentation, while provenance and physical page order remain decisive.
+        capabilities.manual_order_disabled_reason =
+            (!self.folder_manual_order_eligible()).then_some(MANUAL_ORDER_UNSUPPORTED);
+        capabilities
     }
 
     pub(crate) fn effective_listing_sort_order(&self, order: SortOrder) -> SortOrder {
@@ -136,6 +146,22 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_manual_capability_ignores_details_overlay_but_respects_physical_page_lock() {
+        for locked in [false, true] {
+            let result = listing_sort_capabilities(ListingSortContext {
+                surface: &TopLevelGridSurface::Folder,
+                recipe: &ProjectionRecipe::OrdinaryList,
+                page_order_locked: locked,
+                details_sort_active: true,
+                collection_root: false,
+                existing_lock: None,
+            });
+            assert_eq!(result.manual_order_disabled_reason.is_some(), locked);
+            assert!(result.disabled_reason(SortOrder::FileName).is_some());
+        }
+    }
 
     fn capabilities(surface: &TopLevelGridSurface) -> ListingSortCapabilities {
         listing_sort_capabilities(ListingSortContext {

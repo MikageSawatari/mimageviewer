@@ -966,6 +966,7 @@ fn cover_cache_direct_reader_split_restores_stale_saved_basis_without_pixels_or_
             },
             generation_id: app.items_generation,
             saved_items: vec![basis.clone()],
+            saved_folder_order: app.folder_order.clone(),
             saved_projection_recipe: app.projection_recipe.clone(),
             saved_viewing_state: app.capture_snapshot_viewing_state(),
             saved_page_identity_index: app.page_identity_index.clone(),

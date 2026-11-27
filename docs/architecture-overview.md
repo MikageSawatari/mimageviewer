@@ -1,5 +1,8 @@
 # アーキテクチャ概観
 
+Windows のボタン入力は vendor egui-winit のプロセス共通時計・wndproc 呼出単位の証跡から egui の `EdgeTime` へ運ぶ。
+egui・一覧・ツリーは両端の入力時刻が分かる組だけ実入力の間隔を使い、処理待ちをクリックの時間へ混ぜない ([設計 §16](fullscreen-double-click-close-plan.md))。
+
 ## マスクの自動検出（§1.914 段 2、実装・検証状況は §23）
 
 同梱 YuNet と利用者が置く Ultralytics detect / segment の ONNX を、消しゴム・隠蔽加工・補正レイヤーの共通ダイアログから使う。
@@ -14,6 +17,62 @@ UI は対象の一致を確かめ、箱の図形と輪郭パッチを各ツー�
 補正レイヤーは `PageEditOwner` と開始時の文書も照合する。表示の合成順とマスクの永続データ形式は変えない。
 ダイアログは embedded を含む fullscreen の closure だけで描き、ROOT との二重描画を避ける。
 詳細と未実施の検証は [自動検出計画 §5〜§7・§9・§23](auto-conceal-detection-plan.md) を参照。
+
+## 操作のスクリプト（§1.363 段1〜5・§17）
+
+`operation_script` がサンドボックス、状態の写し、スロット・戻り値の解釈、操作の許可表と並びの検査を持つ。
+§17.2/17.3では画像の3D・スライドショーを手動の種別Aへ追加し、キーの各処理位置に残す純粋判定と
+既存トグル本体を共有する。新しい非同期ownerは作らない。6つの状態追加は入力面と再生器に応じたメモリ値だけ。
+App共通の `OperationScriptLoader` は、無効／読み込み中／使える／失敗を一つの値で保持し、viewer contextのbundleには含めない。
+段5と§17.5ではloader所有の遅延起動する単一FIFO workerへ、Load / Open / Reset / AI読み取り / AI書き込みを受け付け順に投入する。
+Loadは欠落時の雛形作成・本文読み込み・コンパイル・`slots()` 評価、Openは欠落時の作成とエディタ起動、
+Resetは既定本文への安全な置き換えを担う。Resetの後に投入したLoadが古い本文を読む競合を除く。
+ROOTは読み込み状態に関係なく受け口を毎フレームdrainする。通常のLoadは現在のLoading世代だけ採用する。
+AI書き込みは受付時に状態・世代を変えず、OFF以外では現世代を捕捉する。照合・コンパイル・slots評価・置き換えが
+成功した本文だけを別の結果種別AiWriteで同じ受け口へ返し、現世代かつReady / Failedなら採用する。
+Loading中の受付は先行Load結果の後に届く。拒否・失敗はloaderへ結果を送らず、状態も採用本文も変えない。
+後のReload / OFF / 再ONは世代を進め、古いAiWriteの採用を失効させる。OFF中は保存だけで有効化時のLoadが読む。
+OFFは世代を進め、workerと受け口を保持する。Open/Reset失敗は全状態でログと通知にする。
+UIはI/O・完了待ち・終了joinをせず、loader破棄で送り口を閉じる。受理済み要求は処理後に終わるが、プロセス終了時の完了は保証しない。
+コンパイル済みの値はヒープに保持し、`rhai/sync` によりASTをworkerから渡す。
+環境設定のOperationScriptページは、下書きの有効化と初回確認をOKで一緒に確定する唯一の書き手。
+ファイルボタンは即時投入し、再読み込みだけは確定済みenabledで可否を決める。状態はメモリからページへ写し、
+スロットの番号・label・関数名とon_eventの有無を示す。labelはここ及び右クリックのみで、操作カスタマイズ名は固定。
+設定転送・AI設定変更はこの2設定を対象外とする。
+段2aでは `app::operation_script_runtime` が入力面に基づく利用資格・在メモリの状態の写し・同期実行を所有し、
+`operation_script_grid` と画像の全画面の共用実行関数へ検査済みの操作を順に渡す。
+対象の型付き識別・チェック集合は呼出し内のローカル値として比較し、後処理の要る結果を既存の呼出し元へ返す。
+一覧の全入口と全画面の描画前の入口を接続している。段2bの描画内入口は、スロットと受信時の識別を
+所有passローカルの `FsScriptFrame` へ返し、メニューと表示設定の適用後に所有viewportのctxで実行する。
+結果は `FsKeyAction::merge_script_action` で既存の移動要求へ合流し、既存dispatcherで1回処理する。
+Closedは既に終了した結果としてdispatcherを通さず、Rebasedは番号だけ取り直す。
+保留wheelの適用順は維持し、保留と同じフレームのスクリプト要求・適用内のスクリプトは通知して拒否する。
+段3では `execute_video_key_action` が解決済みKeyActionの動画・音声操作を共有する。
+nativeは実行完了の受付可否だけを返し、eguiの動画・音楽は既存の `FsKeyAction` を返す。
+nativeのキー・Browserキー・マウス・リングはその場で実行し、音楽表示は描画の所有passの経路を保つ。
+native overlayの文字入力は保持済みの入力snapshotで判断し、動画の状態欄はplayerの保持値だけを読む。
+通常native動画の右クリックメニューの実行は設計担当の判断で段3から外し、共通モデルと選択後のスロット返却を保持する。
+ROOTにフォーカスがある全画面のキーは既存のROOT側予備経路で実行する。共有Contextの転送分岐は変更しない。
+段4では `operation_script_runtime::events` がmain専用のbaseline・ROOT frame番号・rolling実行上限をbundle外で所有する。
+一覧ROOT、egui viewerの所有pass、native ROOTでキーより前に1frame1回検出し、利用資格を満たす時だけ評価する。
+入れ物は表示項目のtyped identityから導出し、pageは段2bと共用するscalarとstrong composition Arcを比較する。
+段2bの要求照合はreader orderを含む従来のO(N)を保つ。イベントは全件検査済みAだけをslotと同じ実行関数へ渡し、
+同frameの再snapshotを基準にする。r12の方向/合わせ方は検出側のopenを含む回だけ許し、イベント集合を並び全体の事前検査へ渡す。
+段4は47fdcb264で関連253テスト成功（設計担当が実行）、独立実装レビュー3回目でACCEPT。既存release識別計測も実施済み。段5は実装済み。自動検証・独立実装レビュー・設計担当の検収と、event_execute費用の実測・実機は未確認。
+r13は再生/ループ/全シーク9操作をイベント不可にし、共用実行の同期保存は利用者の例外決定で保つ。
+`script/event_execute`が評価・検査・全操作と同frame取り直しの費用を記録する。後方3種の追加除外と残る動画4操作の監査は計画§16に記す。
+詳細は [設計](operation-script-plan.md)。
+
+## 魚眼ズームと写真の板の傾け (PlaneView)
+
+- `plane_view.rs`: レンズの設定型、ページ/slice anchor、純粋なホイール遷移、魚眼と遠近のCPU参照式、四元数の傾き、パン/レンズ/傾けの排他的なドラッグ所有型。
+- `app/plane_view.rs`: 共通の入口/継続照合、傾けの所有と最初の非ゼロ移動による入場、素材採用、描画snapshot、出力要求、表示所有者交代時のDepth/PlaneView退役。
+- `plane_view_wgpu.rs` / `plane_view_wgpu/export.rs`: 共通WGSL、format別pipeline、不変素材、callback別uniform、workerでのoffscreen描画とreadback。
+- `gpu_color_copy.rs`: DepthとPlaneView共用のblit/mip生成。context共通の可変素材slotは置かない。
+
+状態は既存 `FsExclusiveView` のvariant。detachedの配送とviewportは拡張せず、既存ownerの中で完結する。
+キャプチャ/コピー/書き出しの既存workerへ不変snapshotを渡し、GPU待機をUIへ持ち込まない。
+[正本と実装記録](fisheye-plane-view-plan.md)を参照。
 
 ## ブラウザ閲覧の保存先のページ構成（§1.870）
 
@@ -52,11 +111,14 @@ Web の AI は同じ worker で案内の文をコピーし、共通の App 受�
 操作の要求内では override 名を一度ずつ解釈する索引を作り、実効キー・変更前後の値・置換位置に共有する。
 `agent/get_operations`・`agent/set_operations` は許可検査から応答までの `duration_ms`、`agent/set_operations_commit` は既存確定経路の時間を記録する。
 `agent-ipc::bound_page_rows` は設定と操作の単行・ページ合計予算を共通化し、所属を保ったまま大きい行を省く。
-IPC 版は 7。スタック用スクリプトの本文は、同じ設定許可の `stack_script` で読み書きする。
+IPC 版は 8（`operation_script` を追加、版7の凍結fixtureを保持）。スタック用スクリプトの本文は、同じ設定許可の `stack_script` で読み書きする。
 本文の取得・検査は agent worker、AI の照合付き書き込みと環境設定の「既定に戻す」「スクリプトを開く」は
 `filename_stack_script` の単一 FIFO worker に集約する。ボタンは enqueue だけで、UI は I/O・完了待ち・監視を行わない。
 書き込みは本文全体の SHA-256 を照合し、変更行とログには本文を出さず行数だけを残す。
 表示中のスタックは再構成せず、開き直し・フォルダ再読込時に新しい本文を使う。
+操作スクリプトは同じ設定許可の `operation_script` で本文を読み書きするが、有効化と初回確認は利用者だけが行う。
+UIで受付とFIFO投入を一緒に行い、loader所有の列と結果採用規約を使う（上の操作スクリプト節）。
+応答のenabled・読み込み状態は受付時点の写しで、返したSHA-256の本文の採用結果ではない。
 詳細は[設計と区切りごとの検証記録](mcp-guide-settings-plan.md)を参照。
 
 ## 3Dスライドショーの準備と提示（§1.771）
@@ -581,6 +643,9 @@ GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付�
 | `lib.rs` | アプリの単一 crate root。全モジュール宣言、logger / eframe 起動、worker サブコマンド分岐を所有し、unit test・integration test・実行ファイルで同じコンパイル結果を共有する |
 | `run_native_failure.rs` | `run_native` 復帰後の単一終了境界。watchdog休止、失敗分類・原因連鎖の記録、既存cleanup、terminal・flush後のnative通知を順序付ける。自動script実行は通知だけを抑止する。詳細は [描画失敗の報告設計](render-init-failure-report-plan.md) |
 | `app.rs` | `App` 構造体と `eframe::App` 実装。非描画の`logic`と、root Uiを受ける`ui`へ状態遷移を接続する |
+| `folder_order.rs` / `folder_order/listing.rs` | `folder_order.db` の単一 FIFO actor、読込前の索引準備と追記専用の記録索引、全順と inventory の合成、移行元優先の改名、物理一覧の共通 eligibility / resolver / context 所有状態を持つ。Remote と Agent IPC の worker も共有 handle を使う |
+| `app/folder_manual_order.rs` | 手動／通常／リセット／保存の共通遷移、書込完了の context と revision 照合、手動適用時だけの投影キー拡張。状態は items と対で Box のまま viewer bundle と snapshot を移り、fork は独立した写しを持つ |
+| `app/folder_order_drag.rs` | サムネイル一覧の手動並べ替え。開始時の identity・可視選択・context・世代・revision・表示条件を固定し、変更時は取消す。挿入位置・挿入線・端数を保持する row 単位の外部スクロールを処理し、成功時は既存 sort refresh へ渡す。未確定操作は egui temporary data が所有し、App の inline field を増やさない |
 | `app/canvas_gesture.rs` | 補正・消しゴム・隠蔽 canvas の順序付き pointer transport。所有 viewport の press/move/release と frame 内の一度だけの消費を扱い、文書・Undo・保存は各編集 owner へ渡す（§1.679） |
 | `app/update_phases.rs` | service・input・render・post-renderの既存順序を所有。表示採用とGPU uploadはUI側へ残す |
 | `app/prepared_edit.rs` | 紙めくり§28段階BのNext編集準備。局所補正・隠蔽・final・注釈をCPU workerで作り、既存`final_effect_pending`のComputing／CpuReady／Registeringで一括公開まで所有する。新しい待機ownerを持たず、表示引取りと編集入口の取消を同じ境界へ集約する。実装・検証進行中、結果は`target/pageturn-1461/implementation-report-b.md` |
@@ -1067,6 +1132,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `book_composition.db`（§1.242 G2、未リリース） | `book_compositions(book_key PRIMARY KEY, revision, schema_version, composition_json)`、schema 2。一行のJSONに検証domainと方向・表紙・順序・hidden・overrideを持つ。未公開旧units移行なし。KeepDrive共有BookScopeKey、local revision、単一writer・immutable snapshot・worker-only maintenance。新storeのmigrationなし。未知/破損は原本保持・書込停止。STORESのrename/purge/copy/probe/cleanup、内容ID Edit観測、明示metadata v11専用family、確認済み完全resetへ登録。Folder sidecarはG4F | `book_composition/{store,service}.rs` |
 | `book_resume.db` | コンテナpathとraw items indexで位置を復元。記録時のHUD読み順ordinal/totalをnullable列に保存し、通常Folder/ZIP/PDF一覧の下端メーターに常に左から右へ表示。旧2列DBへのALTERと一覧全行読込は既存writerで実行。App共通メモリmapを記録受付時にも更新し、描画はmap参照のみ。動画/音声の同じ帯は既存video_resume_positionsと取得済みvideo_metaを読み、別の位置map/DB列は作らない。Remoteは補助列NULL (IPC不変) | `book_resume_db.rs`, `app/book_resume_meter.rs`, [設計・割り切り](book-resume-meter-plan.md) |
 | `reading_history.db` | ユーザー操作で開いた画像フォルダ / ZIP / PDF / 変換アーカイブと動画・音声ファイルの MRU。既存 kind 文字列を維持し、`video` / `audio` と専用の `media_position_ms` / `media_duration_ms` を追加する。未知 kind は行ごと読み飛ばす。保持件数は 1..=1000 | `reading_history_db.rs` + `App::record_reading_history` |
+| `folder_order.db` | フォルダ手動順の項目位置とフォルダ単位の active / revision。KeepDrive、schema 1。専用 actor が読取・保存・有効切替・リセット・改名を直列化する。PC の各一覧 producer と Remote / Agent IPC は worker から同じ handle で読む。STORES は削除 purge のみで、汎用改名・管理本保守・複写・孤児整理から除外 | `folder_order.rs`、[設計](folder-manual-order-plan.md) |
 | `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile/ConvertibleArchive) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` と変換アーカイブの `archivethumb:*#pin:*` が cache key suffix `#pin:{source_id}` で identity を表現し、cascade 時は途中コンテナを含む経路 hash を source_id に加える | `folder_thumb_pins.rs` |
 | `edit_preview_cache.db` | 非破壊編集結果を一覧へ戻す派生 preview の対応表 / LRU。page source の mtime + size と親代表用 container size、crop 後の一覧寸法を保持する。§1.165 B1 は released v6 を維持し nullable `source_coverage_json`／`layout_dims_json` / `metadata_content_hash` を加法追加する。旧行/WebP を残し、新生成は実 pixel bounds と正規座標/raster 寸法、独立したPDF page-box寸法を同じ upsert で保存する。WebP 本体は `edit_preview_cache/` 配下で、各 row が item-key hash directory の下地 + 注釈 layer を単独所有する | `edit_preview_cache.rs` + `source_coverage.rs` |
 | `video_pins.db` | ユーザーがフルスクリーン HUD で指定した動画フレームの抽出 WebP。`(path, pin_pts_secs, thumb_webp, thumb_pts_secs)`。folder thumb pin の source が動画のときは `seed_folder_video_pin_thumbs` が起動時にこの WebP を catalog にミラー seed する。左ジャンプパネルのピン行もこの WebP を再利用する | `video_pins.rs` |

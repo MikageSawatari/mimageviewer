@@ -106,6 +106,8 @@ final pipeline を適用する。
 
 ### 3.3 現行の共有境界
 
+編集途中の項目交代・一覧の入力・終了時の保存の契約は [page-edit-item-change-plan.md](page-edit-item-change-plan.md) (§1.920) を参照。
+
 消しゴムとツールパレットを **完全一致 (10 種)** させ、`mask_db.rs` と
 `Shape` enum 対応に拡張し、両ツールから共有する:
 

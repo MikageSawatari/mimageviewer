@@ -389,6 +389,9 @@ impl App {
     /// Single ページへ pivot し、退場時に spread 状態を復元する。crop は表示 overlay
     /// のみで重い合成が無いため、post_filter バイパスや base cache 準備は行わない。
     pub(crate) fn enter_export_crop_mode(&mut self, fs_idx: usize) {
+        if !self.fullscreen_edit_mode_entry_allowed(fs_idx) {
+            return;
+        }
         self.finish_export_crop_drag(OverlayDragEnd::ModeExit);
         let (target_idx, pivot) = self.plan_page_edit_pivot(fs_idx);
         if !self.raw_edit_target_entry_allowed(target_idx) {
@@ -400,6 +403,7 @@ impl App {
             self.export_crop_spread_ctx = Some(pivot);
             self.enter_page_edit_single_view(target_idx);
         }
+        self.stop_projected_slideshow_playback();
         self.export_crop_mode = true;
     }
 
@@ -430,6 +434,7 @@ impl App {
             return Default::default();
         }
         let action = crate::ui_fullscreen::FsKeyAction {
+            script_slot: None,
             page_transition: Default::default(),
             close: false,
             close_to_page_list: false,
@@ -1545,7 +1550,7 @@ mod tests {
             true,
             true,
         );
-        assert!(app.fs_pan_drag_start.is_some());
+        assert!(app.fs_canvas_drag.pan_start().is_some());
         assert!(app.export_crop_drag.is_none());
         assert!(app.export_crop_create_drag.is_none());
 
@@ -1560,7 +1565,7 @@ mod tests {
             false,
             true,
         );
-        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_canvas_drag.pan_start().is_none());
         assert!(app.export_crop_drag.is_none());
         assert!(
             app.export_crop_create_drag.is_none(),
@@ -1578,7 +1583,7 @@ mod tests {
             false,
             true,
         );
-        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_canvas_drag.pan_start().is_none());
         assert!(app.export_crop_drag.is_none());
         assert!(app.export_crop_create_drag.is_none());
     }

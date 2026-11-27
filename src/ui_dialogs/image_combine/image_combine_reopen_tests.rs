@@ -60,8 +60,7 @@ fn image_combine_reopen_busy_scan_refuses_handler_without_blocking_scan_adoption
             image::RgbImage::new(2, 2).save(path).unwrap();
         }
         app.settings.sort_order = SortOrder::FileName;
-        app.load_folder(folder.clone());
-        app.finish_page_identity_preparation_for_test();
+        app.load_folder_and_finish_for_test(folder.clone());
         app.image_combine
             .index
             .set_keys_for_test([crate::adjustment_db::normalize_path(&output)].into());

@@ -39,8 +39,10 @@ mod favorite_types;
 pub use favorite_types::*;
 mod stack_script_types;
 pub use stack_script_types::*;
+mod operation_script_types;
+pub use operation_script_types::*;
 
-pub const AGENT_PROTOCOL_VERSION: u32 = 7;
+pub const AGENT_PROTOCOL_VERSION: u32 = 8;
 pub const MIN_ADAPTER_PROTOCOL_VERSION: u32 = 3;
 /// Fixed pipe namespace identifier, unrelated to business IPC versions. Never change it.
 pub const AGENT_PIPE_NAMESPACE: &str = "mimageviewer-agent-v3";
@@ -71,6 +73,9 @@ pub enum RequestKind {
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 /// AI writes only; existing user script files retain the core's 1 MiB read cap.
 pub const MAX_STACK_SCRIPT_SOURCE_BYTES: usize = 256 * 1024;
+/// Complete UTF-8 source cap for operation-script reads and writes.
+pub const MAX_OPERATION_SCRIPT_SOURCE_BYTES: usize = 256 * 1024;
+pub const MAX_OPERATION_SCRIPT_FAILURE_REASON_CHARS: usize = 500;
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 200;
 pub const MAX_INFO_LIMIT: u32 = 50;
@@ -170,6 +175,11 @@ pub enum Command {
         container_index: Option<bool>,
     },
     StackScript {
+        source: Option<String>,
+        part: Option<u32>,
+        expected_sha256: Option<String>,
+    },
+    OperationScript {
         source: Option<String>,
         part: Option<u32>,
         expected_sha256: Option<String>,
@@ -317,6 +327,7 @@ pub enum Payload {
     SettingsWrite(SettingsWriteResult),
     FavoriteWrite(FavoriteWriteResult),
     StackScript(StackScriptResult),
+    OperationScript(OperationScriptResult),
     Items(ItemPage),
     Tags(TagPage),
     Collections(CollectionPage),
@@ -870,7 +881,7 @@ mod tests {
             incomplete["command"].as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<Request>(incomplete).is_err());
         }
-        assert_eq!(AGENT_PROTOCOL_VERSION, 7);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 8);
     }
 
     #[test]
@@ -996,7 +1007,7 @@ mod tests {
 
     #[test]
     fn collection_write_wire_roundtrips_grouped_input_positions() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 7);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 8);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -1068,7 +1079,7 @@ mod tests {
             .unwrap(),
             permission
         );
-        assert_eq!(AGENT_PROTOCOL_VERSION, 7);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 8);
     }
 
     #[test]
@@ -1147,7 +1158,7 @@ mod tests {
 
     #[test]
     fn metadata_write_wire_roundtrips_and_full_batch_outcomes_fit_budget() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 7);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 8);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -1224,7 +1235,7 @@ mod tests {
 
     #[test]
     fn open_wire_uses_typed_accepted_result_without_changing_protocol_version() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 7);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 8);
         assert_eq!(
             serde_json::to_value(Command::OpenInViewer {
                 path: "C:/猫.png".into(),

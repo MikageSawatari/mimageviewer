@@ -1012,6 +1012,7 @@ fn egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_own
                         matches!(
                             app.pending_return_to_parent,
                             FullscreenCloseContinuation::Live
+                                | FullscreenCloseContinuation::LiveWithPresentation(_)
                         ),
                         "{kind}: command {variant} must leave its accepted return pending"
                     );
@@ -1028,6 +1029,7 @@ fn egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_own
                     assert!(matches!(
                         app.pending_return_to_parent,
                         FullscreenCloseContinuation::Live
+                            | FullscreenCloseContinuation::LiveWithPresentation(_)
                     ));
                     assert_eq!(
                         app.fullscreen_idx,

@@ -95,7 +95,8 @@ fn move_bound_drag_to(app: &mut App, ctx: &egui::Context, total: Vec2) {
 }
 
 fn bound_drag_origin_pan(app: &App) -> Vec2 {
-    app.fs_pan_drag_start
+    app.fs_canvas_drag
+        .pan_start()
         .expect("the real canvas owns this drag")
         .1
 }
@@ -104,7 +105,7 @@ fn prepared_at_lower_edges(bound: bool) -> (egui::Context, crate::app::AppTestEn
     let (ctx, mut app) = prepared(bound, FullscreenFitMode::Width, 3.0);
     drag(&mut app, &ctx, Vec2::splat(-10000.0));
     seed(&ctx, &mut app);
-    assert!(app.fs_pan_drag_start.is_none());
+    assert!(app.fs_canvas_drag.pan_start().is_none());
     (ctx, app)
 }
 
@@ -124,11 +125,12 @@ fn drag_bound_rebases_blocked_axes_and_reverses_from_the_edge_immediately() {
     move_bound_drag_to(&mut app, &ctx, outward);
     close(app.fs_pan, edge);
     close(bound_drag_origin_pan(&app), edge - outward);
-    let rebased = app.fs_pan_drag_start;
+    let rebased = app.fs_canvas_drag.pan_start();
     move_bound_drag_to(&mut app, &ctx, outward + Vec2::new(100.0, 60.0));
     close(app.fs_pan, edge + Vec2::new(100.0, 60.0));
     assert_eq!(
-        app.fs_pan_drag_start, rebased,
+        app.fs_canvas_drag.pan_start(),
+        rebased,
         "an unconstrained reversal must retain both rebased axes"
     );
 }
@@ -169,17 +171,18 @@ fn drag_bound_waiting_layout_retains_the_absolute_origin_until_a_matching_paint(
     press(&mut app, &ctx);
     app.fullscreen_page_layout.drawn_unit = None;
     move_bound_drag_to(&mut app, &ctx, Vec2::new(25.0, -30.0));
-    let waiting_origin = app.fs_pan_drag_start;
+    let waiting_origin = app.fs_canvas_drag.pan_start();
     close(bound_drag_origin_pan(&app), initial);
     close(app.fs_pan, initial);
     move_bound_drag_to(&mut app, &ctx, Vec2::new(45.0, -60.0));
-    assert_eq!(app.fs_pan_drag_start, waiting_origin);
+    assert_eq!(app.fs_canvas_drag.pan_start(), waiting_origin);
     close(app.fs_pan, initial);
     seed(&ctx, &mut app);
     pointer_frame(&mut app, &ctx, vec![]);
     close(app.fs_pan, initial + Vec2::new(45.0, -60.0));
     assert_eq!(
-        app.fs_pan_drag_start, waiting_origin,
+        app.fs_canvas_drag.pan_start(),
+        waiting_origin,
         "a fully accepted absolute candidate does not rebase"
     );
 }
@@ -193,19 +196,19 @@ fn drag_bound_rebased_origin_survives_stale_frames_and_catches_up_after_paint() 
     press(&mut app, &ctx);
     let outward = Vec2::new(-300.0, -180.0);
     move_bound_drag_to(&mut app, &ctx, outward);
-    let rebased = app.fs_pan_drag_start;
+    let rebased = app.fs_canvas_drag.pan_start();
     close(bound_drag_origin_pan(&app), edge - outward);
     app.fullscreen_page_layout.drawn_unit = None;
     move_bound_drag_to(&mut app, &ctx, outward + Vec2::new(100.0, 60.0));
     close(app.fs_pan, edge);
-    assert_eq!(app.fs_pan_drag_start, rebased);
+    assert_eq!(app.fs_canvas_drag.pan_start(), rebased);
     move_bound_drag_to(&mut app, &ctx, outward + Vec2::new(120.0, 80.0));
     close(app.fs_pan, edge);
-    assert_eq!(app.fs_pan_drag_start, rebased);
+    assert_eq!(app.fs_canvas_drag.pan_start(), rebased);
     seed(&ctx, &mut app);
     pointer_frame(&mut app, &ctx, vec![]);
     close(app.fs_pan, edge + Vec2::new(120.0, 80.0));
-    assert_eq!(app.fs_pan_drag_start, rebased);
+    assert_eq!(app.fs_canvas_drag.pan_start(), rebased);
 }
 
 #[test]
@@ -236,7 +239,7 @@ fn drag_bound_release_discards_the_rebased_origin_and_next_drag_starts_at_curren
     move_bound_drag_to(&mut app, &ctx, outward);
     assert_ne!(bound_drag_origin_pan(&app), edge);
     pointer_frame(&mut app, &ctx, vec![button(origin() + outward, false)]);
-    assert!(app.fs_pan_drag_start.is_none());
+    assert!(app.fs_canvas_drag.pan_start().is_none());
     seed(&ctx, &mut app);
     press(&mut app, &ctx);
     move_bound_drag_to(&mut app, &ctx, Vec2::new(20.0, 10.0));
@@ -327,7 +330,7 @@ fn drag_bound_one_finger_passthrough_reverses_immediately_after_rebasing() {
                 egui::Event::PointerGone,
             ],
         );
-        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_canvas_drag.pan_start().is_none());
         close(app.fs_pan, edge + Vec2::new(100.0, 60.0));
     });
 }
@@ -421,7 +424,7 @@ fn assert_drag_bound_held_ctrl_zoom(
     let before_ctrl = if bound { Vec2::ZERO } else { first_total };
     close(app.fs_pan, before_ctrl);
     close(bound_drag_origin_pan(&app), before_ctrl - first_total);
-    let press_pos = app.fs_pan_drag_start.unwrap().0;
+    let press_pos = app.fs_canvas_drag.pan_start().unwrap().0;
 
     pointer_frame(
         &mut app,
@@ -438,9 +441,9 @@ fn assert_drag_bound_held_ctrl_zoom(
             Vec2::ZERO
         },
     );
-    assert_eq!(app.fs_pan_drag_start.unwrap().0, press_pos);
+    assert_eq!(app.fs_canvas_drag.pan_start().unwrap().0, press_pos);
     assert!(
-        app.fs_rotation_drag_start.is_none(),
+        app.fs_canvas_drag.rotation_start().is_none(),
         "Ctrl added after press cannot start rotation"
     );
     assert_eq!(app.fs_free_rotation, 0.0);
@@ -456,8 +459,8 @@ fn assert_drag_bound_held_ctrl_zoom(
             Vec2::ZERO
         },
     );
-    assert_eq!(app.fs_pan_drag_start.unwrap().0, press_pos);
-    assert!(app.fs_rotation_drag_start.is_none());
+    assert_eq!(app.fs_canvas_drag.pan_start().unwrap().0, press_pos);
+    assert!(app.fs_canvas_drag.rotation_start().is_none());
     assert_eq!(app.fs_free_rotation, 0.0);
     seed(&ctx, &mut app);
     assert!(app.fs_scroll_layout_matches(&ctx));
@@ -477,7 +480,7 @@ fn assert_drag_bound_held_ctrl_zoom(
             false,
         )],
     );
-    assert!(app.fs_pan_drag_start.is_none());
+    assert!(app.fs_canvas_drag.pan_start().is_none());
 }
 
 #[test]
@@ -708,7 +711,7 @@ fn drag_bound_sub_pc_pivot_shrink_returns_a_fitting_unit_inside_then_blocks_outw
         1.0,
         vec![button(enlarged_end, false)],
     );
-    assert!(app.fs_pan_drag_start.is_none());
+    assert!(app.fs_canvas_drag.pan_start().is_none());
     let before_zoom = app.fs_pan;
     let factor = 0.2_f32;
     let delta = WHEEL_SENSITIVITY * factor.ln() / 1.1_f32.ln();
@@ -761,7 +764,7 @@ fn drag_bound_sub_pc_pivot_shrink_returns_a_fitting_unit_inside_then_blocks_outw
         (returned_pan.x - before_zoom.x * factor).abs() < 0.001,
         "a fitting and already-inside horizontal axis stays at its noncentral pan"
     );
-    let origin_after_return = app.fs_pan_drag_start;
+    let origin_after_return = app.fs_canvas_drag.pan_start();
     render_frame(
         &mut app,
         &ctx,
@@ -774,7 +777,8 @@ fn drag_bound_sub_pc_pivot_shrink_returns_a_fitting_unit_inside_then_blocks_outw
         "reversing outwards cannot move the now-fitted unit"
     );
     assert_ne!(
-        app.fs_pan_drag_start, origin_after_return,
+        app.fs_canvas_drag.pan_start(),
+        origin_after_return,
         "the newly blocked outward demand must discard its overdrag"
     );
 }
@@ -791,7 +795,7 @@ fn drag_bound_off_preserves_fitting_and_overflowing_legacy_drag() {
         assert_ne!(expected, Vec2::ZERO);
         drag(&mut app, &ctx, delta);
         close(app.fs_pan, expected);
-        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_canvas_drag.pan_start().is_none());
     }
 }
 
@@ -962,7 +966,7 @@ fn drag_bound_stale_drag_waits_then_catches_up_or_releases_without_write() {
             seed(&ctx, &mut app);
             pointer_frame(&mut app, &ctx, vec![]);
             assert_eq!(app.fs_pan, before);
-            assert!(app.fs_pan_drag_start.is_none());
+            assert!(app.fs_canvas_drag.pan_start().is_none());
         } else {
             seed(&ctx, &mut app);
             pointer_frame(&mut app, &ctx, vec![]);
@@ -1219,7 +1223,7 @@ fn drag_bound_fractional_zoom_dpi_edges_settle_after_real_repaint() {
                 samples.push((app.fs_pan, unit));
             }
             assert!(
-                app.fs_pan_drag_start.is_some(),
+                app.fs_canvas_drag.pan_start().is_some(),
                 "the actual fractional-zoom canvas must own the drag: dpi={dpi}, mode={mode:?}, samples={samples:?}"
             );
             for pair in samples[3..].windows(2) {
@@ -1244,7 +1248,7 @@ fn drag_bound_fractional_zoom_dpi_edges_settle_after_real_repaint() {
                 right_residual_px.abs() <= 2.01,
                 "right residual={right_residual_px}px, bottom residual={bottom_residual_px}px, dpi={dpi}, mode={mode:?}, viewport={viewport:?}, unit={unit:?}, pan={:?}, drag_start={:?}, suppression={:?}, samples={samples:?}, pages={pages:?}",
                 app.fs_pan,
-                app.fs_pan_drag_start,
+                app.fs_canvas_drag.pan_start(),
                 app.fs_primary_suppression
             );
             assert!(
@@ -1303,7 +1307,7 @@ fn drag_bound_odd_width_spread_settles_at_painted_edge() {
         samples.push((app.fs_pan, edge));
     }
     assert!(
-        app.fs_pan_drag_start.is_some(),
+        app.fs_canvas_drag.pan_start().is_some(),
         "the actual odd-width spread canvas must own the drag: samples={samples:?}"
     );
     for pair in samples[3..].windows(2) {
@@ -1320,7 +1324,7 @@ fn drag_bound_odd_width_spread_settles_at_painted_edge() {
         "right residual={right_residual_px}px, viewport={:?}, pan={:?}, drag_start={:?}, suppression={:?}, initial={initial:?}, samples={samples:?}, pages={pages:?}",
         initial[0].viewport_rect,
         app.fs_pan,
-        app.fs_pan_drag_start,
+        app.fs_canvas_drag.pan_start(),
         app.fs_primary_suppression
     );
 }
@@ -1396,7 +1400,7 @@ fn drag_bound_tiny_overflow_crosses_both_actual_painted_edges_and_returns() {
                         samples.push((app.fs_pan, pages[0].paint_rect));
                     }
                     assert!(
-                        app.fs_pan_drag_start.is_some(),
+                        app.fs_canvas_drag.pan_start().is_some(),
                         "the actual canvas must own the tiny-range drag"
                     );
                     for pair in samples[3..].windows(2) {
@@ -1527,7 +1531,7 @@ fn drag_bound_blank_companion_drag_is_gradual_and_survives_actual_draw_correctio
             vec![egui::Event::PointerMoved(origin() + inward)],
         );
         assert!(
-            app.fs_pan_drag_start.is_some(),
+            app.fs_canvas_drag.pan_start().is_some(),
             "actual canvas must own the white-slot drag: side={page_side:?}, pan={:?}, expected={:?}, focused={}, focus_regained={:?}, suppression={:?}, initial={initial:?}, white={white:?}",
             app.fs_pan,
             pan + inward,
@@ -1623,7 +1627,7 @@ fn drag_bound_single_finger_passthrough_uses_the_canvas_bound_setting() {
             ],
         );
         assert_eq!(app.fs_pan, moved);
-        assert!(app.fs_pan_drag_start.is_none());
+        assert!(app.fs_canvas_drag.pan_start().is_none());
         moved
     });
     assert_ne!(outcomes[0], Vec2::ZERO);
@@ -1840,8 +1844,9 @@ fn drag_bound_child_drag_preserves_all_sibling_owned_view_state() {
     let animation = app.fs_page_scroll_animation.clone().unwrap();
     app.request_fs_initial_placement(0);
     let request = app.fs_initial_placement_request;
-    app.fs_pan_drag_start = Some((origin(), Vec2::new(17.0, 23.0)));
-    let start = app.fs_pan_drag_start;
+    app.fs_canvas_drag
+        .set_pan_start(Some((origin(), Vec2::new(17.0, 23.0))));
+    let start = app.fs_canvas_drag.pan_start();
     let items = app.items.clone();
     let child = app.build_window_context_for_test(1834001, |owner| {
         owner.items = items;
@@ -1855,7 +1860,7 @@ fn drag_bound_child_drag_preserves_all_sibling_owned_view_state() {
         owner.fs_pan = Vec2::ZERO;
         owner.fs_zoom = 1.0;
         owner.fs_page_scroll_animation = None;
-        owner.fs_pan_drag_start = None;
+        owner.fs_canvas_drag.set_pan_start(None);
         owner.clear_fs_initial_placement_request();
     });
     app.with_window_context_for_test(child, |owner| {
@@ -1899,7 +1904,7 @@ fn drag_bound_child_drag_preserves_all_sibling_owned_view_state() {
     assert_eq!(app.fs_zoom, zoom);
     assert_eq!(app.fullscreen_page_layout.drawn_unit, stamp);
     assert_eq!(app.fs_initial_placement_request, request);
-    assert_eq!(app.fs_pan_drag_start, start);
+    assert_eq!(app.fs_canvas_drag.pan_start(), start);
     let actual = app.fs_page_scroll_animation.as_ref().unwrap();
     assert_eq!(actual.from, animation.from);
     assert_eq!(actual.to, animation.to);

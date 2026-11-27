@@ -1457,6 +1457,26 @@ pub enum KeyAction {
     ClearBookResumePositions,
     UndoLastAction,
     HelpShowContextShortcuts,
+    ScriptSlot1,
+    ScriptSlot2,
+    ScriptSlot3,
+    ScriptSlot4,
+    ScriptSlot5,
+    ScriptSlot6,
+    ScriptSlot7,
+    ScriptSlot8,
+    ScriptSlot9,
+    ScriptSlot10,
+    ScriptSlot11,
+    ScriptSlot12,
+    ScriptSlot13,
+    ScriptSlot14,
+    ScriptSlot15,
+    ScriptSlot16,
+    ScriptSlot17,
+    ScriptSlot18,
+    ScriptSlot19,
+    ScriptSlot20,
     GridFavoritePrev,
     GridFavoriteNext,
     GridManageFavorites,
@@ -1659,6 +1679,7 @@ pub enum KeyAction {
     GridToggleMaximize,
     GridToggleFolderTreePane,
     GridToggleStackMode,
+    GridEnterFolderManualOrder,
     GridConvertEpubToPdf,
     GridTagApply,
     GridTagView,
@@ -1798,6 +1819,9 @@ pub enum KeyAction {
     FsPanorama,
     FsPanoramaProjection,
     FsDepthParallax,
+    FsFisheyeIn,
+    FsFisheyeOut,
+    FsPlaneTiltReset,
     FsNavigatorToggle,
     FsPageTurnAnimationToggle,
     FsNavigatorHold,
@@ -2086,6 +2110,26 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::ClearBookResumePositions,
     KeyAction::UndoLastAction,
     KeyAction::HelpShowContextShortcuts,
+    KeyAction::ScriptSlot1,
+    KeyAction::ScriptSlot2,
+    KeyAction::ScriptSlot3,
+    KeyAction::ScriptSlot4,
+    KeyAction::ScriptSlot5,
+    KeyAction::ScriptSlot6,
+    KeyAction::ScriptSlot7,
+    KeyAction::ScriptSlot8,
+    KeyAction::ScriptSlot9,
+    KeyAction::ScriptSlot10,
+    KeyAction::ScriptSlot11,
+    KeyAction::ScriptSlot12,
+    KeyAction::ScriptSlot13,
+    KeyAction::ScriptSlot14,
+    KeyAction::ScriptSlot15,
+    KeyAction::ScriptSlot16,
+    KeyAction::ScriptSlot17,
+    KeyAction::ScriptSlot18,
+    KeyAction::ScriptSlot19,
+    KeyAction::ScriptSlot20,
     KeyAction::GridFavoritePrev,
     KeyAction::GridFavoriteNext,
     KeyAction::GridManageFavorites,
@@ -2288,6 +2332,7 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::GridToggleMaximize,
     KeyAction::GridToggleFolderTreePane,
     KeyAction::GridToggleStackMode,
+    KeyAction::GridEnterFolderManualOrder,
     KeyAction::GridConvertEpubToPdf,
     KeyAction::GridTagApply,
     KeyAction::GridTagView,
@@ -2427,6 +2472,9 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsPanorama,
     KeyAction::FsPanoramaProjection,
     KeyAction::FsDepthParallax,
+    KeyAction::FsFisheyeIn,
+    KeyAction::FsFisheyeOut,
+    KeyAction::FsPlaneTiltReset,
     KeyAction::FsNavigatorToggle,
     KeyAction::FsPageTurnAnimationToggle,
     KeyAction::FsNavigatorHold,
@@ -4392,6 +4440,26 @@ impl KeyAction {
             ClearBookResumePositions => "ClearBookResumePositions",
             UndoLastAction => "UndoLastAction",
             HelpShowContextShortcuts => "HelpShowContextShortcuts",
+            ScriptSlot1 => "ScriptSlot1",
+            ScriptSlot2 => "ScriptSlot2",
+            ScriptSlot3 => "ScriptSlot3",
+            ScriptSlot4 => "ScriptSlot4",
+            ScriptSlot5 => "ScriptSlot5",
+            ScriptSlot6 => "ScriptSlot6",
+            ScriptSlot7 => "ScriptSlot7",
+            ScriptSlot8 => "ScriptSlot8",
+            ScriptSlot9 => "ScriptSlot9",
+            ScriptSlot10 => "ScriptSlot10",
+            ScriptSlot11 => "ScriptSlot11",
+            ScriptSlot12 => "ScriptSlot12",
+            ScriptSlot13 => "ScriptSlot13",
+            ScriptSlot14 => "ScriptSlot14",
+            ScriptSlot15 => "ScriptSlot15",
+            ScriptSlot16 => "ScriptSlot16",
+            ScriptSlot17 => "ScriptSlot17",
+            ScriptSlot18 => "ScriptSlot18",
+            ScriptSlot19 => "ScriptSlot19",
+            ScriptSlot20 => "ScriptSlot20",
             GridOpenCurrentDriveRoot => "GridOpenCurrentDriveRoot",
             GridFavoritePrev => "GridFavoritePrev",
             GridFavoriteNext => "GridFavoriteNext",
@@ -4596,6 +4664,7 @@ impl KeyAction {
             GridToggleMaximize => "GridToggleMaximize",
             GridToggleFolderTreePane => "GridToggleFolderTreePane",
             GridToggleStackMode => "GridToggleStackMode",
+            GridEnterFolderManualOrder => "GridEnterFolderManualOrder",
             GridConvertEpubToPdf => "GridConvertEpubToPdf",
             GridTagApply => "GridTagApply",
             GridTagView => "GridTagView",
@@ -4735,6 +4804,9 @@ impl KeyAction {
             FsPanorama => "FsPanorama",
             FsPanoramaProjection => "FsPanoramaProjection",
             FsDepthParallax => "FsDepthParallax",
+            FsFisheyeIn => "FsFisheyeIn",
+            FsFisheyeOut => "FsFisheyeOut",
+            FsPlaneTiltReset => "FsPlaneTiltReset",
             FsNavigatorToggle => "FsNavigatorToggle",
             FsPageTurnAnimationToggle => "FsPageTurnAnimationToggle",
             FsNavigatorHold => "FsNavigatorHold",
@@ -5178,6 +5250,26 @@ impl KeyAction {
             ClearBookResumePositions => "本の読書位置をすべてクリア",
             UndoLastAction => "直前の操作を元に戻す",
             HelpShowContextShortcuts => "現在のコンテキストで使えるショートカット一覧を表示する",
+            ScriptSlot1 => "スクリプト操作 1",
+            ScriptSlot2 => "スクリプト操作 2",
+            ScriptSlot3 => "スクリプト操作 3",
+            ScriptSlot4 => "スクリプト操作 4",
+            ScriptSlot5 => "スクリプト操作 5",
+            ScriptSlot6 => "スクリプト操作 6",
+            ScriptSlot7 => "スクリプト操作 7",
+            ScriptSlot8 => "スクリプト操作 8",
+            ScriptSlot9 => "スクリプト操作 9",
+            ScriptSlot10 => "スクリプト操作 10",
+            ScriptSlot11 => "スクリプト操作 11",
+            ScriptSlot12 => "スクリプト操作 12",
+            ScriptSlot13 => "スクリプト操作 13",
+            ScriptSlot14 => "スクリプト操作 14",
+            ScriptSlot15 => "スクリプト操作 15",
+            ScriptSlot16 => "スクリプト操作 16",
+            ScriptSlot17 => "スクリプト操作 17",
+            ScriptSlot18 => "スクリプト操作 18",
+            ScriptSlot19 => "スクリプト操作 19",
+            ScriptSlot20 => "スクリプト操作 20",
             GridFavoritePrev => "前のお気に入りへ移動する",
             GridFavoriteNext => "次のお気に入りへ移動する",
             GridManageFavorites => "お気に入りの管理を開く",
@@ -5388,6 +5480,7 @@ impl KeyAction {
             GridToggleMaximize => "メインウィンドウを最大化/復元する",
             GridToggleFolderTreePane => "フォルダツリーペインの表示を切り替える",
             GridToggleStackMode => "スタック表示を切り替える",
+            GridEnterFolderManualOrder => "手動順に切り替え",
             GridConvertEpubToPdf => "選択中の EPUB を PDF ファイルに変換する",
             GridTagApply => "タグを付ける/外すダイアログを開く",
             GridTagView => "タグビューを開く",
@@ -5529,6 +5622,9 @@ impl KeyAction {
             FsPanorama => "360度表示または通常動画の拡大表示を切り替える",
             FsPanoramaProjection => "360度パノラマの投影方式を切り替える",
             FsDepthParallax => "3D 写真の表示を切り替える",
+            FsFisheyeIn => "魚眼で寄る",
+            FsFisheyeOut => "魚眼で離れる",
+            FsPlaneTiltReset => "写真の板の傾きを戻す",
             FsNavigatorToggle => "ナビゲータの表示を切り替える",
             FsPageTurnAnimationToggle => "ページめくりアニメーションを切り替える",
             FsNavigatorHold => "押している間だけナビゲータを表示する",
@@ -5804,7 +5900,27 @@ impl KeyAction {
             | ClearVideoMediaMemory
             | ClearBookResumePositions
             | UndoLastAction
-            | HelpShowContextShortcuts => KeyContext::Global,
+            | HelpShowContextShortcuts
+            | ScriptSlot1
+            | ScriptSlot2
+            | ScriptSlot3
+            | ScriptSlot4
+            | ScriptSlot5
+            | ScriptSlot6
+            | ScriptSlot7
+            | ScriptSlot8
+            | ScriptSlot9
+            | ScriptSlot10
+            | ScriptSlot11
+            | ScriptSlot12
+            | ScriptSlot13
+            | ScriptSlot14
+            | ScriptSlot15
+            | ScriptSlot16
+            | ScriptSlot17
+            | ScriptSlot18
+            | ScriptSlot19
+            | ScriptSlot20 => KeyContext::Global,
             GlobalEverythingSearch
             | GridFavoritePrev
             | GridFavoriteNext
@@ -6008,6 +6124,7 @@ impl KeyAction {
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
+            | GridEnterFolderManualOrder
             | GridConvertEpubToPdf
             | GridTagApply
             | GridTagView
@@ -6137,6 +6254,9 @@ impl KeyAction {
             | FsImageAnalysis
             | FsZoomMode
             | FsDepthParallax
+            | FsFisheyeIn
+            | FsFisheyeOut
+            | FsPlaneTiltReset
             | FsNavigatorToggle
             | FsPageTurnAnimationToggle
             | FsNavigatorHold
@@ -6376,6 +6496,26 @@ impl KeyAction {
             | ClearBookResumePositions
             | UndoLastAction
             | HelpShowContextShortcuts
+            | ScriptSlot1
+            | ScriptSlot2
+            | ScriptSlot3
+            | ScriptSlot4
+            | ScriptSlot5
+            | ScriptSlot6
+            | ScriptSlot7
+            | ScriptSlot8
+            | ScriptSlot9
+            | ScriptSlot10
+            | ScriptSlot11
+            | ScriptSlot12
+            | ScriptSlot13
+            | ScriptSlot14
+            | ScriptSlot15
+            | ScriptSlot16
+            | ScriptSlot17
+            | ScriptSlot18
+            | ScriptSlot19
+            | ScriptSlot20
             | GlobalEverythingSearch
             | GridFavoritePrev
             | GridFavoriteNext
@@ -6579,6 +6719,7 @@ impl KeyAction {
             | GridToggleMaximize
             | GridToggleFolderTreePane
             | GridToggleStackMode
+            | GridEnterFolderManualOrder
             | GridConvertEpubToPdf
             | GridTagApply
             | GridTagView
@@ -6716,6 +6857,9 @@ impl KeyAction {
             | FsPanorama
             | FsPanoramaProjection
             | FsDepthParallax
+            | FsFisheyeIn
+            | FsFisheyeOut
+            | FsPlaneTiltReset
             | FsNavigatorToggle
             | FsPageTurnAnimationToggle
             | FsPixelGrid
@@ -6971,9 +7115,29 @@ impl KeyAction {
             GlobalEverythingSearch => ChordList::one(Chord::ctrl(R)),
             GlobalOpenFolder => ChordList::one(Chord::ctrl(O)),
             ToggleDetachedViewerMode => ChordList::one(Chord::key(F12)),
-            ToggleAlwaysOnTop | ClearVideoMediaMemory | ClearBookResumePositions => {
-                ChordList::EMPTY
-            }
+            ToggleAlwaysOnTop
+            | ClearVideoMediaMemory
+            | ClearBookResumePositions
+            | ScriptSlot1
+            | ScriptSlot2
+            | ScriptSlot3
+            | ScriptSlot4
+            | ScriptSlot5
+            | ScriptSlot6
+            | ScriptSlot7
+            | ScriptSlot8
+            | ScriptSlot9
+            | ScriptSlot10
+            | ScriptSlot11
+            | ScriptSlot12
+            | ScriptSlot13
+            | ScriptSlot14
+            | ScriptSlot15
+            | ScriptSlot16
+            | ScriptSlot17
+            | ScriptSlot18
+            | ScriptSlot19
+            | ScriptSlot20 => ChordList::EMPTY,
             UndoLastAction => ChordList::one(Chord::ctrl(Z)),
             HelpShowContextShortcuts => ChordList::one(Chord::shift(Slash)),
             GridFavoritePrev
@@ -7178,6 +7342,7 @@ impl KeyAction {
             GridToggleMaximize => ChordList::one(Chord::key(F11)),
             GridToggleFolderTreePane => ChordList::one(Chord::key(F)),
             GridToggleStackMode => ChordList::EMPTY,
+            GridEnterFolderManualOrder => ChordList::EMPTY,
             GridConvertEpubToPdf => ChordList::EMPTY,
             GridTagApply => ChordList::one(Chord::key(T)),
             GridTagView => ChordList::one(Chord::ctrl(T)),
@@ -7309,6 +7474,7 @@ impl KeyAction {
             FsPanorama => ChordList::one(Chord::key(V)),
             FsPanoramaProjection => ChordList::one(Chord::shift(V)),
             FsDepthParallax => ChordList::one(Chord::key(D)),
+            FsFisheyeIn | FsFisheyeOut | FsPlaneTiltReset => ChordList::EMPTY,
             FsNavigatorToggle => ChordList::one(Chord::alt(N)),
             FsPageTurnAnimationToggle => ChordList::EMPTY,
             FsNavigatorHold => ChordList::one(Chord::modifier(ModKind::Alt)),
@@ -7879,7 +8045,44 @@ fn native_video_shortcut_action(action: KeyAction) -> bool {
                 | KeyAction::ToggleAlwaysOnTop
                 | KeyAction::ClearVideoMediaMemory
                 | KeyAction::ClearBookResumePositions
+        ) || matches!(
+            action,
+            KeyAction::ScriptSlot1
+                | KeyAction::ScriptSlot2
+                | KeyAction::ScriptSlot3
+                | KeyAction::ScriptSlot4
+                | KeyAction::ScriptSlot5
+                | KeyAction::ScriptSlot6
+                | KeyAction::ScriptSlot7
+                | KeyAction::ScriptSlot8
+                | KeyAction::ScriptSlot9
+                | KeyAction::ScriptSlot10
+                | KeyAction::ScriptSlot11
+                | KeyAction::ScriptSlot12
+                | KeyAction::ScriptSlot13
+                | KeyAction::ScriptSlot14
+                | KeyAction::ScriptSlot15
+                | KeyAction::ScriptSlot16
+                | KeyAction::ScriptSlot17
+                | KeyAction::ScriptSlot18
+                | KeyAction::ScriptSlot19
+                | KeyAction::ScriptSlot20
         ))
+}
+
+#[test]
+fn operation_script_slots_are_native_shortcuts_without_expanding_other_globals() {
+    for action in KeyAction::all()
+        .iter()
+        .copied()
+        .filter(|action| action.ini_name().starts_with("ScriptSlot"))
+    {
+        assert!(native_video_shortcut_action(action), "{action:?}");
+    }
+    assert!(!native_video_shortcut_action(KeyAction::GlobalLocalSearch));
+    assert!(!native_video_shortcut_action(
+        KeyAction::FsPageOverviewToggle
+    ));
 }
 
 fn is_overlay_edit_scope(scope: CommandScope) -> bool {
@@ -9781,6 +9984,14 @@ impl Keymap {
                 .copied()
                 .filter(|action| action.context() == section && action.is_user_facing())
             {
+                if matches!(kind, IniTemplateKind::DefaultReference)
+                    && action == KeyAction::ScriptSlot1
+                {
+                    out.push_str("# スクリプト操作1〜20の表示名は固定。labelは環境設定と右クリックだけに表示。\n");
+                    out.push_str(
+                        "# 有効化: 環境設定 > 拡張と診断 > 操作のスクリプト（既定OFF）。\n",
+                    );
+                }
                 let description = action.description();
                 let defaults: Vec<String> = action
                     .default_chords()
@@ -12333,6 +12544,7 @@ mod tests {
             "BookPrev".to_string(),
             "BookNext".to_string(),
         ]);
+        add_numbered_names(&mut key_handled, "ScriptSlot", 1..=20);
         add_numbered_names(&mut key_handled, "OpenCollection", 1..=20);
         add_numbered_names(&mut key_handled, "OpenBook", 1..=20);
         add_numbered_names(&mut key_handled, "OpenFavorite", 1..=20);
@@ -12556,23 +12768,25 @@ mod tests {
     }
 
     #[test]
-    fn search_name_actions_are_unassigned_grid_press_and_roundtrip_ini_and_settings() {
+    fn unassigned_grid_actions_roundtrip_ini_and_settings() {
         let actions = [
             KeyAction::GridSearchNameEverything,
             KeyAction::GridSearchNameMetadata,
             KeyAction::GridSearchNameLocal,
+            KeyAction::GridEnterFolderManualOrder,
         ];
         let keymap = Keymap::from_ini_str(
-            "[Grid]\nGridSearchNameEverything = F16\nGridSearchNameMetadata = F17\nGridSearchNameLocal = F18\n",
+            "[Grid]\nGridSearchNameEverything = F16\nGridSearchNameMetadata = F17\nGridSearchNameLocal = F18\nGridEnterFolderManualOrder = F19\n",
         );
         assert!(keymap.warnings().is_empty(), "{:?}", keymap.warnings());
         let settings = KeymapSettings::from_keymap(&keymap);
         let settings: KeymapSettings =
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         let restored = Keymap::from_settings(&settings);
-        for (action, key) in actions
-            .into_iter()
-            .zip([KeyName::F16, KeyName::F17, KeyName::F18])
+        for (action, key) in
+            actions
+                .into_iter()
+                .zip([KeyName::F16, KeyName::F17, KeyName::F18, KeyName::F19])
         {
             assert_eq!(
                 KeyAction::all()
@@ -12610,7 +12824,7 @@ mod tests {
             )));
         }
         let disabled = Keymap::from_ini_str(
-            "[Grid]\nGridSearchNameEverything = none\nGridSearchNameMetadata = none\nGridSearchNameLocal = none\n",
+            "[Grid]\nGridSearchNameEverything = none\nGridSearchNameMetadata = none\nGridSearchNameLocal = none\nGridEnterFolderManualOrder = none\n",
         );
         assert!(disabled.warnings().is_empty());
         for action in actions {
@@ -12678,6 +12892,137 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Chord::ctrl(KeyName::Right)]
         );
+    }
+
+    #[test]
+    fn plane_fisheye_actions_have_no_defaults_roundtrip_and_conflict_with_each_other() {
+        for action in [KeyAction::FsFisheyeIn, KeyAction::FsFisheyeOut] {
+            assert!(ALL_ACTIONS.contains(&action));
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.default_chords().iter().next().is_none());
+            assert_eq!(KeyAction::from_ini_name(action.ini_name()), Some(action));
+        }
+        let bound = Keymap::from_ini_str("[FsImage]\nFsFisheyeIn = F13\nFsFisheyeOut = F13\n");
+        assert!(
+            bound
+                .binding_conflicts()
+                .iter()
+                .any(|conflict| conflict.action == KeyAction::FsFisheyeIn
+                    && conflict.other_action == Some(KeyAction::FsFisheyeOut)
+                    || conflict.action == KeyAction::FsFisheyeOut
+                        && conflict.other_action == Some(KeyAction::FsFisheyeIn))
+        );
+        let wire = serde_json::to_string(&KeymapSettings::from_keymap(&bound)).unwrap();
+        let restored = Keymap::from_settings(&serde_json::from_str(&wire).unwrap());
+        for action in [KeyAction::FsFisheyeIn, KeyAction::FsFisheyeOut] {
+            assert_eq!(
+                bound.effective_chords(action),
+                restored.effective_chords(action)
+            );
+        }
+        let reference = include_str!("../docs/keymap.ini.default");
+        assert!(reference.contains("# FsFisheyeIn = none"));
+        assert!(reference.contains("# FsFisheyeOut = none"));
+    }
+
+    #[test]
+    fn plane_tilt_reset_is_an_unassigned_image_press_with_scoped_rebinding() {
+        let action = KeyAction::FsPlaneTiltReset;
+        assert!(ALL_ACTIONS.contains(&action));
+        assert!(action.is_user_facing());
+        assert_eq!(action.context(), KeyContext::FsImage);
+        assert_eq!(action.trigger(), KeyTrigger::Press);
+        assert_eq!(action.binding_policy(), BindingPolicy::FullChord);
+        assert_eq!(KeyAction::from_ini_name("FsPlaneTiltReset"), Some(action));
+        assert!(action.default_chords().iter().next().is_none());
+        assert!(command_catalog().any(|spec| spec.action == action));
+
+        let chord = Chord::key(KeyName::F13);
+        let bound = Keymap::from_ini_str("[FsImage]\nFsPlaneTiltReset = F13\n");
+        assert!(bound.warnings().is_empty());
+        assert_eq!(bound.effective_chords(action), vec![chord]);
+        assert_eq!(
+            bound.resolve_first_action_for_chord(chord, FS_IMAGE_ACTIVE_SCOPES, &[action]),
+            Some(action)
+        );
+        assert_eq!(
+            bound.resolve_first_action_for_chord(chord, FS_VIDEO_ACTIVE_SCOPES, &[action]),
+            None
+        );
+        let wire = serde_json::to_string(&KeymapSettings::from_keymap(&bound)).unwrap();
+        let restored = Keymap::from_settings(&serde_json::from_str(&wire).unwrap());
+        assert_eq!(restored.effective_chords(action), vec![chord]);
+        let disabled = Keymap::from_ini_str("[FsImage]\nFsPlaneTiltReset = none\n");
+        assert!(disabled.warnings().is_empty());
+        assert!(disabled.effective_chords(action).is_empty());
+
+        let conflict =
+            Keymap::from_ini_str("[FsImage]\nFsPlaneTiltReset = F13\nFsFisheyeIn = F13\n");
+        assert!(conflict.binding_conflicts().iter().any(|entry| {
+            (entry.action == action && entry.other_action == Some(KeyAction::FsFisheyeIn))
+                || (entry.action == KeyAction::FsFisheyeIn && entry.other_action == Some(action))
+        }));
+        let reference_line = "# FsPlaneTiltReset = none ; 写真の板の傾きを戻す";
+        assert!(
+            Keymap::default_reference_ini()
+                .lines()
+                .any(|line| line == reference_line)
+        );
+        assert!(
+            include_str!("../docs/keymap.ini.default")
+                .lines()
+                .any(|line| line == reference_line)
+        );
+    }
+
+    #[test]
+    fn plane_tilt_reset_is_exposed_and_rebindable_through_operations_api() {
+        use crate::operation_customize_agent::{get_operations, prepare_edits};
+        use crate::operation_customize_share::OperationCustomizeBundle;
+        use mimageviewer_agent_ipc::{OperationEdits, OperationRow, OperationsQuery, PageRow};
+
+        let request: OperationsQuery = serde_json::from_value(serde_json::json!({
+            "view": "keys", "actions": ["FsPlaneTiltReset"], "context": "FsImage",
+        }))
+        .unwrap();
+        let read_row = |bundle: &OperationCustomizeBundle| {
+            get_operations(bundle, &request)
+                .unwrap()
+                .items
+                .into_iter()
+                .find_map(|item| match item {
+                    PageRow::Value(OperationRow::Key(row)) if row.action == "FsPlaneTiltReset" => {
+                        Some(row)
+                    }
+                    _ => None,
+                })
+                .expect("registered reset must be available to the operations API")
+        };
+        let defaults = OperationCustomizeBundle::defaults();
+        let row = read_row(&defaults);
+        assert_eq!(row.context, "FsImage");
+        assert_eq!(row.trigger, "press");
+        assert!(row.keys.is_empty());
+        assert!(row.default.is_empty());
+        let edits: OperationEdits = serde_json::from_value(serde_json::json!({
+            "keys": { "FsPlaneTiltReset": ["F14"] },
+        }))
+        .unwrap();
+        let (changed, result) = prepare_edits(&defaults, &edits).unwrap();
+        assert!(
+            result
+                .changed
+                .iter()
+                .any(|row| row.name == "FsPlaneTiltReset")
+        );
+        assert_eq!(read_row(&changed).keys, vec!["F14".to_owned()]);
+        let clear: OperationEdits = serde_json::from_value(serde_json::json!({
+            "keys": { "FsPlaneTiltReset": [] },
+        }))
+        .unwrap();
+        let (cleared, _) = prepare_edits(&changed, &clear).unwrap();
+        assert!(read_row(&cleared).keys.is_empty());
     }
 
     #[test]
@@ -14578,6 +14923,55 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn script_slot_actions_are_global_press_commands_with_empty_defaults_and_independent_overrides()
+    {
+        let defaults = Keymap::default();
+        let actions: Vec<_> = KeyAction::all()
+            .iter()
+            .copied()
+            .filter(|action| action.ini_name().starts_with("ScriptSlot"))
+            .collect();
+        assert_eq!(actions.len(), 20);
+        for (index, action) in actions.iter().copied().enumerate() {
+            let number = index + 1;
+            let name = format!("ScriptSlot{number}");
+            assert_eq!(action.ini_name(), name);
+            assert_eq!(action.description(), format!("スクリプト操作 {number}"));
+            assert_eq!(KeyAction::from_ini_name(&name), Some(action));
+            assert_eq!(KeyAction::parse_ini_name(&name), Some(action));
+            assert_eq!(action.context(), KeyContext::Global);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert!(action.is_user_facing());
+            assert!(action.default_chords().is_empty());
+            assert!(defaults.effective_chords(action).is_empty());
+
+            let configured = Keymap::from_ini_str(&format!("[Global]\n{name} = F13\n"));
+            assert!(configured.warnings().is_empty(), "{action:?}");
+            let mut saved = KeymapSettings::default();
+            saved.set_override_chords(action, vec![Chord::key(KeyName::F13)]);
+            let loaded: KeymapSettings =
+                serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+            let restored = Keymap::from_settings(&loaded);
+            assert!(restored.warnings().is_empty(), "{action:?}");
+            for &other in &actions {
+                let expected = if other == action {
+                    vec![Chord::key(KeyName::F13)]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(configured.effective_chords(other), expected, "{other:?}");
+                assert_eq!(restored.effective_chords(other), expected, "{other:?}");
+            }
+            let disabled = Keymap::from_ini_str(&format!("[Global]\n{name} = none\n"));
+            assert!(disabled.warnings().is_empty());
+            assert!(disabled.effective_chords(action).is_empty());
+        }
+        for name in ["ScriptSlot0", "ScriptSlot21"] {
+            assert_eq!(KeyAction::from_ini_name(name), None);
+        }
     }
 
     #[test]

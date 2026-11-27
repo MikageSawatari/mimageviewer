@@ -1,5 +1,11 @@
 # GPU device / session テストの並列数制限
 
+§1.917の新規GPUテストは `plane_view_wgpu::gpu_tests`、`ui_fullscreen::plane_view_tests::gpu_tests`、
+`ui_dialogs::preferences::pages::plane_view_lens_tests::gpu_tests` に置く。
+既存 `.config/nextest.toml` の `test(/(^|::)gpu_tests::/)` がすべてをgpu groupへ登録する。
+CPU式・遷移・resolver・naga検証・PDF配置枠の比較はこの子moduleへ入れない。
+新規PNGの生成・目視・通常比較とGPUテストの実行は設計担当へ引き継ぐ。実装担当では未実行。
+
 ## 対象と境界
 
 `.config/nextest.toml` の `gpu` group は `max-threads = 2` とする。
@@ -41,8 +47,8 @@ Linux の WGSL 検査とは分け、Windows の GPU gate で必ず実行する�
 | 深度ダイアログの macro → `RootDepthViewer` | `depth_dialog_owner_scenario!` の12件。helper は grid / linked / independent / parked / export の分岐より前に device を作る。前回期待一覧の macro 生成名の漏れを、今回は展開した完全名で補った |
 | final-prepare / canonical / page-turn の実 renderer | `app::final_prepare_budget::native_tests` の13件、canonical draw-key 3件、backward native handoff 1件、実 native ROI 1件。予算・diagnostics の状態検査・CPU final 登録だけのものは除外 |
 | compare-crop の shader 分岐 | `crop_ready_compare_shader_wipe_affordance_precedes_dim_frame_and_handles` だけ。残り3件は `shader=false` なので state を作らない |
-| LazyRenderer → WgpuTestRenderer → RenderState → `request_device` | `Harness::render` / `snapshot` / `try_snapshot` と推移的な helper。lib は module / 完全名、UI統合テストは binary 単位で選ぶ。builder / run / input / query だけでは初期化されない。CPU adapter 優先でも device を作るため含む |
-| shared `ui_harness` の実 renderer テスト | `context_root_fixture_panel_matches_raw_root_without_wrapper_margin`、`render_state_enumerates_only_product_backends` を各 importing binary で含む。後者は名前に enumeration とあるが実 device を作る |
+| LazyRenderer → WgpuTestRenderer → RenderState → `request_device` | `Harness::render` / `snapshot` / `try_snapshot` と推移的な helper。lib は module / 完全名、UI統合テストは `integration` binary 内の4モジュールのprefixで選ぶ。builder / run / input / query だけでは初期化されない。CPU adapter 優先でも device を作るため含む |
+| shared `ui_harness` の実 renderer テスト | `context_root_fixture_panel_matches_raw_root_without_wrapper_margin`、`render_state_enumerates_only_product_backends` を `test_ui::tests::` で含む。integration では共通supportを1回だけ宣言する。後者は名前に enumeration とあるが実 device を作る |
 | `D3D11CreateDevice(WARP)` | NIS draw、Anime4K draw、ignored compile benchmark の3件。実 D3D device を使い、件数も少ないため含む（通常2件・ignored 1件） |
 | D3D11 hardware / DComp | ignored timestamp benchmark、native-window pump と thread-spike の ignored stall テスト。実 hardware / DComp device を作る |
 | FFmpeg hardware encoder | clockless EOF 2件、ignored encoder probe、深度MP4出力4件、musicvideo-editorの実worker開始1件。`hw_decode=false` やCPU frameでも encoder がAutoならNVENC / QSV / AMF / MF 経路を試す |
@@ -215,15 +221,22 @@ group の上限、全体並列数、retry・timeout・priority は変更しな�
 
 正本は [.config/nextest.toml](../.config/nextest.toml)。`gpu_tests` と実device小moduleはprefix、
 混在lib moduleは完全名に固定したregex / equalityで選ぶ。
-4 integrationはbinary全体を選び、新規snapshot / GPU testを自動で含める。
+旧4 integrationは `integration` binary 内のモジュール全体を選び、
+その中の新規snapshot / GPU testを自動で含める。
 
 ```text
-kind(test) & binary(/^(ui_snapshot|book_composition_editor_snapshots|test_ai_upscale|test_tile_blend|egui(_wgpu|_winit)?|epaint|eframe)$/)
+kind(test) & binary(/^(integration|egui(_wgpu|_winit)?|epaint|eframe)$/) & test(/^(ui_snapshot|book_composition_editor_snapshots|test_ai_upscale|test_tile_blend)::/)
 ```
 
-同一regexのvendor lib名で各standalone graphのpredicate validationを成立させ、
-`kind(test)`とのANDがvendor lib全体への割当を防ぐ。CPU integration 37件
-（ui_snapshot 20、book-composition 16、AI heuristic 1、tile 0）も含める。
+nextestはgraphに存在しない名前のbinary述語をエラーにするため、1つの正規表現に
+`integration`（workspace graph）とvendor lib名（各standalone graph）を入れ、どのgraphでも一致させる。
+`kind(test)`とのANDでvendor lib全体への割当を防ぎ、モジュール名のprefixで旧4 binaryの範囲を選ぶ
+（別々の正規表現に分けると、それぞれが一致しないgraphで設定エラーになる）。
+旧4モジュール内のCPU integration（§1.908前の棚卸しで37件: ui_snapshot 20、book-composition 16、AI heuristic 1、tile 0）も含める。
+§1.908以後、共通supportのCPUテスト10件（`logical_bounds::`・`test_ui::backend_policy::tests::`・
+`test_ui::scroll_layout::tests::`・`test_ui::tests::requests_product_backends_without_initializing_gpu`）は
+`integration` のrootで1回だけ宣言され、旧binary全体の選択から外れてgroup外になった。libの同じsupportと同じ扱いで、
+group外のnextest実行でGPU生成検査に掛からないことを確認した（[§1.908の記録](test-build-memory-plan.md#4-確認)）。
 検査単体も全rootでgpuへ入れる。query / instance-onlyの全moduleを広く選ぶことはしない。
 
 nextestは設定項目ごとに最初の一致overrideを使うため、先行slow overrideのpriority / timeoutと
@@ -234,9 +247,9 @@ test-fullのルート設定指定を維持する。台本修正は不要。
 
 - 新しい製品GPU device / session生成点には、実GPU分岐で生成前に`#[cfg(test)]`の検査を置く。
   test-only helperにも検査を置き、CPU fake・情報照会・instance-onlyは区別する。
-- テストは原則`gpu_tests`か既存4 integrationへ置く。混在libの新規caller / macroもfilterへ含める。
-- **cfg(test)はdependencyへ伝播しない。** 新しいintegration binaryや別crate testが通常libを通じて
-  GPUを使う場合は、binary単位の所属、または自crateの検査付き生成境界を用意する。
+- テストは原則`gpu_tests`か `integration` 内の既存4モジュールへ置く。混在libの新規caller / macroもfilterへ含める。
+- **cfg(test)はdependencyへ伝播しない。** 新しいintegration moduleや別crate testが通常libを通じて
+  GPUを使う場合は、そのテストの所属、または自crateの検査付き生成境界を用意する。
   通常exeで動く外部workerも、親の実session要求 / 起動境界で検査する。
 - 各graphの`nextest list --run-ignored all --message-format json`、`-E 'group(gpu)'`、
   `show-config test-groups --groups gpu --no-pager`を**binary ID + 完全名**の集合で照合する。

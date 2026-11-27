@@ -140,6 +140,7 @@ pub(crate) fn draw_fullscreen_specified_scale_max_controls(
 
 mod folder_background;
 mod name_colors;
+mod operation_script;
 
 mod browser_integration;
 #[cfg(test)]
@@ -513,6 +514,7 @@ pub(crate) enum PreferencesPage {
     Vst3,
     /// 編集用追加パック (オノマトペ向けフォント + 被写体分離モデル) の管理
     EditingAddon,
+    OperationScript,
     /// 開発者 / 診断 (ログ zip 書き出し・性能ログ)
     Developer,
 }
@@ -712,6 +714,7 @@ impl PreferencesPage {
         Self::Video,
         Self::Vst3,
         Self::EditingAddon,
+        Self::OperationScript,
         Self::Developer,
     ];
 
@@ -754,6 +757,7 @@ impl PreferencesPage {
             Self::Video => "動画",
             Self::Vst3 => "VST3 プラグイン",
             Self::EditingAddon => "編集用追加ファイル",
+            Self::OperationScript => "操作のスクリプト",
             Self::Developer => "開発者",
         }
     }
@@ -1020,6 +1024,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::AiCaption,
             PreferencesPage::DepthAddon,
             PreferencesPage::EditingAddon,
+            PreferencesPage::OperationScript,
             PreferencesPage::Developer,
         ],
     },
@@ -1254,6 +1259,10 @@ pub(crate) struct PreferencesState {
     transfer_feedback: Option<PreferencesTransferFeedback>,
     /// Only UI OK asks about themes newly painted by this immutable draft.
     folder_background_confirmation: Option<Vec<bool>>,
+    operation_script_confirmation: Option<operation_script::Confirmation>,
+    pub operation_script_view: operation_script::OperationScriptView,
+    pub operation_script_committed_enabled: bool,
+    pub operation_script_actions: operation_script::Actions,
     /// 保存済み位置と音声トラック選択を明示的にクリアした編集意図。
     video_media_memory_clear_requested: bool,
     /// この編集ダイアログを開いた時点の通常ホイール割り当て。
@@ -1855,6 +1864,10 @@ impl PreferencesState {
             settings: s.preferences_snapshot(),
             transfer_feedback: None,
             folder_background_confirmation: None,
+            operation_script_confirmation: None,
+            operation_script_view: Default::default(),
+            operation_script_committed_enabled: false,
+            operation_script_actions: Default::default(),
             video_media_memory_clear_requested: false,
             initial_video_normal_wheel_action: s.ring_shortcuts.video_normal_wheel_action,
             selected: PreferencesPage::General,
@@ -3548,6 +3561,9 @@ impl App {
         let clipboard_capture_startup_failed = self.clipboard_capture_startup_failed();
         if let Some(state) = self.pref_state.as_mut() {
             state.diag_export_view = self.diagnostics_export.view();
+            state.operation_script_view =
+                operation_script::OperationScriptView::from_loader(&self.operation_script.state);
+            state.operation_script_committed_enabled = self.settings.operation_script_enabled;
             state.clipboard_capture_startup_failed = clipboard_capture_startup_failed;
             state.clipboard_capture_default_output_dir =
                 crate::clipboard_capture::default_destination();
@@ -3606,10 +3622,15 @@ impl App {
             .as_ref()
             .is_some_and(|state| state.folder_background_confirmation.is_some());
         let collection_reorder_open = self.collection_reorder_open();
+        let operation_script_confirm_open = self
+            .pref_state
+            .as_ref()
+            .is_some_and(|state| state.operation_script_confirmation.is_some());
         if transfer_dialog_open
             || registration_dialog_open
             || vlm_dialog_open
             || folder_background_confirm_open
+            || operation_script_confirm_open
         {
             // Popups use independent UI layers and do not inherit a disabled
             // parent. Remove that combination while the transfer modal is shown.
@@ -3620,11 +3641,13 @@ impl App {
         let safe_rect = ctx.content_rect().shrink2(egui::vec2(24.0, 32.0));
         let safe_size = safe_rect.size().max(egui::Vec2::ZERO);
         let enter_pressed = !transfer_dialog_open
+            && !operation_script_confirm_open
             && !folder_background_confirm_open
             && !registration_dialog_open
             && !vlm_dialog_open
             && self.dialog_enter_pressed(ctx);
         let escape_pressed = !transfer_dialog_open
+            && !operation_script_confirm_open
             && !folder_background_confirm_open
             && !registration_dialog_open
             && !vlm_dialog_open
@@ -3636,6 +3659,7 @@ impl App {
             .drag_area(egui::WindowDrag::Anywhere)
             .enabled(
                 !transfer_dialog_open
+                    && !operation_script_confirm_open
                     && !registration_dialog_open
                     && !vlm_dialog_open
                     && !folder_background_confirm_open,
@@ -3936,6 +3960,56 @@ impl App {
             open = true;
         }
         self.submit_browser_integration_preferences(ctx);
+        // The child owns the opening AND closing frame. Parent key decisions
+        // were captured before the checkbox/button could create this modal.
+        let script_confirmation = self
+            .pref_state
+            .as_ref()
+            .and_then(|state| state.operation_script_confirmation);
+        if operation_script_confirm_open || script_confirmation.is_some() {
+            apply = false;
+            cancel = false;
+            open = true;
+        }
+        if let Some(confirmation) = script_confirmation {
+            let enter = self.dialog_enter_pressed(ctx);
+            // The initiating frame's Escape belongs to the parent input that
+            // opened this child. Only an already-open child may cancel on it.
+            let escape = operation_script_confirm_open && self.dialog_escape_pressed(ctx);
+            if let Some(accepted) =
+                operation_script::draw_confirmation(ctx, confirmation, enter, escape)
+            {
+                let state = self.pref_state.as_mut().unwrap();
+                state.operation_script_confirmation = None;
+                if accepted {
+                    match confirmation {
+                        operation_script::Confirmation::Enable => {
+                            state.settings.operation_script_enabled = true;
+                            state.settings.operation_script_notice_confirmed = true;
+                        }
+                        operation_script::Confirmation::Reset => {
+                            state.operation_script_actions.reset = true;
+                        }
+                    }
+                }
+            }
+        }
+        let script_actions = self
+            .pref_state
+            .as_mut()
+            .map(|state| std::mem::take(&mut state.operation_script_actions))
+            .unwrap_or_default();
+        if script_actions.open {
+            self.operation_script
+                .enqueue_open_user_script(&crate::data_dir::get(), ctx);
+        }
+        if script_actions.reset {
+            self.operation_script
+                .enqueue_reset_user_script(&crate::data_dir::get(), ctx);
+        }
+        if script_actions.reload && self.settings.operation_script_enabled {
+            self.operation_script.reload(&crate::data_dir::get(), ctx);
+        }
         if apply {
             let state = self.pref_state.as_mut().unwrap();
             let themes = crate::folder_cell_background::newly_painted_low_contrast(
@@ -4747,6 +4821,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::Video => page_video(ui, state),
         PreferencesPage::Vst3 => page_vst3(ui, state),
         PreferencesPage::EditingAddon => page_editing_addon(ui, state),
+        PreferencesPage::OperationScript => operation_script::page(ui, state),
         PreferencesPage::Developer => page_developer(ui, state),
     }
 }
@@ -6901,7 +6976,7 @@ mod tests {
         std::fs::create_dir_all(folder.join("写真")).unwrap();
         app.settings.auto_fullscreen_image_folders = false;
         app.settings.ui_theme = crate::settings::UiTheme::Light;
-        app.load_folder_with_scan(folder, None);
+        app.load_folder_and_finish_for_test(folder);
         app.finish_page_identity_preparation_for_test();
         app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
         app.settings.grid_cols = 4;
@@ -7461,18 +7536,65 @@ mod tests {
 
     #[test]
     fn preferences_context_menu_layout_default_and_minimum_width_fit_and_controls_work() {
+        check_preferences_context_menu_layout_at_pixels_per_point(1.0);
+    }
+
+    #[test]
+    fn preferences_context_menu_layout_fractional_scale_fit_and_controls_work() {
+        // A one-row Galley can round taller than the combo at 1.4; the old
+        // height comparison then moved even these short inline notes below it.
+        // Keep the full scene/width matrix: fractional text rounding affects
+        // inline notes, adjacent rows and control alignment through the same path.
+        check_preferences_context_menu_layout_at_pixels_per_point(1.4);
+    }
+
+    fn check_preferences_context_menu_layout_at_pixels_per_point(pixels_per_point: f32) {
         use crate::context_menu_model::{
             ContextMenuItemId, ContextMenuLayoutSettings, ContextMenuParentId,
-            ContextMenuPreviewScenario, ContextMenuSeparatorBefore,
+            ContextMenuPreviewItemState, ContextMenuPreviewScenario, ContextMenuSeparatorBefore,
+            context_menu_layout_preview,
         };
         use crate::test_ui::scroll_layout::ScrollLayout;
         use egui_kittest::kittest::{NodeT, Queryable};
+
+        fn collect_text_rows(
+            shape: &egui::Shape,
+            transform: egui::emath::TSTransform,
+            rows: &mut HashMap<String, Vec<egui::Rect>>,
+        ) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    rows.insert(
+                        text.galley.text().to_owned(),
+                        text.galley
+                            .rows
+                            .iter()
+                            .map(|row| transform * row.rect().translate(text.pos.to_vec2()))
+                            .collect(),
+                    );
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_text_rows(shape, transform, rows);
+                    }
+                }
+                _ => {}
+            }
+        }
 
         for width in [720.0, PREFERENCES_MIN_WIDTH] {
             // Fix the actual production Window before opening the page. Checking
             // only content against a Window that already grew would miss this bug.
             let mut harness =
                 preferences_view_harness_with_combo_reference(PreferencesPage::General, true);
+            harness
+                .input_mut()
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .native_pixels_per_point = Some(pixels_per_point);
+            harness.run_steps(3);
+            assert_eq!(harness.ctx.pixels_per_point(), pixels_per_point);
             let window_id = preferences_window_id_for_test();
             let before = harness
                 .ctx
@@ -7494,14 +7616,10 @@ mod tests {
                 .unwrap();
             assert!(
                 (fixed.width() - width).abs() <= 1.0,
-                "width={width}: {fixed:?}"
+                "ppp={pixels_per_point}, width={width}: {fixed:?}"
             );
 
-            for scenario in [
-                ContextMenuPreviewScenario::GridImageWithDynamicApps,
-                ContextMenuPreviewScenario::GridFolderBackground,
-                ContextMenuPreviewScenario::FullscreenVideo,
-            ] {
+            for &scenario in ContextMenuPreviewScenario::ALL {
                 harness
                     .state_mut()
                     .open_preferences_page(PreferencesPage::ContextMenuLayout);
@@ -7520,11 +7638,33 @@ mod tests {
                     state.context_menu_expanded.insert(parent, true);
                 }
                 harness.run_steps(6);
+                assert_eq!(harness.ctx.pixels_per_point(), pixels_per_point);
+                let layout_settings = harness
+                    .state()
+                    .pref_state
+                    .as_ref()
+                    .unwrap()
+                    .settings
+                    .context_menu_layout
+                    .clone();
+                let preview = context_menu_layout_preview(scenario, &layout_settings);
+                let orders: Vec<_> = ContextMenuParentId::ALL
+                    .iter()
+                    .map(|&parent| layout_settings.resolved_order(parent))
+                    .collect();
                 let row_height = harness
                     .ctx
                     .data(|data| {
                         data.get_temp::<f32>(egui::Id::unique(
                             "preferences_single_line_combo_height",
+                        ))
+                    })
+                    .unwrap();
+                let (status_height, item_spacing_y) = harness
+                    .ctx
+                    .data(|data| {
+                        data.get_temp::<(f32, f32)>(egui::Id::unique(
+                            "preferences_context_menu_line_heights",
                         ))
                     })
                     .unwrap();
@@ -7547,10 +7687,12 @@ mod tests {
                     assert!(
                         checkbox.y_range().contains(status.center().y)
                             && status.left() >= checkbox.right(),
-                        "width={width}, scenario={scenario:?}, item={item:?}: \
+                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, item={item:?}: \
                          short item and status should share a row: {checkbox:?}, {status:?}"
                     );
                 }
+                let mut wrapped_status_items = std::collections::HashSet::new();
+                let mut first_line_checked = std::collections::HashSet::new();
                 for step in 0..128 {
                     let (_, layout) = harness
                         .ctx
@@ -7561,17 +7703,157 @@ mod tests {
                         })
                         .unwrap();
                     let tolerance = 1.0 / harness.ctx.pixels_per_point();
+                    let mut painted_rows = HashMap::new();
+                    for clipped in &harness.output().shapes {
+                        collect_text_rows(
+                            &clipped.shape,
+                            clipped.transform_after_tessellation,
+                            &mut painted_rows,
+                        );
+                    }
+                    // Before the fix Grid centered a fixed-height child whose wrapped
+                    // contents grew below its row; wrapping Labels also split status text.
+                    for order in &orders {
+                        let mut rows = Vec::new();
+                        for &item in order {
+                            let checkbox = harness.get_by_label(item.label()).rect();
+                            let preview_rect = harness
+                                .ctx
+                                .data(|data| {
+                                    data.get_temp::<egui::Rect>(egui::Id::unique((
+                                        "context_menu_item_preview",
+                                        item,
+                                    )))
+                                })
+                                .unwrap();
+                            let mut item_parts = vec![preview_rect, checkbox];
+                            let (status_label, separator_suffix) = match preview.state(item) {
+                                ContextMenuPreviewItemState::Unavailable => (
+                                    Some(format!("{}はこの場面で対象外", item.label())),
+                                    "（この場面では対象外）",
+                                ),
+                                ContextMenuPreviewItemState::Hidden => (
+                                    Some(format!("{}は項目非表示中", item.label())),
+                                    "（項目が非表示）",
+                                ),
+                                ContextMenuPreviewItemState::First => (
+                                    Some(format!("{}はこの場面で先頭", item.label())),
+                                    "（先頭のため非表示）",
+                                ),
+                                ContextMenuPreviewItemState::Available { .. } => (None, ""),
+                            };
+                            if let Some(label) = status_label {
+                                let status = harness.get_by_label(&label).rect();
+                                assert!(
+                                    status.is_positive()
+                                        && status.height() <= status_height + tolerance,
+                                    "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, item={item:?}: \
+                                     status must stay on one line: {status:?}, height={status_height}"
+                                );
+                                if let Some(text_rows) = painted_rows.get(item.label()) {
+                                    let text_bottom = text_rows.last().unwrap().bottom();
+                                    if status.top() >= text_bottom - tolerance {
+                                        // Automatic wrapping inherited the multi-line Checkbox's
+                                        // height and centered the small note in that tall row.
+                                        let gap = status.top() - text_bottom;
+                                        assert!(
+                                            (gap - item_spacing_y).abs() <= tolerance,
+                                            "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, item={item:?}: \
+                                             wrapped note must follow the last text row directly: \
+                                             text_bottom={text_bottom}, status={status:?}, \
+                                             gap={gap}, spacing={item_spacing_y}"
+                                        );
+                                        if text_rows.len() > 1 {
+                                            wrapped_status_items.insert(item);
+                                        }
+                                    } else {
+                                        assert_eq!(
+                                            text_rows.len(),
+                                            1,
+                                            "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, item={item:?}: \
+                                             a note following multi-line text must start below it"
+                                        );
+                                    }
+                                }
+                                item_parts.push(status);
+                            }
+                            let mut controls = vec![
+                                harness
+                                    .get_by_label(&format!(
+                                        "{}の前の区切り線{separator_suffix}",
+                                        item.label()
+                                    ))
+                                    .rect(),
+                            ];
+                            if order.len() > 1 {
+                                for direction in ["上", "下"] {
+                                    controls.push(
+                                        harness
+                                            .get_by_label(&format!(
+                                                "{}を{direction}へ",
+                                                item.label()
+                                            ))
+                                            .rect(),
+                                    );
+                                }
+                            }
+                            if layout_settings.separator_before(item)
+                                != ContextMenuSeparatorBefore::Inherit
+                            {
+                                controls.push(
+                                    harness
+                                        .get_by_label(&format!(
+                                            "{}の区切り線を既定に戻す",
+                                            item.label()
+                                        ))
+                                        .rect(),
+                                );
+                            }
+                            if let Some(text_rows) = painted_rows.get(item.label()) {
+                                // Use the actual painted text row, not a height assumed from
+                                // the Checkbox or the implementation's first-line reference.
+                                let first_line_center = text_rows.first().unwrap().center().y;
+                                for control in &controls {
+                                    assert!(
+                                        control.is_positive()
+                                            && (control.center().y - first_line_center).abs()
+                                                <= tolerance,
+                                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, item={item:?}: \
+                                         controls must align with the checkbox's first line: \
+                                         checkbox={checkbox:?}, center={first_line_center}, {control:?}"
+                                    );
+                                }
+                                first_line_checked.insert(item);
+                            }
+                            let mut all_parts = item_parts.clone();
+                            all_parts.extend(controls);
+                            rows.push((item, item_parts, all_parts));
+                        }
+                        for pair in rows.windows(2) {
+                            for part in &pair[0].1 {
+                                for next_part in &pair[1].2 {
+                                    assert!(
+                                        part.bottom() <= next_part.top() + tolerance,
+                                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, step={step}: \
+                                         {:?} {part:?} overlaps next row {:?} {next_part:?}",
+                                        pair[0].0,
+                                        pair[1].0
+                                    );
+                                }
+                            }
+                        }
+                    }
                     let window = harness
                         .ctx
                         .memory(|memory| memory.area_rect(window_id))
                         .unwrap();
                     assert!(
                         (window.width() - width).abs() <= tolerance,
-                        "width={width}, scenario={scenario:?}: Window grew to {window:?}"
+                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}: Window grew to {window:?}"
                     );
                     assert!(
                         layout.content.x <= layout.inner.width() + tolerance,
-                        "width={width}, scenario={scenario:?}, step={step}: {layout:?}"
+                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, step={step}: {layout:?}"
                     );
                     for role in [
                         egui::accesskit::Role::CheckBox,
@@ -7587,13 +7869,13 @@ mod tests {
                             {
                                 assert!(
                                     rect.right() <= layout.inner.right() + tolerance,
-                                    "width={width}, scenario={scenario:?}, {role:?}: {rect:?}, node={:?}",
+                                    "ppp={pixels_per_point}, width={width}, scenario={scenario:?}, {role:?}: {rect:?}, node={:?}",
                                     node.accesskit_node()
                                 );
                                 if role == egui::accesskit::Role::ComboBox {
                                     assert!(
                                         rect.height() <= row_height + tolerance,
-                                        "width={width}, scenario={scenario:?}: multi-line combo {rect:?}"
+                                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}: multi-line combo {rect:?}"
                                     );
                                 }
                             }
@@ -7620,6 +7902,25 @@ mod tests {
                     });
                     harness.run_steps(6);
                 }
+                for &item in orders.iter().flatten() {
+                    assert!(
+                        first_line_checked.contains(&item),
+                        "ppp={pixels_per_point}, width={width}, scenario={scenario:?}: text row was never painted: {item:?}"
+                    );
+                }
+                if width == PREFERENCES_MIN_WIDTH
+                    && scenario == ContextMenuPreviewScenario::GridPdfPage
+                {
+                    for item in [
+                        ContextMenuItemId::OrganizeFiles,
+                        ContextMenuItemId::CombineReopen,
+                    ] {
+                        assert!(
+                            wrapped_status_items.contains(&item),
+                            "exercise the reported multi-line item and following note: {item:?}"
+                        );
+                    }
+                }
             }
 
             let item = ContextMenuItemId::OpenFolderInExplorer;
@@ -7634,7 +7935,7 @@ mod tests {
             let combo = harness.get_by_label(&separator_label).rect();
             assert!(
                 checkbox.height() > combo.height(),
-                "width={width}: exercise a wrapped item, checkbox={checkbox:?}, combo={combo:?}"
+                "ppp={pixels_per_point}, width={width}: exercise a wrapped item, checkbox={checkbox:?}, combo={combo:?}"
             );
             let (_, layout) = harness
                 .ctx
@@ -9451,6 +9752,48 @@ mod tests {
     }
 
     #[test]
+    fn preferences_context_menu_layout_narrow_pdf_page_snapshot() {
+        let mut layout = crate::context_menu_model::ContextMenuLayoutSettings::default();
+        let mut scenario = crate::context_menu_model::ContextMenuPreviewScenario::GridPdfPage;
+        let mut expanded = HashMap::new();
+        // Mirror the minimum Window's right pane: 180pt navigation, 8pt gap,
+        // Window margins and the production pane's solid, always-visible scrollbar.
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(PREFERENCES_MIN_WIDTH - 180.0 - 8.0, 700.0))
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    crate::os_theme::apply_resolved(
+                        root_ui.ctx(),
+                        crate::os_theme::ResolvedTheme::Dark,
+                    );
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::window(root_ui.style()))
+                        .show(root_ui, |ui| {
+                            ui.spacing_mut().scroll = pref_panel_scroll_style();
+                            egui::ScrollArea::vertical()
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                                )
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    draw_context_menu_layout_settings(
+                                        ui,
+                                        &mut layout,
+                                        &mut scenario,
+                                        &mut expanded,
+                                        0,
+                                    );
+                                });
+                        });
+                });
+            });
+        harness.run();
+        harness.snapshot("preferences_context_menu_layout_narrow_pdf_page");
+    }
+
+    #[test]
     fn opening_context_menu_page_and_switching_preview_scene_do_not_edit_settings() {
         use egui_kittest::kittest::Queryable;
 
@@ -10079,7 +10422,7 @@ mod tests {
         egui::Id::unique(title.text())
     }
 
-    fn preferences_view_harness(
+    pub(super) fn preferences_view_harness(
         page: PreferencesPage,
     ) -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
         preferences_view_harness_with_combo_reference(page, false)
@@ -10122,13 +10465,24 @@ mod tests {
                                         &combo.response,
                                         "1 行のコンボの高さの基準",
                                     );
-                                    combo
+                                    let status = ui.add(
+                                        egui::Label::new(egui::RichText::new("対象外").small())
+                                            .wrap_mode(egui::TextWrapMode::Extend),
+                                    );
+                                    (
+                                        combo.response.rect.height(),
+                                        (status.rect.height(), ui.spacing().item_spacing.y),
+                                    )
                                 });
                         ctx.data_mut(|data| {
                             data.insert_temp(
                                 egui::Id::unique("preferences_single_line_combo_height"),
-                                reference.inner.response.rect.height(),
-                            )
+                                reference.inner.0,
+                            );
+                            data.insert_temp(
+                                egui::Id::unique("preferences_context_menu_line_heights"),
+                                reference.inner.1,
+                            );
                         });
                     }
                 },
@@ -12042,7 +12396,7 @@ mod tests {
             }),
         );
         app.settings = reloaded;
-        app.load_folder_with_scan(folder, None);
+        app.load_folder_and_finish_for_test(folder);
         assert_eq!(
             app.items
                 .iter()
@@ -12572,7 +12926,9 @@ mod tests {
         let next_book = harness.state().tmp.path().join("next-book");
         std::fs::create_dir_all(next_book.join("A")).unwrap();
         std::fs::create_dir_all(next_book.join("Page 3")).unwrap();
-        harness.state_mut().load_folder(next_book);
+        harness
+            .state_mut()
+            .load_folder_and_finish_for_test(next_book);
         let same_name = harness
             .state()
             .items

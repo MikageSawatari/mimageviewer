@@ -9,16 +9,16 @@
 //! ## 実行
 //!
 //! ```
-//! cargo test --test ui_snapshot
+//! cargo test -p mimageviewer --test integration ui_snapshot::
 //! ```
 //!
 //! ## スナップショット更新 (意図的に見た目を変えたとき)
 //!
 //! ```
-//! UPDATE_SNAPSHOTS=1 cargo test --test ui_snapshot
+//! UPDATE_SNAPSHOTS=1 cargo test -p mimageviewer --test integration ui_snapshot::
 //! ```
 //!
-//! 更新後は `tests/snapshots/ui_snapshot/*.png` の差分を目視確認してからコミットする。
+//! 更新後は `tests/snapshots/*.png` の差分を目視確認してからコミットする。
 //!
 //! ## 参考
 //!
@@ -788,13 +788,7 @@ fn ai_failure_feedback_hover_small_light() {
     );
 }
 
-#[path = "support/gpu_test_group.rs"]
-mod test_gpu_group;
-#[path = "support/ui_harness.rs"]
-mod test_ui;
-
-#[path = "support/logical_bounds.rs"]
-mod logical_bounds;
+use crate::{logical_bounds, test_ui};
 
 #[test]
 fn depth_parallax_panel_dark() {

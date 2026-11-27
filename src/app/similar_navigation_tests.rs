@@ -43,6 +43,11 @@ fn grid_item_keys(items: &[GridItem]) -> Vec<String> {
 
 fn image_scan(paths: &[PathBuf]) -> ScannedDir {
     ScannedDir {
+        folder_order_inventory: paths
+            .iter()
+            .map(|path| crate::folder_order::folder_key(path))
+            .collect(),
+        folder_order_input: crate::folder_order::FolderOrderListingInput::from_read(Ok(None)),
         duration_facts: None,
         page_count_facts: None,
         precise_stamps: Default::default(),
@@ -68,9 +73,40 @@ fn image_scan(paths: &[PathBuf]) -> ScannedDir {
 /// Replace the real worker channel immediately after the production admission path has run.
 /// The returned sender lets each test choose success, failure, disconnection, or a still-pending
 /// request without sleeps or filesystem timing races.
-fn control_required_scan(
-    app: &mut App,
-) -> (mpsc::Sender<std::io::Result<ScannedDir>>, Arc<AtomicBool>) {
+struct ControlledScanSender {
+    tx: mpsc::Sender<FolderOpenScanResult>,
+    policy: super::folder_scan::FolderScanPolicy,
+}
+
+impl ControlledScanSender {
+    fn send(
+        &self,
+        scan: std::io::Result<ScannedDir>,
+    ) -> Result<(), mpsc::SendError<std::io::Result<ScannedDir>>> {
+        self.tx
+            .send(FolderOpenScanResult {
+                scan,
+                policy: self.policy.clone(),
+                policy_mixed: false,
+            })
+            .map_err(|error| mpsc::SendError(error.0.scan))
+    }
+}
+
+fn controlled_scan_channel(
+    app: &App,
+) -> (ControlledScanSender, mpsc::Receiver<FolderOpenScanResult>) {
+    let (tx, rx) = mpsc::channel();
+    (
+        ControlledScanSender {
+            tx,
+            policy: app.folder_scan_policy(),
+        },
+        rx,
+    )
+}
+
+fn control_required_scan(app: &mut App) -> (ControlledScanSender, Arc<AtomicBool>) {
     let pending = app
         .folder_pane_open_pending
         .take()
@@ -81,7 +117,7 @@ fn control_required_scan(
     ));
     pending.cancel.store(true, Ordering::Relaxed);
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = controlled_scan_channel(app);
     let cancel = Arc::new(AtomicBool::new(false));
     app.folder_pane_open_pending = Some(FolderPaneOpenPending {
         started_at: std::time::Instant::now(),
@@ -796,7 +832,7 @@ fn embedded_similar_move_update_pump_leaves_non_required_scan_for_normal_tail() 
     std::fs::create_dir_all(&pane_folder).unwrap();
     std::fs::write(&origin, b"origin").unwrap();
     install_embedded_update_scene(&mut app, &ctx, std::slice::from_ref(&origin));
-    let (pane_tx, pane_rx) = mpsc::channel();
+    let (pane_tx, pane_rx) = controlled_scan_channel(&app);
     let pane_cancel = Arc::new(AtomicBool::new(false));
     app.folder_pane_open_pending = Some(FolderPaneOpenPending {
         started_at: std::time::Instant::now(),
@@ -844,7 +880,7 @@ fn embedded_similar_move_update_pump_does_not_consume_a_passive_context_scan() {
     std::fs::write(&main_page, b"main").unwrap();
     std::fs::write(&sibling_page, b"sibling").unwrap();
     install_embedded_update_scene(&mut app, &ctx, std::slice::from_ref(&main_page));
-    let (sibling_tx, sibling_rx) = mpsc::channel();
+    let (sibling_tx, sibling_rx) = controlled_scan_channel(&app);
     let sibling_cancel = Arc::new(AtomicBool::new(false));
     let sibling_cancel_for_context = Arc::clone(&sibling_cancel);
     let sibling_folder_for_context = sibling_folder.clone();
@@ -1228,7 +1264,7 @@ fn detached_required_scan_failure_without_a_page_exits_the_password_wait_owner()
     app.fs_info_panel.locked = true;
     app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     install_awaiting_password_sequence(&mut app);
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = controlled_scan_channel(&app);
     tx.send(Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         "controlled detached failure",
@@ -1267,7 +1303,7 @@ fn disconnected_required_scan_uses_the_same_terminal_failure_boundary() {
     app.fs_info_panel.locked = true;
     app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByPointer;
     install_awaiting_password_sequence(&mut app);
-    let (tx, rx) = mpsc::channel::<std::io::Result<ScannedDir>>();
+    let (tx, rx) = mpsc::channel::<FolderOpenScanResult>();
     drop(tx);
     app.folder_pane_open_pending = Some(FolderPaneOpenPending {
         started_at: std::time::Instant::now(),

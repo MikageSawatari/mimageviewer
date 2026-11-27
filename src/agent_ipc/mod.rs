@@ -21,6 +21,9 @@ mod metadata_response_tests;
 pub(crate) mod metadata_write;
 pub(crate) mod open;
 mod open_response;
+pub(crate) mod operation_script;
+#[cfg(test)]
+mod operation_script_tests;
 mod rating;
 mod recent;
 mod stack_script;
@@ -333,6 +336,7 @@ fn check_tool_permission(
         | Command::SetSettings { .. }
         | Command::SetFavorite { .. }
         | Command::StackScript { .. }
+        | Command::OperationScript { .. }
             if !snapshot.settings =>
         {
             Some(SETTINGS_PERMISSION_MESSAGE)
@@ -596,6 +600,7 @@ impl Connection {
                             | Command::SetSettings { .. }
                             | Command::SetFavorite { .. }
                             | Command::StackScript { .. }
+                            | Command::OperationScript { .. }
                     )
                 {
                     metadata_response::respond(
@@ -729,6 +734,7 @@ fn tool_name(command: &Command) -> &'static str {
         Command::SetSettings { .. } => "set_settings",
         Command::SetFavorite { .. } => "set_favorite",
         Command::StackScript { .. } => "stack_script",
+        Command::OperationScript { .. } => "operation_script",
         Command::SearchItems { .. } => "search_items",
         Command::ListTags { .. } => "list_tags",
         Command::ItemsByTag { .. } => "items_by_tag",
@@ -805,7 +811,7 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
             (result.changed.len() + result.unchanged.len(), "none")
         }
         Ok(Payload::FavoriteWrite(_)) => (1, "none"),
-        Ok(Payload::StackScript(_)) => (1, "none"),
+        Ok(Payload::StackScript(_)) | Ok(Payload::OperationScript(_)) => (1, "none"),
         Ok(_) => (0, "none"),
         Err(e) => (
             0,
@@ -1013,6 +1019,7 @@ impl Handlers {
             | Command::SetSettings { .. }
             | Command::SetFavorite { .. }
             | Command::StackScript { .. }
+            | Command::OperationScript { .. }
             | Command::SetRating { .. } => {
                 unreachable!()
             }
@@ -1596,6 +1603,9 @@ impl crate::app::App {
     pub(crate) fn install_agent_readers(&mut self, readers: Arc<crate::remote_ipc::SharedReaders>) {
         if let Some(service) = &self.book_composition_service {
             readers.install_book_composition(service.clone());
+        }
+        if let Some(handle) = self.folder_order_handle() {
+            readers.install_folder_order(handle);
         }
         self.agent_readers = Some(readers);
         self.publish_agent_index();

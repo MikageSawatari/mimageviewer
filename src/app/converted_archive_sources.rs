@@ -177,6 +177,8 @@ impl App {
         for idx in reload_indices {
             self.evict_thumbnail_for_reload(idx);
         }
+        // Unavailable は要求を作らず Pending のままになる。表示素材だけもここで退役する。
+        self.reconcile_thumbnail_standins();
     }
 
     pub(crate) fn catch_up_converted_archive_sources(&mut self) {

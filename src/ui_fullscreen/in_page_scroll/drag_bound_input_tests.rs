@@ -406,7 +406,7 @@ fn drag_bound_setting_preserves_overlay_space_pan_handler_for_every_edit_mode() 
                 });
             }
             assert_ne!(app.fs_pan, Vec2::ZERO, "Space pan must move: {surface:?}");
-            assert!(app.fs_pan_drag_start.is_none());
+            assert!(app.fs_canvas_drag.pan_start().is_none());
             result(&app)
         });
         assert_eq!(outcomes[0], outcomes[1], "surface={surface:?}");

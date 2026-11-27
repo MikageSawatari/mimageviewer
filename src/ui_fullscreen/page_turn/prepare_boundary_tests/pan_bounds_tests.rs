@@ -64,7 +64,8 @@ fn draw(
             selected_current,
             false,
         )
-        .unwrap();
+        .unwrap()
+        .transform;
     app.fullscreen_page_layout
         .begin(FullscreenPageLayoutKind::Single);
     app.fullscreen_page_layout

@@ -13,14 +13,15 @@ use std::time::{Duration, Instant};
 
 mod gamepad;
 mod lifecycle;
+mod view_order_wait_dim;
 mod watch_849;
 mod worker_849;
 
 const DEADLINE: Duration = Duration::from_secs(30);
 
 struct HeldScan {
-    tx: mpsc::Sender<std::io::Result<ScannedDir>>,
-    result: std::io::Result<ScannedDir>,
+    tx: mpsc::Sender<FolderOpenScanResult>,
+    result: FolderOpenScanResult,
     cancel: Arc<AtomicBool>,
 }
 
@@ -146,7 +147,7 @@ impl Harness {
         // A mixed physical folder permits duration sort in the real controls;
         // an image-only folder may have its page order locked instead.
         write_wav(&folder.join("Z.wav"));
-        env.load_folder(folder);
+        env.load_folder_and_finish_for_test(folder);
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         crate::ime_focus::install_ime_input_policy(&ctx);

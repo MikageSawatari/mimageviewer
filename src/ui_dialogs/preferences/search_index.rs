@@ -104,6 +104,20 @@ macro_rules! entry {
 
 pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
+        "extensions/operation-script",
+        OperationScript,
+        "操作のスクリプトを使う",
+        [
+            "操作のスクリプト",
+            "スクリプト操作",
+            "Rhai",
+            "slots",
+            "on_event",
+            "再読み込み",
+            "既定に戻す"
+        ]
+    ),
+    entry!(
         "file-types/categories",
         FileTypeVisibility,
         "表示するファイル種類",
@@ -1324,6 +1338,25 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "spread/plane-view-lens",
+        SpreadMode,
+        "魚眼のレンズ",
+        [
+            "魚眼ズーム",
+            "魚眼レンズ",
+            "等距離",
+            "立体射影",
+            "等立体角",
+            "ズーム",
+            "拡大",
+            "縮小",
+            "Ctrl",
+            "Shift",
+            "ホイール",
+            "fisheye"
+        ]
+    ),
+    entry!(
         "spread/n-scroll-order",
         SpreadMode,
         "N 字スクロールの順序",
@@ -1879,6 +1912,7 @@ mod tests {
     const FOLDER_BACKGROUND_SOURCE: &str = include_str!("folder_background.rs");
     const DEPTH_ADDON_SOURCE: &str = include_str!("../depth_addon.rs");
     const BROWSER_INTEGRATION_SOURCE: &str = include_str!("browser_integration.rs");
+    const OPERATION_SCRIPT_SOURCE: &str = include_str!("operation_script.rs");
 
     #[test]
     fn same_name_folder_book_choice_queries_target_the_existing_anchor() {
@@ -2018,6 +2052,7 @@ mod tests {
         let placed: HashSet<_> = anchors_in_pages_source(PAGES_SOURCE)
             .into_iter()
             .chain(anchors_in_pages_source(BROWSER_INTEGRATION_SOURCE))
+            .chain(anchors_in_pages_source(OPERATION_SCRIPT_SOURCE))
             .collect();
         for entry in PREF_SEARCH_INDEX {
             assert!(
@@ -2057,6 +2092,11 @@ mod tests {
                             .contains("PreferencesPage::BrowserIntegration => browser_integration::page(ui, state)")
                     );
                     BROWSER_INTEGRATION_SOURCE
+                } else if entry.anchor == "extensions/operation-script" {
+                    assert!(PREFERENCES_SOURCE.contains(
+                        "PreferencesPage::OperationScript => operation_script::page(ui, state)"
+                    ));
+                    OPERATION_SCRIPT_SOURCE
                 } else if entry.anchor == "depth-addon/manage" {
                     assert!(PAGES_SOURCE.contains(
                         "super::super::depth_addon::draw_preferences(ui, &state.depth_view)"
@@ -2126,7 +2166,11 @@ mod tests {
     #[test]
     fn every_page_anchor_is_indexed_and_every_page_has_an_entry() {
         let indexed: HashSet<_> = PREF_SEARCH_INDEX.iter().map(|entry| entry.anchor).collect();
-        for anchor in anchors_in_pages_source(PAGES_SOURCE) {
+        for anchor in anchors_in_pages_source(PAGES_SOURCE)
+            .into_iter()
+            .chain(anchors_in_pages_source(BROWSER_INTEGRATION_SOURCE))
+            .chain(anchors_in_pages_source(OPERATION_SCRIPT_SOURCE))
+        {
             assert!(
                 indexed.contains(anchor),
                 "pages.rs に置いた anchor が検索索引にありません: {anchor}"
@@ -2401,6 +2445,26 @@ mod tests {
                 .find(|entry| entry.anchor == anchor)
                 .expect("ページ内スクロール設定が検索できる");
             assert_eq!(entry.page, PreferencesPage::SpreadMode);
+        }
+    }
+
+    #[test]
+    fn plane_view_lens_setting_is_searchable() {
+        for query in [
+            "魚眼のレンズ",
+            "魚眼 ズーム",
+            "等距離",
+            "立体射影",
+            "等立体角",
+            "fisheye",
+            "Ctrl Shift ホイール",
+        ] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "spread/plane-view-lens")
+                .expect("魚眼のレンズが検索できる");
+            assert_eq!(entry.page, PreferencesPage::SpreadMode);
+            assert_eq!(entry.title, "魚眼のレンズ");
         }
     }
 

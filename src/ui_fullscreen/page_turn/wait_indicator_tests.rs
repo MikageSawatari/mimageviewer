@@ -379,7 +379,8 @@ fn draw_position_current(
             true,
             false,
         )
-        .expect("ready single or split page");
+        .expect("ready single or split page")
+        .transform;
     app.fullscreen_page_layout
         .begin(FullscreenPageLayoutKind::Single);
     app.fullscreen_page_layout

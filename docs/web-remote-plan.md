@@ -1607,9 +1607,18 @@ topbar の親フォルダ / ホームだけに `navigation-icon` を付け、40�
 
 GET /api/list の remote-web ローカル走査を廃止し、FolderListRequest /
 FolderListPayload を本体 IPC へ追加する。正本は
-app::folder_scan::materialize_local_folder_listing_with_order である。App::load_folder が直接使い、
+app::folder_scan::materialize_local_folder_listing_with_order_and_metadata である。App::load_folder が使い、
 remote container / folder list は ContainerEngine::recompute_folder_listing という scan wrapper
 から同じ関数を使う。remote-web は一覧の分類・sort・sidecar / 重複規則を持たない。
+
+§1.911 のフォルダ手動順も同じ materializer の resolver を使う。本体プロセス内の ContainerEngine worker が
+`SharedReaders` に登録された `FolderOrderHandle` から FIFO Read を待ち、物理一覧専用の入力と inventory を渡す。
+folder_order.db の第 2 の reader は作らない。PC と共有する `FolderOrderState::applies_to_physical_listing` が真なら、
+`RemoteGridSortState` は `selected: "manual"`、value が `"manual"` の単一 option、理由入りの `locked_reason`
+を返す。`SetSortOrder` は一覧を同じ条件で再計算し、既存の sort-lock 経路で Unsupported として拒否する。
+Remote には手動への切替・リセット・並べ替えを追加しない。ページ順固定やスタックによる抑制も共通の対象判定に従う。
+既存の wire の形で表現できるため、この追加で protocol は変更せず **74** のままとする。
+詳細は [フォルダ手動順の設計](folder-manual-order-plan.md) §4.1・§5・§7。
 
 評価順では ContainerEngine の worker が `RemoteListingSettings` に載る並び順と未評価位置を
 一緒に読み、rating.db の対象 key 全件を完全に読んでから一覧を確定する。評価の書き込みは

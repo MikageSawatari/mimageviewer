@@ -336,12 +336,16 @@ ready済みの直接移動と同じフレームのお気に入り・アドレス
 
 ## 7. 範囲外 (後続候補)
 
-- `dispatch_main_input_nav_immediate` の `Direct` / `CollectionSource` (全画面を閉じる即時経路) の同期走査。
-- `load_folder` / `load_folder_with_scan(path, None)` の同期呼び出し元。
+2026-11-26: 一覧側の先行入力を捨てる扱いと全画面の待ち方が利用者に採択され、
+[§1.853 C・D・E の設計 §6](ui-sync-853-plan.md#6-1853-の残り-cde-v590-予定ブランチ-ui-scan-853b) に基づく実装へ移した。
+生成点の `Worker` 印と早い predicate は撤去し、未走査の共通点が main の既定を判断する。
+`DirectNavigation(Box<DirectNavigationContinuation>)` は owner・intent・効果・検索の帰路・選択・全画面予約を保持し、
+走査完了は modal・owner・navigation・policy を照合して同じ loader の採用へ戻る。
+全画面の Direct / CollectionSource から親へ戻る待ちは `CloseReturn` sequence に接続する。
+この追補のコンパイル・自動テスト・実機確認は未実施。
+
 - main 以外の context の直接移動 (detached はリワーク側で扱う)。
-- 一覧のフォルダを開く (Enter・ダブルクリック・ゲームパッド)・親へ (BS・親ボタン・ZIP からの BS)・コレクションの物理元・
-  フォルダを開くダイアログの同期走査。worker 化するなら、Enter 直後の先行入力が走査待ちの間に捨てられる扱いを
-  先に決める (退行になり得る。§3.2)。リリース済みの挙動の変更なので利用者に相談する。
+- ★固定の葉を開く同期の続き、トレイへ閉じる、診断の同期契約、変換キャッシュの読直しは理由付きの例外として残す。
 - 履歴・レーティングの待ち、構造操作・画像フォルダの ZIP 化中に Esc がスタック表示を切り替える既存の不具合
   (`handle_stack_refresh_keyboard` が停止理由を見ない)。本件では直接移動の待ちだけを型付きの理由で除いた。
 - `GridFolderCandidate` の完了で、採用が拒否されたときに全画面予約が残り得る既存の漏れ (実装レビュー r1 で判明)。

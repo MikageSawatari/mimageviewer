@@ -57,6 +57,7 @@ pub(crate) enum SnsSplitEntryError {
     Rotated,
     ImageLoading,
     RawDevelopmentPending,
+    NavigationPending,
 }
 
 impl SnsSplitEntryError {
@@ -65,6 +66,9 @@ impl SnsSplitEntryError {
             Self::Rotated => SNS_SPLIT_ROTATION_DISABLED_REASON,
             Self::RawDevelopmentPending => "RAW の現像が終わると編集できます",
             Self::ImageLoading => "[SNS 分割] 画像読み込み待ち",
+            Self::NavigationPending => {
+                crate::app::page_edit_admission::PAGE_EDIT_NAVIGATION_PENDING_NOTICE
+            }
         }
     }
 }
@@ -756,6 +760,9 @@ impl App {
     }
 
     pub(crate) fn enter_sns_split_mode(&mut self, fs_idx: usize) -> Result<(), SnsSplitEntryError> {
+        if !self.page_edit_mode_navigation_entry_allowed() {
+            return Err(SnsSplitEntryError::NavigationPending);
+        }
         let (raw_target_idx, _) = self.plan_page_edit_pivot(fs_idx);
         if !self.raw_edit_target_entry_allowed(raw_target_idx) {
             return Err(SnsSplitEntryError::RawDevelopmentPending);
@@ -796,6 +803,7 @@ impl App {
             self.enter_page_edit_single_view(target_idx);
         }
         self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::ModeExit);
+        self.stop_projected_slideshow_playback();
         self.sns_split = Some(layout);
         Ok(())
     }
@@ -825,6 +833,7 @@ impl App {
             return Default::default();
         }
         let action = crate::ui_fullscreen::FsKeyAction {
+            script_slot: None,
             page_transition: Default::default(),
             close: false,
             close_to_page_list: false,
@@ -3071,7 +3080,8 @@ mod tests {
                         if path == &app.tmp.path().join("sns-left.png")
                 ));
             }
-            crate::export_dialog::ExportComposite::Spread { .. } => {
+            crate::export_dialog::ExportComposite::Spread { .. }
+            | crate::export_dialog::ExportComposite::PlaneView(_) => {
                 panic!("SNS 分割は編集対象の単ページだけを worker 合成へ渡す")
             }
         }

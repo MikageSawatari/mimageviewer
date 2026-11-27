@@ -88,12 +88,14 @@ pub struct ColorScanPending {
     pub cancel: Arc<AtomicBool>,
     pub rx: mpsc::Receiver<ColorScanMessage>,
     pub started_at: Instant,
+    pub(crate) selection_policy: crate::app::VisibleSelectionPolicy,
 }
 
 #[derive(Clone, Debug)]
 pub struct ColorScanConfirmation {
     pub scope_signature: ScanScopeSignature,
     pub missing: usize,
+    pub(crate) selection_policy: crate::app::VisibleSelectionPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -124,7 +126,8 @@ pub struct ColorFilterState {
     pub input_has_focus: bool,
     pub picker_hue_degrees: f32,
     pub palettes: ScanPalettes,
-    pub pending: Option<ColorScanPending>,
+    // 完了時の選択方針を含む低頻度の要求は App のスタックへ載せない。
+    pub pending: Option<Box<ColorScanPending>>,
     pub confirmation: Option<ColorScanConfirmation>,
     pub confirmed_large_scan_scope: Option<ScanScopeSignature>,
     pub applied_scope_signature: Option<ScanScopeSignature>,

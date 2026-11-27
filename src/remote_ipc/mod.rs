@@ -34,6 +34,7 @@ pub(crate) struct SharedReaders {
     pub(crate) fts: std::sync::RwLock<Option<std::sync::Arc<crate::fts_index::FtsIndex>>>,
     book_composition: std::sync::RwLock<Option<crate::book_composition::BookCompositionService>>,
     collection_store: std::sync::RwLock<Option<crate::collection_store::CollectionStoreClient>>,
+    folder_order: std::sync::RwLock<Option<crate::folder_order::FolderOrderHandle>>,
 }
 
 impl SharedReaders {
@@ -52,6 +53,7 @@ impl SharedReaders {
             fts: std::sync::RwLock::new(None),
             book_composition: std::sync::RwLock::new(None),
             collection_store: std::sync::RwLock::new(None),
+            folder_order: std::sync::RwLock::new(None),
         }))
     }
 
@@ -83,6 +85,14 @@ impl SharedReaders {
         &self,
     ) -> Option<crate::book_composition::BookCompositionService> {
         self.book_composition.read().unwrap().clone()
+    }
+
+    pub(crate) fn install_folder_order(&self, handle: crate::folder_order::FolderOrderHandle) {
+        *self.folder_order.write().unwrap() = Some(handle);
+    }
+
+    pub(crate) fn folder_order(&self) -> Option<crate::folder_order::FolderOrderHandle> {
+        self.folder_order.read().unwrap().clone()
     }
 
     pub(crate) fn favorites(
@@ -128,6 +138,8 @@ pub(crate) mod ui;
 pub(super) const BOOK_SORT_LOCK_REASON: &str =
     "本として表示中は名前順固定です（一覧の並べ替えは使えません）。";
 pub(super) const FIXED_LIST_SORT_LOCK_REASON: &str = "この一覧では並び順が固定されています。";
+pub(super) const MANUAL_FOLDER_SORT_LOCK_REASON: &str =
+    "このフォルダは手動順です。並び順の変更は PC 側で行ってください。";
 /// Dynamic JSON budget for container and collection entry lists.
 ///
 /// The IPC reader accepts 64 MiB response frames. Capping the repeated list data at
@@ -431,6 +443,18 @@ pub(super) fn remote_grid_sort_state(
             })
             .collect(),
         locked_reason: locked_reason.map(str::to_owned),
+    }
+}
+
+pub(super) fn remote_manual_folder_sort_state() -> mimageviewer_ipc::RemoteGridSortState {
+    mimageviewer_ipc::RemoteGridSortState {
+        selected: "manual".to_owned(),
+        options: vec![mimageviewer_ipc::RemoteGridSortOption {
+            value: "manual".to_owned(),
+            label: "手動順".to_owned(),
+            short_label: "手動順".to_owned(),
+        }],
+        locked_reason: Some(MANUAL_FOLDER_SORT_LOCK_REASON.to_owned()),
     }
 }
 

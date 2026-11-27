@@ -93,7 +93,7 @@ fn record_cache(app: &App, first: &Path, cached: &Path) {
 }
 
 fn request_open(app: &mut App, later: &Path) {
-    app.load_folder(later.parent().unwrap().to_path_buf());
+    app.load_folder_and_finish_for_test(later.parent().unwrap().to_path_buf());
     let outcome =
         app.load_folder_or_convert_archive_with_auto_fullscreen(later.to_path_buf(), false);
     assert!(
