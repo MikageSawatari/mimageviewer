@@ -19513,7 +19513,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 } else {
                     self.thumb_adjust_tex.get(&idx)
                 };
-                crate::app::draw_cell(
+                let display_image = self.grid_thumbnail_display_image(idx);
+                crate::app::draw_cell_with_display_image(
                     &ui,
                     rect,
                     self.selected == Some(idx),
@@ -19534,6 +19535,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     is_cut,
                     resume,
                     &self.settings.folder_cell_background,
+                    display_image.as_ref(),
                 );
                 if self.grid_drop_hover(idx) {
                     crate::app::draw_grid_drop_target(ui.painter(), rect, ui.visuals());
@@ -23299,7 +23301,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     let is_cut = self.items[idx]
                                         .drag_source_path()
                                         .is_some_and(|path| self.cut_clipboard.contains(path));
-                                    let mut areas = crate::app::draw_cell_with_hit_areas(
+                                    let display_image = self.grid_thumbnail_display_image(idx);
+                                    let mut areas = crate::app::draw_cell_with_hit_areas_and_display_image(
                                         ui,
                                         cell_rect,
                                         selected_before,
@@ -23320,6 +23323,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         is_cut,
                                         resume,
                                         &self.settings.folder_cell_background,
+                                        display_image.as_ref(),
                                     );
                                     if let Some(title) = self.draw_bookmark_view_overlay(
                                         ui,
@@ -23447,7 +23451,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     // で対応させる)。
                                     // ネスト ZIP では本ごとピン (Model B): book キー + ZipEntry source
                                     // (ルート = zip_path / 本の中 = 実効 prefix)。
-                                    crate::app::draw_cell(
+                                    let display_image = self.grid_thumbnail_display_image(idx);
+                                    crate::app::draw_cell_with_display_image(
                                         ui,
                                         cell_rect,
                                         self.selected == Some(idx),
@@ -23468,6 +23473,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         is_cut,
                                         book_resume_meter,
                                         &self.settings.folder_cell_background,
+                                        display_image.as_ref(),
                                     );
                                 }
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして

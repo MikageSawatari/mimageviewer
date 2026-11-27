@@ -682,6 +682,7 @@ mod folder_background_fixture;
 pub use folder_background_fixture::draw_folder_cell_background_snapshot_fixture;
 pub(crate) use folder_background_fixture::draw_samples as draw_folder_background_samples;
 mod grid_paint;
+pub(crate) mod thumbnail_standin;
 #[doc(hidden)]
 pub use container_type_icon_fixture::draw_container_type_icon_snapshot_fixture;
 mod duration_metadata;
@@ -902,9 +903,10 @@ pub use grid_paint::draw_thumbnail_name_style_snapshot_fixture;
 #[doc(hidden)]
 pub use grid_paint::draw_video_thumbnail_indicator_snapshot_fixture;
 pub(crate) use grid_paint::{
-    ThumbnailHitAreas, draw_cell, draw_cell_with_hit_areas, draw_cut_badge,
-    draw_drop_hover_snapshot_cells, draw_grid_drop_target, draw_spread_pair_cursor,
-    grid_tag_badge_hit_rect, layout_cell_overlays, primary_grid_tag_for_badge, tq_draw_preview,
+    ThumbnailHitAreas, draw_cell, draw_cell_with_display_image, draw_cell_with_hit_areas,
+    draw_cell_with_hit_areas_and_display_image, draw_cut_badge, draw_drop_hover_snapshot_cells,
+    draw_grid_drop_target, draw_spread_pair_cursor, grid_tag_badge_hit_rect, layout_cell_overlays,
+    primary_grid_tag_for_badge, tq_draw_preview,
 };
 pub(crate) use grid_paint::{audio_thumbnail_indicator_parts, paint_audio_thumbnail_indicator};
 use metadata_ops::{
@@ -16497,6 +16499,8 @@ pub struct App {
     /// `RefCell` for the same reason as the ledger above.
     pub(crate) display_identity_error: std::cell::RefCell<Option<String>>,
     pub(crate) thumbnails: Vec<ThumbnailState>,
+    /// 同じ物理一覧の並び替え中だけ使う、context 所有の表示素材。
+    pub(crate) thumbnail_standins: Box<thumbnail_standin::ThumbnailStandins>,
     pub(crate) selected: Option<usize>,
     pub(crate) grid_click_pairing: GridClickPairingState,
     /// Shift+クリックの起点。index と items 世代を一体で保持し、別一覧の同じ index を
@@ -21079,6 +21083,7 @@ impl App {
             upload_deferral_streak: 0,
             display_identity_error: std::cell::RefCell::new(None),
             thumbnails: Vec::new(),
+            thumbnail_standins: Default::default(),
             selected: None,
             grid_click_pairing: GridClickPairingState::default(),
             grid_click_selection_anchor: None,
@@ -46657,6 +46662,7 @@ impl App {
     }
 
     fn set_items_generation(&mut self, items_generation: u64) {
+        self.thumbnail_standins.set_generation(items_generation);
         if self.items_generation != items_generation {
             self.virtual_folder_parent = None;
             retire_spread_step(&mut self.spread_step);
@@ -47297,6 +47303,7 @@ impl App {
                     }
                 }
                 crate::logger::log(format!("archive_cache_peek spawn failed: {e}"));
+                self.reconcile_thumbnail_standins();
             }
         }
     }
@@ -58291,6 +58298,7 @@ impl App {
     }
 
     fn poll_thumbnails(&mut self, ctx: &egui::Context, consumption: ThumbnailConsumptionPolicy) {
+        self.reconcile_thumbnail_standins();
         // Reservation + CPU image lifetime belongs to requested, independent of display state.
         const MAX_TEXTURES_PER_FRAME: u32 = 8;
         let mut textures_created = 0u32;
@@ -58349,6 +58357,9 @@ impl App {
                     self.thumbnails[i] = ThumbnailState::Failed;
                 }
                 ThumbnailReceipt::Terminal(_) => unreachable!("image payload handled by owner"),
+            }
+            if !matches!(self.thumbnails[i], ThumbnailState::Pending) {
+                self.thumbnail_standins.remove(i);
             }
             received += 1;
         }
@@ -58578,6 +58589,7 @@ impl App {
                 self.thumbnails[i] = ThumbnailState::Evicted;
             }
             self.requested.settle_image(i, request_id);
+            self.thumbnail_standins.remove(i);
             received += 1;
         }
         if received > 0 || self.requested.images_len() > 0 {
@@ -58821,6 +58833,12 @@ impl App {
             interactive_pages,
         } = projection;
         let previous_keep_set = std::mem::replace(&mut self.keep_set, pages);
+        // 通常更新は hydration 中ここへ来ない。詳細 hover などの別 owner から呼ばれても、
+        // その期間の集合では採用直後の表示素材を退役させない。
+        if !self.sidecar_restore_active() {
+            self.thumbnail_standins.retain_keep_set(&self.keep_set);
+        }
+        self.reconcile_thumbnail_standins();
         self.keep_range = bounded_range;
         self.keep_start_shared
             .store(bounded_range.0, Ordering::Relaxed);
@@ -58907,6 +58925,7 @@ impl App {
         ) && let Some(thumb) = self.thumbnails.get_mut(idx)
         {
             *thumb = ThumbnailState::Evicted;
+            self.thumbnail_standins.remove(idx);
         }
         self.idle_upgrade_cache_bypass_ineligible.remove(&idx);
         self.thumb_pixels.remove(&idx);
@@ -59400,6 +59419,10 @@ impl App {
                 if !navigation_active {
                     self.passthrough_rendition_cache.clear();
                 }
+            } else {
+                // Hydration 中の hover が同じ集合を先に計算していた場合も、
+                // この確定済み投影で表示専用の素材を解放する。
+                self.thumbnail_standins.retain_keep_set(&self.keep_set);
             }
             self.details_thumb_suppression_applied = self.keep_set.is_empty();
             return;
@@ -59412,6 +59435,7 @@ impl App {
             // 古い enqueue 済みリクエストが in-range 判定で処理されてしまう。
             self.keep_range = (0, 0);
             self.keep_set.clear();
+            self.thumbnail_standins.clear();
             self.clear_still_seek_thumbnail_requests();
             self.keep_start_shared.store(0, Ordering::Relaxed);
             self.keep_end_shared.store(0, Ordering::Relaxed);
@@ -59627,6 +59651,7 @@ impl App {
                     )
                 {
                     self.thumbnails[i] = ThumbnailState::NoArt;
+                    self.thumbnail_standins.remove(i);
                 }
                 continue;
             }
@@ -59698,6 +59723,7 @@ impl App {
             let Some(mut req) = req_opt else {
                 if self.items_are_drive_list {
                     self.thumbnails[i] = ThumbnailState::Failed;
+                    self.thumbnail_standins.remove(i);
                 }
                 continue;
             };
@@ -63313,6 +63339,7 @@ impl App {
         {
             return false;
         }
+        let thumbnail_standins = self.capture_thumbnail_standins();
         self.preserve_cursor_hint_for_reload();
         let checked = self
             .checked
@@ -63353,22 +63380,30 @@ impl App {
             self.load_folder_with_scan_owned(path, Some(scan), owner, intent)
         };
         if accepted {
-            self.checked = self
-                .items
-                .iter()
-                .enumerate()
-                .filter_map(|(index, item)| {
-                    crate::folder_order::physical_item_key(item)
-                        .filter(|key| checked.contains(key))
-                        .map(|_| index)
-                })
-                .collect();
-            let selected = selected.and_then(|key| {
-                self.items.iter().position(|item| {
-                    crate::folder_order::physical_item_key(item).as_ref() == Some(&key)
-                })
-            });
-            self.move_grid_cursor(selected, GridCursorIntent::Automatic);
+            let mut restored_checked = HashSet::new();
+            let mut restored_selected = None;
+            for (index, item) in self.items.iter().enumerate() {
+                let Some(key) = crate::folder_order::physical_item_key(item) else {
+                    continue;
+                };
+                if checked.contains(&key) {
+                    restored_checked.insert(index);
+                }
+                if restored_selected.is_none() && selected.as_ref() == Some(&key) {
+                    restored_selected = Some(index);
+                }
+                if matches!(self.thumbnails.get(index), Some(ThumbnailState::Pending)) {
+                    self.thumbnail_standins.attach(
+                        index,
+                        &key,
+                        self.image_metas.get(index).copied().flatten(),
+                        &thumbnail_standins,
+                    );
+                }
+            }
+            self.reconcile_thumbnail_standins();
+            self.checked = restored_checked;
+            self.move_grid_cursor(restored_selected, GridCursorIntent::Automatic);
         }
         accepted
     }
@@ -87833,6 +87868,7 @@ impl App {
     /// Remove every queued/materialized form of one grid thumbnail and make it
     /// eligible for a fresh LoadRequest on the next keep-range update.
     fn evict_thumbnail_for_reload(&mut self, idx: usize) {
+        self.thumbnail_standins.remove(idx);
         self.invalidate_color_representative(idx);
         for queue in [&self.reload_queue, &self.heavy_io_queue]
             .into_iter()

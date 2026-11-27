@@ -840,3 +840,43 @@ Smart root の履歴採用後、定義の範囲外にある新しい通常物理
   構造的修正である」ことに同意した (items と記録・inventory・revision の所有境界を揃え、swap / fork で同時に移す。
   兄弟 context への失効や窓種別の補正を足していない)。設計担当 (ClaudeCode) も同じ判断。
 - そのほかの重点 (actor・索引、ソート UI、改名・削除と STORES、手動順を使わない一覧の挙動) は問題なしの判定。
+
+### 実装記録 (段 6)
+
+- 前提の確認: `apply_current_view_order_refresh` は owner / folder / order_revision / 設定の照合後も
+  旧 items・thumbnails・keep_set を参照できる。旧 keep_set は疎な可視列から作る集合であり、数値範囲では代用しない。
+  通常画・選択変更後の再描画・遅延セル再描画の入口を確認し、共通の `grid_thumbnail_display_image` へ接続した。
+  詳細 hover は別経路のまま。主要前提に矛盾は見つからなかった。
+- `app/thumbnail_standin.rs` に世代付きの表示専用 owner を追加した。控える値は physical item key、
+  image_metas の (mtime, size)、実際の表示用 TextureHandle、旧素材から計算した UV・表示寸法・
+  source_dims / layout_dims・回転角である。表紙の角度は旧 Loaded の cover が指すページの在メモリ値を使う。
+  画像の補正 texture を実際に使う状態ならそれを選び、補正の生成や DB / FS の読み取りは行わない。
+  `nav/order_refresh_standin_capture` に保持素材数と控える処理の時間を記録する。
+- 採用が成功した場合だけ、新 items を走査する既存の checked / selected 復元のループで代役も対応づける。
+  key と実測 stamp が両方一致した Pending の index へ付ける。有効な既存代役は元の key / stamp / geometry のまま
+  次の世代へ渡す。読み込み状態・requested・世代の進め方・idle upgrade・補正生成・動画 batch・鮮度検証は変更しない。
+- 終端 1 は `poll_thumbnails` の結果採用 / 終端通知、表示方針による NoArt、明示的な
+  `evict_thumbnail_for_reload` と bundle 内の明示 eviction に接続した。既存の状態を読み取る
+  `reconcile_thumbnail_standins` も非 Pending を退役する。一度退役した画像は同じ世代で復活させない。
+- 終端 2 は App と ViewerContextBundle の `set_items_generation`、終端 4 は owner の自然 drop。
+  owner の payload は Box に置き、bundle の swap / fork と thumbnails を対で運ぶ。
+  fork の map は独立し、texture handle は既存 thumbnails と同じ clone である。
+- 終端 3 は `install_thumbnail_keep_projection` の確定した keep_set で直接 prune する。
+  Pending と動画も対象にし、既存 eviction の Loaded 限定や動画の early return に依存しない。
+  通常更新は hydration 待ちで停止するが、詳細 hover の保持 owner からもこの関数へ到達する。
+  代役の prune は hydration 完了も条件とし、採用直後に keep_set が clear される時点や待機中の poll では行わない。
+  詳細表示が hydration 中に計算した同じ保持集合を再利用する場合も、待機後の投影照合で代役を prune する。
+  空一覧の確定と個別 eviction も表示 owner を解放する。
+- 終端 5 は `reconcile_converted_archive_bindings` の source 公開境界で既存の
+  `read_source() == Unavailable` を使う。source 準備の spawn 失敗で Unavailable を確定する既存経路も同様。
+  Pending / 未取得は利用不可とは扱わず、要求・取消・再試行の条件を変更しない。
+- 引き継がないのは physical_item_key のない派生行（Stack・仮想ページ・検索集約など）、
+  実測 stamp を持たない素材、icon-only のセル、既に退役した代役である。
+  対応づけの証拠または表示中の画像が無いためであり、Folder / ZIP / PDF / 変換書庫 / 動画 / 音声を種類で除外しない。
+  通常画と選択後の再描画は同じ表示選択と描画 geometry を使い、ラベル・バッジ・選択枠は新しい state のまま描く。
+- 詳細 hover / Remote、ThumbnailState の variant、永続データ・公開文書・CHANGELOG は変更しない。
+  コンパイル・テスト・検証用ビルド・コミットは利用者指定により実施しない。
+- 追加テストは状態 / 採用の 18 件と headless 描画の 3 件（Windows の context 検査 1 件を含む）。
+  テクスチャの対応は TextureHandle の id、旧形状は mesh の UV / bounds / hit area で検査する。
+  PNG baseline は生成・更新していない。
+  `cargo fmt`（引数なし）、`python scripts/check_ui_glyphs.py`、`git diff --check` は正常終了した。

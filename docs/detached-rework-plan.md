@@ -8293,3 +8293,16 @@ fork 先は空、元 context は cache と proof を保持する。detached の�
   すべてで Box に揃えた。swap は Box の移動、fork は Box の clone による独立した状態の複製で、
   同じ items 所有境界を維持する。inline payload の配置だけを変える構造上の修正で、
   detached の述語・viewport 配送・窓の寿命は変更しない。
+
+### 2026-11-27: 並び順の再採用中に描く代役（§1.911 段 6）
+
+- 正本は [フォルダ手動順](folder-manual-order-plan.md) §13.2〜13.4。
+  表示専用の `thumbnail_standins` を thumbnails と同じ context の Box owner として追加し、
+  `ViewerContextBundle` の empty / swap / fork / generation 更新へ接続した。fork は独立した集合の clone、
+  同世代の texture handle だけは既存 thumbnails と同じく共有する。終了時は owner の drop で解放する。
+- 代役は表示専用で context をまたがない構造的な追加であり、症状パッチではない。
+  旧一覧の保持済み画像を次の同一物理一覧へ対応づける責任を items 世代の所有者へ置き、
+  兄弟 context の画像・要求・世代を変更しない。既存の別 context の明示 eviction にも、その context の代役破棄を対で足した。
+  detached 述語・viewport 配送・HWND 捕捉・placement・窓の寿命には分岐を追加しない。
+- 本項は指定された変更範囲と実装上の判断理由の記録であり、独立実装レビューの受領・検収を表さない。
+  コンパイル・テスト実行は利用者指定により行わず、設計担当の runner へ引き継ぐ。

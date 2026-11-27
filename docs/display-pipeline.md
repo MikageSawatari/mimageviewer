@@ -295,6 +295,15 @@ Audio は既存 worker / texture backlog に乗り、同名 sidecar → MP3 先�
 
 ### 1.1 状態機械
 
+同じ物理フォルダの並び順だけを変える `CurrentViewOrderRefresh` では、旧 keep_set 内の表示素材を
+physical item key と (mtime, size) で対応づけ、まだ Pending のセルにだけ表示専用の代役を描く。
+控えるのは描画中のテクスチャ（補正済みを含む）と旧素材の UV・表示寸法・回転であり、
+thumbnails・要求・鮮度検証・補正再生成は従来どおり進む。世代が違う代役は描かない。
+Pending 以外への遷移・世代変更・確定済み keep_set の範囲外・source の利用不可確定・context 終了で破棄する。
+採用直後の空 keep_set や hydration 待機だけでは範囲外扱いにしない。代役は context の bundle と一緒に運び、
+連続した並び替えでも有効な代役を次へ渡す。詳細 hover と Remote には使わない。
+詳細は [フォルダ手動順の設計 §13](folder-manual-order-plan.md#13-並べ替えた直後のサムネイルの引き継ぎ-2026-11-27-追加)。
+
 表示状態と要求の寿命は別である。context-local な `ThumbnailRequests` が request ID / items
 generation・要求種別・未採用CPU画像を一体で所有し、sourceは `SourcePixels` の採用/破棄と
 workerの保存/保存省略終端 `Finalized` の両方まで再要求を拒否する。cache / Audio / video /

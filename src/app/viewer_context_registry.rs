@@ -274,6 +274,7 @@ impl App {
                     state.thumb_adjust_tex.remove(&idx);
                     state.idle_upgrade_cache_bypass_ineligible.remove(&idx);
                     state.auto_aspect.samples.remove(&idx);
+                    state.thumbnail_standins.remove(idx);
                     if let Some(thumbnail) = state.thumbnails.get_mut(idx) {
                         *thumbnail = ThumbnailState::Evicted;
                     }
@@ -1504,6 +1505,7 @@ impl App {
                     state.thumb_edit_preview_layers.remove(&idx);
                     state.thumb_adjust_tex.remove(&idx);
                     state.idle_upgrade_cache_bypass_ineligible.remove(&idx);
+                    state.thumbnail_standins.remove(idx);
                     if let Some(thumbnail) = state.thumbnails.get_mut(idx) {
                         *thumbnail = ThumbnailState::Evicted;
                     }
@@ -1590,6 +1592,7 @@ impl App {
                         state.thumb_edit_preview_layers.remove(&idx);
                         state.thumb_adjust_tex.remove(&idx);
                         state.idle_upgrade_cache_bypass_ineligible.remove(&idx);
+                        state.thumbnail_standins.remove(idx);
                         if let Some(thumbnail) = state.thumbnails.get_mut(idx) {
                             *thumbnail = ThumbnailState::Evicted;
                         }
@@ -1964,6 +1967,7 @@ pub(in crate::app) struct ViewerContextBundle {
     facet_name_cache_pending: Option<facet_name_filter::FacetNameCachePending>,
     facet_name_cache_failed_generation: Option<u64>,
     thumbnails: Vec<ThumbnailState>,
+    thumbnail_standins: Box<super::thumbnail_standin::ThumbnailStandins>,
     image_metas: Vec<Option<(i64, i64)>>,
     video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
     auto_aspect: crate::auto_aspect::AutoAspectState,
@@ -3256,6 +3260,7 @@ impl ViewerContextBundle {
             self.fullscreen_page_layout.clear();
         }
         self.items_generation = items_generation;
+        self.thumbnail_standins.set_generation(items_generation);
         self.fs_cache.set_items_generation(items_generation);
         self.fs_pending.set_items_generation(items_generation);
         self.raw_pages.set_items_generation(items_generation);
@@ -3313,6 +3318,7 @@ impl ViewerContextBundle {
             facet_name_cache_pending: None,
             facet_name_cache_failed_generation: None,
             thumbnails: Vec::new(),
+            thumbnail_standins: Default::default(),
             image_metas: Vec::new(),
             video_thumb_overrides: std::collections::HashMap::new(),
             auto_aspect: crate::auto_aspect::AutoAspectState::default(),
@@ -3757,6 +3763,7 @@ impl App {
             facet_name_cache_pending,
             facet_name_cache_failed_generation,
             thumbnails,
+            thumbnail_standins,
             image_metas,
             video_thumb_overrides,
             auto_aspect,
@@ -4087,6 +4094,7 @@ impl App {
         swap_field!(facet_name_cache_pending);
         swap_field!(facet_name_cache_failed_generation);
         swap_field!(thumbnails);
+        swap_field!(thumbnail_standins);
         swap_field!(image_metas);
         swap_field!(video_thumb_overrides);
         swap_field!(auto_aspect);
@@ -4545,6 +4553,7 @@ impl App {
             facet_name_cache_pending,
             facet_name_cache_failed_generation,
             thumbnails,
+            thumbnail_standins,
             image_metas,
             video_thumb_overrides,
             auto_aspect,
@@ -4840,6 +4849,7 @@ impl App {
             facet_name_cache_generation,
             facet_name_cache_failed_generation,
             thumbnails,
+            thumbnail_standins,
             image_metas,
             auto_aspect,
             selected,
