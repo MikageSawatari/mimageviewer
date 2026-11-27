@@ -20,6 +20,16 @@ PNG の生成・目視・通常比較は未実施で、ClaudeCode が行う。`i
 
 # UI スナップショットテスト運用方針
 
+§1.893 の最小幅回帰としてlibの `preferences_context_menu_layout_narrow_pdf_page_snapshot` を追加する。
+`preferences_context_menu_layout_narrow_pdf_page` は624ptの環境設定から左ツリーと間隔を除いた
+436×700の領域に、Windowと同じ余白・右パネルのスクロールバー・PDF内ページ場面を描く。
+本体の純粋rendererを使い、Appや実ファイルは使わない。nextestのgpu groupへ完全名で登録した。
+既存の `preferences_context_menu_layout` / `preferences_context_menu_layout_open_with` も更新候補。
+PNG生成・目視・通常比較は設計担当が行う。全場面×2幅の配置と操作は別のheadless検査で扱う。
+初回差分について設計担当は配置検査の成功とsnapshot 3件の不一致を報告した（新規1件はbaselineなし）。
+既定幅の中央揃えと狭幅の注記前の隙間を追補修正した。1行の行は従来の見た目へ戻す見込みで、
+既存2枚を一律に更新せず差分を再確認する。追補後のPNG生成・目視・比較と強化した配置検査は未実施。
+
 §1.363 段5は、環境設定の本体rendererへ固定の読み込み結果を渡す
 `ui_dialogs::preferences::operation_script::tests::operation_script_preferences_snapshot_light` /
 `operation_script_preferences_snapshot_dark` の2件（560×690）を追加する。App・実ファイル・workerは使わない。
