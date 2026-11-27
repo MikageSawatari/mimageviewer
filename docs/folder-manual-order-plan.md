@@ -883,3 +883,14 @@ Smart root の履歴採用後、定義の範囲外にある新しい通常物理
   テクスチャの対応は TextureHandle の id、旧形状は mesh の UV / bounds / hit area で検査する。
   PNG baseline は生成・更新していない。
   `cargo fmt`（引数なし）、`python scripts/check_ui_glyphs.py`、`git diff --check` は正常終了した。
+
+### 段 6 の検証と独立レビュー (2026-11-27、ClaudeCode が記録)
+
+- 設計レビュー: R9 (Sol / xhigh) で「状態を移して読み込みを止める」最初の案に P1 1 件・P2 3 件 → 表示専用の代役へ改めた。
+  R10 で P1 なし、P2 3 件・P3 1 件 → §13.2 の R10 補足として反映。
+- 独立実装レビュー: R4 (別の Sol / xhigh) で P2 1 件 (通常画像・動画の代役の回転を、旧セルが実際に描いた index の回転にする)。
+  実装担当が修正し、R5 で閉じた (追加の P1/P2/P3 なし)。R4 は ViewerContextBundle への代役の追加が「症状パッチではなく
+  構造的な追加」であることに同意した (docs/detached-rework-plan.md §11)。
+- テストのコンパイルエラー 3 件と借用エラー 1 件は ClaudeCode が直した (挙動の変更なし、R5 で確認)。
+- 検証 (2ee002fb3): 本体 lib 全件 20991 件成功、UI スナップショット 277 件成功 (PNG の変化なし)、`build-dev.ps1` 成功。
+  実機での見え方は未確認 (利用者の確認待ち)。
