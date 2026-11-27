@@ -26,7 +26,7 @@ pub(super) fn mask_detect_fixture(tool: MaskDetectTool) -> AppTestEnvForTest {
     let mut app = setup_app_for_test();
     // Ordinary ownership/UI fixtures never initialize ORT or inspect real files.
     let (_tx, rx) = mpsc::channel();
-    *app.mask_detect_catalog = DetectorCatalogState::Loading {
+    app.mask_detect.catalog = DetectorCatalogState::Loading {
         cancel: Arc::new(AtomicBool::new(false)),
         rx,
     };
@@ -124,12 +124,78 @@ pub(super) fn mask_detect_queue(
     let (tx, rx) = mpsc::channel();
     assert!(tx.send(Ok(output)).is_ok());
     let cancel = Arc::new(AtomicBool::new(false));
-    app.mask_detect_pending = Some(Box::new(MaskDetectPending {
+    app.mask_detect.context.pending = Some(Box::new(MaskDetectPending {
         request,
         cancel: Arc::clone(&cancel),
         rx,
     }));
     cancel
+}
+
+#[cfg(windows)]
+#[test]
+fn mask_detect_context_box_swap_and_drop_keep_catalog_and_sibling_state() {
+    let mut app = mask_detect_fixture(MaskDetectTool::Erase);
+    app.mask_detect.context.erase_session = 11;
+    app.mask_detect.context.conceal_session = 12;
+    let request = app
+        .capture_mask_detect_request(MaskDetectTool::Erase)
+        .unwrap();
+    let cancel = mask_detect_queue(&mut app, request, mask_detect_output());
+    let runtime = std::ptr::from_ref(app.mask_detect.as_ref());
+    let owner = std::ptr::from_ref(app.mask_detect.context.as_ref());
+    let DetectorCatalogState::Loading {
+        cancel: catalog_cancel,
+        ..
+    } = &app.mask_detect.catalog
+    else {
+        panic!("fixture catalog");
+    };
+    let catalog_cancel = Arc::clone(catalog_cancel);
+    let mut sibling = Box::new(viewer_context_registry::ViewerContextBundle::empty());
+    app.swap_viewer_context_bundle(&mut sibling);
+    assert_ne!(std::ptr::from_ref(app.mask_detect.context.as_ref()), owner);
+    assert!(app.mask_detect.context.pending.is_none());
+    assert!(app.mask_detect.context.dialog.is_none());
+    assert_eq!(app.mask_detect.context.erase_session, 0);
+    assert_eq!(app.mask_detect.context.conceal_session, 0);
+    assert!(!cancel.load(Ordering::Acquire));
+    app.mask_detect.context.dialog = Some(MaskDetectTool::Conceal);
+    app.mask_detect.context.erase_session = 21;
+    app.mask_detect.context.conceal_session = 22;
+
+    app.swap_viewer_context_bundle(&mut sibling);
+    assert_eq!(std::ptr::from_ref(app.mask_detect.context.as_ref()), owner);
+    assert!(Arc::ptr_eq(
+        &app.mask_detect.context.pending.as_ref().unwrap().cancel,
+        &cancel
+    ));
+    assert!(app.mask_detect.context.dialog.is_none());
+    assert_eq!(app.mask_detect.context.erase_session, 11);
+    assert_eq!(app.mask_detect.context.conceal_session, 12);
+    assert!(!cancel.load(Ordering::Acquire));
+    app.swap_viewer_context_bundle(&mut sibling);
+    drop(sibling);
+    assert!(
+        cancel.load(Ordering::Acquire),
+        "only the dropped owner's request ends"
+    );
+    assert!(app.mask_detect.context.pending.is_none());
+    assert_eq!(
+        app.mask_detect.context.dialog,
+        Some(MaskDetectTool::Conceal)
+    );
+    assert_eq!(app.mask_detect.context.erase_session, 21);
+    assert_eq!(app.mask_detect.context.conceal_session, 22);
+    assert_eq!(std::ptr::from_ref(app.mask_detect.as_ref()), runtime);
+    let DetectorCatalogState::Loading {
+        cancel: current, ..
+    } = &app.mask_detect.catalog
+    else {
+        panic!("catalog must not move or close with a context");
+    };
+    assert!(Arc::ptr_eq(current, &catalog_cancel));
+    assert!(!catalog_cancel.load(Ordering::Acquire));
 }
 
 #[test]
@@ -181,7 +247,7 @@ fn mask_detect_page_edit_920_same_item_open_resets_only_erase() {
         );
         let exits = tool == MaskDetectTool::Erase;
         assert_eq!(cancel.load(Ordering::Acquire), exits, "{tool:?}");
-        assert_eq!(app.mask_detect_pending.is_none(), exits, "{tool:?}");
+        assert_eq!(app.mask_detect.context.pending.is_none(), exits, "{tool:?}");
         assert_eq!(app.is_overlay_edit_mode_active(), !exits, "{tool:?}");
     }
 }
@@ -243,7 +309,7 @@ fn mask_detect_page_edit_920_continuing_local_adoption_discards_old_result() {
         let layers = app.local_adjust_page_layers.clone();
         let history = mask_detect_history(&app);
         app.poll_mask_detect(&egui::Context::default());
-        assert!(app.mask_detect_pending.is_none());
+        assert!(app.mask_detect.context.pending.is_none());
         assert_eq!(app.local_adjust_page_layers, layers);
         assert_eq!(mask_detect_history(&app), history);
         assert!(!app.local_adjust_show_mask);
@@ -269,7 +335,7 @@ fn mask_detect_modal_blocks_operation_script_slots_and_events() {
                 let request = app.capture_mask_detect_request(tool).unwrap();
                 mask_detect_queue(&mut app, request, mask_detect_output());
             } else {
-                app.mask_detect_dialog = Some(tool);
+                app.mask_detect.context.dialog = Some(tool);
             }
             // Isolate common-modal admission from the independent tool-mode gate.
             app.erase_mode = false;
@@ -372,7 +438,7 @@ fn mask_detect_zero_and_cancel_do_not_change_masks_documents_or_history() {
                 cancel.store(true, Ordering::Release);
             }
             app.poll_mask_detect(&egui::Context::default());
-            assert!(app.mask_detect_pending.is_none());
+            assert!(app.mask_detect.context.pending.is_none());
             assert!(app.erase_shapes.is_empty());
             assert!(app.conceal_shapes.is_empty());
             assert_eq!(app.erase_mask.as_deref(), Some([false; 64].as_slice()));
@@ -403,9 +469,13 @@ fn mask_detect_stale_identity_size_source_and_edit_session_are_discarded() {
                 // Equal pixels in a different Arc are a different source publication.
                 4 => request.source = Arc::new(request.source.as_ref().clone()),
                 5 => match tool {
-                    MaskDetectTool::Erase => app.erase_session = app.erase_session.wrapping_add(1),
+                    MaskDetectTool::Erase => {
+                        app.mask_detect.context.erase_session =
+                            app.mask_detect.context.erase_session.wrapping_add(1)
+                    }
                     MaskDetectTool::Conceal => {
-                        app.conceal_session = app.conceal_session.wrapping_add(1)
+                        app.mask_detect.context.conceal_session =
+                            app.mask_detect.context.conceal_session.wrapping_add(1)
                     }
                     MaskDetectTool::LocalAdjust => {
                         let mut changed = app.local_adjust_page_layers[&0].clone();
@@ -418,7 +488,7 @@ fn mask_detect_stale_identity_size_source_and_edit_session_are_discarded() {
             let local_before = app.local_adjust_page_layers.get(&0).cloned();
             mask_detect_queue(&mut app, request, mask_detect_output());
             app.poll_mask_detect(&egui::Context::default());
-            assert!(app.mask_detect_pending.is_none());
+            assert!(app.mask_detect.context.pending.is_none());
             assert!(
                 app.erase_shapes.is_empty(),
                 "tool={tool:?}, mismatch={mismatch}"
@@ -689,7 +759,7 @@ fn mask_detect_other_local_ai_mask_and_lut_requests_prevent_detection() {
                 .is_none()
         );
         app.open_mask_detect_dialog(MaskDetectTool::LocalAdjust);
-        assert!(app.mask_detect_dialog.is_none());
+        assert!(app.mask_detect.context.dialog.is_none());
         assert_eq!(mask_detect_history(&app), (0, 0, 0));
     }
 }
@@ -710,7 +780,9 @@ fn mask_detect_real_worker_holds_activity_while_waiting_and_cancel_releases_it()
     let activity_before = app.local_ai_activity.load(Ordering::Acquire);
     app.start_mask_detect(MaskDetectTool::Erase);
     let cancel = Arc::clone(
-        &app.mask_detect_pending
+        &app.mask_detect
+            .context
+            .pending
             .as_ref()
             .expect("worker started")
             .cancel,
@@ -724,7 +796,7 @@ fn mask_detect_real_worker_holds_activity_while_waiting_and_cancel_releases_it()
     app.start_mask_detect(MaskDetectTool::Erase);
     assert!(Arc::ptr_eq(
         &cancel,
-        &app.mask_detect_pending.as_ref().unwrap().cancel
+        &app.mask_detect.context.pending.as_ref().unwrap().cancel
     ));
     assert_eq!(
         app.local_ai_activity.load(Ordering::Acquire),

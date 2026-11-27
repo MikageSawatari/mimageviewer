@@ -741,7 +741,7 @@ impl App {
             || self.local_adjust_layer_bypass_pending.is_some()
             || self.local_adjust_prefix_preview_pending.is_some()
             || self.local_adjust_segmentation_pending.is_some()
-            || self.mask_detect_pending.is_some()
+            || self.mask_detect.context.pending.is_some()
             || !self.final_ai_pending.is_empty()
             || !self.retained_final_ai_orphans.is_empty()
             || self

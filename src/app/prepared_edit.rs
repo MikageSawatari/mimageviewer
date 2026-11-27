@@ -1092,7 +1092,9 @@ impl App {
 
     fn prepared_edit_conflict(&self, idx: usize, page_key: &str) -> bool {
         let context = self.projected_viewer_context_id();
-        self.mask_detect_pending
+        self.mask_detect
+            .context
+            .pending
             .as_ref()
             .is_some_and(|p| p.request.context == context && p.request.page_key == page_key)
             || self.commit_pending_matches_current_erase_key(idx)

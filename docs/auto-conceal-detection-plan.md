@@ -365,7 +365,10 @@ impl Drop for MaskDetectPending { fn drop(&mut self) { self.cancel.store(true, R
 ```
 
 - 待ちは **viewer context の bundle に 1 つだけ** (既存の `local_adjust_segmentation_pending` と同じ扱い)。
-  App / bundle のフィールドは `Option<Box<MaskDetectPending>>` とし、捕捉した文書を含む payload を heap に置く。
+  `Box<MaskDetectContextState>` の中の `Option<Box<MaskDetectPending>>` とし、捕捉した文書を含む payload を heap に置く。
+  この context 状態には設定窓・消しゴムと隠蔽加工の session も含め、Box ごと既存の bundle と交換する。
+  App 共通の `Box<MaskDetectState>` はこの投影先と catalog を持ち、交換するのは context の Box だけ。
+  保存する検出設定も `Settings.mask_detect: Box<MaskDetectSettings>` に置く (保存形式は同じ)。
   消しゴム・隠蔽加工の編集中の mask / shapes / Undo は、既存の foreground 共通 draft のままである。
   service の一時 mount はその draft を交換しない。実際の foreground 引き渡しでは旧 owner 上で
   検出を取消・モードを reset してから新しい editor を開始する。この取消境界も検査する
@@ -1711,3 +1714,58 @@ mask_detect_modal_blocks_operation_script_slots_and_events
 実施した整形・差分確認: `cargo fmt` (引数なし) と `git diff --check` は終了コード 0。
 衝突マーカーは残っていない。git add をしていないため index の unmerged entry と MERGE_HEAD は維持している。
 cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動は未実施。
+
+#### 取り込み後の 2 件の失敗への対応 (2026-11-28、検証未実施)
+
+設計担当からの報告: merge `d853ec222` と製品ページ `c119c5402` の後、run-heavy で関連 495 件と
+ui_snapshot 269 件を実行し、失敗は actual close の回帰と App の storage 上限の 2 件だった。
+以下はその報告とソースの確認に基づく修正で、**修正後のコンパイル・テスト・独立レビュー・実機検証は未実施**。
+
+**1. actual close の回帰は、前面所有と fixture の不一致。取消の接続不足ではない。**
+
+- 旧 `mask_detect_foreground_handoff_preserves_new_editor(true)` は `build_active_context_for_test` の
+  build callback で消しゴム・隠蔽加工の App 共通 draft を立て、main に戻したまま
+  `close_and_retire_context(owner, ..., close_fullscreen_content, ...)` を呼んでいた。
+- 同関数の `with_viewer_context_state` は service の一時投影であり、`enter_mount_scope(original)` が
+  元の main を前面所有者として保つ。`page_edit_tools_owned_by_projected_context` は
+  前面 id と投影先 id の一致を検査するため、§1.920 の `end_page_edit_tools` はこの draft を終えない。
+  一方、close の context 固有の後始末 (`finish_fullscreen_edit_modes_with_preview` の `cancel_mask_detect`)
+  は実行される。報告された失敗位置でも、旧 cancel と pending の検査を通った後にモードの assert が落ちている。
+  sibling の close が前面の draft に触れない製品の条件を緩めてはいけない。
+- close の fixture だけ、mounted main 自身に旧ツールを作り、既存の
+  `begin_mounted_detached_session_for_test` で別窓の session を結ぶ。
+  close の直前に前面 id と投影先の所有を assert して、true close の正規入口
+  `close_fullscreen_to_completion` を実行する (内部の content teardown で既存の退出・取消を通る)。
+  idx / pending / 3 モードの終了と cancel を確認してから、既存の promote / retire で旧 context を破棄し、
+  新しい main context で各ツールの通常入場を通す。旧 sender からの送信失敗、旧結果によるマスク・文書・Undo・
+  新しい pending / cache の不変の assert は全て維持した。park 側の経路は維持した。
+
+**2. App の追加状態を heap へまとめる。全体上限は変更しない。**
+
+- master との差分を棚卸しすると、App に直接追加されたのは待ち・設定窓・catalog・2 つの session の 5 項目。
+  見落とされていた追加は `App.settings` に inline で入る `Settings.mask_detect: MaskDetectSettings`。
+  64-bit の見積もりは、5 項目の論理サイズが 33 バイト (8 + 1 + 8 + 8 + 8)、検出設定が 40 バイト
+  (BTreeMap と 3 個の f32、2 個の bool、padding)。報告の App 差分 72 バイトは両者と配置の padding に整合する。
+  正確な旧フィールドの offset / padding は今回実測していない。ほかの追加 bool
+  `LocalAiRemoteBarrierSnapshot.mask_detect_pending` は関数が返す一時 snapshot のもので、App の常駐 field ではない。
+- `App.mask_detect: Box<MaskDetectState>` に catalog と投影中の `Box<MaskDetectContextState>` をまとめた。
+  `MaskDetectContextState` は pending・dialog・erase_session・conceal_session を所有する。
+  設定窓は元から bundle と交換される context 所有であり、App 共通へ変更しない。
+  `ViewerContextBundle` との交換は context の Box 1 つだけ。catalog の場所・受信口・取消フラグは動かさない。
+  empty / fork は新しい既定の context 状態を作り、drop は保持する pending の Drop で自身だけを取り消す。
+- `Settings.mask_detect` も `Box<MaskDetectSettings>` にする。serde のキー・値・既定値・設定転送での除外は変わらない。
+  要求の options は `as_ref().clone()` で従来どおり開始時の値を複製する。設定の別 owner や移行処理は作らない。
+- App に残る §1.914 の inline は **runtime の Box 8 + Settings 内の Box 8 = 計 16 バイト (64-bit)**。
+  context の Box は heap 上の runtime 内か bundle にあり、App に別途 inline で足さない。
+  `history_transition_storage_keeps_app_stack_footprint_bounded` に 4 箇所の storage の assert と各 payload の println、
+  App の runtime + 検出設定の合計が 2 ポインタ分である assert を追加した。`size_of::<App>() < 110_000` はそのまま。
+  全 App の新しい size_of は未取得。master 側の §1.917 の削減は別担当であり、本修正だけで全体の gate が通るとは扱わない。
+- cancel / book append 待ち / prepared edit / all-context poll / idle 再描画 / Remote の barrier の読み先も新しい owner に変更した。
+  bundle の pending 棚卸しテストは、Box の内側の pending も明示的に検査する形に更新し、監査から外していない。
+- 追加回帰 `mask_detect_context_box_swap_and_drop_keep_catalog_and_sibling_state` は、Box の往復で
+  pending・設定窓・session がまとめて移り、片方の破棄が自身の要求だけを取り消して、共通 catalog と sibling を保つことを検査する。
+  close 回帰と storage テストは既存名を維持する。全て未実行で、sleep・追加の worker・新しい待ち合わせは加えない。
+
+製品の close の所有条件・detached の述語・viewport 経路・利用者から見た操作・保存形式は変更しない。
+今回も cargo は整形の `cargo fmt` 以外を実行せず、git add / commit も行わない。修正後の検証は設計担当へ引き継ぐ。
+整形・差分の確認: `cargo fmt` (引数なし) と `git diff --check` は終了コード 0。

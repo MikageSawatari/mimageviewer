@@ -154,7 +154,7 @@ fn mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_t
             app.conceal_tool = crate::conceal::ConcealTool::Brush;
             app.local_adjust_mask_tool = LocalAdjustMaskTool::Brush;
             let (_catalog_tx, rx) = mpsc::channel();
-            *app.mask_detect_catalog = DetectorCatalogState::Loading {
+            app.mask_detect.catalog = DetectorCatalogState::Loading {
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx,
             };
@@ -250,7 +250,7 @@ fn mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_t
             for pressed in [true, false] {
                 frame(&mut app, mask_detect_pointer(start, pressed));
             }
-            assert_eq!(app.mask_detect_dialog, Some(tool));
+            assert_eq!(app.mask_detect.context.dialog, Some(tool));
             for _ in 0..4 {
                 frame(&mut app, Vec::new());
             }
@@ -265,7 +265,7 @@ fn mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_t
             for pressed in [true, false] {
                 frame(&mut app, mask_detect_pointer(close, pressed));
             }
-            assert!(app.mask_detect_dialog.is_none());
+            assert!(app.mask_detect.context.dialog.is_none());
             for _ in 0..3 {
                 frame(&mut app, Vec::new());
             }
@@ -360,7 +360,7 @@ fn mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_t
                 "{tool:?}, together={together}: the real detection Response must be clicked"
             );
             assert_eq!(
-                app.mask_detect_dialog,
+                app.mask_detect.context.dialog,
                 Some(tool),
                 "{tool:?}, together={together}: real button must open the Window"
             );
@@ -424,7 +424,7 @@ fn mask_detect_front_layer_invariant_repairs_after_upper_modal_closes_for_settin
                     .unwrap();
                 mask_detect_queue(app, request, mask_detect_output());
             } else {
-                app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+                app.mask_detect.context.dialog = Some(MaskDetectTool::Erase);
             }
         };
         let frame = |app: &mut App, upper_visible, disrupt| {
@@ -536,7 +536,7 @@ fn mask_detect_settings_and_progress_layers_stay_above_real_panels_after_reopen_
     ] {
         let mut app = mask_detect_fixture(tool);
         let (_catalog_tx, rx) = mpsc::channel();
-        *app.mask_detect_catalog = DetectorCatalogState::Loading {
+        app.mask_detect.catalog = DetectorCatalogState::Loading {
             cancel: Arc::new(AtomicBool::new(false)),
             rx,
         };
@@ -574,7 +574,7 @@ fn mask_detect_settings_and_progress_layers_stay_above_real_panels_after_reopen_
                 );
             }
             app.open_mask_detect_dialog(tool);
-            assert_eq!(app.mask_detect_dialog, Some(tool));
+            assert_eq!(app.mask_detect.context.dialog, Some(tool));
             for _ in 0..4 {
                 draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
                 assert_mask_detect_layer_order_above(&ctx, "mask_detect_settings", panels);
@@ -582,7 +582,7 @@ fn mask_detect_settings_and_progress_layers_stay_above_real_panels_after_reopen_
             assert_mask_detect_layer_above(&ctx, "mask_detect_settings", panels);
             let request = app.capture_mask_detect_request(tool).unwrap();
             mask_detect_queue(&mut app, request, mask_detect_output());
-            app.mask_detect_dialog = None;
+            app.mask_detect.context.dialog = None;
             for _ in 0..4 {
                 draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
                 assert_mask_detect_layer_order_above(&ctx, "mask_detect_progress", panels);
@@ -603,7 +603,7 @@ fn mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_dur
         let tool = MaskDetectTool::Conceal;
         let mut app = mask_detect_fixture(tool);
         let (_catalog_tx, rx) = mpsc::channel();
-        *app.mask_detect_catalog = DetectorCatalogState::Loading {
+        app.mask_detect.catalog = DetectorCatalogState::Loading {
             cancel: Arc::new(AtomicBool::new(false)),
             rx,
         };
@@ -644,7 +644,7 @@ fn mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_dur
         }
         // The very next frame opens the dialog via the normal entry boundary.
         app.open_mask_detect_dialog(tool);
-        assert_eq!(app.mask_detect_dialog, Some(tool));
+        assert_eq!(app.mask_detect.context.dialog, Some(tool));
         for _ in 0..4 {
             draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
             assert_mask_detect_layer_order_above(&ctx, "mask_detect_settings", &["conceal_panel"]);
@@ -652,7 +652,7 @@ fn mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_dur
         assert_mask_detect_layer_above(&ctx, "mask_detect_settings", &["conceal_panel"]);
         let request = app.capture_mask_detect_request(tool).unwrap();
         mask_detect_queue(&mut app, request, mask_detect_output());
-        app.mask_detect_dialog = None;
+        app.mask_detect.context.dialog = None;
         app.conceal_tool = crate::conceal::ConcealTool::Brush;
         for _ in 0..4 {
             draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, Vec::new());
@@ -676,7 +676,7 @@ fn mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_dur
             draw_mask_detect_layer_frame(&mut app, &ctx, tool, &transform, pointer(pressed));
             assert_mask_detect_layer_above(&ctx, "mask_detect_progress", &["conceal_panel"]);
             assert_eq!(app.conceal_tool, crate::conceal::ConcealTool::Brush);
-            assert!(app.mask_detect_pending.is_some());
+            assert!(app.mask_detect.context.pending.is_some());
         }
         app.cancel_mask_detect();
         // Close before the next fixture reuses the retained layer history.
@@ -724,7 +724,7 @@ fn mask_detect_foreground_windows_keep_real_viewer_toast_above_and_action_clicka
             mask_detect_queue(&mut app, request, mask_detect_output());
             ("mask_detect_progress", "検出中")
         } else {
-            app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+            app.mask_detect.context.dialog = Some(MaskDetectTool::Erase);
             ("mask_detect_settings", "自動検出")
         };
         let ctx = egui::Context::default();
@@ -811,7 +811,7 @@ fn mask_detect_foreground_windows_keep_real_viewer_toast_above_and_action_clicka
 fn mask_detect_foreground_modal_keeps_real_margin_hover_tooltip_above_window() {
     let _input = crate::key_input::lock_test_input();
     let mut app = mask_detect_fixture(MaskDetectTool::Erase);
-    app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+    app.mask_detect.context.dialog = Some(MaskDetectTool::Erase);
     let ctx = egui::Context::default();
     crate::ui_fonts::configure_fonts(&ctx);
     ctx.all_styles_mut(|style| {
@@ -871,7 +871,7 @@ fn mask_detect_foreground_modal_allows_menu_and_combo_popup_selection() {
     let _input = crate::key_input::lock_test_input();
     for menu in [true, false] {
         let mut app = mask_detect_fixture(MaskDetectTool::Erase);
-        app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+        app.mask_detect.context.dialog = Some(MaskDetectTool::Erase);
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let screen = transform().viewport_rect;
@@ -968,7 +968,7 @@ fn mask_detect_settings_escape_only_closes_front_real_modal_in_either_draw_order
     let _input = crate::key_input::lock_test_input();
     for upper_first in [false, true] {
         let mut app = mask_detect_fixture(MaskDetectTool::Erase);
-        app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+        app.mask_detect.context.dialog = Some(MaskDetectTool::Erase);
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         let own = egui::LayerId::new(
@@ -1034,7 +1034,7 @@ fn mask_detect_settings_escape_only_closes_front_real_modal_in_either_draw_order
         ));
         assert!(!upper_open, "the front Modal must close");
         assert_eq!(
-            app.mask_detect_dialog,
+            app.mask_detect.context.dialog,
             Some(MaskDetectTool::Erase),
             "the back dialog must survive, upper_first={upper_first}"
         );
@@ -1057,7 +1057,7 @@ fn mask_detect_settings_escape_only_closes_front_real_modal_in_either_draw_order
         );
         assert_eq!(ctx.memory(|memory| memory.top_modal_layer()), Some(own));
         frame(&mut app, &mut upper_open, vec![key(egui::Key::Escape)]);
-        assert!(app.mask_detect_dialog.is_none());
+        assert!(app.mask_detect.context.dialog.is_none());
     }
 }
 
@@ -1071,7 +1071,7 @@ fn mask_detect_settings_escape_closes_without_other_modal_on_first_and_later_fra
     ] {
         for warm_frames in [0, 4] {
             let mut app = mask_detect_fixture(tool);
-            app.mask_detect_dialog = Some(tool);
+            app.mask_detect.context.dialog = Some(tool);
             let ctx = egui::Context::default();
             crate::ui_fonts::configure_fonts(&ctx);
             let frame = |app: &mut App, events| {
@@ -1097,7 +1097,7 @@ fn mask_detect_settings_escape_closes_without_other_modal_on_first_and_later_fra
             assert_eq!(ctx.memory(|memory| memory.top_modal_layer()), expected);
             frame(&mut app, vec![key(egui::Key::Escape)]);
             assert!(
-                app.mask_detect_dialog.is_none(),
+                app.mask_detect.context.dialog.is_none(),
                 "{tool:?}, warm_frames={warm_frames}"
             );
         }
@@ -1108,7 +1108,7 @@ fn mask_detect_settings_escape_closes_without_other_modal_on_first_and_later_fra
 fn mask_detect_foreground_modal_keeps_details_numeric_input_and_ime_active() {
     let _input = crate::key_input::lock_test_input();
     let mut app = mask_detect_fixture(MaskDetectTool::Erase);
-    app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+    app.mask_detect.context.dialog = Some(MaskDetectTool::Erase);
     let ctx = egui::Context::default();
     crate::ui_fonts::configure_fonts(&ctx);
     crate::ime_focus::install_ime_input_policy(&ctx);
@@ -1234,7 +1234,7 @@ fn mask_detect_foreground_modal_keeps_details_numeric_input_and_ime_active() {
     );
     assert!(app.ime_input_active(&ctx));
     assert!(!app.dialog_escape_pressed(&ctx));
-    assert_eq!(app.mask_detect_dialog, Some(MaskDetectTool::Erase));
+    assert_eq!(app.mask_detect.context.dialog, Some(MaskDetectTool::Erase));
     output.drop_without_applying_deltas();
     frame(
         &mut app,
@@ -1251,7 +1251,7 @@ fn mask_detect_foreground_modal_keeps_details_numeric_input_and_ime_active() {
     )
     .drop_without_applying_deltas();
     assert!(!app.ime_input_active(&ctx));
-    assert_eq!(app.mask_detect_dialog, Some(MaskDetectTool::Erase));
+    assert_eq!(app.mask_detect.context.dialog, Some(MaskDetectTool::Erase));
     assert!((app.settings.mask_detect.threshold - 0.73).abs() < 0.001);
     // Re-enter through the real number button after Escape, ensuring the modal
     // still permits editing rather than just allowing an earlier focus claim.
@@ -1266,7 +1266,7 @@ fn mask_detect_foreground_modal_keeps_details_numeric_input_and_ime_active() {
     // Like other dialogs using dialog_escape_pressed, normal Escape is admitted
     // again after the composition has ended.
     frame(&mut app, vec![key(egui::Key::Escape)]).drop_without_applying_deltas();
-    assert!(app.mask_detect_dialog.is_none());
+    assert!(app.mask_detect.context.dialog.is_none());
 }
 
 fn mask_detect_append_receipt(
@@ -1533,7 +1533,7 @@ fn mask_detect_mode_exit_and_index_invalidation_cancel_only_owned_request() {
                 }
             }
             assert!(cancel.load(Ordering::Acquire));
-            assert!(app.mask_detect_pending.is_none());
+            assert!(app.mask_detect.context.pending.is_none());
             assert!(!app.mask_detect_active());
         }
     }
@@ -1861,9 +1861,9 @@ fn mask_detect_expanded_dialog_keeps_actions_outside_scroll_at_small_screen() {
         app.open_mask_detect_dialog(MaskDetectTool::Erase);
         // Exercise the normal empty catalog, independently of worker timing or
         // the fixture's disconnected receiver and its error-message layout.
-        *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(Vec::new()));
+        app.mask_detect.catalog = DetectorCatalogState::Ready(Ok(Vec::new()));
         assert_eq!(
-            mask_detect_margin_visibility(&app.mask_detect_catalog, &app.settings.mask_detect),
+            mask_detect_margin_visibility(&app.mask_detect.catalog, &app.settings.mask_detect),
             (true, false)
         );
         let ctx = egui::Context::default();
@@ -1969,7 +1969,7 @@ fn mask_detect_parked_context_poll_and_close_leave_sibling_masks_unchanged() {
         } else {
             app.poll_all_page_edit_producers(&ctx);
             app.with_owner_viewer_context(owner, |owner_app| {
-                assert!(owner_app.mask_detect_pending.is_none());
+                assert!(owner_app.mask_detect.context.pending.is_none());
                 let local_adjust_core::LocalMask::RasterVector(mask) =
                     &owner_app.local_adjust_page_layers[&0][0].mask
                 else {
@@ -1981,7 +1981,7 @@ fn mask_detect_parked_context_poll_and_close_leave_sibling_masks_unchanged() {
         }
         app.poll_all_page_edit_producers(&ctx);
         assert_eq!(app.projected_viewer_context_id(), sibling);
-        assert!(app.mask_detect_pending.is_none());
+        assert!(app.mask_detect.context.pending.is_none());
         assert!(app.erase_shapes.is_empty() && app.conceal_shapes.is_empty());
         assert_eq!(app.local_adjust_page_layers[&0], sibling_layers);
         assert!(Arc::ptr_eq(
@@ -2056,7 +2056,7 @@ fn mask_detect_parked_empty_receiver_keeps_root_poll_awake_until_result() {
         .unwrap();
     let owner_key = request.page_key.clone();
     let (tx, rx) = mpsc::channel();
-    app.mask_detect_pending = Some(Box::new(MaskDetectPending {
+    app.mask_detect.context.pending = Some(Box::new(MaskDetectPending {
         request,
         cancel: Arc::new(AtomicBool::new(false)),
         rx,
@@ -2082,7 +2082,7 @@ fn mask_detect_parked_empty_receiver_keeps_root_poll_awake_until_result() {
     tx.send(Ok(mask_detect_output())).ok().unwrap();
     app.poll_all_page_edit_producers(&ctx);
     app.with_owner_viewer_context(owner, |owner_app| {
-        assert!(owner_app.mask_detect_pending.is_none());
+        assert!(owner_app.mask_detect.context.pending.is_none());
         let local_adjust_core::LocalMask::RasterVector(mask) =
             &owner_app.local_adjust_page_layers[&0][0].mask
         else {
@@ -2092,7 +2092,7 @@ fn mask_detect_parked_empty_receiver_keeps_root_poll_awake_until_result() {
     })
     .unwrap();
     assert_eq!(app.projected_viewer_context_id(), sibling);
-    assert!(app.mask_detect_pending.is_none());
+    assert!(app.mask_detect.context.pending.is_none());
     assert_eq!(app.local_adjust_page_layers[&0], sibling_layers);
     assert!(Arc::ptr_eq(
         &app.local_adjust_cache[&sibling_cache_key].pixels,

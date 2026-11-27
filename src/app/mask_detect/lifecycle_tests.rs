@@ -14,7 +14,7 @@ fn mask_detect_foreground_handoff_preserves_new_editor(close: bool) {
         let mut app = setup_app_for_test();
         let ctx = egui::Context::default();
         app.settings.detached_viewer_open_images_in_window = true;
-        let main = app.projected_viewer_context_id();
+        let initial_main = app.projected_viewer_context_id();
         let old_path = app.tmp.path().join("old-detection-owner.png");
         let new_path = app.tmp.path().join("new-detection-owner.png");
         for path in [&old_path, &new_path] {
@@ -22,51 +22,73 @@ fn mask_detect_foreground_handoff_preserves_new_editor(close: bool) {
                 .save(path)
                 .unwrap();
         }
-        let owner = app.build_active_context_for_test(Some(914), DetachedSource::Image, |app| {
-            mask_detect_install_source(app, old_path, tool, &ctx);
+        let owner = if close {
+            // Foreground scratch belongs to the mounted context. Creating it in a
+            // build/service projection does not transfer that ownership (§1.920).
+            mask_detect_install_source(&mut app, old_path, tool, &ctx);
             app.viewer_presentation = ViewerPresentation::DetachedWindow;
             app.detached_viewer_independent_active = true;
+            app.begin_mounted_detached_session_for_test(914, DetachedSource::Image);
             app.set_detached_window_binding_for_test(Some(914));
-        });
-        assert_ne!(owner, main);
+            initial_main
+        } else {
+            let owner =
+                app.build_active_context_for_test(Some(914), DetachedSource::Image, |app| {
+                    mask_detect_install_source(app, old_path, tool, &ctx);
+                    app.viewer_presentation = ViewerPresentation::DetachedWindow;
+                    app.detached_viewer_independent_active = true;
+                    app.set_detached_window_binding_for_test(Some(914));
+                });
+            assert_ne!(owner, initial_main);
+            owner
+        };
         let old_cancel = Arc::new(AtomicBool::new(false));
         let (old_tx, old_rx) = mpsc::channel();
         app.with_viewer_context_state(owner, |app| {
             let request = app.capture_mask_detect_request(tool).unwrap();
             assert_eq!(request.context, owner);
-            app.mask_detect_pending = Some(Box::new(MaskDetectPending {
+            app.mask_detect.context.pending = Some(Box::new(MaskDetectPending {
                 request,
                 cancel: Arc::clone(&old_cancel),
                 rx: old_rx,
             }));
         })
         .unwrap();
-        assert_eq!(app.projected_viewer_context_id(), main);
+        assert_eq!(app.projected_viewer_context_id(), initial_main);
 
         if close {
-            app.close_and_retire_context(
+            assert_eq!(app.foreground_viewer_context_id(), Some(owner));
+            assert!(app.page_edit_tools_owned_by_projected_context());
+            // Close the actual foreground before moving to another context. A
+            // sibling's service close intentionally cannot end this scratch.
+            app.close_fullscreen_to_completion(&ctx).unwrap();
+            assert!(app.fullscreen_idx.is_none());
+            assert!(app.mask_detect.context.pending.is_none());
+            assert!(!app.erase_mode && !app.conceal_mode && !app.local_adjust_mode);
+            assert!(old_cancel.load(Ordering::Acquire));
+            assert_eq!(
+                app.stash_mounted_and_start_fresh("mask_detect_closed_foreground_test"),
                 owner,
-                "mask_detect_foreground_close_test",
-                |app| {
-                    app.close_fullscreen_content();
-                    assert!(app.fullscreen_idx.is_none());
-                    assert!(app.mask_detect_pending.is_none());
-                },
-                |_| (),
-            )
-            .unwrap();
+            );
+            app.retire_context(owner, "mask_detect_foreground_close_test", |_| ())
+                .unwrap();
             assert!(!app.viewer_context_ids().contains(&owner));
         } else {
             assert!(app.pause_current_active_viewer_context(&ctx));
             app.with_viewer_context_state(owner, |app| {
-                assert!(app.mask_detect_pending.is_none());
+                assert!(app.mask_detect.context.pending.is_none());
                 assert!(!app.local_adjust_mode);
             })
             .unwrap();
         }
         assert!(old_cancel.load(Ordering::Acquire));
-        assert_eq!(app.projected_viewer_context_id(), main);
+        let main = app.projected_viewer_context_id();
+        assert_ne!(owner, main);
+        if !close {
+            assert_eq!(main, initial_main);
+        }
         assert!(!app.erase_mode && !app.conceal_mode);
+        assert!(!app.local_adjust_mode);
         assert!(app.erase_shapes.is_empty() && app.conceal_shapes.is_empty());
 
         // Recreate the same tool through its normal entry boundary in the new owner.
@@ -109,7 +131,7 @@ fn mask_detect_foreground_handoff_preserves_new_editor(close: bool) {
         let source = Arc::clone(&new_request.source);
         let new_cancel = Arc::new(AtomicBool::new(false));
         let (_new_tx, new_rx) = mpsc::channel();
-        app.mask_detect_pending = Some(Box::new(MaskDetectPending {
+        app.mask_detect.context.pending = Some(Box::new(MaskDetectPending {
             request: new_request,
             cancel: Arc::clone(&new_cancel),
             rx: new_rx,
@@ -187,7 +209,7 @@ fn mask_detect_foreground_handoff_preserves_new_editor(close: bool) {
             ),
             history
         );
-        let pending = app.mask_detect_pending.as_ref().unwrap();
+        let pending = app.mask_detect.context.pending.as_ref().unwrap();
         assert_eq!(pending.request.context, main);
         assert!(Arc::ptr_eq(&pending.cancel, &new_cancel));
         assert!(!new_cancel.load(Ordering::Acquire));

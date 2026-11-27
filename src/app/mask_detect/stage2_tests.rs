@@ -147,7 +147,7 @@ fn mask_detect_errors_and_folder_warning_only_paint_on_viewer_surface() {
                 .unwrap();
             let (tx, rx) = mpsc::channel();
             assert!(tx.send(Err(error)).is_ok());
-            app.mask_detect_pending = Some(Box::new(MaskDetectPending {
+            app.mask_detect.context.pending = Some(Box::new(MaskDetectPending {
                 request,
                 cancel: Arc::new(AtomicBool::new(false)),
                 rx,
@@ -163,7 +163,7 @@ fn mask_detect_errors_and_folder_warning_only_paint_on_viewer_surface() {
             .unwrap();
         let (tx, rx) = mpsc::channel();
         drop(tx);
-        app.mask_detect_pending = Some(Box::new(MaskDetectPending {
+        app.mask_detect.context.pending = Some(Box::new(MaskDetectPending {
             request,
             cancel: Arc::new(AtomicBool::new(false)),
             rx,
@@ -214,18 +214,18 @@ fn mask_detect_selected_byo_blocks_start_until_catalog_ready_and_is_captured() {
             ..Default::default()
         },
     );
-    *app.mask_detect_catalog = DetectorCatalogState::Idle;
+    app.mask_detect.catalog = DetectorCatalogState::Idle;
     assert!(!app.mask_detect_selection_valid());
     assert!(
         app.capture_mask_detect_request(MaskDetectTool::Erase)
             .is_none()
     );
     let (tx, rx) = mpsc::channel();
-    *app.mask_detect_catalog = DetectorCatalogState::Loading {
+    app.mask_detect.catalog = DetectorCatalogState::Loading {
         cancel: Arc::new(AtomicBool::new(false)),
         rx,
     };
-    app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+    app.mask_detect.context.dialog = Some(MaskDetectTool::Erase);
     let ctx = egui::Context::default();
     crate::ui_fonts::configure_fonts(&ctx);
     let frame = |app: &mut App| {
@@ -285,7 +285,7 @@ fn mask_detect_ready_unavailable_byo_requires_face_or_another_executable_detecto
                     ..Default::default()
                 },
             );
-            *app.mask_detect_catalog = DetectorCatalogState::Ready(match state {
+            app.mask_detect.catalog = DetectorCatalogState::Ready(match state {
                 0 => Ok(Vec::new()), // temporarily absent
                 1 => Ok(vec![DetectorEntry {
                     name: "saved".into(),
@@ -347,7 +347,7 @@ fn mask_detect_empty_contour_worker_result_keeps_masks_history_targets_and_visib
                 ..Default::default()
             },
         );
-        *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(vec![entry("empty")]));
+        app.mask_detect.catalog = DetectorCatalogState::Ready(Ok(vec![entry("empty")]));
         let before = app.local_adjust_page_layers.get(&0).cloned();
         let history = mask_detect_history(&app);
         let request = app.capture_mask_detect_request(tool).unwrap();
@@ -518,7 +518,7 @@ fn mask_detect_selection_requires_face_or_readable_selected_nonempty_classes_and
     let mut app = mask_detect_fixture(MaskDetectTool::Erase);
     app.settings.mask_detect.face_selected = false;
     assert!(!app.mask_detect_selection_valid());
-    *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(vec![
+    app.mask_detect.catalog = DetectorCatalogState::Ready(Ok(vec![
         entry("test.onnx"),
         DetectorEntry {
             name: "bad.onnx".into(),
@@ -573,7 +573,7 @@ fn mask_detect_selection_requires_face_or_readable_selected_nonempty_classes_and
     info.key.size = 999;
     info.names = vec!["new-class".into()];
     info.thresholds = vec![0.8];
-    *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(vec![replacement]));
+    app.mask_detect.catalog = DetectorCatalogState::Ready(Ok(vec![replacement]));
     assert_eq!(request.detectors[0].info.key, old_key);
     assert_eq!(request.detectors[0].info.names, old_names);
     assert_eq!(request.detectors[0].info.thresholds, vec![0.15, 0.3]);
@@ -582,7 +582,7 @@ fn mask_detect_selection_requires_face_or_readable_selected_nonempty_classes_and
         vec![true, true]
     );
     assert!(app.mask_detect_request_is_current(&request));
-    *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(Vec::new()));
+    app.mask_detect.catalog = DetectorCatalogState::Ready(Ok(Vec::new()));
     assert_eq!(request.detectors[0].info.key, old_key);
     assert_eq!(request.detectors[0].info.names, old_names);
     assert_eq!(request.detectors[0].params.thresholds, vec![0.15, 0.3]);
@@ -596,7 +596,7 @@ fn mask_detect_selection_requires_face_or_readable_selected_nonempty_classes_and
 #[test]
 fn mask_detect_catalog_loading_worker_runs_off_ui_and_retains_activity_until_terminal() {
     let mut app = mask_detect_fixture(MaskDetectTool::Erase);
-    *app.mask_detect_catalog = DetectorCatalogState::Idle;
+    app.mask_detect.catalog = DetectorCatalogState::Idle;
     let ui_thread = std::thread::current().id();
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -614,19 +614,19 @@ fn mask_detect_catalog_loading_worker_runs_off_ui_and_retains_activity_until_ter
         ui_thread
     );
     assert!(matches!(
-        &*app.mask_detect_catalog,
+        &app.mask_detect.catalog,
         DetectorCatalogState::Loading { .. }
     ));
     assert_eq!(app.local_ai_activity.load(Ordering::Acquire), activity + 1);
     app.poll_mask_detect_catalog(&egui::Context::default());
     assert!(matches!(
-        &*app.mask_detect_catalog,
+        &app.mask_detect.catalog,
         DetectorCatalogState::Loading { .. }
     ));
     release_tx.send(()).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while matches!(
-        &*app.mask_detect_catalog,
+        &app.mask_detect.catalog,
         DetectorCatalogState::Loading { .. }
     ) {
         assert!(std::time::Instant::now() < deadline);
@@ -634,7 +634,7 @@ fn mask_detect_catalog_loading_worker_runs_off_ui_and_retains_activity_until_ter
         std::thread::yield_now();
     }
     assert!(
-        matches!(&*app.mask_detect_catalog, DetectorCatalogState::Ready(Ok(entries)) if entries.len() == 1)
+        matches!(&app.mask_detect.catalog, DetectorCatalogState::Ready(Ok(entries)) if entries.len() == 1)
     );
     while app.local_ai_activity.load(Ordering::Acquire) != activity {
         assert!(std::time::Instant::now() < deadline);
@@ -696,8 +696,8 @@ fn mask_detect_many_readable_and_unreadable_rows_scroll_with_visible_actions() {
                 result: Err(DetectorReadError::OutputShape),
             });
         }
-        *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(entries));
-        app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+        app.mask_detect.catalog = DetectorCatalogState::Ready(Ok(entries));
+        app.mask_detect.context.dialog = Some(MaskDetectTool::Erase);
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         ctx.set_pixels_per_point(scale);
@@ -757,7 +757,7 @@ fn mask_detect_unselected_face_collapses_shape_and_details_but_keeps_shared_marg
         let mut app = mask_detect_fixture(MaskDetectTool::Erase);
         let mut boxed = entry("boxed");
         boxed.result.as_mut().unwrap().format = DetectorFormat::UltralyticsDetect;
-        *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(vec![boxed]));
+        app.mask_detect.catalog = DetectorCatalogState::Ready(Ok(vec![boxed]));
         app.settings.mask_detect.detectors.insert(
             "boxed".into(),
             crate::settings::ExternalDetectorSettings {
@@ -765,7 +765,7 @@ fn mask_detect_unselected_face_collapses_shape_and_details_but_keeps_shared_marg
                 ..Default::default()
             },
         );
-        app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+        app.mask_detect.context.dialog = Some(MaskDetectTool::Erase);
         app.settings.mask_detect.face_selected = selected;
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
@@ -913,13 +913,13 @@ fn mask_detect_margin_sliders_follow_selected_readable_detector_kinds_and_keep_v
                 },
             );
         }
-        *app.mask_detect_catalog = DetectorCatalogState::Ready(Ok(entries));
+        app.mask_detect.catalog = DetectorCatalogState::Ready(Ok(entries));
         assert_eq!(
-            mask_detect_margin_visibility(&app.mask_detect_catalog, &app.settings.mask_detect),
+            mask_detect_margin_visibility(&app.mask_detect.catalog, &app.settings.mask_detect),
             expected,
             "{label}"
         );
-        app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+        app.mask_detect.context.dialog = Some(MaskDetectTool::Erase);
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         // A selected model's controls can push the contour margin below the
@@ -941,7 +941,7 @@ fn mask_detect_margin_sliders_follow_selected_readable_detector_kinds_and_keep_v
             output.drop_without_applying_deltas();
         }
         assert_eq!(
-            mask_detect_margin_visibility(&app.mask_detect_catalog, &app.settings.mask_detect),
+            mask_detect_margin_visibility(&app.mask_detect.catalog, &app.settings.mask_detect),
             expected,
             "{label}: after rendering"
         );
@@ -1040,11 +1040,11 @@ fn mask_detect_loading_row_disables_reload_without_changing_selection() {
     let _input = crate::key_input::lock_test_input();
     let mut app = mask_detect_fixture(MaskDetectTool::Erase);
     let (_tx, rx) = mpsc::channel();
-    *app.mask_detect_catalog = DetectorCatalogState::Loading {
+    app.mask_detect.catalog = DetectorCatalogState::Loading {
         cancel: Arc::new(AtomicBool::new(false)),
         rx,
     };
-    app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+    app.mask_detect.context.dialog = Some(MaskDetectTool::Erase);
     let ctx = egui::Context::default();
     crate::ui_fonts::configure_fonts(&ctx);
     fn has_loading_text(shape: &egui::Shape) -> bool {
@@ -1122,7 +1122,7 @@ fn mask_detect_cancelled_or_stale_mixed_results_preserve_masks_document_undo_and
                 app.items_generation = app.items_generation.wrapping_add(1);
             }
             app.poll_mask_detect(&egui::Context::default());
-            assert!(app.mask_detect_pending.is_none());
+            assert!(app.mask_detect.context.pending.is_none());
             assert!(app.erase_shapes.is_empty());
             assert!(app.conceal_shapes.is_empty());
             assert_eq!(app.erase_mask.as_ref().unwrap(), &vec![false; 64]);

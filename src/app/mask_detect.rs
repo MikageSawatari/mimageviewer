@@ -77,6 +77,22 @@ impl MaskDetectTool {
     }
 }
 
+/// App-common catalog stays put while only `context` is exchanged with a bundle.
+#[derive(Default)]
+pub(crate) struct MaskDetectState {
+    pub(crate) catalog: DetectorCatalogState,
+    pub(crate) context: Box<MaskDetectContextState>,
+}
+
+/// One viewer's dialog, inference and edit identities move and drop together.
+#[derive(Default)]
+pub(crate) struct MaskDetectContextState {
+    pub(crate) pending: Option<Box<MaskDetectPending>>,
+    pub(crate) dialog: Option<MaskDetectTool>,
+    pub(crate) erase_session: u64,
+    pub(crate) conceal_session: u64,
+}
+
 pub(crate) struct MaskDetectRequest {
     pub(super) context: ViewerContextId,
     pub(super) page_key: String,
@@ -554,7 +570,7 @@ impl App {
     }
     fn reload_mask_detect_catalog(&mut self) {
         if matches!(
-            &*self.mask_detect_catalog,
+            &self.mask_detect.catalog,
             DetectorCatalogState::Loading { .. }
         ) {
             return;
@@ -584,7 +600,7 @@ impl App {
         work: impl FnOnce(Arc<AtomicBool>) -> Result<Vec<DetectorEntry>, String> + Send + 'static,
     ) {
         if matches!(
-            &*self.mask_detect_catalog,
+            &self.mask_detect.catalog,
             DetectorCatalogState::Loading { .. }
         ) {
             return;
@@ -617,9 +633,9 @@ impl App {
                 );
                 let _ = tx.send(result);
             }) {
-            Ok(_) => *self.mask_detect_catalog = DetectorCatalogState::Loading { cancel, rx },
+            Ok(_) => self.mask_detect.catalog = DetectorCatalogState::Loading { cancel, rx },
             Err(error) => {
-                *self.mask_detect_catalog = DetectorCatalogState::Ready(Err(format!(
+                self.mask_detect.catalog = DetectorCatalogState::Ready(Err(format!(
                     "検出器の読み込みを開始できません: {error}"
                 )))
             }
@@ -627,7 +643,7 @@ impl App {
     }
 
     fn poll_mask_detect_catalog(&mut self, ctx: &egui::Context) {
-        let DetectorCatalogState::Loading { rx, .. } = &*self.mask_detect_catalog else {
+        let DetectorCatalogState::Loading { rx, .. } = &self.mask_detect.catalog else {
             return;
         };
         let result = match rx.try_recv() {
@@ -638,7 +654,7 @@ impl App {
                 return;
             }
         };
-        *self.mask_detect_catalog = DetectorCatalogState::Ready(result);
+        self.mask_detect.catalog = DetectorCatalogState::Ready(result);
     }
 
     fn open_mask_detect_folder(&mut self, ctx: &egui::Context) {
@@ -681,14 +697,14 @@ impl App {
             .detectors
             .values()
             .any(|setting| setting.selected)
-            && !matches!(&*self.mask_detect_catalog, DetectorCatalogState::Ready(_))
+            && !matches!(&self.mask_detect.catalog, DetectorCatalogState::Ready(_))
         {
             return false;
         }
         if self.settings.mask_detect.face_selected {
             return true;
         }
-        let DetectorCatalogState::Ready(Ok(entries)) = &*self.mask_detect_catalog else {
+        let DetectorCatalogState::Ready(Ok(entries)) = &self.mask_detect.catalog else {
             return false;
         };
         entries.iter().any(|entry| {
@@ -709,7 +725,7 @@ impl App {
     }
 
     pub(crate) fn mask_detect_active(&self) -> bool {
-        self.mask_detect_dialog.is_some() || self.mask_detect_pending.is_some()
+        self.mask_detect.context.dialog.is_some() || self.mask_detect.context.pending.is_some()
     }
 
     /// この context で今描かれる窓だけを共通モーダルへ登録する。
@@ -728,20 +744,22 @@ impl App {
     }
 
     pub(crate) fn cancel_mask_detect(&mut self) {
-        self.mask_detect_dialog = None;
-        self.mask_detect_pending = None;
+        self.mask_detect.context.dialog = None;
+        self.mask_detect.context.pending = None;
     }
 
     pub(crate) fn cancel_mask_detect_for_tool(&mut self, tool: MaskDetectTool) {
-        if self.mask_detect_dialog == Some(tool) {
-            self.mask_detect_dialog = None;
+        if self.mask_detect.context.dialog == Some(tool) {
+            self.mask_detect.context.dialog = None;
         }
         if self
-            .mask_detect_pending
+            .mask_detect
+            .context
+            .pending
             .as_ref()
             .is_some_and(|p| p.request.target.tool() == tool)
         {
-            self.mask_detect_pending = None;
+            self.mask_detect.context.pending = None;
         }
     }
 
@@ -797,13 +815,13 @@ impl App {
 
     pub(crate) fn open_mask_detect_dialog(&mut self, tool: MaskDetectTool) {
         if self.mask_detect_available(tool) {
-            self.mask_detect_dialog = Some(tool);
+            self.mask_detect.context.dialog = Some(tool);
             self.reload_mask_detect_catalog();
         }
     }
 
     fn capture_mask_detect_request(&mut self, tool: MaskDetectTool) -> Option<MaskDetectRequest> {
-        if self.mask_detect_pending.is_some()
+        if self.mask_detect.context.pending.is_some()
             || !self.mask_detect_can_start(tool)
             || !self.mask_detect_selection_valid()
         {
@@ -816,10 +834,10 @@ impl App {
         }
         let target = match tool {
             MaskDetectTool::Erase => MaskDetectTarget::Erase {
-                session: self.erase_session,
+                session: self.mask_detect.context.erase_session,
             },
             MaskDetectTool::Conceal => MaskDetectTarget::Conceal {
-                session: self.conceal_session,
+                session: self.mask_detect.context.conceal_session,
                 source_kind,
             },
             MaskDetectTool::LocalAdjust => {
@@ -858,8 +876,8 @@ impl App {
             target,
             source,
             mask_size,
-            options: self.settings.mask_detect.clone(),
-            detectors: chosen_detectors(&self.mask_detect_catalog, &self.settings.mask_detect),
+            options: self.settings.mask_detect.as_ref().clone(),
+            detectors: chosen_detectors(&self.mask_detect.catalog, &self.settings.mask_detect),
         })
     }
 
@@ -931,7 +949,7 @@ impl App {
         request: MaskDetectRequest,
         work: impl FnOnce(Arc<AtomicBool>) -> Result<MaskDetectOutput, MaskDetectError> + Send + 'static,
     ) {
-        if self.mask_detect_pending.is_some() {
+        if self.mask_detect.context.pending.is_some() {
             return;
         }
         let tool = request.target.tool();
@@ -949,8 +967,8 @@ impl App {
             });
         match spawn {
             Ok(_) => {
-                self.mask_detect_dialog = None;
-                self.mask_detect_pending = Some(Box::new(MaskDetectPending {
+                self.mask_detect.context.dialog = None;
+                self.mask_detect.context.pending = Some(Box::new(MaskDetectPending {
                     request,
                     cancel,
                     rx,
@@ -991,11 +1009,13 @@ impl App {
             return false;
         }
         match &request.target {
-            MaskDetectTarget::Erase { session } => *session == self.erase_session,
+            MaskDetectTarget::Erase { session } => {
+                *session == self.mask_detect.context.erase_session
+            }
             MaskDetectTarget::Conceal {
                 session,
                 source_kind,
-            } => *session == self.conceal_session && *source_kind == kind,
+            } => *session == self.mask_detect.context.conceal_session && *source_kind == kind,
             MaskDetectTarget::LocalAdjust {
                 owner, document, ..
             } => {
@@ -1080,7 +1100,7 @@ impl App {
     }
 
     pub(crate) fn poll_mask_detect(&mut self, ctx: &egui::Context) {
-        let Some(pending) = self.mask_detect_pending.as_ref() else {
+        let Some(pending) = self.mask_detect.context.pending.as_ref() else {
             return;
         };
         let result = match pending.rx.try_recv() {
@@ -1091,13 +1111,13 @@ impl App {
                 return;
             }
             Err(mpsc::TryRecvError::Disconnected) => {
-                self.mask_detect_pending = None;
+                self.mask_detect.context.pending = None;
                 self.show_mask_detect_error("検出処理が停止しました".into());
                 return;
             }
             Ok(result) => result,
         };
-        let pending = self.mask_detect_pending.take().unwrap();
+        let pending = self.mask_detect.context.pending.take().unwrap();
         if pending.cancel.load(Ordering::Acquire) {
             return;
         }
@@ -1137,7 +1157,7 @@ impl App {
 
     pub(crate) fn show_mask_detect_dialog(&mut self, ctx: &egui::Context) {
         self.poll_mask_detect_catalog(ctx);
-        if self.mask_detect_pending.is_some() {
+        if self.mask_detect.context.pending.is_some() {
             let id = egui::Id::unique("mask_detect_progress");
             let layer = egui::LayerId::new(egui::Order::Foreground, id);
             // Like egui::Modal: block lower layers without covering Tooltip.
@@ -1167,7 +1187,7 @@ impl App {
             });
             return;
         }
-        let Some(tool) = self.mask_detect_dialog else {
+        let Some(tool) = self.mask_detect.context.dialog else {
             return;
         };
         let id = egui::Id::unique("mask_detect_settings");
@@ -1217,7 +1237,7 @@ impl App {
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             ui.checkbox(&mut self.settings.mask_detect.face_selected, "顔 (内蔵)");
-                            let (show_box_margin, _) = mask_detect_margin_visibility(&self.mask_detect_catalog, &self.settings.mask_detect);
+                            let (show_box_margin, _) = mask_detect_margin_visibility(&self.mask_detect.catalog, &self.settings.mask_detect);
                             if self.settings.mask_detect.face_selected {
                             ui.horizontal(|ui| {
                                 ui.label("形");
@@ -1268,16 +1288,16 @@ impl App {
                                 );
                             });
                             }
-                            show_detector_entries(ui, &self.mask_detect_catalog, &mut self.settings.mask_detect);
+                            show_detector_entries(ui, &self.mask_detect.catalog, &mut self.settings.mask_detect);
                             ui.separator();
                             // Resolve again after detector-row controls, so a new
                             // selection is reflected in this same UI pass.
-                            let (_, show_contour_margin) = mask_detect_margin_visibility(&self.mask_detect_catalog, &self.settings.mask_detect);
+                            let (_, show_contour_margin) = mask_detect_margin_visibility(&self.mask_detect.catalog, &self.settings.mask_detect);
                             if show_contour_margin { ui.add(egui::Slider::new(&mut self.settings.mask_detect.contour_margin_percent, 0.0..=5.0).text("輪郭の余白 (%)"))
                                 .on_hover_text("元の画像の長辺に対する割合で太らせます (最小 2px)"); }
                             ui.horizontal_wrapped(|ui| {
                                 folder = ui.button("フォルダを開く").clicked();
-                                let loading = matches!(&*self.mask_detect_catalog, DetectorCatalogState::Loading { .. });
+                                let loading = matches!(&self.mask_detect.catalog, DetectorCatalogState::Loading { .. });
                                 let button = ui.add_enabled(!loading, egui::Button::new("一覧を読み直す"));
                                 reload = button.clicked();
                                 #[cfg(test)]
@@ -1321,7 +1341,7 @@ impl App {
             });
         }
         if !open || close {
-            self.mask_detect_dialog = None;
+            self.mask_detect.context.dialog = None;
         } else if detect {
             self.start_mask_detect(tool);
         } else if reload {

@@ -9,7 +9,10 @@ egui・一覧・ツリーは両端の入力時刻が分かる組だけ実入力�
 `ai::detector_catalog` は `<data_dir>\detectors\` の直下ファイルと 1 階層の `model.onnx`、任意の json を読む。
 一覧は App 共通の単一 owner に持ち、viewer context の bundle には入れない。専用 worker がランタイム準備を待ち、
 CPU・最適化なしの一時 Session でメタデータと入出力を読む。この Session は外部モデルの cache に入れない。
-検出の待ちは viewer context の bundle に 1 つだけ置き、`MaskDetectRequest` が開始時の対象・世代・画素を所有する。
+App の `Box<MaskDetectState>` が共通の一覧と投影中の `Box<MaskDetectContextState>` を持つ。
+後者の待ち・設定窓・2 ツールの session だけを bundle と交換し、一覧は動かさない。保存する設定も
+`Settings.mask_detect` の Box に置き、App に増える inline は x64 で計 16 バイトとする。
+検出の待ちは viewer context ごとに 1 つだけ置き、`MaskDetectRequest` が開始時の対象・世代・画素を所有する。
 要求は使う検出器のパス・サイズ・更新時刻・形式・分類・閾値・入力サイズも複製し、一覧の再読込では変えない。
 `app/mask_detect.rs` の worker は選んだ検出器を順に実行し、BYO は要求のファイル identity を確認してから
 `AiRuntime` の外部モデル経路（DirectML / CPU、FIFO 最大 2 件、TensorRT なし）で推論する。

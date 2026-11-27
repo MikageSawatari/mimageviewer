@@ -196,7 +196,8 @@ impl App {
         // stopping playback or replacing this tool's detection/edit session.
         self.stop_projected_slideshow_playback();
         self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::Conceal);
-        self.conceal_session = self.conceal_session.wrapping_add(1);
+        self.mask_detect.context.conceal_session =
+            self.mask_detect.context.conceal_session.wrapping_add(1);
         self.conceal_mode = true;
         self.conceal_preview_active = false;
         self.conceal_preview_hold = Default::default();

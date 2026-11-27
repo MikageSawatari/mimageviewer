@@ -3,7 +3,9 @@
 ## マスクの自動検出（§1.914 段 2、実装・検証状況は §23）
 
 3 ツール共通の `MaskDetectPending` は viewer context ごとに 1 つで、開始時の対象を固定した要求・取消フラグ・受信口を所有する。
-App と bundle は `Option<Box<MaskDetectPending>>` で保持し、捕捉した文書を含む要求を inline で常駐させない。
+待ちの `Option<Box<MaskDetectPending>>` と設定窓・session は `Box<MaskDetectContextState>` にまとめ、
+App の共通 `Box<MaskDetectState>` 内の投影先と bundle の間で、その Box だけを交換する。
+catalog は共通状態に残し、context の破棄では自身の待ちだけを drop して取り消す。要求を inline で常駐させない。
 `launch_mask_detect_worker` は本番とテストの推論注入で共有する。1 回ごとの worker が `local_ai_activity_lease()` を
 ランタイム待ちから thread 終了まで保持し、検出器ごと・YuNet の各段の区切りで取消を調べる。
 要求は一覧の `DetectorInfo` と選択・形・閾値も複製して固定する。検出 worker はファイルのサイズ・更新時刻を

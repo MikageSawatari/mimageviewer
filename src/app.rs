@@ -19395,12 +19395,8 @@ pub struct App {
     pub(crate) local_adjust_lut_pending: Option<LocalAdjustLutLoadPending>,
     /// 補正レイヤーの被写体/領域マスク生成 worker。
     pub(crate) local_adjust_segmentation_pending: Option<LocalAdjustSegmentationPending>,
-    /// Rare, captured detection state lives on the heap, including its document claim.
-    pub(crate) mask_detect_pending: Option<Box<MaskDetectPending>>,
-    pub(crate) mask_detect_dialog: Option<MaskDetectTool>,
-    mask_detect_catalog: Box<mask_detect::DetectorCatalogState>,
-    pub(crate) erase_session: u64,
-    pub(crate) conceal_session: u64,
+    /// Shared catalog and the projected context state live off the App stack.
+    pub(crate) mask_detect: Box<mask_detect::MaskDetectState>,
     /// 補正レイヤー領域分割の色差許容。
     pub(crate) local_adjust_region_color_tolerance: f32,
     /// 補正レイヤー領域分割の最小領域面積。
@@ -22440,11 +22436,7 @@ impl App {
             local_adjust_prefix_preview_pending: None,
             local_adjust_lut_pending: None,
             local_adjust_segmentation_pending: None,
-            mask_detect_pending: None,
-            mask_detect_dialog: None,
-            mask_detect_catalog: Box::default(),
-            erase_session: 0,
-            conceal_session: 0,
+            mask_detect: Box::default(),
             local_adjust_region_color_tolerance: 42.0,
             local_adjust_region_min_area: 64,
             adjustment_cache: std::collections::HashMap::new(),
@@ -87589,7 +87581,7 @@ impl App {
             ai_upscale_pending: self.ai_upscale_pending.len(),
             retained_final_ai_orphans: self.retained_final_ai_orphans.len(),
             local_adjust_segmentation_pending: self.local_adjust_segmentation_pending.is_some(),
-            mask_detect_pending: self.mask_detect_pending.is_some(),
+            mask_detect_pending: self.mask_detect.context.pending.is_some(),
             book_op_pending: self.book_op_pending.is_some() || self.book_structural_op.is_some(),
             local_ai_activity: self.local_ai_activity.load(Ordering::Acquire),
             trt_worker_starting: self

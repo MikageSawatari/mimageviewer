@@ -112,7 +112,7 @@ impl App {
             || self.rename_migration_writers_busy()
             || self.local_adjust_lut_pending.is_some()
             || self.local_adjust_segmentation_pending.is_some()
-            || self.mask_detect_pending.is_some()
+            || self.mask_detect.context.pending.is_some()
             || self.stamp_embed_pending.is_some()
             || self.view_trim_save_pending
             || !self.view_trim_dirty_page_overrides.is_empty()
