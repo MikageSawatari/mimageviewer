@@ -5263,10 +5263,11 @@ mod thumbnail_standin_paint_tests {
         );
         // Hidden only hides the marker for Loaded art. Pending must retain its
         // fallback music icon even when a stand-in supplies the image.
-        let note_bounds =
-            crate::ui_helpers::music_icon_shapes(cell().shrink(4.0), ctx.style().visuals.dark_mode)
-                [3]
-            .visual_bounding_rect();
+        let note_bounds = crate::ui_helpers::music_icon_shapes(
+            cell().shrink(4.0),
+            ctx.global_style().visuals.dark_mode,
+        )[3]
+        .visual_bounding_rect();
         assert!(
             shapes
                 .iter()

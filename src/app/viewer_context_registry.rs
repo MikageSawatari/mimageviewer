@@ -3274,7 +3274,7 @@ impl ViewerContextBundle {
         self.normalize_auto_scan_suppressed.clear();
     }
 
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         // per-context ロード複合体: 空コンテキストは「誰も繋がっていない」fresh channel と
         // token を持つ (App::new と同じ初期状態。この tx を掴む worker は存在しないので
         // rx は常に Empty を返す)。

@@ -529,6 +529,72 @@ fn thumbnail_standins_unavailable_converted_source_retires_even_while_pending() 
 }
 
 #[test]
+fn thumbnail_standins_image_and_video_keep_painted_index_rotation_after_reindex() {
+    use crate::rotation_db::Rotation;
+
+    let mut app = setup_app_for_test();
+    synthetic_loaded(&mut app, 4);
+    app.items[1] = GridItem::Video(PathBuf::from("c:/standins/1.mp4"));
+    app.items[3] = GridItem::Video(PathBuf::from("c:/standins/3.mp4"));
+    let angles = [
+        Rotation::Cw270,
+        Rotation::Cw270,
+        Rotation::None,
+        Rotation::Cw90,
+    ];
+    let owner_angles = [
+        Rotation::None,
+        Rotation::Cw90,
+        Rotation::Cw180,
+        Rotation::Cw270,
+    ];
+    for index in 0..4 {
+        let key = app.rotation_key_for_idx(index).unwrap();
+        app.rotation_page_keys.insert(key, owner_angles[index]);
+        app.rotation_cache.insert(index, angles[index]);
+        assert_eq!(app.grid_tile_rotation_memory(index), owner_angles[index]);
+    }
+    let reads = crate::rotation_db::read_operations_for_test();
+    let expected = (0..4)
+        .map(|index| {
+            let angle = app.grid_tile_rotation(index);
+            assert_eq!(angle, angles[index]);
+            let thumb = &app.thumbnails[index];
+            let ThumbnailState::Loaded { tex, .. } = thumb else {
+                panic!("loaded fixture");
+            };
+            (
+                physical_item_key(&app.items[index]).unwrap(),
+                tex.id(),
+                thumb.tile_view_for_texture(tex, angle),
+                angle,
+            )
+        })
+        .collect::<Vec<_>>();
+    let captured = app.capture_thumbnail_standins();
+    assert_eq!(crate::rotation_db::read_operations_for_test(), reads);
+    app.items.reverse();
+    app.thumbnails = vec![ThumbnailState::Pending; 4];
+    app.bump_items_generation();
+    for index in 0..4 {
+        let key = physical_item_key(&app.items[index]).unwrap();
+        app.thumbnail_standins
+            .attach(index, &key, app.image_metas[index], &captured);
+        app.rotation_cache.insert(index, Rotation::Cw180);
+    }
+    let reads = crate::rotation_db::read_operations_for_test();
+    for (index, item) in app.items.iter().enumerate() {
+        let key = physical_item_key(item).unwrap();
+        let (_, id, view, angle) = expected.iter().find(|entry| entry.0 == key).unwrap();
+        let image = app.grid_thumbnail_display_image(index).unwrap();
+        assert_eq!(image.tex.id(), *id);
+        assert_eq!(image.view, *view, "layout must use the old painted angle");
+        assert_eq!(image.rotation, *angle);
+    }
+    assert_eq!(crate::rotation_db::read_operations_for_test(), reads);
+}
+
+#[test]
 fn thumbnail_standins_folder_and_zip_keep_old_cover_rotation_crop_after_reindex() {
     use crate::cover_auto_material::{AutoCropResults, AutoMaterial};
     use crate::cover_source_scope::LoadedCoverIdentity;
@@ -562,6 +628,7 @@ fn thumbnail_standins_folder_and_zip_keep_old_cover_rotation_crop_after_reindex(
                 AutoMaterial::Automatic(AutoCropResults::new([None, Some(crop), None, None]));
         }
         app.rotation_page_keys.insert(key.into(), Rotation::Cw90);
+        app.rotation_cache.insert(index, Rotation::Cw270);
     }
     let old = (0..2)
         .map(|index| app.grid_thumbnail_display_image(index).unwrap())

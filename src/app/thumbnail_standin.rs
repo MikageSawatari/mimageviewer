@@ -80,7 +80,17 @@ impl App {
                 } else {
                     tex
                 };
-                let rotation = self.grid_tile_rotation_memory(index);
+                // ページ・動画の実描画は get_rotation の index cache を優先する。
+                // 既に採用した角度だけを peek し、表紙は旧 Loaded.cover の参照元を保つ。
+                let rotation = match item {
+                    GridItem::Image(_)
+                    | GridItem::ZipImage { .. }
+                    | GridItem::PdfPage { .. }
+                    | GridItem::Video(_) => self
+                        .peek_rotation(index)
+                        .unwrap_or_else(|| self.grid_tile_rotation_memory(index)),
+                    _ => self.grid_tile_rotation_memory(index),
+                };
                 Some(ThumbnailDisplayImage {
                     tex: tex.clone(),
                     view: thumb.tile_view_for_texture(tex, rotation),

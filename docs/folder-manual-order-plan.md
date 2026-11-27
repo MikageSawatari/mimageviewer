@@ -843,6 +843,9 @@ Smart root の履歴採用後、定義の範囲外にある新しい通常物理
 
 ### 実装記録 (段 6)
 
+- R4 指摘への対応: 通常画像・動画などの代役は旧 index の `peek_rotation` を優先し、表紙は旧 Loaded.cover の参照を維持する。
+  index cache と page owner を意図的に異ならせ、旧描画の回転・配置寸法を保ち、取り出し時に DB 読み取りが増えない回帰を追加した。
+
 - 前提の確認: `apply_current_view_order_refresh` は owner / folder / order_revision / 設定の照合後も
   旧 items・thumbnails・keep_set を参照できる。旧 keep_set は疎な可視列から作る集合であり、数値範囲では代用しない。
   通常画・選択変更後の再描画・遅延セル再描画の入口を確認し、共通の `grid_thumbnail_display_image` へ接続した。
