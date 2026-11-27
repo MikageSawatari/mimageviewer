@@ -1,6 +1,6 @@
 # 編集ツールの途中で表示中の画像が外から替わるときの扱い (§1.920)
 
-作成: 2026-11-27 / ClaudeCode (設計担当)。状態: 設計 r2 (案 A' に改訂、独立設計レビュー r2 待ち)。
+作成: 2026-11-27 / ClaudeCode (設計担当)。状態: 設計 r3 (案 A'、独立設計レビュー r2 の指摘を反映、r3 待ち)。
 
 関連: [next-release-backlog.md §1.920](next-release-backlog.md)、[conceal-feature-plan.md](conceal-feature-plan.md)、
 [detached-rework-plan.md](detached-rework-plan.md) §2 (憲法) と §11 (リワーク外からの変更記録)。
@@ -119,7 +119,24 @@ SNS 分割の見開きの退避 (`PageEditSpreadPivot`) は数値の idx を持�
   (編集の終了は別ウィンドウの操作)。
 - 一覧への入力を受け付けなかったとき (操作の時点) に、メインウィンドウへ通知する:
   「別ウィンドウで編集中です。別ウィンドウで Esc を押して編集を終えると、一覧を使えます」。
-  同じ操作の繰り返しで通知が溜まらないようにする (既存の通知の置き換えに従う)。
+  getter の評価時や毎フレームではなく、拒否した入力の時点だけ出す。一覧は `ui.disable()` されるので、通常の
+  clicked 応答では拾えない (`ui_main.rs:22196` 付近)。一覧の領域への押下・キーを拒否した時点で出す。同じ操作の
+  繰り返しで通知が溜まらないようにする (既存の通知の置き換えに従う)。
+- 既存の `handle_stack_refresh_keyboard` (`app.rs:61167` 以降) は、理由によって Esc の stack 切替・再読込・変換などを
+  許している。新しい理由はそのまま既存の分岐へ流さず、許す非項目操作を明示する (既定は何も許さない)。
+  メインウィンドウの viewport・文字入力の所有は今のまま (入力欄や IME の Esc は奪わない)。
+- 背景のコンテキストメニューには門の例外がある (`context_menu.rs:2003` 付近)。新しい理由では例外を広げず、
+  既に開いていたメニューの項目の実行も止める。ゲームパッド・リングは既存の門で止まる。拒否中に押されたままの
+  入力が、編集の終了直後に発火しないことを確かめる。
+- **一覧の領域への D&D**: 門が閉じると main drop の grid geometry が空になり (`main_drop.rs:126`)、native の
+  hit-test はその位置を `ExistingDropArea` とし、外部ファイルを `GridFiles` として現在フォルダへのコピーに読み替えて
+  しまう (`main_drop_target.rs:147`・`:253`、コピーは `app.rs:54242` で直接始まる)。従来はフォルダのセルへの
+  コピーだった操作が別の場所へのコピーに変わるので、新しい理由では一覧の領域への drop を拒否し (背景へのコピーへ
+  読み替えない)、通知する。
+- tray の隠す・戻す、activation は、新しい理由を全体のモーダルとして扱わない (既存の session を保つ。activation は
+  旧対象を close / park / 終了してから進む今の経路のまま)。
+- 判定に使う述語は、sibling を含まない現 session の述語 (`current_viewer_session_is_detached_or_switching`、
+  `app.rs:66546` 付近) を使う。at-rest を含む `viewer_session_is_detached_or_switching` (`:66564`) と取り違えない。
 - **inner の受付 (`open_fullscreen_with_metadata_boundary_inner` の `grid_item_input_allowed`) は、この理由では
   拒否しない。** 一覧以外から届く open (延期の再開・同じ画像の open) まで拒否すると、延期の後始末と同じ画像の
   更新が壊れる。inner では、別の画像への切り替えを §3.4 で扱う。
@@ -139,6 +156,13 @@ SNS 分割の見開きの退避 (`PageEditSpreadPivot`) は数値の idx を持�
 次のフレームの `reconcile_page_edit_spread_pivots` などで遅れて位置が戻ることがない (r1 P2、補正レイヤーは
 パネルの退出だけでは位置が戻らず毎フレームの reconcile に頼っている)。
 
+**所有 context の契約 (r2 P1)**: 下書きは App 共通で、束と一緒には交換されない。編集ツールを持つのは、
+入った時点で mounted だった context だけ (park で終わるので sibling は持たない)。helper は、**今の投影先が
+その所有 context であるときだけ**作用する。構成のサービスなどが `with_viewer_context` で park 中の sibling を
+一時投影して items を書き換える間 (`book_composition_runtime.rs:761`、`viewer_context_registry.rs:6013`) は、
+active の編集に触れず、終えもしない (sibling の書き換えは active の表示中の項目を替えない)。所有の確かめは
+既存の context の identity (mounted / 投影中の context の id) で行い、新しい印は足さない。
+
 呼ぶ場所 (どれも「旧項目がまだ有効」な時点):
 
 1. **inner**: 受付の拒否 (Remote・`grid_item_input_allowed` の既存の理由) の後、`poll_and_remap_book_target` と
@@ -148,20 +172,34 @@ SNS 分割の見開きの退避 (`PageEditSpreadPivot`) は数値の idx を持�
    (退避先 == idx なら同じ画像の open)。r1 の指摘のとおり、終了は表示の移動の lock・holdover にも触れるので、
    旧の編集対象・戻った退避先・新しい対象の関係ごとにテストする。
    idx の代入の後にある既存の `reset_erase_mode` は、新規の入場 (`fullscreen_idx` が `None` だった) のための
-   片付けだけに限る。同じ画像の open では、6 ツールとも編集を続ける (今は消しゴムだけ未適用の筆跡を捨てている。
+   片付けだけに限る。新規の入場かどうかは、idx の代入の前に、振り分け後の行き先の context で取っておく
+   (後の `fullscreen_idx.is_none()` では判定しない)。同じ画像の open では、6 ツールとも編集を続ける (今は消しゴムだけ未適用の筆跡を捨てている。
    同じ画像の open が消しゴム中に起きる経路を列挙し、捨てることに依存している経路があれば報告する)。
-2. **items を書き換える側**: 表示中の viewer を開いたまま items を書き換える (置き換え・削除・付け替え・並べ替え)
-   非同期の完了と、一覧の門を通らない操作は、**編集ツールが動いていれば、書き換える前に終える**。表示中の項目が
-   残るかどうかで分けない (分けると見開きの退避の付け替えが要る、r1 P2)。少なくとも本の構成の採用
-   (`install_prepared_aggregate_items` の前、`refresh_landings` の着地の前)、`remove_items_batch` (一覧からは
-   §3.3 で届かなくなるが、本の追加の取り消しなど一覧以外の呼び出し元がある)。同じ idx の置き換えを起こす実際の
-   producer を特定し、そこで置き換える前に終える (`sync_detached_viewer_to_selected` の検出では遅い)。
-   実装担当は、viewer を開いたまま items を書き換える経路を、編集中に届くかで列挙し、届くものに入れ、届かない
-   理由 (close / park を先に通る・一覧の門・モーダル) を報告に書く。
-3. **閉じる経路**: `close_fullscreen_now_for_destination` で、編集ツールの終了 (`finish_fullscreen_edit_modes`) を
-   `fullscreen_idx = None` より前へ移す。閉じた後は `fullscreen_idx` が `None` のままで、退避の復元待ちが
-   残らない。edit preview の snapshot → 保存 → preview の enqueue の順序と、Undo の扱い (評価の移動の保持を含む)
-   を保つ (r1)。
+2. **items を書き換える側**: 表示中の viewer を開いたまま、所有 context の**項目の identity か index 空間**を変える
+   採用 (置き換え・削除・付け替え・並べ替え) は、**編集ツールが動いていれば、その採用の処理に入る前に終える**。
+   表示中の項目が残るかどうかで分けない (分けると見開きの退避の付け替えが要る、r1 P2)。同じ項目の
+   `content_type` などのメタデータの更新は対象にしない。500 か所の書き込みを個別に直すのではなく、membership /
+   index 空間を変える採用の境界に集める。
+   - **終える時点は、採用が既存の鮮度の検証・状態の捕捉をする前** (r2 P1)。本の構成の採用は、編集の snapshot の
+     write epoch の検証 (`book_composition_runtime.rs:1226`)、landing の捕捉 (`:1282`)、補正レイヤーの退避
+     (`:1346`) を `install_prepared_aggregate_items` より前に行い、その後 `install_prepared_page_edits` (`:1386`) で
+     準備済みの編集を採用する。隠蔽加工の保存は write epoch を進める (`conceal_db.rs:255`)。終了の保存を先に
+     済ませ、その結果を含めて既存の鮮度の検証 (古ければ既存の再準備) と状態の捕捉を行う。inner の冒頭の
+     `poll_and_remap_book_target` からの採用も同じ。
+   - 監査する採用の境界 (r2 が挙げたもの): `install_new_items_inner`、本の構成の採用、`remove_items_batch`
+     (一覧からは §3.3 で届かなくなるが、本の追加の取り消しなど一覧以外の呼び出し元がある)、★固定 (snapshot) の
+     activate / deactivate (`snapshot_ops.rs:1052` は items の代入より前に viewer の付け替えの状態を捕捉するので、
+     その捕捉より前)、smart-folder の準備済み一覧の採用、direct-media reader の items の採用。同じ idx の置き換えを
+     起こす実際の producer を特定し、そこで置き換える前に終える (`sync_detached_viewer_to_selected` の検出では遅い)。
+   - 実装担当は、編集中に届くかで採用の境界を列挙し、届くものに入れ、届かない理由 (close / park を先に通る・
+     一覧の門・モーダル・所有 context でない) を報告に書く。
+3. **閉じる経路**: `close_fullscreen_now_for_destination` で、編集ツールの終了を `fullscreen_idx = None` より前へ
+   移す。保つ順序 (r2): 評価の履歴の退避を fold / reset より前 → local pending の fold → edit preview の snapshot →
+   編集の保存 → preview の enqueue。`restore_grid_cursor_to_fullscreen_item` が退避先を読む前に、テキスト・
+   切り取りなどの退避を捨てない。閉じた後は `fullscreen_idx == None` で、退避 (補正レイヤーを含む。今の
+   `finish_fullscreen_edit_modes` は補正レイヤーの退避を消費しないので、呼ぶ位置を変えるだけでは足りない) が全部
+   消費されている。park と true close を混同しない (park は `reset_detached_pause_foreground_modes` のまま)。
+   窓の × (viewport close) も同じ保存・終端の契約へ届く。
 
 ### 3.5 スライドショー
 
@@ -169,6 +207,15 @@ SNS 分割の見開きの退避 (`PageEditSpreadPivot`) は数値の idx を持�
 スライドショーの開始を受け付けない (キーは編集のキー処理が吸収、HUD・メニュー・ゲームパッドなど他の開始の
 入口も編集中は止める)。受理済みの `Slideshow` の送り (本の構成の許可待ち) は、採用条件が `slideshow_playing`
 を見るので、止めた時点で採用されない (実装で確かめる。採用されるなら同じ要求の所有者で取り消す)。
+
+受理済みの自動送りは、ほかにも次の形で残る (r2 P2): 次のフォルダへの送りは開始時に `slideshow_playing = false`
+にしてから、完了側が `resume_slideshow` で再開する (`ui_fullscreen.rs:45471`、`app.rs:64441`)。ZIP の DFS の
+`Slideshow` の continuation は完了時に再生を true にする (`ui_fullscreen.rs:45387`)。既存の停止 (`:45297`) は
+これらを取り消さない。**受理済みの移動 (自動送り由来か手動かを問わず、fs_nav の lock・フォルダ移動の pending・
+DFS の continuation・構成の許可待ち) がある間は、編集ツールへ入らない** (入場を断り、
+「移動が終わってから編集してください」と通知する)。移動が着地すれば viewer の画像が替わるので、入ってから
+終わらせるより、入らないほうが組み合わせが少ない。これは移動中の一瞬の状態で、通常の使い方は変わらない。
+判定は既存の移動の所有者の述語を使い、新しい印は足さない。
 
 タイマーに編集中の条件を足して「一時停止」にする案は、編集の終了後に再開するかという組み合わせを残すので
 採らない。編集とスライドショーは同時に成り立たない。
@@ -214,8 +261,16 @@ linked の別ウィンドウだけが一覧を viewer の入口として残し�
   `remove_items_batch` の一覧以外の呼び出し元。
 - 閉じる経路: 隠蔽加工・テキストの編集が閉じたときに保存され、閉じた後に `fullscreen_idx == None`、退避が
   残らない。見開きから入った場合も。
+- 一覧の門の周り: 編集中の一覧の領域への外部ファイルの drop が拒否され、コピーが始まらない (背景への
+  コピーへ読み替わらない)。背景メニュー・開いていたメニューの項目が実行されない。拒否中に押されていた
+  ゲームパッドの入力が、編集の終了直後に発火しない。入力欄・IME の Esc はメインウィンドウで今のまま効く。
+  通知は拒否した入力 1 回につき 1 回で、毎フレーム出ない。
+- 本の構成の採用の順序: 終了の保存が鮮度の検証より前に行われ、採用の後の表示・バッジが保存後の状態のまま
+  (保存前へ戻らない)。
 - スライドショー: 再生中に編集ツールへ入ると止まる。許可待ちの送りが後から完了しても採用されない。
-  編集中は開始できない。
+  編集中は開始できない。次のフォルダへの送り・ZIP の DFS の continuation・fs_nav の lock がある間は、編集ツールへ
+  入れず通知が出る。手動の移動が終わった後は入れる。
 - sibling: park 中の束の `fullscreen_idx`・items・cache・世代・pending・cancel が、active 側の終了・一覧の門・
-  書き換えで変わらない。
+  書き換えで変わらない。逆方向: active で隠蔽加工の編集中に、park 中の sibling の構成の更新が一時投影で完了しても、
+  active の下書き・モード・保存先が変わらず、sibling の項目へ保存されない。
 - 既存の見開き内の切り替えのテストが通る。
