@@ -31484,13 +31484,13 @@ impl App {
                 })
     }
 
-    pub(crate) fn direct_navigation_scan_elapsed(&self) -> Option<std::time::Duration> {
+    pub(crate) fn direct_navigation_scan_elapsed_at(
+        &self,
+        now: Instant,
+    ) -> Option<std::time::Duration> {
         self.direct_navigation_scan_pending().then(|| {
-            self.folder_pane_open_pending
-                .as_ref()
-                .unwrap()
-                .started_at
-                .elapsed()
+            let started_at = self.folder_pane_open_pending.as_ref().unwrap().started_at;
+            now.saturating_duration_since(started_at)
         })
     }
 
@@ -31507,13 +31507,13 @@ impl App {
                 })
     }
 
-    pub(crate) fn view_order_refresh_scan_elapsed(&self) -> Option<std::time::Duration> {
+    pub(crate) fn view_order_refresh_scan_elapsed_at(
+        &self,
+        now: Instant,
+    ) -> Option<std::time::Duration> {
         self.view_order_refresh_scan_pending().then(|| {
-            self.folder_pane_open_pending
-                .as_ref()
-                .unwrap()
-                .started_at
-                .elapsed()
+            let started_at = self.folder_pane_open_pending.as_ref().unwrap().started_at;
+            now.saturating_duration_since(started_at)
         })
     }
 

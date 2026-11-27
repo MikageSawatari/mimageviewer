@@ -884,6 +884,13 @@ Smart root の履歴採用後、定義の範囲外にある新しい通常物理
   PNG baseline は生成・更新していない。
   `cargo fmt`（引数なし）、`python scripts/check_ui_glyphs.py`、`git diff --check` は正常終了した。
 
+### 実装記録 (段 6c)
+
+- 主一覧の CentralPanel は `ViewOrderRefreshScan` の表示猶予中だけ不透明のまま入力を無効化し、猶予後と他の block は従来の薄い表示を保つ。子部品の disabled 表示も保つ。
+- 待機表示と同じ `direct_navigation_wait_overlay_delay_at(now)` の述語を使い、既存の `request_repaint_after(delay)` を利用する。入力判定・許可一覧・detached 経路は変更しない。
+- `view_order_wait_dim` を含む描画回帰 4 件を追加した（画像 mesh の色、実セルへの入力、500ms 境界、直接移動、子部品）。走査の経過時間にも既存の `_at(now)` の時刻を渡し、猶予を sleep で待たない。
+- 利用者指定によりコンパイル・テスト・検証用ビルド・コミットは未実施。
+
 ### 段 6 の検証と独立レビュー (2026-11-27、ClaudeCode が記録)
 
 - 設計レビュー: R9 (Sol / xhigh) で「状態を移して読み込みを止める」最初の案に P1 1 件・P2 3 件 → 表示専用の代役へ改めた。

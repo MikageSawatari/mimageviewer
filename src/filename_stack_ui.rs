@@ -2356,6 +2356,7 @@ impl crate::app::App {
 
     /// Grace is visual only: item input is blocked immediately. Existing history/rating
     /// waits keep their immediate indicator, even if a physical scan is also pending.
+    #[cfg(test)]
     pub(crate) fn direct_navigation_wait_overlay_delay(&self) -> Option<std::time::Duration> {
         self.direct_navigation_wait_overlay_delay_at(std::time::Instant::now())
     }
@@ -2368,10 +2369,10 @@ impl crate::app::App {
             return None;
         }
         let elapsed = self
-            .direct_navigation_scan_elapsed()
+            .direct_navigation_scan_elapsed_at(now)
             .or_else(|| self.drive_jump_elapsed())
             .or_else(|| self.main_startup_scan_elapsed_at(now))
-            .or_else(|| self.view_order_refresh_scan_elapsed())?;
+            .or_else(|| self.view_order_refresh_scan_elapsed_at(now))?;
         (elapsed < DIRECT_NAVIGATION_WAIT_GRACE).then(|| DIRECT_NAVIGATION_WAIT_GRACE - elapsed)
     }
 

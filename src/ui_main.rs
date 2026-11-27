@@ -12580,12 +12580,16 @@ impl App {
     }
 
     /// Keep the source grid visible while a location or its new order is prepared offscreen.
-    fn render_location_navigation_wait_overlay(&self, ctx: &egui::Context) {
+    fn render_location_navigation_wait_overlay(
+        &self,
+        ctx: &egui::Context,
+        now: std::time::Instant,
+    ) {
         let location_pending = self.location_navigation_pending();
         if !location_pending && !self.view_order_refresh_scan_pending() {
             return;
         }
-        if let Some(delay) = self.direct_navigation_wait_overlay_delay() {
+        if let Some(delay) = self.direct_navigation_wait_overlay_delay_at(now) {
             ctx.request_repaint_after(delay);
             return;
         }
@@ -22497,8 +22501,36 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
     // ── サムネイルグリッド ───────────────────────────────────────────
 
+    /// Preserve the old list's appearance during the sort indicator's visual grace.
+    /// Input ownership remains entirely with the existing grid item gate.
+    pub(crate) fn gate_main_grid_item_input_at(&self, ui: &mut egui::Ui, now: std::time::Instant) {
+        let Some(block) = self.grid_item_input_block() else {
+            return;
+        };
+        if block == crate::filename_stack_ui::GridItemInputBlock::ViewOrderRefreshScan
+            && self.direct_navigation_wait_overlay_delay_at(now).is_some()
+        {
+            // As in gate_main_chrome, restore the style immediately so genuinely
+            // disabled child controls retain their own disabled appearance.
+            let disabled_alpha = ui.visuals().disabled_alpha;
+            ui.visuals_mut().disabled_alpha = 1.0;
+            ui.disable();
+            ui.visuals_mut().disabled_alpha = disabled_alpha;
+        } else {
+            ui.disable();
+        }
+    }
+
     /// サムネイルグリッドを描画し、フォルダナビゲーション先を返す。
     pub(crate) fn render_grid(&mut self, root_ui: &mut egui::Ui) -> Option<AddressBarNav> {
+        self.render_grid_at(root_ui, std::time::Instant::now())
+    }
+
+    pub(crate) fn render_grid_at(
+        &mut self,
+        root_ui: &mut egui::Ui,
+        now: std::time::Instant,
+    ) -> Option<AddressBarNav> {
         let ctx = &root_ui.ctx().clone();
         let folder_drag_end = self.take_folder_order_drag_end(ctx);
         self.begin_grid_click_input_frame(ctx);
@@ -22517,9 +22549,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         let nav = egui::CentralPanel::default()
             .show(root_ui, |ui| -> Option<AddressBarNav> {
-                if !self.grid_item_input_allowed() {
-                    ui.disable();
-                }
+                self.gate_main_grid_item_input_at(ui, now);
                 let suppress_primary_pointer = self.begin_grid_right_drag_primary_frame(ctx);
                 // Preserve the grid-owned pending click for this frame's cell check, while
                 // clearing App state up front so a primary click not accepted by any cell breaks
@@ -23629,7 +23659,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 nav
             })
             .inner;
-        self.render_location_navigation_wait_overlay(ctx);
+        self.render_location_navigation_wait_overlay(ctx, now);
         nav
     }
 
