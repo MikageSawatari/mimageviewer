@@ -116,3 +116,45 @@ fn cancelled_handshake_never_sends_a_business_request() {
         ErrorCode::Cancelled
     );
 }
+
+#[test]
+fn sound_chain_requires_exact_v9_hello_before_sending_its_command() {
+    for version in [8, AGENT_PROTOCOL_VERSION, AGENT_PROTOCOL_VERSION + 1] {
+        let mut hello = vec![];
+        write_frame(
+            &mut hello,
+            &Response {
+                id: 1,
+                result: Ok(Payload::Hello { version }),
+            },
+        )
+        .unwrap();
+        let mut sent = vec![];
+        let result = after_hello(&mut hello.as_slice(), &CallControl::default(), |_| {
+            write_frame(
+                &mut sent,
+                &Request {
+                    id: 2,
+                    command: Command::SoundChain(SoundChainRequest::Lock {}),
+                },
+            )
+            .unwrap();
+            Ok(())
+        });
+        if version == AGENT_PROTOCOL_VERSION {
+            result.unwrap();
+            assert!(matches!(
+                read_frame::<_, Request>(&mut sent.as_slice())
+                    .unwrap()
+                    .unwrap()
+                    .command,
+                Command::SoundChain(SoundChainRequest::Lock {})
+            ));
+        } else {
+            let error = result.unwrap_err().into_agent();
+            assert_eq!(error.code, ErrorCode::VersionMismatch);
+            assert_eq!(error.message, VERSION_MISMATCH_MESSAGE);
+            assert!(sent.is_empty());
+        }
+    }
+}

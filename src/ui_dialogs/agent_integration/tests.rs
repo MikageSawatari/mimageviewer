@@ -377,7 +377,7 @@ fn agent_exposure_guide_permissions_follow_checks_at_every_level() {
                 assert_eq!(
                     result
                         .hidden
-                        .contains(&"環境設定の項目と値・操作カスタマイズの割り当て・スタック用スクリプトの本文"),
+                        .contains(&"環境設定の項目と値・操作カスタマイズの割り当て・スタック用・操作スクリプトの本文・mIV Sound の並びと設定値"),
                     !settings
                 );
                 assert_eq!(
@@ -391,7 +391,8 @@ fn agent_exposure_guide_permissions_follow_checks_at_every_level() {
                     "環境設定の変更",
                     "キー割り当て・リング・マウスボタン・ジェスチャーの変更",
                     "外部ツールの登録",
-                    "スタック用スクリプトの書き換え",
+                    "スタック用・操作スクリプトの書き換え",
+                    "mIV Sound の並びの変更とプリセットの保存",
                     "お気に入りへの登録",
                 ] {
                     assert_eq!(
@@ -408,7 +409,14 @@ fn agent_exposure_guide_permissions_follow_checks_at_every_level() {
                     result
                         .shown
                         .iter()
-                        .any(|line| line.contains("スタック用スクリプトの本文")),
+                        .any(|line| line.contains("スタック用・操作スクリプトの本文")),
+                    settings
+                );
+                assert_eq!(
+                    result
+                        .shown
+                        .iter()
+                        .any(|line| line.contains("mIV Sound の並びと設定値")),
                     settings
                 );
             }

@@ -3,7 +3,7 @@ use serde_json::json;
 
 #[test]
 fn operations_wire_round_trips_new_commands_and_typed_responses() {
-    assert_eq!(AGENT_PROTOCOL_VERSION, 8);
+    assert_eq!(AGENT_PROTOCOL_VERSION, 9);
     for command in [
         json!({"type":"get_operations", "view":"keys", "key":"Ctrl+C", "screen":"image_fullscreen"}),
         json!({"type":"set_operations", "keys":{"FsCopyImage":["Ctrl+C"]}, "inputs":{"gesture.image":[{"pattern":"DR","action":"none"}]}}),

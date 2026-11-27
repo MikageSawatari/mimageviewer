@@ -179,7 +179,7 @@
       <li>操作の組み合わせを記したスクリプト（データフォルダ内の <code>operation_scripts.rhai</code>）。AI に変更を許可した場合も、このファイルに保存します。実行の有効・無効と初回説明の確認記録は設定に保存し、利用者だけが変更できます。スクリプト自身は通信できません</li>
       <li>スタック表示の分け方を変更するカスタムスクリプト（データフォルダ内の <code>stack_rules.rhai</code>）。AI に変更を許可した場合も、このファイルに保存します</li>
       <li>本ごとの見開き1ページずらしの調整（記憶をOFFにしても保存済み調整は保持し、明示的に解除できます。メタ情報の移行で持ち運べます）</li>
-      <li>音響調整 (mIV Sound) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像。Headphone EQ でダウンロードまたは読み込んだ測定カーブとターゲットカーブは、エフェクトの保存済み状態やプリセットに含まれます</li>
+      <li>音響調整 (mIV Sound) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像。AI に許可した並びの変更と「MCP: 」で始まるプリセットの保存も、同じ音響調整の保存先に残ります。編集のロックと AI の取り消し用の状態は保存せず、解除時に消えます。Headphone EQ でダウンロードまたは読み込んだ測定カーブとターゲットカーブは、エフェクトの保存済み状態やプリセットに含まれます</li>
       <li>登録した SFZ 音源の名前と保存場所。サンプルファイルはコピーしません</li>
       <li>サムネイルキャッシュ（コレクションの一覧用も元フォルダ単位で保存・共有します。登録解除では削除せず、キャッシュ管理から削除できます。動画・音声の長さ、解像度、形式、読取可否の情報、動画の場面と音声波形の解析結果を含みます）</li>
       <li>EPUB を変換した閲覧用 PDF（キャッシュ管理画面でその場で削除できます。表示中など使用中の本は削除されず、理由が表示されます）</li>
@@ -290,6 +290,7 @@
       AI にタグや★の変更を許可した場合は、通常の操作と共通の動作記録に、変更したファイルの場所やタグ名などが残ります。
       AI による設定の変更では、変えた項目と変更前後の値（場所・外部ツールの実行ファイルと引数を含む）、お気に入りへの登録では場所も通常のログに残ります。
       スタック用・操作スクリプトの変更は、通知・「AI による変更」・通常のログに変更前後の行数だけを残し、本文は記録しません。
+      mIV Sound の変更では、ロックと解除、変更前後のエフェクトの種類と段数、使う側、プリセット名などを記録し、各つまみの設定値はログへ記録しません。
       「AI による変更」と「最近使った AI アプリ」の表示用の記録はメモリ内に持ち、本アプリを終了すると消えます。
       変更済みのタグ・★・コレクション・設定・お気に入りや、通常の動作記録はこの表示用の記録とは別に保存されます。
     </div>
@@ -343,8 +344,9 @@
         文字起こしを許可すると、動画・音声の文字起こしの本文を時刻つきで、ファイルの情報としてその作成日などの状態も AI アプリへ渡します。話された氏名や私的な会話もそのまま含むことがあります。許可しない場合は渡しません。
         GPS 欄を無効にしても、ファイル名やプロンプトなどの文章に書かれた場所の情報を取り除くものではありません。
         「今開いている場所を AI に見せる」を有効にすると、開いている場所と表示中の項目の場所を渡します。
-        「設定の確認と変更を AI に任せる」（既定ではオフ）を有効にすると、環境設定の項目と値（起動時のフォルダや保存先などの場所、外部ツールの実行ファイルと引数を含む）に加え、操作カスタマイズの割り当てとスタック用・操作スクリプトの本文を渡します。本文も AI アプリの提供元へ送られます。
+        「設定の確認と変更を AI に任せる」（既定ではオフ）を有効にすると、環境設定の項目と値（起動時のフォルダや保存先などの場所、外部ツールの実行ファイルと引数を含む）に加え、操作カスタマイズの割り当てとスタック用・操作スクリプトの本文、mIV Sound の A / B のエフェクトの並びと設定値・使う側・全体のオン / オフ・遅延・編集のロック状態を渡します。設定値には IR や測定データなどの選択情報が含まれる場合があります。これらも AI アプリの提供元へ送られます。
         AI アプリからの指示で環境設定やキー・リング・マウスボタン・ジェスチャーの割り当ての変更、外部ツールの登録・変更・削除、スタック用・操作スクリプトの書き換え、お気に入りへの登録と索引の切り替えを確認なしで行います。
+        mIV Sound の編集のロックと解除、並び・使う側・全体のオン / オフの変更、同じロック内での直前の変更の取り消し、「MCP: 」で始まるプリセットの保存も確認なしで行います。窓の帯から利用者がロックを解除できます。
         スタック用スクリプトのオン・オフも変えられます。操作スクリプトの有効化と初回説明の確認は利用者だけが行い、AI は変更できません。
         操作スクリプトが有効なら AI が書いた内容を自動で反映するため、自動で行う表示操作や 1 回の入力で行う操作の組み合わせも変わります。無効なら保存だけを行います。外部ツールの起動はこの連携では行いません。
         AI 連携の許可の状態は渡しますが、AI からは変えられません。保存した PDF のパスワードとリモート接続の暗証番号は渡しません。
@@ -511,7 +513,7 @@
       <li>A script for combining viewer operations (<code>operation_scripts.rhai</code> in the data folder). Changes made with AI permission are saved to the same file. Whether scripts are enabled and whether the initial explanation was confirmed are saved in settings and can be changed only by the user. The script itself cannot communicate over a network</li>
       <li>A custom script for grouping images in stack view (<code>stack_rules.rhai</code> in the data folder). Changes made with AI permission are saved to the same file</li>
       <li>Per-book spread-pairing adjustments (saved adjustments remain when remembering is turned off and can be explicitly cleared or moved using metadata transfer)</li>
-      <li>mIV Sound adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images. Measurement and target curves downloaded or loaded in Headphone EQ are included in the effect's saved state and presets</li>
+      <li>mIV Sound adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images. Authorized AI changes to effect chains and presets whose names start with "MCP: " are saved in the same audio-adjustment storage. The editing lock and the state for AI undo are not saved and are cleared when the lock is released. Measurement and target curves downloaded or loaded in Headphone EQ are included in the effect's saved state and presets</li>
       <li>Registered SFZ instrument names and locations. Sample files are not copied</li>
       <li>Thumbnail cache (including video frames and audio waveform analysis)</li>
       <li>PDFs converted from EPUBs for reading (you can delete them in the cache manager immediately; books in use remain and the App shows why they could not be deleted)</li>
@@ -598,6 +600,7 @@
       contain information such as the locations of changed files and tag names.
       AI settings changes also leave the changed settings and their old and new values (including paths and external-tool executables and arguments) in normal logs. Favorite registration also logs the location.
       Stack and operation script changes show only the old and new line counts in notifications, "AI changes", and normal logs; the script body is not recorded there.
+      mIV Sound changes record locks and releases, effect types and counts before and after changes, the selected side, and preset names; individual parameter values are not recorded in logs.
       The display records for "AI changes" and "Recent AI apps" are held in memory and cleared when the App exits.
       Saved changes to tags, ratings, collections, settings, and favorites, and normal operation logs, are stored separately from these display records.
     </div>
@@ -654,8 +657,9 @@
         Allowing transcripts passes the text of video and audio transcripts with timestamps, and their status such as the creation date as part of file information. Spoken names and private conversations may be included as they are. Without this permission, transcripts are not passed.
         Turning off GPS fields does not remove location information written in text such as filenames or prompts.
         Enabling permission to show the current location shares the open location and the location of the item being viewed.
-        Enabling permission for AI to inspect and change settings (off by default) shares Preferences settings and values, including startup folders, output paths, and external-tool executables and arguments, operation customization assignments, and the bodies of stack and operation scripts. The script bodies are also sent to the AI app's provider.
+        Enabling permission for AI to inspect and change settings (off by default) shares Preferences settings and values, including startup folders, output paths, and external-tool executables and arguments, operation customization assignments, the bodies of stack and operation scripts, and mIV Sound's A/B effect chains and parameter values, selected side, overall on/off state, latency, and editing lock status. Parameter values may include selections of IR files or measurements. These are also sent to the AI app's provider.
         AI requests can then change Preferences and key, ring, mouse-button, and gesture assignments, register, change or delete external tools, rewrite stack and operation scripts, register favorite folders, and switch their indexing on or off without confirmation.
+        AI can also lock and unlock mIV Sound editing, change effect chains, the selected side and overall on/off state, undo the most recent change within the same lock, and save presets whose names start with "MCP: " without confirmation. The user can release the lock from the banner in the window.
         AI can also switch the stack script option on or off. Only the user can enable operation scripts and confirm their initial explanation; AI cannot change these settings.
         When operation scripts are enabled, AI-written changes are applied automatically and can change automatic display operations and the combination of operations performed by one input. When disabled, changes are saved without running them. This integration does not launch external tools.
         AI integration permission states are shared, but AI cannot change them. Saved PDF passwords and the remote connection PIN are not shared.

@@ -509,6 +509,9 @@ bridge → 親:
 
 ### mIV Sound の AI 編集用 host コマンド (protocol v9、区切り 2)
 
+agent IPC版9の `SoundChain` は本体の既存FIFO serviceを経由して以下のhostコマンドへ接続する。
+agent IPCの版とhost protocolの版は独立で、hostの状態所有者・コマンド契約は区切り4でも変えない。
+
 `sound_lock` / `sound_unlock` / `sound_get` / `sound_replace_locked` /
 `sound_undo_locked` / `sound_preset_commit` は、専用 `MIV_SOUND_DATA_DIR` を持つ
 `mIV Sound` の先頭 slot だけに対応する。制御 thread は `post_async` で slot の GUI thread に

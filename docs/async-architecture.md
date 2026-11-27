@@ -523,6 +523,8 @@ purge lease解放後にStack candidateを読み、同じ削除終端でowner／�
 ## EffeTuneのタスクバー設定・通常矩形（§1.378、未リリース）
 
 §1.843 第3段の mIV Sound 編集は `CaptureQueue` の既存 FIFO worker を共有する。
+agent IPC版9の `SoundChain` はUIで設定許可と既存の操作受付条件を検査し、受付済みのticketをagent workerが待つ。
+受付後は許可変更で結果を失敗へ差し替えず、読み取りは送信直前に許可を照合する。新しいI/O用のworkerは増やさない。
 `SoundRequest` の受付とロード完了の受け渡しは controller、文書検査・bridge 往復・プリセット I/O・変更後の保存は worker が所有する。
 host 側の印・世代・undo・プリセット handle は GUI thread だけが所有し、音声 thread の fence を使わない。
 応答期限で受信を終えても要求を取り消さず、遅い結果も通知・記録・保存する。host 終了では要求 ID の待機を Aborted で閉じる。

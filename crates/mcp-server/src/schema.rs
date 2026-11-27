@@ -45,6 +45,7 @@ fn write(name: &str) -> bool {
                 | "set_favorite"
                 | "stack_script"
                 | "operation_script"
+                | "sound_chain"
         )
 }
 fn collection_write(name: &str) -> bool {
@@ -335,6 +336,8 @@ fn output(name: &str) -> Value {
         "set_settings" => json!({"required":["changed","unchanged"]}),
         "set_favorite" => json!({"required":["added","before","after"]}),
         "stack_script" | "operation_script" => json!({}),
+        "sound_effects" => json!({"required":["sound_version","page","pages"]}),
+        "sound_chain" => json!({"required":["outcome","persistence_warning"]}),
         // Help has several success shapes. Keep the common version contract in
         // discovery; typed retrieval tests check the full payload shapes.
         "search_help" | "get_help" => json!({"required":["app_version"]}),
@@ -599,6 +602,9 @@ pub fn tools() -> Vec<Value> {
         serde_json::from_str(include_str!("favorite_tool.json"))
             .expect("embedded favorite tool definition"),
     );
+    let sound: Vec<Value> = serde_json::from_str(include_str!("sound_tools.json"))
+        .expect("embedded sound tool definitions");
+    tools.extend(sound);
     tools
 }
 #[cfg(test)]
@@ -756,7 +762,7 @@ mod tests {
     #[test]
     fn tools_have_precise_annotation_contracts() {
         let tools = tools();
-        assert_eq!(tools.len(), 30);
+        assert_eq!(tools.len(), 32);
         for tool in &tools {
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
             assert_eq!(tool["outputSchema"]["type"], "object");
@@ -768,14 +774,14 @@ mod tests {
                 tool["annotations"]["destructiveHint"],
                 matches!(
                     tool["name"].as_str().unwrap(),
-                    "remove_from_collection" | "remove_tags" | "set_settings"
+                    "remove_from_collection" | "remove_tags" | "set_settings" | "sound_chain"
                 )
             );
             assert_eq!(
                 tool["annotations"]["idempotentHint"],
                 !matches!(
                     tool["name"].as_str().unwrap(),
-                    "create_collection" | "set_settings"
+                    "create_collection" | "set_settings" | "sound_chain"
                 )
             );
             assert_eq!(tool["annotations"]["openWorldHint"], false);

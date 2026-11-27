@@ -55,6 +55,30 @@ fn operation_script_help_is_searchable_and_retrievable_offline() {
 }
 
 #[test]
+fn sound_chain_manual_conditions_are_searchable_and_retrievable_offline() {
+    let section = call("get_help", json!({"id":"ai-integration.html#sound"})).unwrap();
+    assert_eq!(section["isError"], false);
+    let text = section["structuredContent"]["text"].as_str().unwrap();
+    for condition in [
+        "ロックを解除",
+        "A を残して B に作って",
+        "同じロックを解除する前",
+        "2 秒を超える",
+        "MCP:",
+    ] {
+        assert!(text.contains(condition), "{condition}");
+    }
+    let search = call("search_help", json!({"query":"ロック","limit":30})).unwrap();
+    assert!(
+        search["structuredContent"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|hit| { hit["id"] == "ai-integration.html#sound" })
+    );
+}
+
+#[test]
 fn help_generation_is_deterministic_and_ids_are_unique() {
     let first = help_build::load_manual(&manual_root()).unwrap();
     let second = help_build::load_manual(&manual_root()).unwrap();

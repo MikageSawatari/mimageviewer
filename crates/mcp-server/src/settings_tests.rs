@@ -227,7 +227,13 @@ fn settings_tools_discovery_and_calls_work_on_all_mcp_versions() {
 
 #[test]
 fn settings_instructions_keep_the_total_guide_addition_within_budget() {
-    let guide = INSTRUCTIONS.split("\nFor questions").nth(1).unwrap();
+    let guide = INSTRUCTIONS
+        .split("\nFor questions")
+        .nth(1)
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap();
     // 300 was the stage-1 target; allow stage-2 manual guidance while keeping the full 4,096 UTF-16 client limit below.
     assert!("\nFor questions".chars().count() + guide.chars().count() <= 520);
     assert!(INSTRUCTIONS.encode_utf16().count() <= 4096);

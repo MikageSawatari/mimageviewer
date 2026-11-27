@@ -318,7 +318,9 @@ host protocol 9 の `sound_lock`・`sound_unlock`・`sound_get`・`sound_replace
 
 応答期限20秒を過ぎても worker は要求を保持し、遅い結果の記録・通知・状態保存を行う。bridge 終了時は Aborted。
 まれな保存失敗はログと通知で扱い、受理済みの変更を巻き戻さない。
-この区切りでは agent IPC と tool の登録は追加していない。コンパイル・自動テスト・実機確認・独立実装レビューは未実施。
+区切り4では agent IPC版9の `SoundChain` と `sound_effects` / `sound_chain` のtool登録を追加する。
+設定許可と既存の受付条件をUIで検査して同じserviceへ渡し、取り消し・状態保存の正本は増やさない。
+公開マニュアル、AI連携の許可説明、通信・端末保存の説明も同期する。コンパイル・自動テスト・実機確認・独立実装レビューは未実施。
 
 - host に **新コマンド `query_state_concurrent`** を追加する。GUI スレッドへ **非同期に** 投げて
   `getState` を呼び、結果を `plugin_state` イベント (要求 ID 付き) で返す。音声スレッドは待たない。

@@ -1685,7 +1685,7 @@ impl EffetuneController {
         false
     }
 
-    /// UI-side typed admission seam for stage 4. This method only enqueues;
+    /// UI-side typed admission seam. This method only enqueues;
     /// callers perform the shared settings permission check before admission.
     pub(crate) fn submit_sound(
         &mut self,

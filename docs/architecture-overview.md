@@ -82,7 +82,7 @@ Web の AI は同じ worker で案内の文をコピーし、共通の App 受�
 操作の要求内では override 名を一度ずつ解釈する索引を作り、実効キー・変更前後の値・置換位置に共有する。
 `agent/get_operations`・`agent/set_operations` は許可検査から応答までの `duration_ms`、`agent/set_operations_commit` は既存確定経路の時間を記録する。
 `agent-ipc::bound_page_rows` は設定と操作の単行・ページ合計予算を共通化し、所属を保ったまま大きい行を省く。
-IPC 版は 8（`operation_script` を追加、版7の凍結fixtureを保持）。スタック用スクリプトの本文は、同じ設定許可の `stack_script` で読み書きする。
+IPC 版は 9（`SoundChain` を追加、直前の版8の凍結fixtureを保持）。スタック用スクリプトの本文は、同じ設定許可の `stack_script` で読み書きする。
 本文の取得・検査は agent worker、AI の照合付き書き込みと環境設定の「既定に戻す」「スクリプトを開く」は
 `filename_stack_script` の単一 FIFO worker に集約する。ボタンは enqueue だけで、UI は I/O・完了待ち・監視を行わない。
 書き込みは本文全体の SHA-256 を照合し、変更行とログには本文を出さず行数だけを残す。
@@ -90,6 +90,10 @@ IPC 版は 8（`operation_script` を追加、版7の凍結fixtureを保持）�
 操作スクリプトは同じ設定許可の `operation_script` で本文を読み書きするが、有効化と初回確認は利用者だけが行う。
 UIで受付とFIFO投入を一緒に行い、loader所有の列と結果採用規約を使う（上の操作スクリプト節）。
 応答のenabled・読み込み状態は受付時点の写しで、返したSHA-256の本文の採用結果ではない。
+`sound_effects` は同梱のエフェクト一覧を本体に接続せず返す。`sound_chain` は同じ設定許可で
+`agent_ipc/sound_chain` → UIでの受付 → `EffetuneController::submit_sound` → `CaptureQueue` の既存FIFOへ渡す。
+hostのGUI threadだけがロック・世代・同じロック内のundo・プリセットの番を所有する。
+状態の正本と保存先はmIV Soundの既存状態のまま。本体UIでbridge往復やプリセットI/Oを行わない。
 詳細は[設計と区切りごとの検証記録](mcp-guide-settings-plan.md)を参照。
 
 ## 3Dスライドショーの準備と提示（§1.771）

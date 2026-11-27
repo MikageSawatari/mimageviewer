@@ -614,6 +614,40 @@ fn sound_service_undo_nothing_or_unlocked_never_persists_or_records_success() {
 }
 
 #[test]
+fn sound_service_parent_wait_budget_does_not_extend_or_cancel_the_accepted_job() {
+    let directory = tempfile::tempdir().unwrap();
+    let changes = ChangeController::new();
+    let (job, ticket) = job(
+        SoundRequest::Lock,
+        "deadline client",
+        Arc::clone(&changes),
+        0.0,
+    );
+    let own_deadline = ticket.deadline;
+    let ticket = ticket.with_wait_budget(Duration::from_secs(60));
+    assert_eq!(ticket.deadline, own_deadline);
+    let ticket = ticket.with_wait_budget(Duration::ZERO);
+    assert!(ticket.deadline <= Instant::now());
+    assert!(matches!(
+        ticket.wait().unwrap().outcome,
+        SoundOutcome::Pending { .. }
+    ));
+    let host = FakeHost::new(|command| match command {
+        SoundCommand::Lock => Ok(reply("Locked", 0)),
+        SoundCommand::Get => Ok(state_reply(0, None, false)),
+        other => panic!("unexpected command: {other:?}"),
+    });
+    let mut saved = false;
+    run_with_host(job, &host, directory.path(), |_| {
+        saved = true;
+        Ok(())
+    });
+    assert!(saved);
+    assert_eq!(host.commands.lock().unwrap().len(), 2);
+    assert_eq!(changes.records().lock().unwrap().entries().len(), 1);
+}
+
+#[test]
 fn sound_service_reject_and_disconnected_queue_return_aborted_without_host() {
     let changes = ChangeController::new();
     let (queued, ticket) = job(SoundRequest::Lock, "test client", Arc::clone(&changes), 0.0);

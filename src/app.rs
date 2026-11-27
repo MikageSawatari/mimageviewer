@@ -811,6 +811,9 @@ mod agent_operation_script_tests;
 mod agent_operations;
 pub(crate) mod agent_rating_write;
 mod agent_settings;
+mod agent_sound_chain;
+#[cfg(test)]
+mod agent_sound_chain_tests;
 #[cfg(test)]
 mod agent_stack_script_tests;
 mod agent_view_state;

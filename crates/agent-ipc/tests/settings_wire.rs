@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 
 #[test]
 fn settings_commands_and_payloads_roundtrip_without_protocol_change() {
-    assert_eq!(AGENT_PROTOCOL_VERSION, 8);
+    assert_eq!(AGENT_PROTOCOL_VERSION, 9);
     assert_eq!(MIN_ADAPTER_PROTOCOL_VERSION, 3);
     for command in [
         Command::GetSettings {

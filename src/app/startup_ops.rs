@@ -257,6 +257,23 @@ impl App {
                 continue;
             }
             match &request.kind {
+                crate::agent_ipc::open::UiRequestKind::SoundChain { .. } => {
+                    request.complete_with(|kind| {
+                        let crate::agent_ipc::open::UiRequestKind::SoundChain {
+                            request,
+                            client_name,
+                        } = kind
+                        else {
+                            unreachable!("sound request arm owns its prepared request");
+                        };
+                        match self.admit_agent_sound_chain(request, client_name, ctx) {
+                            Ok(ticket) => {
+                                crate::agent_ipc::open::UiOpenOutcome::SoundChainAdmitted(ticket)
+                            }
+                            Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                        }
+                    });
+                }
                 crate::agent_ipc::open::UiRequestKind::OperationScript(job) => {
                     let outcome = match self.admit_agent_settings_write() {
                         Ok(()) => {

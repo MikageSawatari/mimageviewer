@@ -241,7 +241,8 @@ impl App {
             | UiRequestKind::SetSettings { .. }
             | UiRequestKind::SetFavorite(_)
             | UiRequestKind::StackScriptAdmission
-            | UiRequestKind::OperationScript(_) => {
+            | UiRequestKind::OperationScript(_)
+            | UiRequestKind::SoundChain { .. } => {
                 unreachable!("non-write requests have their own UI handler")
             }
         };

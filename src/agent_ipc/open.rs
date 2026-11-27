@@ -57,6 +57,7 @@ pub(crate) enum UiOpenOutcome {
         snapshot: super::operation_script::AdmissionSnapshot,
         queued: Result<(), String>,
     },
+    SoundChainAdmitted(crate::effetune::sound_service::SoundTicket),
     Written(Result<mimageviewer_agent_ipc::Payload, AgentError>),
     Refused(AgentError),
 }
@@ -83,6 +84,10 @@ pub(crate) enum UiRequestKind {
     SetFavorite(super::favorite::PreparedFavorite),
     StackScriptAdmission,
     OperationScript(crate::operation_script::AgentScriptRequest),
+    SoundChain {
+        request: crate::effetune::sound_service::SoundRequest,
+        client_name: String,
+    },
     TagWrite(super::metadata_write::PreparedTags),
     RatingWrite(super::metadata_write::PreparedRatings),
 }
@@ -109,6 +114,12 @@ impl UiOpenRequest {
 
     pub(crate) fn complete(self, outcome: UiOpenOutcome) {
         let _ = self.reply.send(outcome);
+    }
+
+    /// Transfer the prepared request without cloning its parameter document
+    /// on the UI thread. The handler still completes in this one UI turn.
+    pub(crate) fn complete_with(self, handle: impl FnOnce(UiRequestKind) -> UiOpenOutcome) {
+        let _ = self.reply.send(handle(self.kind));
     }
 }
 
@@ -407,6 +418,37 @@ impl OpenController {
         }
     }
 
+    pub(super) fn execute_sound_chain(
+        self: &Arc<Self>,
+        args: mimageviewer_agent_ipc::SoundChainRequest,
+        ctx: &super::ReadContext,
+        client_name: String,
+        dispatch: Arc<UiRequestDispatch>,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        let request = super::sound_chain::prepare_request(args)?;
+        ctx.checkpoint()?;
+        let admission = self.dispatch_request(&ctx.cancel, dispatch, UI_REPLY_TIMEOUT, || {
+            Ok(UiRequestKind::SoundChain {
+                request,
+                client_name,
+            })
+        })?;
+        match admission {
+            UiOpenOutcome::SoundChainAdmitted(ticket) => {
+                // UI has already submitted the accepted request to the FIFO.
+                // Only this worker waits, within the parent tool's deadline.
+                let result = super::sound_chain::wire_result(
+                    ticket.with_wait_budget(ctx.remaining()).wait(),
+                )?;
+                Ok(UiOpenOutcome::Written(Ok(
+                    mimageviewer_agent_ipc::Payload::SoundChain(result),
+                )))
+            }
+            UiOpenOutcome::Refused(error) => Ok(UiOpenOutcome::Refused(error)),
+            _ => Err(super::internal()),
+        }
+    }
+
     fn stack_script_admission(
         self: &Arc<Self>,
         cancel: &AtomicBool,
@@ -605,7 +647,8 @@ fn outcome_result(reply: UiOpenOutcome) -> Result<OpenResult, AgentError> {
         | UiOpenOutcome::Operations(_)
         | UiOpenOutcome::Settings(_)
         | UiOpenOutcome::StackScriptAdmitted { .. }
-        | UiOpenOutcome::OperationScriptAdmitted { .. } => Err(open_failed()),
+        | UiOpenOutcome::OperationScriptAdmitted { .. }
+        | UiOpenOutcome::SoundChainAdmitted(_) => Err(open_failed()),
     }
 }
 

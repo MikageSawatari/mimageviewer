@@ -118,12 +118,30 @@ pub(crate) struct SoundResponse {
 
 /// The receiver may be dropped after the deadline. The queue still owns the
 /// accepted job, persistence and notices, including results arriving late.
+#[derive(Debug)]
 pub(crate) struct SoundTicket {
     deadline: Instant,
     rx: mpsc::Receiver<Result<SoundResponse, SoundError>>,
 }
 
 impl SoundTicket {
+    #[cfg(test)]
+    pub(crate) fn completed_for_test(result: Result<SoundResponse, SoundError>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        tx.send(result).unwrap();
+        Self {
+            deadline: Instant::now() + RESPONSE_DEADLINE,
+            rx,
+        }
+    }
+
+    /// Admission may follow time spent in the agent queue. Keep the common
+    /// tool deadline without cancelling the accepted job or its late result.
+    pub(crate) fn with_wait_budget(mut self, remaining: Duration) -> Self {
+        self.deadline = self.deadline.min(Instant::now() + remaining);
+        self
+    }
+
     pub(crate) fn wait(self) -> Result<SoundResponse, SoundError> {
         match self
             .rx
@@ -461,7 +479,11 @@ fn execute(
                 ));
             }
             crate::logger::log(format!(
-                "[sound_chain] replace before_types={} after_types={}",
+                "[sound_chain] replace before_current={} after_current={} before_counts={:?} after_counts={:?} before_types={} after_types={}",
+                before["currentPipeline"].as_str().unwrap_or("unknown"),
+                after["currentPipeline"].as_str().unwrap_or("unknown"),
+                prepared.before_counts,
+                prepared.after_counts,
                 state_types(&current),
                 state_types(&prepared.bytes)
             ));

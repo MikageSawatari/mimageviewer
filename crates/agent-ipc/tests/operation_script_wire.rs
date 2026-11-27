@@ -22,7 +22,7 @@ fn operation_script_admission_state_preserves_each_loader_state() {
 
 #[test]
 fn operation_script_v8_command_defaults_and_frames_are_additive() {
-    assert_eq!(AGENT_PROTOCOL_VERSION, 8);
+    assert_eq!(AGENT_PROTOCOL_VERSION, 9);
     assert_eq!(MIN_ADAPTER_PROTOCOL_VERSION, 3);
     for (fields, source, part, expected_sha256) in [
         (json!({}), None, None, None),
