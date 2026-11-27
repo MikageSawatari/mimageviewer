@@ -2848,8 +2848,8 @@ VST3 host → (pipe) event sound_lock_released { lock, by } (利用者の解除�
 
 - `Command` に `SoundChain` を足す (追加だけ)。`AGENT_PROTOCOL_VERSION` を上げ、直前の版の凍結 fixture を、統合後の実際の型から
   作る (§10・§20.8 と同じ)。
-- **§1.363 (v5.9.0) が版を 7 → 8 に上げ、tool を足す**。IPC と tool 一覧に触れる区切りは §1.363 が master に入った後に回し、版は 8 → 9 にする。
-  それ以外 (一覧の生成・host・本体の worker) は先に進められる。
+- **§1.363 (v5.9.0) が版を 7 → 8 に上げ、tool を足す**。§1.363 は 2026-11-27 に master に入った (`b015024c7`、`crates/agent-ipc/src/lib.rs:45` が 8)。
+  作業ブランチに取り込み済み (`56e66d375`)。この段の版は 8 → 9 にする。区切り 4 は `b015024c7` 以降を土台にする。
 - tool 一覧: 今の最大は 50,522 / 52,000 (§20.16)。§1.363 の後の最終の JSON と 512 字の余裕で測り直し、2 本 (目標 合わせて 2,600 字) が
   入らなければ上限の改定を設計担当が決める (§20.8 と同じ判断。理由を親文書 §15.4 に書く)。細かい使い方はマニュアルに書き `get_help` で引かせる。
 - `INSTRUCTIONS` に「mIV Sound を組むときは sound_chain の lock → get → apply → unlock。鍵は sound_effects で確かめる。新しく組むときは
@@ -2881,7 +2881,8 @@ VST3 host → (pipe) event sound_lock_released { lock, by } (利用者の解除�
 
 ### 21.13 実装の区切りとテスト
 
-- **区切り 1 (一覧)**: 生成 script・JSON・`sound_effects`・版と digest の一致のテスト・鍵の不完全の印。
+- **区切り 1 (一覧)**: 生成 script・JSON・一覧を引く関数 (`sound_effects` の中身)・版と digest の一致のテスト・鍵の不完全の印・保存の形。
+  tool としての登録 (tool 一覧への追加) は区切り 4 で `sound_chain` と一緒に行う (tool 一覧の大きさを 1 回で測るため)。
 - **区切り 2 (host)**: GUI の thread が持つロックの印・世代・取り消しの 1 世代・番の handle、`sound_lock`・`sound_unlock`・`sound_get`・
   `sound_replace_locked`・`sound_undo_locked`・`sound_preset_commit`・`sound_lock_released`、帯と入力の停止、窓を後で作ったときのロックの
   反映、処理の知らせが入れ子の loop で失われた後の drain (§21.5)、プロトコル版。C++ の単体テスト (`crates/vst3-host/tests`、偽の component) で:
