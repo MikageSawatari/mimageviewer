@@ -775,8 +775,8 @@ Smart root の履歴採用後、定義の範囲外にある新しい通常物理
   「安心して使えます」と通信の記述は照合し、新しい通信・外部保存が無いため本文を変更しない。
 - architecture の module map・既存 DB 行、display pipeline の resolver と採用境界、stack の手動抑制、
   Remote の共有 actor／manual shape／sort-lock 拒否／protocol 74、README の設計索引を更新した。
-- CHANGELOG は版番号・日付を決めず「未リリース」欄へ 1 項目を追加した。公開済みの版の見出しと
-  manual/changelog.html は変更しない。画像や PNG baseline の作成・差替えも行わない。
+- CHANGELOG は版番号・日付を決めず「未リリース」欄へ 1 項目を追加したが、リリース時に利用者の確認を経て書く慣例に合わせて
+  ClaudeCode が取り消した (CHANGELOG.md は本ブランチで無変更)。公開済みの版の見出しと manual/changelog.html は変更しない。画像や PNG baseline の作成・差替えも行わない。
   未実装のツールバーの手動個別ボタンは案内せず、実装済みの選択欄・メニュー・キー操作を説明する。
 - 本段は文書だけを変更し、コンパイル・Rust テスト・検証用ビルド・コミットは実施しない。
   `python scripts/check_site_cards.py` は 54 cards / 違反 0、`python scripts/check_ui_glyphs.py` と
