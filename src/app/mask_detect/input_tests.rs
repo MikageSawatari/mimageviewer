@@ -557,6 +557,147 @@ fn mask_detect_foreground_modal_allows_menu_and_combo_popup_selection() {
 }
 
 #[test]
+fn mask_detect_settings_escape_only_closes_front_real_modal_in_either_draw_order() {
+    let _input = crate::key_input::lock_test_input();
+    for upper_first in [false, true] {
+        let mut app = mask_detect_fixture(MaskDetectTool::Erase);
+        app.mask_detect_dialog = Some(MaskDetectTool::Erase);
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let own = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("mask_detect_settings"),
+        );
+        let upper = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::unique("external_tool_preparing"),
+        );
+        let show_upper = |open: &mut bool| {
+            if !*open {
+                return false;
+            }
+            // Same Modal id and pure body as the external-tool dialog, without
+            // creating its operation/worker or invoking an external process.
+            let response = egui::Modal::new(upper.id).show(&ctx, |ui| {
+                ui.set_min_width(380.0);
+                crate::external_tool::draw_external_tool_preparing_body(ui, 1)
+            });
+            let close = response.inner || response.should_close();
+            if close {
+                *open = false;
+            }
+            close
+        };
+        let frame = |app: &mut App, upper_open: &mut bool, events| {
+            let mut upper_closed = false;
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(transform().viewport_rect),
+                    events,
+                    ..Default::default()
+                },
+                |_| {
+                    if upper_first {
+                        upper_closed |= show_upper(upper_open);
+                    }
+                    app.show_mask_detect_dialog(&ctx);
+                    if !upper_first {
+                        upper_closed |= show_upper(upper_open);
+                    }
+                },
+            )
+            .drop_without_applying_deltas();
+            upper_closed
+        };
+        let mut upper_open = false;
+        for _ in 0..4 {
+            assert!(!frame(&mut app, &mut upper_open, Vec::new()));
+        }
+        assert_eq!(ctx.memory(|memory| memory.top_modal_layer()), Some(own));
+        upper_open = true;
+        for _ in 0..4 {
+            assert!(!frame(&mut app, &mut upper_open, Vec::new()));
+        }
+        assert_eq!(ctx.memory(|memory| memory.top_modal_layer()), Some(upper));
+        assert!(!ctx.memory(|memory| memory.allows_interaction(own)));
+        assert!(frame(
+            &mut app,
+            &mut upper_open,
+            vec![key(egui::Key::Escape)]
+        ));
+        assert!(!upper_open, "the front Modal must close");
+        assert_eq!(
+            app.mask_detect_dialog,
+            Some(MaskDetectTool::Erase),
+            "the back dialog must survive, upper_first={upper_first}"
+        );
+        assert!(
+            !ctx.input(|input| input.key_pressed(egui::Key::Escape)),
+            "the front Modal must consume Escape"
+        );
+        // Release the key and let the standard modal registration return to the
+        // settings window before sending a fresh Escape to that window.
+        frame(
+            &mut app,
+            &mut upper_open,
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: Some(egui::Key::Escape),
+                pressed: false,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert_eq!(ctx.memory(|memory| memory.top_modal_layer()), Some(own));
+        frame(&mut app, &mut upper_open, vec![key(egui::Key::Escape)]);
+        assert!(app.mask_detect_dialog.is_none());
+    }
+}
+
+#[test]
+fn mask_detect_settings_escape_closes_without_other_modal_on_first_and_later_frames() {
+    let _input = crate::key_input::lock_test_input();
+    for tool in [
+        MaskDetectTool::Erase,
+        MaskDetectTool::Conceal,
+        MaskDetectTool::LocalAdjust,
+    ] {
+        for warm_frames in [0, 4] {
+            let mut app = mask_detect_fixture(tool);
+            app.mask_detect_dialog = Some(tool);
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let frame = |app: &mut App, events| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(transform().viewport_rect),
+                        events,
+                        ..Default::default()
+                    },
+                    |_| app.show_mask_detect_dialog(&ctx),
+                )
+                .drop_without_applying_deltas();
+            };
+            for _ in 0..warm_frames {
+                frame(&mut app, Vec::new());
+            }
+            let expected = (warm_frames != 0).then(|| {
+                egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::unique("mask_detect_settings"),
+                )
+            });
+            assert_eq!(ctx.memory(|memory| memory.top_modal_layer()), expected);
+            frame(&mut app, vec![key(egui::Key::Escape)]);
+            assert!(
+                app.mask_detect_dialog.is_none(),
+                "{tool:?}, warm_frames={warm_frames}"
+            );
+        }
+    }
+}
+
+#[test]
 fn mask_detect_foreground_modal_keeps_details_numeric_input_and_ime_active() {
     let _input = crate::key_input::lock_test_input();
     let mut app = mask_detect_fixture(MaskDetectTool::Erase);

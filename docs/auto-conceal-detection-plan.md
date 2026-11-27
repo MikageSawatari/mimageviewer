@@ -123,6 +123,8 @@
 既存の `mask_detect_active` による入力遮断も維持する。初回／再表示時の最前面化は Area 自身の処理を使い、
 アプリから毎フレーム／開く時点の `move_to_top` は追加しない。tooltip と発火面付きトーストは Tooltip 段で窓より上に描く。
 ダイアログから開いた menu / combo の popup は Foreground 内で親より上になり、モーダルの入力制限を通る。
+設定窓の Escape は `top_modal_layer` が自分の場合、または初回でまだ登録が無い（`None`）場合だけ受け付ける。
+そのうえで既存の `dialog_escape_pressed` による IME・popup の判定を通す。他の Modal が上にある場合は背面の設定窓を閉じない。
 
 | 項目 | 内容 | 既定 |
 |---|---|---|
@@ -1381,8 +1383,27 @@ mask_detect_foreground_modal_keeps_details_numeric_input_and_ime_active
   自動検出は本の構成・AI 連携の確認画面等と同じ `dialog_escape_pressed` を使い、未確定中は false、Commit / Disabled 後は通常キーを
   通すという既存規則を維持する。他画面の回帰も変換中の Enter / Escape で画面を閉じないことを検査しており、数値欄の focus 維持は要求していない。
 
+- 設計担当からの報告: r11・r12 のコミットは `ce28d15f1`。独立レビュー R4 は REJECT、P2 1 件で、
+  別の Modal が上にあっても背面の設定窓が Escape を直接読んで閉じる点を設計担当も妥当と判断した。
+  R3 の遮蔽問題は解消しているとのレビュー結果で、cargo check・178 件・実モデル照合の成功は設計担当の報告として扱う。
+- `set_modal_layer` の widget 操作・focus の遮断は生の `ctx.input` の読み取りには効かず、`dialog_escape_pressed` 自身も
+  IME と popup を確認するだけなので、設定窓側で前面モーダルの所有を確認する。`top_modal_layer` が自分の LayerId のとき、
+  または最初のフレームでまだモーダル登録が無い `None` のときだけ、既存の helper による Escape の判定を通す。
+  他の LayerId が前面なら閉じない。標準 `ModalResponse::should_close` と同じ前面所有の考え方で、helper・既存の入力遮断・
+  登録の寿命・Window の Id と Order は変更しない。進行窓のキャンセルボタン等は widget の層制限を使う既存経路のまま。
+- 回帰は実際の `egui::Modal` を `external_tool_preparing` と同じ Id・純粋な描画本文で重ね、前面への登録を確認して Escape を送る。
+  自動検出窓→前面 Modal / 前面 Modal→自動検出窓の両描画順で、前面だけが閉じてキーを消費し、背面が残ることを検査する。
+  その Modal が閉じた後は次の通常 Escape で自動検出窓が閉じること、3 ツールで他の Modal が無い初回／表示後も閉じることを検査する。
+  外部操作の worker やプロセスは起動しない。追加テスト（未実行、`test(/mask_detect/)` に含まれる）:
+
+```text
+mask_detect_settings_escape_only_closes_front_real_modal_in_either_draw_order
+mask_detect_settings_escape_closes_without_other_modal_on_first_and_later_frames
+```
+
 - cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動、git add / commit は依頼に従い未実行。
   修正後の自動検証と実機での表示・ログ／perf の観測は設計担当へ引き継ぐ。
 - r7〜r10 時点の `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。glyph 検査は危険 glyph 0、card 検査は 55 件・超過 0。
   R3 の修正でも `cargo fmt`（引数なし）・`git diff --check` は終了コード 0、glyph 検査は危険 glyph 0。
   R3 ではマニュアル・製品ページは変更していないため、card 検査は再実行していない。
+  R4 の修正は `cargo fmt`（引数なし）・`git diff --check` が終了コード 0。UI 文言・サイトは変更せず、glyph / card 検査は再実行していない。

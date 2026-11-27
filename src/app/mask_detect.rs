@@ -1120,15 +1120,18 @@ impl App {
         let Some(tool) = self.mask_detect_dialog else {
             return;
         };
+        let id = egui::Id::unique("mask_detect_settings");
+        let layer = egui::LayerId::new(egui::Order::Foreground, id);
+        // Raw key reads are not gated by set_modal_layer. Like Modal::should_close,
+        // only the front modal owns Escape; None permits a cold first frame.
+        let owns_escape =
+            ctx.memory(|memory| memory.top_modal_layer().is_none_or(|top| top == layer));
         let mut open = true;
         let mut detect = false;
-        let mut close = self.dialog_escape_pressed(ctx);
+        let mut close = owns_escape && self.dialog_escape_pressed(ctx);
         let mut reload = false;
         let mut folder = false;
-        let id = egui::Id::unique("mask_detect_settings");
-        ctx.memory_mut(|memory| {
-            memory.set_modal_layer(egui::LayerId::new(egui::Order::Foreground, id))
-        });
+        ctx.memory_mut(|memory| memory.set_modal_layer(layer));
         let _window = crate::os_theme::with_dark_context_style(ctx, || {
             egui::Window::new("自動検出")
                 .id(id)
