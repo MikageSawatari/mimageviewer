@@ -1139,6 +1139,7 @@ impl App {
     pub(crate) fn has_page_edit_producers(&self) -> bool {
         if self.local_adjust_lut_pending.is_some()
             || self.local_adjust_segmentation_pending.is_some()
+            || self.mask_detect.context.pending.is_some()
         {
             return true;
         }
@@ -1149,6 +1150,7 @@ impl App {
             };
             if bundle.local_adjust_lut_pending.is_some()
                 || bundle.local_adjust_segmentation_pending.is_some()
+                || bundle.mask_detect_context.pending.is_some()
             {
                 return true;
             }
@@ -1159,6 +1161,7 @@ impl App {
     pub(crate) fn poll_all_page_edit_producers(&mut self, ctx: &egui::Context) {
         self.poll_local_adjust_lut_load(ctx);
         self.poll_local_adjust_segmentation(ctx);
+        self.poll_mask_detect(ctx);
         #[cfg(windows)]
         {
             let owners = self
@@ -1171,7 +1174,8 @@ impl App {
                         Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
                     };
                     (bundle.local_adjust_lut_pending.is_some()
-                        || bundle.local_adjust_segmentation_pending.is_some())
+                        || bundle.local_adjust_segmentation_pending.is_some()
+                        || bundle.mask_detect_context.pending.is_some())
                     .then_some(*id)
                 })
                 .collect::<Vec<_>>();
@@ -1179,6 +1183,7 @@ impl App {
                 self.with_owner_viewer_context(owner, |app| {
                     app.poll_local_adjust_lut_load(ctx);
                     app.poll_local_adjust_segmentation(ctx);
+                    app.poll_mask_detect(ctx);
                 });
             }
         }
@@ -1191,8 +1196,9 @@ impl App {
         accepted: bool,
     ) {
         let mut cancelled = false;
+        let mut detection_cancelled = false;
         macro_rules! cancel {
-            ($state:expr) => {{
+            ($state:expr, $detect:ident $(.$nested:ident)*) => {{
                 let state = $state;
                 if state
                     .local_adjust_lut_pending
@@ -1210,16 +1216,23 @@ impl App {
                     state.local_adjust_segmentation_pending = None;
                     cancelled = true;
                 }
+                if state.$detect$(.$nested)*.pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.local_document_differs(key, layers))
+                {
+                    state.$detect$(.$nested)*.pending = None;
+                    detection_cancelled = true;
+                }
             }};
         }
-        cancel!(&mut *self);
+        cancel!(&mut *self, mask_detect.context);
         #[cfg(windows)]
         if accepted {
             for slot in self.viewer_contexts.table.slots.values_mut() {
                 let bundle = match slot {
                     Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
                 };
-                cancel!(bundle);
+                cancel!(bundle, mask_detect_context);
             }
         }
         if cancelled {
@@ -1229,6 +1242,9 @@ impl App {
             self.show_feedback_warning(
                 "LUT／マスク生成結果を破棄しました。レイヤーが変更されています".to_owned(),
             );
+        }
+        if detection_cancelled {
+            self.show_feedback_toast("画像が変わったため中止しました".into());
         }
     }
 
@@ -2323,6 +2339,7 @@ pub(in crate::app) struct ViewerContextBundle {
     local_adjust_effect_picker_dialog_open: bool,
     local_adjust_lut_pending: Option<LocalAdjustLutLoadPending>,
     local_adjust_segmentation_pending: Option<LocalAdjustSegmentationPending>,
+    mask_detect_context: Box<mask_detect::MaskDetectContextState>,
     adjustment_page_params: std::collections::HashMap<usize, crate::adjustment::AdjustParams>,
     local_adjust_page_layers:
         std::collections::HashMap<usize, local_adjust_core::LocalAdjustmentLayers>,
@@ -3609,6 +3626,7 @@ impl ViewerContextBundle {
             local_adjust_effect_picker_dialog_open: false,
             local_adjust_lut_pending: None,
             local_adjust_segmentation_pending: None,
+            mask_detect_context: Box::default(),
             adjustment_page_params: std::collections::HashMap::new(),
             local_adjust_page_layers: std::collections::HashMap::new(),
             local_adjust_pages: std::collections::HashSet::new(),
@@ -4047,6 +4065,7 @@ impl App {
             local_adjust_effect_picker_dialog_open,
             local_adjust_lut_pending,
             local_adjust_segmentation_pending,
+            mask_detect_context,
             adjustment_page_params,
             local_adjust_page_layers,
             local_adjust_pages,
@@ -4388,6 +4407,8 @@ impl App {
         swap_field!(local_adjust_effect_picker_dialog_open);
         swap_field!(local_adjust_lut_pending);
         swap_field!(local_adjust_segmentation_pending);
+        // Catalog stays App-common; exchange the context's single state owner.
+        std::mem::swap(&mut self.mask_detect.context, mask_detect_context);
         swap_field!(adjustment_page_params);
         swap_field!(local_adjust_page_layers);
         swap_field!(local_adjust_pages);
@@ -9798,11 +9819,34 @@ mod tests {
             .split_once("\n}\n")
             .unwrap()
             .0;
-        let fields = bundle
+        let mut fields = bundle
             .lines()
             .filter_map(|line| line.trim().split_once(':').map(|(name, _)| name))
             .filter(|name| name.ends_with("pending"))
             .collect::<std::collections::BTreeSet<_>>();
+        // The detection aggregate is still a context-owned producer. Boxing it
+        // must not hide newly added waits from this inventory.
+        assert!(bundle.contains("mask_detect_context: Box<mask_detect::MaskDetectContextState>"));
+        let detection_source = include_str!("mask_detect.rs").replace("\r\n", "\n");
+        let detection = detection_source
+            .split_once("pub(crate) struct MaskDetectContextState {")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let nested_waits = detection
+            .lines()
+            .filter_map(|line| line.trim().split_once(':').map(|(name, _)| name))
+            .filter(|name| name.ends_with("pending"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            nested_waits,
+            ["pub(crate) pending"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+        fields.insert("mask_detect_context.pending");
         let registered = [
             "external_rescan_pending",
             "folder_nav_pending",
@@ -9828,6 +9872,7 @@ mod tests {
             // Parking must not use the document-open cancellation inventory for them.
             "local_adjust_lut_pending",
             "local_adjust_segmentation_pending",
+            "mask_detect_context.pending",
             "stack_script_pending",
             "facet_name_cache_pending",
             "details_meta_pending",

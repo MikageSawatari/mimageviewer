@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>追加の検出器 — mImageViewer マニュアル</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="自動検出で使う追加の検出器の置き場所、設定、形式、分類や形の選び方を説明します。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/detectors.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/detectors.html">
+  <meta property="og:title" content="追加の検出器｜mImageViewer">
+  <meta property="og:description" content="自動検出で使う追加の検出器の置き場所、設定、形式、分類や形の選び方を説明します。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="追加の検出器｜mImageViewer">
+  <meta name="twitter:description" content="自動検出で使う追加の検出器の置き場所、設定、形式、分類や形の選び方を説明します。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>追加の検出器</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="music-video.html">音楽ビデオの作成</a>
+        <a href="effetune.html">音響調整</a>
+        <a href="sound/index.html" class="sub">エフェクトの説明書</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="detectors.html" class="active">追加の検出器</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="clipboard-capture.html">クリップボード取り込み</a>
+        <a href="browser-integration.html">ブラウザ連携</a>
+        <a href="metadata-transfer.html">メタ情報の移行</a>
+        <a href="external-tools.html">外部ツール連携</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="collections.html">コレクション</a>
+        <a href="search.html">検索機能</a>
+        <a href="remote.html">リモート閲覧</a>
+        <a href="ai-integration.html">AI アプリとの連携</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="known-issues.html">既知の問題</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">追加の検出器</h1>
+    <p class="page-desc">自分で入手した検出器を置いて、検出した領域を消しゴム・隠蔽加工・補正レイヤーのマスクに追加できます。</p>
+    <p>mIV は追加の検出器を配布していません。入手した検出器は配布元のライセンスに従って使ってください。</p>
+    <p>検出には見落としや誤検出があり得ます。追加されたマスクと仕上がりを確かめ、必要な修正をしてから使ってください。
+    検出は PC 内で行い、そのために画像を外部へ送信しません。</p>
+
+    <h2 id="folder">置き場所</h2>
+    <p>各ツールの［自動検出…］で［フォルダを開く］を押すと、<code>&lt;データフォルダ&gt;\detectors\</code> を開きます。
+    フォルダがなければ作成します。ポータブル版や <code>--data-dir</code> を使う場合も、そのデータフォルダの中です。</p>
+    <p>次のどちらかの置き方を使います。表示名は、直接置く場合は拡張子を除いたファイル名、フォルダに入れる場合はそのフォルダ名です。
+    さらに下のフォルダは探しません。同じ表示名を重ねずに置いてください。</p>
+    <pre><code>detectors\
+  sample.onnx
+  sample.json          （任意）
+  another\
+    model.onnx
+    model.json         （任意）
+    labels.json        （任意）
+    threshold.json     （任意）
+    model_artifacts.json （任意）</code></pre>
+    <p>置いたり入れ替えたりしたら［一覧を読み直す］を押します。読み込み中は「読み込み中」と表示します。
+    フォルダに検出器がなければ「検出器はありません」と置き場所を表示します。</p>
+
+    <h2 id="selection">選択・形・余白・閾値</h2>
+    <ol>
+      <li><a href="erase.html#auto-detect">消しゴム</a>、<a href="conceal.html#auto-detect">隠蔽加工</a>、
+      <a href="local-adjustment.html#auto-detect">補正レイヤー</a>でマスクを編集できる状態にし、［自動検出…］を押します。</li>
+      <li>検出器にチェックを付け、その下で使う分類を選びます。複数の検出器を選べます。初めは「顔 (内蔵)」だけが選ばれています。
+      追加の検出器の分類は、初回はすべて選ばれています。</li>
+      <li>形と余白を選び、必要なら［詳細］で閾値を変えます。［検出］を押すと、選んだ検出器を順に実行します。
+      読める検出器が選ばれていない場合や、追加の検出器の分類が一つも選ばれていない場合は、検出できません。</li>
+      <li>結果を確かめ、筆や図形で調整します。1 回の検出は Undo 1 回で取り消せます。0 件やキャンセルの場合はマスクを変えません。</li>
+    </ol>
+    <table>
+      <thead><tr><th>項目</th><th>内容</th></tr></thead>
+      <tbody>
+        <tr><td>箱の形</td><td>楕円 / 矩形。顔の既定は楕円、追加の検出器は設定ファイルの指定、なければ矩形です。追加した図形は選択ツールで動かせます。</td></tr>
+        <tr><td>輪郭の形</td><td>輪郭に沿う / 楕円 / 矩形。既定は設定ファイルの指定、なければ輪郭に沿います。輪郭に沿って加えた範囲は筆・消去で直せます。</td></tr>
+        <tr><td>箱の余白</td><td>顔と追加の検出器で共通。既定 15%。検出した幅・高さの指定割合を各辺の外側に足します。</td></tr>
+        <tr><td>輪郭の余白</td><td>元画像の長辺に対する割合を半径として円形に太らせます。既定 0.6%。画素数に切り上げ、最小 2px です。</td></tr>
+        <tr><td>閾値</td><td>確からしさの下限。顔の既定は 0.6。追加の検出器は設定ファイルの分類ごとの値、全分類の値、0.25 の順で使います。
+        ［詳細］で上書きを選ぶと、全分類に同じ値を使います。</td></tr>
+      </tbody>
+    </table>
+    <p>輪郭の余白は、選んでいて読める輪郭の検出器があるときに表示します。箱の余白は顔・箱の検出器を選んだときや、輪郭の検出器の形を楕円・矩形にしたときに表示します。表示されていない間も余白の設定は残ります。</p>
+    <p>選択・分類・形・余白・閾値は 3 ツールで共有します。検出器を一時的にフォルダから外しても、その設定は残ります。
+    一覧には種類（箱 / 輪郭）、分類の数、ONNX 内のライセンス表記があればその文字列を表示します。</p>
+    <p>マスクは、筆や輪郭で加えた範囲を下地にし、図形を作った順に重ねます。
+    <strong>輪郭で足した部分に、以前作った消去の図形が重なると、そこは抜けたままになります。</strong>
+    箱から作る楕円・矩形は末尾に加わるため、前の消去の図形より後に効きます。</p>
+
+    <h2 id="json">設定ファイル</h2>
+    <p>直接置く場合は ONNX と同じ名前の <code>.json</code>、フォルダに入れる場合は <code>model.json</code> で上書きできます。
+    すべての項目は省略できます。不明な項目は無視しますが、書式が壊れたファイルは読めない検出器として表示します。</p>
+    <pre><code>{
+  "names": ["分類 A", "分類 B"],
+  "thresholds": {"分類 A": 0.15},
+  "threshold": 0.25,
+  "shape": "rect"
+}</code></pre>
+    <p><code>names</code> はモデルの分類番号順の名前です。上の分類名は書式を説明するための仮の名前です。
+    <code>thresholds</code> は分類名ごとの閾値、<code>threshold</code> は指定のない分類で使う閾値です。
+    <code>shape</code> は <code>rect</code>（矩形）、<code>ellipse</code>（楕円）、<code>contour</code>（輪郭に沿う）のいずれかです。
+    輪郭に沿う形は輪郭の検出器で使えます。</p>
+    <p>分類名はこの json の <code>names</code>、ONNX 内の名前、<code>labels.json</code> の順で使います。
+    どこにも名前がなければ「分類 0」「分類 1」…と表示します。</p>
+    <p>フォルダ形式では <code>labels.json</code> を <code>["分類 A", "分類 B"]</code> のような名前の配列にできます。
+    <code>threshold.json</code> は <code>{"threshold": 0.278}</code> のように全分類共通の値を指定します。
+    <code>model.json</code> の同じ項目を優先します。
+    <code>model_artifacts.json</code> の <code>args.imgsz</code> は入力サイズに使います（例: <code>{"args": {"imgsz": 640}}</code>）。
+    入力サイズは ONNX 内の指定を優先し、それらがなければ固定の入力サイズ、どれもなければ 640 を使います。</p>
+
+    <h2 id="unreadable">読めないとき</h2>
+    <p>対応する形式は Ultralytics の箱の検出（detect）と輪郭の検出（segment）の ONNX です。
+    重なり除去済みの形式には対応していません。形式が違う、分類名の数が出力と合わない、json を読めない、ONNX を開けない場合は、
+    灰色の行に理由を出し、選べないようにします。元のファイルと設定ファイルを確かめてから一覧を読み直してください。</p>
+    <p>一覧を読んだ後で ONNX が変わった場合も検出を中止し、「検出器のファイルが変わりました。一覧を読み直してください」と表示します。</p>
+
+    <h2 id="models">形式を確かめた検出器</h2>
+    <p>次は成人向けの画像で、隠す対象になる部位の領域を返す検出器です。
+    配布元のページには年齢の確認があり、成人向けの見本が載ることがあります。</p>
+    <table>
+      <thead><tr><th>名前</th><th>配布元（ページの URL）</th><th>種類</th><th>配布元が示すライセンス</th><th>学習の仕組み</th></tr></thead>
+      <tbody>
+        <tr><td>01miku/anime-nsfw-segm-yolo26 nano</td><td><a href="https://huggingface.co/01miku/anime-nsfw-segm-yolo26">Hugging Face / 01miku</a></td><td>輪郭</td><td>MIT（ONNX 内の表記は AGPL-3.0）</td><td>Ultralytics YOLO26 製。Ultralytics 製のモデルには AGPL-3.0 の主張があります。</td></tr>
+        <tr><td>01miku/anime-nsfw-segm-yolo26 medium</td><td><a href="https://huggingface.co/01miku/anime-nsfw-segm-yolo26">Hugging Face / 01miku</a></td><td>輪郭</td><td>MIT（ONNX 内の表記は AGPL-3.0）</td><td>Ultralytics YOLO26 製。Ultralytics 製のモデルには AGPL-3.0 の主張があります。</td></tr>
+        <tr><td>deepghs/anime_censor_detection censor_detect v1.0_n</td><td><a href="https://huggingface.co/deepghs/anime_censor_detection">Hugging Face / deepghs</a></td><td>箱</td><td>MIT</td><td>Ultralytics YOLOv8 製。Ultralytics 製のモデルには AGPL-3.0 の主張があります。</td></tr>
+        <tr><td>NudeNet v3 320n</td><td><a href="https://github.com/notAI-tech/NudeNet">GitHub / notAI-tech</a></td><td>箱</td><td>AGPL-3.0</td><td>Ultralytics YOLOv8 製。Ultralytics 製のモデルには AGPL-3.0 の主張があります。</td></tr>
+        <tr><td>NudeNet v3 640m</td><td><a href="https://github.com/notAI-tech/NudeNet">GitHub / notAI-tech</a></td><td>箱</td><td>AGPL-3.0</td><td>Ultralytics YOLOv8 製。Ultralytics 製のモデルには AGPL-3.0 の主張があります。</td></tr>
+      </tbody>
+    </table>
+    <p>形式の読み取りを確かめた一覧です。画像ごとの検出結果は、使う前に自分で確かめてください。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

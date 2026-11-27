@@ -2331,7 +2331,7 @@ mod local_adjust_segmentation_tests {
     }
 }
 
-fn effective_local_mask_edit_target(
+pub(crate) fn effective_local_mask_edit_target(
     layer: &local_adjust_core::LocalAdjustmentLayer,
     selected: LocalAdjustMaskEditTarget,
 ) -> Option<LocalAdjustMaskEditTarget> {
@@ -3992,6 +3992,18 @@ mod local_adjust_fold_audit {
     }
 }
 
+pub(crate) fn mask_detect_local_target_size(
+    layer: &local_adjust_core::LocalAdjustmentLayer,
+    target: LocalAdjustMaskEditTarget,
+) -> Option<[usize; 2]> {
+    if target == LocalAdjustMaskEditTarget::Base {
+        if let local_adjust_core::LocalMask::Raster(mask) = &layer.mask {
+            return Some([mask.width, mask.height]);
+        }
+    }
+    local_adjust_target_raster_vector_mask_ref(layer, target).map(|mask| [mask.width, mask.height])
+}
+
 fn local_adjust_target_raster_vector_mask_ref(
     layer: &local_adjust_core::LocalAdjustmentLayer,
     target: LocalAdjustMaskEditTarget,
@@ -4746,15 +4758,25 @@ fn draw_local_manual_mask_tool_panel(
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for &(tool, label) in row {
-                if local_adjust_panel_toggle_button(
+                let response = local_adjust_panel_toggle_button(
                     ui,
                     label,
                     *mask_tool == tool,
                     Some(btn_size),
                     false,
-                )
-                .clicked()
-                {
+                );
+                #[cfg(test)]
+                if tool == LocalAdjustMaskTool::Brush {
+                    // Response::clicked may lock its Context; snapshot before data_mut.
+                    let test_response = (response.id, response.rect, response.clicked());
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::unique("mask_detect_local_brush_rect"),
+                            test_response,
+                        )
+                    });
+                }
+                if response.clicked() {
                     *mask_tool = tool;
                 }
             }
@@ -12988,7 +13010,39 @@ impl App {
         transform: &DisplayedImageTransform,
         overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
-        if self.book_structural_op.is_some() {
+        if self.local_adjust_mask_input_blocked() {
+            // Disabled transport still delivers its terminal Cancel. In particular, a
+            // dialog opened from the other panel must not leave a brush gesture alive.
+            if let Some(idx) = self.current_local_adjust_edit_idx() {
+                let layer = self.selected_local_adjust_layer_idx(idx).unwrap_or(0);
+                let scope = self.canvas_gesture_scope(
+                    idx,
+                    crate::app::canvas_gesture::CanvasTool::Local(
+                        layer,
+                        self.local_adjust_mask_edit_target,
+                        self.local_adjust_mask_tool,
+                    ),
+                );
+                for input in crate::app::canvas_gesture::canvas_pointer_inputs(
+                    ctx,
+                    scope,
+                    overflow_pointer_input,
+                    false,
+                    |_| false,
+                ) {
+                    self.dispatch_canvas_gesture_input(
+                        ctx,
+                        input,
+                        |_, _| {},
+                        |app| {
+                            app.commit_local_adjust_pending_edits();
+                            app.local_adjust_mask_lasso_points.clear();
+                            app.local_adjust_mask_shape_drag_start = None;
+                            app.local_adjust_mask_shape_drag_end = None;
+                        },
+                    );
+                }
+            }
             return;
         }
         let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
@@ -13051,7 +13105,7 @@ impl App {
             ctx,
             scope,
             overflow_pointer_input,
-            !self.fs_primary_suppression.is_active(),
+            !self.local_adjust_mask_input_blocked() && !self.fs_primary_suppression.is_active(),
             |pos| !panel.contains(pos) && !tools.contains(pos),
         );
         for input in inputs {
@@ -13075,6 +13129,72 @@ impl App {
                 },
             );
         }
+    }
+
+    pub(crate) fn apply_mask_detect_to_local_adjust(
+        &mut self,
+        owner: &crate::app::PageEditOwner,
+        document: &local_adjust_core::LocalAdjustmentLayers,
+        layer_idx: usize,
+        edit_target: LocalAdjustMaskEditTarget,
+        size: [usize; 2],
+        shapes: Vec<crate::mask_db::Shape>,
+        patches: &[crate::ai::detect::MaskPatch],
+    ) {
+        let before = self.local_page_edit_document_for_producer(owner, document);
+        let mut after = before.clone();
+        let Some(layer) = Arc::make_mut(&mut after).get_mut(layer_idx) else {
+            return;
+        };
+        let Some(prepared) = local_adjust_prepare_target_raster_vector_mask(
+            layer,
+            edit_target,
+            (size[0], size[1]),
+            true,
+        ) else {
+            return;
+        };
+        if !patches.is_empty() {
+            let alpha = prepared.mask.alpha_mut();
+            Self::apply_detect_mask_patches(patches, size, |index| alpha[index] = 1.0);
+        }
+        for shape in shapes {
+            let shape = match shape {
+                crate::mask_db::Shape::Rect {
+                    center,
+                    half_w,
+                    half_h,
+                    ..
+                } => local_adjust_core::MaskShape::Rect {
+                    op: local_adjust_core::ShapeOp::Add,
+                    center: [center.0, center.1],
+                    half_w,
+                    half_h,
+                    rotation_rad: 0.0,
+                },
+                crate::mask_db::Shape::Ellipse { center, rx, ry, .. } => {
+                    local_adjust_core::MaskShape::Ellipse {
+                        op: local_adjust_core::ShapeOp::Add,
+                        center: [center.0, center.1],
+                        rx,
+                        ry,
+                        rotation_rad: 0.0,
+                    }
+                }
+                _ => unreachable!("detections contain boxes only"),
+            };
+            prepared.mask.shapes.push(shape);
+        }
+        self.local_adjust_selected_shape = None;
+        self.set_local_adjust_layers_for_target_with_undo(
+            &owner.target,
+            before,
+            after,
+            "自動検出".into(),
+        );
+        // Like a hand-drawn shape or bucket fill, reveal the adopted mask edit.
+        // The request owner calls this only after validating a nonempty result.
+        self.local_adjust_show_mask = true;
     }
 
     fn finish_local_adjust_canvas_gesture(
@@ -14653,7 +14773,7 @@ impl App {
         clear_layers: bool,
         effect_requests: LocalEffectPanelRequests,
     ) {
-        if self.book_structural_op.is_some() {
+        if self.local_adjust_mask_input_blocked() {
             return;
         }
         let changes_document = add_layer_mask.is_some()
@@ -14921,7 +15041,7 @@ impl App {
     }
 
     fn choose_local_adjust_cube_lut_for_layer(&mut self, fs_idx: usize, layer_idx: usize) {
-        if self.book_structural_op.is_some() {
+        if self.local_adjust_mask_input_blocked() {
             return;
         }
         if self.local_adjust_lut_pending.is_some() {
@@ -15727,9 +15847,16 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
-                if self.book_structural_op.is_some() {
+                if self.local_adjust_mask_input_blocked() {
                     ui.disable();
                 }
+                #[cfg(test)]
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("mask_detect_local_left_panel_enabled"),
+                        ui.is_enabled(),
+                    )
+                });
                 ui.interact(
                     sink_rect,
                     egui::Id::unique("local_adjust_panel_click_sink"),
@@ -15908,9 +16035,16 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
-                if self.book_structural_op.is_some() {
+                if self.local_adjust_mask_input_blocked() {
                     ui.disable();
                 }
+                #[cfg(test)]
+                ctx.data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("mask_detect_local_right_panel_enabled"),
+                        ui.is_enabled(),
+                    )
+                });
                 ui.interact(
                     tool_sink_rect,
                     egui::Id::unique("local_adjust_tool_panel_click_sink"),
@@ -15942,6 +16076,28 @@ impl App {
                                 ui.set_min_width(LOCAL_ADJUST_TOOL_PANEL_W);
                                 ui.set_max_width(LOCAL_ADJUST_TOOL_PANEL_W);
                                 if let Some(layer) = layers.get(selected_layer) {
+                                    let detect = ui.add_enabled(
+                                        self.mask_detect_available(
+                                            crate::app::MaskDetectTool::LocalAdjust,
+                                        ),
+                                        egui::Button::new("自動検出…"),
+                                    );
+                                    #[cfg(test)]
+                                    {
+                                        let test_response =
+                                            (detect.id, detect.rect, detect.clicked());
+                                        ctx.data_mut(|data| {
+                                            data.insert_temp(
+                                                egui::Id::unique("mask_detect_local_start_rect"),
+                                                test_response,
+                                            )
+                                        });
+                                    }
+                                    if detect.clicked() {
+                                        self.open_mask_detect_dialog(
+                                            crate::app::MaskDetectTool::LocalAdjust,
+                                        );
+                                    }
                                     draw_selected_local_adjust_layer_editor(
                                         ui,
                                         selected_layer,
@@ -16142,6 +16298,9 @@ impl App {
         self.local_adjust_repair_point_pick_active = None;
         self.local_adjust_selective_color_pick_active = false;
 
+        // This switches spread sides while keeping the tool open, so the ordinary
+        // exit helper is not involved; the outgoing page's detection must end here.
+        self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::LocalAdjust);
         self.enter_page_edit_single_view(new_idx);
     }
 

@@ -15,9 +15,16 @@ fn extraction_span(stage: miv_startup::Stage) -> miv_startup::Span {
     ))
 }
 
+/// 同梱物の識別子。検出器は TensorRT 等の固定 ModelKind 表に加えない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmbeddedAsset {
+    Model(ModelKind),
+    FaceDetectorYuNet,
+}
+
 /// 埋め込みモデルの定義。
 struct EmbeddedModel {
-    kind: ModelKind,
+    asset: EmbeddedAsset,
     filename: &'static str,
     // portable ビルドでは埋め込まず、exe 隣の `models/` から loose 読みするため bytes を持たない。
     #[cfg(not(feature = "portable"))]
@@ -27,46 +34,52 @@ struct EmbeddedModel {
 /// exe に埋め込まれた全モデル。
 static EMBEDDED_MODELS: &[EmbeddedModel] = &[
     EmbeddedModel {
-        kind: ModelKind::UpscaleRealEsrganX4Plus,
+        asset: EmbeddedAsset::Model(ModelKind::UpscaleRealEsrganX4Plus),
         filename: "realesrgan_x4plus.onnx",
         #[cfg(not(feature = "portable"))]
         bytes: include_bytes!("../../vendor/models/realesrgan_x4plus.onnx"),
     },
     EmbeddedModel {
-        kind: ModelKind::UpscaleRealEsrganAnime6B,
+        asset: EmbeddedAsset::Model(ModelKind::UpscaleRealEsrganAnime6B),
         filename: "realesrgan_x4plus_anime_6b.onnx",
         #[cfg(not(feature = "portable"))]
         bytes: include_bytes!("../../vendor/models/realesrgan_x4plus_anime_6b.onnx"),
     },
     EmbeddedModel {
-        kind: ModelKind::UpscaleRealEsrGeneralV3,
+        asset: EmbeddedAsset::Model(ModelKind::UpscaleRealEsrGeneralV3),
         filename: "realesr_general_x4v3.onnx",
         #[cfg(not(feature = "portable"))]
         bytes: include_bytes!("../../vendor/models/realesr_general_x4v3.onnx"),
     },
     EmbeddedModel {
-        kind: ModelKind::UpscaleRealCugan4x,
+        asset: EmbeddedAsset::Model(ModelKind::UpscaleRealCugan4x),
         filename: "realcugan_4x_conservative.onnx",
         #[cfg(not(feature = "portable"))]
         bytes: include_bytes!("../../vendor/models/realcugan_4x_conservative.onnx"),
     },
     EmbeddedModel {
-        kind: ModelKind::UpscaleNmkdSiax4x,
+        asset: EmbeddedAsset::Model(ModelKind::UpscaleNmkdSiax4x),
         filename: "4x_NMKD-Siax_200k.onnx",
         #[cfg(not(feature = "portable"))]
         bytes: include_bytes!("../../vendor/models/4x_NMKD-Siax_200k.onnx"),
     },
     EmbeddedModel {
-        kind: ModelKind::DenoiseRealplksr,
+        asset: EmbeddedAsset::Model(ModelKind::DenoiseRealplksr),
         filename: "dejpg_realplksr_otf.onnx",
         #[cfg(not(feature = "portable"))]
         bytes: include_bytes!("../../vendor/models/dejpg_realplksr_otf.onnx"),
     },
     EmbeddedModel {
-        kind: ModelKind::InpaintMiGan,
+        asset: EmbeddedAsset::Model(ModelKind::InpaintMiGan),
         filename: "migan.onnx",
         #[cfg(not(feature = "portable"))]
         bytes: include_bytes!("../../vendor/models/migan.onnx"),
+    },
+    EmbeddedModel {
+        asset: EmbeddedAsset::FaceDetectorYuNet,
+        filename: "face_detection_yunet_2026may.onnx",
+        #[cfg(not(feature = "portable"))]
+        bytes: include_bytes!("../../vendor/models/face_detection_yunet_2026may.onnx"),
     },
     // 被写体マット (ModelKind::SubjectMatte = BiRefNet) は本体に埋め込まず、
     // 編集用追加パック (editing_addon) からダウンロードして供給する。
@@ -215,11 +228,65 @@ impl ModelManager {
         if path.exists() { Some(path) } else { None }
     }
 
+    /// 同梱 YuNet のパス。通常版は展開先、portable 版は exe 隣の models。
+    /// ファイルの存在を確認するため worker から呼ぶこと。
+    pub fn face_detector_yunet_path(&self) -> Option<PathBuf> {
+        let filename = Self::asset_filename(EmbeddedAsset::FaceDetectorYuNet)?;
+        let path = self.models_dir.join(filename);
+        if path.exists() { Some(path) } else { None }
+    }
+
     /// ModelKind に対応するファイル名を返す。
     fn model_filename(kind: ModelKind) -> Option<&'static str> {
+        Self::asset_filename(EmbeddedAsset::Model(kind))
+    }
+
+    fn asset_filename(asset: EmbeddedAsset) -> Option<&'static str> {
         EMBEDDED_MODELS
             .iter()
-            .find(|m| m.kind == kind)
+            .find(|m| m.asset == asset)
             .map(|m| m.filename)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_asset_yunet_path_and_existing_model_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        // The manager receives the resolved normal/portable models directory.
+        let manager = ModelManager {
+            models_dir: temp.path().join("models"),
+        };
+        std::fs::create_dir_all(&manager.models_dir).unwrap();
+        assert!(manager.face_detector_yunet_path().is_none());
+        let face = manager.models_dir.join("face_detection_yunet_2026may.onnx");
+        std::fs::write(&face, b"fixture").unwrap();
+        assert_eq!(manager.face_detector_yunet_path(), Some(face));
+        for (kind, name) in [
+            (ModelKind::UpscaleRealEsrganX4Plus, "realesrgan_x4plus.onnx"),
+            (
+                ModelKind::UpscaleRealEsrganAnime6B,
+                "realesrgan_x4plus_anime_6b.onnx",
+            ),
+            (
+                ModelKind::UpscaleRealEsrGeneralV3,
+                "realesr_general_x4v3.onnx",
+            ),
+            (
+                ModelKind::UpscaleRealCugan4x,
+                "realcugan_4x_conservative.onnx",
+            ),
+            (ModelKind::UpscaleNmkdSiax4x, "4x_NMKD-Siax_200k.onnx"),
+            (ModelKind::DenoiseRealplksr, "dejpg_realplksr_otf.onnx"),
+            (ModelKind::InpaintMiGan, "migan.onnx"),
+        ] {
+            let path = manager.models_dir.join(name);
+            std::fs::write(&path, b"fixture").unwrap();
+            assert_eq!(manager.model_path(kind), Some(path));
+        }
+        assert_eq!(ModelManager::model_filename(ModelKind::SubjectMatte), None);
     }
 }

@@ -730,6 +730,7 @@ preferences_policy! {
         browser_integration_enabled => "ブラウザ連携の登録は PC ごとの状態で、移行先を維持";
         active_book_name => "利用データ・登録先・履歴・検索対象";
         pinned_books => "同上";
+        mask_detect => "環境設定外で管理するマスクツールの検出設定";
         conceal_type => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         conceal_mosaic_tile_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         conceal_mosaic_boundary => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -2724,7 +2725,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 527);
+        assert_eq!(entries.len(), 528);
         assert_eq!(
             entries
                 .iter()
@@ -2737,7 +2738,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            352
+            353
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2811,6 +2812,49 @@ mod tests {
                 .map(String::as_str)
                 .collect::<HashSet<_>>(),
             wire.into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn mask_detect_tool_settings_are_excluded_from_preferences_transfer() {
+        let entries = classifications();
+        let wire = wire_keys();
+        for field in ["mask_detect", "conceal_type", "conceal_presets"] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(name, reason)| *name == field && reason.is_some())
+            );
+            assert!(!wire.contains(&field));
+        }
+        let mut source = Settings::default();
+        source.mask_detect.ellipse = false;
+        source.mask_detect.margin_percent = 30.0;
+        source.mask_detect.threshold = 0.75;
+        let exported = export_preferences(&source).unwrap();
+        assert!(exported.issues.is_empty());
+        let value: Value = serde_json::from_str(&exported.json).unwrap();
+        assert!(
+            !value["preferences"]
+                .as_object()
+                .unwrap()
+                .contains_key("mask_detect")
+        );
+
+        let mut destination = Settings::default();
+        destination.mask_detect.margin_percent = 42.0;
+        destination.mask_detect.threshold = 0.5;
+        let before = serde_json::to_value(&destination.mask_detect).unwrap();
+        let report = parse_preferences(&document(json!({
+            "mask_detect": serde_json::to_value(&source.mask_detect).unwrap()
+        })))
+        .unwrap()
+        .apply_to(&mut destination);
+        assert_eq!(report.accepted_count, 0);
+        assert_eq!(report.unknown_count, 1);
+        assert_eq!(
+            serde_json::to_value(&destination.mask_detect).unwrap(),
+            before
         );
     }
 

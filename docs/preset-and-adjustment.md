@@ -1479,9 +1479,17 @@ MI-GAN / diffusion に渡す最終マスクと、オーバーレイ描画に使�
 | `denoise.rs` | 1x ノイズ除去 (タイル推論は upscale を流用) |
 | `ui_erase.rs` | MI-GAN によるマスク領域 inpaint (`InpaintMiGan` モデルを直接 `with_session` で呼び出し)。見開き中央ギャップ補完は精度不足で削除済み (タグ `v0.6.0-with-spread-inpaint` 参照) |
 | `classify.rs` | 画像種別分類 (ヒューリスティクス、Illustration/Comic/RealLife) |
+| `detect.rs` | 同梱 YuNet と BYO の Ultralytics detect / segment の前処理・推論・箱と輪郭パッチの読み取り。ツールを知らない検出層 |
+| `detector_catalog.rs` | worker 内の検出器一覧・json と ONNX のメタデータの検査。App 共通の一覧と、検出時の不変な要求に渡す情報 |
 
 `ModelKind` でモデルを識別。セッションは最初の推論時に遅延生成される。
 メモリ負荷が大きいので、不要になった ModelKind はセッションを drop する (runtime.rs)。
+
+自動検出（§1.914）は `ModelKind` を増やさず、同梱 YuNet と BYO を `AiRuntime` の外部モデル表で扱う。
+鍵はパス・ファイルサイズ・更新時刻、FIFO 最大 2 件、DirectML / CPU で TensorRT は登録しない。
+一覧読み取り専用の CPU・最適化なし Session は別に作って閉じ、表に入れない。図形と輪郭パッチの追加は
+消しゴム・隠蔽加工・補正レイヤーの既存の 1 編集へまとめ、該当ページだけの失効を使う。補正と表示の適用順は変えない。
+実装・未実施の検証は [自動検出計画 §23](auto-conceal-detection-plan.md) を参照。
 
 ---
 

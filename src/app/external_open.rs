@@ -29,7 +29,14 @@ impl super::App {
 
     pub(crate) fn poll_external_open_failures(&mut self) {
         while let Ok(failure) = self.external_open_failures.try_recv() {
-            if failure.is_warning() {
+            if failure == crate::external_links::ExternalOpenFailure::DetectorFolder {
+                // The detector folder button belongs to the viewer dialog, even
+                // though this shared channel is drained by the root poll.
+                self.show_feedback_warning_on(
+                    failure.message().to_owned(),
+                    super::ActionSurface::Viewer,
+                );
+            } else if failure.is_warning() {
                 self.show_feedback_warning(failure.message().to_owned());
             } else {
                 self.show_feedback_toast(failure.message().to_owned());

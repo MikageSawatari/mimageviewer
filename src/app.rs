@@ -866,8 +866,10 @@ pub(crate) mod comic_fonts;
 pub(crate) mod final_prepare;
 mod final_prepare_budget;
 mod final_prepare_cpu;
+mod mask_detect;
 mod prepared_edit;
 use final_prepare::{FinalEffectOrigin, FinalEffectReady, FinalEffectReceiver, FinalEffectState};
+pub(crate) use mask_detect::{MaskDetectPending, MaskDetectTool};
 pub(crate) use prepared_edit::{
     FinalPipelineInvalidation, PreparedEditCancel, PreparedEditDisposition, PreparedEditReject,
 };
@@ -11511,6 +11513,7 @@ pub(crate) struct LocalAiRemoteBarrierSnapshot {
     ai_upscale_pending: usize,
     retained_final_ai_orphans: usize,
     local_adjust_segmentation_pending: bool,
+    mask_detect_pending: bool,
     book_op_pending: bool,
     local_ai_activity: usize,
     trt_worker_starting: bool,
@@ -11523,6 +11526,7 @@ impl LocalAiRemoteBarrierSnapshot {
             && self.detached.is_none_or(|detached| detached.is_quiesced())
             && self.ai_upscale_pending == 0
             && self.retained_final_ai_orphans == 0
+            && !self.mask_detect_pending
             && !self.local_adjust_segmentation_pending
             && !self.book_op_pending
             && self.local_ai_activity == 0
@@ -11556,6 +11560,9 @@ impl LocalAiRemoteBarrierSnapshot {
                 "retained_final_ai_orphans={}",
                 self.retained_final_ai_orphans
             ));
+        }
+        if self.mask_detect_pending {
+            blockers.push("mask_detect_pending".to_owned());
         }
         if self.local_adjust_segmentation_pending {
             blockers.push("local_adjust_segmentation_pending".to_owned());
@@ -19388,6 +19395,8 @@ pub struct App {
     pub(crate) local_adjust_lut_pending: Option<LocalAdjustLutLoadPending>,
     /// 補正レイヤーの被写体/領域マスク生成 worker。
     pub(crate) local_adjust_segmentation_pending: Option<LocalAdjustSegmentationPending>,
+    /// Shared catalog and the projected context state live off the App stack.
+    pub(crate) mask_detect: Box<mask_detect::MaskDetectState>,
     /// 補正レイヤー領域分割の色差許容。
     pub(crate) local_adjust_region_color_tolerance: f32,
     /// 補正レイヤー領域分割の最小領域面積。
@@ -22427,6 +22436,7 @@ impl App {
             local_adjust_prefix_preview_pending: None,
             local_adjust_lut_pending: None,
             local_adjust_segmentation_pending: None,
+            mask_detect: Box::default(),
             local_adjust_region_color_tolerance: 42.0,
             local_adjust_region_min_area: 64,
             adjustment_cache: std::collections::HashMap::new(),
@@ -24855,6 +24865,7 @@ impl App {
             self.export_batch_dialog.is_some() => "export_batch_dialog",
             self.combine_dialog_modal() => "image_combine",
             self.export_pending.is_some() => "export_pending",
+            self.mask_detect_dialog_visible() => "mask_detect",
             self.local_adjust_add_layer_dialog_open => "local_adjust_add_layer",
             self.local_adjust_change_mask_dialog_open => "local_adjust_change_mask",
             self.local_adjust_effect_picker_dialog_open => "local_adjust_effect_picker",
@@ -46702,6 +46713,7 @@ impl App {
         self.local_adjust_prefix_preview_cache.clear();
         self.local_adjust_lut_pending = None;
         self.local_adjust_segmentation_pending = None;
+        self.cancel_mask_detect();
         self.mask_pages.clear();
         self.erase_mask_generation.clear();
         self.conceal_pages.clear();
@@ -49905,6 +49917,7 @@ impl App {
         self.cancel_all_local_adjust_pending();
         self.local_adjust_lut_pending = None;
         self.local_adjust_segmentation_pending = None;
+        self.cancel_mask_detect();
         // 360 度パノラマビュー: cache 全体が変わったので世代を一斉 bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
         self.bump_all_ai_generations();
@@ -68247,6 +68260,7 @@ impl App {
         self.fold_local_adjust_edit_state();
         self.local_adjust_lut_pending = None;
         self.local_adjust_segmentation_pending = None;
+        self.cancel_mask_detect();
         self.cancel_all_local_adjust_pending();
 
         if self.erase_mode {
@@ -86632,6 +86646,7 @@ impl App {
         self.local_adjust_change_mask_keep_manual_override = true;
         self.local_adjust_effect_picker_dialog_open = false;
         self.local_adjust_segmentation_pending = None;
+        self.cancel_mask_detect();
     }
 
     fn close_fullscreen_now_with_metadata_boundary(&mut self, boundary: FsMetadataBoundary) {
@@ -87566,6 +87581,7 @@ impl App {
             ai_upscale_pending: self.ai_upscale_pending.len(),
             retained_final_ai_orphans: self.retained_final_ai_orphans.len(),
             local_adjust_segmentation_pending: self.local_adjust_segmentation_pending.is_some(),
+            mask_detect_pending: self.mask_detect.context.pending.is_some(),
             book_op_pending: self.book_op_pending.is_some() || self.book_structural_op.is_some(),
             local_ai_activity: self.local_ai_activity.load(Ordering::Acquire),
             trt_worker_starting: self
@@ -101168,6 +101184,7 @@ impl App {
         self.fs_loupe_locked = false;
         self.fold_local_adjust_edit_state();
         self.local_adjust_segmentation_pending = None;
+        self.cancel_mask_detect();
         self.analysis_mode = false;
         self.reset_erase_mode();
         self.deactivate_compare_view();

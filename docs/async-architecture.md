@@ -1,5 +1,28 @@
 # 非同期・並列アーキテクチャ
 
+## マスクの自動検出（§1.914 段 2、実装・検証状況は §23）
+
+3 ツール共通の `MaskDetectPending` は viewer context ごとに 1 つで、開始時の対象を固定した要求・取消フラグ・受信口を所有する。
+待ちの `Option<Box<MaskDetectPending>>` と設定窓・session は `Box<MaskDetectContextState>` にまとめ、
+App の共通 `Box<MaskDetectState>` 内の投影先と bundle の間で、その Box だけを交換する。
+catalog は共通状態に残し、context の破棄では自身の待ちだけを drop して取り消す。要求を inline で常駐させない。
+`launch_mask_detect_worker` は本番とテストの推論注入で共有する。1 回ごとの worker が `local_ai_activity_lease()` を
+ランタイム待ちから thread 終了まで保持し、検出器ごと・YuNet の各段の区切りで取消を調べる。
+要求は一覧の `DetectorInfo` と選択・形・閾値も複製して固定する。検出 worker はファイルのサイズ・更新時刻を
+外部モデル cache と同じ `ExternalModelKey` で照合し、変化があれば全体をエラーとして終える。途中結果の採用はしない。
+検出器をまたぐ NMS はせず、箱・輪郭パッチ・分類ごとの件数をまとめて返す。
+UI は `try_recv` で受け取り、context・page key・items 世代・ソースの Arc・ツールの編集対象が開始時と同じ場合だけ反映する。
+補正レイヤーは最新受付済み文書とも照合する。ダイアログと待ちの間は同 context の新規入力をモーダルで止める。
+モード終了・フォルダ切替・context の破棄では自身の待ちを捨てて取消し、UI で worker を join しない。
+0 件・取消・不一致ではマスクと Undo を変えず、有効な結果の反映だけを既存の各ツールの 1 操作へ渡す。
+呼出元が渡す不透明な `trace_label` を開始から結果の追加までの perf event に持たせ、ツール別に区間を追える。
+外部セッションの準備計測はファイル照合・lock 待ち・cache 取得 / load までとし、推論 callback の前で閉じる。
+検出器一覧は App 共通であり、context の移譲・破棄では交換しない。ダイアログを開く操作と再読込から一覧 worker を開始し、
+UI は読み込み中を表示して `try_recv` で受信する。一覧 worker も活動 lease を保持し、ランタイム準備後に CPU・最適化なしの
+一時 Session で調べて閉じる。動的な分類数が名前から決まらない場合だけ、その Session で灰色の 640×640 を 1 回推論する。
+フォルダの作成・Explorer で開く処理も worker に置く。UI は I/O や worker の終了を待たない。
+詳細と未実施の検証は [自動検出計画 §6・§7・§23](auto-conceal-detection-plan.md) を参照。
+
 ## 操作スクリプトのファイル処理（§1.363 段1〜5・§17）
 
 App共通の `OperationScriptLoader` が単一FIFO worker・要求sender・結果receiverを所有し、viewer bundleへ入れない。

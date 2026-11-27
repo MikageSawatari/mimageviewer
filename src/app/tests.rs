@@ -3799,6 +3799,28 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
     );
     assert_eq!(storage(|app| &app.image_combine), size_of::<usize>());
     println!(
+        "mask detection storage runtime={} settings={} context={} pending={}; payload MaskDetectState={} MaskDetectContextState={} MaskDetectSettings={}",
+        storage(|app| &app.mask_detect),
+        storage(|app| &app.settings.mask_detect),
+        storage(|app| &app.mask_detect.context),
+        storage(|app| &app.mask_detect.context.pending),
+        size_of::<mask_detect::MaskDetectState>(),
+        size_of::<mask_detect::MaskDetectContextState>(),
+        size_of::<crate::settings::MaskDetectSettings>(),
+    );
+    assert_eq!(storage(|app| &app.mask_detect), size_of::<usize>());
+    assert_eq!(storage(|app| &app.settings.mask_detect), size_of::<usize>());
+    assert_eq!(storage(|app| &app.mask_detect.context), size_of::<usize>());
+    assert_eq!(
+        storage(|app| &app.mask_detect.context.pending),
+        size_of::<usize>()
+    );
+    // Count the persisted settings embedded in App too, not only runtime fields.
+    assert_eq!(
+        storage(|app| &app.mask_detect) + storage(|app| &app.settings.mask_detect),
+        2 * size_of::<usize>(),
+    );
+    println!(
         "operation script storage loader={} events={}; payload OperationScriptLoader={} OperationScriptEvents={}",
         storage(|app| &app.operation_script),
         storage(|app| &app.operation_script_events),
@@ -80621,6 +80643,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             ai_upscale_pending: 3,
             retained_final_ai_orphans: 4,
             local_adjust_segmentation_pending: true,
+            mask_detect_pending: false,
             book_op_pending: true,
             local_ai_activity: 5,
             trt_worker_starting: true,

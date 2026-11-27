@@ -3,6 +3,24 @@
 Windows のボタン入力は vendor egui-winit のプロセス共通時計・wndproc 呼出単位の証跡から egui の `EdgeTime` へ運ぶ。
 egui・一覧・ツリーは両端の入力時刻が分かる組だけ実入力の間隔を使い、処理待ちをクリックの時間へ混ぜない ([設計 §16](fullscreen-double-click-close-plan.md))。
 
+## マスクの自動検出（§1.914 段 2、実装・検証状況は §23）
+
+同梱 YuNet と利用者が置く Ultralytics detect / segment の ONNX を、消しゴム・隠蔽加工・補正レイヤーの共通ダイアログから使う。
+`ai::detector_catalog` は `<data_dir>\detectors\` の直下ファイルと 1 階層の `model.onnx`、任意の json を読む。
+一覧は App 共通の単一 owner に持ち、viewer context の bundle には入れない。専用 worker がランタイム準備を待ち、
+CPU・最適化なしの一時 Session でメタデータと入出力を読む。この Session は外部モデルの cache に入れない。
+App の `Box<MaskDetectState>` が共通の一覧と投影中の `Box<MaskDetectContextState>` を持つ。
+後者の待ち・設定窓・2 ツールの session だけを bundle と交換し、一覧は動かさない。保存する設定も
+`Settings.mask_detect` の Box に置き、App に増える inline は x64 で計 16 バイトとする。
+検出の待ちは viewer context ごとに 1 つだけ置き、`MaskDetectRequest` が開始時の対象・世代・画素を所有する。
+要求は使う検出器のパス・サイズ・更新時刻・形式・分類・閾値・入力サイズも複製し、一覧の再読込では変えない。
+`app/mask_detect.rs` の worker は選んだ検出器を順に実行し、BYO は要求のファイル identity を確認してから
+`AiRuntime` の外部モデル経路（DirectML / CPU、FIFO 最大 2 件、TensorRT なし）で推論する。
+UI は対象の一致を確かめ、箱の図形と輪郭パッチを各ツールの既存の Undo・保存・cache 失効経路へ 1 操作として渡す。
+補正レイヤーは `PageEditOwner` と開始時の文書も照合する。表示の合成順とマスクの永続データ形式は変えない。
+ダイアログは embedded を含む fullscreen の closure だけで描き、ROOT との二重描画を避ける。
+詳細と未実施の検証は [自動検出計画 §5〜§7・§9・§23](auto-conceal-detection-plan.md) を参照。
+
 ## 操作のスクリプト（§1.363 段1〜5・§17）
 
 `operation_script` がサンドボックス、状態の写し、スロット・戻り値の解釈、操作の許可表と並びの検査を持つ。

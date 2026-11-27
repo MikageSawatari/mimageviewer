@@ -45,6 +45,7 @@ impl App {
 
     /// The ordinary panel exit, also shared by item changes and viewer close.
     pub(crate) fn exit_local_adjust_mode(&mut self, preview: LocalAdjustmentExitPreview) {
+        self.cancel_mask_detect_for_tool(MaskDetectTool::LocalAdjust);
         self.cancel_original_material_entry_intents(None);
         if matches!(preview, LocalAdjustmentExitPreview::CacheCurrent) {
             self.cache_current_edit_preview_if_ready();
@@ -86,6 +87,9 @@ impl App {
                 continue_local_adjustment: true
             }
         );
+        // A surviving local document keeps its tool and detection request. Item
+        // adoption advances items_generation; mask_detect_request_is_current rejects
+        // that old request before adding any result, even if the page survives.
         if self.local_adjust_mode && !continue_local_adjustment {
             let preview = match exit {
                 PageEditExit::Fullscreen(preview) => preview,

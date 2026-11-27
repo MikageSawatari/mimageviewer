@@ -62,6 +62,25 @@ fn conceal_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f
 }
 
 impl App {
+    pub(crate) fn apply_mask_detect_to_conceal(
+        &mut self,
+        shapes: Vec<Shape>,
+        patches: &[crate::ai::detect::MaskPatch],
+    ) {
+        self.push_conceal_undo();
+        if let Some(mask) = self.conceal_mask.as_mut() {
+            Self::apply_detect_mask_patches(patches, self.conceal_mask_size, |index| {
+                mask[index] = true
+            });
+        }
+        self.conceal_shapes.extend(shapes);
+        self.conceal_selected_shape = None;
+        self.conceal_mask_texture = None;
+        if let Some(idx) = self.fullscreen_idx {
+            self.clear_conceal_caches(idx);
+        }
+    }
+
     /// 「フルスクリーン上の主要 UI (メタデータパネル / 上部ホバーバー / カーソル自動隠し /
     /// マウスホイールでのページ送り 等) を抑制すべき編集モード」が現在 active か判定する
     /// (= 消しゴム / 補正レイヤー / 隠蔽加工 / 最後段 crop / SNS 分割)。Phase 4 で追加。
@@ -173,7 +192,12 @@ impl App {
         let fs_idx = target_idx;
         let [w, h] = pixels.size;
 
+        // Entry/navigation checks and material acceptance above must succeed before
+        // stopping playback or replacing this tool's detection/edit session.
         self.stop_projected_slideshow_playback();
+        self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::Conceal);
+        self.mask_detect.context.conceal_session =
+            self.mask_detect.context.conceal_session.wrapping_add(1);
         self.conceal_mode = true;
         self.conceal_preview_active = false;
         self.conceal_preview_hold = Default::default();
@@ -250,6 +274,7 @@ impl App {
     /// 空マスク経路に揃える)。表示パイプライン側の `conceal_cache` は次回の
     /// composite で自然に再生成されるため、ここでは触らない。
     pub(crate) fn reset_conceal_mode(&mut self) {
+        self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::Conceal);
         self.cancel_original_material_entry_intents(None);
         let restore_idx = self.fullscreen_idx;
         let was_conceal_mode = self.conceal_mode;
@@ -357,6 +382,7 @@ impl App {
         self.finish_conceal_edit_for_current("switch_save");
         // Both source and saved target mask are ready: commit the old editor and
         // install the new editor in the same pass.
+        self.cancel_mask_detect_for_tool(crate::app::MaskDetectTool::Conceal);
         self.conceal_mode = false;
         self.conceal_preview_active = false;
         self.conceal_preview_hold = Default::default();
@@ -620,7 +646,7 @@ impl App {
             KeyAction::ConcealPreviewHold,
             drawing_in_progress,
         );
-        if self.book_structural_op.is_some() {
+        if self.conceal_input_blocked() {
             return Default::default();
         }
         let action = FsKeyAction {
@@ -1211,6 +1237,7 @@ impl App {
         if self.conceal_mask_texture.is_some() {
             return;
         }
+        let rebuild_start = std::time::Instant::now();
         self.conceal_mask_texture_dirty_rect = None;
         let Some(composite) = self.composite_conceal_mask() else {
             return;
@@ -1227,6 +1254,21 @@ impl App {
         let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
         let tex = ctx.load_texture("conceal_mask", ci, egui::TextureOptions::NEAREST);
         self.conceal_mask_texture = Some(tex);
+        crate::perf::event(
+            "mask",
+            "texture_rebuild",
+            None,
+            0,
+            &[
+                ("tool", "conceal".into()),
+                ("width", w.into()),
+                ("height", h.into()),
+                (
+                    "ms",
+                    (rebuild_start.elapsed().as_secs_f64() * 1000.0).into(),
+                ),
+            ],
+        );
     }
 
     /// ビットマップとベクタを合成した最終マスクを返す (Phase 3 の合成入力でも使う)。
@@ -1386,9 +1428,6 @@ impl App {
             KeyAction::ConcealPreviewHold,
             drawing_in_progress,
         );
-        if self.book_structural_op.is_some() {
-            return;
-        }
         let full_rect = transform.viewport_rect;
         if self.fs_primary_suppression.is_active() {
             return;
@@ -1405,7 +1444,7 @@ impl App {
             ctx,
             scope,
             overflow_pointer_input,
-            true,
+            !self.conceal_input_blocked(),
             |pos| preview_owns_pointer || !panel.contains(pos),
         );
         for input in inputs {
@@ -2088,13 +2127,21 @@ impl App {
         let primary_down = primary_down && !self.fs_front_pointer.owns_primary_in(viewport_id);
         // An editing drag keeps its owner while crossing the panel. Do not let the
         // geometric eye pre-read turn that stream into preview suppression.
+        let continuing_hold = self.conceal_preview_active
+            && !ctx.input_for(viewport_id, |input| input.pointer.primary_pressed());
         let pointer_active = !self.conceal_pointer_operation_in_progress()
-            && conceal_preview_pointer_active(
-                self.conceal_mode,
-                self.conceal_preview_button_rect,
-                pointer_pos,
-                primary_down,
-            );
+            && if self.conceal_input_blocked() {
+                // A Response accepted before disabling the panel owns this hold
+                // until release, including movement outside the eye rectangle.
+                continuing_hold && primary_down
+            } else {
+                conceal_preview_pointer_active(
+                    self.conceal_mode,
+                    self.conceal_preview_button_rect,
+                    pointer_pos,
+                    primary_down,
+                )
+            };
         // キー受付は所有 viewport の canvas が担当する。ROOT の入力で読み直さず、
         // 前 pass で受付済みの保持を目ボタンと合成して pipeline の前に確定する。
         self.conceal_preview_active =
@@ -2383,7 +2430,9 @@ impl App {
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
-                if self.book_structural_op.is_some() { ui.disable(); }
+                if self.conceal_input_blocked() { ui.disable(); }
+                #[cfg(test)]
+                ctx.data_mut(|data| data.insert_temp(egui::Id::new("mask_detect_conceal_panel_enabled"), ui.is_enabled()));
                 // 1. sink を widget より前に登録 (egui の hit test 後勝ちルール対策)
                 ui.interact(
                     sink_rect,
@@ -2473,6 +2522,12 @@ impl App {
                             );
                         });
                         let drawing_in_progress = self.conceal_drawing_in_progress();
+                        // Disabled Responses cannot retain pointer-down ownership. The
+                        // pipeline pre-read already admitted only an existing hold.
+                        if self.conceal_input_blocked() {
+                            preview_pressed = self.conceal_preview_active
+                                && ctx.input(|input| input.pointer.primary_down());
+                        }
                         self.conceal_preview_active = self.conceal_preview_hold.merge(
                             preview_pressed,
                             self.conceal_preview_active,
@@ -2574,6 +2629,15 @@ impl App {
                                         });
                                         ui.separator();
 
+                                        let detect = ui.add_enabled(self.mask_detect_available(crate::app::MaskDetectTool::Conceal), egui::Button::new("自動検出…"));
+                                        #[cfg(test)]
+                                        {
+                                            let test_response = (detect.id, detect.rect, detect.clicked());
+                                            ctx.data_mut(|data| data.insert_temp(egui::Id::unique("mask_detect_conceal_start_rect"), test_response));
+                                        }
+                                        if detect.clicked() {
+                                            self.open_mask_detect_dialog(crate::app::MaskDetectTool::Conceal);
+                                        }
                                         // ツールパレット。筆/囲みはビットマップ下地、線/矩形/楕円は
                                         // その上に作成順で重なるオブジェクト。消去モードの
                                         // オブジェクトは Subtract Shape として残る。
@@ -2598,14 +2662,20 @@ impl App {
                                                 for &(kind, base_label) in *row {
                                                     let label =
                                                         self.conceal_tool_label(base_label, kind);
-                                                    if panel_toggle_button(
+                                                    let response = panel_toggle_button(
                                                         ui,
                                                         label.as_str(),
                                                         tool == kind,
                                                         Some(btn_size),
                                                         None,
-                                                    )
-                                                    .clicked()
+                                                    );
+                                                    #[cfg(test)]
+                                                    if kind == ConcealTool::Brush {
+                                                        // Response::clicked may lock its Context; snapshot before data_mut.
+                                                        let test_response = (response.id, response.rect, response.clicked());
+                                                        ctx.data_mut(|data| data.insert_temp(egui::Id::unique("mask_detect_conceal_brush_rect"), test_response));
+                                                    }
+                                                    if response.clicked()
                                                     {
                                                         tool = kind;
                                                     }

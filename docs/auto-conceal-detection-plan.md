@@ -1,8 +1,9 @@
 # マスクを検出で自動作成する (消しゴム・隠蔽加工・補正レイヤー共通) — 設計案 (§1.914)
 
-> ステータス: **設計案 / 未着手 (2026-11-26 起票)**。設計担当 = ClaudeCode Opus 5.5。
+> ステータス: **段 2 の実装、cargo 検証待ち (2026-11-27)**。設計担当 = ClaudeCode Opus 5.5。
 > 隠蔽加工だけを対象にした版で Sol の独立レビュー R1〜R3 を受け、R3 で ACCEPT。その後の利用者の判断 (§13) で
-> **3 つのマスクツール共通**に広げ、広げた部分も R4〜R5 で ACCEPT (§16)。段 0 は 2026-11-27 に完了 (§17)。次は段 1 (専用のブランチと worktree で進める)。
+> **3 つのマスクツール共通**に広げ、広げた部分も R4〜R5 で ACCEPT (§16)。段 0 の記録は §17、段 1a の引き継ぎは §18、段 1b の実装範囲と未実施の検証は §19。
+> 段 1 のその後の記録は §20〜§22、段 2 の実装引き継ぎは §23。段 1 の独立レビュー・全件テスト・実機確認の完了は今回の利用者報告による。
 > ファイル名は起票時のまま (`auto-conceal-…`) にしている。
 > 旧案 [archive/ai/auto-mask-detection-plan.md](archive/ai/auto-mask-detection-plan.md) (2026-05、v1.1.0 期、未着手)
 > の方針を引き継ぎ、現在のコードと 2026-11 時点の公開モデルの調査に合わせて作り直したもの。旧案の行番号・型名は古い。
@@ -115,6 +116,18 @@
 ### 4.2 設定ダイアログ (3 ツール共通)
 
 `default_pos()` の通常ダイアログ (モーダル)。1093×614 でも [検出] と [閉じる] が見えること (見出しと操作行は ScrollArea の外)。
+設定と検出中の Window は fullscreen の描画経路だけで表示し、`with_dark_context_style` でタイトルバーを含めて常に暗色にする。
+描画後は Context の Light / Dark 両 Style と theme preference を復元する。
+両 Window は `Order::Foreground` とし、表示中は毎フレーム、その Window の Area と同じ LayerId を
+`set_modal_layer` に登録する（egui の Modal と同じ方式）。背面のツールパネルへの入力を egui の層でも止め、
+既存の `mask_detect_active` による入力遮断も維持する。自分が前面モーダルで popup が無く、
+自分より上に見えている Foreground の Area がツールパネルだけの場合は、パネルより上という不変条件を毎 pass 確かめる。
+順序が逆のときだけ `move_to_top` と再描画要求を行う（§23.10 の B 案）。正しい順序なら何もしない。
+別の上位モーダル・Area・popup は追い越さず、それらが閉じて条件を満たせば再判定で順序を直す。表示開始の pass を記録する状態は持たない。
+tooltip と発火面付きトーストは Tooltip 段で窓より上に描く。
+ダイアログから開いた menu / combo の popup は Foreground 内で親より上になり、モーダルの入力制限を通る。
+設定窓の Escape は `top_modal_layer` が自分の場合、または初回でまだ登録が無い（`None`）場合だけ受け付ける。
+そのうえで既存の `dialog_escape_pressed` による IME・popup の判定を通す。他の Modal が上にある場合は背面の設定窓を閉じない。
 
 | 項目 | 内容 | 既定 |
 |---|---|---|
@@ -128,9 +141,16 @@
 
 - 設定 (選んだ検出器・分類・形・余白) は 3 ツールで共有する 1 組にする。ツールごとに別の設定は持たない
   (状態を増やさない。ツールを変えても同じ検出がかかる)。
+- BYO の設定は表示名を鍵にして選択・分類名の選択・形・閾値の上書き `Option<f32>` を保存する。
+  一覧に無い検出器の設定も残す。上書きなしは分類別 json → 共通 json / threshold.json → 0.25。
+  選択した検出器の設定だけを行の下に展開し、閾値は詳細内に置く。
 - 各検出器の行には、ファイル名・分類の数・種類 (箱 / 輪郭)・ONNX に書かれたライセンス文字列 (あれば) を出す。
 - 文言は処理内容だけを書く (例:「顔を検出して楕円のマスクを追加します」)。「投稿用」などの用途判定の語は使わない。
 - 読めなかったファイルは灰色の行で理由を出す (例:「出力の形式を読めません」)。黙って隠さない。
+- 輪郭の余白は、選択済みで読める輪郭検出器があるときだけ表示する。箱の余白は顔または選択済みで読める箱検出器があるときに表示する。
+  輪郭検出器で楕円／矩形を選んだ場合も箱の余白を使うので表示する。非表示でも保存値・既定値は変えない。
+- 選択済み BYO の設定がある間は、一覧が Ready になるまで [検出] を押せない。Ready 後は読める・分類が選ばれた検出器だけを要求に含める。
+  読めない／不在／分類未選択の BYO の設定は残すが実行しない。それらしかなければ顔の選択ありで顔だけを実行でき、顔も未選択なら開始できない。
 
 ### 4.3 置き場所とボタンを押せる条件
 
@@ -163,8 +183,8 @@
 | 形式 | 出力 | 読み方 |
 |---|---|---|
 | `YuNet` | stride 8/16/32 ごとの cls・obj・bbox・kps | OpenCV の `FaceDetectorYN` と同じ式。5 点は v1 では使わない |
-| `UltralyticsDetect` | `[1, 4+C, N]` (xywh + 分類ごとの確からしさ) | 転置 → 閾値 → 分類ごとの重なり除去 (IoU 0.5) |
-| `UltralyticsSegment` | `[1, 4+C+32, N]` と元マスク `[1, 32, H/4, W/4]` | 上と同じ + 32 係数 × 元マスク → 0 以上を内側 → 箱で切り抜く |
+| `UltralyticsDetect` | `[1, 4+C, N]` (xywh + 分類ごとの確からしさ) | 転置 → 最大の分類 1 つ → 選択と閾値 → 分類ごとの重なり除去 (IoU 0.7、最大 300 件) |
+| `UltralyticsSegment` | `[1, 4+C+32, N]` と元マスク `[1, 32, H/4, W/4]` | 上と同じ + 32 係数 × 元マスクのロジットを元画像の画素中心で双線形に読む → 0 より大きければ内側 → 箱で切り抜く |
 
 - **形式は上の 3 つだけにする** (段 0 の結果、§17)。YOLO26 も既定の書き出しは従来形式 (`end2end = False`、出力は
   v8 / 11 と同じ並び) で、調べた BYO の候補 5 つもすべて従来形式だった。重なり除去済みの書き出し
@@ -180,15 +200,20 @@
 - **Ultralytics 系 (段 0 で ultralytics 本体と一致を確認、§17)**: 入力の大きさ `S` はメタデータの `imgsz` →
   同じ場所の `model_artifacts.json` の `args.imgsz` → 入力の形が固定ならその大きさ → 640 の順で決める。
   ultralytics の `LetterBox` と同じ計算にする: `r = min(S/h, S/w)`、縮めた大きさ `(round(w·r), round(h·r))`、
-  縮小は双線形、余白 `dw = (S - 新しい幅) / 2` を左 `round(dw - 0.1)`・右 `round(dw + 0.1)` (上下も同じ) に分け、
+  縮小・拡大とも cv2.INTER_LINEAR と同じ 2×2 だけの双線形（半画素の座標、端は切り詰め）を使う。
+  image crate の Triangle は縮小で範囲を広げるので使わない。余白 `dw = (S - 新しい幅) / 2` を左 `round(dw - 0.1)`・右 `round(dw + 0.1)` (上下も同じ) に分け、
   灰色 (114) で埋める。RGB、0..1、NCHW。出力は転置して `(cx, cy, w, h)` + 分類ごとの確からしさ (既に 0..1)。
-  確からしさ ≥ 閾値で残し、**分類ごとに** 重なりを除く (IoU 0.7、ultralytics の既定)、多くて 300 個。
+  各候補で確からしさが最大の分類 1 つだけを取り、未選択なら捨てる（multi_label なし、sigmoid なし）。
+  確からしさ ≥ その分類の閾値で残し、**分類ごとに** 重なりを除く (IoU 0.7、ultralytics の既定)、確からしさ順に多くて 300 個。
   座標は余白を引いて `r` で割り、画像の範囲に切り詰める。
 - **輪郭**: 32 係数 × 元マスクで元マスクの解像度の値 (ロジット) を作る。**元の画像の箱の中の各画素について、
   画素の中心を letterbox の座標 → 元マスクの座標へ写し、ロジットを双線形で読んで 0 より大きければ内側**とする
   (元マスクの解像度で 0/1 にしてから拡大すると、元の画像では約 30px の階段になるため)。そのあと §4.2 の余白
-  (**元の画像の px**) ぶん太らせる。結果は **検出ごとの小さなパッチ** (画像座標の矩形 + その範囲のビット列) にする
+  (**元の画像の px**) を半径とし、最も近い内側の画素からのユークリッド距離が半径以下の画素を含めて円形に太らせる。
+  拡張後のパッチ範囲だけを二乗距離変換で走査し、費用はパッチの画素数に比例させる。結果は **検出ごとの小さなパッチ** (画像座標の矩形 + その範囲のビット列) にする
   (§7.4 の UI スレッドの負荷のため)。この方法で ultralytics の `retina_masks` と IoU 中央値 0.999 (最小 0.97) だった。
+- 輪郭に沿うモードで全画素 false のパッチは検出 worker で候補と一緒に捨て、分類別件数も残った候補から集計する。
+  全候補が空なら 0 件とし、UI の Undo・書き先作成・Raster 変換・表示 ON に進まない。楕円／矩形のモードは箱を使う。
 - **YuNet (段 0 で OpenCV と一致を確認、§17)**: 入力は **BGR、0..255 のまま、縦横を 32 の倍数へ右下に 0 で埋める**。
   出力は stride 8 / 16 / 32 ごとに、`score = sqrt(clamp(cls) × clamp(obj))`、
   `cx = (列 + bbox0) × stride`、`cy = (行 + bbox1) × stride`、`w = exp(bbox2) × stride`、`h = exp(bbox3) × stride`
@@ -213,16 +238,27 @@
 
 - 置き場は **`<data_dir>\detectors\`** に固定する (ポータブル版・`--data-dir` でも data_dir に従う)。
   フォルダを変える設定は v1 では作らない (状態を増やさない)。
-- 1 つの検出器 = `<名前>.onnx` + 任意の `<名前>.json`。json は分類名・既定の閾値・既定の形を上書きするためのもの:
+- 1 つの検出器は (a) `<名前>.onnx` + 任意の `<名前>.json`、または (b) `<フォルダ名>\model.onnx` と同じフォルダの
+  任意の `labels.json`（分類名の配列）・`threshold.json`（全分類で 1 つの `threshold`）・`model_artifacts.json`（`args.imgsz`）・
+  `model.json`（a の json と同じ）。1 階層だけを見て再帰しない。表示名・設定の鍵は a の stem / b のフォルダ名。
+  json は分類名・分類別／全体の閾値・既定の形を上書きする。項目はすべて任意、不明キーは無視し、壊れた書式は読めない理由として出す:
 
   ```json
-  { "names": ["anus", "penis", "vagina"], "thresholds": {"anus": 0.15}, "shape": "rect" }
+  { "names": ["分類 A", "分類 B"], "thresholds": {"分類 A": 0.15}, "threshold": 0.25, "shape": "rect" }
   ```
 
 - 分類名は、json → ONNX のメタデータ `names` → deepghs 形式の `labels.json` (同名フォルダ内) の順で探す。
   どこにも無ければ「分類 0」「分類 1」… と出す (使えるが、利用者には分かりにくいことを表示する)。
+- ONNX の `names` は Python dict リテラルの小さな parser で読む（単引用符・二重引用符とエスケープ、名前内の `,` / `:`）。
+  キーは 0 からの連番だけを受け付け、式の評価はしない。
 - フォルダの読み込み (read_dir・ONNX のメタデータの読み取り) は **worker** で行う。ダイアログを開いたときと
   [一覧を読み直す] で走らせ、結果が来るまでは「読み込み中」と出す。UI スレッドで ONNX を開かない。
+- 一覧は App 共通の単一 owner に持ち、context bundle には入れない。`ai_runtime_init` の準備を待ち、CPU・最適化なしの
+  一時 Session で読み、閉じる。外部モデル表には入れない。動的な分類数は名前の数で決め、名前も無い場合だけ
+  その Session に灰色 114 の 640×640 を 1 回入れて形を確かめる。決まらなければ読めない扱い。
+- 検出要求は使う一覧情報（外部モデル鍵・形式・分類・閾値・入力サイズ）を複製する。worker が Session を使う前に
+  `ExternalModelKey` と同じサイズ・更新時刻を照合し、変化は型付きエラー「検出器のファイルが変わりました。一覧を読み直してください」。
+  照合と読み込みの間の入れ替わりはまれな失敗として割り切る。
 - ファイルを選んで取り込むボタン (コピーで登録) は v1 では作らない。[フォルダを開く] で足りるかを使ってから決める。
 
 ### 6.2 推論セッション (`AiRuntime` の外部モデル)
@@ -238,7 +274,10 @@
   先読みのアップスケールが走っていても検出 (利用者が待っている操作) がその後ろに並ばないようにする。
   GPU 自体は共有するので、遅くなることはある。DirectML は別セッションの並行実行を許している (R1 で確認)。
 - **段 0 の結果、調べた 10 モデルはすべて DirectML で読めて動いた** (§17)。ランタイムが DirectML / TensorRT なら
-  DirectML で、CPU なら CPU で読む。**黙って CPU に切り替えない** (読めなければエラーとして表示する)。
+  DirectML で、CPU なら CPU で読む。**外部モデルのための CPU への切り替えや再試行は足さない** (読めなければエラーとして
+  表示する)。例外として、セッションの作り方は既存の固定モデルと共有するので、既存の helper が持つ「DirectML の EP の
+  登録自体に失敗したら CPU で続ける」挙動はそのまま受け継ぐ (環境全体の問題で、全 AI 機能で同じ扱い。段 1a の
+  独立レビューの P3、2026-11-27)。
 
 ### 6.3 同梱する YuNet
 
@@ -326,6 +365,14 @@ impl Drop for MaskDetectPending { fn drop(&mut self) { self.cancel.store(true, R
 ```
 
 - 待ちは **viewer context の bundle に 1 つだけ** (既存の `local_adjust_segmentation_pending` と同じ扱い)。
+  `Box<MaskDetectContextState>` の中の `Option<Box<MaskDetectPending>>` とし、捕捉した文書を含む payload を heap に置く。
+  この context 状態には設定窓・消しゴムと隠蔽加工の session も含め、Box ごと既存の bundle と交換する。
+  App 共通の `Box<MaskDetectState>` はこの投影先と catalog を持ち、交換するのは context の Box だけ。
+  保存する検出設定も `Settings.mask_detect: Box<MaskDetectSettings>` に置く (保存形式は同じ)。
+  消しゴム・隠蔽加工の編集中の mask / shapes / Undo は、既存の foreground 共通 draft のままである。
+  service の一時 mount はその draft を交換しない。実際の foreground 引き渡しでは旧 owner 上で
+  検出を取消・モードを reset してから新しい editor を開始する。この取消境界も検査する
+  (session の照合だけで別 editor への誤適用を防ぐとは考えない)。補正レイヤーの文書は bundle 所有。
   3 ツールで別々の待ちを持たない。根拠は **共通の受付が、待ちがある間は新しい検出を受け付けず (置き換えない)、
   開始時に捕捉した対象 1 つだけを所有する**こと (Sol レビュー R4 P2)。「同じ context で 2 つのツールを同時に
   編集しない」ことは根拠にしない: 今のコードでは、同じ入力のまとまりに Ctrl+G と Ctrl+M があると補正レイヤーと
@@ -401,6 +448,9 @@ impl Drop for MaskDetectPending { fn drop(&mut self) { self.cancel.store(true, R
 | 後処理 | 表示用テクスチャを無効にし、`clear_erase_preview(fs_idx)` で古い補完のプレビューを捨てる。**補完はここでは始めない** (次のプレビュー押下・確定・終了の既存の操作で走る。`commit_erase_shape` と同じ。R4 P2) | `commit_conceal_shape` と同じ (`conceal_mask_texture = None`・`clear_conceal_caches(idx)`) | `set_local_adjust_layers_for_target_with_undo` が行う (書き込み worker と再計算) |
 | 選択 | 選択中の図形を外す | 同左 | 同左 |
 
+補正レイヤーで 1 件以上を採用したときは、手描き・バケツと同様に `local_adjust_show_mask = true` にする。
+0 件・キャンセル・照合不一致では表示状態も変えない。
+
 - **検出が 0 件のとき・キャンセルしたとき・照合で捨てたときは、どのツールでもマスクも文書も変えず、Undo も積まない**
   (補正レイヤーでも空の書き先を作らない、`Raster` を変換しない)。
 - 「描画 / 消去」の切替 (D / F) は見ない。検出は常に **書き先へ足す** (描画)。補正レイヤーで書き先が
@@ -419,6 +469,8 @@ impl Drop for MaskDetectPending { fn drop(&mut self) { self.cancel.store(true, R
 
 モデルが壊れている・読めない・推論に失敗した・GPU のメモリが足りない、はログとエラー表示で終わる
 (既定の割り切り)。再試行・自動で別の検出器に切り替える・途中の結果を残すことはしない。
+自動検出の結果・0 件・対象変更・警告・エラー・フォルダを開く失敗の通知は、すべて `ActionSurface::Viewer` を指定する。
+メインの全画面でも別ウィンドウでもビューアー面だけで描き、後ろのメイングリッドへ二重に出さない。
 
 ## 8. 配布・ライセンス・公開文書
 
@@ -479,6 +531,22 @@ impl Drop for MaskDetectPending { fn drop(&mut self) { self.cancel.store(true, R
 
 `perf::event` を「検出の開始」「セッション準備」「推論」「後処理」「結果の追加」に入れる (ツール名を付ける)。
 
+段 1b は共通の `trace_label`（App が `erase` / `conceal` / `local_adjust` を渡す）で次の event を追う。
+detect / runtime 層は label の値を解釈せず、ツールの型・UI 状態を参照しない。既存の label なし API は互換 wrapper として残す。
+
+| 区間 | event |
+|---|---|
+| 開始 | `mask_detect/start`（既存の `tool` と `trace_label`） |
+| 一覧の読み込み完了 | `mask_detect/catalog`（`readable`・`unreadable`・`ms`、worker 完了時だけ 1 件） |
+| セッション準備 | `ai/external_session_prepare`（`trace_label`・`cache`・`ms`） |
+| 推論 | `ai/detect_faces_inference`（`trace_label`・段の `w/h`・`ms`） |
+| 後処理 | `ai/detect_faces_postprocess`、全段をまとめる `ai/detect_faces_postprocess_merge_nms`（同上） |
+| 結果の追加 | `mask_detect/apply`（既存の `tool` と `trace_label`・件数・寸法・`ms`） |
+
+前処理と検出全体の event にも同じ label を付ける。セッション準備はファイル identity の照合・独立 Mutex の取得待ち・cache の取得 / load を含み、
+`f(session)` を呼ぶ直前で閉じる。`cache=hit/loaded` を区別し、`key_failed/lock_failed/load_failed` も記録する。
+これは load だけの時間ではなく、取得待ちを含む準備時間である。cache の FIFO と EP 登録・失敗の扱いは変えない。
+
 ## 11. 段階
 
 ### 段 0 — 実物の確認 (設計を確定させるための調査、コードは本体に入れない) — **2026-11-27 完了、結果は §17**
@@ -508,7 +576,7 @@ YuNet の同梱、外部モデルのセッション、検出 worker とモーダ
 
 ### 段 2 — 追加の検出器 (BYO)
 
-検出器フォルダと一覧の worker、Ultralytics の 3 形式の読み取り、分類の選択、輪郭パッチ、json による上書き、
+検出器フォルダと一覧の worker、Ultralytics の 2 形式（detect / segment）の読み取り、分類の選択、輪郭パッチ、json による上書き、
 読めないファイルの表示、マニュアルの検出器の表 (§8)。
 
 ### 段 3 — 複数の画像への一括適用 (後で決める)
@@ -721,3 +789,994 @@ Ultralytics の汎用モデルと ultralytics 本体 (AGPL-3.0) は、この作�
 - 大きな画像で結果を足す 1 回の時間 (Undo の複製と表示用テクスチャ) は、段 1 の perf ログで測る (§11)。
 - YuNet の ONNX は段 1 で `vendor/models/` に置き、バックアップへもコピーする (取得物の sha256
   `ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0`、opencv_zoo の LFS の値と一致)。
+
+## 18. 段 1a の実装引き継ぎ (2026-11-27)
+
+- 範囲は同梱物・外部セッション・YuNet の純粋な検出層まで。UI・worker の起動と待ち・マスクへの
+  変換と書き込みは段 1b、Ultralytics の読み取りは段 2 のまま。
+- `model_manager` は `EmbeddedAsset::Model(ModelKind)` と `FaceDetectorYuNet` を分離し、
+  `face_detector_yunet_path()` を追加した。既存の展開先と portable の loose モデル解決は共通のまま。
+  `build.rs`・portable 同梱一覧・bootstrap に YuNet を追加した。MIT 本文は追跡する
+  `YUNET-LICENSE.txt` にも置き、ソフトウェア情報・インストーラ・portable で全文を供給する。
+- 外部セッションは `AiRuntime` の独立 Mutex が所有する。正規化したパス・サイズ・更新時刻を鍵にし、
+  読み込み順 FIFO で最大 2 件。参照では順序を変えず、3 件目の構築前に最古のセッションを閉じる。
+  最適化・EP 登録・ロードを既存モデルと共有し、外部モデルには TensorRT を登録しない。
+  EP 登録失敗時の扱いは実装依頼に従い既存 helper を維持し、外部モデル専用の CPU 再試行は追加していない。
+- `ai::detect` の結果は `Detection { class_idx, score, rect }` (元の画像の px) とした。
+  §5.3 の形・余白付き `DetectedBox` は段 1b で変換する。縮小には image crate の面積平均に近い
+  `imageops::thumbnail` を使い、丸め後の各軸の倍率で座標を戻す。YuNet の 12 出力は名前と形を検証する。
+  キャンセル・型付きエラー・各段の前処理／推論／後処理と全体の perf event を備える。
+- 合成出力・段寸法・BGR/ゼロ埋め・復元/切り詰め/NMS・同梱パス・外部キャッシュ/破棄・独立ロック・
+  MIT 本文のテストを追加した。実装担当は負荷の指定により cargo のビルド／テスト／check／clippy を
+  実行しない。設計担当の実行フィルター:
+  `cargo nextest run -p mimageviewer --lib -E 'test(/detect|external_model|embedded_asset/)'`。
+- この作業では他の worktree とツリー外のバックアップ先を変更しない。モデルの外部バックアップへの
+  コピーは設計担当へ引き継ぐ。モデル実体は指定の 229,738 バイトと上記 SHA-256 に一致した。
+- **段 1a の実装の独立レビュー (2026-11-27、Sol gpt-6.1-sol / xhigh、実装担当とは別、対象 ec0f385f5)**: **ACCEPT**
+  (P1・P2 なし)。P3 の 2 件は設計担当が反映した: §6.2 に既存の EP 登録の失敗時の挙動を受け継ぐ例外を明記、
+  `detect.rs` に重なりの除去の閾値 (IoU 1/3 の箱で 0.3 と 0.5 を見分ける) と各軸の倍率 (切り詰めの無い箱) のテストを追加。
+
+## 19. 段 1b の実装引き継ぎ (2026-11-27、未コンパイル・未テスト)
+
+### 19.1 接続した範囲
+
+- `app/mask_detect.rs` に 3 ツール共通の受付、ダイアログ、`MaskDetectRequest`、context 所有の
+  `MaskDetectPending`、worker、結果の照合と採用を追加した。同梱 YuNet の顔検出だけを接続し、段 2 は未実装。
+- 入力は §5.1 の各ツールのソースを Arc で捕捉する。context・page key・items 世代・マスク寸法・入力 Arc・
+  編集 session を開始時と照合し、補正レイヤーでは `PageEditOwner` と最新受付済み文書も照合する。
+  0 件・取消・不一致ではマスク・文書・Undo を変えない。
+- `apply_mask_detect_to_erase` / `apply_mask_detect_to_conceal` / `apply_mask_detect_to_local_adjust` が
+  既存の手描き 1 操作と同じ経路で図形を足す。消しゴムは古い補完プレビューを捨てるだけで補完を開始しない。
+  補正レイヤーは既存の Undo 付き保存へ渡し、必要な Raster 変換・未作成 override の作成もその 1 操作へ含める。
+- 設定は `Settings.mask_detect` の 1 キー（楕円 / 矩形・余白・閾値）で共有する。未リリースのため移行は不要。
+  `settings_transfer` では既存のツール設定と同様に除外する。余白は検出した幅・高さの指定 % を
+  **各辺の外側へ追加**する（15% なら全幅・全高は 1.3 倍）。
+- `launch_mask_detect_worker` は本番の YuNet とテストの推論注入で共有する。worker の活動 lease は
+  ランタイム待ちから thread 終了まで保持し、待ちを取消・破棄しただけでは解放しない。
+- ダイアログと進行表示は embedded を含む fullscreen の closure だけで描き、ROOT で重ねて描かない。
+  表示中・検出待ち中のモーダル判定は 3 ツールで共有する。
+- open / capture は本の追加 Undo の busy 検査だけを行う。`admit_book_append_followup_mutation` は
+  照合済み・非 0 件の apply だけで呼び、表示・取消・0 件で追加 Undo の receipt を破棄しない。
+- poll が Empty のときは live context に 100 ms 後の repaint を予約する。parked context の未完了 receiver も
+  all-context poll の対象に残し、ROOT の起床を継続する。
+
+### 19.2 先例の出現箇所との対応
+
+| 箇所 | 段 1b の対応 |
+|---|---|
+| `app.rs` | `LocalAiRemoteBarrierSnapshot` のフィールド・is_quiesced・blocker_summary、App のフィールド・初期値、`local_ai_remote_barrier_snapshot` に追加。破棄は `install_loading_items_inner`、`invalidate_idx_state_and_queues`、`reset_detached_pause_foreground_modes`、`finish_fullscreen_edit_modes`、`close_fs_exclusive_conflicts` の 5 か所へ追加 |
+| `book_append_undo` / `prepared_edit` | 自動検出の待ちを既存の編集・停止判定へ追加 |
+| `update_phases` | 待ちの間の再描画要求へ追加 |
+| `viewer_context_registry` | has 判定、全 context の poll、`cancel_superseded`、bundle の型・初期化・take / swap、async field inventory に追加 |
+| `ui_adjustment_panel` の segmentation start / poll | 既存の別処理として維持し、`mask_detect_available` 側で被写体マスク・LUT の待ちとの競合を排除 |
+| `page_edit_owner` の inventory / reproject | 開始時の照合条件を保持するため追加しない。items 世代を付け直さない |
+| `app/page_edit_owner_tests.rs` の先例初期化 2 か所 | 変更なし。既存の segmentation 検査を維持し、自動検出の所有・破棄は専用テストへ追加 |
+| `app/prepared_edit/tests.rs` の先例初期化・照合 | 変更なし。既存の segmentation の conflict 検査を維持 |
+| `app/tests.rs` の barrier literal・blocker 名 | literal に新 field（false）を追加。従来の blocker 名の期待値は維持 |
+
+### 19.3 入力と計装
+
+- 消しゴムのキャンバス有効フラグより前には `EditPreviewHoldState::read` だけがあり、操作キーの消費はない。
+  その helper は既に Modal を拒否する。新しい操作は disabled の canvas transport で遮断し、Cancel の配送を残す。
+- 補正レイヤーは `LaToolBucket` などの操作キーを消費するより前に blocked を判定し、Cancel を配送して戻る。
+  左右のパネルとキャンバスで同じ入力遮断を使う。
+- 目のプレビューの先読みは新しい開始を抑え、既存の保持と release の後始末を残す。
+  無効化されたパネルの Response だけに依存せず、既存の押下は目の矩形外へ動かしても release まで継続する。
+- perf は `mask_detect/start`（tool・ms）、`mask_detect/apply`（tool・count・width・height・ms）、共有の
+  `mask/texture_rebuild`（tool・width・height・ms）を追加した。補正レイヤーの既存
+  `mask_preview_rebuild` は継続する。大画像での Undo 複製・マスク texture 再作成の実測は未実施。
+
+### 19.4 追加したテストと検証の引き継ぎ
+
+以下は追加したテスト名であり、成功の記録ではない。`src/app/mask_detect/tests.rs`:
+
+```text
+mask_detect_three_tools_add_one_edit_and_undo_once
+mask_detect_zero_and_cancel_do_not_change_masks_documents_or_history
+mask_detect_stale_identity_size_source_and_edit_session_are_discarded
+mask_detect_same_source_arc_is_adopted_through_poll
+mask_detect_local_raster_conversion_and_absent_overrides_are_one_undo
+mask_detect_overlapping_modes_only_change_captured_tool
+mask_detect_cancel_drops_queued_result_and_releases_modal_input_block
+mask_detect_erase_invalidates_preview_without_starting_inpaint
+mask_detect_other_local_ai_mask_and_lut_requests_prevent_detection
+mask_detect_real_worker_holds_activity_while_waiting_and_cancel_releases_it
+mask_detect_dialog_actions_fit_small_screen_at_100_and_200_percent
+```
+
+`src/app/mask_detect/input_tests.rs`:
+
+```text
+mask_detect_modal_blocks_tool_keys_raw_canvas_and_both_local_panels
+mask_detect_eye_preview_rejects_start_but_keeps_existing_hold_until_release
+mask_detect_mode_exit_and_index_invalidation_cancel_only_owned_request
+mask_detect_cancel_keeps_inference_activity_until_worker_really_finishes
+mask_detect_remote_and_append_undo_wait_reject_all_three_tools
+mask_detect_settings_roundtrip_and_missing_key_defaults_are_shared
+mask_detect_margin_geometry_and_paint_operation_are_independent_of_tool_erase_toggle
+mask_detect_addition_invalidates_only_the_target_page_cache
+mask_detect_open_cancel_and_zero_keep_book_append_undo_receipt
+mask_detect_expanded_dialog_keeps_actions_outside_scroll_at_small_screen
+mask_detect_parked_context_poll_and_close_leave_sibling_masks_unchanged
+mask_detect_parked_empty_receiver_keeps_root_poll_awake_until_result
+```
+
+- ONNX を使わない App の結果注入、共有 worker への推論注入、実 egui の小画面レイアウトと入力配送を対象にする。
+  レイアウトには「詳細」を展開した 1093×614・200% の検査も含む。snapshot PNG は変更していない。
+- 共有 runner へ引き継ぐフィルター（未実行）:
+  `cargo nextest run -p mimageviewer --lib -E 'test(/mask_detect/)'`。
+- 親担当の実行結果: `python scripts/check_ui_glyphs.py` は危険 glyph 0、
+  `python scripts/check_site_cards.py` は 55 cards・over 0。
+- `cargo fmt`（引数なし）は終了コード 0。build / test / check / clippy は一切未実行、
+  `git add` / commit も未実行。コンパイル・テスト・実機確認・大画像の性能測定は引き継ぎ先で実施する。
+- この節は実装範囲と検証状況の記録であり、設計との差異や未対応事項の承認を表さない。
+
+## 20. 段 1b の実行検証からの修正 (2026-11-27)
+
+設計担当の run-heavy で本体 `cargo check -p mimageviewer --bin mimageviewer-core` は成功した。
+テストの型推論エラーは設計担当が `input_tests.rs` の待機 channel を `mpsc::channel::<()>()` に修正した。
+その後の `mask_detect|^ai::detect::` は利用者報告で 34 件中 28 件成功・6 件失敗。
+実装担当は失敗ログとコードを調べ、以下を変更した。修正後のコンパイル・テストは設計担当へ引き継ぐ。
+
+| 失敗 | 原因の分類と変更 |
+|---|---|
+| 追加 Undo receipt の保持 / UndoAppend 待ち拒否の 2 件 | fixture の誤り。`AppendReceiptBuilder` は追加ファイルが空なら `finish()` で拒否する。実 PNG を 1 枚作って `record` し、現在の構成の照合も通る receipt を共通 fixture で用意する |
+| parked Empty receiver / parked poll と close の 2 件 | fixture の所有の仮定が誤り。直接 stash しても erase/conceal の foreground draft は交換されないので、owner 上で採用した shapes が復帰後も App に見える。投影 context への誤配を示す失敗ではない。bundle 所有の補正レイヤーで、非空の sibling 文書・cache Arc の不変と Undo の captured page key を検査する |
+| 詳細を開いたダイアログの操作行 | 測定の誤り。`ScrollAreaOutput.inner_rect` は `auto_shrink` 前、親のカーソルは `Prepared::end` の縮小後 `outer_rect` で進む。テスト用の本文 geometry は親が実際に確保した下端で記録し、画面内・Window 内・本文より下という全操作ボタンの検査を維持する |
+| 目プレビューの新規受付 | 消しゴム側の実装の誤り。`Response::is_pointer_button_down_on()` は enabled と独立の capture flag なので、パネルを無効にしても真になり得る。OR でその flag を通さず、blocked 中は既存 active・物理 down・新 press なしだけを既存 merge に渡す。新規開始を拒否し、既存保持・矩形外移動・release は残す |
+
+- `lifecycle_tests.rs` に実際の park と close → retire → 新 context の editor 入場を使う回帰を追加した。
+  3 ツールで旧 cancel と receiver の破棄を確かめ、遅延した旧結果が新しい mask / shapes / 文書 / Undo /
+  cache / pending を変えないことを検査する。隠蔽加工は hydration worker を動かさず、本番の採用入口へ既知の空マスクを渡す。
+- `tests.rs` の共通ソース fixture を抽出し、通常の結果採用と lifecycle 検査で同じ入力を使う。
+  設計担当の `channel::<()>()` の 1 行は維持する。既存の失敗した 6 テスト名は維持し、新規 2 テストも `mask_detect` filter に含める。
+- 実行結果とソースからの判断を区別する。上記 34 件の結果は設計担当の観測であり、今回の修正後の成功を意味しない。
+- 今回の `cargo fmt` と `git diff --check` は終了コード 0。cargo の build / test / check / clippy と
+  git add / commit は実行していない。再検証は同じ `test(/mask_detect|^ai::detect::/)` filter で行う。
+
+## 21. 段 1b の P2・P3 対応 (対象 eb9f86384、修正後の実行検証待ち)
+
+- P2: 補正レイヤーの非 0 件の結果を採用した後に選択マスク表示を ON に戻す。
+  手描き・バケツは共通 helper ではなく直接フィールドを更新しているため、同じ形にした。
+  `apply_mask_detect_output` の 0 件・取消・照合不一致の帰路ではこの更新に到達しない。
+- 新規回帰 `mask_detect_local_adopted_result_enables_mask_display` は OFF → 非 0 件の採用 → ON を検査する。
+  既存の `mask_detect_zero_and_cancel_do_not_change_masks_documents_or_history` と
+  `mask_detect_stale_identity_size_source_and_edit_session_are_discarded` に、OFF の保持を追加した。
+- P3: §10 の 5 区間に共通の `trace_label` を付けた。App だけがツール名を label に変換し、
+  `detect_faces_with_trace` と `with_external_session_traced` は label を解釈せず event に載せる。
+  旧 API は `unspecified` の互換 wrapper として維持する。段間の NMS も後処理として計測する。
+- 外部セッションの準備はファイル照合前から開始し、cache の hit / load を区別して callback 直前に閉じる。
+  新規回帰 `external_model_mask_detect_perf_label_survives_key_failure` は perf publisher を子 process へ隔離し、
+  ONNX をロードせず、前処理 → セッション準備失敗 → 全体の実ログで label が一致することを検査する。
+- 所有・lifecycle・入力の遮断は変更しない。`detached-rework-plan.md` は設計担当の変更を維持し、本対応では触らない。
+  コンパイル・テストの実行は設計担当へ引き継ぐ。
+- `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。cargo の build / test / check / clippy、
+  git add / commit は実行していない。再検証は `test(/mask_detect|^ai::detect::/)` で追加テストを含めて実行できる。
+
+## 22. lib 全件テストの失敗と非推奨 Id の修正 (対象 8144ef46b、修正後の実行検証待ち)
+
+- 設計担当による本体 lib 全件（21,036 件）の実行で、設定分類の件数と App のサイズ上限の 2 件が失敗したとの報告を受けた。
+  今回の実装担当は cargo の build / test / check / clippy を実行しない。
+- `mask_detect` は形・余白・閾値をまとめた Settings の 1 フィールドで、分類表には既に「環境設定外のツール設定」として
+  除外登録されていた。隠蔽加工と同じ除外を維持し、固定件数を総数 525 / 対象 174 / 除外 351 に更新する。
+  `mask_detect_tool_settings_are_excluded_from_preferences_transfer` を追加し、書き出しに含めず、読み込みで手元の 3 設定を
+  上書きしないことを検査する。
+- 大きな待ち状態は App と bundle の両方で `Option<Box<MaskDetectPending>>` に変更し、本番の生成と結果注入 fixture を揃える。
+  `local_adjust_segmentation_pending` は既存の inline 保持のまま。履歴遷移・PDF 採用などの Box 化の先例に合わせ、今回追加した待ちだけを対象にする。
+  取消・結果の照合・context の移譲は同じ pending を使う。`history_transition_storage_keeps_app_stack_footprint_bounded` の
+  110,000 バイトの上限は維持し、待ちフィールド自体が pointer 1 個分であることの検査を追加する。
+- Window と共有テストデータのキーはグローバルな Id なので `Id::unique` に揃え、テストの読み取りも同じ呼び出しにする。
+  ローカルな ScrollArea の `id_salt` は既存の書き方を維持する。`Id::new` は `Id::unique` への互換呼び出しだったので hash は変わらない。
+- `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。コンパイル・テストの再実行は設計担当へ引き継ぎ、git add / commit は実行していない。
+
+## 23. 段 2 の実装引き継ぎ (2026-11-27、未コンパイル・未テスト)
+
+### 23.1 実装した範囲
+
+- `ai::detector_catalog` に直下の ONNX + 同名 json と、1 階層のフォルダ内 `model.onnx` + 任意の sidecar を追加した。
+  配置形式を明示して扱い、直下の `model.onnx` をフォルダ形式と取り違えない。別の検出器の json を横取りして読まない。
+  worker 内の `entry.file_type()`、差し替え可能な ONNX reader、型付きの読めない理由、分類名と入力サイズ・閾値の優先順位、
+  Python dict の名前 parser、動的分類数の名前からの解決 / 1 回の灰色推論を持つ。
+- `runtime` の一覧専用 helper は CPU・最適化なしの一時 Session を作り、外部モデル表には入れない。
+  既存の `ExternalModelKey` のパス・サイズ・更新時刻を一覧情報と検出要求で共有する。
+- 一覧 owner は App 共通の boxed `DetectorCatalogState`。ダイアログの open / 再読込で worker を開始し、
+  ランタイムの準備待ちから読込の終了まで活動 lease を保持する。UI は Loading と結果の表示・受信だけ。
+  context bundle・detached の述語と viewport 経路は変更しない。フォルダの作成と Explorer 起動も worker に置き、
+  失敗通知には既存の外部操作の通知 channel を使う。
+- `ai::detect::ultralytics` は RGB / NCHW の LetterBox、縮小・拡大とも半画素の 2×2 双線形、最大分類の選択、
+  選択分類・分類別閾値、分類ごとの IoU 0.7 の NMS と全体 300 件上限を実装する。
+  segment は箱の中の元画像の画素中心から元マスクへ写し、ロジットを双線形に読んで 0 より大きければ内側とする。
+  ロジットの計算・確保は、箱に必要な双線形の隣接画素を含む元マスクの範囲に限る。
+  太らせは §23.8 の修正で円形近傍へ変更し、既存の二乗ユークリッド距離変換でパッチ内だけを線形走査する。
+  推論ごとに出力数・形式・分類数を検査し、ファイル identity の変化は型付き `DetectorChanged` で全体を中止する。
+- `MaskDetectRequest` は検出器情報・選択・形・閾値・余白を複製して固定し、一覧再読込と独立させた。
+  worker は顔と選ばれた BYO を順に実行し、検出器間の NMS はしない。箱・輪郭パッチ・分類ごとの件数をまとめる。
+  UI の対象照合は段 1 のまま、検出器のファイル照合は worker 側だけに置く。
+- 3 ツールの既存 apply 関数で、Undo の区切り → パッチ範囲の OR / alpha 1.0 → 図形の末尾追加 → 後処理を行う。
+  補正レイヤーの `alpha_mut()` はパッチループ外で 1 回。Raster の変換・未作成 override の準備も同じ Undo に含める。
+  パッチだけ・図形だけの結果も採用し、0 件・取消・照合不一致では文書・マスク・Undo・表示状態を変えない。
+- `Settings.mask_detect` は 3 ツール共有の 1 キーを維持し、顔の選択、輪郭の余白、検出器名ごとの選択・分類・形・閾値を追加した。
+  未リリースなので移行なし。設定転送の除外は維持する。保存してある輪郭指定で箱のモデルへ入れ替えた場合は矩形を使い、
+  保存値自体は残す。
+- ダイアログに読める / 読めない行、分類・形・詳細の閾値、フォルダ操作、配布とライセンスの説明を追加した。
+  20 行の混在した一覧で 1093×614・100% / 200% の操作行を検査する headless テストを追加した。PNG の追加・生成はしていない。
+- マニュアル `detectors.html` と、目次・サイドバー・3 ツールからのリンクを追加した。形式を確かめた 5 件、配布元とライセンス、
+  JSON、余白・形・閾値、見落としと合成順を説明する。製品ページと Store 文言は変更していない。
+
+### 23.2 設計本文の整合と参照テスト
+
+- §5.2 の古い表の IoU 0.5 / 0 以上、§11 の Ultralytics 3 形式という記述を、§5.3・段 0 と今回の依頼に合わせて
+  IoU 0.7 / 0 より大きい / detect と segment の 2 形式へ訂正した。§4〜§6 に配置形式・設定・不変な要求・CPU 一覧読取を明記した。
+  製品機能を減らす設計変更は行っていない。段 3 の一括適用は実装していない。
+- ignored `detect_ultralytics_reference_matches_external_models` は `MIV_DETECT_REFERENCE` の外部 JSON を読み、
+  外部モデルの実セッション経路で検出し、同分類・箱 IoU ≥ 0.5 の全組を IoU 降順に貪欲に 1 対 1 に対応させる。
+  対応箱は全組 IoU ≥ 0.85・score 差 ≤ 0.05、かつ全ケースの全組を合わせて 95% 以上が IoU ≥ 0.95 とする（ケースごとの割合の平均ではない）。
+  未対応は両側とも score < 閾値 + 0.03 だけ許す。輪郭は対応箱の IoU にかかわらず全組 IoU ≥ 0.9 を検査する。
+  参照 PNG は Ultralytics の余白前の結果なので、同じ推論・読取経路の private 入口から半径 0 を渡して比較する。
+  製品入口の余白は常に最小 2px で、円形の太らせと端の切詰めは別の単体テストで検査する（円形への変更は §23.8）。
+  ONNX・画像・参照 JSON は追加していない。この ignored テストは既存の nextest `gpu` group に登録した。
+- **設計担当の判断による基準の変更**: CPU と DirectML の推論・縮小の固定小数点の差で、確からしさの低い大きな箱の縁が動く数値差を許容する。
+  設計担当が TurboJPEG 入力で照合した case 4 の分類 5 では、score 約 0.40 の大きな箱が IoU 0.910382 となり、他の対応はすべて 0.98 以上だったとの報告に基づく。
+  各ケースの件数・対応数・境目の許容数・IoU 0.95 未満の組数・各最小 IoU、最後に全体の組数・0.95 以上の割合・箱と輪郭の最小 IoU を出してから失敗をまとめる。
+- 参照テストの JPEG は既存の `thumb_loader::decode_jpeg_turbo_scaled_from_path(path, u32::MAX)` で等倍・EXIF 向き未適用の画素を読む。通常 fullscreen の canonical 経路は `image::open` と向き適用を行うため使わず、依頼で許可された既存 TurboJPEG helper を使う（製品コードは変更しない）。
+  未対応箱は両側とも、本人の分類・score・xyxy と、相手側全箱の最大 IoU の箱の分類・score・IoU をケース名付きで出す。今回の基準変更後の実モデル照合は実装担当では未実行。
+
+### 23.3 追加・拡張したテストと実行の引き継ぎ
+
+以下の追加テスト名は成功の記録ではない。すべて既存のフィルター
+`test(/mask_detect|^ai::detect::/)` に含まれる。実モデル参照だけは ignored のため明示実行が必要。
+
+`src/ai/detector_catalog.rs`:
+
+```text
+mask_detect_catalog_placements_are_one_level_and_errors_remain_visible
+mask_detect_catalog_root_model_uses_file_name_and_its_override
+mask_detect_catalog_file_sidecars_do_not_read_sibling_package_metadata
+mask_detect_catalog_names_thresholds_shape_and_license_priority
+mask_detect_catalog_malformed_relevant_json_is_not_hidden_by_priority
+mask_detect_catalog_python_dict_handles_quotes_escapes_punctuation_and_sequential_keys
+mask_detect_catalog_dynamic_channels_use_names_or_probe_once
+mask_detect_catalog_validates_format_class_count_and_all_tensor_types
+mask_detect_catalog_scalar_threshold_overrides_package_default_but_not_class_values
+mask_detect_catalog_mixed_dynamic_spatial_axes_keep_fixed_input_contract
+mask_detect_catalog_input_size_priority_and_fixed_shape_consistency
+```
+
+`src/ai/detect/ultralytics/tests.rs`:
+
+```text
+detect_ultralytics_letterbox_python_round_padding_and_roundtrip
+detect_ultralytics_resize_is_two_by_two_halfpixel_in_both_directions
+detect_ultralytics_selects_max_class_before_selection_and_class_threshold
+detect_ultralytics_nms_uses_point_seven_per_class_and_caps_globally
+detect_ultralytics_nms_precedes_original_coordinate_clipping
+detect_ultralytics_mask_multiplies_all_coefficients_and_interpolates_logits_before_threshold
+detect_ultralytics_mask_sampling_uses_original_centers_and_replicated_edges
+detect_ultralytics_mask_accepts_nonquarter_prototypes_and_computes_only_box_roi
+detect_ultralytics_crop_original_box_before_circle_dilation_and_clip_patch
+detect_ultralytics_circle_dilation_matches_naive_neighborhood
+detect_ultralytics_runtime_shapes_and_nonfinite_data_return_errors
+detect_ultralytics_changed_file_rejects_catalog_identity_without_onnx_load
+detect_ultralytics_rejects_invalid_options_and_honors_cancel
+detect_ultralytics_reference_matches_external_models
+detect_ultralytics_reference_matching_is_global_iou_greedy_with_half_iou_cutoff
+detect_ultralytics_reference_box_quality_enforces_floor_and_pair_weighted_global_ratio
+detect_ultralytics_reference_mask_quality_requires_point_nine_for_every_matched_box
+detect_ultralytics_reference_jpeg_uses_full_size_without_exif_orientation
+detect_ultralytics_reference_unmatched_diagnostic_searches_all_opposite_classes
+detect_ultralytics_reference_allows_only_strict_boundary_unmatched_on_either_side
+detect_ultralytics_reference_enforces_one_to_one_class_iou_and_score_difference
+```
+
+`src/app/mask_detect/stage2_tests.rs`:
+
+```text
+mask_detect_mixed_patch_and_box_patch_only_and_box_only_undo_as_one_edit
+mask_detect_settings_preserve_missing_detectors_and_all_class_semantics
+mask_detect_selection_requires_face_or_readable_selected_nonempty_classes_and_captures_options
+mask_detect_catalog_loading_worker_runs_off_ui_and_retains_activity_until_terminal
+mask_detect_summary_omits_zero_counts_and_limits_detail
+mask_detect_replacing_segment_with_detect_keeps_saved_shape_but_uses_rect
+mask_detect_many_readable_and_unreadable_rows_scroll_with_visible_actions
+mask_detect_unselected_face_collapses_shape_and_details_but_keeps_shared_margin
+mask_detect_loading_row_disables_reload_without_changing_selection
+mask_detect_patch_writes_only_true_bits_with_clipped_bounds
+mask_detect_cancelled_or_stale_mixed_results_preserve_masks_document_undo_and_visibility
+mask_detect_chosen_detector_uses_json_defaults_and_explicit_class_threshold_shape
+```
+
+既存の `mask_detect_local_raster_conversion_and_absent_overrides_are_one_undo` は混合結果を受け取るように広げ、
+`mask_detect_settings_roundtrip_and_missing_key_defaults_are_shared` は追加設定と各欠損キーの既定も検査するよう広げた。
+その他の段 1 の所有・照合・入力・Undo テストは維持する。
+共有 runner で通常 filter の実行、本体 check、必要な全件 gate を行い、参照 JSON を用意できたら次も実行する（今回未実行）:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/mask_detect|^ai::detect::/)'
+cargo nextest run -p mimageviewer --lib --run-ignored ignored-only -E 'test(=ai::detect::ultralytics::tests::detect_ultralytics_reference_matches_external_models)'
+```
+
+### 23.4 この実装担当が実行した検証
+
+- cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリの起動は、今回の依頼によって未実行。
+  コンパイル・テスト・実モデル照合・実機確認・性能測定の結果は設計担当へ引き継ぐ。
+- git add / commit は未実行。他の worktree・リポジトリ外のファイルは変更していない。
+- `cargo fmt`（引数なし）は終了コード 0。`python scripts/check_ui_glyphs.py` は危険 glyph 0、
+  `python scripts/check_site_cards.py` は 55 cards・超過 0。`git diff --check` は終了コード 0。
+  新規マニュアルのローカルリンク 42 件は参照先ファイルが存在した（外部ページの取得・照合はしていない）。
+- 実装担当は作業の中で、別のコンテキストにソースの確認を依頼した。そこで指摘された `ModelMetadata` の借用が
+  Session の移動まで残る問題は、内側のスコープで借用を終える形へ直した。**これは実装担当の内部の確認で、
+  設計担当が依頼する独立レビューではない** (独立レビューは §23.6 に記録する)。
+
+- **共有 runner の実行後のテスト期待値修正（設計担当報告）**:
+  `cargo check -p mimageviewer --bin mimageviewer-core` は成功、
+  `test(/mask_detect|^ai::detect|detector_catalog|external_model|settings_transfer/)` は 154 件中 153 件成功・1 件失敗との報告を受けた。
+  失敗は `mask_detect_expanded_dialog_keeps_actions_outside_scroll_at_small_screen` の両倍率に `Fits` を期待した箇所。
+  報告された本文高 267pt / 表示領域 179pt は、段 2 で追加したフォルダ操作・説明を含む本文が
+  200% の 546.5×307pt の画面に収まらないことと整合する。本文上限は画面・利用可能高から操作行ぶんを引き、
+  操作行は ScrollArea の外で描くため、今回の修正では製品コードを変えない。
+  空の一覧を明示した fixture で、詳細展開時の期待を 100% = `Fits` / 200% = `Scrolls` に分け、
+  両倍率で Window が画面内、2 個の操作ボタンが画面内・Window 内・本文下端より下にあることを検査する。
+  多数の読める / 読めない行を並べる stage2 テストは両倍率で `Scrolls` を検査する別の規模として維持する。
+  その後、設計担当から修正後の同フィルター 154 件すべて成功との報告を受けた。実装担当は cargo check / nextest を実行していない。
+
+### 23.5 変更ファイル一覧
+
+実装・設定・テスト:
+
+```text
+.config/nextest.toml
+src/ai/detect.rs
+src/ai/detect/ultralytics.rs
+src/ai/detect/ultralytics/tests.rs
+src/ai/detector_catalog.rs
+src/ai/mod.rs
+src/ai/runtime.rs
+src/app.rs
+src/app/mask_detect.rs
+src/app/mask_detect/input_tests.rs
+src/app/mask_detect/stage2_tests.rs
+src/app/mask_detect/tests.rs
+src/external_links.rs
+src/settings.rs
+src/ui_adjustment_panel.rs
+src/ui_conceal.rs
+src/ui_erase.rs
+```
+
+設計・運用文書:
+
+```text
+docs/README.md
+docs/architecture-overview.md
+docs/async-architecture.md
+docs/auto-conceal-detection-plan.md
+docs/conceal-feature-plan.md
+docs/gpu-test-groups.md
+docs/local-adjustment-layer-v1.1.0-plan.md
+docs/preset-and-adjustment.md
+docs/spec.md
+docs/ui-responsiveness.md
+```
+
+マニュアル（本文・目次・共通ナビ）:
+
+```text
+htdocs/mimageviewer/manual/adjustment.html
+htdocs/mimageviewer/manual/ai-integration.html
+htdocs/mimageviewer/manual/analysis.html
+htdocs/mimageviewer/manual/annotation.html
+htdocs/mimageviewer/manual/books.html
+htdocs/mimageviewer/manual/browser-integration.html
+htdocs/mimageviewer/manual/changelog.html
+htdocs/mimageviewer/manual/clipboard-capture.html
+htdocs/mimageviewer/manual/collections.html
+htdocs/mimageviewer/manual/conceal.html
+htdocs/mimageviewer/manual/detectors.html
+htdocs/mimageviewer/manual/effetune.html
+htdocs/mimageviewer/manual/erase.html
+htdocs/mimageviewer/manual/export.html
+htdocs/mimageviewer/manual/external-tools.html
+htdocs/mimageviewer/manual/faq.html
+htdocs/mimageviewer/manual/formats.html
+htdocs/mimageviewer/manual/fullscreen.html
+htdocs/mimageviewer/manual/gamepad.html
+htdocs/mimageviewer/manual/getting-started.html
+htdocs/mimageviewer/manual/grid.html
+htdocs/mimageviewer/manual/index.html
+htdocs/mimageviewer/manual/known-issues.html
+htdocs/mimageviewer/manual/local-adjustment.html
+htdocs/mimageviewer/manual/metadata-transfer.html
+htdocs/mimageviewer/manual/music-video.html
+htdocs/mimageviewer/manual/music.html
+htdocs/mimageviewer/manual/remote.html
+htdocs/mimageviewer/manual/search.html
+htdocs/mimageviewer/manual/settings.html
+htdocs/mimageviewer/manual/shortcuts.html
+htdocs/mimageviewer/manual/stack.html
+htdocs/mimageviewer/manual/tags.html
+htdocs/mimageviewer/manual/troubleshooting.html
+htdocs/mimageviewer/manual/tutorial.html
+htdocs/mimageviewer/manual/video.html
+```
+
+### 23.6 設計担当が依頼した独立レビューの P2 対応（対象 7ca8732ff、修正後の検証待ち）
+
+- 設計担当から、別担当 Sol / xhigh の独立レビューは **REJECT、P1 なし・P2 3 件**との全文を受領した。
+  設計担当も 3 件をコードと照合して妥当と判断した。以下はその修正であり、修正後の独立レビューの結果ではない。
+- P2-1: 顔の選択を採用する前に、選択済み BYO があれば一覧が Ready であることを受付条件に加えた。
+  同じ条件を UI のボタンと要求捕捉で使い、Loading 中に顔だけの要求を作らない。
+  Ready 後の読めない／不在／分類未選択は設定を残し、顔が選ばれていれば顔だけ、選ばれていなければ開始不可とする。
+- P2-2: Ultralytics の輪郭読取でパッチの全 false を除外し、対応する検出候補も返さない。
+  worker の既存の結果合流を `MaskDetectOutput::append_ultralytics_result` へ抽出し、分類別件数は採用候補と揃える。
+  箱／楕円のモードは輪郭が空でも有効な箱を残す。UI に空パッチを捨てる追加走査やガードは足さない。
+- P2-3: 参照照合の輪郭の下限を、対応箱の IoU によらず 0.9 へ戻した。0.8 への緩和は撤回し、§23.2 と単体テストを更新した。
+  箱の貪欲対応・全組 0.85 以上・全体 95% 以上が 0.95 以上、score 差と未対応の境目の基準は維持する。
+- 追加テスト（成功の記録ではない）:
+
+```text
+mask_detect_selected_byo_blocks_start_until_catalog_ready_and_is_captured
+mask_detect_ready_unavailable_byo_requires_face_or_another_executable_detector
+mask_detect_empty_contour_worker_result_keeps_masks_history_targets_and_visibility
+mask_detect_contour_counts_follow_adopted_worker_detections
+detect_ultralytics_empty_contours_drop_candidates_and_keep_nonempty_patches_aligned
+```
+
+輪郭の既存テスト `detect_ultralytics_mask_multiplies_all_coefficients_and_interpolates_logits_before_threshold` は
+全ゼロのロジットで候補も空になる検査に広げた。基準テストは
+`detect_ultralytics_reference_mask_quality_requires_point_nine_for_every_matched_box` に改名し、
+箱 IoU 0.95／0.949／0.85 のいずれでも輪郭 0.9 は成功・0.899 は失敗になる条件を検査する。
+App の 0 件テストは 3 ツールと補正レイヤーの Raster／未作成追加／未作成削除を対象に、
+件数・マスク・文書・Undo・表示状態・「見つかりませんでした」を検査する。
+すべて `test(/mask_detect|^ai::detect::/)` に含まれる。
+
+- cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動、git add / commit は実行しない依頼で、未実行。
+  自動検証・実モデル照合・独立レビューの再判定は設計担当へ引き継ぐ。
+- 今回の `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。`python scripts/check_ui_glyphs.py` は危険 glyph 0。
+
+### 23.7 段 2 の検証と独立レビュー (2026-11-27、設計担当)
+
+- 設計担当の run-heavy: `cargo check -p mimageviewer --bin mimageviewer-core` 成功。
+  `test(/mask_detect|^ai::detect|detector_catalog|external_model|settings_transfer/)` は 166 件成功 (ac335361d)。
+- 実モデル照合 (ignored): 参照はリポジトリの外で ultralytics 8.4.219 の CPU 推論 (conf 0.25・iou 0.7・`retina_masks`、
+  EXIF の向きを無視) で作った。yolo11n と yolo26n-seg、利用者の写真 6 枚 (読み取りのみ)。mIV は DirectML。
+  83 組・IoU 0.95 以上 97.6%・箱 IoU 最小 0.89・輪郭 IoU 最小 0.988 で成功。最初は件数の完全一致で落ち、
+  閾値の境目の候補と、確からしさ 0.40 の大きな箱 (IoU 0.91) が原因だったので、§23.2 の基準 (IoU 0.5 の貪欲対応・
+  境目だけ未対応を許す・全組 0.85 以上かつ 95% 以上が 0.95 以上・輪郭は全組 0.9 以上) に改めた。
+  テストの画像の読み込みは製品と同じ TurboJPEG (`image::open` では cv2 と画素が違った)。
+- **独立レビュー (Sol gpt-6.1-sol / xhigh、実装担当とは別)**: R1 (対象 7ca8732ff) は **REJECT** (P1 なし・P2 3 件:
+  一覧の読み込み中に顔だけで開始できる、全 false の輪郭を 1 件として採用する、照合で輪郭の下限を 0.8 へ緩める)。
+  3 件とも妥当と判断して実装担当が直した (§23.6)。R2 (対象 ac335361d) は **ACCEPT** (新しい指摘なし)。
+
+### 23.8 サブ PC の観測による余白表示・一覧ログ・ダイアログの層の修正（修正後の実行検証待ち）
+
+- 観測者はサブ PC の Claude。追加検出器が 0 個でも輪郭の余白が出ることと、一覧読み込みの記録がログに残らないことを観測したとの報告を受けた。
+  設計担当がこの 2 点を修正対象と判断した。今回の実装担当は実機での観測・起動をしていない。
+- 追加の観測もサブ PC の Claude による写真付きの報告: 隠蔽加工で自動検出を開いて閉じ、隠蔽パネルを閉じてから
+  消しゴムで自動検出を開くと、消しゴムのパネルがダイアログの上に残り、2 秒後も文字が読めなかった。
+  最初に隠蔽加工から開いたときはダイアログがパネルの上に出ていたとの報告。今回の実装担当自身の再現ではない。
+- 消しゴム・隠蔽加工・補正レイヤーの実パネルと自動検出の 2 Window は、修正前はいずれも `Order::Foreground` だった。
+  vendored egui の Area は押下や再表示で同じ Order の中の前後を変え、Memory の層順序がその記憶を使うことをソースで確認した。
+  初回だけでなく「前フレームに無かった Area」も最前へ移すため、初回／2 回目だけによる原因の断定はしない。
+  同一 Order の履歴依存を除くため、設計担当が示した補正レイヤーの「追加」「マスク種類変更」「加工内容を選択」の先例へ揃え、
+  r8 では自動検出の設定と進行の両 Window を `Order::Debug` にした（後述の独立レビュー R3 の指摘で撤回）。
+  毎フレームの最前面化・再描画要求・Window Id の変更は追加していない。
+- 他の fullscreen の面はソースを確認し、通常のメニュー／popup は `Foreground`、tooltip と feedback toast は `Tooltip` のまま維持する。
+  r8 では重なる場合に自動検出 Window が上になる関係まで正解としたが、この判断と回帰の期待は R3 で撤回した。
+  Tooltip を覆う根拠はなく、現在は後述の Foreground と modal layer でパネルだけを下に保つ。実機での修正後の見え方は未確認。
+- 余白の表示条件を在メモリの一覧・選択・形から解決する。輪郭は選択済みで読める輪郭検出器が 1 つ以上ある場合だけ、
+  箱は顔または選択済みで読める箱検出器がある場合に表示する。輪郭検出器で楕円／矩形を選んだ場合も箱の余白を使うため表示する。
+  不在・読めない・未選択・一覧の未完了からは検出器の種類を推測しない。余白の保存形式・値・既定は変更しない。
+- 一覧 worker は準備待ちと読み込みの完了後、フォルダのパス・読めた数・読めない数の要約を `crate::logger::log` で 1 行、
+  読めない検出器は表示名・型付き理由（enum の Debug）・詳細（Display）をそれぞれ 1 行出す。
+  空／フォルダなしも 0 / 0 の要約を 1 行出し、一覧全体の失敗は同じ要約に理由を含める。
+  引用形式で制御文字をエスケープし、複数行のエラーでも 1 行を維持する。
+- 同じ worker 完了箇所から `mask_detect/catalog`（`readable`・`unreadable`・`ms`）を 1 件出す。
+  `ms` はランタイム準備待ちと一覧読み込みを含み、ログの文章作成・送出より前に計測を終える。
+  `poll_mask_detect_catalog` と描画からは記録せず、一覧の読み込み 1 回につき 1 回に限定する。
+  normal / perf とも既存の非同期 log writer の publication を使い、UI スレッドへ新しい同期 I/O は足さない。
+- 設計担当が修正しないと判断した 2 点も維持する: `fs/page_turn_decision` の `reason=mask_detect` が毎フレーム出るのは
+  共通モーダルと同じ既存動作なので変更しない。置き方 b の `mismatch-names` が読めるのは ONNX の `names`（80 個）が
+  `labels.json`（3 個）より優先される §6.1 どおりで、試験の期待の誤りとの判断を受けた。名前の優先順位は変更しない。
+- マニュアルにも余白の表示条件を追記した。既存の小画面テストは空の一覧で箱のみ表示、詳細展開時は
+  100% = Fits / 200% = Scrolls を引き続き検査する。多数行では選択中の輪郭検出器と顔を並べる。
+  `mask_detect_unselected_face_collapses_shape_and_details_but_keeps_shared_margin` は選択中の箱検出器を明示し、
+  顔を畳んでも箱側の共有余白を残す検査にした。
+- 追加したテスト（共有 runner の結果と修正後の未実行箇所は後述、すべて `test(/mask_detect/)` に含まれる）:
+
+```text
+mask_detect_margin_sliders_follow_selected_readable_detector_kinds_and_keep_values
+mask_detect_margin_sliders_do_not_infer_detector_kinds_before_catalog_ready
+mask_detect_catalog_report_includes_counts_typed_reasons_and_error_details_on_single_lines
+mask_detect_catalog_report_empty_missing_and_failed_reads_each_have_one_summary
+mask_detect_settings_and_progress_layers_stay_above_real_panels_after_reopen_and_tool_switch
+```
+
+層の回帰は、同じ egui Context と両 Window Id の記憶を保持したまま、隠蔽加工 → 消しゴム → 補正レイヤーを繰り返し、
+各ツールでも 2 回ずつ開く。実パネルの背景を headless のポインター入力で押した後、設定・進行 Window を描き、
+`memory.layer_ids()` の順序と実際の重なり点の `layer_id_at` がダイアログを返すことを検査する。
+今回の実装担当はテストを実行しておらず、実機での解消も未確認。
+
+- r7・r8 の共有 runner による検証は設計担当の報告: core の `cargo check` は成功、
+  `test(/mask_detect|^ai::detect|detector_catalog|external_model|settings_transfer/)` は 172 件中 171 件成功。
+  余白スライダーのテストだけ、顔＋輪郭で表示条件は `(true, true)` の検査を通過した後、
+  描画文字の検査が `(true, false)` となって失敗した。
+- 原因は表示条件ではなくテストの検査方法。輪郭の余白は検出器の詳細行より後ろにあり、
+  ScrollArea は本文を表示範囲で切り抜く。vendored egui の Slider は Label を作るが、Label は
+  `ui.is_rect_visible(response.rect)` が偽なら文字を描画せず、`output.shapes` に現れない。
+  このため余白の有無は描画文字ではなく、UI と共通の `mask_detect_margin_visibility` で描画前後に検査するよう直した。
+  描画による保存値の維持と、既存の小画面・多数行でのスクロール／操作行の検査は残す。製品の表示条件は変更していない。
+  このテスト修正後の cargo 検証は未実行。
+
+- 続くサブ PC の Claude による観測と設計担当の判断: F12 の別ウィンドウで検出結果の通知がメインの右上にも出た。
+  輪郭の余白 4.1% では角張った塊になった。また、隠蔽パネルの表示直後／ボタン押下直後から開いた設定窓の重なりと、
+  検出中にパネルを押した際に進行窓が隠れる動きも報告された。今回の実装担当自身の実機観測ではない。
+- 通知の原因は面を指定しない発行。`fs_feedback_toast_surface` の説明と `draw_feedback_toast` の面ゲートを確認し、
+  自動検出の結果・0 件・対象変更は `show_feedback_toast_on(..., Viewer)`、エラーは既存の
+  `show_feedback_result_on(..., Viewer, Error)` を使う共通の小さな発行関数へ揃えた。
+  エラーの種類と既存の通知時間ポリシーは面指定の既存関数へ渡す。フォルダ起動 worker の失敗も、既存 channel の
+  root 側受信口で `DetectorFolder` だけ `show_feedback_warning_on(..., Viewer)` とする。他の外部操作の通知は変えない。
+  detached の述語・viewport・bundle・窓の寿命は変更せず、既存の Viewer 面の描画契約を利用する。
+- 輪郭の余白は、正方形近傍から円形（内側の画素までのユークリッド距離 ≤ 半径）へ変更した。
+  既存の `mask_db::squared_distance_map` を拡張・画像端で切詰め済みのパッチだけに適用し、半径の二乗以下を採用する。
+  2 軸の距離変換と閾値化は O(パッチの画素数)、距離の作業領域もパッチ内だけ。半径に比例する近傍走査や
+  全画像への拡張はしない。距離変換の前後と書き戻しの各行でキャンセルを確認する。余白の割合・最小 2px は維持する。
+  元の箱で切り抜いてから太らせる順番と、最小パッチの返却・空パッチの除外も維持する。
+- 新しい層順序の回帰は、実際の隠蔽パネルを描き、初回表示と同じ Context での再表示を対象にする。
+  ボタンを押さず直ちに開く場合と、実際の「選択」ボタンを press / release して変更を確認した次フレームに開く場合を検査する。
+  続いて進行窓が出ている間に露出したパネルのボタン位置を押し、press / release の各フレームで
+  `memory.layer_ids()` と重なり点の hit test が進行窓を上とすること、パネルのツールは変更されないことを検査する。
+  r10 時点では設定・進行 Window の `Order::Debug` は r8 のままとしたが、後述の R3 の修正で Foreground に戻した。
+- 追加したテスト（未実行、すべて `test(/mask_detect|^ai::detect/)` に含まれる）:
+
+```text
+mask_detect_results_empty_and_stale_feedback_only_paint_on_originating_viewer_surface
+mask_detect_errors_and_folder_warning_only_paint_on_viewer_surface
+mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_during_progress
+```
+
+  通知の検査はメイン全画面／別ウィンドウの両表示状態で、結果・0 件・対象変更を 3 ツールから注入し、
+  検出器変更など各 worker エラー・受信切断・大きさ不一致・フォルダ失敗も発行面と種類を検査する。
+  実際の `draw_feedback_toast` に MainWindow / Viewer を渡し、メインには文字を描かず Viewer にだけ描くことも検査する。
+  OS のスレッド起動失敗は強制せず、共通のエラー発行関数だけを直接検査する。
+  既存の太らせテスト 2 件は上記リストの `circle` 名へ置き換え、半径 0・1・2・4・20、種なし・全面・隅・中央・複数の種を
+  素朴な円形近傍と比較する。箱での切抜き・画像端の切詰め・太らせ時のパッチ位置と大きさの不変も検査する。
+
+- 設計担当からの報告: r7〜r10 のコミットは `a9a1c6e50`。独立レビュー R3 は REJECT、P2 1 件で、
+  Debug 指定が必要なトーストと tooltip を窓の下に隠す点を設計担当も妥当と判断した。
+  175 件と実モデル照合の成功は設計担当の報告であり、今回の修正後の実行結果ではない。
+  補正レイヤーの Debug の先例の目的はパネルの裏に潜らないことで、Tooltip 段を覆う根拠はないため撤回した。
+- 2 Window を Foreground に戻し、egui の `Modal::show` と同じく、描くたびに `set_modal_layer` へ登録する。
+  `Window::id` は `self.area.id(id)` へ直接渡されるため、LayerId はそれぞれ
+  `Foreground + mask_detect_settings` / `Foreground + mask_detect_progress`。別の派生 Id は作らない。
+  `is_above_modal_layer` / `allows_interaction` と `layer_id_at` が背面への押下・focus を遮断し、パネルがクリックで上がるのを防ぐ。
+  段 1 のパネル・キー・キャンバスの入力遮断も残し、egui の層による遮断で置き換えていない。
+- 初回／再表示の順序は `Area::begin` が `!visible_last_frame` のとき自動で最前面化し、`Areas::end_pass` が描画順へ反映する。
+  r11 時点ではこの仕組みだけで十分と判断したが、同じ pass でパネルも最前面化を求める場合は不足すると §23.10 で確認した。
+  r8・r10 の回帰を、パネル押下直後・別ツールからの再表示・検出中の押下について、開いた最初のフレームから各フレームの
+  層順序を検査するよう拡張した（修正後は未実行なので、最初のフレームの合格を確認した記録ではない）。
+  egui の modal layer は次の pass へ引き継がれる標準の仕組みで、定常時の modal id・背面の interaction 拒否も検査する。
+- `mask_detect_debug_windows_stay_above_menu_tooltip_and_toast_orders` は撤回・削除した。代わりに実際の Viewer 宛ての
+  エラートーストと実際の余白スライダーの hover 説明を窓に重ね、出力 shapes の描画順で窓より後になることを検査する。
+  通知ボタンは製品の `FeedbackAction::response` に press / release を渡してクリックできることを検査し、Explorer の起動はしない。
+  menu / combo は実際の親モーダル層に属する egui の代表 widget をテストだけで置き、開いた popup の項目のクリックを検査する。
+  popup は Foreground の新しい Area として上に上がり、Tooltip の通知・説明は段が上なので modal の入力制限を通る。
+  数値入力は実際の［詳細］の閾値スライダーを開き、DragValue → TextEdit の入力・focus・IMEOutput、
+  IME Preedit 中の Escape でダイアログを閉じないことを検査する。実 OS の IME 候補窓の実機確認は未実施。
+- R3 修正で追加したテスト（未実行、すべて `test(/mask_detect/)` に含まれる）:
+
+```text
+mask_detect_foreground_windows_keep_real_viewer_toast_above_and_action_clickable
+mask_detect_foreground_modal_keeps_real_margin_hover_tooltip_above_window
+mask_detect_foreground_modal_allows_menu_and_combo_popup_selection
+mask_detect_foreground_modal_keeps_details_numeric_input_and_ime_active
+```
+
+  既存の `mask_detect_settings_and_progress_layers_stay_above_real_panels_after_reopen_and_tool_switch` と
+  `mask_detect_windows_stay_above_conceal_panel_on_immediate_open_and_clicks_during_progress` も上記の最初のフレームと modal 判定へ拡張した。
+
+- r11 の共有 runner の結果は設計担当からの報告: core の `cargo check` は成功、filter は 178 件中 177 件成功。
+  数値入力・IME の回帰だけ、Preedit と生の Escape を同じフレームに注入した後の `platform_output.ime.is_some()` で失敗した。
+  その前の数値 0.42 の入力と、同フレームの `app.ime_input_active` は成功したとの報告。
+- 原因はテストの前提。vendored egui の `Focus::begin_pass` は生の Escape で widget focus を解除し、DragValue は
+  focus が無ければ TextEdit ではなく数値ボタンを構築する。TextEdit の IMEOutput は可視・編集可能かつ IME 所有時にだけ出る。
+  共有 `egui-ime::track_drag_value_focus` も、自由入力と異なり数値編集の Escape キャンセルでは focus を復帰しないと明記している。
+  `ime_input_active` は viewport の変換状態なので、同じフレームで true でも IMEOutput や数値欄の focus 維持を保証しない。
+  modal layer が入力を拒否した結果ではなく、この回の製品コードの変更はない。
+- `mask_detect_foreground_modal_keeps_details_numeric_input_and_ime_active` を、数値編集の IME Preedit → Commit で
+  0.73 が入り、focus・IMEOutput・モーダル層内の入力許可を保つ検査と、生の Escape を注入しても変換中のダイアログが閉じない
+  検査に分けた。後者では IMEOutput と元の focus の維持を要求しない。変換終了後に数値欄へ入り直して 0.58 を入力できること、
+  通常の Escape では閉じることも検査する。修正後は未実行、既存の `test(/mask_detect/)` に含まれる。
+  自動検出は本の構成・AI 連携の確認画面等と同じ `dialog_escape_pressed` を使い、未確定中は false、Commit / Disabled 後は通常キーを
+  通すという既存規則を維持する。他画面の回帰も変換中の Enter / Escape で画面を閉じないことを検査しており、数値欄の focus 維持は要求していない。
+
+- 設計担当からの報告: r11・r12 のコミットは `ce28d15f1`。独立レビュー R4 は REJECT、P2 1 件で、
+  別の Modal が上にあっても背面の設定窓が Escape を直接読んで閉じる点を設計担当も妥当と判断した。
+  R3 の遮蔽問題は解消しているとのレビュー結果で、cargo check・178 件・実モデル照合の成功は設計担当の報告として扱う。
+- `set_modal_layer` の widget 操作・focus の遮断は生の `ctx.input` の読み取りには効かず、`dialog_escape_pressed` 自身も
+  IME と popup を確認するだけなので、設定窓側で前面モーダルの所有を確認する。`top_modal_layer` が自分の LayerId のとき、
+  または最初のフレームでまだモーダル登録が無い `None` のときだけ、既存の helper による Escape の判定を通す。
+  他の LayerId が前面なら閉じない。標準 `ModalResponse::should_close` と同じ前面所有の考え方で、helper・既存の入力遮断・
+  登録の寿命・Window の Id と Order は変更しない。進行窓のキャンセルボタン等は widget の層制限を使う既存経路のまま。
+- 回帰は実際の `egui::Modal` を `external_tool_preparing` と同じ Id・純粋な描画本文で重ね、前面への登録を確認して Escape を送る。
+  自動検出窓→前面 Modal / 前面 Modal→自動検出窓の両描画順で、前面だけが閉じてキーを消費し、背面が残ることを検査する。
+  その Modal が閉じた後は次の通常 Escape で自動検出窓が閉じること、3 ツールで他の Modal が無い初回／表示後も閉じることを検査する。
+  外部操作の worker やプロセスは起動しない。追加テスト（未実行、`test(/mask_detect/)` に含まれる）:
+
+```text
+mask_detect_settings_escape_only_closes_front_real_modal_in_either_draw_order
+mask_detect_settings_escape_closes_without_other_modal_on_first_and_later_frames
+```
+
+- cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動、git add / commit は依頼に従い未実行。
+  修正後の自動検証と実機での表示・ログ／perf の観測は設計担当へ引き継ぐ。
+- r7〜r10 時点の `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。glyph 検査は危険 glyph 0、card 検査は 55 件・超過 0。
+  R3 の修正でも `cargo fmt`（引数なし）・`git diff --check` は終了コード 0、glyph 検査は危険 glyph 0。
+  R3 ではマニュアル・製品ページは変更していないため、card 検査は再実行していない。
+  R4 の修正は `cargo fmt`（引数なし）・`git diff --check` が終了コード 0。UI 文言・サイトは変更せず、glyph / card 検査は再実行していない。
+
+### 23.9 サブ PC の指摘の直しの独立レビュー (2026-11-27、設計担当)
+
+- 対象: a9a1c6e50 (サブ PC の指摘の直し)・ce28d15f1 (前面の段を egui のモーダルの層に)・e600c22df (Escape を前面のモーダルのときだけ)。
+  同じ独立レビュー担当 (Sol gpt-6.1-sol / xhigh、実装担当とは別) の R3〜R6。
+- **R3 REJECT** (P2): `Order::Debug` は Tooltip の段 (トースト・ツールチップ) より上なので、ダイアログを開いている間の
+  エラーのトーストや余白の説明が窓の下に隠れる。補正レイヤーの 3 つの窓の Debug は「パネルの裏に潜らない」ためで
+  (39d1e5647)、Tooltip より上に置く根拠は無い。全画面のダイアログの段は Middle / Foreground / Debug で統一されていない。
+  → `Order::Foreground` に戻し、egui::Modal と同じく `set_modal_layer` で窓の層を登録する形にした (先例 book_composition_editor.rs)。
+- **R4 REJECT** (P2): 別のモーダルが上にあっても Escape で背面の設定の窓が閉じる → 前面のモーダルのときだけ受ける形にした。
+- **R5 REJECT** (P2): 別のモーダルが初めて出るのと同じフレームに Escape が来ると、背面になる設定の窓が閉じ得る
+  (`top_modal_layer()` が前の pass の値のため)。
+- **R6 ACCEPT**: 設計担当の判断 (下) を妥当とし、R5 の P2 を撤回した。
+  - 前の pass を参照する 1 pass の遅れは egui::Modal と共通 (modal.rs:84〜87・162)。ただし完全に同じではなく、自動検出の窓は
+    登録が無い最初のフレームでも閉じ、Escape を消費しない。
+  - 起きたときの結果は設定の窓が閉じるだけ (`mask_detect_dialog = None`)。検出・マスク・文書・Undo・設定値は変わらない。
+    検出中の窓は Escape を受けない。リモートとサイドカーの復元の画面は Escape で確定・削除をしない。外部ツールの準備の画面が
+    同居すると、同じ Escape がその取消 (起動前) にも届き得るが、取り返しのつかない操作ではない。
+  - 利用者の操作でないモーダルが初めて出る 1 フレームに Escape が届く場合だけなので、pass をまたいだ Escape の所有の仕組みは
+    足さない (設計の簡素化)。
+- 設計担当の run-heavy: cargo check 成功、filter 180 件成功、実モデル照合成功 (e600c22df)。
+
+### 23.10 同じ pass の押下・離しで開き直す場合の層順序（実行検証待ち）
+
+- 観測者はサブ PC の Claude。`f078d1172` の再確認で、隠蔽加工の選択中の［筆 [B]］をクリックしてすぐ［自動検出…］を
+  クリックする b-2 だけ、パネルが窓の上に残り、0.3 秒後・1.8 秒後も変わらなかったとの報告。Ctrl+M 直後の b-1 と
+  検出中にパネルを押す b-3 は期待どおりとの報告。今回の実装担当自身の実機観測・起動ではない。
+- 設計担当の見立てはソース上で一致する。`Area::begin` はパネル上の press と窓の再表示でそれぞれ `move_to_top` を求める。
+  `Areas::end_pass` の `(order, wants_to_be_on_top)` による安定ソートは、両方が true なら元の上下を維持する。
+  同じ RawInput に press / release が入ると実ボタンの clicked で窓を同じ pass に開けるため、以前の Window Id がパネルより下なら
+  同点のままになる。次の pass 以降は modal layer がパネルの press を遮断するだけで、既に逆になった描画順を直す契機は無い。
+  これまでのテストはボタンを押した後で `open_mask_detect_dialog` を直接呼ぶか、窓を先に描いており、この同時要求を作っていなかった。
+- 再現テストは同じ Context で実際の各ツールの［自動検出…］から一度開き、［閉じる］で閉じ、選択済みの実際の［筆］へ press / release
+  を送る。Brush の Response が clicked になったことと、保存された Window の層が筆のパネルより下になった前提を確認したうえで、
+  実ボタンから同じ RawInput の press / release で再び開き、後続の pass の順序を検査する。分離した press / release も 3 ツールで検査する。
+  消しゴム・隠蔽加工では筆と検出が同じパネルなので、修正前の形では上記の同点が保たれ、後続 pass の「窓がパネルより上」の検査が
+  失敗するはずというソース上の根拠がある。補正レイヤーは筆と検出が別パネルで、この前提が異なる（下の r17 後の記録を参照）。
+  cargo の実行禁止により、この失敗も修正後の成功も実装担当は実行確認していない。
+- r14 の初案 A は表示開始の次の pass に限る 1 回の最前面化。egui の一時データに viewport Id + Window Id ごとの
+  `First(pass)` / `Visible(pass)` を持ち、連続する次の pass にだけ `ctx.move_to_top` を要求する。
+  同じ pass の二重呼び出しは無視し、非表示の間隙・明示的な閉じる操作・設定窓と進行窓の切替では表示開始を取り直す。
+  表示開始時だけ次の repaint を要求し、定常時には最前面化・追加の repaint を行わない。App や viewer context bundle へ新しい field は足さない。
+- 初案ではその 1 回を `top_modal_layer` が自分のときだけ許し、さらに自分より上に見えている別の Foreground の Area があれば見送る
+  （既知の 4 つのツールパネルだけは追い越してよい）。これにより modal 登録が 1 pass 古くても、最初の表示 pass に既に上へ出た別の
+  Modal を追い越さない。popup が開いている場合も見送る。見送った要求はその場で消費し、上位 Modal が閉じた後の再試行はしない。
+  Foreground を維持するため Tooltip の通知・説明も覆わない。R4 の Escape 所有と R6 の標準の 1 pass の遅れの判断は変更しない。
+- 進行窓も同じ Area の並べ替え規則を使うので初案は同じ表示 helper を使った。通常の［検出］からの遷移では設定窓の modal layer が既にパネルを
+  止めるため、パネルとの同時 press は作られないが、再表示と上位 Modal に対する同じ 1 回の処理を、結果注入で作った進行窓でも検査する。
+  対象照合・検出要求・worker・Undo・ツール側の入力遮断には変更を加えていない。
+- 初案で退けたもの: 同じ pass にその場でもう一度 `move_to_top` しても要求は集合なので同点を崩せない。毎 pass **無条件**に上げる形は
+  上位 UI の入力を奪い続ける。Debug は R3 の通知・tooltip 遮蔽を再発する。`set_sublayer` は複数パネルと popup の親子関係を新たに
+  固定し、1 段だけの sublayer の制約にも触れる。以下の比較で、無条件に上げる形と、不変条件の違反時だけ直す B は異なると整理した。
+- 追加テスト（未実行、既存 filter の `test(/mask_detect/)` に含まれる）:
+
+```text
+mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_three_tools
+mask_detect_front_layer_invariant_repairs_after_upper_modal_closes_for_settings_and_progress
+```
+
+  後者は A 用の `mask_detect_deferred_raise_yields_to_upper_modal_once_for_settings_and_progress` を B の検査へ置き換えたもの。
+  実際の別の Modal が最初の表示 pass に上へ出る場合に追い越さないこと、上位 Modal が閉じた後は再表示せずに順序を直せること、
+  表示開始から時間が経って起きた順序の逆転も直すことを検査する。3 パネルの変更は実ボタンの矩形・clicked を読む `cfg(test)` の計装と
+  Response の名前付けだけで、表示内容・操作・文字列は変更していない。
+
+#### 標準 Modal の順序保持の確認（r14 後の設計比較）
+
+- `vendor/egui/src/containers/modal.rs` の `default_area` は Foreground・interactable・`Sense::hover()` の Area を作る。
+  `Modal::show` は毎 pass `set_modal_layer(area.layer())` で入力所有を登録するが、自身では `move_to_top` を呼ばない。
+  最前面化は `area.rs` の `Area::begin` にある、move Response の clicked / dragged、`pointer_pressed_on_area`、
+  `!visible_last_frame` の条件に従う。Modal の hover の親 Response は通常 clicked / dragged を生じないが、押下判定と再表示の条件は残る。
+- backdrop は同じ Area の層に属する、`content_rect` 全体の CLICK / DRAG の child UI。背面への入力を受け止め、clicked は
+  `ModalResponse::should_close` の理由になる。そこで受けた押下が Area の `pointer_pressed_on_area` の条件を満たせば最前面化の契機にもなるが、
+  backdrop による別の層・無入力 pass ごとの最前面化・安定ソートの同点を崩す特別処理は無い。
+  `set_modal_layer` と `should_close` の前面判定も、描画順を直接並べ替えるものではない。
+- したがって標準 Modal でも、保存済みの層がパネルより下にあり、表示する pass にパネルと Modal の Area の両方が最前を求めれば、
+  `Areas::end_pass` の安定ソートで下のまま残り得る。これはソースからの判断で、標準 Modal 自体の実行再現は未実施。
+  `Modal` の doc comment も、複数の Modal が同じフレームに新しく出る場合の前後は未定義としている。
+
+#### A・B の比較と採用する不変条件
+
+| 観点 | A: 表示開始の次の pass に 1 回 | B: 各 pass で必要な順序を検査 |
+|---|---|---|
+| タイミング | 特定の次の pass だけが修復の機会。その pass に保留条件や同点があると失う | 表示開始の時点に依存せず、修復可能な pass で違反を直す。再び同点なら以後も検査する |
+| 「最前」の範囲 | 上位 modal / Area / popup を保護する guard が必要 | 同じ guard が必要。Foreground 全体を無条件に追い越す意味ではなく、ツールパネルとの順序を不変条件にする |
+| 状態 | viewport + Window ごとの First / Visible、pass 番号、閉じる／切替の初期化、見送った要求を消費する規則 | 本番用の一時状態なし。現在の modal・popup・可視層の順序から判定する |
+| パネルの識別 | 既知の 4 パネルを追い越してよい対象として識別 | 同じ識別を残す。状態は減るが、同じ Foreground のパネルと正当な上位 UI の区別は省けない |
+| 見送った後 | 上位 Modal 等が閉じても、自分を開き直さなければ直らない | 上位 Modal 等が閉じれば再表示せずに直る。表示開始後の別の逆転も対象になる |
+| 正常時の費用 | 状態の読み書きを毎 pass 行う | viewport 内の少数の層を確認するだけ。正常時は最前面化も追加の repaint も無い |
+
+- A が「次の pass」に頼る点は認める必要がある。次の pass にパネルが最前を求めないという根拠は、通常は同じ RawInput の
+  press / release が既に終わっていること。modal 登録だけでは十分ではない。誤った描画順でパネルが modal より上なら
+  `Memory::is_above_modal_layer` はパネルを上位と判定するため、Area の押下まで必ず遮断されるわけではない。
+  App の `ui.disable` はパネルのボタン操作を止めるが、Area 自身の `pointer_pressed_on_area` とは別である。
+- **結論: B の方が構造として正しいため、A から B に変更する。** 不変条件は「自分が前面 modal で popup が無く、
+  自分より上の可視 Foreground Area がツールパネルだけなら、窓をそれらのパネルより上へ戻す」。
+  他の Foreground Area が 1 つでも上にあれば上げないため、別の Modal や窓自身の menu / combo popup を毎 pass 追い越す形にはしない。
+  `top_modal_layer` は 1 pass 古いので、modal の照合と可視 Area の照合を両方残す。popup の有無も確認する。
+  Tooltip は別の上位 Order なので修復対象外で、通知・説明は窓より上のまま。
+- B も egui の pass の観測と end_pass の並べ替えを使う。直したい pass に別の同点要求が来ればその pass 内で直る保証は無いが、
+  違反が残れば次の pass も確認するため、A のように 1 回の機会を失って固定されない。R6 の標準の 1 pass の modal 所有の扱いは変えない。
+- 実装は `maintain_mask_detect_window_layer` を設定窓・進行窓で呼ぶだけとし、First / Visible・pass 番号・表示の cleanup・
+  次の pass のためだけの repaint を削除した。逆転を見つけて `move_to_top` したときだけ repaint を要求して再確認し、正しければ何もしない。
+  本番用の状態は追加していない（テスト専用の呼出回数の記録は本番に含まれない）。汎用の modal 管理機構や新しい callback は作らない。
+- 回帰は 3 ツールの実ボタンによる同じ RawInput / 分離した press・release を維持した。加えて設定窓／進行窓の順序を表示開始とは別の
+  後続 pass で意図的に逆転させ、上位の実 Modal を追い越さず、閉じた後に再表示なしで直すことを検査する。
+  既存の `mask_detect_foreground_modal_allows_menu_and_combo_popup_selection` に、実 popup の層が親より上で保たれ、項目をクリックでき、
+  親窓の追加の最前面化が発生しないことの検査も加えた。正常な順序に戻った後の複数 pass で追加の最前面化が無いことも検査する。
+  これらの追加・変更後の cargo 検証は未実行。全件が既存の `test(/mask_detect/)` に含まれる。
+
+#### r15 のテスト計装の Context 再入の修正
+
+- 設計担当からの共有 runner の報告: r15 は cargo check 成功、filter は 182 件中 181 件成功。
+  `mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_three_tools` だけ、egui の write lock を
+  10 秒取得できず debug panic になった。
+- 原因は 3 ツールの筆ボタンに追加した `cfg(test)` の計装。`ctx.data_mut` の closure 内で `(response.rect, response.clicked())` を
+  評価していた。`Response::clicked` は pointer のクリック成立時に `clicked_by` → `self.ctx.input` を呼び、
+  `Context::input` は読み取り用の API 名でも内部で `self.write` を使う。`data_mut` が保持する同じ Context の write lock へ再入していた。
+  CLICKED が無い pass は短絡評価で `ctx.input` を呼ばないため、実際の筆ボタンのクリックで初めて止まる。
+  テストは消しゴムから始まるので、最初の該当箇所は消しゴムの計装で、隠蔽加工・補正レイヤーにも同じ誤りがあった。
+- 3 箇所とも `response.clicked()` をロックの外で評価した tuple を作り、`data_mut` 内では値の保存だけを行うよう修正した。
+  この計装は `cfg(test)` なので本番にはコンパイルされず、今回の再入はテスト専用。通常の clicked 判定はもともと closure の外にあり維持する。
+- 本番でも到達する経路は別に確認した。`maintain_mask_detect_window_layer` の `memory` closure は Memory の値だけを読み、
+  popup 判定・`move_to_top`・repaint は closure の外。2 つの呼出箇所も Context のロック closure 内には無い。
+  `with_dark_context_style` の guard は Context の clone と Style の Arc を持つだけで、ロックを保持せずに callback を呼ぶ。
+  egui の `root_ui` / Area の `show` も、UI callback の実行時に Context のロックを保持しない。
+  テスト内の `memory` / `data` / `input` closure と残りの関連計装も確認し、矩形・bool・層の値の読み書きだけで再入は見つからなかった。
+  `Ui::is_enabled` / `Ui::visuals` / `Response::enabled` は Ui の保持値や flags の参照で、`Response::clicked` とは異なる。
+- 同じ回帰テストを維持する（`test(/mask_detect/)` に含まれる）。構造は 3 ツール × 同一／分離入力の 6 ケース、
+  各 28／29 回の有限な headless フレームで、待機 loop・sleep・blocking recv は無い。テストが保持する Loading の sender により
+  一覧の再読込は runtime 準備の前で return し、ONNX・一覧の worker は起動しない。画像は 8×8 の fixture。
+  10 秒の固定 lock 待ちを生む経路は除去したが、修正後の実行と「10 秒以内」の実測は cargo 実行禁止のため未確認。共有 runner へ引き継ぐ。
+- 実行: `cargo fmt`（引数なし）・`git diff --check` は終了コード 0、glyph 検査は危険 glyph 0。cargo の build / test / check / clippy / nextest、確認用 binary の build、
+  アプリ起動、git add / commit は依頼に従い未実行。共有 runner での再現／修正後の検証とサブ PC の実機確認は設計担当へ引き継ぐ。
+
+#### r15 の実ボタンクリックの fixture 修正
+
+- 設計担当からの共有 runner の報告: Context の再入による待ちは解消し、filter は 182 件中 181 件成功。
+  同じ回帰テストが `Conceal, together=true: real button must open the Window` で失敗した。
+  loop は Erase → Conceal → LocalAdjust、各ツールは together=true → false の順なので、消しゴムの両ケースは最後まで通過済み。
+  隠蔽加工の true は初回の分離入力での開閉・筆の clicked・古い層順の検査まで通過した。
+  隠蔽加工の false と補正レイヤーの両ケースは未到達であり、成功とは扱わない。
+- コード上の判定はテストの入力生成と検査の誤り（依頼の b）。旧 fixture は、窓の［閉じる］の位置から筆へ
+  PointerMoved と press を同じ RawInput で送り、release は次のフレームへ送っていた。
+  `PointerState::begin_pass` の delta は press より前の移動も含むフレーム間の差で、
+  `hit_test` は click 専用の筆と、その下の drag 専用 ScrollArea の両方を返す。
+  `interaction::interact` は drag 専用の背景を press 直後から dragged とし、隠蔽パネルの `DragScroll::Always` の native 経路は
+  その delta を `ScrollArea::begin` でスクロールへ渡す。本文はその更新より前の offset で配置されるため、
+  次の release フレームでは本文が動く一方、clicked は前の pass の widget ID によって成立し得る。
+  筆の clicked が通っても、次に使う［自動検出…］の描画矩形が clip 内にある保証はなかった。
+  製品の検出ボタンは 3 ツールとも普通の Button の clicked から共通の open へ進み、同一 RawInput の press / release を
+  除外する分岐は無い。egui の interaction 自身も、同一フレーム内で完了するクリックを drag としない。
+- fixture は各ボタンの位置へボタンを離したまま PointerMoved を 1 フレーム送り、次に静止したクリックを送る形へ直した。
+  スクロール状態のリセット、待ち時間、製品のスクロール・クリック処理の変更は加えない。
+  筆を押す前後で検出ボタンの矩形が動かないこと、実 widget ID の Response が enabled で、その中心が
+  clip 後の interact_rect 内かつ当該パネルの層にあることを検査する。
+  再表示時は引き続き **1 つの RawInput に press と release の両方**を入れるケースと、分離するケースを 3 ツールで検査する。
+  両 edge の hit-test の宛先が実検出ボタンの ID で入力可能であること、実 Response の clicked、窓の open、
+  後続の層順・不要な追加前面化が無いことまで検査する。sizing の再 pass があっても、クリックの証跡は同じ run_ui 内で保持する。
+  各ケースの完了も eprintln! に出し、途中失敗時の到達範囲を判別できるようにした。
+- 変更は既存の `mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_three_tools` と
+  3 パネルの cfg(test) の計装・本記録だけ。本番の処理は変更しない。Context の再入を避けるため、clicked は
+  data_mut の外で評価し、read_response・入力の宛先の取得も data / memory の closure の外で行う。
+  有限な 6 ケース・各 32 / 33 headless フレームで、worker・待機 loop・sleep は無い。
+  修正後の cargo 検証は未実行であり、スクロール量・修正後の実ボタンの成立の実測は共有 runner に引き継ぐ。
+- 実行: `cargo fmt`（引数なし）・`git diff --check` は終了コード 0、`python scripts/check_ui_glyphs.py` は危険 glyph 0。
+  cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動、git add / commit は未実行。
+
+#### r17 後の補正レイヤーのパネル配置に合わせた期待の修正
+
+- 設計担当からの共有 runner の報告: r17 後は消しゴム・隠蔽加工のケースが成功。
+  補正レイヤーの together=true の筆の層の検査だけ、実際の `local_adjust_panel` に対して
+  `local_adjust_tool_panel` を期待して失敗した。loop 順から前 2 ツールの 4 ケースは最後まで完了し、
+  補正レイヤーの true は初回の開閉後の筆の露出確認で停止、false は未到達。
+- コードで実際の配置を確認した。左の Foreground の Area `local_adjust_panel` は
+  `draw_local_adjust_left_panel` → `draw_local_adjust_manual_tool_selector` → `draw_local_manual_mask_tool_panel` で［筆］を描く。
+  右の別 Area `local_adjust_tool_panel` は、選択中のレイヤーの詳細の直前に［自動検出…］を描く。
+  筆が右パネルに覆われている製品の不具合ではなく、両ボタンが同じ層だとしたテストの誤り。
+- 一度窓を開いて閉じた後は両パネルより上にその Window Id の順序が残る。左の筆を押した後は下から
+  「右パネル < 窓 < 左パネル」で、検出のある右パネルは窓より下のまま。
+  右の検出ボタンの press / release と窓の再表示が同じ pass なら、前面化を要求する右パネルと窓の同点は
+  「右パネル < 窓」の順を保ち、要求しない左パネルはその下になる。
+  同じパネルの筆が検出パネル自身を窓より上にする消しゴム・隠蔽加工とは異なる。
+  これがサブ PC の Claude が補正レイヤーで重なりを観測しなかった経路と整合する理由。
+  補正レイヤーが常に逆転しないという一般的な保証とはしない。右パネルの別操作などで順序が変わる場合も、
+  既存の `maintain_mask_detect_window_layer` が左右両パネルを対象に不変条件を維持する設計は変えない。
+- テストは各ボタンの所属する LayerId を明示して、Response 自身の layer_id とポインター位置の hit test の両方を検査する。
+  筆の後は「筆のパネル > 窓」を 3 ツールで検査し、検出のパネルが窓より上なのは消しゴム・隠蔽加工だけと確認する。
+  補正レイヤーも同一 RawInput / 分離した press・release の両方で実検出ボタンへの両 edge の到達・clicked・open を検査し、
+  同一 RawInput の開いたフレームの終了時点と後続の複数フレームで窓が左右両パネルより上にあることを検査する。
+  この経路では不要な追加前面化が 0 回、消しゴム・隠蔽加工の同一 RawInput の同点修復は 1 回と期待を分ける。
+- 今回の変更は `src/app/mask_detect/input_tests.rs` と本記録。本番処理に新しい不具合は見つからず、変更していない。
+  既存の `mask_detect_reopened_from_real_panel_click_recovers_same_pass_raise_tie_for_three_tools` を拡張し、
+  `test(/mask_detect_reopened_from_real_panel_click/)`（従来の `test(/mask_detect/)` にも含まれる）で選択できる。
+  修正後の cargo 検証・実機確認は未実行。共有 runner での検証は設計担当へ引き継ぐ。
+- 実行: `cargo fmt`（引数なし）・`git diff --check` は終了コード 0。UI 文字列・マニュアルの変更は無い。
+  cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動、git add / commit は未実行。
+
+### 23.11 b-2 の直しの独立レビュー (2026-11-27、設計担当)
+
+- 対象 e8653c246。同じ独立レビュー担当 (Sol gpt-6.1-sol / xhigh、実装担当とは別) の R7 は **ACCEPT** (P1〜P3 なし)。
+- 統括から頼まれた比較について、レビューの判断: 「表示開始の次の pass に 1 回だけ」(A) は修復を見送ると逆転が残る。
+  今の「開いている間は毎 pass 確かめて修復する」(B) は追加の状態を持たず、違反が残れば後の pass でも直すので、B の採用が妥当。
+  同点になった pass の中で即座に直る保証は無いが、逆転が固定されない。popup・前面の別のモーダル・上に見えている未知の
+  Foreground の層があるときは上げず、Foreground の段の中の移動なので Tooltip の段 (通知・説明) も追い越さない。
+- egui::Modal は modal の登録と Area の通常の最前面化だけに頼り、安定ソートの同点を解く処理を持たない。実際に観測された
+  ツールパネルとの逆転に限って補う理由がある、とレビューは判断した。4 つのパネルの Id は、実ボタンの所属の層とクリックの到達を
+  照合するテストで、Id が変わったら検出できる。
+- 設計担当の run-heavy (e8653c246): cargo check 成功、filter 182 件成功、実モデル照合成功。
+
+### 23.12 master 取り込み (e62893dd1)
+
+実装担当による衝突解決とコード上の両立確認。進行中の merge を保持し、git add / commit / merge --abort は行わない。
+取り込み後のコンパイル・テスト・実機検証・独立レビューは **未実施**。設計担当へ引き継ぐ。
+
+#### 衝突の解決
+
+- `ui_conceal.rs` / `ui_erase.rs` の入場は、master のスライドショー停止と §1.914 のツール別取消・session 更新を両方残した。
+  §1.920 の入場受付と素材の取得が成功した後だけ変更する。消しゴムは旧要求を対象の切替前に取り消し、
+  入場の確定時に停止・session 更新を行う。隠蔽加工は非同期の完了の受付を確認してから停止・取消・session 更新を行う。
+  受理済みの移動により入場を断る段階ではこれらを実行しない。コードにも順序の理由を記した。
+- 補正レイヤーのパネルを閉じる処理とキーによる退出は master の `exit_local_adjust_mode` を採り、
+  自動検出の取消を同 helper の先頭へ移した。呼出側に重複した取消は置かない。
+  `switch_local_adjust_target_in_spread` はモードを継続したまま左右を替えるため、対象交代の取消を残す。
+  `toggle_analysis_mode` と `disable_non_paged_fullscreen_modes` は master でも同 helper を通らない専用退出であり、
+  素材・entry intent の処理順と `local_adjust_change_mask_keep_manual_override` の既存の扱いを保つため、
+  既存の退出列とその取消を残した。各箇所に理由を記した。
+- `app/tests.rs` は `mask_detect_pending` と操作スクリプトの heap storage の assert を両方保持した。
+- `settings_transfer.rs` は merge base `a38a3e4a3` の全 524 / 対象 174 / 除外 350 を起点に再集計した。
+  ブランチは `mask_detect` (除外) 1 件、master は `plane_view_lens` (対象) 1 件と
+  `operation_script_enabled` / `operation_script_notice_confirmed` (除外) 2 件を追加している。
+  合成後は **全 528 / 対象 175 / 除外 353**。マクロの通常項目・group 3 項目・除外項目の集合でも数え直し、一致した。
+- architecture / async architecture / detached 計画 §11 は両側の節を保持した。
+  architecture 冒頭の Windows 入力の説明は各機能の節より前へ置いた。同日の記録は各側の節内の順序を保った。
+
+#### §1.920 の終了・項目採用との両立（コード確認）
+
+- `app/page_edit_item_change.rs::end_page_edit_tools` は前面の所有 context だけに作用し、
+  `reset_conceal_mode` / `reset_erase_mode` / `exit_local_adjust_mode` が退出するツールの待ちと設定窓を取り消す。
+  別項目の open は `app.rs::open_fullscreen_with_metadata_boundary_inner` が旧 idx のうちにこの経路へ渡す。
+  同一項目の open は従来どおり消しゴムだけ reset し、他ツールの待ちを取消の巻き添えにしない。
+- items の採用は `app/page_edit_item_adoption.rs` が旧項目の存続を決め、継続しないツールを同じ終了経路へ渡す。
+  `continue_local_adjustment = true` では終了 helper が補正レイヤーと検出待ちを保持するが、items 採用による世代更新で
+  `mask_detect_request_is_current` の先頭の `items_generation` 比較に失敗する。
+  要求は reproject されない。同じページが残る場合でも、表示先が別ページになった場合でも旧結果を足さない。
+  加えて context・page key・ソース Arc・マスク寸法・`PageEditOwner`・最新文書を照合する既存の条件も保持した。
+  採用元も列挙した: 本の構成は `install_prepared_aggregate_items`、検索の採用は通常／準備済み install を経由する。
+  検索・snapshot の開始／復帰・項目削除では、世代更新後の `invalidate_idx_state_and_queues` が待ち自体も取り消す。
+  採用前の検証で中断して items が変わらない場合は、継続中の補正レイヤーと検出要求をそのまま保持してよい。
+- true close は `close_fullscreen_now_for_destination` が旧ページのうちに終了し、
+  `finish_fullscreen_edit_modes_with_preview` も同じ helper と context 固有の `cancel_mask_detect` を通る。
+  全画面終了・park・フォルダ切替・idx 失効の既存の取消を保持し、detached の述語・viewport 経路は変更しない。
+  まれな失敗は既存のログ + 通知の方針のままで、回復の仕組みは増やしていない。
+
+#### モーダル・前後関係・§1.363（コード確認）
+
+- §1.920 の門は `filename_stack_ui.rs::grid_item_input_block` で一覧の項目操作を拒否する。
+  検出窓のボタンからはこの門を呼ばない。案内は `notify_detached_viewer_editing_grid_input_blocked` が
+  拒否時だけ `ActionSurface::MainWindow` へ送り、`draw_feedback_toast` は Tooltip 層で描く。
+  viewer の Foreground の検出窓より下にはならず、面の指定によって viewer との二重描画も起こさない構成である。
+- **未変更の仕様判断候補**: 検出窓の表示中の ROOT キーは、`keyboard_ownership_snapshot` が
+  `any_dialog_open` により Modal 所有とし、`handle_keyboard` の `shortcuts_blocked_by_text_input` が
+  一覧の門より前に戻る。キー案内 helper 自体にも同じ条件があるため、この間の一覧キー操作では
+  §1.920 の案内が出ない。入力の拒否は維持され、トーストが描画順で隠れる問題とは異なる。
+  検出中にも一覧キーの案内を必須とするかは設計担当へ返し、モーダルの既存の所有・案内の優先順位は変更しない。
+- master の追加 UI を確認した。§1.917 のレンズ設定は環境設定内の ComboBox で、専用の Foreground Area は増えていない。
+  §1.363 の `operation_script_confirmation` は標準 Modal (Foreground)、手動順の確認窓は既定 Order の Window。
+  `maintain_mask_detect_window_layer` は既知の 4 パネルだけを追い越す規則のままにし、
+  上位の別 Modal・未知の可視 Foreground・popup があれば持ち上げない。新しい UI をパネルの許可表へ加えていない。
+  上位 Modal と実 popup を追い越さず、上位窓の終了後に順序を直す既存の headless 回帰も保持した。
+- `app/operation_script_runtime.rs::operation_script_eligibility` はツール編集中と `common_modal_dialog_open` の両方を拒否する。
+  自動検出の設定窓・検出待ちは `mask_detect_dialog_visible` を通じて後者へ登録済み。
+  slot 実行は評価前と操作間の再照合で、event は `begin_operation_script_event_detection` と適用時の再照合で同じ資格を読む。
+  自動検出中にスクリプトのページ移動・ツール切替が実行される受付漏れはコード確認では見つからず、製品コードは変更しない。
+- 3 ツールの cfg(test) の Response 計装と `mask_detect/{tests,input_tests,stage2_tests}.rs` の呼出先・fixture を照合した。
+  master で削除された App フィールドの参照や、明らかな旧関数名・旧引数の呼出は見つからなかった。
+  実ボタンの矩形・clip・hit-test と clicked のロック外評価は維持した。型の整合・実行結果はコンパイル待ち。
+
+#### 追加・更新した回帰（未実施）
+
+追加 (`src/app/mask_detect/tests.rs`):
+
+```text
+mask_detect_page_edit_920_exit_boundaries_cancel_three_tools
+mask_detect_page_edit_920_same_item_open_resets_only_erase
+mask_detect_page_edit_920_continuing_local_adoption_discards_old_result
+mask_detect_modal_blocks_operation_script_slots_and_events
+```
+
+既存 `mask_detect_mode_exit_and_index_invalidation_cancel_only_owned_request` は、補正レイヤーの直接の退出を
+`exit_local_adjust_mode` で検査するよう変更した。true close は追加テストと既存 lifecycle 回帰で引き続き扱う。
+継続採用の回帰は、採用後にソースの同じ Arc と編集可能なレイヤーを置き直し、一時的な cache miss に頼らず
+旧結果を捨てることを検査する。同じページの継続と、旧ページが残ったまま別ページを表示する場合の両方を扱う。
+全て既存の `test(/mask_detect/)` の対象。新たな worker・sleep・待機 loop・アプリ起動は加えていない。
+
+本取り込みへの対応で新しい機能制限・保存仕様の変更は加えていない。master の §1.920 の既定仕様
+(別窓の編集中は一覧の項目操作を拒否・入場でスライドショー停止・旧項目への退出保存) を保持する。
+この取り込みに対する独立レビューの結果はまだ無い。
+
+実施した整形・差分確認: `cargo fmt` (引数なし) と `git diff --check` は終了コード 0。
+衝突マーカーは残っていない。git add をしていないため index の unmerged entry と MERGE_HEAD は維持している。
+cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動は未実施。
+
+#### 取り込み後の 2 件の失敗への対応 (2026-11-28、検証未実施)
+
+設計担当からの報告: merge `d853ec222` と製品ページ `c119c5402` の後、run-heavy で関連 495 件と
+ui_snapshot 269 件を実行し、失敗は actual close の回帰と App の storage 上限の 2 件だった。
+以下はその報告とソースの確認に基づく修正で、**修正後のコンパイル・テスト・独立レビュー・実機検証は未実施**。
+
+**1. actual close の回帰は、前面所有と fixture の不一致。取消の接続不足ではない。**
+
+- 旧 `mask_detect_foreground_handoff_preserves_new_editor(true)` は `build_active_context_for_test` の
+  build callback で消しゴム・隠蔽加工の App 共通 draft を立て、main に戻したまま
+  `close_and_retire_context(owner, ..., close_fullscreen_content, ...)` を呼んでいた。
+- 同関数の `with_viewer_context_state` は service の一時投影であり、`enter_mount_scope(original)` が
+  元の main を前面所有者として保つ。`page_edit_tools_owned_by_projected_context` は
+  前面 id と投影先 id の一致を検査するため、§1.920 の `end_page_edit_tools` はこの draft を終えない。
+  一方、close の context 固有の後始末 (`finish_fullscreen_edit_modes_with_preview` の `cancel_mask_detect`)
+  は実行される。報告された失敗位置でも、旧 cancel と pending の検査を通った後にモードの assert が落ちている。
+  sibling の close が前面の draft に触れない製品の条件を緩めてはいけない。
+- close の fixture だけ、mounted main 自身に旧ツールを作り、既存の
+  `begin_mounted_detached_session_for_test` で別窓の session を結ぶ。
+  close の直前に前面 id と投影先の所有を assert して、true close の正規入口
+  `close_fullscreen_to_completion` を実行する (内部の content teardown で既存の退出・取消を通る)。
+  idx / pending / 3 モードの終了と cancel を確認してから、既存の promote / retire で旧 context を破棄し、
+  新しい main context で各ツールの通常入場を通す。旧 sender からの送信失敗、旧結果によるマスク・文書・Undo・
+  新しい pending / cache の不変の assert は全て維持した。park 側の経路は維持した。
+
+**2. App の追加状態を heap へまとめる。全体上限は変更しない。**
+
+- master との差分を棚卸しすると、App に直接追加されたのは待ち・設定窓・catalog・2 つの session の 5 項目。
+  見落とされていた追加は `App.settings` に inline で入る `Settings.mask_detect: MaskDetectSettings`。
+  64-bit の見積もりは、5 項目の論理サイズが 33 バイト (8 + 1 + 8 + 8 + 8)、検出設定が 40 バイト
+  (BTreeMap と 3 個の f32、2 個の bool、padding)。報告の App 差分 72 バイトは両者と配置の padding に整合する。
+  正確な旧フィールドの offset / padding は今回実測していない。ほかの追加 bool
+  `LocalAiRemoteBarrierSnapshot.mask_detect_pending` は関数が返す一時 snapshot のもので、App の常駐 field ではない。
+- `App.mask_detect: Box<MaskDetectState>` に catalog と投影中の `Box<MaskDetectContextState>` をまとめた。
+  `MaskDetectContextState` は pending・dialog・erase_session・conceal_session を所有する。
+  設定窓は元から bundle と交換される context 所有であり、App 共通へ変更しない。
+  `ViewerContextBundle` との交換は context の Box 1 つだけ。catalog の場所・受信口・取消フラグは動かさない。
+  empty / fork は新しい既定の context 状態を作り、drop は保持する pending の Drop で自身だけを取り消す。
+- `Settings.mask_detect` も `Box<MaskDetectSettings>` にする。serde のキー・値・既定値・設定転送での除外は変わらない。
+  要求の options は `as_ref().clone()` で従来どおり開始時の値を複製する。設定の別 owner や移行処理は作らない。
+- App に残る §1.914 の inline は **runtime の Box 8 + Settings 内の Box 8 = 計 16 バイト (64-bit)**。
+  context の Box は heap 上の runtime 内か bundle にあり、App に別途 inline で足さない。
+  `history_transition_storage_keeps_app_stack_footprint_bounded` に 4 箇所の storage の assert と各 payload の println、
+  App の runtime + 検出設定の合計が 2 ポインタ分である assert を追加した。`size_of::<App>() < 110_000` はそのまま。
+  全 App の新しい size_of は未取得。master 側の §1.917 の削減は別担当であり、本修正だけで全体の gate が通るとは扱わない。
+- cancel / book append 待ち / prepared edit / all-context poll / idle 再描画 / Remote の barrier の読み先も新しい owner に変更した。
+  bundle の pending 棚卸しテストは、Box の内側の pending も明示的に検査する形に更新し、監査から外していない。
+- 追加回帰 `mask_detect_context_box_swap_and_drop_keep_catalog_and_sibling_state` は、Box の往復で
+  pending・設定窓・session がまとめて移り、片方の破棄が自身の要求だけを取り消して、共通 catalog と sibling を保つことを検査する。
+  close 回帰と storage テストは既存名を維持する。全て未実行で、sleep・追加の worker・新しい待ち合わせは加えない。
+
+製品の close の所有条件・detached の述語・viewport 経路・利用者から見た操作・保存形式は変更しない。
+今回も cargo は整形の `cargo fmt` 以外を実行せず、git add / commit も行わない。修正後の検証は設計担当へ引き継ぐ。
+整形・差分の確認: `cargo fmt` (引数なし) と `git diff --check` は終了コード 0。
+
+#### 取り込みの検証と独立レビュー (2026-11-28、設計担当)
+
+- 設計担当が run-heavy 経由で関連テストを実行した。`2fa97266d` で nextest 1074 件 (mask_detect・page_edit_920・page_edit_item_change・
+  detector_catalog・ai::detect・settings_transfer・operation_script_runtime・conceal・ui_erase・about::・viewer_context_registry・
+  history_transition_storage・book_append_undo・prepared_edit・settings::) のうち 1073 件成功、ui_snapshot 269 件成功。
+- 残る 1 件は `history_transition_storage_keeps_app_stack_footprint_bounded` (`size_of::<App>() < 110_000`)。実測 App=110704 で、
+  master `e62893dd1` 単体の 110688 (§1.911 + §1.917) に、このブランチの inline 16 バイトが乗った値。§1.917 側が master で直す。上限は上げていない。
+- 独立実装レビュー (実装者とは別の GPT-6.1 Sol / xhigh、read-only): `d853ec222`・`c119c5402` は指摘なし ACCEPT、
+  `2fa97266d` も指摘なし ACCEPT。detached に触れた範囲 (registry の bundle の Box 交換) は症状パッチではなく所有境界を保つ
+  構造的変更と判断された。本体 lib の全件は master 取り込み後に統括が実行する。実機は取り込み後の版では未確認。
