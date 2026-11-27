@@ -1003,12 +1003,12 @@ pub struct EdgeTime {
 }
 
 impl EdgeTime {
+    /// Signed elapsed time; callers retain their own interval bounds.
     pub fn since(self, earlier: Self) -> f64 {
-        let difference = match (self.input, earlier.input) {
+        match (self.input, earlier.input) {
             (Some(later), Some(earlier)) => later - earlier,
             _ => self.pass - earlier.pass,
-        };
-        difference.max(0.0)
+        }
     }
 
     /// Wall time for ongoing drag/long-press/tooltip observations.

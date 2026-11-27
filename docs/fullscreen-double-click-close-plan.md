@@ -929,6 +929,11 @@ guard・遅延・再試行・時間切れを足さない。ClaudeCode と Codex 
 - egui: `PointerButtonTime` は provenance だけを挟んだ一致ボタンへ結合し、clock 不在・不一致・他イベントで捨てる。
   `EdgeTime` の入力時刻を pass 以下へ、同じボタンの離しを既知の押下入力時刻以上へ丸める。
   押下の長さ・押下時の回数・double / triple の履歴は `EdgeTime::since` を共有する。
+  追補: runner で既存の `folder_pane::tests::label_gesture_diagnostic_reports_double_click_delay_rejection` が失敗したとの
+  ClaudeCode の報告を受け、`since` の差を 0 へ丸めず符号付きで返すよう修正した。両端が入力時刻を持つときだけ入力差、
+  それ以外は pass 差を選ぶ規則は維持する。egui・一覧の従来の上限比較と、ツリーの `0.0..=max_delay` による
+  負の間隔の棄却をそのまま有効にする。注釈時刻の正規化とは別の規則であり、その丸めは変更していない。
+  共有規則のテストを符号保持の期待へ更新した。この追補の実行検証は未実施で、cargo は fmt のみ。
   進行中のドラッグ・長押し・velocity・tooltip は現在の pass を観測する既存経路に残す。
   `button_edges` と既存の release counts は同じ pointer_events を読み、cancel 後の edge はどちらにも残らない。
   vendor と本体の Event / PointerEvent match を棚卸しし、内部 scroll_area のパターンと focus_debug の表示名を追従させた。
@@ -983,7 +988,7 @@ input_state::timestamp_tests::timestamp_919_mixed_press_release_uses_pass_durati
 input_state::timestamp_tests::timestamp_919_edges_preserve_order_clicks_and_cancel_removes_owned_edges
 input_state::timestamp_tests::timestamp_919_pending_append_keeps_absolute_stamps_and_latest_clock
 input_state::timestamp_tests::timestamp_919_viewport_cancel_and_recreation_do_not_change_sibling_history
-input_state::timestamp_tests::timestamp_919_shared_interval_rule_clamps_negative_and_uses_whole_pair_clock
+input_state::timestamp_tests::timestamp_919_shared_interval_rule_preserves_sign_and_uses_whole_pair_clock
 ```
 
 Vendor: egui-winit --lib (native_pointer_time: Windows only)

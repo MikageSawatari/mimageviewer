@@ -281,7 +281,7 @@ fn timestamp_919_viewport_cancel_and_recreation_do_not_change_sibling_history() 
 }
 
 #[test]
-fn timestamp_919_shared_interval_rule_clamps_negative_and_uses_whole_pair_clock() {
+fn timestamp_919_shared_interval_rule_preserves_sign_and_uses_whole_pair_clock() {
     assert_eq!(
         EdgeTime {
             pass: 9.0,
@@ -308,5 +308,31 @@ fn timestamp_919_shared_interval_rule_clamps_negative_and_uses_whole_pair_clock(
         }),
         8.0
     );
-    assert_eq!(EdgeTime::from(1.0).since(EdgeTime::from(2.0)), 0.0);
+    assert_eq!(EdgeTime::from(1.0).since(EdgeTime::from(2.0)), -1.0);
+    assert_eq!(
+        EdgeTime {
+            pass: 9.0,
+            input: Some(1.0)
+        }
+        .since(EdgeTime {
+            pass: 2.0,
+            input: Some(1.25)
+        }),
+        -0.25
+    );
+    assert_eq!(
+        EdgeTime {
+            pass: 1.0,
+            input: Some(0.5)
+        }
+        .since(EdgeTime::from(2.0)),
+        -1.0
+    );
+    assert_eq!(
+        EdgeTime::from(1.0).since(EdgeTime {
+            pass: 2.0,
+            input: Some(0.0)
+        }),
+        -1.0
+    );
 }
