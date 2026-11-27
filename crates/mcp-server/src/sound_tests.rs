@@ -404,6 +404,16 @@ fn sound_chain_rejects_unbounded_parameter_rows_but_preserves_too_long_placehold
 
 #[test]
 fn sound_tool_descriptions_keep_lock_undo_recovery_and_risk_conditions() {
+    let effects = definition("sound_effects");
+    let value_note =
+        "Values use stored form; display gives screen units, ranges and conversion formulas.";
+    assert!(value_note.chars().count() <= 120);
+    assert!(
+        effects["description"]
+            .as_str()
+            .unwrap()
+            .contains(value_note)
+    );
     let tool = definition("sound_chain");
     let properties = &tool["inputSchema"]["properties"];
     assert_eq!(properties["effects"]["maxItems"], MAX_SOUND_STAGES);

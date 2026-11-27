@@ -201,6 +201,378 @@ vm.runInContext(`for (const name of ['createParameterControl', 'createLogarithmi
 const { describeEffect } = await loadModule('js/remote/effect-describe.js');
 const { DSP_AUTOMATION_CATALOG: dsp, DSP_PARAM_LAYOUTS: dspLayouts } = await loadModule('js/audio/dsp-params.generated.js');
 const { PARAMETER_HINTS: hints } = await loadModule('js/remote/parameter-hints.js');
+// The generated packers clamp in the saved representation, before Float32
+// conversion. Match every numeric slot, including arrays and object members;
+// packedOffset, rather than a guessed key name, joins it to its descriptor.
+const packRanges = new Map();
+const packKeyRanges = new Map();
+const dspSource = read(path.join(web, 'js/audio/dsp-params.generated.js'));
+for (const [, type, body] of dspSource.matchAll(/export function pack(\w+)Params\(params = \{\}\) \{([\s\S]*?)\n\}/g)) {
+    const slots = new Map();
+    const keys = new Map();
+    for (const [, offset, expression] of body.matchAll(/packed\[(\d+)\] = ([^\n]+);/g)) {
+        const min = /if \(value < ([-\d.e+]+)\) return/.exec(expression);
+        const max = /if \(value > ([-\d.e+]+)\) return/.exec(expression);
+        if (!!min !== !!max) throw new Error(`One-sided numeric pack clamp: ${type}[${offset}]`);
+        if (min && max) {
+            const range = { min: Number(min[1]), max: Number(max[1]) };
+            slots.set(Number(offset), range);
+            // Non-automatable public keys have pack slots but no descriptor
+            // (Bass Management / Spatial Mapper arrays and derived FIR delay).
+            const input = /const value = (.*?);/.exec(expression)?.[1] || '';
+            for (const match of input.matchAll(/params\["(\w+)"\](?:\[(\d+)\](?:\?\.\["(\w+)"\])?)?/g)) {
+                const [, key, element, member] = match;
+                const keyPath = element === undefined ? key : `${key}[]${member ? `.${member}` : ''}`;
+                if (!keys.has(keyPath)) keys.set(keyPath, []);
+                keys.get(keyPath).push({ ...range, offset: Number(offset), element: element === undefined ? null : Number(element) });
+            }
+        }
+    }
+    packRanges.set(type, slots);
+    packKeyRanges.set(type, keys);
+}
+
+// Actual UI conversions / increments. Paths use [] for each array element.
+// These are descriptions, never conversions applied to an AI write.
+const valueOverrides = {
+    // plugins/eq/tilt_eq.js:252-255 (hand-built slider edits ln Hz).
+    'TiltEQPlugin.f0': { step: 0.01, display: { unit: 'Hz', min: Math.exp(3), max: Math.exp(9.9), formula: 'exp(v)' },
+        evidence: { file: 'plugins/eq/tilt_eq.js', occurrences: [1, 1, 1, 3, 1], code: ['pivotLogSlider.min = 3.0;', 'pivotLogSlider.max = 9.9;',
+            'pivotLogSlider.step = 0.01;', 'pivotHzInput.value = Math.round(Math.exp(this.f0));',
+            'const clampedLog = Math.max(3.0, Math.min(9.9, logValue));'] } },
+    // plugins/lofi/simple_jitter.js:167-169 (hand-built slider edits dB).
+    'SimpleJitterPlugin.rj': { step: 1, display: { unit: 'ns', min: 0.001, max: 10000000, formula: '0.001*10^(v/20)' },
+        evidence: { file: 'plugins/lofi/simple_jitter.js', occurrences: [1, 1, 1, 2, 1, 3], code: ["jitterSlider.min = '0';", "jitterSlider.max = '200';",
+            "jitterSlider.step = '1';", 'const MIN_JITTER_NS = 0.001;',
+            'const rmsJitterNs = MIN_JITTER_NS * Math.pow(10, this.rj / 20);', 'jitterValue.textContent = this.getDisplayValue();'] } },
+    // plugins/analyzer/spectrum_analyzer.js:581-598 (exponent <-> point count).
+    'SpectrumAnalyzerPlugin.pt': { display: { unit: 'points', min: 256, max: 16384, formula: '2^v' },
+        evidence: { file: 'plugins/analyzer/spectrum_analyzer.js', occurrences: [3, 1, 1, 1], code: ['pointsValue.value = 1 << this.pt;',
+            'pointsValue.min = 1 << 8;', 'pointsValue.max = 1 << 14;', 'const exponent = Math.round(Math.log2(numFFTPoints));'] } },
+    // plugins/analyzer/spectrogram.js:751-766 (exponent <-> point count).
+    'SpectrogramPlugin.pt': { display: { unit: 'points', min: 256, max: 16384, formula: '2^v' },
+        evidence: { file: 'plugins/analyzer/spectrogram.js', occurrences: [3, 1, 1, 1], code: ['pointsValue.value = 1 << this.pt;',
+            'pointsValue.min = 1 << 8;', 'pointsValue.max = 1 << 14;', 'const exponent = Math.round(Math.log2(numFFTPoints));'] } },
+    // plugins/basics/stereo_balance.js:49-51,78-81 (saved ratio, percent widget).
+    'StereoBalancePlugin.bl': { min: -1, max: 1, step: 0.01, unit: '', display: { unit: '%', min: -100, max: 100, formula: '100*v' },
+        evidence: { file: 'plugins/basics/stereo_balance.js', occurrences: [1, 1, 1, 1], code: ["'Balance', -100, 100, 1, this.bl * 100,",
+            '(value) => this.setBl(value / 100)', "'bl', (value) => value * 100",
+            'this.bl = params.bl < -1 ? -1 : (params.bl > 1 ? 1 : params.bl);'] } },
+    // plugins/analyzer/oscilloscope.js:331-340,611 (seconds saved, ms widget).
+    'OscilloscopePlugin.dt': { unit: 's', display: { unit: 'ms', min: 1, max: 10000, formula: '1000*v' },
+        evidence: { file: 'plugins/analyzer/oscilloscope.js', occurrences: [1, 1, 1, 1], code: ["'Display Time', 1, 10000, 1,",
+            '(this.displayTime * 1000).toFixed(0)', 'this.setDisplayTime(value / 1000);',
+            "'ms', 'displayTime', (value) => value * 1000, true"] } },
+    // plugins/analyzer/oscilloscope.js:443-451,611 (seconds saved, ms widget).
+    'OscilloscopePlugin.ho': { unit: 's', display: { unit: 'ms', min: 0.1, max: 10, formula: '1000*v' },
+        evidence: { file: 'plugins/analyzer/oscilloscope.js', occurrences: [1, 1, 1, 1], code: ["'Holdoff', 0.1, 10, 0.1,",
+            '(this.holdoff * 1000).toFixed(1)', 'this.setHoldoff(value / 1000);',
+            "'ms', 'holdoff', (value) => value * 1000, true"] } },
+    // plugins/analyzer/stereo_meter.js:228-233,273-276 (seconds -> ms).
+    'StereoMeterPlugin.wt': { unit: 's', display: { unit: 'ms', min: 10, max: 1000, formula: '1000*v' },
+        evidence: { file: 'plugins/analyzer/stereo_meter.js', occurrences: [1, 1, 1, 1], code: ["'Window', 10, 1000, 1,",
+            '(this.windowTime * 1000).toFixed(0)', '(value) => this.setWindowTime(value / 1000)',
+            "'windowTime', (value) => value * 1000, true"] } },
+    // plugins/resonator/modal_resonator.js:358,546-583 (ln Hz -> Hz input).
+    'ModalResonatorPlugin.rs[].fr': { unit: 'ln(Hz)', display: { unit: 'Hz', min: Math.exp(3), max: Math.exp(9.9), formula: 'exp(v)' },
+        evidence: { file: 'plugins/resonator/modal_resonator.js', occurrences: [1, 3, 1, 1, 1], code: ["'Freq (Hz):', 3.00, 9.90, 0.01, resonator.fr, 'fr', i",
+            "if (param === 'fr' || param === 'lp' || param === 'hp') {", 'input.value = Math.round(Math.exp(value));',
+            'paramVal = Math.log(inputVal);', 'this.rs[index].fr = Math.max(3.00, Math.min(9.90, fr));'] } },
+    // plugins/resonator/modal_resonator.js:370,546-583 (ln Hz -> Hz input).
+    'ModalResonatorPlugin.rs[].lp': { unit: 'ln(Hz)', display: { unit: 'Hz', min: Math.exp(3), max: Math.exp(9.9), formula: 'exp(v)' },
+        evidence: { file: 'plugins/resonator/modal_resonator.js', occurrences: [1, 3, 1, 1, 1], code: ["'LPF Freq (Hz):', 3.00, 9.90, 0.01, resonator.lp, 'lp', i",
+            "if (param === 'fr' || param === 'lp' || param === 'hp') {", 'input.value = Math.round(Math.exp(value));',
+            'paramVal = Math.log(inputVal);', 'this.rs[index].lp = Math.max(3.00, Math.min(9.90, lp));'] } },
+    // plugins/resonator/modal_resonator.js:376,546-583 (ln Hz -> Hz input).
+    'ModalResonatorPlugin.rs[].hp': { unit: 'ln(Hz)', display: { unit: 'Hz', min: Math.exp(3), max: Math.exp(9.9), formula: 'exp(v)' },
+        evidence: { file: 'plugins/resonator/modal_resonator.js', occurrences: [1, 3, 1, 1, 1], code: ["'HPF Freq (Hz):', 3.00, 9.90, 0.01, resonator.hp, 'hp', i",
+            "if (param === 'fr' || param === 'lp' || param === 'hp') {", 'input.value = Math.round(Math.exp(value));',
+            'paramVal = Math.log(inputVal);', 'this.rs[index].hp = Math.max(3.00, Math.min(9.90, hp));'] } },
+};
+const usedOverrides = new Set();
+
+// Content fingerprints tolerate line moves / whitespace, but never changes to
+// the recorded conversion or clamp expressions. Validate before either writing
+// or checking a catalog; input digests alone cannot reject stale overrides.
+const fingerprintCode = code => code.replace(/\s+/g, '');
+function verifyOverrideEvidence(key, override, source) {
+    const evidence = override.evidence;
+    if (!evidence?.file || !evidence.code?.length || evidence.occurrences?.length !== evidence.code.length) {
+        throw new Error(`Missing override evidence: ${key}`);
+    }
+    const fingerprint = fingerprintCode(source);
+    for (const [index, code] of evidence.code.entries()) {
+        const expected = evidence.occurrences[index];
+        if (!code || !Number.isSafeInteger(expected) || expected < 1 ||
+            fingerprint.split(fingerprintCode(code)).length - 1 !== expected) {
+            throw new Error(`Override evidence changed: ${key} (${evidence.file}); review the override before regenerating`);
+        }
+    }
+}
+for (const [key, override] of Object.entries(valueOverrides)) {
+    verifyOverrideEvidence(key, override, read(path.join(web, override.evidence.file)));
+}
+
+function storedDescriptor(descriptor) {
+    const d = descriptor;
+    const transform = {
+        identity: [v => v, d.unit || ''],
+        naturalLog: [Math.log, `ln(${d.unit || 'value'})`],
+        log10: [Math.log10, 'log10(probability)'],
+        decibelsFromReference: [v => 20 * Math.log10(v / d.transformReference), `dB re ${d.transformReference} ${d.unit}`]
+    }[d.transform];
+    if (!transform) throw new Error(`Unsupported descriptor transform: ${d.transform}`);
+    const [convert, unit] = transform;
+    return { min: convert(d.minimum), max: convert(d.maximum), unit };
+}
+
+// Recognize only literal, direct JS clamp idioms. More complex/dynamic clamps
+// retain their indicative UI/hint range unless the packer supplies evidence.
+function jsRange(source, key) {
+    const index = /\d+$/.exec(key)?.[0];
+    if (index !== undefined) source = source.replace(/\$\{(?:index|band)\}/g, index)
+        .replace(/\[`(\w+)`\]/g, '.$1')
+        .replace(/\['(\w+)' \+ index\]/g, (_, prefix) => `.${prefix}${index}`);
+    // A frozen range table used by the subclass's own setter (Headphone EQ).
+    for (const [, table] of source.matchAll(/Object\.entries\((\w+_RANGES)\)/g)) {
+        const range = vm.runInContext(`typeof ${table} === 'undefined' ? null : ${table}[${JSON.stringify(key)}]`, context);
+        if (Array.isArray(range) && range.length === 2 && range.every(Number.isFinite)) return { min: range[0], max: range[1] };
+    }
+    const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const number = '(-?\\d+(?:\\.\\d*)?(?:e[+-]?\\d+)?)';
+    const patterns = [
+        `(?:this\\.\\w+\\s*=\\s*)?(?:this\\.)?parseFiniteNumber\\(\\s*params\\.${escaped},\\s*${number},\\s*${number}`,
+        `this\\.${escaped}\\s*=\\s*Math\\.max\\(\\s*${number},\\s*Math\\.min\\(\\s*${number},`,
+        `this\\.${escaped}\\s*=\\s*params\\.${escaped}\\s*<\\s*${number}\\s*\\?[^:]+:\\s*\\(params\\.${escaped}\\s*>\\s*${number}\\s*\\?`
+    ];
+    for (const pattern of patterns) {
+        const match = new RegExp(pattern, 'i').exec(source);
+        if (match) return { min: Number(match[1]), max: Number(match[2]) };
+    }
+    // The same helper also takes named constants / class range constants.
+    // Resolve only identifier paths, never arbitrary expressions from source.
+    const named = new RegExp(`parseFiniteNumber\\(\\s*params\\.${escaped},\\s*([\\w.]+),\\s*([\\w.]+)`).exec(source);
+    if (named) {
+        const values = named.slice(1).map(token => {
+            if (Number.isFinite(Number(token))) return Number(token);
+            if (!/^[A-Za-z_]\w*(?:\.\w+)*$/.test(token)) return undefined;
+            try { return vm.runInContext(token, context, { timeout: 1000 }); } catch { return undefined; }
+        });
+        if (values.every(Number.isFinite)) return { min: values[0], max: values[1] };
+    }
+    const spread = new RegExp(`parseFiniteNumber\\(\\s*params\\.${escaped},\\s*\\.\\.\\.([A-Z_]+)`).exec(source);
+    if (spread) {
+        const range = vm.runInContext(spread[1], context, { timeout: 1000 });
+        if (Array.isArray(range) && range.length === 2 && range.every(Number.isFinite)) return { min: range[0], max: range[1] };
+    }
+    // Serialization aliases such as dt: this.displayTime still refer to the
+    // same saved value. Require a direct property assignment and a ternary
+    // returning exactly the bounds it compares against.
+    const property = new RegExp(`\\b${escaped}:\\s*this\\.(\\w+)`).exec(source)?.[1] || key;
+    const ternary = new RegExp(`this\\.${property}\\s*=\\s*(\\w+)\\s*<\\s*${number}\\s*\\?\\s*${number}\\s*:\\s*\\(\\1\\s*>\\s*${number}\\s*\\?\\s*${number}\\s*:\\s*\\1\\)`, 'i').exec(source);
+    if (ternary && Number(ternary[2]) === Number(ternary[3]) && Number(ternary[4]) === Number(ternary[5])) {
+        return { min: Number(ternary[2]), max: Number(ternary[4]) };
+    }
+    return null;
+}
+
+// Bounds whose setters use dynamic limits or indirect/indexed inputs. The
+// default-context dynamic limits come from the upstream hint that calls the
+// same _delayLimitMs(); they remain explicitly marked dynamic_range.
+function indirectJsRange(type, key, metadata) {
+    // plugins/analyzer/spectrum_analyzer.js:191-194;
+    // plugins/analyzer/spectrogram.js:285-287 (indirect setPoints helper).
+    if (['SpectrumAnalyzerPlugin', 'SpectrogramPlugin'].includes(type) && key === 'pt') return { min: 8, max: 14 };
+    // plugins/others/sfz_note_player.js:51-57 (local keyed range table).
+    if (type === 'SFZNotePlayerPlugin' && ['mn', 'mx', 'pl'].includes(key)) {
+        return { min: key === 'pl' ? 1 : 21, max: key === 'pl' ? 128 : 108 };
+    }
+    // plugins/spatial/phase_select_eq.js:105-141: core intervals have a
+    // minimum width of 1; the outer bounds must enclose their core interval.
+    if (type === 'PhaseSelectEqPlugin' && key.startsWith('regions[].')) {
+        const range = {
+            ofl: [20, 39999], fl: [20, 39999], fh: [21, 40000], ofh: [21, 40000],
+            opl: [0, 179], pl: [0, 179], ph: [1, 180], oph: [1, 180],
+            obl: [-100, 99], bl: [-100, 99], bh: [-99, 100], obh: [-99, 100]
+        }[key.split('.').at(-1)];
+        if (range) {
+            metadata.dynamic_range = true;
+            metadata.range_note = 'Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point.';
+            return { min: range[0], max: range[1] };
+        }
+    }
+    // plugins/eq/group_delay_eq.js:82-90,119-128;
+    // plugins/eq/group_delay_peq.js:126-137,174-199.
+    if (['GroupDelayEqPlugin', 'GroupDelayPEQPlugin'].includes(type) && /^d\d+$/.test(key)) {
+        return { min: metadata.min, max: metadata.max };
+    }
+    // plugins/eq/group_delay_peq.js:34,192-196 (named Q_RANGE).
+    if (type === 'GroupDelayPEQPlugin' && /^q\d+$/.test(key)) return { min: 0.1, max: 100 };
+    // plugins/eq/headphone_eq.js:228-230;
+    // plugins/eq/tonal_balance_eq.js:323-328 (shelves have a conditional max of 2).
+    if (['HeadphoneEQPlugin', 'TonalBalanceEQPlugin'].includes(type) && /^qa\d+$/.test(key)) {
+        metadata.dynamic_range = true;
+        metadata.range_note = 'Q is limited to 2 for shelf filters and 10 for peaking filters.';
+        return { min: 0.1, max: 10 };
+    }
+    // plugins/basics/fir_crossover.js:147-156 (ascending active crossovers).
+    if (type === 'FIRCrossoverPlugin' && /^f[1-3]$/.test(key)) {
+        metadata.dynamic_range = true;
+        metadata.range_note = 'Active crossovers must ascend by at least 1 Hz; bounds also depend on the band count.';
+        return { min: 10, max: 40000 };
+    }
+    // plugins/eq/room_eq.js:1197-1205,1434-1435 (rounded/manual lower bound).
+    if (type === 'RoomEqPlugin' && key === 'pl') return { min: 20, max: 20000 };
+    // plugins/eq/room_eq.js:1256-1261 (dl is milliseconds, dy0 is legacy samples).
+    if (type === 'RoomEqPlugin' && key === 'dl') return { min: 0, max: 20 };
+    // plugins/eq/room_eq.js:1374-1381 (validated objects, no native band pack).
+    if (type === 'RoomEqPlugin') {
+        return { 'bs[].frequency': { min: 20, max: 20000 },
+            'bs[].gain': { min: -20, max: 20 }, 'bs[].q': { min: 0.1, max: 10 } }[key];
+    }
+    // plugins/dynamics/brickwall_limiter.js:734 (throws outside the range).
+    if (type === 'BrickwallLimiterPlugin' && key === 'la') return { min: 0, max: 10 };
+    return null;
+}
+
+const numericChecks = [];
+function normalizeNumber(metadata, descriptors, type, keyPath, source, defaults = [], element = null) {
+    const descriptor = descriptors[0];
+    const original = { ...metadata };
+    const saved = metadata.value;
+    delete metadata.value;
+    delete metadata.scaled;
+    const transformed = descriptor && descriptor.transform !== 'identity';
+    if (transformed) {
+        Object.assign(metadata, storedDescriptor(descriptor));
+        // A physical increment has no constant increment in logarithmic storage.
+        // Keep a UI step only when that widget already edits the saved value.
+        if (original.source !== 'ui' || original.scaled) delete metadata.step;
+    } else if (saved) Object.assign(metadata, saved);
+    const overrideKey = `${type}.${keyPath}`;
+    if (Object.hasOwn(valueOverrides, overrideKey)) {
+        const { evidence, ...values } = valueOverrides[overrideKey];
+        Object.assign(metadata, values);
+        usedOverrides.add(overrideKey);
+    }
+    const bounds = descriptors.map(d => packRanges.get(type)?.get(d.packedOffset)).filter(Boolean);
+    const keyBounds = (packKeyRanges.get(type)?.get(keyPath) || []).filter(range => element === null || range.element === null || range.element === element);
+    bounds.push(...keyBounds);
+    const js = jsRange(source, keyPath) || indirectJsRange(type, keyPath, metadata);
+    if (js) bounds.push(js);
+    if (bounds.length) {
+        metadata.min = Math.max(...bounds.map(range => range.min));
+        metadata.max = Math.min(...bounds.map(range => range.max));
+    }
+    if (!bounds.length) metadata.range_verified = false;
+    else delete metadata.range_verified;
+    // These setters normalize related values together. Their independent
+    // envelopes are still valid, but not every combination is retained.
+    let dependency;
+    // plugins/modulation/chorus.js:245.
+    if (type === 'ChorusPlugin' && keyPath === 'dp') dependency = 'Depth cannot exceed delay (dl).';
+    // plugins/modulation/frequency_shifter.js:437-439.
+    if (type === 'FrequencyShifterPlugin' && ['mn', 'mx'].includes(keyPath)) dependency = 'Minimum and maximum shift are sorted together.';
+    // plugins/others/sfz_note_player.js:66-67.
+    if (type === 'SFZNotePlayerPlugin' && keyPath === 'mx') dependency = 'Highest note is at least mn.';
+    if (type === 'SFZNotePlayerPlugin' && keyPath === 'vc') dependency = 'Velocity ceiling is at least vf + 1.';
+    // plugins/analyzer/pitch_meter.js:123-133; note_spectrogram.js:404-418.
+    if (['PitchMeterPlugin', 'NoteSpectrogramPlugin'].includes(type) && ['mn', 'mx'].includes(keyPath)) dependency = 'Lowest and highest notes are normalized together.';
+    // plugins/analyzer/rhythm_analyzer.js:284-291.
+    if (type === 'RhythmAnalyzerPlugin' && ['mn', 'mx'].includes(keyPath)) dependency = 'Maximum BPM is at least 1.25 times minimum BPM; changing one can adjust the other.';
+    // plugins/dynamics/multiband_compressor.js:955-970;
+    // multiband_expander.js:824-839; multiband_transient.js:607-614;
+    // plugins/spatial/multiband_balance.js:470-488;
+    // plugins/saturation/multiband_saturation.js:386-394,452-454.
+    if (['MultibandCompressorPlugin', 'MultibandExpanderPlugin', 'MultibandTransientPlugin', 'MultibandBalancePlugin', 'MultibandSaturationPlugin'].includes(type) && /^f[2-4]$/.test(keyPath)) dependency = 'Crossover cannot be below the preceding crossover.';
+    if (dependency) {
+        metadata.dynamic_range = true;
+        metadata.range_note = `${dependency} mIV Sound normalizes it.`;
+    }
+    // The scaled upstream `value` supersedes the display range, including 0
+    // for Adaptive Prediction's Infinity setting. Its display depends on other
+    // state, so it has no misleading single-variable display formula.
+    numericChecks.push({ type, keyPath, metadata, bounds, defaults, descriptors, keyBounds });
+}
+
+function normalizeParameter(parameter, descriptors, type, source) {
+    const firstCheck = numericChecks.length;
+    const key = parameter.key;
+    const direct = descriptors.filter(d => !d.containerKey && (d.key === key || `${d.key}${d.element}` === key));
+    const contained = descriptors.filter(d => d.containerKey === key);
+    const defaults = Array.isArray(parameter.default) ? parameter.default : [];
+    if (parameter.kind === 'number' || (parameter.kind === 'unknown' &&
+        (parameter.control === 'number' || direct.some(d => ['float', 'int'].includes(d.kind))))) {
+        normalizeNumber(parameter, direct, type, key, source, [parameter.default]);
+    } else if (Array.isArray(parameter.default) || parameter.items || parameter.elements || parameter.members) {
+        if (contained.some(d => d.memberKey) || parameter.members) {
+            parameter.members ??= {};
+            const members = new Set([...Object.keys(parameter.members), ...defaults.flatMap(v => v && typeof v === 'object' ? Object.keys(v) : [])]);
+            for (const member of members) {
+                const values = defaults.map(value => value?.[member]).filter(value => typeof value === 'number');
+                const ds = contained.filter(d => d.memberKey === member);
+                if (values.length || ds.some(d => ['float', 'int'].includes(d.kind))) {
+                    parameter.members[member] ??= {};
+                    const meta = parameter.members[member];
+                    if (Array.isArray(meta)) meta.forEach((entry, index) => normalizeNumber(entry, ds.filter(d => d.element === index), type, `${key}[].${member}`, source, [defaults[index]?.[member]], index));
+                    else normalizeNumber(meta, ds, type, `${key}[].${member}`, source, values);
+                }
+            }
+        } else if (defaults.some(v => typeof v === 'number') || parameter.items?.control === 'number' || parameter.elements) {
+            const ds = contained.length ? contained : direct;
+            if (parameter.elements) parameter.elements.forEach((entry, index) => {
+                if (typeof defaults[index] === 'number' || ds.some(d => d.element === index && ['float', 'int'].includes(d.kind))) {
+                    normalizeNumber(entry, ds.filter(d => d.element === index), type, `${key}[]`, source, [defaults[index]], index);
+                }
+            });
+            else {
+                parameter.items ??= {};
+                normalizeNumber(parameter.items, ds, type, `${key}[]`, source, defaults.filter(v => typeof v === 'number'));
+            }
+        }
+    }
+    if (numericChecks.slice(firstCheck).some(check => check.metadata.dynamic_range)) {
+        parameter.dynamic_range = true;
+        parameter.range_note ??= 'Range depends on other parameter values; see member descriptions. mIV Sound normalizes it.';
+    }
+}
+
+// Follow saved shapes rather than UI controls: HTML select values are strings
+// even when the plugin serializes numbers. Shared array/member descriptions
+// are visited against every saved element, including per-element metadata.
+function visitSavedDescriptions(metadata, savedShape, value, keyPath, visit) {
+    if (!savedShape) return;
+    visit(metadata, savedShape, value, keyPath);
+    const members = (descriptions, shapes, object, prefix, index = null) => {
+        for (const [key, childShape] of Object.entries(shapes || {})) {
+            const child = descriptions?.[key];
+            if (!child) continue;
+            visitSavedDescriptions(Array.isArray(child) && index !== null ? child[index] : child,
+                childShape, object?.[key], `${prefix}.${key}`, visit);
+        }
+    };
+    if (savedShape.type === 'array') {
+        savedShape.elements.forEach((childShape, index) => {
+            const child = metadata.elements?.[index] || metadata.items;
+            if (child) visitSavedDescriptions(child, childShape, value[index], `${keyPath}[${index}]`, visit);
+            else if (childShape.type === 'object') members(metadata.members, childShape.members, value[index], `${keyPath}[${index}]`, index);
+        });
+    } else if (savedShape.type === 'object') members(metadata.members, savedShape.members, value, keyPath);
+}
+
+function normalizeOptionValues(metadata, savedShape, _value, keyPath) {
+    for (const option of metadata.options || []) {
+        const value = option.value;
+        if (savedShape.type === 'number' && typeof value === 'string' &&
+            /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value.trim())) option.value = Number(value);
+        else if (savedShape.type === 'string' && ['number', 'boolean'].includes(typeof value)) option.value = String(value);
+        else if (savedShape.type === 'boolean' && ['true', 'false'].includes(value)) option.value = value === 'true';
+        if (shape(option.value).type !== savedShape.type ||
+            (typeof option.value === 'number' && !Number.isFinite(option.value))) {
+            throw new Error(`Option does not match saved ${savedShape.type}: ${keyPath}`);
+        }
+    }
+}
 const excluded = new Set(['SoundFontPlayerPlugin', 'SpeakerDistortionCorrectionPlugin',
     'NetworkSendPlugin', 'NetworkReceivePlugin']);
 const definitions = [];
@@ -298,6 +670,12 @@ for (const definition of definitions.sort((a, b) => a.type < b.type ? -1 : a.typ
             ...(dynamic ? { range_note: 'Range is indicative and may depend on other values or sample rate; mIV Sound normalizes it.' } : {}),
             ...metadata };
     });
+    const source = read(path.join(web, definition.relative));
+    for (const parameter of parameters) {
+        normalizeParameter(parameter, descriptors, definition.type, source);
+        visitSavedDescriptions(parameter, parameter.storage_shape, parameter.default,
+            `${definition.type}.${parameter.key}`, normalizeOptionValues);
+    }
     effects.push({ type: definition.type, name: definition.name, category: definition.category, description,
         dsp: Object.hasOwn(dspLayouts, definition.type),
         keys_incomplete: !!report.uiError || [...saved].some(k => !dspKeys.has(k)) ||
@@ -345,10 +723,111 @@ const version = read(path.join(vendor, 'VERSION')).trim();
 read(fileURLToPath(import.meta.url));
 const document = { schema_version: 1, sound_version: version, native_dsp_types: Object.keys(dspLayouts).sort(),
     inputs: [...inputs].sort(([a], [b]) => a.localeCompare(b, 'en')).map(([path, sha256]) => ({ path, sha256 })),
-    range_note: 'Ranges are indicative. mIV Sound normalizes values; retrieve the state after its reload to see normalized values.',
+    range_note: 'Values, units, ranges, steps and defaults use stored form. display gives the display unit, range and formula from stored v. scale: log describes knob motion, not stored form. range_verified: false marks indicative ranges without a located JS or DSP pack clamp. Ranges may depend on other values or sample rate; mIV Sound normalizes values. Retrieve state after reload.',
     external_data_note: 'Choose external data on screen. Existing stages retain their selected data when kept by id.', effects };
 const bytes = JSON.stringify(document, null, 2) + '\n';
 if (process.argv.includes('--check')) {
+    for (const [key, override] of Object.entries(valueOverrides)) {
+        if (!usedOverrides.has(key)) throw new Error(`Unused value override: ${key}`);
+        const source = read(path.join(web, override.evidence.file));
+        // A line move is harmless, but changing any recorded expression must
+        // reject the override. Exercise this without modifying bundled files.
+        verifyOverrideEvidence(key, override, `\n\n${source}`);
+        for (const code of override.evidence.code) {
+            const fingerprint = fingerprintCode(source);
+            const expression = fingerprintCode(code);
+            for (let offset = fingerprint.indexOf(expression); offset >= 0; offset = fingerprint.indexOf(expression, offset + expression.length)) {
+                const changed = fingerprint.slice(0, offset) + '__changed_expression__' + fingerprint.slice(offset + expression.length);
+                let rejected = false;
+                try { verifyOverrideEvidence(key, override, changed); } catch (error) {
+                    rejected = error.message.startsWith(`Override evidence changed: ${key}`);
+                }
+                if (!rejected) throw new Error(`Changed override evidence was accepted: ${key}`);
+            }
+        }
+    }
+    for (const effect of effects) {
+        for (const parameter of effect.parameters) {
+            if (!parameter.storage_shape) continue;
+            if (parameter.kind !== parameter.storage_shape.type ||
+                JSON.stringify(shape(parameter.default)) !== JSON.stringify(parameter.storage_shape)) {
+                throw new Error(`Default / storage shape mismatch: ${effect.type}.${parameter.key}`);
+            }
+            visitSavedDescriptions(parameter, parameter.storage_shape, parameter.default,
+                `${effect.type}.${parameter.key}`, (metadata, savedShape, value, keyPath) => {
+                    if (shape(value).type !== savedShape.type || (metadata.options || []).some(option => shape(option.value).type !== savedShape.type)) {
+                        throw new Error(`Default / shape / option type mismatch: ${keyPath}`);
+                    }
+                });
+        }
+    }
+    for (const [type, key] of [['DigitalErrorEmulatorPlugin', 'be'], ['G726ADPCMSimulatorPlugin', 're']]) {
+        if (effects.find(effect => effect.type === type).parameters.find(parameter => parameter.key === key).display) {
+            throw new Error(`${type}.${key}: the screen shows the saved exponent, not a converted probability`);
+        }
+    }
+    const coveredSlots = new Set();
+    for (const { type, keyPath, metadata: m, bounds, defaults, descriptors, keyBounds } of numericChecks) {
+        const fail = reason => { throw new Error(`${type}.${keyPath}: ${reason}`); };
+        if (m.display && !valueOverrides[`${type}.${keyPath}`]?.display) fail('display has no actual UI evidence');
+        const inside = (v, min, max) => Number.isFinite(v) &&
+            (min === undefined || v >= min - 1e-9 * Math.max(1, Math.abs(min))) &&
+            (max === undefined || v <= max + 1e-9 * Math.max(1, Math.abs(max)));
+        if (m.min !== undefined && m.max !== undefined && m.min > m.max) fail('empty range');
+        for (const range of bounds) {
+            if (!inside(m.min, range.min, range.max) || !inside(m.max, range.min, range.max)) fail('range exceeds clamp');
+        }
+        for (const d of descriptors) {
+            coveredSlots.add(`${type}:${d.packedOffset}`);
+            const range = packRanges.get(type)?.get(d.packedOffset);
+            if (range && !inside(d.packedDefault, range.min, range.max)) fail('packedDefault exceeds pack clamp');
+            if (d.transform !== 'identity') {
+                const savedDefault = { naturalLog: () => Math.log(d.default), log10: () => Math.log10(d.default),
+                    decibelsFromReference: () => 20 * Math.log10(d.default / d.transformReference) }[d.transform]();
+                if (Math.abs(savedDefault - d.packedDefault) > 1e-9 * Math.max(1, Math.abs(d.packedDefault))) {
+                    fail('descriptor default and packedDefault disagree');
+                }
+            }
+        }
+        for (const range of keyBounds) coveredSlots.add(`${type}:${range.offset}`);
+        for (const value of defaults.filter(v => typeof v === 'number')) {
+            if (!inside(value, m.min, m.max)) fail(`default ${value} exceeds stored range`);
+            if (m.display) {
+                // Only the small, documented expression vocabulary is accepted.
+                const formula = m.display.formula;
+                let display;
+                if (formula === 'exp(v)') display = Math.exp(value);
+                else if (formula === '2^v') display = 2 ** value;
+                else if (formula === '100*v') display = 100 * value;
+                else if (formula === '1000*v') display = 1000 * value;
+                else {
+                    const match = /^([\d.]+)\*10\^\(v\/20\)$/.exec(formula);
+                    if (!match) fail(`unsupported formula: ${formula}`);
+                    display = Number(match[1]) * 10 ** (value / 20);
+                }
+                if (!inside(display, m.display.min, m.display.max)) fail('display default exceeds range');
+            }
+        }
+    }
+    for (const effect of effects) {
+        // Packers also contain internal fields (for example resetToken) which
+        // have no public descriptor and are not saved parameter keys.
+        for (const { packedOffset: offset } of dsp[effect.type] || []) {
+            if (!packRanges.get(effect.type)?.has(offset)) continue;
+            if (!coveredSlots.has(`${effect.type}:${offset}`)) {
+                throw new Error(`Numeric pack slot has no catalog range check: ${effect.type}[${offset}]`);
+            }
+        }
+        for (const [keyPath, ranges] of packKeyRanges.get(effect.type) || []) {
+            const parameter = effect.parameters.find(p => p.key === keyPath.split('[]')[0]);
+            if (!parameter || (keyPath === parameter.key && parameter.kind !== 'number')) continue;
+            for (const { offset } of ranges) {
+                if (!coveredSlots.has(`${effect.type}:${offset}`)) {
+                    throw new Error(`Public numeric pack key has no range check: ${effect.type}.${keyPath}[${offset}]`);
+                }
+            }
+        }
+    }
     if (fs.readFileSync(output, 'utf8') !== bytes) throw new Error('Sound effects catalog is stale; regenerate it');
 } else fs.writeFileSync(output, bytes, 'utf8');
 console.log(`${Buffer.byteLength(bytes)} bytes; ${effects.length} effects; ${effects.filter(e => e.keys_incomplete).length} incomplete; ${effects.filter(e => e.ui_partial).length} partial UI`);

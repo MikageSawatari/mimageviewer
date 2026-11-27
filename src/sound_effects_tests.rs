@@ -264,3 +264,282 @@ fn sound_effects_rejects_invalid_arguments_without_echoing_input() {
         assert!(query(args).is_err());
     }
 }
+
+#[test]
+fn sound_catalog_uses_stored_ranges_and_separate_display_conversions() {
+    let parameter = |name: &str, key: &str| {
+        serde_json::to_value(effect(name).unwrap().parameter(key).unwrap()).unwrap()
+    };
+    let tilt = parameter("TiltEQPlugin", "f0");
+    assert!((tilt["min"].as_f64().unwrap() - 3.0).abs() < 1e-9);
+    assert!((tilt["max"].as_f64().unwrap() - 9.9).abs() < 1e-9);
+    assert_eq!(tilt["unit"], "ln(Hz)");
+    assert_eq!(tilt["step"], 0.01);
+    assert_eq!(tilt["display"]["formula"], "exp(v)");
+    let jitter = parameter("SimpleJitterPlugin", "rj");
+    assert_eq!(jitter["min"], 0);
+    assert_eq!(jitter["max"], 200);
+    assert_eq!(jitter["step"], 1);
+    assert_eq!(jitter["display"]["formula"], "0.001*10^(v/20)");
+    let balance = parameter("StereoBalancePlugin", "bl");
+    assert_eq!(balance["min"], -1);
+    assert_eq!(balance["max"], 1);
+    assert_eq!(balance["step"], 0.01);
+    assert_eq!(balance["display"]["formula"], "100*v");
+    let decay = parameter("AdaptivePredictionEffectPlugin", "weightDecay");
+    assert_eq!(decay["min"], 0);
+    assert_eq!(decay["max"], 60);
+    assert!(decay.get("display").is_none());
+    for (name, key, min, max) in [
+        ("CompressorPlugin", "rl", 10.0, 1000.0),
+        ("ExpanderPlugin", "rl", 10.0, 1000.0),
+        ("BrickwallLimiterPlugin", "sm", -3.0, 0.0),
+    ] {
+        let p = parameter(name, key);
+        assert_eq!(p["min"].as_f64().unwrap(), min, "{name}.{key}");
+        assert_eq!(p["max"].as_f64().unwrap(), max, "{name}.{key}");
+    }
+    for key in ["fr", "lp", "hp"] {
+        let resonators = parameter("ModalResonatorPlugin", "rs");
+        assert_eq!(resonators["members"][key]["unit"], "ln(Hz)");
+        assert_eq!(resonators["members"][key]["display"]["formula"], "exp(v)");
+    }
+    for name in ["SpectrumAnalyzerPlugin", "SpectrogramPlugin"] {
+        let points = parameter(name, "pt");
+        assert_eq!(points["unit"], "log2 FFT size");
+        assert_eq!(points["display"]["formula"], "2^v");
+        assert_eq!(points["display"]["min"], 256);
+        assert_eq!(points["display"]["max"], 16384);
+    }
+}
+
+#[test]
+fn sound_effects_response_keeps_stored_value_notes_and_nested_metadata() {
+    let response = query(json!({"type":"ModalResonatorPlugin"})).unwrap();
+    let note = response["range_note"].as_str().unwrap();
+    for text in [
+        "stored form",
+        "display",
+        "formula",
+        "scale: log",
+        "range_verified: false",
+    ] {
+        assert!(note.contains(text), "{text}");
+    }
+    let rs = response["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["key"] == "rs")
+        .unwrap();
+    assert_eq!(rs["members"]["fr"]["display"]["formula"], "exp(v)");
+    // `value` was an upstream duplicate of the saved range. Numeric metadata
+    // uses min/max throughout, including nested descriptions.
+    fn no_duplicate_range(value: &Value) {
+        match value {
+            Value::Object(object) => {
+                assert!(!object.get("value").is_some_and(Value::is_object));
+                for child in object.values() {
+                    no_duplicate_range(child);
+                }
+            }
+            Value::Array(array) => array.iter().for_each(no_duplicate_range),
+            _ => {}
+        }
+    }
+    for effect in &catalog().effects {
+        no_duplicate_range(&serde_json::to_value(effect).unwrap());
+    }
+    let computed = effect("FiveBandFIRPEQPlugin")
+        .unwrap()
+        .parameter("dy")
+        .unwrap();
+    assert_eq!(computed.metadata["range_verified"], false);
+}
+
+#[test]
+fn sound_catalog_nested_ranges_follow_js_ordering_constraints() {
+    let regions = effect("PhaseSelectEqPlugin")
+        .unwrap()
+        .parameter("regions")
+        .unwrap();
+    assert!(regions.dynamic_range);
+    for (keys, min, max) in [
+        (["ofl", "fl"], 20.0, 39999.0),
+        (["fh", "ofh"], 21.0, 40000.0),
+        (["opl", "pl"], 0.0, 179.0),
+        (["ph", "oph"], 1.0, 180.0),
+        (["obl", "bl"], -100.0, 99.0),
+        (["bh", "obh"], -99.0, 100.0),
+    ] {
+        for key in keys {
+            let member = &regions.metadata["members"][key];
+            assert_eq!(member["min"].as_f64().unwrap(), min, "{key}");
+            assert_eq!(member["max"].as_f64().unwrap(), max, "{key}");
+            assert_eq!(member["dynamic_range"], true, "{key}");
+        }
+    }
+    for name in ["HeadphoneEQPlugin", "TonalBalanceEQPlugin"] {
+        let q = effect(name).unwrap().parameter("qa0").unwrap();
+        assert!(q.dynamic_range);
+        assert!(q.metadata["range_note"].as_str().unwrap().contains("shelf"));
+    }
+    let mapper = effect("SpatialMapperPlugin").unwrap();
+    for key in ["dm", "fm", "rm"] {
+        let items = &mapper.parameter(key).unwrap().metadata["items"];
+        assert_eq!(items["min"], -1);
+        assert_eq!(items["max"], 1);
+        assert!(items.get("range_verified").is_none());
+    }
+}
+
+#[test]
+fn sound_catalog_display_only_describes_actual_screen_values() {
+    for (name, key) in [
+        ("DigitalErrorEmulatorPlugin", "be"),
+        ("G726ADPCMSimulatorPlugin", "re"),
+    ] {
+        let parameter = effect(name).unwrap().parameter(key).unwrap();
+        assert!(parameter.metadata.get("display").is_none(), "{name}.{key}");
+        assert_eq!(parameter.kind, "number");
+    }
+    for (name, key, formula) in [
+        ("TiltEQPlugin", "f0", "exp(v)"),
+        ("SimpleJitterPlugin", "rj", "0.001*10^(v/20)"),
+        ("StereoBalancePlugin", "bl", "100*v"),
+        ("OscilloscopePlugin", "dt", "1000*v"),
+        ("OscilloscopePlugin", "ho", "1000*v"),
+        ("StereoMeterPlugin", "wt", "1000*v"),
+        ("SpectrumAnalyzerPlugin", "pt", "2^v"),
+        ("SpectrogramPlugin", "pt", "2^v"),
+    ] {
+        let parameter = effect(name).unwrap().parameter(key).unwrap();
+        assert_eq!(
+            parameter.metadata["display"]["formula"], formula,
+            "{name}.{key}"
+        );
+    }
+    let resonators = effect("ModalResonatorPlugin")
+        .unwrap()
+        .parameter("rs")
+        .unwrap();
+    for key in ["fr", "lp", "hp"] {
+        assert_eq!(
+            resonators.metadata["members"][key]["display"]["formula"],
+            "exp(v)"
+        );
+    }
+    fn display_count(value: &Value) -> usize {
+        match value {
+            Value::Object(object) => {
+                usize::from(object.contains_key("display"))
+                    + object.values().map(display_count).sum::<usize>()
+            }
+            Value::Array(array) => array.iter().map(display_count).sum(),
+            _ => 0,
+        }
+    }
+    assert_eq!(
+        display_count(&serde_json::to_value(&catalog().effects).unwrap()),
+        11
+    );
+}
+
+#[test]
+fn sound_catalog_option_values_match_saved_shapes() {
+    fn check(
+        metadata: &Value,
+        saved_shape: &Value,
+        default: &Value,
+        path: &str,
+        index: Option<usize>,
+    ) {
+        let value_type = |value: &Value| match value {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        };
+        let expected = saved_shape["type"].as_str().unwrap();
+        assert_eq!(value_type(default), expected, "{path}: default / shape");
+        if let Some(options) = metadata["options"].as_array() {
+            for option in options {
+                assert_eq!(
+                    value_type(&option["value"]),
+                    expected,
+                    "{path}: option / shape"
+                );
+            }
+        }
+        if expected == "array" {
+            for (i, child_shape) in saved_shape["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .enumerate()
+            {
+                let child = metadata["elements"]
+                    .get(i)
+                    .or_else(|| metadata.get("items"))
+                    .unwrap_or(metadata);
+                check(
+                    child,
+                    child_shape,
+                    &default[i],
+                    &format!("{path}[{i}]"),
+                    Some(i),
+                );
+            }
+        } else if expected == "object" {
+            for (key, child_shape) in saved_shape["members"].as_object().unwrap() {
+                let child = &metadata["members"][key];
+                let child = if child.is_array() {
+                    &child[index.expect("per-element member metadata")]
+                } else {
+                    child
+                };
+                check(
+                    child,
+                    child_shape,
+                    &default[key],
+                    &format!("{path}.{key}"),
+                    None,
+                );
+            }
+        }
+    }
+    for effect in &catalog().effects {
+        for parameter in &effect.parameters {
+            if let (Some(saved_shape), Some(default)) =
+                (&parameter.storage_shape, &parameter.default)
+            {
+                assert_eq!(saved_shape["type"], parameter.kind);
+                check(
+                    &serde_json::to_value(parameter).unwrap(),
+                    saved_shape,
+                    default,
+                    &format!("{}.{}", effect.effect_type, parameter.key),
+                    None,
+                );
+            }
+        }
+    }
+    let analog = effect("AnalogMeterPlugin")
+        .unwrap()
+        .parameter("dc")
+        .unwrap();
+    assert_eq!(analog.metadata["options"][1]["value"], 1);
+    assert_eq!(analog.metadata["options"][1]["label"], "DIN");
+    let bass = effect("BassManagementPlugin").unwrap();
+    for key in ["ro", "sl"] {
+        assert!(
+            bass.parameter(key).unwrap().metadata["items"]["options"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|option| option["value"].is_number())
+        );
+    }
+}

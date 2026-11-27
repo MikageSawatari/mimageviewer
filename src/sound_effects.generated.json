@@ -123,7 +123,7 @@
   "inputs": [
     {
       "path": "scripts/generate-sound-effects.mjs",
-      "sha256": "7f3439d0e16f532a635ad0f0546367d0456b614a72c8c4b8e07ca4a17233009c"
+      "sha256": "d2f69ec65830c39de3d07cf65c3d59e0b00290d8dc307357f5b8b0acb206ec6e"
     },
     {
       "path": "vendor/miv-sound/mIV Sound.vst3/Contents/Resources/webview/features/measurement/audio-utils/channel-selection.js",
@@ -1870,7 +1870,7 @@
       "sha256": "4cfb2945e4abc36f2e3b3d423c0662459186a2d65064fd10aeee153ee9f91d94"
     }
   ],
-  "range_note": "Ranges are indicative. mIV Sound normalizes values; retrieve the state after its reload to see normalized values.",
+  "range_note": "Values, units, ranges, steps and defaults use stored form. display gives the display unit, range and formula from stored v. scale: log describes knob motion, not stored form. range_verified: false marks indicative ranges without a located JS or DSP pack clamp. Ranges may depend on other values or sample rate; mIV Sound normalizes values. Retrieve state after reload.",
   "external_data_note": "Choose external data on screen. Existing stages retain their selected data when kept by id.",
   "effects": [
     {
@@ -1925,8 +1925,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "cp",
@@ -1944,8 +1943,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dt",
@@ -1963,8 +1961,7 @@
           "max": 500,
           "step": 1,
           "unit": "µs",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "fd",
@@ -1982,8 +1979,7 @@
           "max": 2,
           "step": 0.01,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "hm",
@@ -2001,8 +1997,7 @@
           "max": -20,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hz",
@@ -2043,8 +2038,7 @@
           "max": 0,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "io",
@@ -2062,8 +2056,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "md",
@@ -2081,8 +2074,7 @@
           "max": 125,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mx",
@@ -2100,8 +2092,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -2119,8 +2110,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pe",
@@ -2138,8 +2128,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rd",
@@ -2170,8 +2159,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sk",
@@ -2189,8 +2177,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sm",
@@ -2276,8 +2263,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tn",
@@ -2295,8 +2281,7 @@
           "max": 30,
           "step": 0.01,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -2325,12 +2310,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": true,
-          "value": {
-            "min": 0,
-            "max": 1
-          }
+          "scale": "linear"
         },
         {
           "key": "decayInfinite",
@@ -2368,8 +2348,7 @@
           "max": 500,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hold",
@@ -2400,8 +2379,7 @@
           "max": 0.1,
           "step": 0.001,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "learningFrozen",
@@ -2426,8 +2404,7 @@
           "max": 2,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "prediction",
@@ -2445,8 +2422,7 @@
           "max": 2,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "residual",
@@ -2464,8 +2440,7 @@
           "max": 2,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "weightDecay",
@@ -2479,16 +2454,11 @@
           "source": "ui",
           "control": "number",
           "label": "Weight Decay",
-          "min": 0.5,
+          "min": 0,
           "max": 60,
           "step": 0.5,
           "unit": "s",
-          "scale": "linear",
-          "scaled": true,
-          "value": {
-            "min": 0,
-            "max": 60
-          }
+          "scale": "linear"
         }
       ]
     },
@@ -2517,8 +2487,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dc",
@@ -2534,26 +2503,27 @@
           "label": "Dial",
           "options": [
             {
-              "value": "0",
+              "value": 0,
               "label": "VU"
             },
             {
-              "value": "1",
+              "value": 1,
               "label": "DIN"
             },
             {
-              "value": "2",
+              "value": 2,
               "label": "BBC"
             },
             {
-              "value": "3",
+              "value": 3,
               "label": "dB"
             },
             {
-              "value": "4",
+              "value": 4,
               "label": "dBFS"
             }
-          ]
+          ],
+          "range_verified": false
         },
         {
           "key": "de",
@@ -2602,8 +2572,7 @@
           "max": 3,
           "step": 0.01,
           "unit": "s",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ln",
@@ -2619,14 +2588,15 @@
           "label": "Needle",
           "options": [
             {
-              "value": "0",
+              "value": 0,
               "label": "Momentary"
             },
             {
-              "value": "1",
+              "value": 1,
               "label": "Short-term"
             }
-          ]
+          ],
+          "range_verified": false
         },
         {
           "key": "ls",
@@ -2642,14 +2612,15 @@
           "label": "Scale",
           "options": [
             {
-              "value": "0",
+              "value": 0,
               "label": "EBU +9"
             },
             {
-              "value": "1",
+              "value": 1,
               "label": "EBU +18"
             }
-          ]
+          ],
+          "range_verified": false
         },
         {
           "key": "md",
@@ -2710,8 +2681,7 @@
           "max": 3000,
           "step": 1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "os",
@@ -2729,8 +2699,7 @@
           "max": 25,
           "step": 0.05,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ph",
@@ -2748,8 +2717,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "s",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rg",
@@ -2767,8 +2735,7 @@
           "max": 60,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rl",
@@ -2786,8 +2753,7 @@
           "max": 0,
           "step": 1,
           "unit": "dBFS",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rt",
@@ -2805,8 +2771,7 @@
           "max": 5,
           "step": 0.01,
           "unit": "s",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sc",
@@ -2822,18 +2787,19 @@
           "label": "PPM Scale",
           "options": [
             {
-              "value": "0",
+              "value": 0,
               "label": "DIN"
             },
             {
-              "value": "1",
+              "value": 1,
               "label": "BBC"
             },
             {
-              "value": "2",
+              "value": 2,
               "label": "dB"
             }
-          ]
+          ],
+          "range_verified": false
         },
         {
           "key": "tg",
@@ -2851,8 +2817,7 @@
           "max": -10,
           "step": 1,
           "unit": "LUFS",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -2894,8 +2859,7 @@
           "max": 12,
           "step": 0.5,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "te",
@@ -2926,8 +2890,7 @@
           "max": 12,
           "step": 0.5,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -2956,8 +2919,7 @@
           "max": 500,
           "step": 1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "dr",
@@ -3025,8 +2987,7 @@
           "max": 20000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "lf",
@@ -3044,8 +3005,7 @@
           "max": 20000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "md",
@@ -3086,8 +3046,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rl",
@@ -3105,8 +3064,7 @@
           "max": 2000,
           "step": 1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "rs",
@@ -3124,8 +3082,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "Q",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "rt",
@@ -3143,8 +3100,7 @@
           "max": 20,
           "step": 0.01,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sn",
@@ -3162,8 +3118,7 @@
           "max": 60,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sp",
@@ -3181,8 +3136,7 @@
           "max": 180,
           "step": 1,
           "unit": "deg",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "wf",
@@ -3234,8 +3188,7 @@
           "max": 1000,
           "step": 1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "gt",
@@ -3253,8 +3206,7 @@
           "max": -24,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mg",
@@ -3272,8 +3224,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ng",
@@ -3291,8 +3242,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rt",
@@ -3310,8 +3260,7 @@
           "max": 10000,
           "step": 10,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "tg",
@@ -3329,8 +3278,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tw",
@@ -3348,8 +3296,7 @@
           "max": 10000,
           "step": 10,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         }
       ]
     },
@@ -3378,8 +3325,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dp",
@@ -3397,8 +3343,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ph",
@@ -3416,8 +3361,7 @@
           "max": 360,
           "step": 1,
           "unit": "deg",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rt",
@@ -3435,8 +3379,7 @@
           "max": 20,
           "step": 0.01,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "wd",
@@ -3454,8 +3397,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "wf",
@@ -3507,8 +3449,7 @@
           "max": 40000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "hs",
@@ -3545,8 +3486,7 @@
           "max": 40000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "ls",
@@ -3594,8 +3534,7 @@
           "max": 24000,
           "step": 100,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "cm",
@@ -3636,8 +3575,7 @@
           "max": 200,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "na",
@@ -3655,8 +3593,7 @@
           "max": 200,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -3685,8 +3622,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -3704,8 +3640,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -3734,8 +3669,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "fc",
@@ -3842,8 +3776,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "lf",
@@ -3861,8 +3794,7 @@
           "max": 300,
           "step": 1,
           "unit": "Hz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "lg",
@@ -3880,8 +3812,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "lo",
@@ -3910,18 +3841,20 @@
           "label": "LFE Slope",
           "options": [
             {
-              "value": "24",
+              "value": 24,
               "label": "24 dB/oct"
             },
             {
-              "value": "48",
+              "value": 48,
               "label": "48 dB/oct"
             },
             {
-              "value": "96",
+              "value": 96,
               "label": "96 dB/oct"
             }
-          ]
+          ],
+          "min": 24,
+          "max": 96
         },
         {
           "key": "ph",
@@ -4132,7 +4065,9 @@
                 "value": 3,
                 "label": "Unused"
               }
-            ]
+            ],
+            "min": 0,
+            "max": 3
           },
           "description": "One role per input channel (16 entries, Ch 1 first)."
         },
@@ -4318,7 +4253,9 @@
                 "value": 96,
                 "label": "96dB"
               }
-            ]
+            ],
+            "min": 24,
+            "max": 96
           },
           "description": "Crossover slope of each managed input channel (16 entries)."
         },
@@ -4396,8 +4333,7 @@
           "max": 24,
           "step": 1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "be",
@@ -4415,8 +4351,7 @@
           "max": 10,
           "step": 0.01,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sd",
@@ -4434,8 +4369,7 @@
           "max": 1000,
           "step": 1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "td",
@@ -4466,8 +4400,7 @@
           "max": 96000,
           "step": 100,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         }
       ]
     },
@@ -4527,8 +4460,7 @@
           "max": 53,
           "step": 1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "cm",
@@ -4573,8 +4505,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -4592,8 +4523,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pl",
@@ -4611,8 +4541,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -4641,8 +4570,7 @@
           "max": 18,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "la",
@@ -4660,8 +4588,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "os",
@@ -4693,7 +4620,9 @@
               "label": "8x"
             }
           ],
-          "description": "Any other value rejects the whole parameter update."
+          "description": "Any other value rejects the whole parameter update.",
+          "min": 1,
+          "max": 8
         },
         {
           "key": "pluginType",
@@ -4725,8 +4654,7 @@
           "max": 500,
           "step": 1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sm",
@@ -4740,12 +4668,11 @@
           "source": "ui",
           "control": "number",
           "label": "Margin",
-          "min": -1,
+          "min": -3,
           "max": 0,
           "step": 0.01,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "th",
@@ -4763,8 +4690,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -4793,8 +4719,7 @@
           "max": 6,
           "step": 0.1,
           "unit": "arcmin",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "bs",
@@ -4812,8 +4737,7 @@
           "max": 6,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dg",
@@ -4862,8 +4786,7 @@
           "max": 3,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dp",
@@ -4881,8 +4804,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "events/min",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hs",
@@ -4900,8 +4822,7 @@
           "max": -42,
           "step": 0.1,
           "unit": "dB re 250 nWb/m",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "md",
@@ -4954,8 +4875,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "nr",
@@ -5000,8 +4920,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rl",
@@ -5019,8 +4938,7 @@
           "max": 18,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tp",
@@ -5065,8 +4983,7 @@
           "max": 1,
           "step": 0.001,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -5236,8 +5153,7 @@
           "max": 30,
           "step": 0.1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "dp",
@@ -5247,7 +5163,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "ui",
           "control": "number",
           "label": "Depth",
@@ -5256,7 +5172,7 @@
           "step": 0.1,
           "unit": "ms",
           "scale": "linear",
-          "scaled": false
+          "range_note": "Depth cannot exceed delay (dl). mIV Sound normalizes it."
         },
         {
           "key": "fb",
@@ -5274,8 +5190,7 @@
           "max": 75,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "md",
@@ -5328,8 +5243,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rt",
@@ -5347,8 +5261,7 @@
           "max": 10,
           "step": 0.01,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "ss",
@@ -5366,8 +5279,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "vc",
@@ -5385,8 +5297,7 @@
           "max": 6,
           "step": 1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -5415,8 +5326,7 @@
           "max": -24,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dm",
@@ -5443,7 +5353,8 @@
               "value": 2,
               "label": "Note Colors"
             }
-          ]
+          ],
+          "range_verified": false
         },
         {
           "key": "ft",
@@ -5461,8 +5372,7 @@
           "max": 6,
           "step": 0.5,
           "unit": "dB/oct",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hi",
@@ -5480,8 +5390,7 @@
           "max": 9,
           "step": 1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "lo",
@@ -5499,8 +5408,7 @@
           "max": 8,
           "step": 1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "lr",
@@ -5518,8 +5426,7 @@
           "max": 96,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -5548,8 +5455,7 @@
           "max": 2,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sn",
@@ -5567,8 +5473,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -5597,8 +5502,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "th",
@@ -5616,8 +5520,7 @@
           "max": 0,
           "step": 0.01,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -5669,8 +5572,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ff",
@@ -5688,8 +5590,7 @@
           "max": 20000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "fg",
@@ -5707,8 +5608,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -5737,8 +5637,7 @@
           "max": 100,
           "step": 0.1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "gn",
@@ -5756,8 +5655,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "kn",
@@ -5775,8 +5673,7 @@
           "max": 12,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rl",
@@ -5790,12 +5687,11 @@
           "source": "ui",
           "control": "number",
           "label": "Release",
-          "min": 1,
+          "min": 10,
           "max": 1000,
           "step": 1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "rt",
@@ -5813,8 +5709,7 @@
           "max": 20,
           "step": 0.01,
           "unit": "1:",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "th",
@@ -5832,8 +5727,7 @@
           "max": 0,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -5862,8 +5756,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "lf",
@@ -5881,8 +5774,7 @@
           "max": 20000,
           "step": 100,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "lv",
@@ -5900,8 +5792,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -5926,7 +5817,9 @@
           "source": "hint",
           "format": "internal",
           "label": "Filter Delay",
-          "description": "Always Taps / 2 in samples; derived by the effect and ignored when set."
+          "description": "Always Taps / 2 in samples; derived by the effect and ignored when set.",
+          "min": 0,
+          "max": 65536
         },
         {
           "key": "fh",
@@ -5944,8 +5837,7 @@
           "max": 20000,
           "step": 10,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "fl",
@@ -5963,8 +5855,7 @@
           "max": 2000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "ll",
@@ -6045,8 +5936,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -6064,8 +5954,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rg",
@@ -6083,8 +5972,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rl",
@@ -6130,8 +6018,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tp",
@@ -6147,26 +6034,27 @@
           "label": "Taps",
           "options": [
             {
-              "value": "1024",
+              "value": 1024,
               "label": "1024"
             },
             {
-              "value": "2048",
+              "value": 2048,
               "label": "2048"
             },
             {
-              "value": "4096",
+              "value": 4096,
               "label": "4096"
             },
             {
-              "value": "8192",
+              "value": 8192,
               "label": "8192"
             },
             {
-              "value": "16384",
+              "value": 16384,
               "label": "16384"
             }
-          ]
+          ],
+          "range_verified": false
         },
         {
           "key": "wl",
@@ -6184,8 +6072,7 @@
           "max": 50,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ],
       "ui_error": "Inert UI does not load dynamic module: ../../js/measurement-store/client.js; Inert UI does not load dynamic module: ../../js/crosstalk-cancellation/designer.js; Inert UI does not load dynamic module: ../../js/ir-library/ir-asset-payload.js; Inert UI does not load dynamic module: ../../js/ir-library/ir-plugin-contract.js"
@@ -6215,8 +6102,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -6245,8 +6131,7 @@
           "max": 50,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "an",
@@ -6264,8 +6149,7 @@
           "max": 10,
           "step": 0.01,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "cs",
@@ -6283,8 +6167,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dw",
@@ -6321,8 +6204,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hf",
@@ -6340,8 +6222,7 @@
           "max": 8,
           "step": 0.1,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "nc",
@@ -6359,8 +6240,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "nt",
@@ -6378,8 +6258,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ot",
@@ -6397,8 +6276,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sc",
@@ -6416,8 +6294,7 @@
           "max": 200,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "st",
@@ -6435,8 +6312,7 @@
           "max": 14,
           "step": 0.1,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ul",
@@ -6454,8 +6330,7 @@
           "max": -18,
           "step": 0.5,
           "unit": "dBFS RMS",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -6484,8 +6359,7 @@
           "max": 1,
           "step": 0.001,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dc",
@@ -6503,8 +6377,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dd1",
@@ -6522,8 +6395,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dm",
@@ -6541,8 +6413,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dp",
@@ -6560,8 +6431,7 @@
           "max": 1,
           "step": 0.001,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "id1",
@@ -6579,8 +6449,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "id2",
@@ -6598,8 +6467,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "md",
@@ -6617,8 +6485,7 @@
           "max": 16,
           "step": 0.1,
           "unit": "samples",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mr",
@@ -6636,8 +6503,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "Hz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pd",
@@ -6655,8 +6521,7 @@
           "max": 100,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "wm",
@@ -6674,8 +6539,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -6704,8 +6568,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ds",
@@ -6723,8 +6586,7 @@
           "max": 5000,
           "step": 1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "fb",
@@ -6742,8 +6604,7 @@
           "max": 99,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hd",
@@ -6761,8 +6622,7 @@
           "max": 20000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "ld",
@@ -6780,8 +6640,7 @@
           "max": 20000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "mx",
@@ -6799,8 +6658,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pd",
@@ -6818,8 +6676,7 @@
           "max": 100,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pp",
@@ -6837,8 +6694,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -6866,9 +6722,8 @@
           "min": -12,
           "max": -2,
           "step": 0.2,
-          "unit": "10^x",
-          "scale": "linear",
-          "scaled": false
+          "unit": "log10(probability)",
+          "scale": "linear"
         },
         {
           "key": "md",
@@ -6982,7 +6837,9 @@
               "value": 192,
               "label": "192"
             }
-          ]
+          ],
+          "min": 44.1,
+          "max": 192
         },
         {
           "key": "wt",
@@ -7000,8 +6857,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -7030,8 +6886,7 @@
           "max": 100,
           "step": 0.1,
           "unit": "N / V",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "df",
@@ -7049,8 +6904,7 @@
           "max": 50,
           "step": 0.1,
           "unit": "N·s/m",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sc",
@@ -7068,8 +6922,7 @@
           "max": 100000,
           "step": 10,
           "unit": "N/m",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sm",
@@ -7087,8 +6940,7 @@
           "max": 0.5,
           "step": 0.001,
           "unit": "kg",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -7117,8 +6969,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "db",
@@ -7136,8 +6987,7 @@
           "max": 1,
           "step": 0.02,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dd",
@@ -7155,8 +7005,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dm",
@@ -7174,8 +7023,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -7193,8 +7041,7 @@
           "max": 18,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "os",
@@ -7225,7 +7072,9 @@
               "value": 8,
               "label": "8x"
             }
-          ]
+          ],
+          "min": 1,
+          "max": 8
         },
         {
           "key": "sd",
@@ -7243,8 +7092,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sm",
@@ -7262,8 +7110,7 @@
           "max": 5,
           "step": 0.05,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sp",
@@ -7281,8 +7128,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ss",
@@ -7300,8 +7146,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -7330,8 +7175,7 @@
           "max": 5,
           "step": 0.1,
           "unit": "µH",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "lv",
@@ -7349,8 +7193,7 @@
           "max": 2,
           "step": 0.01,
           "unit": "mH",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rc",
@@ -7368,8 +7211,7 @@
           "max": 2,
           "step": 0.01,
           "unit": "Ω",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "re0",
@@ -7722,8 +7564,7 @@
           "max": 64,
           "step": 1,
           "unit": "Ω",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "zo",
@@ -7741,8 +7582,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "Ω",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -7771,8 +7611,7 @@
           "max": 0.3,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dr",
@@ -7790,8 +7629,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hf",
@@ -7809,8 +7647,7 @@
           "max": 10000,
           "step": 10,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "hs",
@@ -7837,7 +7674,9 @@
               "value": 2,
               "label": "12dB/oct"
             }
-          ]
+          ],
+          "min": 0,
+          "max": 2
         },
         {
           "key": "mx",
@@ -7855,8 +7694,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "os",
@@ -7887,7 +7725,9 @@
               "value": 8,
               "label": "8x"
             }
-          ]
+          ],
+          "min": 1,
+          "max": 8
         }
       ]
     },
@@ -7916,8 +7756,7 @@
           "max": 100,
           "step": 0.1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "gn",
@@ -7935,8 +7774,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "kn",
@@ -7954,8 +7792,7 @@
           "max": 12,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rl",
@@ -7969,12 +7806,11 @@
           "source": "ui",
           "control": "number",
           "label": "Release",
-          "min": 1,
+          "min": 10,
           "max": 1000,
           "step": 1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "rt",
@@ -7992,8 +7828,7 @@
           "max": 20,
           "step": 0.01,
           "unit": "1:",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "th",
@@ -8011,8 +7846,7 @@
           "max": 0,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -8041,8 +7875,7 @@
           "max": 60,
           "step": 0.1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "df",
@@ -8060,8 +7893,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dm",
@@ -8079,8 +7911,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ds",
@@ -8098,8 +7929,7 @@
           "max": 25,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dt",
@@ -8117,8 +7947,7 @@
           "max": 8,
           "step": 1,
           "unit": "lines",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hd",
@@ -8136,8 +7965,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB/s",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "lc",
@@ -8155,8 +7983,7 @@
           "max": 500,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "md",
@@ -8174,8 +8001,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "ct",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mr",
@@ -8193,8 +8019,7 @@
           "max": 5,
           "step": 0.01,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "pd",
@@ -8212,8 +8037,7 @@
           "max": 100,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rt",
@@ -8231,8 +8055,7 @@
           "max": 10,
           "step": 0.01,
           "unit": "s",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sw",
@@ -8250,8 +8073,7 @@
           "max": 200,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "wm",
@@ -8269,8 +8091,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -8310,7 +8131,9 @@
               "label": "4"
             }
           ],
-          "description": "Limited to half the output channel count (at most 4)."
+          "description": "Limited to half the output channel count (at most 4).",
+          "min": 2,
+          "max": 4
         },
         {
           "key": "f1",
@@ -8321,7 +8144,7 @@
           },
           "external_data": false,
           "dynamic_range": true,
-          "range_note": "Range is indicative and may depend on other values or sample rate; mIV Sound normalizes it.",
+          "range_note": "Active crossovers must ascend by at least 1 Hz; bounds also depend on the band count.",
           "source": "hint",
           "control": "number",
           "label": "Freq 1",
@@ -8341,7 +8164,7 @@
           },
           "external_data": false,
           "dynamic_range": true,
-          "range_note": "Range is indicative and may depend on other values or sample rate; mIV Sound normalizes it.",
+          "range_note": "Active crossovers must ascend by at least 1 Hz; bounds also depend on the band count.",
           "source": "hint",
           "control": "number",
           "label": "Freq 2",
@@ -8361,7 +8184,7 @@
           },
           "external_data": false,
           "dynamic_range": true,
-          "range_note": "Range is indicative and may depend on other values or sample rate; mIV Sound normalizes it.",
+          "range_note": "Active crossovers must ascend by at least 1 Hz; bounds also depend on the band count.",
           "source": "hint",
           "control": "number",
           "label": "Freq 3",
@@ -8475,7 +8298,8 @@
               "value": -384,
               "label": "384dB"
             }
-          ]
+          ],
+          "range_verified": false
         },
         {
           "key": "s2",
@@ -8522,7 +8346,8 @@
               "value": -384,
               "label": "384dB"
             }
-          ]
+          ],
+          "range_verified": false
         },
         {
           "key": "s3",
@@ -8569,7 +8394,8 @@
               "value": -384,
               "label": "384dB"
             }
-          ]
+          ],
+          "range_verified": false
         },
         {
           "key": "tp",
@@ -8585,26 +8411,27 @@
           "label": "Taps",
           "options": [
             {
-              "value": "8192",
+              "value": 8192,
               "label": "8192"
             },
             {
-              "value": "16384",
+              "value": 16384,
               "label": "16384"
             },
             {
-              "value": "32768",
+              "value": 32768,
               "label": "32768"
             },
             {
-              "value": "65536",
+              "value": 65536,
               "label": "65536"
             },
             {
-              "value": "131072",
+              "value": 131072,
               "label": "131072"
             }
-          ]
+          ],
+          "range_verified": false
         }
       ]
     },
@@ -8633,8 +8460,7 @@
           "max": 240,
           "step": 1,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dl",
@@ -8652,8 +8478,7 @@
           "max": 50,
           "step": 0.01,
           "unit": "µs",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "em",
@@ -8694,8 +8519,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "Hz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mp",
@@ -8713,8 +8537,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mx",
@@ -8732,8 +8555,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -8751,8 +8573,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pr",
@@ -8770,8 +8591,7 @@
           "max": 18,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rd",
@@ -8829,8 +8649,7 @@
           "max": 70,
           "step": 0.1,
           "unit": "dBµV",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tn",
@@ -8848,8 +8667,7 @@
           "max": 200,
           "step": 0.1,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -9922,12 +9740,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": true,
-          "value": {
-            "min": -20,
-            "max": 20
-          }
+          "scale": "linear"
         },
         {
           "key": "q0",
@@ -11341,7 +11154,8 @@
           "source": "hint",
           "format": "internal",
           "label": "Delay",
-          "description": "Always 0; values sent are ignored."
+          "description": "Always 0; values sent are ignored.",
+          "range_verified": false
         },
         {
           "key": "e0",
@@ -11510,7 +11324,9 @@
           "source": "hint",
           "format": "internal",
           "label": "FIR Delay",
-          "description": "Computed from the phase mode and taps (0 or taps / 2 samples); values sent are ignored."
+          "description": "Computed from the phase mode and taps (0 or taps / 2 samples); values sent are ignored.",
+          "min": 0,
+          "max": 65536
         },
         {
           "key": "g0",
@@ -11614,7 +11430,8 @@
           "source": "hint",
           "format": "internal",
           "label": "Gain",
-          "description": "Always 0; values sent are ignored."
+          "description": "Always 0; values sent are ignored.",
+          "range_verified": false
         },
         {
           "key": "lt",
@@ -12083,26 +11900,27 @@
           "label": "Taps",
           "options": [
             {
-              "value": "8192",
+              "value": 8192,
               "label": "8192"
             },
             {
-              "value": "16384",
+              "value": 16384,
               "label": "16384"
             },
             {
-              "value": "32768",
+              "value": 32768,
               "label": "32768"
             },
             {
-              "value": "65536",
+              "value": 65536,
               "label": "65536"
             },
             {
-              "value": "131072",
+              "value": 131072,
               "label": "131072"
             }
-          ]
+          ],
+          "range_verified": false
         }
       ]
     },
@@ -12712,8 +12530,7 @@
           "max": 10000,
           "step": 0.1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "dr",
@@ -12781,8 +12598,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mn",
@@ -12792,7 +12608,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "ui",
           "control": "number",
           "label": "Minimum Shift",
@@ -12801,7 +12617,7 @@
           "step": 0.1,
           "unit": "Hz",
           "scale": "linear",
-          "scaled": false
+          "range_note": "Minimum and maximum shift are sorted together. mIV Sound normalizes it."
         },
         {
           "key": "mx",
@@ -12811,7 +12627,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "ui",
           "control": "number",
           "label": "Maximum Shift",
@@ -12820,7 +12636,7 @@
           "step": 0.1,
           "unit": "Hz",
           "scale": "linear",
-          "scaled": false
+          "range_note": "Minimum and maximum shift are sorted together. mIV Sound normalizes it."
         },
         {
           "key": "rt",
@@ -12838,8 +12654,7 @@
           "max": 2,
           "step": 0.01,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sh",
@@ -12857,8 +12672,7 @@
           "max": 5000,
           "step": 0.1,
           "unit": "Hz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sp",
@@ -12876,8 +12690,7 @@
           "max": 180,
           "step": 1,
           "unit": "degrees",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -12937,8 +12750,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -12956,8 +12768,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "re",
@@ -12974,9 +12785,8 @@
           "min": -6,
           "max": -2,
           "step": 0.1,
-          "unit": "10^x",
-          "scale": "linear",
-          "scaled": false
+          "unit": "log10(probability)",
+          "scale": "linear"
         }
       ]
     },
@@ -13005,8 +12815,7 @@
           "max": 30,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mx",
@@ -13024,8 +12833,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -13043,8 +12851,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tc",
@@ -13060,18 +12867,20 @@
           "label": "Transcodes",
           "options": [
             {
-              "value": "1",
+              "value": 1,
               "label": "1"
             },
             {
-              "value": "2",
+              "value": 2,
               "label": "2"
             },
             {
-              "value": "3",
+              "value": 3,
               "label": "3"
             }
-          ]
+          ],
+          "min": 1,
+          "max": 3
         }
       ]
     },
@@ -13100,8 +12909,7 @@
           "max": 50,
           "step": 0.01,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "gn",
@@ -13119,8 +12927,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "kn",
@@ -13138,8 +12945,7 @@
           "max": 6,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rl",
@@ -13157,8 +12963,7 @@
           "max": 2000,
           "step": 10,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "rt",
@@ -13176,8 +12981,7 @@
           "max": 100,
           "step": 0.1,
           "unit": ":1",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "th",
@@ -13195,8 +12999,7 @@
           "max": 0,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -13560,22 +13363,23 @@
           "label": "Taps",
           "options": [
             {
-              "value": "4096",
+              "value": 4096,
               "label": "4096"
             },
             {
-              "value": "8192",
+              "value": 8192,
               "label": "8192"
             },
             {
-              "value": "16384",
+              "value": 16384,
               "label": "16384"
             },
             {
-              "value": "32768",
+              "value": 32768,
               "label": "32768"
             }
-          ]
+          ],
+          "range_verified": false
         }
       ],
       "ui_error": "Inert UI does not load dynamic module: ../../js/group-delay-eq/designer.js; Inert UI does not load dynamic module: ../../js/group-delay-eq/design-core.js; Inert UI does not load dynamic module: ../js/ir-library/ir-asset-payload.js; Inert UI does not load dynamic module: ../js/ir-library/ir-plugin-contract.js"
@@ -14160,22 +13964,23 @@
           "label": "Taps",
           "options": [
             {
-              "value": "4096",
+              "value": 4096,
               "label": "4096"
             },
             {
-              "value": "8192",
+              "value": 8192,
               "label": "8192"
             },
             {
-              "value": "16384",
+              "value": 16384,
               "label": "16384"
             },
             {
-              "value": "32768",
+              "value": 32768,
               "label": "32768"
             }
-          ]
+          ],
+          "range_verified": false
         }
       ],
       "ui_error": "Inert UI does not load dynamic module: ../../js/group-delay-peq/designer.js; Inert UI does not load dynamic module: ../../js/group-delay-peq/design-core.js; Inert UI does not load dynamic module: ../js/ir-library/ir-asset-payload.js; Inert UI does not load dynamic module: ../js/ir-library/ir-plugin-contract.js"
@@ -14249,7 +14054,9 @@
               "value": 16,
               "label": "16x"
             }
-          ]
+          ],
+          "min": 1,
+          "max": 16
         },
         {
           "key": "th",
@@ -14267,8 +14074,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -14297,8 +14103,7 @@
           "max": 30,
           "step": 0.1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "h3",
@@ -14316,8 +14121,7 @@
           "max": 30,
           "step": 0.1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "h4",
@@ -14335,8 +14139,7 @@
           "max": 30,
           "step": 0.1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "h5",
@@ -14354,8 +14157,7 @@
           "max": 30,
           "step": 0.1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "os",
@@ -14386,7 +14188,9 @@
               "value": 8,
               "label": "8x"
             }
-          ]
+          ],
+          "min": 1,
+          "max": 8
         },
         {
           "key": "sn",
@@ -14404,8 +14208,7 @@
           "max": 2,
           "step": 0.01,
           "unit": "x",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -14447,8 +14250,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ea0",
@@ -14617,7 +14419,9 @@
           "source": "hint",
           "format": "internal",
           "label": "FIR Delay",
-          "description": "Computed from the phase mode and taps (0 or taps / 2 samples); values sent are ignored."
+          "description": "Computed from the phase mode and taps (0 or taps / 2 samples); values sent are ignored.",
+          "min": 0,
+          "max": 65536
         },
         {
           "key": "ga0",
@@ -14760,8 +14564,7 @@
           "max": 18,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mn",
@@ -14781,7 +14584,8 @@
             "control": "number",
             "label": "Measurement Level",
             "unit": "dB",
-            "scale": "linear"
+            "scale": "linear",
+            "range_verified": false
           },
           "description": "Headphone measurement: 241 levels at 20 * 1000^(i / 240) Hz (1/24 octave, 20 Hz to 20 kHz), or [] for none. Other lengths or non-finite values are ignored."
         },
@@ -14794,7 +14598,8 @@
             "control": "number",
             "label": "Target Level",
             "unit": "dB",
-            "scale": "linear"
+            "scale": "linear",
+            "range_verified": false
           },
           "description": "Target curve on the same 241-point grid as mr, or [] for none. Other lengths or non-finite values are ignored."
         },
@@ -14829,7 +14634,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "hint",
           "control": "number",
           "label": "Target Adjust 1 Q",
@@ -14838,7 +14643,8 @@
           "step": 0.01,
           "unit": "",
           "scale": "linear",
-          "description": "Limited to 2 for ls and hs bands."
+          "description": "Limited to 2 for ls and hs bands.",
+          "range_note": "Q is limited to 2 for shelf filters and 10 for peaking filters."
         },
         {
           "key": "qa1",
@@ -14848,7 +14654,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "hint",
           "control": "number",
           "label": "Target Adjust 2 Q",
@@ -14857,7 +14663,8 @@
           "step": 0.01,
           "unit": "",
           "scale": "linear",
-          "description": "Limited to 2 for ls and hs bands."
+          "description": "Limited to 2 for ls and hs bands.",
+          "range_note": "Q is limited to 2 for shelf filters and 10 for peaking filters."
         },
         {
           "key": "qa2",
@@ -14867,7 +14674,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "hint",
           "control": "number",
           "label": "Target Adjust 3 Q",
@@ -14876,7 +14683,8 @@
           "step": 0.01,
           "unit": "",
           "scale": "linear",
-          "description": "Limited to 2 for ls and hs bands."
+          "description": "Limited to 2 for ls and hs bands.",
+          "range_note": "Q is limited to 2 for shelf filters and 10 for peaking filters."
         },
         {
           "key": "qa3",
@@ -14886,7 +14694,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "hint",
           "control": "number",
           "label": "Target Adjust 4 Q",
@@ -14895,7 +14703,8 @@
           "step": 0.01,
           "unit": "",
           "scale": "linear",
-          "description": "Limited to 2 for ls and hs bands."
+          "description": "Limited to 2 for ls and hs bands.",
+          "range_note": "Q is limited to 2 for shelf filters and 10 for peaking filters."
         },
         {
           "key": "qa4",
@@ -14905,7 +14714,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "hint",
           "control": "number",
           "label": "Target Adjust 5 Q",
@@ -14914,7 +14723,8 @@
           "step": 0.01,
           "unit": "",
           "scale": "linear",
-          "description": "Limited to 2 for ls and hs bands."
+          "description": "Limited to 2 for ls and hs bands.",
+          "range_note": "Q is limited to 2 for shelf filters and 10 for peaking filters."
         },
         {
           "key": "sm",
@@ -14932,8 +14742,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "oct",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ta0",
@@ -15093,26 +14902,27 @@
           "label": "Taps",
           "options": [
             {
-              "value": "8192",
+              "value": 8192,
               "label": "8192"
             },
             {
-              "value": "16384",
+              "value": 16384,
               "label": "16384"
             },
             {
-              "value": "32768",
+              "value": 32768,
               "label": "32768"
             },
             {
-              "value": "65536",
+              "value": 65536,
               "label": "65536"
             },
             {
-              "value": "131072",
+              "value": 131072,
               "label": "131072"
             }
-          ]
+          ],
+          "range_verified": false
         },
         {
           "key": "uf",
@@ -15130,8 +14940,7 @@
           "max": 20000,
           "step": 10,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         }
       ]
     },
@@ -15160,8 +14969,7 @@
           "max": 40000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sl",
@@ -15209,8 +15017,7 @@
           "max": 5000,
           "step": 10,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "cv",
@@ -15228,8 +15035,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dp",
@@ -15247,8 +15053,7 @@
           "max": 10,
           "step": 0.01,
           "unit": "dB/m",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ln",
@@ -15266,8 +15071,7 @@
           "max": 120,
           "step": 1,
           "unit": "cm",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mo",
@@ -15285,8 +15089,7 @@
           "max": 200,
           "step": 0.5,
           "unit": "cm",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "th",
@@ -15304,8 +15107,7 @@
           "max": 50,
           "step": 0.1,
           "unit": "cm",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tr",
@@ -15323,8 +15125,7 @@
           "max": 0.99,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "wg",
@@ -15342,8 +15143,7 @@
           "max": 36,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -15372,8 +15172,7 @@
           "max": 5000,
           "step": 10,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "cv",
@@ -15391,8 +15190,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dp",
@@ -15410,8 +15208,7 @@
           "max": 10,
           "step": 0.01,
           "unit": "dB/m",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ln",
@@ -15429,8 +15226,7 @@
           "max": 120,
           "step": 1,
           "unit": "cm",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mo",
@@ -15448,8 +15244,7 @@
           "max": 200,
           "step": 0.5,
           "unit": "cm",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "th",
@@ -15467,8 +15262,7 @@
           "max": 50,
           "step": 0.1,
           "unit": "cm",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tr",
@@ -15486,8 +15280,7 @@
           "max": 0.99,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "wg",
@@ -15505,8 +15298,7 @@
           "max": 36,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -15535,8 +15327,7 @@
           "max": 120,
           "step": 0.1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "hm",
@@ -15554,8 +15345,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "in",
@@ -15573,8 +15363,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "lv",
@@ -15592,8 +15381,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tn",
@@ -15611,8 +15399,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "kHz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "tp",
@@ -15695,8 +15482,7 @@
           "max": 64,
           "step": 1,
           "unit": "",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sp",
@@ -15714,8 +15500,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -15779,8 +15564,7 @@
           "max": 50,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "cr",
@@ -15855,8 +15639,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dt",
@@ -15874,8 +15657,7 @@
           "max": 400,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dw",
@@ -15893,8 +15675,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ir",
@@ -15961,8 +15742,7 @@
           "max": 500,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tr",
@@ -15980,8 +15760,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -16020,8 +15799,7 @@
           "max": 40000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sl",
@@ -16069,8 +15847,7 @@
           "max": 6000,
           "step": 10,
           "unit": "Hz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hg",
@@ -16088,8 +15865,7 @@
           "max": 15,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hq",
@@ -16107,8 +15883,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "lf",
@@ -16126,8 +15901,7 @@
           "max": 300,
           "step": 1,
           "unit": "Hz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "lg",
@@ -16145,8 +15919,7 @@
           "max": 15,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "lq",
@@ -16164,8 +15937,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rv",
@@ -16183,12 +15955,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": true,
-          "value": {
-            "min": -30,
-            "max": 12
-          }
+          "scale": "linear"
         },
         {
           "key": "sp",
@@ -16206,8 +15973,7 @@
           "max": 96,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -16263,8 +16029,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -16282,8 +16047,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -16398,8 +16162,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -16417,8 +16180,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rv",
@@ -16481,14 +16243,16 @@
           "label": "Mode",
           "options": [
             {
-              "value": "0",
+              "value": 0,
               "label": "Encode"
             },
             {
-              "value": "1",
+              "value": 1,
               "label": "Decode"
             }
-          ]
+          ],
+          "min": 0,
+          "max": 1
         },
         {
           "key": "mg",
@@ -16506,8 +16270,7 @@
           "max": 18,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sg",
@@ -16525,8 +16288,7 @@
           "max": 18,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sw",
@@ -16539,7 +16301,9 @@
           "dynamic_range": false,
           "source": "ui",
           "control": "checkbox",
-          "label": "Swap L/R"
+          "label": "Swap L/R",
+          "min": 0,
+          "max": 1
         }
       ]
     },
@@ -16774,8 +16538,14 @@
               "min": 3,
               "max": 9.9,
               "step": 0.01,
-              "unit": "",
-              "scale": "linear"
+              "unit": "ln(Hz)",
+              "scale": "linear",
+              "display": {
+                "unit": "Hz",
+                "min": 20.085536923187668,
+                "max": 19930.370438230297,
+                "formula": "exp(v)"
+              }
             },
             "dc": {
               "control": "number",
@@ -16792,8 +16562,14 @@
               "min": 3,
               "max": 9.9,
               "step": 0.01,
-              "unit": "",
-              "scale": "linear"
+              "unit": "ln(Hz)",
+              "scale": "linear",
+              "display": {
+                "unit": "Hz",
+                "min": 20.085536923187668,
+                "max": 19930.370438230297,
+                "formula": "exp(v)"
+              }
             },
             "hp": {
               "control": "number",
@@ -16801,8 +16577,14 @@
               "min": 3,
               "max": 9.9,
               "step": 0.01,
-              "unit": "",
-              "scale": "linear"
+              "unit": "ln(Hz)",
+              "scale": "linear",
+              "display": {
+                "unit": "Hz",
+                "min": 20.085536923187668,
+                "max": 19930.370438230297,
+                "formula": "exp(v)"
+              }
             },
             "gn": {
               "control": "number",
@@ -16849,7 +16631,8 @@
               "label": "Resonator 5"
             }
           ],
-          "description": "The resonator tab shown in the UI; it does not change the sound."
+          "description": "The resonator tab shown in the UI; it does not change the sound.",
+          "range_verified": false
         }
       ]
     },
@@ -17236,7 +17019,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Frequency2",
@@ -17244,7 +17027,8 @@
           "max": 2000,
           "step": 1,
           "unit": "Hz",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Crossover cannot be below the preceding crossover. mIV Sound normalizes it."
         },
         {
           "key": "f3",
@@ -17254,7 +17038,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Frequency3",
@@ -17262,7 +17046,8 @@
           "max": 8000,
           "step": 1,
           "unit": "Hz",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Crossover cannot be below the preceding crossover. mIV Sound normalizes it."
         },
         {
           "key": "f4",
@@ -17273,7 +17058,7 @@
           },
           "external_data": false,
           "dynamic_range": true,
-          "range_note": "Range is indicative and may depend on other values or sample rate; mIV Sound normalizes it.",
+          "range_note": "Crossover cannot be below the preceding crossover. mIV Sound normalizes it.",
           "source": "hint",
           "control": "number",
           "label": "Freq 4",
@@ -17547,7 +17332,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Frequency2",
@@ -17555,7 +17340,8 @@
           "max": 2000,
           "step": 1,
           "unit": "Hz",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Crossover cannot be below the preceding crossover. mIV Sound normalizes it."
         },
         {
           "key": "f3",
@@ -17565,7 +17351,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Frequency3",
@@ -17573,7 +17359,8 @@
           "max": 8000,
           "step": 1,
           "unit": "Hz",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Crossover cannot be below the preceding crossover. mIV Sound normalizes it."
         },
         {
           "key": "f4",
@@ -17584,7 +17371,7 @@
           },
           "external_data": false,
           "dynamic_range": true,
-          "range_note": "Range is indicative and may depend on other values or sample rate; mIV Sound normalizes it.",
+          "range_note": "Crossover cannot be below the preceding crossover. mIV Sound normalizes it.",
           "source": "hint",
           "control": "number",
           "label": "Freq 4",
@@ -17858,7 +17645,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Frequency2",
@@ -17866,7 +17653,8 @@
           "max": 2000,
           "step": 1,
           "unit": "Hz",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Crossover cannot be below the preceding crossover. mIV Sound normalizes it."
         },
         {
           "key": "f3",
@@ -17876,7 +17664,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Frequency3",
@@ -17884,7 +17672,8 @@
           "max": 8000,
           "step": 1,
           "unit": "Hz",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Crossover cannot be below the preceding crossover. mIV Sound normalizes it."
         },
         {
           "key": "f4",
@@ -17895,7 +17684,7 @@
           },
           "external_data": false,
           "dynamic_range": true,
-          "range_note": "Range is indicative and may depend on other values or sample rate; mIV Sound normalizes it.",
+          "range_note": "Crossover cannot be below the preceding crossover. mIV Sound normalizes it.",
           "source": "hint",
           "control": "number",
           "label": "Freq 4",
@@ -18065,7 +17854,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Frequency2",
@@ -18073,7 +17862,8 @@
           "max": 20000,
           "step": 1,
           "unit": "Hz",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Crossover cannot be below the preceding crossover. mIV Sound normalizes it."
         },
         {
           "key": "os",
@@ -18104,7 +17894,9 @@
               "value": 8,
               "label": "8x"
             }
-          ]
+          ],
+          "min": 1,
+          "max": 8
         }
       ]
     },
@@ -18327,7 +18119,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Frequency2",
@@ -18335,7 +18127,8 @@
           "max": 20000,
           "step": 1,
           "unit": "Hz",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Crossover cannot be below the preceding crossover. mIV Sound normalizes it."
         }
       ]
     },
@@ -18374,8 +18167,7 @@
           "max": 4000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "hs",
@@ -18412,8 +18204,7 @@
           "max": 40000,
           "step": 100,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "ls",
@@ -18461,8 +18252,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "nt",
@@ -18531,8 +18321,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mix",
@@ -18550,8 +18339,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rd",
@@ -18569,8 +18357,7 @@
           "max": 24,
           "step": 0.5,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sm",
@@ -18588,8 +18375,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sn",
@@ -18607,8 +18393,7 @@
           "max": 12,
           "step": 0.5,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -18755,7 +18540,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "hint",
           "control": "number",
           "label": "Lowest Note",
@@ -18764,7 +18549,8 @@
           "step": 1,
           "unit": "MIDI note",
           "scale": "linear",
-          "integer": true
+          "integer": true,
+          "range_note": "Lowest and highest notes are normalized together. mIV Sound normalizes it."
         },
         {
           "key": "mx",
@@ -18774,7 +18560,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "hint",
           "control": "number",
           "label": "Highest Note",
@@ -18783,7 +18569,8 @@
           "step": 1,
           "unit": "MIDI note",
           "scale": "linear",
-          "integer": true
+          "integer": true,
+          "range_note": "Lowest and highest notes are normalized together. mIV Sound normalizes it."
         },
         {
           "key": "os",
@@ -18837,8 +18624,7 @@
           "max": 10,
           "step": 1,
           "unit": "s",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "vl",
@@ -18957,8 +18743,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "wd",
@@ -19080,7 +18865,13 @@
           "max": 10,
           "step": 0.001,
           "unit": "s",
-          "scale": "log"
+          "scale": "log",
+          "display": {
+            "unit": "ms",
+            "min": 1,
+            "max": 10000,
+            "formula": "1000*v"
+          }
         },
         {
           "key": "ho",
@@ -19098,7 +18889,13 @@
           "max": 0.01,
           "step": 0.0001,
           "unit": "s",
-          "scale": "log"
+          "scale": "log",
+          "display": {
+            "unit": "ms",
+            "min": 0.1,
+            "max": 10,
+            "formula": "1000*v"
+          }
         },
         {
           "key": "holdoff",
@@ -19564,7 +19361,7 @@
             ]
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "members": {
             "en": {
@@ -19575,73 +19372,89 @@
               "control": "number",
               "label": "Outer Frequency Low",
               "min": 20,
-              "max": 40000,
+              "max": 39999,
               "step": 1,
               "unit": "Hz",
-              "scale": "log"
+              "scale": "log",
+              "dynamic_range": true,
+              "range_note": "Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point."
             },
             "fl": {
               "control": "number",
               "label": "Core Frequency Low",
               "min": 20,
-              "max": 40000,
+              "max": 39999,
               "step": 1,
               "unit": "Hz",
-              "scale": "log"
+              "scale": "log",
+              "dynamic_range": true,
+              "range_note": "Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point."
             },
             "fh": {
               "control": "number",
               "label": "Core Frequency High",
-              "min": 20,
+              "min": 21,
               "max": 40000,
               "step": 1,
               "unit": "Hz",
-              "scale": "log"
+              "scale": "log",
+              "dynamic_range": true,
+              "range_note": "Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point."
             },
             "ofh": {
               "control": "number",
               "label": "Outer Frequency High",
-              "min": 20,
+              "min": 21,
               "max": 40000,
               "step": 1,
               "unit": "Hz",
-              "scale": "log"
+              "scale": "log",
+              "dynamic_range": true,
+              "range_note": "Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point."
             },
             "opl": {
               "control": "number",
               "label": "Outer Phase Low",
               "min": 0,
-              "max": 180,
+              "max": 179,
               "step": 1,
               "unit": "degree",
-              "scale": "linear"
+              "scale": "linear",
+              "dynamic_range": true,
+              "range_note": "Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point."
             },
             "pl": {
               "control": "number",
               "label": "Core Phase Low",
               "min": 0,
-              "max": 180,
+              "max": 179,
               "step": 1,
               "unit": "degree",
-              "scale": "linear"
+              "scale": "linear",
+              "dynamic_range": true,
+              "range_note": "Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point."
             },
             "ph": {
               "control": "number",
               "label": "Core Phase High",
-              "min": 0,
+              "min": 1,
               "max": 180,
               "step": 1,
               "unit": "degree",
-              "scale": "linear"
+              "scale": "linear",
+              "dynamic_range": true,
+              "range_note": "Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point."
             },
             "oph": {
               "control": "number",
               "label": "Outer Phase High",
-              "min": 0,
+              "min": 1,
               "max": 180,
               "step": 1,
               "unit": "degree",
-              "scale": "linear"
+              "scale": "linear",
+              "dynamic_range": true,
+              "range_note": "Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point."
             },
             "gn": {
               "control": "number",
@@ -19660,39 +19473,48 @@
               "control": "number",
               "label": "Outer Balance Low",
               "min": -100,
-              "max": 100,
+              "max": 99,
               "step": 0.1,
               "unit": "%",
-              "scale": "linear"
+              "scale": "linear",
+              "dynamic_range": true,
+              "range_note": "Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point."
             },
             "bl": {
               "control": "number",
               "label": "Core Balance Low",
               "min": -100,
-              "max": 100,
+              "max": 99,
               "step": 0.1,
               "unit": "%",
-              "scale": "linear"
+              "scale": "linear",
+              "dynamic_range": true,
+              "range_note": "Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point."
             },
             "bh": {
               "control": "number",
               "label": "Core Balance High",
-              "min": -100,
+              "min": -99,
               "max": 100,
               "step": 0.1,
               "unit": "%",
-              "scale": "linear"
+              "scale": "linear",
+              "dynamic_range": true,
+              "range_note": "Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point."
             },
             "obh": {
               "control": "number",
               "label": "Outer Balance High",
-              "min": -100,
+              "min": -99,
               "max": 100,
               "step": 0.1,
               "unit": "%",
-              "scale": "linear"
+              "scale": "linear",
+              "dynamic_range": true,
+              "range_note": "Outer bounds enclose the core; core frequency, phase and balance intervals have minimum widths of 1 Hz, 1 degree and 1 percent point."
             }
-          }
+          },
+          "range_note": "Range depends on other parameter values; see member descriptions. mIV Sound normalizes it."
         }
       ]
     },
@@ -19721,8 +19543,7 @@
           "max": 8000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "dr",
@@ -19763,8 +19584,7 @@
           "max": 90,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "md",
@@ -19805,8 +19625,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rg",
@@ -19824,8 +19643,7 @@
           "max": 6,
           "step": 0.1,
           "unit": "octaves",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rt",
@@ -19843,8 +19661,7 @@
           "max": 10,
           "step": 0.01,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sp",
@@ -19862,8 +19679,7 @@
           "max": 180,
           "step": 1,
           "unit": "degrees",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "st",
@@ -19881,8 +19697,7 @@
           "max": 12,
           "step": 2,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -19953,7 +19768,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "hint",
           "control": "number",
           "label": "Lowest Note",
@@ -19962,7 +19777,8 @@
           "step": 1,
           "unit": "MIDI note",
           "scale": "linear",
-          "integer": true
+          "integer": true,
+          "range_note": "Lowest and highest notes are normalized together. mIV Sound normalizes it."
         },
         {
           "key": "mx",
@@ -19972,7 +19788,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "hint",
           "control": "number",
           "label": "Highest Note",
@@ -19981,7 +19797,8 @@
           "step": 1,
           "unit": "MIDI note",
           "scale": "linear",
-          "integer": true
+          "integer": true,
+          "range_note": "Lowest and highest notes are normalized together. mIV Sound normalizes it."
         },
         {
           "key": "rf",
@@ -19999,8 +19816,7 @@
           "max": 480,
           "step": 1,
           "unit": "Hz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -20029,8 +19845,7 @@
           "max": 50,
           "step": 1,
           "unit": "cents",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ps",
@@ -20048,8 +19863,7 @@
           "max": 6,
           "step": 1,
           "unit": "semitones",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -20078,8 +19892,7 @@
           "max": 50,
           "step": 1,
           "unit": "cents",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ps",
@@ -20097,8 +19910,7 @@
           "max": 6,
           "step": 1,
           "unit": "semitones",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ws",
@@ -20116,8 +19928,7 @@
           "max": 500,
           "step": 1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "xf",
@@ -20135,8 +19946,7 @@
           "max": 40,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -20188,8 +19998,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rs",
@@ -20207,8 +20016,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ss",
@@ -20226,8 +20034,7 @@
           "max": 18,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -20256,8 +20063,7 @@
           "max": 0.8,
           "step": 0.01,
           "unit": "ratio",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dp",
@@ -20275,8 +20081,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ds",
@@ -20294,8 +20099,7 @@
           "max": 8,
           "step": 1,
           "unit": "lines",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hd",
@@ -20313,8 +20117,7 @@
           "max": 20000,
           "step": 100,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "ld",
@@ -20332,8 +20135,7 @@
           "max": 500,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "mx",
@@ -20351,8 +20153,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pd",
@@ -20370,8 +20171,7 @@
           "max": 50,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rs",
@@ -20389,8 +20189,7 @@
           "max": 50,
           "step": 0.1,
           "unit": "m",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rt",
@@ -20408,8 +20207,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "s",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         }
       ]
     },
@@ -20466,7 +20264,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "ui",
           "control": "number",
           "label": "Min BPM",
@@ -20475,7 +20273,7 @@
           "step": 1,
           "unit": "BPM",
           "scale": "linear",
-          "scaled": false
+          "range_note": "Maximum BPM is at least 1.25 times minimum BPM; changing one can adjust the other. mIV Sound normalizes it."
         },
         {
           "key": "mx",
@@ -20485,7 +20283,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "ui",
           "control": "number",
           "label": "Max BPM",
@@ -20494,7 +20292,7 @@
           "step": 1,
           "unit": "BPM",
           "scale": "linear",
-          "scaled": false
+          "range_note": "Maximum BPM is at least 1.25 times minimum BPM; changing one can adjust the other. mIV Sound normalizes it."
         },
         {
           "key": "sp",
@@ -20510,26 +20308,27 @@
           "label": "Span (beats)",
           "options": [
             {
-              "value": "4",
+              "value": 4,
               "label": "4"
             },
             {
-              "value": "6",
+              "value": 6,
               "label": "6"
             },
             {
-              "value": "8",
+              "value": 8,
               "label": "8"
             },
             {
-              "value": "12",
+              "value": 12,
               "label": "12"
             },
             {
-              "value": "16",
+              "value": 16,
               "label": "16"
             }
-          ]
+          ],
+          "range_verified": false
         },
         {
           "key": "ve",
@@ -20819,8 +20618,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "delayMs",
@@ -20863,8 +20661,7 @@
           "max": 50,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dy",
@@ -20892,8 +20689,7 @@
           "max": 20000,
           "step": 10,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "fl",
@@ -20911,8 +20707,7 @@
           "max": 1000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "gn",
@@ -20930,8 +20725,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "le",
@@ -20997,8 +20791,7 @@
           "max": 18,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mn",
@@ -21218,8 +21011,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ps",
@@ -21255,8 +21047,7 @@
           "max": 20000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "rp",
@@ -21275,7 +21066,8 @@
           "unit": "",
           "scale": "linear",
           "integer": true,
-          "description": "Index of the reference point of the selected measurement; 0 when the measurement has no such point."
+          "description": "Index of the reference point of the selected measurement; 0 when the measurement has no such point.",
+          "range_verified": false
         },
         {
           "key": "rs",
@@ -21293,8 +21085,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "oct",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rv",
@@ -21312,8 +21103,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rw",
@@ -21331,8 +21121,7 @@
           "max": 1000,
           "step": 10,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sm",
@@ -21350,8 +21139,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "oct",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tp",
@@ -21367,26 +21155,27 @@
           "label": "Taps",
           "options": [
             {
-              "value": "8192",
+              "value": 8192,
               "label": "8192"
             },
             {
-              "value": "16384",
+              "value": 16384,
               "label": "16384"
             },
             {
-              "value": "32768",
+              "value": 32768,
               "label": "32768"
             },
             {
-              "value": "65536",
+              "value": 65536,
               "label": "65536"
             },
             {
-              "value": "131072",
+              "value": 131072,
               "label": "131072"
             }
-          ]
+          ],
+          "range_verified": false
         }
       ],
       "ui_error": "Inert UI does not load dynamic module: ../../js/measurement-store/client.js; Inert UI does not load dynamic module: ../../js/room-eq/designer.js; Inert UI does not load dynamic module: ../../js/room-eq/design-core.js; Inert UI does not load dynamic module: ../../js/ir-library/ir-asset-payload.js; Inert UI does not load dynamic module: ../../js/ir-library/ir-plugin-contract.js"
@@ -21416,8 +21205,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "s",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "ad",
@@ -21435,8 +21223,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dd",
@@ -21454,8 +21241,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mx",
@@ -21473,8 +21259,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rb",
@@ -21492,8 +21277,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sp",
@@ -21511,8 +21295,7 @@
           "max": 200,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ss",
@@ -21557,8 +21340,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "xo",
@@ -21576,8 +21358,7 @@
           "max": 2000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         }
       ]
     },
@@ -21629,8 +21410,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dt",
@@ -21722,7 +21502,7 @@
           },
           "external_data": false,
           "dynamic_range": true,
-          "range_note": "Range is indicative and may depend on other values or sample rate; mIV Sound normalizes it.",
+          "range_note": "Highest note is at least mn. mIV Sound normalizes it.",
           "source": "hint",
           "control": "number",
           "label": "Highest Note",
@@ -21751,8 +21531,7 @@
           "max": 100,
           "step": 1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -21770,8 +21549,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "os",
@@ -21789,8 +21567,7 @@
           "max": 2,
           "step": 1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pl",
@@ -21808,8 +21585,7 @@
           "max": 128,
           "step": 1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rd",
@@ -21827,8 +21603,7 @@
           "max": 96,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sf",
@@ -21880,8 +21655,7 @@
           "max": 6,
           "step": 1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "th",
@@ -21899,8 +21673,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tm",
@@ -21918,8 +21691,7 @@
           "max": 100,
           "step": 1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "vc",
@@ -21929,7 +21701,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "ui",
           "control": "number",
           "label": "Velocity 127 Level",
@@ -21938,7 +21710,7 @@
           "step": 0.1,
           "unit": "dB",
           "scale": "linear",
-          "scaled": false
+          "range_note": "Velocity ceiling is at least vf + 1. mIV Sound normalizes it."
         },
         {
           "key": "vf",
@@ -21956,8 +21728,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "wm",
@@ -21975,8 +21746,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ],
       "ui_error": "Inert UI does not load dynamic module: ../js/sfz/service.js"
@@ -22033,8 +21803,7 @@
           "max": 1000,
           "step": 1,
           "unit": "Hz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "bw",
@@ -22052,8 +21821,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "cp",
@@ -22071,8 +21839,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "de",
@@ -22113,8 +21880,7 @@
           "max": 8,
           "step": 0.01,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "dt",
@@ -22132,8 +21898,7 @@
           "max": 500,
           "step": 1,
           "unit": "µs",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "fd",
@@ -22151,8 +21916,7 @@
           "max": 10,
           "step": 0.01,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "hm",
@@ -22170,8 +21934,7 @@
           "max": -20,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hz",
@@ -22212,8 +21975,7 @@
           "max": 0,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "io",
@@ -22231,8 +21993,7 @@
           "max": 10,
           "step": 0.01,
           "unit": "kHz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "md",
@@ -22250,8 +22011,7 @@
           "max": 125,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mo",
@@ -22296,8 +22056,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -22315,8 +22074,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pe",
@@ -22334,8 +22092,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rd",
@@ -22366,8 +22123,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sk",
@@ -22385,8 +22141,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sp",
@@ -22449,8 +22204,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tn",
@@ -22468,8 +22222,7 @@
           "max": 5,
           "step": 0.01,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -22498,8 +22251,7 @@
           "max": 0.3,
           "step": 0.01,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dr",
@@ -22517,8 +22269,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "gn",
@@ -22536,8 +22287,7 @@
           "max": 18,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mx",
@@ -22555,8 +22305,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "os",
@@ -22587,7 +22336,9 @@
               "value": 8,
               "label": "8x"
             }
-          ]
+          ],
+          "min": 1,
+          "max": 8
         }
       ]
     },
@@ -22637,11 +22388,17 @@
           "source": "catalog",
           "control": "number",
           "label": "Rms Jitter Nanoseconds",
-          "min": 0.001,
-          "max": 10000000,
-          "step": 0.001,
-          "unit": "ns",
-          "scale": "log"
+          "min": 0,
+          "max": 200,
+          "unit": "dB re 0.001 ns",
+          "scale": "log",
+          "step": 1,
+          "display": {
+            "unit": "ns",
+            "min": 0.001,
+            "max": 10000000,
+            "formula": "0.001*10^(v/20)"
+          }
         }
       ]
     },
@@ -22705,8 +22462,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dm",
@@ -23772,8 +23528,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ep",
@@ -24852,8 +24607,7 @@
           "max": 16,
           "step": 1,
           "unit": "ch",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ph",
@@ -24871,8 +24625,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rm",
@@ -25938,8 +25691,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ts",
@@ -25957,8 +25709,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -26010,8 +25761,7 @@
           "max": -48,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hq",
@@ -26058,7 +25808,13 @@
           "unit": "log2 FFT size",
           "scale": "linear",
           "integer": true,
-          "description": "FFT size exponent: the analysis uses 2^pt points (256 to 16384)."
+          "description": "FFT size exponent: the analysis uses 2^pt points (256 to 16384).",
+          "display": {
+            "unit": "points",
+            "min": 256,
+            "max": 16384,
+            "formula": "2^v"
+          }
         },
         {
           "key": "sc",
@@ -26164,8 +25920,7 @@
           "max": -48,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hq",
@@ -26212,7 +25967,13 @@
           "unit": "log2 FFT size",
           "scale": "linear",
           "integer": true,
-          "description": "FFT size exponent: the analysis uses 2^pt points (256 to 16384)."
+          "description": "FFT size exponent: the analysis uses 2^pt points (256 to 16384).",
+          "display": {
+            "unit": "points",
+            "min": 256,
+            "max": 16384,
+            "formula": "2^v"
+          }
         },
         {
           "key": "sc",
@@ -26264,15 +26025,16 @@
           "source": "ui",
           "control": "number",
           "label": "Balance",
-          "min": -100,
-          "max": 100,
-          "step": 1,
-          "unit": "%",
+          "min": -1,
+          "max": 1,
+          "step": 0.01,
+          "unit": "",
           "scale": "linear",
-          "scaled": true,
-          "value": {
-            "min": -1,
-            "max": 1
+          "display": {
+            "unit": "%",
+            "min": -100,
+            "max": 100,
+            "formula": "100*v"
           }
         }
       ]
@@ -26302,8 +26064,7 @@
           "max": 200,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -26364,7 +26125,13 @@
           "max": 1,
           "step": 0.001,
           "unit": "s",
-          "scale": "log"
+          "scale": "log",
+          "display": {
+            "unit": "ms",
+            "min": 10,
+            "max": 1000,
+            "formula": "1000*v"
+          }
         }
       ]
     },
@@ -26393,8 +26160,7 @@
           "max": 400,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "dhs",
@@ -26431,8 +26197,7 @@
           "max": 200,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "shf",
@@ -26450,8 +26215,7 @@
           "max": 400,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "shs",
@@ -26488,8 +26252,7 @@
           "max": 200,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "slf",
@@ -26507,8 +26270,7 @@
           "max": 400,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sls",
@@ -26556,8 +26318,7 @@
           "max": 240,
           "step": 1,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "bz",
@@ -26575,8 +26336,7 @@
           "max": -20,
           "step": 1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dl",
@@ -26594,8 +26354,7 @@
           "max": 50,
           "step": 0.01,
           "unit": "µs",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "fd",
@@ -26613,8 +26372,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "Hz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mp",
@@ -26632,8 +26390,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mx",
@@ -26651,8 +26408,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -26670,8 +26426,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pr",
@@ -26689,8 +26444,7 @@
           "max": 18,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rd",
@@ -26799,8 +26553,7 @@
           "max": 70,
           "step": 0.1,
           "unit": "dBµV",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tn",
@@ -26818,8 +26571,7 @@
           "max": 200,
           "step": 0.1,
           "unit": "kHz",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tx",
@@ -26875,8 +26627,7 @@
           "max": 6,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hs",
@@ -26894,8 +26645,7 @@
           "max": -39,
           "step": 0.1,
           "unit": "dB re 320 nWb/m",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mx",
@@ -26913,8 +26663,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -26932,8 +26681,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rl",
@@ -26951,8 +26699,7 @@
           "max": 18,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sp",
@@ -27020,8 +26767,7 @@
           "max": 1,
           "step": 0.001,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -27046,11 +26792,17 @@
           "source": "catalog",
           "control": "number",
           "label": "Pivot Frequency",
-          "min": 20.085536923187668,
-          "max": 19930.370438230297,
-          "step": 1,
-          "unit": "Hz",
-          "scale": "log"
+          "min": 3,
+          "max": 9.9,
+          "unit": "ln(Hz)",
+          "scale": "log",
+          "step": 0.01,
+          "display": {
+            "unit": "Hz",
+            "min": 20.085536923187668,
+            "max": 19930.370438230297,
+            "formula": "exp(v)"
+          }
         },
         {
           "key": "sl",
@@ -27068,8 +26820,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB/oct",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -27098,8 +26849,7 @@
           "max": 500,
           "step": 0.01,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -27128,8 +26878,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "at",
@@ -27410,8 +27159,7 @@
           "max": 20000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "lo",
@@ -27429,8 +27177,7 @@
           "max": 200,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "qa0",
@@ -27440,7 +27187,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Adjust Q",
@@ -27448,7 +27195,8 @@
           "max": 10,
           "step": 0.01,
           "unit": "",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Q is limited to 2 for shelf filters and 10 for peaking filters."
         },
         {
           "key": "qa1",
@@ -27458,7 +27206,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Adjust Q",
@@ -27466,7 +27214,8 @@
           "max": 10,
           "step": 0.01,
           "unit": "",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Q is limited to 2 for shelf filters and 10 for peaking filters."
         },
         {
           "key": "qa2",
@@ -27476,7 +27225,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Adjust Q",
@@ -27484,7 +27233,8 @@
           "max": 10,
           "step": 0.01,
           "unit": "",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Q is limited to 2 for shelf filters and 10 for peaking filters."
         },
         {
           "key": "qa3",
@@ -27494,7 +27244,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Adjust Q",
@@ -27502,7 +27252,8 @@
           "max": 10,
           "step": 0.01,
           "unit": "",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Q is limited to 2 for shelf filters and 10 for peaking filters."
         },
         {
           "key": "qa4",
@@ -27512,7 +27263,7 @@
             "type": "number"
           },
           "external_data": false,
-          "dynamic_range": false,
+          "dynamic_range": true,
           "source": "catalog",
           "control": "number",
           "label": "Adjust Q",
@@ -27520,7 +27271,8 @@
           "max": 10,
           "step": 0.01,
           "unit": "",
-          "scale": "linear"
+          "scale": "linear",
+          "range_note": "Q is limited to 2 for shelf filters and 10 for peaking filters."
         },
         {
           "key": "rg",
@@ -27538,8 +27290,7 @@
           "max": 12,
           "step": 0.5,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sm",
@@ -27557,8 +27308,7 @@
           "max": 2,
           "step": 0.01,
           "unit": "oct",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sp",
@@ -27576,8 +27326,7 @@
           "max": 96,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ta0",
@@ -27730,8 +27479,7 @@
           "max": 1000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "tg",
@@ -27788,8 +27536,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB/oct",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -27818,8 +27565,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "md",
@@ -27837,8 +27583,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tr",
@@ -27856,8 +27601,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -27886,8 +27630,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "fr",
@@ -27905,8 +27648,7 @@
           "max": 200,
           "step": 1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "gs",
@@ -27924,8 +27666,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "gt",
@@ -27943,8 +27684,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sa",
@@ -27962,8 +27702,7 @@
           "max": 100,
           "step": 1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sm",
@@ -27981,8 +27720,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sr",
@@ -28000,8 +27738,7 @@
           "max": 1000,
           "step": 5,
           "unit": "ms",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         }
       ]
     },
@@ -28030,8 +27767,7 @@
           "max": 180,
           "step": 1,
           "unit": "Deg.",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "cs",
@@ -28049,8 +27785,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dp",
@@ -28068,8 +27803,7 @@
           "max": 12,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rc",
@@ -28087,8 +27821,7 @@
           "max": 1000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "rn",
@@ -28106,8 +27839,7 @@
           "max": 96,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rs",
@@ -28125,8 +27857,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rt",
@@ -28144,8 +27875,7 @@
           "max": 50,
           "step": 0.1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         }
       ]
     },
@@ -28187,8 +27917,7 @@
           "max": 50,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dr",
@@ -28206,8 +27935,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "iv",
@@ -28225,8 +27953,7 @@
           "max": 300,
           "step": 0.001,
           "unit": "Vpk",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "kr",
@@ -28244,8 +27971,7 @@
           "max": 500,
           "step": 1,
           "unit": "Ω / valve",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mx",
@@ -28263,8 +27989,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "nf",
@@ -28282,8 +28007,7 @@
           "max": 30,
           "step": 0.5,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -28301,8 +28025,7 @@
           "max": 48,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "os",
@@ -28347,8 +28070,7 @@
           "max": 470,
           "step": 0.001,
           "unit": "V",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pt",
@@ -28397,8 +28119,7 @@
           "max": 300,
           "step": 1,
           "unit": "V",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rl",
@@ -28416,8 +28137,7 @@
           "max": 32,
           "step": 0.1,
           "unit": "Ω",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sb",
@@ -28435,8 +28155,7 @@
           "max": 450,
           "step": 0.001,
           "unit": "V",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sd",
@@ -28553,8 +28272,7 @@
           "max": 1300,
           "step": 1,
           "unit": "Ω",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "st",
@@ -28599,8 +28317,7 @@
           "max": 47,
           "step": 0.1,
           "unit": "kΩ",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "sz",
@@ -28618,8 +28335,7 @@
           "max": 100,
           "step": 0.1,
           "unit": "kΩ",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "tp",
@@ -28706,8 +28422,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "cm",
@@ -28725,8 +28440,7 @@
           "max": 2000,
           "step": 10,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hs",
@@ -28744,8 +28458,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mx",
@@ -28763,8 +28476,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pl",
@@ -28782,8 +28494,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "pp",
@@ -28801,8 +28512,7 @@
           "max": 120,
           "step": 1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rb",
@@ -28820,8 +28530,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rm",
@@ -28862,8 +28571,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tn",
@@ -28881,8 +28589,7 @@
           "max": 10,
           "step": 0.1,
           "unit": "",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "wr",
@@ -28900,8 +28607,7 @@
           "max": 200,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "xt",
@@ -28919,8 +28625,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -28949,8 +28654,7 @@
           "max": 35,
           "step": 0.1,
           "unit": "cu",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dr",
@@ -28986,8 +28690,7 @@
           "max": 1,
           "step": 0.01,
           "unit": "ζ",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "hf",
@@ -29005,8 +28708,7 @@
           "max": 24000,
           "step": 100,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "lv",
@@ -29024,8 +28726,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "mb",
@@ -29043,8 +28744,7 @@
           "max": 1000,
           "step": 1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "mx",
@@ -29062,8 +28762,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "og",
@@ -29081,8 +28780,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "ql",
@@ -29131,8 +28829,7 @@
           "max": 25,
           "step": 0.1,
           "unit": "µm",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rd",
@@ -29150,8 +28847,7 @@
           "max": 146,
           "step": 1,
           "unit": "mm",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rg",
@@ -29169,8 +28865,7 @@
           "max": 100,
           "step": 0.01,
           "unit": "nm",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "rp",
@@ -29215,8 +28910,7 @@
           "max": 25,
           "step": 0.1,
           "unit": "µm",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "sc",
@@ -29275,8 +28969,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "st",
@@ -29312,8 +29005,7 @@
           "max": 5,
           "step": 0.1,
           "unit": "g",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "tm",
@@ -29331,8 +29023,7 @@
           "max": 1.5,
           "step": 0.01,
           "unit": "mg",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -29361,8 +29052,7 @@
           "max": 24,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         }
       ]
     },
@@ -29391,8 +29081,7 @@
           "max": 180,
           "step": 1,
           "unit": "Deg.",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "cs",
@@ -29410,8 +29099,7 @@
           "max": 100,
           "step": 1,
           "unit": "%",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "dp",
@@ -29429,8 +29117,7 @@
           "max": 40,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rc",
@@ -29448,8 +29135,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         },
         {
           "key": "rn",
@@ -29467,8 +29153,7 @@
           "max": 40,
           "step": 0.1,
           "unit": "ms",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rs",
@@ -29486,8 +29171,7 @@
           "max": 0,
           "step": 0.1,
           "unit": "dB",
-          "scale": "linear",
-          "scaled": false
+          "scale": "linear"
         },
         {
           "key": "rt",
@@ -29505,8 +29189,7 @@
           "max": 20,
           "step": 0.1,
           "unit": "Hz",
-          "scale": "log",
-          "scaled": false
+          "scale": "log"
         }
       ]
     }
