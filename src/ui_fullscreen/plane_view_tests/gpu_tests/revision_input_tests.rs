@@ -214,7 +214,12 @@ fn plane_revision_cover_producer_rebinds_current_canvas_dpi_rotation_and_fit() {
     let _keys = crate::key_input::lock_test_input();
     let mut app = crate::app::setup_app_for_test();
     let viewer = viewer(&mut app);
-    let accepted = app.fullscreen_page_layout.plane_cover.unwrap();
+    let accepted = app
+        .fullscreen_page_layout
+        .plane_cover
+        .as_deref()
+        .copied()
+        .unwrap();
     let canvas = egui::Rect::from_min_size(egui::pos2(11., 17.), egui::vec2(614., 1093.));
     app.fs_free_rotation = 17_f32.to_radians();
     app.rotation_cache
@@ -266,6 +271,8 @@ fn plane_revision_real_paint_publishes_material_and_transform_together() {
         let accepted = app
             .fullscreen_page_layout
             .plane_cover
+            .as_deref()
+            .copied()
             .expect("a completed real single-page paint publishes its accepted material");
         let drawn = {
             let pages = app
@@ -312,7 +319,7 @@ fn plane_revision_layout_replacements_retire_accepted_material_before_the_next_i
     let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size);
     r9_record(&mut app, viewport);
     let original = app.fullscreen_page_layout.clone();
-    let old = original.plane_cover.unwrap();
+    let old = original.plane_cover.as_deref().copied().unwrap();
     let transform = resolve_fs_image_transform(old.input, old.layout_source_size).unwrap();
     let occurrence = SpreadPageOccurrence::navigation(transform.page_idx, transform.page_idx);
     for boundary in 0..10 {
@@ -379,7 +386,11 @@ fn plane_revision_layout_replacements_retire_accepted_material_before_the_next_i
     app.fullscreen_page_layout = original;
     assert!(app.fullscreen_page_layout.rebind_occurrences(&[occurrence]));
     assert_eq!(
-        app.fullscreen_page_layout.plane_cover.unwrap().material,
+        app.fullscreen_page_layout
+            .plane_cover
+            .as_ref()
+            .unwrap()
+            .material,
         old.material
     );
     assert!(
@@ -395,7 +406,12 @@ fn plane_revision_record_creation_is_independent_of_layout_and_publication_is_ex
     let viewer = viewer(&mut app);
     let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size);
     r9_record(&mut app, viewport);
-    let old = app.fullscreen_page_layout.plane_cover.unwrap();
+    let old = app
+        .fullscreen_page_layout
+        .plane_cover
+        .as_deref()
+        .copied()
+        .unwrap();
     let mut material = old.material;
     material.coverage = egui::Rect::from_min_max(egui::pos2(0.2, 0.1), egui::pos2(0.8, 0.9));
     let input = DisplayedImageTransformInput {
@@ -407,21 +423,33 @@ fn plane_revision_record_creation_is_independent_of_layout_and_publication_is_ex
         .plane_cover_record(0, input, old.layout_source_size, material)
         .unwrap();
     assert_eq!(
-        app.fullscreen_page_layout.plane_cover.unwrap().material,
+        app.fullscreen_page_layout
+            .plane_cover
+            .as_ref()
+            .unwrap()
+            .material,
         old.material
     );
     app.fullscreen_page_layout
         .publish_single(transform, Some(next));
     assert_eq!(app.fullscreen_page_layout.displayed_pages().count(), 1);
     assert_eq!(
-        app.fullscreen_page_layout.plane_cover.unwrap().material,
+        app.fullscreen_page_layout
+            .plane_cover
+            .as_ref()
+            .unwrap()
+            .material,
         material
     );
     let replacement = app.fullscreen_page_layout.clone();
     app.fullscreen_page_layout.clear();
     app.fullscreen_page_layout = replacement;
     assert_eq!(
-        app.fullscreen_page_layout.plane_cover.unwrap().material,
+        app.fullscreen_page_layout
+            .plane_cover
+            .as_ref()
+            .unwrap()
+            .material,
         material
     );
     assert_eq!(
@@ -455,7 +483,12 @@ fn plane_revision_record_creation_is_independent_of_layout_and_publication_is_ex
             FullscreenPageLayoutKind::Single
         );
         assert_eq!(app.fullscreen_page_layout.displayed_pages().count(), 1);
-        let accepted = app.fullscreen_page_layout.plane_cover.unwrap();
+        let accepted = app
+            .fullscreen_page_layout
+            .plane_cover
+            .as_deref()
+            .copied()
+            .unwrap();
         assert_eq!(accepted.material, material);
         assert_ne!(accepted.material, old.material);
         assert_eq!(accepted.input.viewport_rect, input.viewport_rect);

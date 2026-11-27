@@ -275,7 +275,12 @@ fn plane_revision2_ordinary_shrink_keeps_visible_distortion_and_second_zoom_keep
     assert_eq!(shrunk.k_fill, before.k_fill);
     assert_eq!(shrunk.params.values[2][0], before.params.values[2][0]);
     assert!(shrunk.params.values[2][0] > 0.);
-    let accepted = app.fullscreen_page_layout.plane_cover.unwrap();
+    let accepted = app
+        .fullscreen_page_layout
+        .plane_cover
+        .as_deref()
+        .copied()
+        .unwrap();
     let drawn = *app.fullscreen_page_layout.displayed_pages().next().unwrap();
     let quad = plane_effective_quad(&drawn.transform, accepted.material).unwrap();
     let canvas = drawn.transform.viewport_rect;
@@ -434,7 +439,12 @@ fn plane_revision2_locked_outward_keeps_geometry_and_inward_gradually_covers() {
     assert!(app.fs_zoom > zoom_pan.0);
     assert!(app.fs_zoom <= zoom_pan.0 * 1.5 + 1.0e-6);
     assert!(snapshot(&app).k_fill > 0.);
-    let record = app.fullscreen_page_layout.plane_cover.unwrap();
+    let record = app
+        .fullscreen_page_layout
+        .plane_cover
+        .as_deref()
+        .copied()
+        .unwrap();
     let drawn = app
         .fullscreen_page_layout
         .displayed_pages()
@@ -1083,7 +1093,12 @@ fn plane_revision3_locked_combined_integer_and_fractional_wheels_agree_without_o
             for notch in notches {
                 fisheye_wheel(&mut viewer, &mut app, notch * 40.);
                 assert_eq!(mode(&app), PlaneFillMode::Locked(coefficient));
-                let cover = app.fullscreen_page_layout.plane_cover.unwrap();
+                let cover = app
+                    .fullscreen_page_layout
+                    .plane_cover
+                    .as_deref()
+                    .copied()
+                    .unwrap();
                 let transform = resolve_fs_image_transform(
                     DisplayedImageTransformInput {
                         placement: ResolvedDisplayPlacement::Normal {

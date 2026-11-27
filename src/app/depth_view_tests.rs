@@ -166,7 +166,10 @@ fn depth_wait_clock_survives_readback_estimation_and_resets_only_after_terminal(
         .unwrap();
     assert!(matches!(state.source, DepthSourcePhase::ReadingBack { .. }));
     assert_eq!(state.wait_started_at, old);
-    app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "depth_wait_readback");
+    app.set_fs_exclusive_view(
+        FsExclusiveView::Depth(Box::new(state)),
+        "depth_wait_readback",
+    );
     assert!(app.depth_wait_status().is_some());
     let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
         unreachable!()
@@ -304,7 +307,7 @@ pub(super) fn install_pages(app: &mut App, ctx: &egui::Context) {
 
 fn depth(app: &mut App) {
     let state = DepthViewState::new(app.edit_request_owner_context());
-    app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "depth_test_on");
+    app.set_fs_exclusive_view(FsExclusiveView::Depth(Box::new(state)), "depth_test_on");
 }
 
 #[cfg(windows)]
@@ -389,7 +392,7 @@ fn tracked_depth(app: &mut App, ready: bool) -> DepthOwnerEvidence {
             resource_id: None,
         }
     };
-    app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "depth_owner_test");
+    app.set_fs_exclusive_view(FsExclusiveView::Depth(Box::new(state)), "depth_owner_test");
     evidence
 }
 
@@ -1047,7 +1050,10 @@ fn depth_linked_f11_keeps_readback_estimation_and_ready_owners_in_both_direction
                     cancel = Some(pending.cancellation_token_for_test());
                     state.source = DepthSourcePhase::Estimating { key, pending };
                 }
-                app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "linked_f11_pending");
+                app.set_fs_exclusive_view(
+                    FsExclusiveView::Depth(Box::new(state)),
+                    "linked_f11_pending",
+                );
             }
             let FsExclusiveView::Depth(before) = &app.fs_exclusive_view else {
                 unreachable!()
@@ -1254,7 +1260,7 @@ fn depth_f11_d_reentry_rejects_old_readback_and_estimation_after_new_slot_is_pub
                 drop(pending); // ReadingBack owns only its GPU map callbacks.
             }
             assert!(old.lru.resident_bytes() > 0);
-            app.set_fs_exclusive_view(FsExclusiveView::Depth(old), "depth_reentry_old");
+            app.set_fs_exclusive_view(FsExclusiveView::Depth(Box::new(old)), "depth_reentry_old");
             depth_key_frame(
                 &mut app,
                 &ctx,
@@ -2161,7 +2167,7 @@ fn depth_native_color_readback_and_lru_are_registered_then_retired_from_vram_acc
         .unwrap();
     let bytes = state.resident_bytes();
     assert!(bytes > 4 * 4 * 4);
-    app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "depth_accounting");
+    app.set_fs_exclusive_view(FsExclusiveView::Depth(Box::new(state)), "depth_accounting");
     let recorded = app.vram_accounting_snapshot().subsystems_json()["depth_parallax"]["bytes"]
         .as_u64()
         .unwrap();

@@ -112543,9 +112543,9 @@ mod depth_slideshow_folder_tests {
         if depth {
             let owner = app.edit_request_owner_context();
             app.set_fs_exclusive_view(
-                crate::fs_exclusive_view::FsExclusiveView::Depth(
+                crate::fs_exclusive_view::FsExclusiveView::Depth(Box::new(
                     crate::depth_parallax::DepthViewState::new(owner),
-                ),
+                )),
                 "depth_slideshow_staged_test",
             );
         }
@@ -112846,9 +112846,9 @@ mod depth_slideshow_folder_tests {
             if depth {
                 let owner = app.edit_request_owner_context();
                 app.set_fs_exclusive_view(
-                    crate::fs_exclusive_view::FsExclusiveView::Depth(
+                    crate::fs_exclusive_view::FsExclusiveView::Depth(Box::new(
                         crate::depth_parallax::DepthViewState::new(owner),
-                    ),
+                    )),
                     "slideshow_folder_test",
                 );
             }

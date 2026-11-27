@@ -3875,6 +3875,34 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
     );
     #[cfg(windows)]
     assert_eq!(storage(|app| &app.asr_setup), size_of::<usize>());
+    assert_eq!(
+        size_of::<Option<Box<crate::displayed_image_transform::PlaneCoverRecord>>>(),
+        size_of::<usize>()
+    );
+    fn layout_storage<T>(
+        _: fn(&crate::displayed_image_transform::FullscreenPageLayout) -> &T,
+    ) -> usize {
+        size_of::<T>()
+    }
+    assert_eq!(
+        layout_storage(|layout| &layout.plane_cover),
+        size_of::<usize>(),
+        "accepted material records must stay off the inline page layout"
+    );
+    // Large exclusive-view states live in Box so every App/context stays small while inactive.
+    assert!(size_of::<crate::fs_exclusive_view::FsExclusiveView>() <= 128);
+    assert!(
+        size_of::<crate::fs_exclusive_view::FsExclusiveView>()
+            <= size_of::<crate::plane_view::PlaneViewState>() + 2 * size_of::<usize>()
+    );
+    println!(
+        "viewer storage FsExclusiveView={} DepthViewState={} PlaneViewState={} FullscreenPageLayout={} plane_cover={}",
+        size_of::<crate::fs_exclusive_view::FsExclusiveView>(),
+        size_of::<crate::depth_parallax::DepthViewState>(),
+        size_of::<crate::plane_view::PlaneViewState>(),
+        size_of::<crate::displayed_image_transform::FullscreenPageLayout>(),
+        size_of::<Option<Box<crate::displayed_image_transform::PlaneCoverRecord>>>(),
+    );
     assert!(size_of::<App>() < 110_000);
 }
 
@@ -52033,9 +52061,9 @@ mod favorite_adjustment_defaults_tests {
         app.fs_zoom = 2.0;
         assert!(!app.should_native_rerender_pdf_for_ai(idx));
         assert!(!app.display_should_defer_final_ai(idx));
-        app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(
+        app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(Box::new(
             crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context()),
-        );
+        ));
         for zoom in [0.2, 1.0, 2.0, 8.0] {
             app.fs_zoom = zoom;
             assert!(app.should_native_rerender_pdf_for_ai(idx));
@@ -100809,11 +100837,11 @@ mod smart_folder_transition_tests {
                 viewer.viewer_presentation = ViewerPresentation::DetachedWindow;
                 viewer.detached_viewer_independent_active = true;
                 viewer.set_fs_exclusive_view(
-                    crate::fs_exclusive_view::FsExclusiveView::Depth(
+                    crate::fs_exclusive_view::FsExclusiveView::Depth(Box::new(
                         crate::depth_parallax::DepthViewState::new(
                             viewer.edit_request_owner_context(),
                         ),
-                    ),
+                    )),
                     "realmachine50_foreign_offer_before_confirmation",
                 );
             });

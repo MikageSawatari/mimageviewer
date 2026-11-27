@@ -4,7 +4,7 @@ pub(crate) enum FsExclusiveView {
     #[default]
     None,
     Panorama(crate::panorama::PanoramaState),
-    Depth(crate::depth_parallax::DepthViewState),
+    Depth(Box<crate::depth_parallax::DepthViewState>),
     PlaneView(crate::plane_view::PlaneViewState),
 }
 

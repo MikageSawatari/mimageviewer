@@ -291,9 +291,9 @@ fn depth_focus_canvas_click_uses_release_modifiers_and_preserves_prior_exclusion
                 app.items = vec![GridItem::Image("focus-click.jpg".into())];
                 app.fullscreen_idx = Some(0);
                 if depth {
-                    app.fs_exclusive_view = FsExclusiveView::Depth(DepthViewState::new(
+                    app.fs_exclusive_view = FsExclusiveView::Depth(Box::new(DepthViewState::new(
                         app.edit_request_owner_context(),
-                    ));
+                    )));
                 }
                 app.fit_popup_open = exclusion == "popup";
                 if exclusion == "overflow" {
@@ -345,8 +345,9 @@ fn depth_focus_batched_clicks_use_the_last_primary_release_after_pointer_move() 
     for ctrl in [false, true] {
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
-        app.fs_exclusive_view =
-            FsExclusiveView::Depth(DepthViewState::new(app.edit_request_owner_context()));
+        app.fs_exclusive_view = FsExclusiveView::Depth(Box::new(DepthViewState::new(
+            app.edit_request_owner_context(),
+        )));
         for click in [false, true] {
             let mut events = if click {
                 vec![
@@ -596,7 +597,7 @@ fn depth_focus_click_pending_failed_and_original_hold_never_navigate() {
             }
             _ => {}
         }
-        app.fs_exclusive_view = FsExclusiveView::Depth(state);
+        app.fs_exclusive_view = FsExclusiveView::Depth(Box::new(state));
         app.feedback_toasts_for_test.clear();
         app.plan_depth_focus_click(&ctx, egui::pos2(200., 200.));
         assert_eq!(app.fullscreen_idx, Some(0));

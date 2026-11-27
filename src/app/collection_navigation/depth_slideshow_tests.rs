@@ -106,7 +106,7 @@ fn prepared_outer(resume_slideshow: bool) -> PreparedOuter {
     app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsDepthParallax = F24\n");
     let owner = app.edit_request_owner_context();
     app.set_fs_exclusive_view(
-        FsExclusiveView::Depth(DepthViewState::new(owner)),
+        FsExclusiveView::Depth(Box::new(DepthViewState::new(owner))),
         "collection_depth_test",
     );
     app.feedback_toasts_for_test.clear();

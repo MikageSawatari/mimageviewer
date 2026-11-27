@@ -67,7 +67,10 @@ pub(super) mod gpu_tests {
             key,
             outcome: DepthSettledOutcome::Failed,
         });
-        app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "failed_fact_regression");
+        app.set_fs_exclusive_view(
+            FsExclusiveView::Depth(Box::new(state)),
+            "failed_fact_regression",
+        );
         app.advance_depth_source(
             &ctx,
             DepthSourceMaterial::Ready {
@@ -196,7 +199,10 @@ pub(super) mod gpu_tests {
                     );
                     None
                 };
-                app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "supersession_fixture");
+                app.set_fs_exclusive_view(
+                    FsExclusiveView::Depth(Box::new(state)),
+                    "supersession_fixture",
+                );
                 app.slideshow_playing = true;
                 assert!(app.depth_current_settled());
                 let mut current_reply = None;
@@ -287,7 +293,7 @@ pub(super) mod gpu_tests {
                 phase: DepthNextPhase::Estimating { pending },
                 started_at: std::time::Instant::now(),
             });
-            app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "handoff_test");
+            app.set_fs_exclusive_view(FsExclusiveView::Depth(Box::new(state)), "handoff_test");
             app.slideshow_playing = true;
             app.fullscreen_idx = Some(2);
             if mutation == 0 {
@@ -1159,7 +1165,7 @@ impl App {
         if let Some(renderer) = &self.wgpu_render_state {
             state.attach_renderer(renderer);
         }
-        self.set_fs_exclusive_view(FsExclusiveView::Depth(state), "depth_toggle_on");
+        self.set_fs_exclusive_view(FsExclusiveView::Depth(Box::new(state)), "depth_toggle_on");
         self.close_fs_exclusive_conflicts();
         ctx.request_repaint();
     }
@@ -1453,6 +1459,7 @@ impl App {
         let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view else {
             return;
         };
+        let state = state.as_mut();
         // Sole production writer: capture the normal selector's value for
         // this visible pass, including NotYet while a Failed key is retained.
         state.current_material = selected_key;

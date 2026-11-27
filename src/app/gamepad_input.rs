@@ -14469,9 +14469,9 @@ mod next_input_tests {
         app.items = vec![GridItem::Image(app.tmp.path().join("depth-fit.jpg"))];
         app.fullscreen_idx = Some(0);
         app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
-        app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(
+        app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(Box::new(
             crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context()),
-        );
+        ));
         let mut picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
         picker.row = picker_rows_for_context(picker.context)
             .iter()

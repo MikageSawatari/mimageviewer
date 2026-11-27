@@ -1242,6 +1242,17 @@ cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen|in_page_scroll|p
 
 許可された検査は`cargo fmt`正常終了、UI字形は危険な字形なし、サイトは54カード・超過0、`git diff --check`正常終了。コンパイル/追加試験の成功は示さない。
 
+### master 取り込み後の App の大きさ (2026-11-28)
+
+§1.911と§1.917の追加がmasterで合わさり、設計担当のx64テスト実行体で`App=110688`バイトとなって既存の`<110_000`検査に失敗した。変更前の実測は`FsExclusiveView=976`、`DepthViewState=976`、`PlaneViewState=96`、`FullscreenPageLayout=456`、`Option<PlaneCoverRecord>=344`バイトである。`FullscreenPageLayout::plane_cover`を`Option<Box<PlaneCoverRecord>>`へ、`FsExclusiveView::Depth`を`Depth(Box<DepthViewState>)`へ変更し、生成/参照箇所と既存テストを型に合わせた。読み出すrecordは元のCopy値を取り、単ページの公開では既存のBoxがあれば中身を書き換える。`begin`/`clear`/ページ追加の無効化と描画ページとの対応は維持する。Depthは自動derefと必要な`as_mut()`だけで既存処理を通し、余分なclone、所有/再作成/退役、detachedのbundle移動、Panorama/PlaneViewの格納方式は変えない。
+
+`history_transition_storage_keeps_app_stack_footprint_bounded`に、Option<Box<PlaneCoverRecord>>と実際のlayoutフィールドがポインターサイズであること、`FsExclusiveView<=128`かつ`PlaneViewState+2ポインター`以内であることの検査と型ごとのサイズ出力を追加した。Appの上限`110_000`は変更していない。実装の範囲は`displayed_image_transform.rs`・`fs_exclusive_view.rs`・Depthの生成/借用とPlaneCoverの読み取りを行う製品/テスト箇所、および本節とdetached計画§11。指示との差分はない。
+
+実装担当は cargo を実行しない取り決めのため、ビルドとテストは設計担当が共通の実行口で流した。
+- 変更後の実測: `App=109136` (上限まで 864 バイト)、`FsExclusiveView=96`、`FullscreenPageLayout=120`、`plane_cover=8`。
+- サイズの検査と、魚眼・傾け・3D 写真・detached・複数ウィンドウ・操作のスクリプトなどの関連テスト 5122 件が成功した。
+- 本体 lib の全件は、master へ取り込んだ後に統括が流す。
+
 ## 12. 文書
 
 - [display-pipeline.md](display-pipeline.md): PlaneView の節 (§5 の要約と §6 の出口)。
