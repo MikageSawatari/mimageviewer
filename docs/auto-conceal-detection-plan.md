@@ -1407,3 +1407,24 @@ mask_detect_settings_escape_closes_without_other_modal_on_first_and_later_frames
   R3 の修正でも `cargo fmt`（引数なし）・`git diff --check` は終了コード 0、glyph 検査は危険 glyph 0。
   R3 ではマニュアル・製品ページは変更していないため、card 検査は再実行していない。
   R4 の修正は `cargo fmt`（引数なし）・`git diff --check` が終了コード 0。UI 文言・サイトは変更せず、glyph / card 検査は再実行していない。
+
+### 23.9 サブ PC の指摘の直しの独立レビュー (2026-11-27、設計担当)
+
+- 対象: a9a1c6e50 (サブ PC の指摘の直し)・ce28d15f1 (前面の段を egui のモーダルの層に)・e600c22df (Escape を前面のモーダルのときだけ)。
+  同じ独立レビュー担当 (Sol gpt-6.1-sol / xhigh、実装担当とは別) の R3〜R6。
+- **R3 REJECT** (P2): `Order::Debug` は Tooltip の段 (トースト・ツールチップ) より上なので、ダイアログを開いている間の
+  エラーのトーストや余白の説明が窓の下に隠れる。補正レイヤーの 3 つの窓の Debug は「パネルの裏に潜らない」ためで
+  (39d1e5647)、Tooltip より上に置く根拠は無い。全画面のダイアログの段は Middle / Foreground / Debug で統一されていない。
+  → `Order::Foreground` に戻し、egui::Modal と同じく `set_modal_layer` で窓の層を登録する形にした (先例 book_composition_editor.rs)。
+- **R4 REJECT** (P2): 別のモーダルが上にあっても Escape で背面の設定の窓が閉じる → 前面のモーダルのときだけ受ける形にした。
+- **R5 REJECT** (P2): 別のモーダルが初めて出るのと同じフレームに Escape が来ると、背面になる設定の窓が閉じ得る
+  (`top_modal_layer()` が前の pass の値のため)。
+- **R6 ACCEPT**: 設計担当の判断 (下) を妥当とし、R5 の P2 を撤回した。
+  - 前の pass を参照する 1 pass の遅れは egui::Modal と共通 (modal.rs:84〜87・162)。ただし完全に同じではなく、自動検出の窓は
+    登録が無い最初のフレームでも閉じ、Escape を消費しない。
+  - 起きたときの結果は設定の窓が閉じるだけ (`mask_detect_dialog = None`)。検出・マスク・文書・Undo・設定値は変わらない。
+    検出中の窓は Escape を受けない。リモートとサイドカーの復元の画面は Escape で確定・削除をしない。外部ツールの準備の画面が
+    同居すると、同じ Escape がその取消 (起動前) にも届き得るが、取り返しのつかない操作ではない。
+  - 利用者の操作でないモーダルが初めて出る 1 フレームに Escape が届く場合だけなので、pass をまたいだ Escape の所有の仕組みは
+    足さない (設計の簡素化)。
+- 設計担当の run-heavy: cargo check 成功、filter 180 件成功、実モデル照合成功 (e600c22df)。
