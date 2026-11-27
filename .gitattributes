@@ -4,6 +4,7 @@ models/*.onnx filter=lfs diff=lfs merge=lfs -text
 LIBRAW-LICENSE.txt -text
 ZLIB-LICENSE.txt -text
 LIBJPEG-TURBO-LICENSE.txt -text
+YUNET-LICENSE.txt -text
 
 # FFmpeg LGPL source mirror — keep byte-exact (no EOL conversion); the .asc GPG
 # armored signature must stay LF or signature verification breaks on checkout.
