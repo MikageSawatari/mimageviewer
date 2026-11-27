@@ -18,6 +18,23 @@ pub(crate) struct FolderScanPolicy {
 }
 
 impl FolderScanPolicy {
+    /// The policy and live Susie pool must describe one coherent scan. Both startup
+    /// and pane completion use this proof before taking their request owner.
+    pub(crate) fn scan_checked(
+        &self,
+        path: &std::path::Path,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> (std::io::Result<ScannedDir>, bool) {
+        let before = crate::susie_loader::pool_revision();
+        let scan = self.scan(path, cancel);
+        let after = crate::susie_loader::pool_revision();
+        (scan, before != after || before != self.susie_pool_revision)
+    }
+
+    pub(crate) fn result_is_current(&self, mixed: bool, current: &Self) -> bool {
+        !mixed && self == current
+    }
+
     pub(crate) fn capture(
         settings: &crate::settings::Settings,
         duration_wanted: bool,

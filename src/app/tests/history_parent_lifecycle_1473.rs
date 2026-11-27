@@ -21,7 +21,7 @@ fn history_fixture(portable: bool, slot: Option<QuickFolderSlotId>) -> (CaseEnv,
         .unwrap()
         .join("lifecycle-origin");
     std::fs::create_dir_all(&origin).unwrap();
-    env.load_folder(origin.clone());
+    env.load_folder_and_finish_for_test(origin.clone());
     settle(&mut env);
     env.enter_reading_history_from_menu();
     settle(&mut env);

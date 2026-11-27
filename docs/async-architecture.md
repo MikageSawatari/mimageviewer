@@ -36,6 +36,17 @@ loaderをdropするとsenderが閉じる。workerは受理済み要求を処理�
 
 ## 起動 resolver の走査と外部 Shell 起動（§1.853・§1.861、実装・検証待ち）
 
+§1.853 C・D・E は、main の実フォルダが未走査で共通 loader へ届く場合の既定を worker へ変更した。
+`DirectNavigation(Box<DirectNavigationContinuation>)` が、その loader の引数・選択を捕捉した navigation・
+フォルダ open の効果・検索の帰路・自動全画面予約を所有する。claim と要求の数え上げは受付で一度だけ行い、
+通常の nav 裁定後、modal・native owner・navigation の現在性を再確認して、同じ loader を `Some(scan)` で再開する。
+worker の結果が持つ policy と Susie の走査前後照合を resolver と共有する。不一致時は continuation・cancel token・
+開始時刻を保持し、同じ pending の受信口だけを差し替える。失敗・切断はログと通知で終端し、再試行や UI fallback は行わない。
+走査の判断は main の context／scope 述語に限定し、他 context の同期経路は変えない。
+全画面の閉じ戻りは navigation が描画資源を持ち、要求固有の `CloseReturn` sequence を開始する。
+通常 nav の末尾に届かない embedded／native 全画面でも同じ完了を回収し、採用で `ViewerExited`、不採用で `Superseded` とする。
+詳細は [設計 §6 と実装記録](ui-sync-853-plan.md#617-実装の記録)。コンパイル・テスト・実機検証は未実施。
+
 `startup-open-resolve` は既存 pending 一つで、明示の起動入力と既定の場所の typed input を扱う。
 worker が known-folder 解決・祖先探索・分類・要求ファイルの準備を済ませ、main の Directory なら同じ cancel token で
 走査と長さ・ページ数順の材料収集まで行う。ツリーと共有する `FolderScanPolicy` は在メモリ設定・ページ数の事実の fingerprint と Susie の pool revision を控える。
@@ -920,7 +931,7 @@ Surfaceもswitch epochを省略しない。Bookmarkはコピー済み入力のna
 | `app.rs::open_bookmark_browser_row_classified` | Surface（コピー済みbrowser row）。resolver受付時にnative Bookmark requestへ移し、同じrequest ID/target/epochを保持 |
 | `app.rs::copied_destination_source_proof` → context Jumpの同期／scan adapter | Surface（copied path・exact selection）。Collection由来のnative row/anchor validatorは別に維持 |
 | `app.rs::start_folder_open_scan_with_restore` → pane / RequiredFullscreen / Jump | Surface（copied path・purpose・exact leaf）。RequiredFullscreenのscan完了は元navigationを準備済みPhysical ownerへmoveし、source teardownより前に検証・採用を準備 |
-| 同scanのDirectNavigation（§1.805 r10） | mainのお気に入り・アドレス欄Enter (検索外)・最近開いたフォルダのメニューだけをworkerへ渡す。拒否判定・Navigation owner受理後、元navigationを再captureせず保持。purposeはフィールドなしで、完了はExplicitList・collection_ownerなしとして通常nav裁定からpre-scan付きの同じconsumerへ戻す。対象入口は全画面予約を作らず、予約の移送・消去も加えない |
+| 同scanのDirectNavigation（§1.805・§1.853 C/D/E） | main の未走査の共通点で呼び出しを continuation へ移す。Navigation／CollectionGridPhysical／RatingPhysical 等の owner、intent、効果、検索の帰路、捕捉済みの選択、全画面予約を保つ。通常 nav 裁定から同じ loader の pre-scan 採用へ戻り、claim は再実行しない。main 以外と理由付きの同期例外は従来経路 |
 | 同scanのGridFolderCandidate／CurrentViewOrderRefresh | native Collection owner付きcandidateとorder refreshはRow（現row/revision／order snapshot）。通常candidateはSurface（copied path、scan結果でkind決定）。DetachedFolder / DetachedImageは共通main要求を作らずnative window leaseで処理 |
 | `smart_folder.rs::capture_smart_list_navigation`、`begin_smart_physical_navigation_with_navigation`、`begin_smart_history_navigation` | Surface（copied destination/root payloadと安定したowner lease）。同owner PDF verification/Collection revisionは許可。SmartGridの分類で渡されたRowは置換しない |
 | `collection_navigation.rs::enqueue_collection_navigation` | 共通headerはSurface（copied destination）、native requestはrow/entry ID/revision/anchorを厳密に照合。共通headerだけでnative検証を緩めない |
@@ -933,8 +944,9 @@ Surfaceもswitch epochを省略しない。Bookmarkはコピー済み入力のna
 §1.818 の初回起動・activation・Agent の表示意図と相関 ID は `ExplicitOpenPath` → `StartupOpenPathOwner` → 既存の `ViewerOpenAdoption` で運ぶ。sidecar／composition の待機 owner が context・世代・対象 identity を検証し、有効な明示ファイル要求がある間は履歴より先に選択を所有する。要求の取消は同じ continuation を退役させ、別の pending フラグは作らない。
 
 §1.805 r10では、走査済みパスの再分類を省く変更を撤回し、ツリー・GridFolderCandidateの完了経路を維持する。
-DirectNavigationの対象は分類の要らない名前に限り、完了の再入で再分類は起きない。
-一覧フォルダ・親移動・Collection物理元・フォルダを開くダイアログ・コンテキストメニューは従来の同期走査を維持する。
+§1.853 C/D/E ではその後の共通走査点で未走査の main 呼び出しを預けるため、
+一覧フォルダ・親移動・Collection 物理元・フォルダを開くダイアログにも同じ owner を使う。
+分類が既に走査した結果はそのまま既存の採用を通り、continuation の完了は再分類しない。
 
 Surface取得不能時の既存Row fallbackは保持する（main以外にはmain採用資格がない）。
 表にあるRow＋native validatorでは、共通のitems世代を外すこともnative revision/index検証を外すこともしない。
@@ -1201,7 +1213,7 @@ session 取消で通知・未開始仕事を失効させ、最後の fetch / sav
 | フォルダ一覧の変換アーカイブ読み取り元判定 | `std::thread` (`archive-cache-peek`) + mpsc | viewer context / items generation ごとに最大 1 | 全候補を UI 側で `Pending` 登録するが、worker へは visible + keep + その item の pin 依存先だけを渡す。RAR は volume header 解決 → cache DB peek → miss 時だけ full inspection の順。候補ごとに `Direct` / `CachedZip` / `Unavailable` を逐次送信し、UI は通知ごとに `items_generation` を照合する。range 移動時は共有 scope を差し替え、既に開始済みの 1 冊だけを完了可として旧 range の queued 候補を skip する。現 batch 終了後に新 range の未解決候補を追加する。folder 切替・再読込・drop は cancel token を立てる。rollup edit filter 時だけ folder 全体 scope。batch 完了時は `nav/archive_cache_peek`、各候補は `nav/archive_cache_candidate` を記録する |
 | フォルダナビゲーション | `std::thread` | 1 (常時 ≤ 1 本) | 深さ優先で次フォルダを検索。連打は `pending_folder_nav_steps` に累積され、完了ごとに連鎖実行する (並行 DFS による FS 競合を避ける) |
 | 物理フォルダ open 事前走査 | `std::thread` + mpsc | viewer context ごとに最大 1 | フォルダペイン / detached open と、下記のmain専用DirectNavigation、お気に入り表示状態の OFF・リセットでカテゴリ順または一覧ソートが変わった通常フォルダの再構築に使う。`FolderOpenScanPurpose` が用途を型で所有し、再構築は path と並び設定 snapshot が現在値に一致するときだけ pre-scan 付きロードへ戻す。別 navigation / 後続要求は同じ pending を cancel するため、UI スレッドで `read_dir` / metadata scan を追加しない |
-| main 直接移動の事前走査（§1.805 r10、上記workerを共有） | `std::thread` + mpsc | 上記pendingと共有 | 対象はお気に入り・アドレス欄Enter・最近開いたフォルダだけ。`DirectNavigation` は場所移動待ちとして旧一覧の項目入力を止め、専用の停止理由でEsc・スタック切替キーも止める。他の停止理由の扱いは維持。通常nav裁定は拒否された後続でも取消す。裁定外の後続はclaim成功時 (owner_contextがmain) と共通退役 (retained == Paneも含む) で退役。DFS新規受付とsaved-groupの既知の拒否判定後の受付が取消すのはDirectNavigationだけで、PaneNavigationは変えない。直接移動受付はDFS・累積・所有sequenceを退役。saved-group完了は従来どおり後発paneに譲る。表示だけ500 ms猶予。全画面予約の移送・消去は加えない。失敗はログ＋通知。全purposeのworker時間は`nav/folder_open_scan`で計測 |
+| main 直接移動の事前走査（§1.805・§1.853 C/D/E、上記workerを共有） | `std::thread` + mpsc | 上記pendingと共有 | 未走査の main の既定。呼び出しの引数と予約は continuation が所有し、取消時に破棄する。旧一覧の項目入力・Esc・スタック切替キーは既存の DirectNavigationScan で止め、移動は後勝ち。他目的の pane／detached は巻き込まない。DFS・saved-group・共通退役と通常 nav の優先順位は維持。500 ms の待機表示（C5 の全画面は表示無し）。policy 不一致だけ同じ要求を再走査。`nav/folder_open_scan` は owner／intent／auto_fs／rescan を追加。失敗はログ＋通知 |
 | メディア前後送り候補の存在確認 | 常駐 `std::thread` (`media-nav-resolver`) + mpsc mailbox | App-global 0 or 1 (初回要求時に lazy 起動) | EOF / 手動前後送り時、UI が bundle items から抽出した方向付き候補列の実ファイルだけを `Path::exists` で順次検証する。worker は受信時に mailbox を drain して最新 request だけを処理し、キャンセル不能な `Path::exists` 中の新要求も同じ 1 thread に滞留させる。結果は単調増加 request id が最新 pending と一致する場合だけ検討し、`items_generation` / owner window / 開始時 `fullscreen_idx` を context-local stale 条件とする。App-global `input_seq` の一致は owner なしの mounted context だけで要求し、ParkedLive では無関係な main 入力を stale 理由にしない。owner 不一致中は結果を受信せず保留する。EOF action を stale / superseded / context close・load / resolver 切断 / apply 拒否のいずれかで捨てる場合は、対応する `(fs_idx, seek_serial)` と現在値が一致するときだけ video / 動画音声モード / music 共通 dedup latch を解除して次 tick の再試行を許す。ZIP/PDF 仮想 entry は I/O せず候補に残す。App drop で request sender が drop され、in-flight I/O が戻った後に receiver disconnect で自然終了する (終了時 join なし)。 |
 | ファイル名スタック分類 | `std::thread` (`stack-script`) + mpsc | スタックモード ON かつスクリプト有効時、フォルダ読込ごとに最大 1 本 | ユーザー定義 Rhai スクリプト ([`filename_stack_script`](../src/filename_stack_script.rs)) でフォルダ内画像のグループキーを算出する。重くなり得る (実測 10 万件 ~1 秒) ので UI スレッドから外す。通常フォルダを先に表示し、完了後 `poll_stack_script` が `start_loading_items` 経由で集約ビューへ差し替える。`StackScriptPending` の cancel + folder 一致で stale 判定、別フォルダ移動 / スタック OFF / 再ロードで cancel、失敗は組み込み既定へフォールバック。組み込み既定 (separator) ルールは軽量なので同期構築のまま。詳細 [filename-stack-scripting-plan.md](filename-stack-scripting-plan.md) |
 | 音楽ビュー解析 | `std::thread` (`miv-music-analysis`) + 区間worker最大4本 + mpsc | 音楽sourceにつき解析owner 1本、デコード後のみ区間並列 | `run_music_analysis` がFFmpeg progressive decode、取消可能な部分／確定timeline解析、独立Bass計算を全てUI外で行う。`TimelineComplete`のみをin-memory LRU（path+applied stream+size+mtime）へ保存し、UIの楽観ヒットはworkerのfresh statで検証する。PCMはデコード開始前に空の追記式 `Arc<MusicPcm>` を送り、以降appendする。`RwLock`のreadによりtimeline／Bassの長い読取とspectrumの短い窓コピーを並行できる。メッセージは `MusicAnalysisMsg::{Probe,Pcm,Timeline,TimelineComplete,Bass}`。デコード成功・取消なし→必要なTimelineComplete送信→最大 `min(4,available_parallelism)` 本のBELOW_NORMAL区間workerによるBass計算（LRUヒットでも実行）。各推論フレームで既存cancelを確認し、唯一の公開者である解析ownerが区間を結合し、全体snapshotを最短250ms間隔と完了時に公開する。UIは既存source一致内でdrainし最新Bassだけを採用、共有版数更新は1回。新source／closeでcancelとBass破棄、同じ音源のpark／復帰では保持。詳細は本書冒頭と鍵盤設計§13。 |

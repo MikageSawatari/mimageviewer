@@ -46,7 +46,7 @@ fn row_origin(app: &App, dataset_run: u64, row: &Path) -> SearchOpenOrigin {
 
 fn commit_row(app: &mut App, row: &Path) {
     let origin = row_origin(app, accepted_run(app), row);
-    app.commit_staged_search_navigation_effects(row, false, None, Some(origin));
+    app.commit_staged_search_navigation_effects(row, None, None, Some(origin));
 }
 
 fn settle_search(app: &mut App) {
@@ -433,7 +433,7 @@ fn list_order_everything_admission_requires_current_outer_run_and_accepted_datas
     app.cancel_everything_search();
     assert_ne!(app.global_search.run_sequence, run);
     assert!(!app.search_open_origin_is_current(&old_origin));
-    app.commit_staged_search_navigation_effects(&b, false, None, Some(old_origin));
+    app.commit_staged_search_navigation_effects(&b, None, None, Some(old_origin));
     assert_child(&app, &a);
     let current = row_origin(&app, run, &b);
     assert!(app.search_open_origin_is_current(&current));
@@ -441,26 +441,26 @@ fn list_order_everything_admission_requires_current_outer_run_and_accepted_datas
         matches!(&current, SearchOpenOrigin::Everything { run: outer, child: EverythingChildAdmission::ListOrderRow { dataset_run, .. }, .. } if outer != dataset_run)
     );
     let wrong_dataset = row_origin(&app, app.global_search.run_sequence, &b);
-    app.commit_staged_search_navigation_effects(&b, false, None, Some(wrong_dataset));
+    app.commit_staged_search_navigation_effects(&b, None, None, Some(wrong_dataset));
     assert_child(&app, &a);
-    app.commit_staged_search_navigation_effects(&a, false, None, Some(current.clone()));
+    app.commit_staged_search_navigation_effects(&a, None, None, Some(current.clone()));
     assert_child(&app, &a);
-    app.commit_staged_search_navigation_effects(&b, false, None, Some(current));
+    app.commit_staged_search_navigation_effects(&b, None, None, Some(current));
     assert_child(&app, &b);
     let outsider = root.join("outside.zip");
     let origin = row_origin(&app, run, &outsider);
-    app.commit_staged_search_navigation_effects(&outsider, false, None, Some(origin));
+    app.commit_staged_search_navigation_effects(&outsider, None, None, Some(origin));
     assert_child(&app, &b);
     let mut wrong_context = row_origin(&app, run, &a);
     if let SearchOpenOrigin::Everything { context, .. } = &mut wrong_context {
         *context = ViewerContextId::for_test(u64::MAX);
     }
     assert!(!app.search_open_origin_is_current(&wrong_context));
-    app.commit_staged_search_navigation_effects(&a, false, None, Some(wrong_context));
+    app.commit_staged_search_navigation_effects(&a, None, None, Some(wrong_context));
     assert_child(&app, &b);
     let inactive = row_origin(&app, run, &a);
     app.global_search.active = false;
-    app.commit_staged_search_navigation_effects(&a, false, None, Some(inactive));
+    app.commit_staged_search_navigation_effects(&a, None, None, Some(inactive));
     assert_child(&app, &b);
 }
 
@@ -671,7 +671,7 @@ fn landing_fixture(
     app.capture_main_folder_list_order(source_index);
     let snapshot = app.list_order.clone().unwrap();
     assert_eq!(snapshot.scope, ListOrderScope::Everything { run });
-    app.load_folder(source.clone());
+    app.load_folder_and_finish_for_test(source.clone());
     app.finish_page_identity_preparation_for_test();
     assert_child(app, &source);
     app.fullscreen_idx = Some(0);
@@ -749,6 +749,7 @@ fn replace_document_preflight(app: &mut App, stamp: Option<crate::pdf_loader::Do
 fn finish_landing(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while app.top_level_grid_view.open_path_classification().is_some()
+        || app.direct_navigation_scan_pending()
         || app
             .top_level_grid_view
             .history_navigation_transition()
@@ -760,6 +761,7 @@ fn finish_landing(app: &mut App, ctx: &egui::Context) {
         || app.fullscreen_idx.is_none()
     {
         app.settle_open_path_classification_for_test();
+        app.poll_direct_navigation_scan_for_test(ctx);
         app.poll_history_navigation_transition_for_test(ctx);
         app.poll_zip_enumerate();
         app.poll_pdf_enumerate();
@@ -894,6 +896,7 @@ fn list_order_everything_parent_uses_the_moved_row_and_nested_book_returns_to_it
         app.close_fullscreen();
         assert!(app.handle_grid_parent_folder_action().is_none());
         if matches!(landing, Landing::FolderInnerZip) {
+            app.finish_direct_navigation_scan_for_test();
             app.finish_page_identity_preparation_for_test();
             assert_eq!(app.effective_folder().as_ref(), Some(&fixture.row));
             assert_child(&app, &fixture.row);
@@ -1373,7 +1376,7 @@ fn list_order_everything_internal_open_physical_book_reports_unavailable_from_re
                 }
                 // Explicit user destinations exit Search. Retain this internal-open
                 // fixture to cover the original list-order ownership defect.
-                app.load_folder(favorite.clone());
+                app.load_folder_and_finish_for_test(favorite.clone());
                 app.settle_open_path_classification_for_test();
                 app.finish_page_identity_preparation_for_test();
                 assert_eq!(app.current_folder.as_ref(), Some(&favorite));
@@ -1556,7 +1559,7 @@ fn retained_parent_internal_open_repro(
     let snapshot = app.list_order.clone().unwrap();
     assert_eq!(snapshot.entries[0].path, parent);
     // Internal opens still preserve Search; user destinations now exit it.
-    app.load_folder(favorite.clone());
+    app.load_folder_and_finish_for_test(favorite.clone());
     app.settle_open_path_classification_for_test();
     app.finish_page_identity_preparation_for_test();
     assert_eq!(app.current_folder.as_ref(), Some(&favorite));

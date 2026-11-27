@@ -261,6 +261,7 @@ fn settle(app: &mut App, ctx: &egui::Context, pdf: Option<&Path>) {
     let mut injected = false;
     loop {
         app.settle_open_path_classification_for_test();
+        app.poll_direct_navigation_scan_for_test(ctx);
         // Only PDF enumeration is faked; admission, preparation, ownership and
         // visible install remain production code, as in the parent test module.
         if !injected
@@ -295,6 +296,7 @@ fn settle(app: &mut App, ctx: &egui::Context, pdf: Option<&Path>) {
             && app.pdf_enumerate_pending.is_none()
             && app.global_search.pending.is_none()
             && !app.sidecar_restore_active()
+            && !app.direct_navigation_scan_pending()
         {
             app.finish_page_identity_preparation_for_test();
             return;
@@ -398,7 +400,7 @@ fn scenario(book: Book, linked: bool, parent_starred: bool, everything: bool, ro
             dataset(vec![row.clone(), unstarred.clone()]),
         );
     } else {
-        app.load_folder(root.clone());
+        app.load_folder_and_finish_for_test(root.clone());
     }
     app.finish_page_identity_preparation_for_test();
     assert_eq!(visible(&app), vec![row.clone()]);
@@ -667,11 +669,11 @@ fn same_backing_reload_and_switch_use_the_adopted_source() {
             .set(&crate::adjustment_db::normalize_path(&source), 5)
             .unwrap();
         app.settings.rating_filter = FIVE;
-        app.load_folder(root);
+        app.load_folder_and_finish_for_test(root);
         admit(&mut app, &ctx, &row);
         app.close_fullscreen();
         // F5's same-backing load must retain the original archive identity.
-        app.load_folder(backing.clone());
+        app.load_folder_and_finish_for_test(backing.clone());
         settle(&mut app, &ctx, None);
         assert_eq!(app.current_folder, Some(backing));
         assert_eq!(app.effective_folder(), Some(source.clone()));
@@ -733,7 +735,7 @@ fn unadopted_canceled_and_failed_pdf_leave_the_converted_book_unchanged() {
             .set(&crate::adjustment_db::normalize_path(&source), 5)
             .unwrap();
         app.settings.rating_filter = FIVE;
-        app.load_folder(root.clone());
+        app.load_folder_and_finish_for_test(root.clone());
         admit(&mut app, &ctx, &row);
         app.close_fullscreen();
         let before = (
@@ -813,7 +815,7 @@ fn unadopted_pdf_password_terminal(pause: bool) {
             .set(&crate::adjustment_db::normalize_path(&source), 5)
             .unwrap();
         app.settings.rating_filter = FIVE;
-        app.load_folder(root.clone());
+        app.load_folder_and_finish_for_test(root.clone());
         admit(&mut app, &ctx, &row);
         app.close_fullscreen();
         let before = (

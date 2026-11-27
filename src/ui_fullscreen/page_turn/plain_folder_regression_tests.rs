@@ -26,7 +26,7 @@ fn folder_fixture(
     let (service, owner) =
         BookCompositionService::spawn_at(app.tmp.path().join("composition-data"), None).unwrap();
     app.install_book_composition_runtime(service);
-    app.load_folder(folder.clone());
+    app.load_folder_and_finish_for_test(folder.clone());
     app.finish_page_identity_preparation_for_test();
     assert_eq!(app.current_folder.as_ref(), Some(&folder));
     assert_eq!(app.items.len(), count);

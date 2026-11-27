@@ -95,7 +95,7 @@ fn assert_bookmark_build_retired(
 #[test]
 fn bookmark_build_folder_adoption_retires_worker_and_preserves_audio_sidecar() {
     let (mut app, audio, cover, cancel) = bookmark_build_fixture();
-    app.load_folder(audio.parent().unwrap().to_path_buf());
+    app.load_folder_and_finish_for_test(audio.parent().unwrap().to_path_buf());
     assert!(matches!(&app.items[..], [GridItem::Audio(path)] if path == &audio));
     assert_bookmark_build_retired(&mut app, &audio, &cover, &cancel);
 }
@@ -220,7 +220,7 @@ fn bookmark_build_late_owner_proof_rejects_held_reply_after_folder_adoption() {
     let (mut app, audio, cover, cancel) = bookmark_build_fixture();
     // Hold the request outside App to bypass eager retirement and exercise poll's proof check.
     let held = app.bookmark_browser_pending.take().unwrap();
-    app.load_folder(audio.parent().unwrap().to_path_buf());
+    app.load_folder_and_finish_for_test(audio.parent().unwrap().to_path_buf());
     assert!(!cancel.load(Ordering::Relaxed));
     app.bookmark_browser_pending = Some(held);
     let key = crate::path_key::normalize_keep_drive(&audio);

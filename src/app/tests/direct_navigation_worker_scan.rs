@@ -5,13 +5,35 @@ use super::*;
 impl App {
     /// Settle only this new worker route. Tests keep their original post-adoption assertions.
     pub(crate) fn finish_direct_navigation_scan_for_test(&mut self) {
+        if self.direct_navigation_scan_pending() {
+            self.finish_direct_navigation_scan_before_hydration_for_test();
+            self.finish_page_identity_preparation_for_test();
+        }
+    }
+
+    /// Adopt the scan through the real frame seam, leaving the newly started
+    /// hydration owner intact for tests of admission and first-display ordering.
+    pub(crate) fn finish_direct_navigation_scan_before_hydration_for_test(&mut self) {
         let ctx = egui::Context::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while self.direct_navigation_scan_pending() {
             self.poll_sidecar_restore(&ctx);
-            self.poll_direct_navigation_scan_for_test(&ctx);
+            #[cfg(windows)]
+            if self
+                .folder_pane_open_pending
+                .as_ref()
+                .is_some_and(|pending| pending.purpose.closes_main_fullscreen())
+            {
+                self.poll_main_embedded_required_fullscreen_folder_open(&ctx);
+            } else {
+                self.post_render_main_navigation(
+                    &ctx,
+                    update_phases::MainFrameNavigation::default(),
+                );
+            }
+            #[cfg(not(windows))]
+            self.post_render_main_navigation(&ctx, update_phases::MainFrameNavigation::default());
             if !self.direct_navigation_scan_pending() {
-                self.finish_page_identity_preparation_for_test();
                 return;
             }
             assert!(
@@ -32,7 +54,7 @@ fn open(app: &mut App, path: PathBuf) {
         None,
         StartupListIntent::ExplicitList,
         MainListRequestStage::Admission,
-        DirectoryScanRoute::Worker,
+        DirectoryScanRoute::MainWorker,
     );
 }
 
@@ -62,7 +84,7 @@ fn capture_destination_missing_warns_without_replacing_current_listing() {
     let mut app = setup_app();
     let origin = folder(&app, "capture-origin");
     std::fs::create_dir(origin.join("child")).unwrap();
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     app.finish_page_identity_preparation_for_test();
     let generation = app.items_generation;
     let items = app.items.clone();
@@ -115,7 +137,7 @@ fn capture_destination_existing_opens_like_pane_navigation() {
             if !quick_slot {
                 app.active_quick_folder_slot = None;
             }
-            app.load_folder(origin.clone());
+            app.load_folder_and_finish_for_test(origin.clone());
             app.finish_page_identity_preparation_for_test();
             if capture {
                 app.start_capture_destination_open(destination.clone());
@@ -156,7 +178,7 @@ fn capture_destination_existing_opens_like_pane_navigation() {
 fn capture_destination_other_scan_errors_keep_generic_warning() {
     let mut app = setup_app();
     let origin = folder(&app, "capture-error-origin");
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     app.finish_page_identity_preparation_for_test();
     for kind in [
         std::io::ErrorKind::PermissionDenied,
@@ -164,9 +186,15 @@ fn capture_destination_other_scan_errors_keep_generic_warning() {
     ] {
         let destination = app.tmp.path().join("capture-error");
         app.start_capture_destination_open(destination);
+        let policy = app.folder_scan_policy();
         let pending = app.folder_pane_open_pending.as_mut().unwrap();
         let (tx, rx) = mpsc::channel();
-        tx.send(Err(std::io::Error::from(kind))).unwrap();
+        tx.send(FolderOpenScanResult {
+            scan: Err(std::io::Error::from(kind)),
+            policy,
+            policy_mixed: false,
+        })
+        .unwrap();
         pending.rx = rx;
         app.post_render_main_navigation(
             &egui::Context::default(),
@@ -189,7 +217,7 @@ fn direct_navigation_worker_ready_scan_yields_to_same_frame_navigation_inputs() 
         let origin = folder(&app, "origin");
         let a = folder(&app, "a");
         let b = folder(&app, "b");
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         app.finish_page_identity_preparation_for_test();
         open(&mut app, a.clone());
         let cancel = make_scan_ready(&mut app);
@@ -263,7 +291,7 @@ fn direct_navigation_worker_admission_after_real_dfs_poll_retires_sequence() {
             .save(path.join("page.png"))
             .unwrap();
     }
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     app.finish_page_identity_preparation_for_test();
     app.capture_fs_nav_holdover(0);
     app.start_folder_nav(a.clone(), true, FolderNavMode::Fullscreen);
@@ -299,20 +327,28 @@ fn direct_navigation_worker_admission_after_real_dfs_poll_retires_sequence() {
 }
 
 #[test]
-fn direct_navigation_worker_admission_does_not_take_global_fullscreen_reservation() {
+fn direct_navigation_worker_admission_takes_and_retires_global_fullscreen_reservation() {
     let mut app = setup_app();
     let target = folder(&app, "target");
     app.pending_auto_fs_open = true;
     open(&mut app, target);
-    assert!(app.pending_auto_fs_open);
+    // §1.853 §6.3: the accepted request now owns a pre-existing reservation so
+    // cancellation cannot leave it for the next unrelated directory load.
+    assert!(!app.pending_auto_fs_open);
     assert!(matches!(
         app.folder_pane_open_pending.as_ref().unwrap().purpose,
-        FolderOpenScanPurpose::DirectNavigation
+        FolderOpenScanPurpose::DirectNavigation(_)
     ));
+    let FolderOpenScanPurpose::DirectNavigation(call) =
+        &app.folder_pane_open_pending.as_ref().unwrap().purpose
+    else {
+        unreachable!();
+    };
+    assert!(call.auto_fullscreen);
     app.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
     assert!(
-        app.pending_auto_fs_open,
-        "global reservation is outside this request's ownership"
+        !app.pending_auto_fs_open,
+        "the cancelled request retires its reservation"
     );
 }
 
@@ -335,7 +371,7 @@ fn direct_navigation_worker_dispatch_has_zero_caller_scans_and_adopts_once() {
         let target = folder(&app, "target");
         let origin = folder(&app, "origin");
         std::fs::write(target.join("page.jpg"), []).unwrap();
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         app.finish_page_identity_preparation_for_test();
         let before = folder_scan::caller_scan_count_for_test();
         let mut frame = update_phases::MainFrameNavigation::default();
@@ -388,7 +424,7 @@ fn direct_navigation_worker_dispatch_has_zero_caller_scans_and_adopts_once() {
 }
 
 #[test]
-fn direct_navigation_worker_unmarked_producers_keep_synchronous_adoption() {
+fn direct_navigation_worker_unmarked_producers_scan_off_caller_and_keep_adoption() {
     use crate::ui_main::AddressBarNav;
     for producer in ["dialog", "grid", "parent", "favorite", "wrapper"] {
         let mut app = setup_app();
@@ -402,7 +438,7 @@ fn direct_navigation_worker_unmarked_producers_keep_synchronous_adoption() {
                 "origin"
             },
         );
-        app.load_folder(origin);
+        app.load_folder_and_finish_for_test(origin);
         app.finish_page_identity_preparation_for_test();
         let before = folder_scan::caller_scan_count_for_test();
         let mut frame = update_phases::MainFrameNavigation::default();
@@ -429,7 +465,16 @@ fn direct_navigation_worker_unmarked_producers_keep_synchronous_adoption() {
         }
         assert_eq!(
             folder_scan::caller_scan_count_for_test(),
-            before + 1,
+            before,
+            "{producer}"
+        );
+        // §1.853 §6.3: the common directory scan defaults to a worker for these
+        // formerly unmarked inputs; destination semantics remain unchanged.
+        assert!(app.direct_navigation_scan_pending(), "{producer}");
+        app.finish_direct_navigation_scan_for_test();
+        assert_eq!(
+            folder_scan::caller_scan_count_for_test(),
+            before,
             "{producer}"
         );
         assert_eq!(app.current_folder.as_ref(), Some(&target), "{producer}");
@@ -549,15 +594,22 @@ fn direct_navigation_worker_blocks_old_folder_image_zip_pdf_accept_handlers() {
 
 #[test]
 fn direct_navigation_worker_dfs_admission_cancels_only_replaceable_scan() {
-    for purpose in [
-        FolderOpenScanPurpose::PaneNavigation,
-        FolderOpenScanPurpose::DirectNavigation,
-        FolderOpenScanPurpose::DetachedFolder,
-    ] {
+    for purpose in ["pane", "direct", "detached"] {
         let mut app = setup_app();
         let target = folder(&app, "target");
-        let replaceable = matches!(purpose, FolderOpenScanPurpose::DirectNavigation);
-        app.start_folder_open_scan(target.clone(), purpose);
+        let replaceable = purpose == "direct";
+        if replaceable {
+            open(&mut app, target.clone());
+        } else {
+            app.start_folder_open_scan(
+                target.clone(),
+                if purpose == "pane" {
+                    FolderOpenScanPurpose::PaneNavigation
+                } else {
+                    FolderOpenScanPurpose::DetachedFolder
+                },
+            );
+        }
         let cancel = app
             .folder_pane_open_pending
             .as_ref()
@@ -654,7 +706,7 @@ fn direct_navigation_worker_stale_failure_and_disconnect_preserve_listing() {
     for exit in ["stale", "failure", "disconnect"] {
         let mut app = setup_app();
         let origin = folder(&app, "origin");
-        app.load_folder(origin.clone());
+        app.load_folder_and_finish_for_test(origin.clone());
         let missing = app.tmp.path().join("missing");
         open(&mut app, missing);
         if exit == "stale" {
@@ -761,7 +813,7 @@ fn direct_navigation_worker_original_navigation_is_not_recaptured() {
         None,
         StartupListIntent::ExplicitList,
         MainListRequestStage::Admission,
-        DirectoryScanRoute::Worker,
+        DirectoryScanRoute::MainWorker,
     );
     let pending = app.folder_pane_open_pending.as_ref().unwrap();
     let original = pending.navigation.as_ref().unwrap();
@@ -770,10 +822,10 @@ fn direct_navigation_worker_original_navigation_is_not_recaptured() {
         original.source_slot_switch_sequence,
         navigation.source_slot_switch_sequence
     );
-    assert!(matches!(
-        pending.purpose,
-        FolderOpenScanPurpose::DirectNavigation
-    ));
+    let FolderOpenScanPurpose::DirectNavigation(call) = &pending.purpose else {
+        panic!("direct continuation");
+    };
+    assert_eq!(call.navigation, pending.navigation);
     app.finish_direct_navigation_scan_for_test();
     assert!(app.folder_nav_back_stack.is_empty());
 }
@@ -807,7 +859,7 @@ fn direct_navigation_worker_snapshot_refusal_keeps_existing_owner_and_history() 
     let origin = folder(&app, "origin");
     let outside = folder(&app, "outside");
     std::fs::write(origin.join("page.jpg"), []).unwrap();
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     app.finish_page_identity_preparation_for_test();
     app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
     assert!(app.is_snapshot_active());
@@ -834,7 +886,7 @@ fn direct_navigation_worker_history_navigation_replaces_pending_scan() {
     let origin = folder(&app, "origin");
     let a = folder(&app, "a");
     let back = folder(&app, "back");
-    app.load_folder(origin);
+    app.load_folder_and_finish_for_test(origin);
     app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(back.clone()).into()];
     open(&mut app, a);
     let cancel = app
@@ -855,7 +907,7 @@ fn direct_navigation_worker_history_wait_keeps_released_escape_stack_toggle() {
     app.active_quick_folder_slot = None;
     let origin = folder(&app, "origin");
     let target = folder(&app, "target");
-    app.load_folder(origin);
+    app.load_folder_and_finish_for_test(origin);
     app.stack_mode_requested = true;
     app.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(target).into()];
     app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);
@@ -947,46 +999,60 @@ fn direct_navigation_worker_block_reason_keeps_non_item_shortcuts_available() {
 #[test]
 fn direct_navigation_worker_route_excludes_virtual_and_sibling_contexts() {
     let mut app = setup_app();
+    let archive = app.tmp.path().join("book.zip");
+    std::fs::write(&archive, []).unwrap();
+    let before = folder_scan::caller_scan_count_for_test();
+    open(&mut app, archive);
+    assert!(!app.direct_navigation_scan_pending());
+    assert_eq!(folder_scan::caller_scan_count_for_test(), before);
+
+    // The removed route predicate is exercised at its actual dispatch boundary:
+    // a classified directory with an archive suffix still reaches the directory worker.
     let path = folder(&app, "folder.zip");
-    let proof = app.copied_destination_source_proof();
-    let navigation =
-        Some(app.capture_main_list_navigation(MainHistoryOperation::SameLocation, proof));
-    assert!(!app.direct_navigation_uses_worker_scan(
-        &path,
+    app.open_direct_navigation_target_classified(
+        path.clone(),
         None,
-        &None,
-        &OpenRequestOwner::Navigation,
-        &navigation,
-        DirectoryScanRoute::Worker
-    ));
-    assert!(app.direct_navigation_uses_worker_scan(
-        &path,
+        OpenRequestOwner::Navigation,
+        None,
+        None,
         Some(OpenPathKind::Directory),
-        &None,
-        &OpenRequestOwner::Navigation,
-        &navigation,
-        DirectoryScanRoute::Worker
-    ));
-    assert!(!app.direct_navigation_uses_worker_scan(
-        &path,
-        Some(OpenPathKind::Directory),
-        &None,
-        &OpenRequestOwner::Navigation,
-        &navigation,
-        DirectoryScanRoute::UiThread
-    ));
+        StartupListIntent::ExplicitList,
+        MainListRequestStage::Admission,
+        DirectoryScanRoute::MainWorker,
+    );
+    assert!(app.direct_navigation_scan_pending());
+    app.finish_direct_navigation_scan_for_test();
+    assert_eq!(folder_scan::caller_scan_count_for_test(), before);
+    assert_eq!(app.current_folder.as_ref(), Some(&path));
+
+    let physical = folder(&app, "sibling-physical");
     let sibling = app.build_window_context_for_test(1805, |_| {});
     app.with_viewer_context(sibling, |app| {
-        assert!(!app.direct_navigation_uses_worker_scan(
-            &path,
-            Some(OpenPathKind::Directory),
-            &None,
-            &OpenRequestOwner::Navigation,
-            &navigation,
-            DirectoryScanRoute::Worker
-        ));
+        app.load_folder_with_scan_route(physical.clone(), DirectoryScanRoute::MainWorker);
+        assert!(!app.direct_navigation_scan_pending());
+        assert_eq!(app.current_folder.as_ref(), Some(&physical));
+        assert_eq!(folder_scan::caller_scan_count_for_test(), before + 1);
     })
     .unwrap();
+}
+
+#[test]
+fn section1853_reasoned_ui_scan_routes_keep_synchronous_adoption() {
+    for reason in [
+        UiThreadScanReason::TrayClose,
+        UiThreadScanReason::ConvertedCacheReload,
+        UiThreadScanReason::SnapshotLeafOpen,
+        UiThreadScanReason::PlayTest,
+        UiThreadScanReason::ReleaseCheck,
+    ] {
+        let mut app = setup_app();
+        let target = folder(&app, "explicit-sync");
+        let before = folder_scan::caller_scan_count_for_test();
+        app.load_folder_with_scan_route(target.clone(), DirectoryScanRoute::UiThread(reason));
+        assert_eq!(folder_scan::caller_scan_count_for_test(), before + 1);
+        assert!(!app.direct_navigation_scan_pending());
+        assert_eq!(app.current_folder.as_ref(), Some(&target));
+    }
 }
 
 #[test]
@@ -995,7 +1061,7 @@ fn direct_navigation_worker_quick_folder_round_trip_retires_old_epoch() {
     let a = folder(&app, "a");
     let b = folder(&app, "b");
     let target = folder(&app, "target");
-    app.load_folder(a.clone());
+    app.load_folder_and_finish_for_test(a.clone());
     app.set_quick_folder_slot_target(QuickFolderSlotId::A, a.clone());
     app.set_quick_folder_slot_target(QuickFolderSlotId::B, b.clone());
     app.active_quick_folder_slot = Some(QuickFolderSlotId::A);
@@ -1047,7 +1113,7 @@ fn direct_navigation_worker_rejected_address_input_cancels_prior_scan_in_actual_
     let mut app = setup_app();
     let origin = folder(&app, "origin");
     let target = folder(&app, "target");
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     app.finish_page_identity_preparation_for_test();
     app.post_render_main_navigation(
         &egui::Context::default(),
@@ -1084,7 +1150,7 @@ fn direct_navigation_worker_rejected_filtered_backspace_cancels_prior_scan() {
     let mut app = setup_app();
     let origin = folder(&app, "origin");
     let target = folder(&app, "target");
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     app.finish_page_identity_preparation_for_test();
     open(&mut app, target);
     let cancel = make_scan_ready(&mut app);
@@ -1126,7 +1192,7 @@ fn direct_navigation_worker_uncached_pdf_acceptance_retires_scan_before_pdf_comp
     let target = folder(&app, "target");
     let pdf = app.tmp.path().join("uncached.pdf");
     std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     app.finish_page_identity_preparation_for_test();
     app.post_render_main_navigation(
         &egui::Context::default(),
@@ -1185,7 +1251,7 @@ fn direct_navigation_worker_successful_pdf_claim_outside_frame_retires_scan() {
     let target = folder(&app, "target");
     let pdf = app.tmp.path().join("claim.pdf");
     std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
-    app.load_folder(origin.clone());
+    app.load_folder_and_finish_for_test(origin.clone());
     app.finish_page_identity_preparation_for_test();
     open(&mut app, target);
     let cancel = make_scan_ready(&mut app);
@@ -1212,14 +1278,11 @@ fn direct_navigation_worker_pane_retirement_does_not_retain_older_direct_scan() 
     for direct in [false, true] {
         let mut app = setup_app();
         let target = folder(&app, "target");
-        app.start_folder_open_scan(
-            target,
-            if direct {
-                FolderOpenScanPurpose::DirectNavigation
-            } else {
-                FolderOpenScanPurpose::PaneNavigation
-            },
-        );
+        if direct {
+            open(&mut app, target);
+        } else {
+            app.start_folder_open_scan(target, FolderOpenScanPurpose::PaneNavigation);
+        }
         let cancel = app
             .folder_pane_open_pending
             .as_ref()
@@ -1270,10 +1333,261 @@ fn direct_navigation_worker_preserves_unmarked_presentation_intents() {
             None,
             intent,
             MainListRequestStage::Admission,
-            DirectoryScanRoute::UiThread,
+            DirectoryScanRoute::MainWorker,
         );
+        // §1.853 §6.3: unmarked intents now wait for the common worker; the
+        // presentation intent and installed destination keep their original meaning.
+        assert!(app.direct_navigation_scan_pending());
+        assert_eq!(folder_scan::caller_scan_count_for_test(), before);
+        app.finish_direct_navigation_scan_for_test();
+        assert_eq!(folder_scan::caller_scan_count_for_test(), before);
         assert!(!app.direct_navigation_scan_pending());
-        assert_eq!(folder_scan::caller_scan_count_for_test(), before + 1);
         assert_eq!(app.current_folder.as_ref(), Some(&target));
+    }
+}
+
+#[test]
+fn direct_navigation_worker_busy_install_refuses_before_scan_admission() {
+    let mut app = setup_app();
+    app.active_quick_folder_slot = None;
+    app.settings.detached_viewer_open_images_in_window = false;
+    app.settings.auto_fullscreen_image_folders = false;
+    app.settings.sidecar_backup_enabled = true;
+    let source = folder(&app, "busy-source");
+    let target = folder(&app, "busy-target");
+    image::RgbaImage::new(2, 2)
+        .save(source.join("page.png"))
+        .unwrap();
+    app.load_folder(source.clone());
+    assert!(app.direct_navigation_scan_pending());
+    app.finish_direct_navigation_scan_before_hydration_for_test();
+    assert!(app.sidecar_restore_active());
+    assert!(!app.direct_navigation_scan_pending());
+    assert!(!app.items.is_empty());
+    let items = app.items.clone();
+    let generation = app.items_generation;
+    let history = app.folder_nav_history_snapshot();
+
+    assert!(!app.load_folder_with_scan_owned(
+        target,
+        None,
+        OpenRequestOwner::Navigation,
+        StartupListIntent::ExplicitList,
+    ));
+    assert!(!app.direct_navigation_scan_pending());
+    assert!(app.folder_pane_open_pending.is_none());
+    assert!(app.sidecar_restore_active());
+    assert_eq!(app.current_folder.as_ref(), Some(&source));
+    assert_eq!(app.items, items);
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.folder_nav_history_snapshot(), history);
+}
+
+#[test]
+fn section1853_worker_continuation_commits_captured_effects_and_selection_once() {
+    let mut app = setup_app();
+    app.active_quick_folder_slot = None;
+    app.settings.detached_viewer_open_images_in_window = false;
+    let origin = folder(&app, "effects-origin");
+    let target = folder(&app, "effects-origin/target");
+    let chosen = folder(&app, "effects-origin/target/chosen");
+    folder(&app, "effects-origin/target/other");
+    app.load_folder_and_finish_for_test(origin.clone());
+    let index = app
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::Folder(path) if path == &target))
+        .unwrap();
+    app.settings.rating_filter = [false, false, false, false, false, true];
+    app.rating_cache.insert(index, 5);
+    let old_return = super::reading_history_return_for_test(origin.join("previous.zip"));
+    app.reading_history_return_from = Some(old_return.clone());
+    app.select_after_load = Some(AfterLoadSelection::Name("chosen".into()));
+    let nav = app.grid_physical_navigation(index, target.clone(), false);
+    let scans = folder_scan::caller_scan_count_for_test();
+    app.post_render_main_navigation(
+        &egui::Context::default(),
+        update_phases::MainFrameNavigation {
+            grid_nav: Some(nav),
+            ..Default::default()
+        },
+    );
+    let pending = app.folder_pane_open_pending.as_ref().unwrap();
+    let FolderOpenScanPurpose::DirectNavigation(call) = &pending.purpose else {
+        panic!("grid folder must use the common directory continuation");
+    };
+    assert!(matches!(call.owner, OpenRequestOwner::Navigation));
+    let effects = call.grid_effects.as_ref().unwrap();
+    assert_eq!(
+        effects.rating_suppression.as_deref().cloned(),
+        Some((target.clone(), app.settings.rating_filter))
+    );
+    assert!(!effects.suppress_facet_filter);
+    assert!(!effects.auto_fullscreen);
+    assert_eq!(
+        call.navigation
+            .as_ref()
+            .unwrap()
+            .selection_after_load()
+            .cloned(),
+        Some(AfterLoadSelection::Name("chosen".into()))
+    );
+    assert_eq!(app.reading_history_return_from, Some(old_return));
+    assert!(app.rating_filter_suppressed_at.is_none());
+    assert_eq!(app.current_folder.as_ref(), Some(&origin));
+    // Adoption must use the request's captured hint instead of a later App value.
+    app.select_after_load = Some(AfterLoadSelection::Name("other".into()));
+    app.finish_direct_navigation_scan_for_test();
+    assert_eq!(folder_scan::caller_scan_count_for_test(), scans);
+    assert_eq!(app.current_folder.as_ref(), Some(&target));
+    assert!(app.reading_history_return_from.is_none());
+    assert_eq!(
+        app.rating_filter_suppressed_at,
+        Some((target, [false, false, false, false, false, true]))
+    );
+    assert!(matches!(&app.items[app.selected.unwrap()], GridItem::Folder(path) if path == &chosen));
+    let history = app.folder_nav_history_snapshot();
+    let generation = app.items_generation;
+    app.post_render_main_navigation(&egui::Context::default(), Default::default());
+    assert_eq!(app.folder_nav_history_snapshot(), history);
+    assert_eq!(app.items_generation, generation);
+}
+
+#[test]
+fn section1853_policy_rescan_keeps_same_continuation_token_clock_and_admission() {
+    for change in ["settings", "mixed", "susie-revision"] {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = folder(&app, "policy-origin");
+        let target = folder(&app, "policy-target");
+        let chosen = folder(&app, "policy-target/chosen");
+        app.load_folder_and_finish_for_test(origin.clone());
+        app.select_after_load = Some(AfterLoadSelection::Name("chosen".into()));
+        app.pending_auto_fs_open = true;
+        let scans = folder_scan::caller_scan_count_for_test();
+        open(&mut app, target.clone());
+        let pending = app.folder_pane_open_pending.as_mut().unwrap();
+        let mut result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let token = Arc::clone(&pending.cancel);
+        let started = pending.started_at;
+        let navigation = pending.navigation.clone();
+        let FolderOpenScanPurpose::DirectNavigation(call) = &pending.purpose else {
+            panic!("direct continuation");
+        };
+        let continuation_address = &**call as *const DirectNavigationContinuation;
+        let saved_navigation = call.navigation.clone();
+        let saved_intent = call.restore_intent.clone();
+        #[cfg(all(windows, feature = "test-script"))]
+        let admitted = app.test_script_folder_load_requests;
+        match change {
+            "settings" => app.settings.show_hidden_files = !app.settings.show_hidden_files,
+            "mixed" => result.policy_mixed = true,
+            _ => {
+                result.policy.susie_pool_revision =
+                    result.policy.susie_pool_revision.wrapping_add(1)
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        tx.send(result).unwrap();
+        app.folder_pane_open_pending.as_mut().unwrap().rx = rx;
+        let generation = app.items_generation;
+        app.post_render_main_navigation(&egui::Context::default(), Default::default());
+        let pending = app.folder_pane_open_pending.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&pending.cancel, &token), "{change}");
+        assert!(!token.load(Ordering::Relaxed));
+        assert_eq!(pending.started_at, started);
+        assert_eq!(pending.navigation, navigation);
+        let FolderOpenScanPurpose::DirectNavigation(call) = &pending.purpose else {
+            panic!("same continuation must own the rescan");
+        };
+        assert_eq!(
+            &**call as *const DirectNavigationContinuation,
+            continuation_address
+        );
+        assert_eq!(call.navigation, saved_navigation);
+        assert_eq!(call.restore_intent, saved_intent);
+        assert!(matches!(call.owner, OpenRequestOwner::Navigation));
+        assert_eq!(call.rescans, 1);
+        assert!(call.auto_fullscreen);
+        assert!(!app.pending_auto_fs_open);
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, admitted);
+        app.finish_direct_navigation_scan_for_test();
+        assert_eq!(folder_scan::caller_scan_count_for_test(), scans);
+        assert_eq!(app.current_folder.as_ref(), Some(&target));
+        assert!(
+            matches!(&app.items[app.selected.unwrap()], GridItem::Folder(path) if path == &chosen)
+        );
+        assert_eq!(app.folder_nav_back_stack.len(), 1);
+        #[cfg(all(windows, feature = "test-script"))]
+        assert_eq!(app.test_script_folder_load_requests, admitted);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn section1853_worker_ready_rejects_sibling_document_modal_without_adoption() {
+    let mut app = setup_app();
+    let origin = folder(&app, "modal-origin");
+    let target = folder(&app, "modal-target");
+    app.load_folder_and_finish_for_test(origin.clone());
+    app.pending_auto_fs_open = true;
+    open(&mut app, target);
+    make_scan_ready(&mut app);
+    let generation = app.items_generation;
+    let history = app.folder_nav_history_snapshot();
+    let pdf = app.tmp.path().join("sibling-password.pdf");
+    let _sibling = app.build_window_context_for_test(1853, |sibling| {
+        sibling.pdf_password_request = Some(PdfPasswordRequest::legacy(pdf));
+    });
+    assert!(app.document_open_modal_admission_blocked());
+    let scans = folder_scan::caller_scan_count_for_test();
+    app.post_render_main_navigation(&egui::Context::default(), Default::default());
+    assert!(app.folder_pane_open_pending.is_none());
+    assert!(!app.pending_auto_fs_open);
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.folder_nav_history_snapshot(), history);
+    assert_eq!(app.current_folder.as_ref(), Some(&origin));
+    assert_eq!(folder_scan::caller_scan_count_for_test(), scans);
+}
+
+#[test]
+fn section1853_worker_error_and_disconnect_retire_reservation_and_selection() {
+    for failure in ["error", "disconnect"] {
+        let mut app = setup_app();
+        let origin = folder(&app, "terminal-origin");
+        let target = folder(&app, "terminal-target");
+        app.load_folder_and_finish_for_test(origin.clone());
+        app.select_after_load = Some(AfterLoadSelection::Name("must-not-leak".into()));
+        app.pending_auto_fs_open = true;
+        open(&mut app, target);
+        let (tx, rx) = mpsc::channel();
+        if failure == "error" {
+            tx.send(FolderOpenScanResult {
+                scan: Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                policy: app.folder_scan_policy(),
+                policy_mixed: false,
+            })
+            .unwrap();
+        }
+        drop(tx);
+        app.folder_pane_open_pending.as_mut().unwrap().rx = rx;
+        let scans = folder_scan::caller_scan_count_for_test();
+        app.finish_direct_navigation_scan_for_test();
+        assert_eq!(folder_scan::caller_scan_count_for_test(), scans);
+        assert_eq!(app.current_folder.as_ref(), Some(&origin));
+        assert!(!app.pending_auto_fs_open);
+        assert!(app.select_after_load.is_none());
+        assert!(app.fs_feedback_toast.is_some());
+        let unrelated = folder(&app, "unrelated");
+        app.load_folder_and_finish_for_test(unrelated.clone());
+        assert_eq!(app.current_folder.as_ref(), Some(&unrelated));
+        assert!(app.fullscreen_idx.is_none());
+        assert!(app.select_after_load.is_none());
     }
 }

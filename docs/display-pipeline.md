@@ -3804,6 +3804,17 @@ scale_x=3.0443971, scale_y=3.0443973` で、論理 1440 × ppp1.5 = 実 2160px �
 
 #### 2.5.4 表示単位 (単一 / 見開き / 連結)
 
+§1.853 C5 の全画面から親へ戻る待ちは、`FolderItems` の目的 `CloseReturn { request_id }` を使う。
+true-close の後始末より前に、実際に描いている holdover を優先して表示単位を捕捉し、
+既存の close continuation から `MainListNavigation` の `FsCloseReturnPresentation` へ描画資源だけを渡す。
+旧 sequence の操作権限を引き継がず、worker 発行後にこの要求の sequence として開始する。
+現在の補助表紙を含む表示単位全体を描けるときは通常描画にし、待ちの間の拡大・回転・位置を反映する。
+未準備のときだけ捕捉した単位を代役として描く。通常描画へ切り替えても sequence・lock・代役の資源を終えず、
+採用直前の `ViewerExited`、失敗／取消／置換の `Superseded` で同じ要求だけを終える。
+ページ送り・ジャンプ・スクロールの拒否と、読み込み中の表示を出さない扱いは既存の FolderItems 待ちに従う。
+Ctrl+↑↓ の previous 描画は変更しない。[設計 §6.12](ui-sync-853-plan.md#612-c5-全画面から戻る経路-全画面の-ctrl-の待ちと同じ扱い-利用者決定-61r6)。
+本追補のコンパイル・テスト・実機描画は未確認。
+
 単一ページは 1 ページ、見開きは左右 2 ページを表示単位として、**表示単位全体を 1 回で解決する**。
 受理時に current unit の texture / rotation / Part A の captured layout geometry を
 `FsNavigationSequence::previous` へ 1 unit として取る。`FsNavigationSequenceTarget::Display` は

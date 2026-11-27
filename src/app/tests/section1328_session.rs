@@ -6,6 +6,7 @@ fn session1328_settle(app: &mut App) {
     let ctx = egui::Context::default();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
+        app.poll_direct_navigation_scan_for_test(&ctx);
         app.poll_collection_history_transition(&ctx);
         app.poll_zip_enumerate();
         app.poll_pdf_enumerate();
@@ -24,6 +25,7 @@ fn session1328_settle(app: &mut App) {
             && app.zip_enumerate_pending.is_none()
             && app.pdf_enumerate_pending.is_none()
             && !app.sidecar_restore_active()
+            && !app.direct_navigation_scan_pending()
         {
             return;
         }
@@ -412,7 +414,7 @@ fn section1328_session_zip_bs_preserves_physical_and_expansion_parent_meaning() 
             std::fs::create_dir_all(root.join("a-first")).unwrap();
             let zip = root.join("book.zip");
             write_1328_zip(&zip);
-            app.load_folder(root.clone());
+            app.load_folder_and_finish_for_test(root.clone());
             session1328_settle(&mut app);
             zip
         };
@@ -456,7 +458,7 @@ fn section1328_session_reading_deep_zip_parent_does_not_return_to_history() {
         std::io::Write::write_all(&mut writer, b"page").unwrap();
     }
     writer.finish().unwrap();
-    app.load_folder(zip.clone());
+    app.load_folder_and_finish_for_test(zip.clone());
     session1328_settle(&mut app);
     app.reading_history_return_from = Some(reading_history_return_for_test(zip.clone()));
     app.zip_nav_enter("A/");
@@ -1021,7 +1023,7 @@ fn section1328_session_subfolder_prepare_uses_destination_sort_and_category_orde
     state.grid_display_order = GridDisplayOrder::default();
     app.favorite_view_states.insert(favorite.id, state);
     app.settings.favorites.push(favorite);
-    app.load_folder(root.clone());
+    app.load_folder_and_finish_for_test(root.clone());
     session1328_settle(&mut app);
     assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
     app.start_subfolder_expansion_scan_roots(root.clone(), vec![root.clone()]);
@@ -1047,7 +1049,7 @@ fn section1328_session_subfolder_prepare_uses_destination_sort_and_category_orde
         }
         app.selected = Some(2);
         app.grid_scroll.set_position(400.0);
-        app.load_folder(root.clone());
+        app.load_folder_and_finish_for_test(root.clone());
         session1328_settle(&mut app);
         assert_eq!(app.settings.sort_order, SortOrder::DateDesc);
         app.dispatch_main_folder_history_input(FolderHistoryDirection::Back);

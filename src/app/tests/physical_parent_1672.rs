@@ -285,7 +285,7 @@ fn section1672_all_inputs_use_the_same_preview_and_exact_jump_selection() {
         let mut app = setup(false);
         configure(&mut app);
         let (source, _) = fixture(&mut app, "folder");
-        app.load_folder(source.clone());
+        app.load_folder_and_finish_for_test(source.clone());
         settle(&mut app);
         let before = state(&app);
         assert_jump(&app, &source);
@@ -319,7 +319,7 @@ fn section1672_history_and_search_books_exit_to_physical_list_without_old_return
                 nested_zip(&source);
             }
             let parent = source.parent().unwrap().to_owned();
-            app.load_folder(parent.clone());
+            app.load_folder_and_finish_for_test(parent.clone());
             settle(&mut app);
             if entrance == "history" {
                 add_history(&app, &source, history_kind);
@@ -415,12 +415,12 @@ fn section1672_history_descendant_jump_does_not_resurrect_expired_return() {
     let mut app = setup(false);
     configure(&mut app);
     let (source, history_kind) = fixture(&mut app, "folder");
-    app.load_folder(source.parent().unwrap().to_owned());
+    app.load_folder_and_finish_for_test(source.parent().unwrap().to_owned());
     settle(&mut app);
     add_history(&app, &source, history_kind);
     enter(&mut app, Entrance::Menu);
     open_container_path(&mut app, &source);
-    app.load_folder(source.join("child"));
+    app.load_folder_and_finish_for_test(source.join("child"));
     settle(&mut app);
     assert!(app.reading_history_return_from.is_none());
     app.handle_grid_physical_parent_action();

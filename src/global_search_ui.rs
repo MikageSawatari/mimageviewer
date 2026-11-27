@@ -5369,7 +5369,10 @@ pub(crate) mod tests {
                 .unwrap();
             let opened = match app.accept_grid_container_open(&egui::Context::default(), index) {
                 Some(crate::ui_main::AddressBarNav::Direct(open, _)) => open,
-                Some(crate::ui_main::AddressBarNav::GridVirtual(intent)) => intent.path,
+                Some(
+                    crate::ui_main::AddressBarNav::GridVirtual(intent)
+                    | crate::ui_main::AddressBarNav::GridFolder(intent),
+                ) => intent.path,
                 other => panic!("unexpected open route: {other:?}"),
             };
             assert_eq!(opened, *path);
@@ -5626,7 +5629,7 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 app.accept_grid_container_open(&egui::Context::default(), 0),
-                Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == branch
+                Some(crate::ui_main::AddressBarNav::GridFolder(intent)) if intent.path == branch
             ),
             "retained rows remain physically openable after the search ends"
         );
@@ -5719,7 +5722,7 @@ pub(crate) mod tests {
         for path in &paths {
             image::RgbImage::new(2, 3).save(path).unwrap();
         }
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.settle_open_path_classification_for_test();
         app.finish_page_identity_preparation_for_test();
         let physical = app.grid_scroll.session();
@@ -5875,7 +5878,7 @@ pub(crate) mod tests {
                 section690_streamed_rows_without_applied_conditions(&mut app, &ctx, &path);
             app.drill_into_container(folder.clone(), false);
             app.advance_drilled_current_path(&folder);
-            app.load_folder(folder);
+            app.load_folder_and_finish_for_test(folder);
             app.settle_open_path_classification_for_test();
             app.finish_page_identity_preparation_for_test();
             assert!(!app.items_are_global_search_view);
@@ -6264,7 +6267,7 @@ pub(crate) mod tests {
                     ),
                 )
                 .unwrap();
-            app.load_folder(book.clone());
+            app.load_folder_and_finish_for_test(book.clone());
             app.settle_open_path_classification_for_test();
             app.finish_page_identity_preparation_for_test();
             assert_eq!(

@@ -2536,7 +2536,7 @@ mod tests {
             image::RgbImage::new(1, 1)
                 .save(folder.join("b_1.jpg"))
                 .unwrap();
-            app.load_folder(folder.clone());
+            app.load_folder_and_finish_for_test(folder.clone());
             app.finish_page_identity_preparation_for_test();
             app.stack_mode_requested = true;
             app.spawn_stack_script_worker(
@@ -2613,10 +2613,10 @@ mod tests {
         StackGroupReady,
         std::sync::mpsc::Sender<Result<Option<StackGroupReady>, String>>,
     ) {
-        app.load_folder_with_scan(folder.clone(), None);
+        app.load_folder_and_finish_for_test(folder.clone());
         finish_list_hydration_for_test(app, ctx);
         app.stack_mode_requested = true;
-        app.load_folder_with_scan(folder, None);
+        app.load_folder_and_finish_for_test(folder);
         finish_list_hydration_for_test(app, ctx);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !matches!(
@@ -2897,7 +2897,7 @@ mod tests {
         app.settings.default_spread_mode = crate::settings::SpreadMode::RtlCover;
         app.settings.default_reading_flow = crate::settings::ReadingFlow::Vertical;
         app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
-        app.load_folder(folder.clone());
+        app.load_folder_and_finish_for_test(folder.clone());
         app.settle_open_path_classification_for_test();
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.reading_flow, crate::settings::ReadingFlow::Vertical);
@@ -3017,6 +3017,8 @@ mod tests {
         app.stack_reconcile_after_fullscreen_close(&ctx);
         app.exit_subfolder_expansion_view();
         app.settle_open_path_classification_for_test();
+        // §1.853 D3: the original Book returns only when its directory scan is adopted.
+        app.finish_direct_navigation_scan_for_test();
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.current_folder.as_deref(), Some(folder.as_path()));
         assert!(app.extracted_result_surface().is_none());
@@ -3139,10 +3141,10 @@ mod tests {
                     .unwrap();
             }
             app.settings.sort_order = initial;
-            app.load_folder_with_scan(folder.clone(), None);
+            app.load_folder_and_finish_for_test(folder.clone());
             finish_list_hydration_for_test(&mut app, &ctx);
             app.stack_mode_requested = true;
-            app.load_folder_with_scan(folder, None);
+            app.load_folder_and_finish_for_test(folder);
             finish_list_hydration_for_test(&mut app, &ctx);
             let Some(StackPreparePending::Extracting(pending)) = app.stack_script_pending.as_ref()
             else {
@@ -3212,7 +3214,7 @@ mod tests {
                 .set_user_rating(&crate::adjustment_db::normalize_path(&path), stars, None)
                 .unwrap();
         }
-        app.load_folder_with_scan(folder.clone(), None);
+        app.load_folder_and_finish_for_test(folder.clone());
         finish_list_hydration_for_test(&mut app, &ctx);
         app.stack_mode_requested = true;
         let spec = crate::rating_sort::RatingSortSpec {
@@ -3220,7 +3222,7 @@ mod tests {
             unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
         };
         crate::rating_sort::with_test_rating_order(spec, || {
-            app.load_folder_with_scan(folder.clone(), None)
+            app.load_folder_and_finish_for_test(folder.clone())
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while (app.stack_view.is_none() || app.sidecar_restore_active())
@@ -3312,7 +3314,7 @@ mod tests {
         );
 
         crate::rating_sort::with_test_rating_order(spec, || {
-            app.load_folder_with_scan(folder, None)
+            app.load_folder_and_finish_for_test(folder)
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while (app.stack_view.is_none() || app.sidecar_restore_active())
@@ -3347,7 +3349,7 @@ mod tests {
         for name in ["a_1.jpg", "a_2.jpg", "b_1.jpg", "b_2.jpg"] {
             std::fs::write(folder.join(name), b"image").unwrap();
         }
-        app.load_folder_with_scan(folder.clone(), None);
+        app.load_folder_and_finish_for_test(folder.clone());
         finish_list_hydration_for_test(&mut app, &ctx);
         let db_path = app.tmp.path().join("stack-failed-rating.db");
         app.rating_db = Some(crate::rating_db::RatingDb::open_at(&db_path).unwrap());
@@ -3361,7 +3363,7 @@ mod tests {
             unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
         };
         crate::rating_sort::with_test_rating_order(spec, || {
-            app.load_folder_with_scan(folder, None)
+            app.load_folder_and_finish_for_test(folder)
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while (app.stack_view.is_none() || app.sidecar_restore_active())
@@ -3403,7 +3405,7 @@ mod tests {
             std::fs::write(folder.join(name), b"image").unwrap();
         }
         app.settings.sort_order = SortOrder::FileNameDesc;
-        app.load_folder_with_scan(folder.clone(), None);
+        app.load_folder_and_finish_for_test(folder.clone());
         finish_list_hydration_for_test(&mut app, &ctx);
         let db_path = app.tmp.path().join("rating-stack-name-fallback.db");
         app.rating_db = Some(crate::rating_db::RatingDb::open_at(&db_path).unwrap());
@@ -3417,7 +3419,7 @@ mod tests {
             unrated_position: crate::rating_sort::RatingSortUnratedPosition::BelowAll,
         };
         crate::rating_sort::with_test_rating_order(spec, || {
-            app.load_folder_with_scan(folder, None)
+            app.load_folder_and_finish_for_test(folder)
         });
         finish_list_hydration_for_test(&mut app, &ctx);
         let names = |items: &[GridItem]| {

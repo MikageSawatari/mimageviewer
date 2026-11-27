@@ -42,7 +42,7 @@ fn round_trip(book: Book, parent_stars: u8, filter: [bool; 6], suppressed: bool)
     let unrated = root.join("unrated.png");
     image::RgbImage::new(2, 2).save(&unrated).unwrap();
     app.settings.rating_filter = filter;
-    app.load_folder(root.clone());
+    app.load_folder_and_finish_for_test(root.clone());
     settle(&mut app, &ctx, None);
     if !suppressed {
         // The badge (or editing the filter in this list) explicitly restores it.
@@ -165,14 +165,14 @@ fn unrated_child_parent_action_and_same_folder_reload_keep_explicit_filter() {
     rate(&app, &root, 4);
     rate(&app, &rated, 4);
     app.settings.rating_filter = FOUR;
-    app.load_folder(root.clone());
+    app.load_folder_and_finish_for_test(root.clone());
     settle(&mut app, &ctx, None);
     assert!(app.restore_rating_filter_suppression());
     app.rebuild_visible_indices();
     let before = visible(&app);
     assert_eq!(before, vec![GridItem::Image(rated)]);
 
-    app.load_folder(child.clone());
+    app.load_folder_and_finish_for_test(child.clone());
     settle(&mut app, &ctx, None);
     assert_eq!(app.effective_folder(), Some(child));
     assert!(app.rating_filter_suppressed_at.is_none());
@@ -185,7 +185,7 @@ fn unrated_child_parent_action_and_same_folder_reload_keep_explicit_filter() {
     assert_eq!(app.effective_rating_filter(), FOUR);
     assert_eq!(visible(&app), before);
 
-    app.load_folder(root);
+    app.load_folder_and_finish_for_test(root);
     settle(&mut app, &ctx, None);
     assert!(app.rating_filter_suppressed_at.is_none());
     assert_eq!(app.effective_rating_filter(), FOUR);
@@ -207,13 +207,13 @@ fn same_starred_folder_reload_does_not_suppress_after_badge_restore() {
     }
     rate(&app, &root, 4);
     app.settings.rating_filter = FOUR;
-    app.load_folder(root.clone());
+    app.load_folder_and_finish_for_test(root.clone());
     settle(&mut app, &ctx, None);
     assert!(app.restore_rating_filter_suppression());
     app.rebuild_visible_indices();
     let before = visible(&app);
     assert_eq!(before, vec![GridItem::Image(root.join("rated.png"))]);
-    app.load_folder(root);
+    app.load_folder_and_finish_for_test(root);
     settle(&mut app, &ctx, None);
     assert!(app.rating_filter_suppressed_at.is_none());
     assert_eq!(app.effective_rating_filter(), FOUR);
@@ -244,7 +244,7 @@ fn new_descendant_sibling_unrelated_and_startup_entries_still_suppress() {
     // Ctrl+Down/PageDown's adopted sibling and load_folder's descendant share
     // this boundary; clear the prior badge to test each new entry independently.
     for path in [first, sibling, descendant, unrelated] {
-        app.load_folder(path.clone());
+        app.load_folder_and_finish_for_test(path.clone());
         settle(&mut app, &ctx, None);
         assert_eq!(
             app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
@@ -272,7 +272,7 @@ fn synthetic_search_and_smart_origins_allow_new_physical_entry() {
     ] {
         assert!(!path_in_subtree_ci(&origin, &root));
         app.current_folder = Some(origin);
-        app.load_folder(root.clone());
+        app.load_folder_and_finish_for_test(root.clone());
         settle(&mut app, &ctx, None);
         assert_eq!(
             app.rating_filter_suppressed_at.as_ref().map(|(p, _)| p),
@@ -340,7 +340,7 @@ fn zip_book_reload(book: Book, outer_starred: bool, layout: ReloadLayout) {
     let anchor = source.join("A");
     rate(&app, &anchor, 4);
     app.settings.rating_filter = FOUR;
-    app.load_folder(root);
+    app.load_folder_and_finish_for_test(root);
     let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
         source.clone(),
         false,

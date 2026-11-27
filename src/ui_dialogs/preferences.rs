@@ -6976,7 +6976,7 @@ mod tests {
         std::fs::create_dir_all(folder.join("写真")).unwrap();
         app.settings.auto_fullscreen_image_folders = false;
         app.settings.ui_theme = crate::settings::UiTheme::Light;
-        app.load_folder_with_scan(folder, None);
+        app.load_folder_and_finish_for_test(folder);
         app.finish_page_identity_preparation_for_test();
         app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
         app.settings.grid_cols = 4;
@@ -12117,7 +12117,7 @@ mod tests {
             }),
         );
         app.settings = reloaded;
-        app.load_folder_with_scan(folder, None);
+        app.load_folder_and_finish_for_test(folder);
         assert_eq!(
             app.items
                 .iter()
@@ -12647,7 +12647,9 @@ mod tests {
         let next_book = harness.state().tmp.path().join("next-book");
         std::fs::create_dir_all(next_book.join("A")).unwrap();
         std::fs::create_dir_all(next_book.join("Page 3")).unwrap();
-        harness.state_mut().load_folder(next_book);
+        harness
+            .state_mut()
+            .load_folder_and_finish_for_test(next_book);
         let same_name = harness
             .state()
             .items

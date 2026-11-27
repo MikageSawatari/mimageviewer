@@ -856,6 +856,8 @@ pub(crate) enum AddressBarNav {
     RecentFolder(PathBuf),
     ZipListReturn(crate::app::ZipListReturnRequest),
     Direct(PathBuf, crate::app::StartupListIntent),
+    /// A grid folder activation carries its admission effects until visible adoption.
+    GridFolder(crate::app::GridVirtualOpenIntent),
     GridVirtual(crate::app::GridVirtualOpenIntent),
     RatingSource {
         path: PathBuf,
@@ -8682,7 +8684,7 @@ mod fixed_sort_control_tests {
                 } else {
                     ToolbarSectionDisplay::Buttons
                 };
-                app.load_folder_with_scan(folder, None);
+                app.load_folder_and_finish_for_test(folder);
                 // Production sanitizes pointer input during hydration; this harness must settle it first.
                 app.finish_page_identity_preparation_for_test();
                 assert!(app.grid_sort_lock_reason().is_none());
@@ -17475,7 +17477,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     | Some(AddressBarNav::CollectionSource { path: p, .. }) => {
                                         format!("親フォルダへ [BS]\n{}", p.to_string_lossy())
                                     }
-                                    Some(AddressBarNav::GridVirtual(intent)) => {
+                                    Some(AddressBarNav::GridFolder(intent))
+                                    | Some(AddressBarNav::GridVirtual(intent)) => {
                                         format!(
                                             "親フォルダへ [BS]\n{}",
                                             intent.path.to_string_lossy()
@@ -35437,6 +35440,7 @@ mod grid_reclick_open_tests {
                         OpenRequestOwner::Navigation,
                         StartupListIntent::ExplicitList,
                     ));
+                    app.finish_direct_navigation_scan_before_hydration_for_test();
                     app.finish_page_identity_preparation_for_test();
                     if !stacked {
                         app.move_grid_cursor(Some(3), crate::app::GridCursorIntent::Automatic);
@@ -36794,7 +36798,7 @@ mod section207_tests {
             only_folder_and_tree(&mut env);
             let folder = env.tmp.path().join("physical-parent-button");
             std::fs::create_dir_all(&folder).unwrap();
-            env.load_folder_with_scan(folder, None);
+            env.load_folder_and_finish_for_test(folder);
             let app = Rc::new(RefCell::new(env));
             let render = Rc::clone(&app);
             let settings_menu = Rc::new(Cell::new(false));
@@ -37667,7 +37671,7 @@ mod section207_tests {
                         let folder = app.tmp.path().join("snapshot-label");
                         std::fs::create_dir_all(&folder).unwrap();
                         std::fs::write(folder.join("image.jpg"), b"fixture").unwrap();
-                        app.load_folder_with_scan(folder, None);
+                        app.load_folder_and_finish_for_test(folder);
                         app.finish_page_identity_preparation_for_test();
                         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
                         app.finish_page_identity_preparation_for_test();
@@ -37782,7 +37786,7 @@ mod section207_tests {
                 let folder = env.tmp.path().join("reported-controls");
                 std::fs::create_dir_all(&folder).unwrap();
                 std::fs::write(folder.join("image.jpg"), b"fixture").unwrap();
-                env.load_folder_with_scan(folder.clone(), None);
+                env.load_folder_and_finish_for_test(folder.clone());
                 let item = env.items[0].clone();
                 env.items.resize(674, item);
                 env.visible_indices = (0..674).collect();
@@ -37968,7 +37972,7 @@ mod section207_tests {
                                 std::fs::write(folder.join(name), b"fixture").unwrap();
                             }
                             env.settings.skip_duplicate_images = true;
-                            env.load_folder_with_scan(folder, None);
+                            env.load_folder_and_finish_for_test(folder);
                             env.selected = Some(0);
                             // Representative state for the existing cached status badge.
                             env.current_folder_rating_cache = Some(5);
@@ -38040,7 +38044,12 @@ mod section207_tests {
                 std::fs::write(target.join(name), []).unwrap();
                 std::fs::write(source.join(name), []).unwrap();
             }
-            env.load_folder_with_scan(source.clone(), None);
+            // This fixture inspects hydration before it completes; keep its scan prepared
+            // rather than using the shared helper that also finishes page identities.
+            let scan =
+                crate::app::folder_scan::scan_directory_with_settings(&source, &env.settings)
+                    .unwrap();
+            env.load_folder_with_scan(source.clone(), Some(scan));
             assert_eq!(
                 env.modal_dialog_block_reason(),
                 Some("sidecar_restore"),
@@ -38114,7 +38123,7 @@ mod section207_tests {
         for path in [&source, &middle, &oldest] {
             std::fs::create_dir_all(path).unwrap();
         }
-        env.load_folder(source.clone());
+        env.load_folder_and_finish_for_test(source.clone());
         env.folder_nav_back_stack = vec![
             FolderNavHistoryTarget::Path(oldest.clone()).into(),
             FolderNavHistoryTarget::Path(middle.clone()).into(),
@@ -38243,7 +38252,7 @@ mod section207_tests {
                 target
             });
             env.active_quick_folder_slot = None;
-            env.load_folder(source);
+            env.load_folder_and_finish_for_test(source);
             env.recent_folders = targets.to_vec();
             let app = Rc::new(RefCell::new(env));
             let render = Rc::clone(&app);
@@ -38833,7 +38842,7 @@ mod section292_tests {
         for name in ["a.jpg", "b.jpg"] {
             std::fs::write(folder.join(name), b"image").unwrap();
         }
-        app.load_folder_with_scan(folder, None);
+        app.load_folder_and_finish_for_test(folder);
         // Production sanitizes pointer input during hydration; this harness must settle it first.
         app.finish_page_identity_preparation_for_test();
         app.settings.show_toolbar_sort = true;
@@ -38967,7 +38976,7 @@ mod section292_tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, b"image").unwrap();
         }
-        app.load_folder_with_scan(root.join("a"), None);
+        app.load_folder_and_finish_for_test(root.join("a"));
         app.finish_page_identity_preparation_for_test();
         app.settings.show_toolbar_sort = false;
         app.settings.show_facet_sort = true;
