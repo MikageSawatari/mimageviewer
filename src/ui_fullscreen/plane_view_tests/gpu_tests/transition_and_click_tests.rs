@@ -37,7 +37,7 @@ fn plane_key_noop_and_rejection_preserve_pending_initial_placement_and_pan() {
                         slice: crate::page_split::PageSlice::Left,
                         ..app.plane_view_anchor(0)
                     },
-                    strength: 0.125,
+                    strength: 0.25,
                     lens_center: egui::Vec2::splat(0.5),
                 });
                 if let Some(pose) = old_pose {
@@ -168,6 +168,17 @@ fn plane_same_pass_entry_exit_clicks_turn_close_or_reset_from_the_predicted_view
                 }
                 app.fs_focus_regained_at = None;
                 let pos = viewer.size.to_pos2() * 0.5;
+                let expected = plane_view_wheel_transition(wheel_input_for_current_view(
+                    &mut app,
+                    &viewer.ctx,
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size),
+                    Some(pos),
+                    if leaving { -1. } else { 1. },
+                ));
+                assert!(
+                    expected.zoom > 1.,
+                    "cover enlargement remains after leaving"
+                );
                 let mut events = vec![wheel(
                     0.,
                     if leaving { -40. } else { 40. },
@@ -175,17 +186,9 @@ fn plane_same_pass_entry_exit_clicks_turn_close_or_reset_from_the_predicted_view
                 )];
                 events.extend(click(pos, double));
                 viewer.frame(&mut app, events);
-                let closed = leaving && double && mode == DoubleClickClose;
-                let turned = leaving && mode == PageTurn;
                 assert_eq!(
                     app.fullscreen_idx,
-                    if closed {
-                        None
-                    } else if turned {
-                        Some(1)
-                    } else {
-                        Some(0)
-                    },
+                    Some(0),
                     "{mode:?} leaving={leaving} double={double}"
                 );
                 let remains = !leaving && !double;
@@ -194,17 +197,36 @@ fn plane_same_pass_entry_exit_clicks_turn_close_or_reset_from_the_predicted_view
                     remains,
                     "{mode:?} leaving={leaving} double={double}"
                 );
-                if remains {
-                    assert_eq!(app.plane_view_pose().unwrap().strength, 0.125);
-                    assert!((app.fs_zoom - 1.1).abs() < 1.0e-5);
-                } else if !closed && !turned {
+                if !double {
+                    assert_eq!(app.plane_view_pose(), expected.pose);
+                    assert!((app.fs_zoom - expected.zoom).abs() < 1.0e-5);
+                    assert!((app.fs_pan - expected.pan).length() < 0.01);
+                    if remains {
+                        assert_eq!(app.plane_view_pose().unwrap().strength, 0.25);
+                    }
+                } else {
                     assert!(
                         (app.fs_zoom - 1.).abs() < 1.0e-5,
-                        "double click resets the entering projection"
+                        "double click resets either the projection or the retained ordinary zoom"
                     );
                     assert_eq!(app.fs_pan, egui::Vec2::ZERO);
                     assert_eq!(app.fs_free_rotation, 0.);
                 }
+                // At the resulting fit view, a later real click still follows the chosen mode.
+                if !double {
+                    app.frame_counter += 60;
+                    viewer.frame(&mut app, click(pos, true));
+                    assert_eq!(app.fullscreen_idx, Some(0));
+                    assert!((app.fs_zoom - 1.).abs() < 1.0e-5);
+                    assert!(!app.fs_exclusive_view.is_plane_view());
+                }
+                app.frame_counter += 60;
+                app.fs_focus_regained_at = None;
+                viewer.frame(&mut app, click(pos, mode == DoubleClickClose));
+                assert_eq!(
+                    app.fullscreen_idx,
+                    if mode == PageTurn { Some(1) } else { None }
+                );
             }
         }
     }

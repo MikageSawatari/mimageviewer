@@ -991,6 +991,42 @@ UI PNGは `plane_view_lens_settings_light`、`plane_view_lens_settings_dark`、`
 
 ビルド・test・check・clippy・アプリ起動・コミットは行っていない。δ の一律の上限と、改訂1全体の試験は未確認。補助算術に許可一覧外の Python 実行があったため、以後の検証実行は停止した。
 
+### 改訂 1 の実装記録 (範囲を限定した設計での続き)
+
+着手時 `96d8817cf`。上の停止記録は経緯として残す。作業用パッチから再開し、§16.2〜§16.6 の実装・試験・文書を接続した。作業用パッチは最終差分に含めず削除する。
+
+**保証範囲の扱い**: 表示の縦横比32以下、遷移後の連続配置の座標の絶対値2²¹物理画素以下は、まだ候補である。δ は4物理画素のまま。**範囲はテストで確定する**。実装担当は候補の成否を未実行の算術で確定したとは扱わない。範囲外にも同じ覆う式を使い、誤差の上限を求める式・範囲ごとの別処理・保証用の新しい状態は追加していない。
+
+根拠を確認する `plane_view::precision_tests` は、実際の `resolve_fs_image_transform` を Proportional/Texels の両方で通す。矩形の両軸から倍率を再計算して平均する順序、その値とpppから物理サイズを作る順序を実出力と照合する。その後、trim・部分素材・保存回転・自由回転・screenと同じ物理座標化を含む Q の各辺を、その法線へ投影して総誤差4以下を検査する。理想実数の丸めだけの上限や、元の要求倍率を代わりに使った検査ではない。候補の端、PDF/RAWのSourceLayout、過去の範囲外反例を試験へ含めた。候補が失敗した場合は、設計担当の結果を受けて範囲を狭め、ここへ確定値を記録する。
+
+実装した経路:
+
+- 有効 Q は実際の transform の source/screen 写像を使い、表示した paint の範囲と coverage、material source (coverage と sampler_roi) の交差から作る。`plane_fill_coefficient` は4隅×4辺と80度上限から決め、画面の uniform 生成だけが計算する。`perf::event` の `plane_view/fill_coefficient` で区間を記録し、キャッシュは持たない。alpha_max/coefficient を削除し、CPU参照cameraも k を受け取る。出力は凍結した snapshot の k を使う。
+- `FullscreenPageLayout` に表示単位の `PlaneCoverRecord` を付けた。PlaneView の記録は、実際に描いた素材の old_input/old_layout と description を採用する。通常の単ページは採用した paint payload から記録し、別の holdover geometry へ束縛されたものを新しい現在素材として記録しない。begin/clear と表示単位の anchor の照合で寿命を揃える。viewer context の新しい退避項目は増やさない。
+- producer は受理済み素材だけを前の記録から取り、canvas/ppp/回転/trim/fit/左右配置とgapは今のpassから組み立てる。キーも同じproducerを使う。予測の前に確定した PlaneCoverInput を proposal に持たせ、遅延適用とsegment再分割でもその値を使う。記録の無い入力は量を捨て、通知もしない。
+- 連続の resolver の Q で canvas⁺ を覆う位置・倍率に揃え、source点を固定した通常ズームを行う。strength は1/4、離れる量は max(notches, −4×strength)。最後の最小重なり補正も同じ連続配置で一度だけ行い、魚眼の予測・実適用の layout 再clampを削除した。ほかの入力のclamp、PDF需要の分離、入口・終了・ドラッグ・detached・出力配送は維持する。
+
+**設計との差分**: 新たな仕様上の差分はない。保証範囲の数値は設計が許す候補のままで、未確定である。受理済みの素材情報は既存の表示単位の記録に同居させ、独立した viewer 状態やキャッシュにはしなかった。
+
+変更したファイル:
+
+- `src/plane_view.rs`、`src/plane_view/revision_tests.rs`、`src/plane_view/precision_tests.rs`
+- `src/plane_view_wgpu.rs`、`src/plane_view_wgpu/gpu_tests.rs`
+- `src/app/plane_view.rs`、`src/displayed_image_transform.rs`、`src/ui_fullscreen.rs`
+- `src/ui_fullscreen/plane_view_tests.rs`、同 `gpu_tests/transition_and_click_tests.rs`、同 `gpu_tests/revision_input_tests.rs`
+- `docs/display-pipeline.md`、`docs/spec.md`、`htdocs/mimageviewer/manual/fullscreen.html`、本書§11・§13
+
+試験は§16.5の全画素/細分境界参照/最大性、3レンズ・中心・aspect・回転・trim・部分素材の組合せ、R7〜R9の数値例、SourceLayout、分割と合算、resize、最大倍率と欠落記録を追加した。GPU試験は既存 `gpu_tests::` 内に置き、snapshot k の出力不変、覆う/覆わない範囲外の実画素を区別する。入力の回帰には予測・即時適用・layoutと素材が変わった後の遅延適用の同一結果、現在のDPI/表示条件、未描画frameのキー/ホイール破棄、PDFの前素材の記録を含む。旧1/8刻み、固定alphaと半径0.8Rの試験は置き換えた。
+
+設計担当の共有実行口へ引き継ぐ:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/plane_view::/) | test(/plane_view_wgpu::/) | test(/plane_view_tests::/)'
+cargo nextest run -p mimageviewer --lib -E 'test(/depth_/) | test(/displayed_image_transform::/) | test(/ui_fullscreen::in_page_scroll::/) | test(/ui_fullscreen::initial_placement::/) | test(/wheel_frame_tests::/) | test(/double_click_close_tests::/)'
+```
+
+新しい統合試験ファイルやUI PNGの更新は不要。今回の `cargo fmt` は正常終了、`python scripts/check_ui_glyphs.py` は危険な字形なし、`python scripts/check_site_cards.py` は54カード・超過0。ビルド・test・check・clippy・アプリ起動・コミット、算術用スクリプトは実装担当では実行していない。保証範囲の確定、Rustのコンパイルと試験、GPUの画素結果・性能・実機での見た目は未確認。
+
 ## 12. 文書
 
 - [display-pipeline.md](display-pipeline.md): PlaneView の節 (§5 の要約と §6 の出口)。
@@ -1003,7 +1039,8 @@ UI PNGは `plane_view_lens_settings_light`、`plane_view_lens_settings_dark`、`
 
 ## 13. CHANGELOG の下書き
 
-- 魚眼ズームを追加しました。1ページの静止画で Ctrl+Shift+ホイールを回すと、拡大しながら魚眼レンズのような歪みを加えられます。下へ回すと戻ります。
+- 余白の出ない魚眼ズームを追加しました。1ページの静止画で Ctrl+Shift+ホイールを回すと、画像が画面を覆うまで寄り、余白を作らない範囲で歪みを加えます。画像の端を画面に入れると歪みが消えます。極端に細長い画像や大きな拡大・移動では、通常表示と同じ余白が残ることがあります。
+- 下へ回すと歪みと倍率が戻ります。覆うために増えた倍率を最初のフィットへ戻すには、ダブルクリックかフィットの切り替えを使います。
 - 魚眼中は Shift+左ドラッグでレンズの中心を動かせます。通常のズーム・パン・自由回転と組み合わせて使えます。レンズの種類は環境設定で選べます。
 - 魚眼の見た目をキャプチャ保存・画像のコピー・エクスポートで出力できます。「魚眼で寄る」「魚眼で離れる」には操作カスタマイズでキーを割り当てられます。
 

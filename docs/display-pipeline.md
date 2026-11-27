@@ -2,11 +2,29 @@
 
 ## 魚眼の表示レイヤー (PlaneView)
 
-正本: [魚眼と板の傾け設計](fisheye-plane-view-plan.md) §3〜§6。段1は単ページの静止画を対象とし、
+正本: [魚眼と板の傾け設計](fisheye-plane-view-plan.md) §3〜§6・§16。段1は単ページの静止画を対象とし、
 `FsExclusiveView::PlaneView` が context ごとの強さ・レンズ中心・素材・直近の描画 snapshot を所有する。
 2D の selector、zoom / pan / 回転 / trim / fit と `commit_fs_single_page_placement` を共用する。
 resampler の準備より前に採用を決め、元の TextureHandle から `gpu_color_copy` (Depth と共用) で mip を作る。
 PlaneView は拡大方式の resampler を通らず、最終の補正・AI・元画像ホールドの選択をそのまま描く。
+
+魚眼の係数は `k = strength × k_fill`。`k_fill` は、その pass に描く素材の paint 四角形と
+`coverage ∩ material_source` の交わりから作る有効四角形 `Q` により、canvas 全体で余白を出さない最大値を求める。
+canvas の4隅と `Q` の4辺の16条件と、最遠点の入射角80°の上限を使い、画面寸法に比例する標本走査は行わない。
+画像の端を画面に入れたときは `k_fill = 0` となるが、PlaneView の占有と終了条件は変えない。
+
+寄る操作は、まず連続配置の `Q` が余裕を加えた canvas を覆う倍率・pan に揃え、
+その後にレンズ中心の下の source 点を固定して通常の拡大を行う。1ノッチの strength は1/4。
+連続配置と描画の量子化配置は、単ページ描画と同じ SourceLayout・sampler contain の resolver を使う。
+素材の情報は実際に描いた素材の記録から、canvas・DPI・回転・trim・fit・配置は現在の pass から取り、
+予測前に確定した `PlaneCoverInput` を即時適用と描画後の遅延適用で共用する。
+最小の重なりの pan 制約も同じ入力による純粋な遷移の中で決め、layout による再クランプはしない。
+まだ描画記録のないページでは、その frame の魚眼操作の量を使わない。
+量子化との差への余裕は4物理画素。覆いを保証する範囲の候補は、表示の縦横比32以下・遷移後の連続配置の
+座標の絶対値が2²¹物理画素以下であり、倍率の再計算と平均・trim・自由回転を通る実経路の総誤差の試験で確定する。
+範囲の外でも同じ覆う計算を使い、誤差に応じた余裕の再計算や追加の補正経路は設けない。
+ズーム上限や範囲の外で描画の `Q` が canvas を覆わなければ、`k_fill = 0` の恒等表示となり2Dの余白が残る。
+描画の `Q` が覆う場合は、その `Q` から求めた係数により歪みによる余白を作らない。
 
 `PlaneGpuCopy` は TextureId、`PlaneMaterial` は幾何の記述全体で照合する。登録待ちは所有 viewport の次passを要求し、
 配置枠の各辺が1/64物理画素以内で一致すれば前の不変素材をその素材自身の変換で描く。

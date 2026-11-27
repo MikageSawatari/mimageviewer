@@ -27,22 +27,13 @@ impl PlaneLensKind {
             Self::EquisolidAngle => 2.,
         }
     }
+    #[cfg(test)]
     pub(crate) fn g(self, theta: f32) -> f32 {
         match self {
             Self::Equidistant => theta,
             Self::Stereographic => 2. * (theta * 0.5).tan(),
             Self::EquisolidAngle => 2. * (theta * 0.5).sin(),
         }
-    }
-    pub(crate) fn alpha_max(self) -> f32 {
-        match self {
-            Self::Equidistant => std::f32::consts::FRAC_PI_2 / 0.8,
-            Self::Stereographic => 1.792_110_8,
-            Self::EquisolidAngle => 2.168_202_6,
-        }
-    }
-    pub(crate) fn coefficient(self, strength: f32) -> f32 {
-        self.g(strength * self.alpha_max())
     }
     #[cfg(test)]
     pub(crate) fn theta(self, radius: f32) -> Option<f32> {
@@ -58,6 +49,270 @@ impl PlaneLensKind {
         (theta < std::f32::consts::PI
             || (self == Self::EquisolidAngle && theta == std::f32::consts::PI))
             .then_some(theta)
+    }
+}
+
+/// Effective paint support, using exactly the source/screen maps used by the shader.
+/// The material crop and the displayed trim/slice are both source-space rectangles.
+pub(crate) fn plane_effective_quad(
+    transform: &crate::displayed_image_transform::DisplayedImageTransform,
+    material: crate::plane_view_wgpu::PlaneMaterialDescription,
+) -> Option<[Pos2; 4]> {
+    let source_paint = Rect::from_points(
+        &transform
+            .paint_quad()
+            .positions
+            .map(|p| transform.screen_to_source_normalized(p)),
+    );
+    let material_source = Rect::from_min_max(
+        material.coverage.min + material.coverage.size() * material.sampler_roi.min.to_vec2(),
+        material.coverage.min + material.coverage.size() * material.sampler_roi.max.to_vec2(),
+    );
+    let support = source_paint
+        .intersect(material.coverage)
+        .intersect(material_source);
+    (support.is_finite() && support.is_positive()).then(|| {
+        [
+            support.left_top(),
+            support.right_top(),
+            support.right_bottom(),
+            support.left_bottom(),
+        ]
+        .map(|p| transform.source_normalized_to_screen(p))
+    })
+}
+
+pub(crate) const PLANE_COVER_MARGIN_PHYSICAL: f32 = 4.;
+const PLANE_THETA_CAP: f64 = 80. * std::f64::consts::PI / 180.;
+
+fn lens_g(lens: PlaneLensKind, theta: f64) -> f64 {
+    match lens {
+        PlaneLensKind::Equidistant => theta,
+        PlaneLensKind::Stereographic => 2. * (theta * 0.5).tan(),
+        PlaneLensKind::EquisolidAngle => 2. * (theta * 0.5).sin(),
+    }
+}
+
+/// Largest untilted coefficient allowed by the sixteen corner/edge inequalities and 80° cap.
+/// Canvas, center and quad must all use the same units (screen callers use physical pixels).
+pub(crate) fn plane_fill_coefficient(
+    canvas: Rect,
+    center: Pos2,
+    quad: [Pos2; 4],
+    lens: PlaneLensKind,
+) -> f32 {
+    if !canvas.is_positive()
+        || !canvas.is_finite()
+        || !center.is_finite()
+        || quad.iter().any(|p| !p.is_finite())
+    {
+        return 0.;
+    }
+    let corners = [
+        canvas.left_top(),
+        canvas.right_top(),
+        canvas.right_bottom(),
+        canvas.left_bottom(),
+    ];
+    let radius = 0.5 * f64::from(canvas.size().min_elem());
+    let delta = |p: Pos2| {
+        [
+            f64::from(p.x) - f64::from(center.x),
+            f64::from(p.y) - f64::from(center.y),
+        ]
+    };
+    let far = corners
+        .iter()
+        .map(|p| {
+            let v = delta(*p);
+            v[0].hypot(v[1])
+        })
+        .fold(0., f64::max);
+    if far == 0. {
+        return 0.;
+    }
+    let mut limit = lens_g(lens, PLANE_THETA_CAP) * radius / far;
+    let area: f64 = (0..4)
+        .map(|i| {
+            let a = delta(quad[i]);
+            let b = delta(quad[(i + 1) % 4]);
+            a[0] * b[1] - a[1] * b[0]
+        })
+        .sum();
+    if area == 0. {
+        return 0.;
+    }
+    for j in 0..4 {
+        let a = delta(quad[j]);
+        let b = delta(quad[(j + 1) % 4]);
+        let n = [(b[1] - a[1]) * area.signum(), (a[0] - b[0]) * area.signum()];
+        let distance = n[0] * a[0] + n[1] * a[1];
+        if distance < 0. {
+            return 0.;
+        }
+        for p in corners {
+            let v = delta(p);
+            let rho = v[0].hypot(v[1]);
+            let projection = n[0] * v[0] + n[1] * v[1];
+            if rho == 0. || projection <= 0. {
+                continue;
+            }
+            let m = distance / projection;
+            if m <= 1. {
+                return 0.;
+            }
+            let g_star = match lens {
+                PlaneLensKind::Equidistant => {
+                    let (mut low, mut high) = (0., PLANE_THETA_CAP);
+                    for _ in 0..56 {
+                        let theta = (low + high) * 0.5;
+                        if theta.tan() / theta > m {
+                            high = theta;
+                        } else {
+                            low = theta;
+                        }
+                    }
+                    low
+                }
+                PlaneLensKind::Stereographic => 2. * (1. - 1. / m).max(0.).sqrt(),
+                PlaneLensKind::EquisolidAngle => {
+                    // Rationalized smaller root avoids cancellation for m close to one.
+                    let squared = m * m;
+                    2. * (2. * (squared - 1.) / (4. * squared - 1. + (8. * squared + 1.).sqrt()))
+                        .max(0.)
+                        .sqrt()
+                }
+            };
+            limit = limit.min(g_star * radius / rho);
+        }
+    }
+    // Round toward the safe side, including the f64 -> shader-f32 conversion.
+    (limit as f32) * (1. - f32::EPSILON)
+}
+
+/// Frozen material plus this pass's canonical single-page geometry. Prediction and application
+/// carry this value together; neither consults a subsequently rebuilt page layout.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlaneCoverInput {
+    pub transform: crate::displayed_image_transform::DisplayedImageTransformInput,
+    pub layout_source_size: Option<Vec2>,
+    pub material: crate::plane_view_wgpu::PlaneMaterialDescription,
+}
+
+impl PlaneCoverInput {
+    pub(crate) fn resolve(
+        self,
+        zoom: f32,
+        pan: Vec2,
+        pixel_fit: crate::displayed_image_transform::RectPixelFit,
+    ) -> Option<crate::displayed_image_transform::DisplayedImageTransform> {
+        use crate::displayed_image_transform::ResolvedDisplayPlacement;
+        let placement = match self.transform.placement {
+            ResolvedDisplayPlacement::Normal { .. } => ResolvedDisplayPlacement::Normal {
+                zoom_pan: Some((zoom, pan)),
+            },
+            ResolvedDisplayPlacement::SingletonSpread { side, gap, .. } => {
+                ResolvedDisplayPlacement::SingletonSpread {
+                    side,
+                    gap,
+                    zoom_pan: Some((zoom, pan)),
+                }
+            }
+            ResolvedDisplayPlacement::Z {
+                active,
+                factor,
+                singleton_side,
+                singleton_gap,
+                ..
+            } => ResolvedDisplayPlacement::Z {
+                active,
+                factor,
+                singleton_side,
+                singleton_gap,
+                zoom_pan: Some((zoom, pan)),
+            },
+        };
+        crate::ui_fullscreen::resolve_fs_image_transform(
+            crate::displayed_image_transform::DisplayedImageTransformInput {
+                placement,
+                pixel_fit,
+                ..self.transform
+            },
+            self.layout_source_size,
+        )
+    }
+
+    fn continuous(
+        self,
+        zoom: f32,
+        pan: Vec2,
+    ) -> Option<crate::displayed_image_transform::DisplayedImageTransform> {
+        self.resolve(
+            zoom,
+            pan,
+            crate::displayed_image_transform::RectPixelFit::Proportional,
+        )
+    }
+
+    fn zoom_about_source(self, zoom: f32, pan: Vec2, next_zoom: f32, center: Pos2) -> Option<Vec2> {
+        let source = self
+            .continuous(zoom, pan)?
+            .screen_to_source_normalized(center);
+        let next = self.continuous(next_zoom, pan)?;
+        Some(pan + (center - next.source_normalized_to_screen(source)))
+    }
+
+    fn cover(self, zoom: f32, pan: Vec2, center: Pos2) -> Option<(f32, Vec2)> {
+        let current = self.continuous(zoom, pan)?;
+        let quad = plane_effective_quad(&current, self.material)?;
+        let target = self
+            .transform
+            .viewport_rect
+            .expand(PLANE_COVER_MARGIN_PHYSICAL / self.transform.pixels_per_point);
+        let corners = [
+            target.left_top(),
+            target.right_top(),
+            target.right_bottom(),
+            target.left_bottom(),
+        ];
+        let u = (quad[1] - quad[0]).normalized();
+        let v = (quad[3] - quad[0]).normalized();
+        let project = |axis: Vec2| {
+            corners
+                .iter()
+                .map(|p| (*p - quad[0]).dot(axis))
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), x| {
+                    (lo.min(x), hi.max(x))
+                })
+        };
+        let (left, right) = project(u);
+        let (top, bottom) = project(v);
+        let width = (quad[1] - quad[0]).length();
+        let height = (quad[3] - quad[0]).length();
+        if left >= 0. && top >= 0. && right <= width && bottom <= height {
+            return Some((zoom, pan));
+        }
+        let cover_zoom = zoom * ((right - left) / width).max((bottom - top) / height);
+        let next_zoom = zoom.max(cover_zoom).min(crate::ui_fullscreen::ZOOM_MAX);
+        let mut next_pan = self.zoom_about_source(zoom, pan, next_zoom, center)?;
+        if cover_zoom > crate::ui_fullscreen::ZOOM_MAX {
+            return Some((next_zoom, next_pan));
+        }
+        let next_quad =
+            plane_effective_quad(&self.continuous(next_zoom, next_pan)?, self.material)?;
+        let correction = |axis: Vec2, extent: f32| {
+            let (lo, hi) = corners
+                .iter()
+                .map(|p| (*p - next_quad[0]).dot(axis))
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), x| {
+                    (lo.min(x), hi.max(x))
+                });
+            // Roundoff at the exact cover scale can invert the otherwise nonempty interval.
+            0_f32.max(hi - extent).min(lo.max(hi - extent))
+        };
+        next_pan += u * correction(u, (next_quad[1] - next_quad[0]).length())
+            + v * correction(v, (next_quad[3] - next_quad[0]).length());
+        Some((next_zoom, next_pan))
     }
 }
 
@@ -229,6 +484,7 @@ pub(crate) struct PlaneViewWheelInput {
     pub notches: f32,
     pub allowed: Result<(), PlaneViewEntryBlock>,
     pub step: crate::settings::FullscreenWheelZoomStep,
+    pub cover: Option<PlaneCoverInput>,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PlaneViewWheelOutcome {
@@ -254,6 +510,9 @@ pub(crate) fn plane_view_wheel_transition(input: PlaneViewWheelInput) -> PlaneVi
     if !input.notches.is_finite() || input.notches == 0. || !input.canvas.is_positive() {
         return out;
     }
+    let Some(cover) = input.cover else {
+        return out;
+    };
     if current.is_none() {
         if input.notches < 0. {
             return out;
@@ -274,19 +533,41 @@ pub(crate) fn plane_view_wheel_transition(input: PlaneViewWheelInput) -> PlaneVi
             }),
     });
     let used = if input.notches < 0. {
-        input.notches.max(-8. * pose.strength)
+        input.notches.max(-4. * pose.strength)
     } else {
         input.notches
     };
-    pose.strength = (pose.strength + used / 8.).clamp(0., 1.);
+    pose.strength = (pose.strength + used / 4.).clamp(0., 1.);
+    let center = input.canvas.min + pose.lens_center * input.canvas.size();
+    let Some((zoom, pan)) = (if used > 0. {
+        cover.cover(out.zoom, out.pan, center)
+    } else {
+        Some((out.zoom, out.pan))
+    }) else {
+        return out;
+    };
+    let mut next_zoom = zoom;
+    let mut unused_pan = Vec2::ZERO;
     crate::app::App::apply_wheel_zoom(
-        &mut out.zoom,
-        &mut out.pan,
+        &mut next_zoom,
+        &mut unused_pan,
         used * 40.,
         input.step,
-        Some(input.canvas.min + pose.lens_center * input.canvas.size()),
+        None,
         input.canvas.center(),
     );
+    let Some(mut next_pan) = cover.zoom_about_source(zoom, pan, next_zoom, center) else {
+        return out;
+    };
+    let Some(final_transform) = cover.continuous(next_zoom, next_pan) else {
+        return out;
+    };
+    next_pan += crate::ui_fullscreen::pan_correction_for_minimum_overlap(
+        final_transform.hit_rect,
+        cover.transform.viewport_rect,
+    );
+    out.zoom = next_zoom;
+    out.pan = next_pan;
     out.pose = (pose.strength > 0.).then_some(pose);
     out
 }
@@ -310,7 +591,7 @@ pub(crate) fn camera_point(
     p: Pos2,
     canvas: Rect,
     center: Vec2,
-    strength: f32,
+    k: f32,
     lens: PlaneLensKind,
     tilt: PlaneTilt,
 ) -> Option<Pos2> {
@@ -321,7 +602,6 @@ pub(crate) fn camera_point(
     let c = canvas.min + center * canvas.size();
     let u = (p - c) / r_scale;
     let r = u.length();
-    let k = lens.coefficient(strength);
     if k <= 1.0e-7 {
         return Some(p);
     }
@@ -407,88 +687,22 @@ mod tests {
             notches,
             allowed: Ok(()),
             step: crate::settings::FullscreenWheelZoomStep::Percent10,
+            cover: Some(super::revision_tests::fixture(
+                canvas(),
+                Vec2::new(800., 600.),
+            )),
         })
     }
     fn close(a: f32, b: f32) {
         assert!((a - b).abs() < 1.0e-4, "{a} != {b}");
     }
     #[test]
-    fn plane_lens_limits_center_monotonicity_and_identity_limit() {
-        for (lens, degrees) in PlaneLensKind::ALL
-            .into_iter()
-            .zip([112.5, 102.6804, 124.2289])
-        {
-            close(lens.alpha_max().to_degrees(), degrees);
-            let k = lens.coefficient(1.);
-            close(lens.g(std::f32::consts::FRAC_PI_2) / k, 0.8);
-            let c = canvas().center();
-            assert_eq!(
-                camera_point(
-                    c,
-                    canvas(),
-                    Vec2::splat(0.5),
-                    1.,
-                    lens,
-                    PlaneTilt::default()
-                ),
-                Some(c)
-            );
-            let mut previous = 1.;
-            for i in 1..80 {
-                let r = i as f32 / 100.;
-                let p = c + Vec2::new(r * 300., 0.);
-                let q = camera_point(
-                    p,
-                    canvas(),
-                    Vec2::splat(0.5),
-                    1.,
-                    lens,
-                    PlaneTilt::default(),
-                )
-                .unwrap();
-                let w = (q.x - c.x) / (p.x - c.x);
-                assert!(w >= previous - 1.0e-5);
-                previous = w;
-                let theta = lens.theta(k * r).unwrap();
-                assert!(((q.x - c.x) - 300. / k * theta.tan()).abs() < 0.1);
-                let tiny = camera_point(
-                    p,
-                    canvas(),
-                    Vec2::splat(0.5),
-                    1.0e-5,
-                    lens,
-                    PlaneTilt::default(),
-                )
-                .unwrap();
-                assert!((tiny - p).length() < 0.001);
-            }
-            assert!(
-                camera_point(
-                    c + Vec2::new(240.1, 0.),
-                    canvas(),
-                    Vec2::splat(0.5),
-                    1.,
-                    lens,
-                    PlaneTilt::default()
-                )
-                .is_none()
-            );
-            assert!(lens.theta(f32::INFINITY).is_none());
-        }
-        assert!(
-            PlaneLensKind::Equidistant
-                .theta(std::f32::consts::PI + 0.01)
-                .is_none()
-        );
-        assert!(PlaneLensKind::EquisolidAngle.theta(2.01).is_none());
-    }
-    #[test]
     fn plane_wheel_enters_saturates_and_spends_only_strength_on_exit() {
         let first = step(None, 1., Vec2::ZERO, 1.);
         let pose = first.pose.unwrap();
-        close(pose.strength, 0.125);
+        close(pose.strength, 0.25);
         assert_eq!(pose.lens_center, Vec2::new(0.125, 1. / 6.));
-        let full = step(first.pose, first.zoom, first.pan, 7.);
+        let full = step(first.pose, first.zoom, first.pan, 3.);
         close(full.pose.unwrap().strength, 1.);
         let more = step(full.pose, full.zoom, full.pan, 1.);
         close(more.pose.unwrap().strength, 1.);
@@ -498,7 +712,7 @@ mod tests {
         let split = step(one.pose, one.zoom, one.pan, -1.);
         assert_eq!(joined, split);
         assert!(joined.pose.is_none());
-        close(joined.zoom, 1.);
+        close(joined.zoom, 1. + 8. / 600.);
         assert_eq!(step(None, 1., Vec2::ZERO, -2.).zoom, 1.);
     }
     #[test]
@@ -536,6 +750,10 @@ mod tests {
                 notches: 1.,
                 allowed: Err(block),
                 step: Default::default(),
+                cover: Some(super::revision_tests::fixture(
+                    canvas(),
+                    Vec2::new(800., 600.),
+                )),
             });
             assert_eq!(out.blocked, Some(block));
             assert!(out.pose.is_none());
@@ -554,6 +772,10 @@ mod tests {
             notches: 1.,
             allowed: Ok(()),
             step: Default::default(),
+            cover: Some(super::revision_tests::fixture(
+                canvas(),
+                Vec2::new(800., 600.),
+            )),
         });
         assert_eq!(centered.pose.unwrap().lens_center, Vec2::splat(0.5));
     }
@@ -652,57 +874,9 @@ mod tests {
             close(uv.y, 0.5);
         }
     }
-    #[test]
-    fn plane_camera_rejects_domain_horizon_and_matches_untilted_intersection() {
-        for lens in PlaneLensKind::ALL {
-            let c = canvas().center();
-            let radius = 300.;
-            let k = lens.coefficient(1.);
-            assert!(
-                camera_point(
-                    c + Vec2::new(radius * 0.81, 0.),
-                    canvas(),
-                    Vec2::splat(0.5),
-                    1.,
-                    lens,
-                    PlaneTilt::default()
-                )
-                .is_none()
-            );
-            for r in [0.000001, 0.1, 0.5, 0.7999] {
-                let theta = lens.theta(k * r).unwrap();
-                let q = camera_point(
-                    c + Vec2::new(radius * r, 0.),
-                    canvas(),
-                    Vec2::splat(0.5),
-                    1.,
-                    lens,
-                    PlaneTilt::default(),
-                )
-                .unwrap();
-                assert!(q.is_finite());
-                let expected = radius * theta.tan() / k;
-                assert!((q.x - c.x - expected).abs() < expected.abs() * 0.003 + 0.001);
-            }
-            for strength in [0.001, 0.00001] {
-                let p = c + Vec2::new(100., 50.);
-                let q = camera_point(
-                    p,
-                    canvas(),
-                    Vec2::splat(0.5),
-                    strength,
-                    lens,
-                    PlaneTilt::default(),
-                )
-                .unwrap();
-                assert!((q - p).length() < 0.01);
-            }
-        }
-        assert!(
-            PlaneLensKind::Equidistant
-                .theta(std::f32::consts::PI + 0.001)
-                .is_none()
-        );
-        assert!(PlaneLensKind::EquisolidAngle.theta(2.001).is_none());
-    }
 }
+
+#[cfg(test)]
+mod precision_tests;
+#[cfg(test)]
+mod revision_tests;

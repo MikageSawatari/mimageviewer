@@ -166,12 +166,32 @@ impl PlaneRenderParams {
         };
         let crop = transform.uv_rect;
         let canvas = canvas * ppp;
+        let started = crate::perf::is_enabled().then(std::time::Instant::now);
+        let k_fill = crate::plane_view::plane_effective_quad(transform, material)
+            .map(|quad| {
+                crate::plane_view::plane_fill_coefficient(
+                    canvas,
+                    canvas.min + center * canvas.size(),
+                    quad.map(|p| p * ppp),
+                    lens,
+                )
+            })
+            .unwrap_or(0.);
+        if let Some(started) = started {
+            crate::perf::event(
+                "plane_view",
+                "fill_coefficient",
+                None,
+                0,
+                &[("ms", (started.elapsed().as_secs_f64() * 1000.).into())],
+            );
+        }
         let bg = background.to_array();
         Self {
             values: [
                 [canvas.min.x, canvas.min.y, canvas.width(), canvas.height()],
                 [center.x, center.y, strength, lens.shader_id()],
-                [lens.coefficient(strength), tilt.yaw, tilt.pitch, 0.],
+                [strength * k_fill, tilt.yaw, tilt.pitch, 0.],
                 [paint.min.x, paint.min.y, paint.width(), paint.height()],
                 [frame.x, frame.y, cos, sin],
                 [crop.min.x, crop.min.y, crop.max.x, crop.max.y],

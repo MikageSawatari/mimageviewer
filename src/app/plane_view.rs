@@ -169,6 +169,7 @@ impl App {
         zoom: f32,
         pan: egui::Vec2,
         current: Option<PlaneViewPose>,
+        cover: Option<PlaneCoverInput>,
     ) -> Option<PlaneViewWheelInput> {
         let idx = self.fullscreen_idx?;
         Some(PlaneViewWheelInput {
@@ -181,6 +182,7 @@ impl App {
             notches,
             allowed: self.plane_view_entry_allowed(idx),
             step: self.settings.fullscreen_wheel_zoom_step,
+            cover,
         })
     }
     /// Owner changes retire live projections together; panorama's intent stays on its old path.
@@ -196,6 +198,25 @@ impl App {
             state.last_drawn = None;
         }
     }
+    pub(crate) fn plane_material_description(
+        resource: &crate::gpu_lanczos::FullscreenPaintPayload,
+        source_size: egui::Vec2,
+        texture_size: egui::Vec2,
+    ) -> Option<PlaneMaterialDescription> {
+        Some(PlaneMaterialDescription {
+            source_size: [source_size.x as usize, source_size.y as usize],
+            texture_size,
+            coverage: resource.source_coverage().source_uv_rect()?,
+            sampler_roi: resource
+                .visible_source_uv_rect()
+                .unwrap_or(egui::Rect::from_min_max(
+                    egui::Pos2::ZERO,
+                    egui::pos2(1., 1.),
+                )),
+            display_basis: resource.display_basis(),
+            material_kind: resource.page_material_kind(),
+        })
+    }
     pub(crate) fn select_plane_material(
         &mut self,
         ctx: &egui::Context,
@@ -208,20 +229,7 @@ impl App {
         };
         state.last_drawn = None;
         let texture = resource.source_texture()?;
-        let coverage = resource.source_coverage().source_uv_rect()?;
-        let description = PlaneMaterialDescription {
-            source_size: [source_size.x as usize, source_size.y as usize],
-            texture_size,
-            coverage,
-            sampler_roi: resource
-                .visible_source_uv_rect()
-                .unwrap_or(egui::Rect::from_min_max(
-                    egui::Pos2::ZERO,
-                    egui::pos2(1., 1.),
-                )),
-            display_basis: resource.display_basis(),
-            material_kind: resource.page_material_kind(),
-        };
+        let description = Self::plane_material_description(resource, source_size, texture_size)?;
         let previous = match &state.color {
             PlaneColorPhase::Ready(material) => Some(material.clone()),
             PlaneColorPhase::Pending { previous } => previous.clone(),

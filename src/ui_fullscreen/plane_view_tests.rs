@@ -5,6 +5,7 @@ use crate::plane_view::*;
 
 mod gpu_tests {
     mod additional_coverage;
+    mod revision_input_tests;
     mod transition_and_click_tests;
     use super::*;
     use crate::app::depth_main_window_tests::RootDepthViewer;
@@ -29,15 +30,54 @@ mod gpu_tests {
             source: egui::MouseWheelSource::Unknown,
         }
     }
-    fn enter(app: &mut App, viewer: &mut RootDepthViewer) {
+    fn wheel_input_for_current_view(
+        app: &mut App,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        pointer: Option<egui::Pos2>,
+        notches: f32,
+    ) -> PlaneViewWheelInput {
+        let idx = app.fullscreen_idx.unwrap();
+        let canvas = app.fullscreen_media_rect(rect, idx, false);
+        let cover = app.plane_cover_input_for_canvas(ctx, canvas);
+        assert!(
+            cover.is_some(),
+            "the preceding real paint supplies the accepted material"
+        );
+        app.plane_view_wheel_input(
+            canvas,
+            pointer,
+            notches,
+            app.fs_zoom,
+            app.fs_pan,
+            app.plane_view_pose(),
+            cover,
+        )
+        .unwrap()
+    }
+    fn enter(app: &mut App, viewer: &mut RootDepthViewer) -> PlaneViewWheelOutcome {
+        // Resets and owner changes may have discarded the accepted paint record.
+        viewer.frame(app, vec![]);
+        let pos = viewer.size.to_pos2() * 0.5;
+        let expected = plane_view_wheel_transition(wheel_input_for_current_view(
+            app,
+            &viewer.ctx,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size),
+            Some(pos),
+            1.,
+        ));
         viewer.frame(
             app,
             vec![
-                egui::Event::PointerMoved(viewer.size.to_pos2() * 0.5),
+                egui::Event::PointerMoved(pos),
                 wheel(0., 40., egui::Modifiers::CTRL | egui::Modifiers::SHIFT),
             ],
         );
-        assert_eq!(app.plane_view_pose().unwrap().strength, 0.125);
+        assert_eq!(app.plane_view_pose().unwrap().strength, 0.25);
+        assert_eq!(app.plane_view_pose(), expected.pose);
+        assert!((app.fs_zoom - expected.zoom).abs() < 1.0e-5);
+        assert!((app.fs_pan - expected.pan).length() < 0.01);
+        expected
     }
     #[test]
     fn plane_export_size_choices_snapshot_dark() {
@@ -115,7 +155,7 @@ mod gpu_tests {
                 .plane_view_pose()
                 .expect("key stage ran on the old still page");
             assert_eq!(entered.anchor.fs_idx, 0);
-            assert_eq!(entered.strength, 0.125);
+            assert_eq!(entered.strength, 0.25);
             // Navigation commits at frame tail, after the old page was painted. The
             // next pass must retire its anchor before painting the newly selected video.
             viewer.frame(&mut app, vec![]);
@@ -124,6 +164,28 @@ mod gpu_tests {
             app.fullscreen_idx = Some(0);
             app.fs_zoom = 1.;
             app.fs_pan = egui::Vec2::ZERO;
+            viewer.frame(&mut app, vec![]);
+            let input = wheel_input_for_current_view(
+                &mut app,
+                &viewer.ctx,
+                egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size),
+                None,
+                1.,
+            );
+            let cover = input.cover;
+            let entered = plane_view_wheel_transition(input);
+            let expected = plane_view_wheel_transition(
+                app.plane_view_wheel_input(
+                    cover.unwrap().transform.viewport_rect,
+                    None,
+                    -2.,
+                    entered.zoom,
+                    entered.pan,
+                    entered.pose,
+                    cover,
+                )
+                .unwrap(),
+            );
             let mut events = key(egui::Key::F13);
             let out = wheel(0., -80., egui::Modifiers::CTRL | egui::Modifiers::SHIFT);
             if wheel_first {
@@ -136,7 +198,9 @@ mod gpu_tests {
                 !app.fs_exclusive_view.is_plane_view(),
                 "the key enters first and the downward wheel exits it"
             );
-            assert!((app.fs_zoom - 1.).abs() < 1.0e-5);
+            assert!((app.fs_zoom - expected.zoom).abs() < 1.0e-5);
+            assert!((app.fs_pan - expected.pan).length() < 0.01);
+            assert!(app.fs_zoom > 1., "leaving keeps the cover enlargement");
         }
     }
 
@@ -264,11 +328,23 @@ mod gpu_tests {
         let mods = egui::Modifiers::CTRL | egui::Modifiers::SHIFT;
         viewer.frame(&mut app, vec![wheel(40., 0., mods)]);
         assert!(!app.fs_exclusive_view.is_plane_view());
-        enter(&mut app, &mut viewer);
-        assert!((app.fs_zoom - 1.1).abs() < 1.0e-5);
+        let entered = enter(&mut app, &mut viewer);
+        assert!(
+            entered.zoom > 1.1,
+            "the portrait fixture first covers the wide canvas"
+        );
+        let expected = plane_view_wheel_transition(wheel_input_for_current_view(
+            &mut app,
+            &viewer.ctx,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size),
+            None,
+            -2.,
+        ));
         viewer.frame(&mut app, vec![wheel(0., -80., mods)]);
         assert!(!app.fs_exclusive_view.is_plane_view());
-        assert!((app.fs_zoom - 1.).abs() < 1.0e-5);
+        assert!((app.fs_zoom - expected.zoom).abs() < 1.0e-5);
+        assert!((app.fs_pan - expected.pan).length() < 0.01);
+        assert!(app.fs_zoom > 1.);
     }
     #[test]
     fn plane_real_frame_drops_fisheye_after_wheel_page_request_and_does_not_rebind_click() {
@@ -791,6 +867,34 @@ mod gpu_tests {
         };
         let second = draw(&mut app, &now, egui::vec2(634., 819.));
         assert_eq!(second.transform.source_size, first.transform.source_size);
+        let accepted = app.fullscreen_page_layout.plane_cover.unwrap();
+        assert_eq!(accepted.material, first_material.description);
+        assert_eq!(accepted.input.source_size, first.transform.source_size);
+        assert_eq!(accepted.input.texture_size, first.transform.texture_size);
+        assert_ne!(accepted.input.source_size, egui::vec2(634., 819.));
+        assert_ne!(accepted.input.texture_size, now.full_source_size_vec2());
+        let next_canvas = egui::Rect::from_min_size(egui::pos2(17., 23.), egui::vec2(1300., 800.));
+        let cover = app
+            .plane_cover_input_for_canvas(&viewer.ctx, next_canvas)
+            .unwrap();
+        assert_eq!(cover.material, first_material.description);
+        assert_eq!(cover.transform.source_size, accepted.input.source_size);
+        assert_eq!(cover.transform.texture_size, accepted.input.texture_size);
+        assert_eq!(cover.layout_source_size, accepted.layout_source_size);
+        assert_eq!(cover.transform.viewport_rect, next_canvas);
+        assert_eq!(
+            cover.transform.pixels_per_point,
+            viewer.ctx.pixels_per_point()
+        );
+        assert_eq!(
+            cover.transform.fit_mode,
+            app.fs_basis_fit_input(
+                app.effective_fullscreen_fit_mode(),
+                first_material.description.display_basis,
+                crate::material_display_basis::MaterialDisplayView::Single,
+            )
+            .unwrap()
+        );
         assert!(
             app.fs_initial_placement_request.is_some(),
             "pending current complete must not consume the previous provisional's placement"

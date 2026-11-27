@@ -4156,7 +4156,7 @@ fn pan_translation_bounds_for_overlap(
     )
 }
 
-fn pan_correction_for_minimum_overlap(
+pub(crate) fn pan_correction_for_minimum_overlap(
     image_rect: egui::Rect,
     viewport_rect: egui::Rect,
 ) -> egui::Vec2 {
@@ -9043,7 +9043,7 @@ pub(crate) const MIDDLE_DRAG_THRESHOLD_PX: f32 = 4.0;
 /// ズーム倍率の下限
 const ZOOM_MIN: f32 = 0.1;
 /// ズーム倍率の上限
-const ZOOM_MAX: f32 = 50.0;
+pub(crate) const ZOOM_MAX: f32 = 50.0;
 /// 連結読み: ホイール 1 ノッチ相当として扱う raw scroll delta。
 const CONTINUOUS_READING_WHEEL_REFERENCE_DELTA: f32 = 120.0;
 /// 連結読み: PageUp/PageDown で進む画面長の割合。
@@ -11126,7 +11126,7 @@ fn resolve_fs_image_geometry(
     resolve_fs_geometry_in_layout_rect(input, layout.full_image_rect)
 }
 
-fn resolve_fs_image_transform(
+pub(crate) fn resolve_fs_image_transform(
     input: DisplayedImageTransformInput,
     layout_source_size: Option<egui::Vec2>,
 ) -> Option<DisplayedImageTransform> {
@@ -20400,6 +20400,7 @@ struct FsWheelFrameProposal {
     side_panel_click_chrome: FullscreenSidePanelClickChrome,
     full_rect: egui::Rect,
     default_image_rect: egui::Rect,
+    plane_cover: Option<crate::plane_view::PlaneCoverInput>,
     primary_suppression: FullscreenPrimarySuppressionDecision,
     fs_response: egui::Response,
     is_spread_double: bool,
@@ -37402,6 +37403,7 @@ impl App {
                     false,
                     seek_geometry,
                 );
+                let cover = self.plane_cover_input_for_canvas(ctx, canvas);
                 if let Some(input) = self.plane_view_wheel_input(
                     canvas,
                     None,
@@ -37409,6 +37411,7 @@ impl App {
                     self.fs_zoom,
                     self.fs_pan,
                     self.plane_view_pose(),
+                    cover,
                 ) {
                     let outcome = crate::plane_view::plane_view_wheel_transition(input);
                     self.apply_plane_view_outcome(ctx, outcome);
@@ -42576,8 +42579,14 @@ impl App {
         );
         // Preserve the released wheel-before-click classification without mutating
         // a page which an intermediate navigation has already left.
-        let (click_zoom, click_pan, wheel_navigation_produced, click_plane_active) =
-            self.predict_fs_wheel_frame(ctx, default_image_rect, &accepted_wheel);
+        let plane_cover = self.plane_cover_input_for_canvas(ctx, default_image_rect);
+        let (click_zoom, click_pan, wheel_navigation_produced, click_plane_active) = self
+            .predict_fs_wheel_frame_with_cover(
+                ctx,
+                default_image_rect,
+                &accepted_wheel,
+                plane_cover,
+            );
         let canvas_click = self.plan_fs_canvas_click(
             ctx,
             &fs_response,
@@ -42630,6 +42639,7 @@ impl App {
             side_panel_click_chrome,
             full_rect,
             default_image_rect,
+            plane_cover,
             primary_suppression,
             fs_response,
             is_spread_double,
@@ -42805,6 +42815,7 @@ impl App {
             side_panel_click_chrome,
             full_rect,
             default_image_rect,
+            plane_cover,
             primary_suppression,
             fs_response,
             is_spread_double,
@@ -42875,6 +42886,7 @@ impl App {
                         self.fs_zoom,
                         self.fs_pan,
                         self.plane_view_pose(),
+                        plane_cover,
                     ) {
                         let outcome = crate::plane_view::plane_view_wheel_transition(input);
                         self.apply_plane_view_outcome(ctx, outcome);
@@ -43378,6 +43390,83 @@ impl App {
         close
     }
 
+    /// Freeze accepted material facts with this pass's display conditions.
+    fn plane_cover_input_for_canvas(
+        &mut self,
+        ctx: &egui::Context,
+        canvas: egui::Rect,
+    ) -> Option<crate::plane_view::PlaneCoverInput> {
+        let idx = self.fullscreen_idx?;
+        let accepted = self.fullscreen_page_layout.plane_cover?;
+        if accepted.anchor != self.plane_view_anchor(idx) {
+            return None;
+        }
+        let rotation = self.get_rotation(idx);
+        let trim = self.view_trim_single_content_bbox(idx);
+        let content_bbox = self.fs_page_content_bbox(idx, rotation, trim);
+        let ppp = ctx.pixels_per_point();
+        let side = self
+            .spread_display_composition_for_anchor(idx)
+            .singleton_placement();
+        let placement = if side == SingletonSpreadPlacement::Center {
+            ResolvedDisplayPlacement::Normal {
+                zoom_pan: self.fs_zoom_pan(),
+            }
+        } else {
+            ResolvedDisplayPlacement::SingletonSpread {
+                side,
+                gap: quantize_points_to_physical_pixels(
+                    self.settings.spread_page_gap_px.min(200) as f32,
+                    ppp,
+                ),
+                zoom_pan: self.fs_zoom_pan(),
+            }
+        };
+        let input = DisplayedImageTransformInput {
+            viewport_rect: canvas,
+            pixels_per_point: ppp,
+            rotation,
+            free_rotation_rad: self.fs_free_rotation,
+            content_bbox,
+            fit_mode: self
+                .fs_basis_fit_input(
+                    self.effective_fullscreen_fit_mode(),
+                    accepted.material.display_basis,
+                    crate::material_display_basis::MaterialDisplayView::Single,
+                )
+                .ok()?,
+            fit_scale_limits: self.fullscreen_fit_scale_limits(ppp),
+            placement,
+            ..accepted.input
+        };
+        Some(crate::plane_view::PlaneCoverInput {
+            transform: input,
+            layout_source_size: accepted.layout_source_size,
+            material: accepted.material,
+        })
+    }
+
+    fn record_plane_cover_material(
+        &mut self,
+        page_idx: usize,
+        input: DisplayedImageTransformInput,
+        layout_source_size: Option<egui::Vec2>,
+        material: crate::plane_view_wgpu::PlaneMaterialDescription,
+    ) {
+        if self.fullscreen_idx == Some(page_idx)
+            && self.fullscreen_page_layout.kind() == FullscreenPageLayoutKind::Single
+        {
+            self.fullscreen_page_layout.plane_cover =
+                Some(crate::displayed_image_transform::PlaneCoverRecord {
+                    anchor: self.plane_view_anchor(page_idx),
+                    input,
+                    layout_source_size,
+                    material,
+                });
+        }
+    }
+
+    #[cfg(test)]
     fn propose_fs_wheel_click_transform(
         &mut self,
         ctx: &egui::Context,
@@ -43391,7 +43480,7 @@ impl App {
     pub(crate) fn apply_plane_view_outcome(
         &mut self,
         ctx: &egui::Context,
-        mut out: crate::plane_view::PlaneViewWheelOutcome,
+        out: crate::plane_view::PlaneViewWheelOutcome,
     ) {
         if let Some(block) = out.blocked {
             self.show_fullscreen_nav_noop(
@@ -43411,7 +43500,6 @@ impl App {
         if !out.changes_view(current, self.fs_zoom, self.fs_pan) {
             return;
         }
-        out.pan = clamp_fullscreen_pan_from_layout(&self.fullscreen_page_layout, out.zoom, out.pan);
         self.clear_fs_initial_placement_request();
         self.fs_zoom = out.zoom;
         self.fs_pan = out.pan;
@@ -43439,11 +43527,23 @@ impl App {
 
     /// Ordered simulation is shared by click planning and delayed-merge admission.
     /// The page-local step itself is the same pure proposal used at application.
+    #[cfg(test)]
     fn predict_fs_wheel_frame(
         &mut self,
         ctx: &egui::Context,
         image_rect: egui::Rect,
         actions: &[FsWheelAction],
+    ) -> (f32, egui::Vec2, bool, bool) {
+        let cover = self.plane_cover_input_for_canvas(ctx, image_rect);
+        self.predict_fs_wheel_frame_with_cover(ctx, image_rect, actions, cover)
+    }
+
+    fn predict_fs_wheel_frame_with_cover(
+        &mut self,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        actions: &[FsWheelAction],
+        cover: Option<crate::plane_view::PlaneCoverInput>,
     ) -> (f32, egui::Vec2, bool, bool) {
         let mut plane = self.plane_view_pose().filter(|pose| {
             self.fullscreen_idx
@@ -43480,16 +43580,13 @@ impl App {
                             zoom,
                             pan,
                             plane,
+                            cover,
                         ) {
                             let outcome = crate::plane_view::plane_view_wheel_transition(input);
                             if outcome.changes_view(plane, zoom, pan) {
                                 plane = outcome.pose;
                                 zoom = outcome.zoom;
-                                pan = clamp_fullscreen_pan_from_layout(
-                                    &self.fullscreen_page_layout,
-                                    zoom,
-                                    outcome.pan,
-                                );
+                                pan = outcome.pan;
                             }
                         }
                     }
@@ -47528,8 +47625,10 @@ impl App {
                 },
                 bounded_pan,
             );
-            if let Some((material, _, _, _)) = plane_selected {
+            if let Some((material, _, old_input, old_layout)) = plane_selected {
+                let description = material.description;
                 assert!(self.paint_plane_view(&painter, material, &transform, full_rect, bg_style));
+                self.record_plane_cover_material(page_idx, old_input, old_layout, description);
                 if let Some(submitted) = submitted {
                     submitted.pages.clear();
                     submitted.pages.push(FsNavigatorTextureSource {
@@ -47603,6 +47702,22 @@ impl App {
             } else {
                 page
             };
+            if selected_current
+                && matches!(layout_source, FsPageLayoutSource::CurrentItem)
+                && page.transform == transform
+                && let Some(description) = Self::plane_material_description(
+                    &page.resource,
+                    transform_input.source_size,
+                    transform_input.texture_size,
+                )
+            {
+                self.record_plane_cover_material(
+                    page_idx,
+                    transform_input,
+                    layout_source_size,
+                    description,
+                );
+            }
             let transform = page.transform;
             let img_rect = transform.full_image_rect;
             let total_scale = transform.total_scale;

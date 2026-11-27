@@ -1168,12 +1168,23 @@ pub(crate) struct FullscreenPageLayout {
     kind: FullscreenPageLayoutKind,
     pages: Vec<DisplayedPage>,
     pub(crate) drawn_unit: Option<crate::ui_fullscreen::in_page_scroll::FsDrawnUnitStamp>,
+    /// Accepted material geometry, paired with the displayed page rather than viewer state.
+    pub(crate) plane_cover: Option<PlaneCoverRecord>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PlaneCoverRecord {
+    pub(crate) anchor: crate::plane_view::PlaneViewAnchor,
+    pub(crate) input: DisplayedImageTransformInput,
+    pub(crate) layout_source_size: Option<egui::Vec2>,
+    pub(crate) material: crate::plane_view_wgpu::PlaneMaterialDescription,
 }
 
 impl FullscreenPageLayout {
     pub(crate) fn begin(&mut self, kind: FullscreenPageLayoutKind) {
         self.pages.clear();
         self.drawn_unit = None;
+        self.plane_cover = None;
         self.kind = kind;
     }
 
