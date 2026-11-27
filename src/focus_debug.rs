@@ -296,6 +296,7 @@ fn format_event(event: &Event) -> Value {
             Event::Text(_) => "Text",
             Event::Ime(_) => "Ime",
             Event::PointerInputProvenance(_) => "PointerInputProvenance",
+            Event::PointerButtonTime { .. } => "PointerButtonTime",
             Event::MouseMoved(_) => "MouseMoved",
             Event::PointerGone => "PointerGone",
             Event::Zoom(_) => "Zoom",

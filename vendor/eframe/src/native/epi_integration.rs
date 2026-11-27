@@ -543,7 +543,9 @@ impl EpiIntegration {
         app: &mut dyn epi::App,
         mut raw_input: egui::RawInput,
     ) -> egui::RawInput {
-        raw_input.time = Some(self.beginning.elapsed().as_secs_f64());
+        let input_now = web_time::Instant::now();
+        raw_input.time = Some(input_now.duration_since(self.beginning).as_secs_f64());
+        raw_input.input_clock = Some(egui_winit::input_clock::at(input_now));
 
         app.raw_input_hook(&self.egui_ctx, &mut raw_input);
 
@@ -775,6 +777,78 @@ pub(super) mod tests {
 
     pub(in crate::native) fn headless_integration() -> EpiIntegration {
         EpiIntegration::headless(egui::Context::default())
+    }
+
+    #[test]
+    fn timestamp_919_recreated_child_state_uses_eframe_clock_and_preserves_intervals() {
+        let mut integration = headless_integration();
+        integration.beginning = Instant::now() - web_time::Duration::from_secs(100);
+        let ctx = integration.egui_ctx.clone();
+        let mut app = RecordingApp::default();
+        let physical_start = egui_winit::input_clock::now() - 1.0;
+        let mut first_edge = None;
+        for (generation, state_time, offset) in [(0, -5_000.0, 0.0), (1, 5_000.0, 0.25)] {
+            let context_time_at_creation = ctx.time();
+            let mut state = egui_winit::State::new(
+                ctx.clone(),
+                child_id(),
+                &integration.frame,
+                None,
+                None,
+                None,
+            );
+            let mut events = Vec::new();
+            for (pressed, offset) in [(true, offset), (false, offset + 0.08)] {
+                events.push(Event::PointerButtonTime {
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    time: physical_start + offset,
+                });
+                events.push(Event::PointerButton {
+                    pos: egui::pos2(20.0, 30.0),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Modifiers::NONE,
+                });
+            }
+            *state.egui_input_mut() = input(child_id(), events);
+            // The State's original epoch cannot be used after eframe overwrites
+            // time. Deliberately incompatible values make that premise explicit.
+            state.egui_input_mut().time = Some(state_time);
+            state.egui_input_mut().input_clock = Some(-10_000.0);
+            let raw = integration.prepare_raw_input(&mut app, state.egui_input_mut().take());
+            assert!(raw.time.unwrap() > 99.0);
+            let translated =
+                raw.time.unwrap() - (raw.input_clock.unwrap() - (physical_start + offset));
+            ctx.run_ui(raw, |ui| {
+                let edges = ui.input(|input| input.pointer.button_edges().collect::<Vec<_>>());
+                assert!((edges[0].time.input.unwrap() - translated).abs() < 1e-9);
+                assert_eq!(edges[1].click.unwrap().1, generation + 1);
+                if let Some(first) = first_edge {
+                    assert!((edges[0].time.since(first) - 0.25).abs() < 1e-6);
+                } else {
+                    first_edge = Some(edges[0].time);
+                }
+            })
+            .drop_without_applying_deltas();
+            // Recreating State now derives start_time from the advanced Context
+            // time (~100s), unlike the first State (~0s). The input clock persists.
+            if generation == 0 {
+                assert!(context_time_at_creation < 1.0);
+                let root = integration.prepare_raw_input(&mut app, input(ViewportId::ROOT, vec![]));
+                ctx.run_ui(root, |ui| {
+                    ui.ctx().show_viewport_deferred(
+                        child_id(),
+                        ViewportBuilder::default(),
+                        |_, _| {},
+                    );
+                })
+                .drop_without_applying_deltas();
+            } else {
+                assert!(context_time_at_creation > 99.0);
+            }
+            drop(state);
+        }
     }
 
     #[derive(Default)]

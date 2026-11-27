@@ -1484,6 +1484,21 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   session が無い間は保存後の既存 revision 検証で再準備し、session がある間は固定結果を維持する。
   保存後に再利用 metadata のバッジが古く見え得る点は Esc と同じ既存挙動として範囲外。新たな失効・再検索は足さない。
 
+### 2026-11-27: 実入力時刻をクリック判定まで保つ (§1.919、実装・検証待ち)
+
+- 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §16、実装記録は §16.17。
+  Windows の共有入力経路 (eframe の msg hook、egui-winit の timestamp subclass、egui の PointerState) を変更した。
+  timestamp subclass の資源は既存 `NativeWindowAllocationLease` に載せ、窓の置換・終了と同じ退役点で外す。
+  ROOT の listener replay 後も vendor subclass を最外へ戻し、listener が設置した subclass より先に呼出を claim する。
+  detached の述語・窓の選択・viewport 経路・open / close の動作は変更していない。
+- 実装者として、処理待ちを物理クリックの長さへ混ぜていた入力の境界を直す構造的修正と判断する。
+  呼出枠と不透明な provenance は別の証跡で、再入・保留で元メッセージを証明できない時刻は渡さない。
+  別窓の入力履歴を reset せず、閾値・猶予・待ち・追加 repaint で症状を吸収していない。
+- 設計の構造的修正への合意は正本 §16.14〜16.16 の記録による (ClaudeCode と独立設計レビュー)。
+  独立設計レビュー (Sol xhigh) は r1〜r4 の各回で構造的修正であることに AGREE し、r4 で ACCEPT。
+  実装の独立レビュー (実装者と別の Sol xhigh、ClaudeCode が依頼) は r1・r2 とも ACCEPT で、構造的修正であり症状パッチではないことに AGREE (2026-11-27、正本 §16.18)。
+
+
 ### 2026-11-26: 閉じるモードの数え方の区切りと、この pass の押下位置 (§1.900・§1.907)
 
 - 正本: [fullscreen-double-click-close-plan.md](fullscreen-double-click-close-plan.md) §14・§15。F12 の別ウィンドウと共有する

@@ -332,6 +332,7 @@ pub mod page_split;
 pub mod panorama;
 pub mod panorama_wgpu;
 pub mod path_key;
+mod pointer_input_time;
 pub mod reading_history_db;
 pub(crate) mod reading_history_thumbnail_sources;
 #[cfg(any(test, feature = "test-script"))]

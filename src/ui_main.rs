@@ -1158,7 +1158,7 @@ fn grid_primary_input_events(
         .unwrap_or_else(|| ctx.pointer_button_targets());
     let mut witnesses = witnesses.into_iter();
     ctx.input(|input| {
-        let mut releases = input.pointer.released_buttons_with_click_counts();
+        let mut edges = input.pointer.button_edges();
         let mut ordinal = 0;
         let mut events = Vec::new();
         for event in &input.events {
@@ -1172,10 +1172,14 @@ fn grid_primary_input_events(
                 egui::Event::PointerButtonReleased { button, .. } => {
                     // This release has no widget witness or click position. It
                     // still occupies its adjudicated release and primary ordinal.
-                    let Some((released_button, click)) = releases.next() else {
+                    let Some(edge) = edges.next() else {
                         return vec![GridPrimaryInput::Cancelled];
                     };
-                    if released_button != button || click.is_some() {
+                    if edge.button != button
+                        || edge.pressed
+                        || edge.pos.is_some()
+                        || edge.click.is_some()
+                    {
                         return vec![GridPrimaryInput::Cancelled];
                     }
                     if button == egui::PointerButton::Primary {
@@ -1199,17 +1203,15 @@ fn grid_primary_input_events(
                         }
                         _ => return vec![GridPrimaryInput::Cancelled],
                     };
-                    let click = if !pressed {
-                        let Some((released_button, click)) = releases.next() else {
-                            return vec![GridPrimaryInput::Cancelled];
-                        };
-                        if released_button != button {
-                            return vec![GridPrimaryInput::Cancelled];
-                        }
-                        click
-                    } else {
-                        None
+                    let Some(edge_time) = edges.next() else {
+                        return vec![GridPrimaryInput::Cancelled];
                     };
+                    if (edge_time.button, edge_time.pressed, edge_time.pos)
+                        != (button, pressed, Some(pos))
+                    {
+                        return vec![GridPrimaryInput::Cancelled];
+                    }
+                    let click = edge_time.click;
                     if button != egui::PointerButton::Primary {
                         events.push(if button == egui::PointerButton::Secondary {
                             GridPrimaryInput::Secondary {
@@ -1240,6 +1242,7 @@ fn grid_primary_input_events(
                     } else {
                         ordinal += 1;
                         events.push(GridPrimaryInput::Release {
+                            at: edge_time.time,
                             click,
                             modifiers,
                             source,
@@ -1261,7 +1264,7 @@ fn grid_primary_input_events(
         }
         // Earlier input owners can consume raw events. Never join a remaining raw
         // edge to a different adjudicated release or carry its old click pair on.
-        if releases.next().is_some() || witnesses.next().is_some() {
+        if edges.next().is_some() || witnesses.next().is_some() {
             return vec![GridPrimaryInput::Cancelled];
         }
         events
@@ -19885,12 +19888,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     &effective_event
                 }
                 GridPrimaryInput::Release {
+                    at,
                     click,
                     modifiers,
                     source,
                     suppressed,
                 } => {
                     effective_event = GridPrimaryInput::Release {
+                        at: *at,
                         click: *click,
                         modifiers: *modifiers,
                         source: *source,
@@ -19907,7 +19912,6 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             let accepted = self.grid_click_pairing.accept_primary_input(
                 context,
                 frame,
-                ctx.input(|input| input.time),
                 options.max_double_click_delay,
                 options.max_click_dist,
                 selected_event,
@@ -34260,6 +34264,94 @@ mod grid_reclick_open_tests {
                 modifiers,
             })
             .collect()
+    }
+
+    fn timestamp_919_grid_pass(
+        harness: &mut Harness<'static, HandlerState>,
+        pos: egui::Pos2,
+        pass: f64,
+        stamps: Option<(f64, f64)>,
+    ) {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        for (pressed, time) in [(true, stamps.map(|s| s.0)), (false, stamps.map(|s| s.1))] {
+            if let Some(time) = time {
+                events.push(egui::Event::PointerButtonTime {
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    time,
+                });
+            }
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        let raw = harness.input_mut();
+        raw.time = Some(pass);
+        raw.input_clock = Some(pass);
+        raw.events = events;
+        // Keep annotations and button events in the same RawInput; event() would
+        // split them into independent egui passes.
+        harness.step();
+    }
+
+    #[test]
+    fn grid_919_timestamped_stall_opens_cell_but_unstamped_does_not() {
+        for known in [false, true] {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+            harness
+                .ctx
+                .options_mut(|o| o.input_options.max_double_click_delay = 0.5);
+            let pos = cell_rect(0).center();
+            harness.hover_at(pos);
+            harness.run();
+            timestamp_919_grid_pass(&mut harness, pos, 1.08, known.then_some((1.0, 1.08)));
+            assert_eq!(harness.state().activations, 0);
+            timestamp_919_grid_pass(&mut harness, pos, 1.8, known.then_some((1.25, 1.33)));
+            assert_eq!(harness.state().activations, usize::from(known));
+        }
+    }
+
+    #[test]
+    fn grid_919_timestamped_stall_pairs_background_but_unstamped_does_not() {
+        for known in [false, true] {
+            let mut harness = background_harness(GridClickSelectionMode::Explorer);
+            harness
+                .ctx
+                .options_mut(|o| o.input_options.max_double_click_delay = 0.5);
+            let pos = egui::pos2(30.0, 170.0);
+            harness.hover_at(pos);
+            harness.run();
+            timestamp_919_grid_pass(&mut harness, pos, 1.08, known.then_some((1.0, 1.08)));
+            assert!(harness.state().background_navs.is_empty());
+            timestamp_919_grid_pass(&mut harness, pos, 1.8, known.then_some((1.25, 1.33)));
+            assert_eq!(harness.state().background_navs.len(), usize::from(known));
+        }
+    }
+
+    #[test]
+    fn grid_919_mixed_timestamp_pairs_retain_pass_interval_in_both_orders() {
+        for first_known in [false, true] {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+            harness
+                .ctx
+                .options_mut(|o| o.input_options.max_double_click_delay = 0.5);
+            let pos = cell_rect(0).center();
+            harness.hover_at(pos);
+            harness.run();
+            timestamp_919_grid_pass(&mut harness, pos, 1.08, first_known.then_some((1.0, 1.08)));
+            timestamp_919_grid_pass(
+                &mut harness,
+                pos,
+                1.8,
+                (!first_known).then_some((1.25, 1.33)),
+            );
+            assert_eq!(harness.state().activations, 0);
+        }
     }
 
     fn section1680_double_click(harness: &mut Harness<'static, HandlerState>, pos: egui::Pos2) {

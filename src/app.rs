@@ -16153,7 +16153,7 @@ impl GridClickTarget {
 struct PendingGridClick {
     target: GridClickTarget,
     items_generation: u64,
-    at: f64,
+    at: egui::EdgeTime,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16175,6 +16175,7 @@ pub(crate) enum GridPrimaryInput {
         suppressed: bool,
     },
     Release {
+        at: egui::EdgeTime,
         click: Option<(egui::Pos2, u32)>,
         modifiers: egui::Modifiers,
         source: GridClickSource,
@@ -16219,12 +16220,13 @@ impl GridClickPairingState {
         index: usize,
         context: GridBackgroundClickContext,
         frame: u64,
-        at: f64,
+        at: impl Into<egui::EdgeTime>,
         max_delay: f64,
     ) -> bool {
+        let at = at.into();
         let paired = previous.pending.is_some_and(|pending| {
             matches!(pending.target, GridClickTarget::Cell { index: old_index, context: old, .. } if old_index == index && old == context)
-                && at - pending.at < max_delay
+                && at.since(pending.at) < max_delay
         });
         self.pending = Some(PendingGridClick {
             target: GridClickTarget::Cell {
@@ -16335,7 +16337,7 @@ impl GridClickPairingState {
         context: GridBackgroundClickContext,
         pos: egui::Pos2,
         frame: u64,
-        at: f64,
+        at: impl Into<egui::EdgeTime>,
         max_delay: f64,
         max_dist: f32,
     ) -> bool {
@@ -16346,9 +16348,10 @@ impl GridClickPairingState {
             self.pending = None;
             return false;
         }
+        let at = at.into();
         let paired = previous.pending.is_some_and(|pending| {
             pending.items_generation == context.items_generation
-                && at - pending.at < max_delay
+                && at.since(pending.at) < max_delay
                 && matches!(pending.target, GridClickTarget::Background { context: old, pos: old_pos, .. }
                     if old == context && old_pos.distance(pos) <= max_dist)
         });
@@ -16375,7 +16378,6 @@ impl GridClickPairingState {
         &mut self,
         context: GridBackgroundClickContext,
         frame: u64,
-        at: f64,
         max_delay: f64,
         max_dist: f32,
         event: &GridPrimaryInput,
@@ -16429,6 +16431,7 @@ impl GridClickPairingState {
                         });
             }
             GridPrimaryInput::Release {
+                at,
                 click,
                 modifiers,
                 source,
@@ -105809,6 +105812,7 @@ impl eframe::App for App {
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, _input: &mut egui::RawInput) {
         crate::focus_debug::install(ctx);
+        crate::pointer_input_time::install(ctx);
         #[cfg(windows)]
         if _input.viewport_id == egui::ViewportId::ROOT {
             // Eframe has delivered the previous output before preparing this

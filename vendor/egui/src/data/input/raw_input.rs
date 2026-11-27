@@ -48,6 +48,11 @@ pub struct RawInput {
     /// If `None` is provided, egui will assume a time delta of `predicted_dt` (default 1/60 seconds).
     pub time: Option<f64>,
 
+    /// Process input clock sampled at the same instant as `time`.
+    /// Native button annotations use this clock, independently of viewport age.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub input_clock: Option<f64>,
+
     /// Should be set to the expected time between frames when painting at vsync speeds.
     /// The default for this is 1/60.
     /// Can safely be left at its default value.
@@ -99,6 +104,7 @@ impl Default for RawInput {
             screen_rect: None,
             max_texture_side: None,
             time: None,
+            input_clock: None,
             predicted_dt: 1.0 / 60.0,
             events: vec![],
             hovered_files: Default::default(),
@@ -133,6 +139,7 @@ impl RawInput {
             safe_area_insets: self.safe_area_insets.take(),
             max_texture_side: self.max_texture_side.take(),
             time: self.time,
+            input_clock: self.input_clock,
             predicted_dt: self.predicted_dt,
             events: core::mem::take(&mut self.events),
             hovered_files: self.hovered_files.clone(),
@@ -150,6 +157,7 @@ impl RawInput {
             screen_rect,
             max_texture_side,
             time,
+            input_clock,
             predicted_dt,
             mut events,
             mut hovered_files,
@@ -164,6 +172,7 @@ impl RawInput {
         self.screen_rect = screen_rect.or(self.screen_rect);
         self.max_texture_side = max_texture_side.or(self.max_texture_side);
         self.time = time; // use latest time
+        self.input_clock = input_clock;
         self.predicted_dt = predicted_dt; // use latest dt
         self.events.append(&mut events);
         self.hovered_files.append(&mut hovered_files);
@@ -182,6 +191,7 @@ impl RawInput {
             screen_rect,
             max_texture_side,
             time,
+            input_clock,
             predicted_dt,
             events,
             hovered_files,
@@ -213,6 +223,7 @@ impl RawInput {
             ui.label("time: None");
         }
         ui.label(format!("predicted_dt: {:.1} ms", 1e3 * predicted_dt));
+        ui.label(format!("input_clock: {input_clock:?}"));
         ui.label(format!("hovered_files: {}", hovered_files.len()));
         ui.label(format!("dropped_files: {}", dropped_files.len()));
         ui.label(format!("focused: {focused}"));
