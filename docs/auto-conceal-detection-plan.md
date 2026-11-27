@@ -1213,3 +1213,17 @@ App の 0 件テストは 3 ツールと補正レイヤーの Raster／未作成
 - cargo の build / test / check / clippy / nextest、確認用 binary の build、アプリ起動、git add / commit は実行しない依頼で、未実行。
   自動検証・実モデル照合・独立レビューの再判定は設計担当へ引き継ぐ。
 - 今回の `cargo fmt`（引数なし）と `git diff --check` は終了コード 0。`python scripts/check_ui_glyphs.py` は危険 glyph 0。
+
+### 23.7 段 2 の検証と独立レビュー (2026-11-27、設計担当)
+
+- 設計担当の run-heavy: `cargo check -p mimageviewer --bin mimageviewer-core` 成功。
+  `test(/mask_detect|^ai::detect|detector_catalog|external_model|settings_transfer/)` は 166 件成功 (ac335361d)。
+- 実モデル照合 (ignored): 参照はリポジトリの外で ultralytics 8.4.219 の CPU 推論 (conf 0.25・iou 0.7・`retina_masks`、
+  EXIF の向きを無視) で作った。yolo11n と yolo26n-seg、利用者の写真 6 枚 (読み取りのみ)。mIV は DirectML。
+  83 組・IoU 0.95 以上 97.6%・箱 IoU 最小 0.89・輪郭 IoU 最小 0.988 で成功。最初は件数の完全一致で落ち、
+  閾値の境目の候補と、確からしさ 0.40 の大きな箱 (IoU 0.91) が原因だったので、§23.2 の基準 (IoU 0.5 の貪欲対応・
+  境目だけ未対応を許す・全組 0.85 以上かつ 95% 以上が 0.95 以上・輪郭は全組 0.9 以上) に改めた。
+  テストの画像の読み込みは製品と同じ TurboJPEG (`image::open` では cv2 と画素が違った)。
+- **独立レビュー (Sol gpt-6.1-sol / xhigh、実装担当とは別)**: R1 (対象 7ca8732ff) は **REJECT** (P1 なし・P2 3 件:
+  一覧の読み込み中に顔だけで開始できる、全 false の輪郭を 1 件として採用する、照合で輪郭の下限を 0.8 へ緩める)。
+  3 件とも妥当と判断して実装担当が直した (§23.6)。R2 (対象 ac335361d) は **ACCEPT** (新しい指摘なし)。
