@@ -127,6 +127,7 @@
         <a href="detectors.html">追加の検出器</a>
         <a href="annotation.html">テキスト注釈</a>
         <a href="export.html">エクスポート</a>
+        <a href="image-combine.html">画像の結合</a>
         <a href="clipboard-capture.html">クリップボード取り込み</a>
         <a href="browser-integration.html">ブラウザ連携</a>
         <a href="metadata-transfer.html">メタ情報の移行</a>
@@ -155,16 +156,39 @@
     <p class="page-desc">mImageViewer のバージョンごとの変更点をまとめています。最新版は<a href="../index.html#download">ダウンロードページ</a>から入手できます。</p>
 
     <div class="ver-tabs" role="tablist" aria-label="メジャー版" hidden>
-      <button type="button" role="tab" class="ver-tab" id="tab-v5" aria-controls="v5" data-major="v5"><span class="ver-tab-name">v5</span><span class="ver-tab-count">11 版</span></button>
+      <button type="button" role="tab" class="ver-tab" id="tab-v5" aria-controls="v5" data-major="v5"><span class="ver-tab-name">v5</span><span class="ver-tab-count">12 版</span></button>
       <button type="button" role="tab" class="ver-tab" id="tab-v4" aria-controls="v4" data-major="v4"><span class="ver-tab-name">v4</span><span class="ver-tab-count">18 版</span></button>
       <button type="button" role="tab" class="ver-tab" id="tab-v3" aria-controls="v3" data-major="v3"><span class="ver-tab-name">v3</span><span class="ver-tab-count">16 版</span></button>
       <button type="button" role="tab" class="ver-tab" id="tab-v2" aria-controls="v2" data-major="v2"><span class="ver-tab-name">v2</span><span class="ver-tab-count">16 版</span></button>
       <button type="button" role="tab" class="ver-tab" id="tab-v1" aria-controls="v1" data-major="v1"><span class="ver-tab-name">v1</span><span class="ver-tab-count">11 版</span></button>
       <button type="button" role="tab" class="ver-tab" id="tab-v0" aria-controls="v0" data-major="v0"><span class="ver-tab-name">v0</span><span class="ver-tab-count">12 版</span></button>
-      <button type="button" role="tab" class="ver-tab" id="tab-all" data-major="all"><span class="ver-tab-name">すべて</span><span class="ver-tab-count">84 版</span></button>
+      <button type="button" role="tab" class="ver-tab" id="tab-all" data-major="all"><span class="ver-tab-name">すべて</span><span class="ver-tab-count">85 版</span></button>
     </div>
 
     <section class="ver-group" id="v5">
+      <h2 id="v5.9.0">v5.9.0 <span class="ver-date">2026-11-28</span></h2>
+
+      <ul>
+        <li><strong>選んだ画像を 1 枚の画像に結合できるようになりました。</strong> 一覧で画像を選び、右クリックまたは「ツール」メニューの「画像を結合...」を選びます（1〜100 枚。ZIP の中の画像・PDF のページも使えます）。横一列・縦一列・グリッド・行ごと / 列ごとに詰める配置、隙間・余白・背景色・角丸・枠線、画像ごとの番号や説明のラベルを選べ、PNG・JPEG・WebP で保存します。「結合をやり直す...」で、並びやラベルを直して書き直せます。</li>
+        <li><strong>操作を組み合わせるスクリプトを使えるようになりました。</strong> 画面の状態を見て「★3 を付けて次へ」「最後のページなら次の本へ」のような組み合わせを作り、操作カスタマイズの「スクリプト操作 1」〜「スクリプト操作 20」でキーやリングに割り当てられます。本を開いたときやページが変わったときに表示を自動で切り替えることもでき、3D 写真やスライドショーの開始・停止も組み合わせられます。環境設定 → 拡張と診断 → 操作のスクリプトの「操作のスクリプトを使う」で有効にします（既定はオフ）。スクリプトからファイルの削除・移動、ほかのプログラムの起動、通信はできません。</li>
+        <li><strong>消しゴム・隠蔽加工・補正レイヤーで、顔を自動で検出してマスクに追加できるようになりました。</strong> パネルの［自動検出…］で形（楕円 / 矩形）と余白を選んで［検出］を押すと、見つかった顔の範囲を図形として加えます。図形は後から直せ、1 回の検出で加えた分は Undo 1 回で取り消せます。顔の検出器は mIV に同梱していて、検出は PC 内で行い、画像を外部へ送りません。自分で入手した検出器（ONNX 形式）をデータフォルダの detectors フォルダに置いて使うこともできます。見落としや顔以外の検出があり得るので、仕上がりを確かめてから使ってください。</li>
+        <li><strong>静止画に魚眼ズームを加えました。</strong> 1 ページ表示の静止画で <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+ホイールを上へ回すと、魚眼レンズで寄ったように歪ませながら拡大し、下へ回すと歪みが弱まります。魚眼中は <kbd>Shift</kbd>+左ドラッグでレンズの中心だけを動かせます。レンズは環境設定 → 表示 → 閲覧表示の「魚眼のレンズ」で選べます（既定は等距離）。見えているとおりの絵を、キャプチャ保存・画像のコピー・エクスポートで出力できます。</li>
+        <li><strong>1 ページ表示の静止画を、<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+左ドラッグで板のように傾けられるようにしました。</strong> 左右のドラッグで縦軸まわり、上下で横軸まわりに回り、裏側（反転した絵）まで回せます。これまで 1 ページ表示の静止画では、<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+左ドラッグは自由な角度の回転でした。自由な角度の回転は、今までどおり <kbd>Ctrl</kbd>+左ドラッグで使えます。見開きなど傾けの対象外の表示では、動きは変わりません。</li>
+        <li><strong>フォルダごとに、ファイルを好きな順に並べて覚えられるようになりました。</strong> 普通のフォルダで、ソートの「手動順 (このフォルダ)」を選び、サムネイルをドラッグして並べ替えます。選んだ項目はまとめて動き、フォルダ・本・画像の種類をまたいで並べられます。順番は mIV のデータフォルダに保存し、閲覧するフォルダには書き込みません。別の並び順にしても保存した順は残り、「手動順をリセット…」で捨てられます。手動順のサムネイル一覧ではドラッグが並べ替えになるので、ファイルの移動・コピーには詳細表示か別の並び順を使ってください。</li>
+        <li><strong>AI 連携で、mIV Sound の音響調整を AI アプリに組んでもらえるようになりました。</strong> 「設定」→「AI 連携…」で許可の範囲を「読み取りのみ」以上にして「設定の確認と変更を AI に任せる」をオンにすると、AI アプリが A / B のエフェクトの並びの組み替え、使う側や全体のオン / オフの切り替え、「MCP: 」で始まる名前でのプリセットの保存を行えます。AI が編集している間は mIV Sound の画面がロックされ、上辺の帯の「ロックを解除」でいつでも解除できます。IR や測定データの新しい選択は画面で行ってください。同じ設定で、操作のスクリプトの本文も AI に読み書きさせられます（有効にするのは利用者だけです）。</li>
+        <li>この版で増えた AI 連携の機能を使うには、更新した後に AI アプリを再起動するか、MCP に再接続してください。</li>
+        <li><strong>Microsoft Edge アドオンで、拡張機能「mIV で見る」を公開しました。</strong> Edge でも、右クリックした画像を mIV の窓で開けます。入れ方は、マニュアルの「ブラウザ連携」をご覧ください。</li>
+        <li>一覧でフォルダを開く、親フォルダへ戻る、本棚フォルダを開く、お気に入り検索・タグ表示から戻る、全画面を閉じて一覧へ戻る、などの操作で、フォルダを読み込む間に画面が止まらないようにしました。読み込み中は今の一覧を表示したまま一覧の操作を受け付けず、その間に押したキーは新しい一覧に渡しません（読み込み後に押し直してください）。0.5 秒を超えると「移動先を読み込み中…」と表示します。全画面から戻るときは、一覧を読み終えるまで全画面のまま待ち、その間のページ送りは受け付けません。</li>
+        <li>1 枚の書き出し（<kbd>Ctrl</kbd>+<kbd>E</kbd>）で「AI プロンプト / EXIF を保持」がオンのとき、JPEG・PNG でも元の RGB の色のプロファイル（ICC）を残すようにしました。一括エクスポートと同じ扱いにそろえ、WebP でも RGB 以外の色のプロファイルは付けません。</li>
+        <li>別ウィンドウで編集ツール（隠蔽加工・消しゴム・テキスト・補正レイヤー・書き出しの切り取り・SNS 分割）を使っている間は、メインの一覧を操作できないようにしました。一覧で別の画像を開くと、編集中の図形が新しい画像へ移って保存されることがあったためです。別ウィンドウで <kbd>Esc</kbd> を押して編集を終えると、一覧を使えます。あわせて、編集ツールに入るとスライドショーを止めるようにしました。</li>
+        <li>編集ツールを開いたまま閲覧を閉じる（窓の × など）と、隠蔽加工とテキストの編集が保存されないことがある問題を修正しました。</li>
+        <li>処理が重いとき、閲覧を閉じるダブルクリックや、一覧・フォルダツリーのダブルクリックが効かないことがある問題を修正しました。</li>
+        <li>「クリックでは送らず、ダブルクリックで閉じる」にしているとき、拡大などを戻したダブルクリックの直後に続けてダブルクリックしても、閲覧が閉じなかった問題を修正しました。</li>
+        <li>ドラッグ拡大のキー（既定は <kbd>Ctrl</kbd>+<kbd>Space</kbd>）を押したまま素早くクリックすると、ページが送られることがある問題を修正しました。</li>
+        <li>本棚フォルダの中のフォルダへ一括エクスポートで書き出したとき、書き出した後に一覧が更新されなかった問題を修正しました。</li>
+        <li>環境設定の「右クリックメニュー」のページが、既定の窓の幅でも右へはみ出していた問題を修正しました。</li>
+      </ul>
+
       <h2 id="v5.8.0">v5.8.0 <span class="ver-date">2026-11-26</span></h2>
 
       <ul>
