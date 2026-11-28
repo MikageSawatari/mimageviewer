@@ -106,6 +106,74 @@ fn consume_close(app: &mut App) {
 }
 
 #[test]
+fn section1853_close_focus_zip_list_return_keeps_same_frame_and_child_target() {
+    for child_viewport in [false, true] {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        let book = app.tmp.path().join("focus-outer.zip");
+        write_pages(&book, &["A/001.png", "B/001.png"]);
+        open_list(&mut app, &ctx, &book);
+        app.settings.auto_fullscreen_zip_pdf = true;
+        activate(&mut app, &ctx, "A/", true);
+        let surface = app.fullscreen_viewport_id();
+        let target = if child_viewport {
+            surface
+        } else {
+            egui::ViewportId::ROOT
+        };
+        ctx.begin_pass(egui::RawInput {
+            viewport_id: target,
+            viewports: [
+                (egui::ViewportId::ROOT, egui::ViewportInfo::default()),
+                (
+                    surface,
+                    egui::ViewportInfo {
+                        parent: Some(egui::ViewportId::ROOT),
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        app.handle_fs_navigation(
+            &ctx,
+            true,
+            false,
+            None,
+            None,
+            None,
+            crate::ui_fullscreen::FsPageNav::None,
+            None,
+            0,
+        );
+        let nav = app
+            .take_pending_return_to_parent_nav_with_focus(&ctx)
+            .unwrap();
+        assert!(matches!(nav, AddressBarNav::ZipListReturn(_)));
+        assert!(app.apply_fullscreen_close_nav_immediate_with_focus(&ctx, nav));
+        assert!(
+            app.take_pending_return_to_parent_nav_with_focus(&ctx)
+                .is_none()
+        );
+        let output = ctx.end_pass();
+        let targets: Vec<_> = output
+            .viewport_output
+            .iter()
+            .flat_map(|(target, viewport)| {
+                viewport.commands.iter().filter_map(move |command| {
+                    matches!(command, egui::ViewportCommand::Focus).then_some(*target)
+                })
+            })
+            .collect();
+        assert_eq!(targets, [target]);
+        output.drop_without_applying_deltas();
+        assert_returned(&app, &[], "A/");
+    }
+}
+
+#[test]
 fn section1675_zipdir_setting_matrix() {
     for nested in [false, true] {
         for auto in [false, true] {
@@ -795,7 +863,9 @@ fn section1675_cancel_composition_wait_does_not_reopen() {
                     FolderOpenOutcome::Loaded | FolderOpenOutcome::Classifying
                 ));
             }
-            _ => app.handle_fullscreen_close_request(),
+            _ => {
+                app.handle_fullscreen_close_request();
+            }
         }
         // A replaced scope drops its receiver; a cancelled open may retain the
         // read for list projection. Both must ignore the obsolete open intent.
@@ -933,8 +1003,8 @@ fn section1676_terminal_and_live_preserve_bookmark_owner() {
             let main = app.viewer_context_main();
             app.transfer_terminal_close_return(main, ViewerCloseCause::User);
             assert!(matches!(
-                app.pending_return_to_parent,
-                FullscreenCloseContinuation::Terminal(_)
+                app.pending_return_to_parent.state,
+                FullscreenCloseState::Terminal(_)
             ));
             app.close_fullscreen_now();
         } else {
@@ -981,15 +1051,15 @@ fn section1676_invalidated_frozen_live_terminal_uses_current_list_teardown() {
     ));
     app.handle_fullscreen_close_request();
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::LiveZipListReturn(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::LiveZipListReturn(_)
     ));
     app.zip_nav.as_mut().unwrap().clear_list_choices();
     let main = app.viewer_context_main();
     app.transfer_terminal_close_return(main, ViewerCloseCause::User);
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::Terminal(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::Terminal(_)
     ));
     let rows = app.items.clone();
     let generation = app.items_generation;
@@ -1003,8 +1073,8 @@ fn section1676_invalidated_frozen_live_terminal_uses_current_list_teardown() {
         "expired chosen destination must not preserve the outer bookmark owner during terminal teardown"
     );
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::Terminal(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::Terminal(_)
     ));
     assert_eq!(app.items, rows);
     assert_eq!(app.items_generation, generation);
@@ -1383,7 +1453,7 @@ fn section1676_real_refresh_stale_live_plan_closes_to_current_list() {
     app.open_fullscreen(1, HistoryTrigger::UserChosen);
     app.spread_popup_open = true;
     let before = (app.items.clone(), app.items_generation);
-    app.pending_return_to_parent = FullscreenCloseContinuation::LiveZipListReturn(plan);
+    app.pending_return_to_parent.state = FullscreenCloseState::LiveZipListReturn(plan);
     let nav = app
         .take_pending_return_to_parent_nav()
         .expect("frozen Live request issues its delivery authority");
@@ -1712,8 +1782,8 @@ fn section1676_collection_live_and_terminal_close_preserve_owner_and_back_out() 
             let main = app.viewer_context_main();
             app.transfer_terminal_close_return(main, ViewerCloseCause::User);
             assert!(matches!(
-                app.pending_return_to_parent,
-                FullscreenCloseContinuation::Terminal(_)
+                app.pending_return_to_parent.state,
+                FullscreenCloseState::Terminal(_)
             ));
             app.close_fullscreen_now();
         } else {
@@ -1756,8 +1826,8 @@ fn close_chosen_root(app: &mut App, ctx: &egui::Context, terminal: bool) {
         let main = app.viewer_context_main();
         app.transfer_terminal_close_return(main, ViewerCloseCause::User);
         assert!(matches!(
-            app.pending_return_to_parent,
-            FullscreenCloseContinuation::Terminal(_)
+            app.pending_return_to_parent.state,
+            FullscreenCloseState::Terminal(_)
         ));
         app.close_fullscreen_now();
     } else {
@@ -2164,8 +2234,8 @@ fn section1676_embedded_page_turn_barrier_keeps_pending_close_for_update_deliver
     }
     app.handle_fullscreen_close_request();
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::LiveZipListReturn(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::LiveZipListReturn(_)
     ));
     // True-close cancels old page-turn state, so establish this specific ingress
     // interleaving after request acceptance using the existing painted fixture.
@@ -2173,8 +2243,8 @@ fn section1676_embedded_page_turn_barrier_keeps_pending_close_for_update_deliver
     assert!(app.page_turn_barrier_active());
     assert!(app.fullscreen_embedded_still_active());
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::LiveZipListReturn(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::LiveZipListReturn(_)
     ));
     ctx.run_pass(Default::default(), |ctx| {
         let (handled, forwarded) = app.fullscreen_root_input_for_frame(ctx);
@@ -2212,8 +2282,8 @@ fn section1676_pending_main_live_return_preserves_newly_active_sibling_session()
     activate(&mut app, &ctx, "A/", true);
     app.handle_fullscreen_close_request();
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::LiveZipListReturn(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::LiveZipListReturn(_)
     ));
     // A real independent descriptor open publishes its context/window binding
     // and active session after main has already accepted its own Live close.
@@ -2299,8 +2369,8 @@ fn section1676_pending_main_live_return_preserves_newly_active_sibling_session()
         })
         .unwrap();
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::LiveZipListReturn(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::LiveZipListReturn(_)
     ));
     consume_close(&mut app);
     settle(&mut app, &ctx);
@@ -2370,8 +2440,8 @@ fn section1676_stale_live_choice_delivers_current_list_through_real_update() {
     activate(&mut app, &ctx, "A/", true);
     app.handle_fullscreen_close_request();
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::LiveZipListReturn(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::LiveZipListReturn(_)
     ));
     // A refresh/restore removes the old tree's Chosen facts. Exercise the
     // invalidation boundary before delivery while the current reader is still
@@ -2426,8 +2496,8 @@ fn section1676_stale_terminal_return_cannot_close_a_later_reader() {
     let main = app.viewer_context_main();
     app.transfer_terminal_close_return(main, ViewerCloseCause::User);
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::Terminal(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::Terminal(_)
     ));
     app.close_fullscreen_now();
     let nav = app
@@ -2490,8 +2560,8 @@ fn take_terminal_archive_return(app: &mut App) -> AddressBarNav {
     let main = app.viewer_context_main();
     app.transfer_terminal_close_return(main, ViewerCloseCause::User);
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::Terminal(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::Terminal(_)
     ));
     app.close_fullscreen_now();
     assert!(app.fullscreen_idx.is_none());
@@ -2503,8 +2573,8 @@ fn take_terminal_archive_return(app: &mut App) -> AddressBarNav {
         AddressBarNav::ZipListReturn(ZipListReturnRequest::Terminal { .. })
     ));
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::IssuedZipListReturn(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::IssuedZipListReturn(_)
     ));
     assert!(!app.pending_return_to_parent.is_pending());
     nav
@@ -2716,15 +2786,15 @@ fn section1676_new_reader_acceptance_retires_zip_close_before_take() {
 fn section1676_repeated_take_retains_the_issued_zip_authority() {
     let (mut app, ctx, _) = archive_return_lifetime_env();
     let nav = take_terminal_archive_return(&mut app);
-    let ticket = match &app.pending_return_to_parent {
-        FullscreenCloseContinuation::IssuedZipListReturn(owner) => owner.ticket(),
+    let ticket = match &app.pending_return_to_parent.state {
+        FullscreenCloseState::IssuedZipListReturn(owner) => owner.ticket(),
         _ => panic!("issued owner must remain in the original slot"),
     };
     for _ in 0..3 {
         assert!(app.take_pending_return_to_parent_nav().is_none());
         assert!(!app.pending_return_to_parent.is_pending());
         assert!(
-            matches!(&app.pending_return_to_parent, FullscreenCloseContinuation::IssuedZipListReturn(current) if current.accepts(&ticket))
+            matches!(&app.pending_return_to_parent.state, FullscreenCloseState::IssuedZipListReturn(current) if current.accepts(&ticket))
         );
     }
     assert!(app.apply_fullscreen_close_nav_immediate(nav));
@@ -2742,8 +2812,8 @@ fn section1676_refused_reader_open_keeps_issued_zip_authority() {
     app.open_fullscreen(invalid, HistoryTrigger::UserChosen);
     assert_eq!(archive_reader_snapshot(&app), before);
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::IssuedZipListReturn(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::IssuedZipListReturn(_)
     ));
     assert!(app.take_pending_return_to_parent_nav().is_none());
     assert!(app.apply_fullscreen_close_nav_immediate(nav));
@@ -2774,8 +2844,8 @@ fn section1676_issued_zip_return_installs_its_exact_destination_once() {
 fn section1676_sibling_reader_acceptance_keeps_main_issued_zip_authority() {
     let (mut app, ctx, book) = archive_return_lifetime_env();
     let nav = take_terminal_archive_return(&mut app);
-    let ticket = match &app.pending_return_to_parent {
-        FullscreenCloseContinuation::IssuedZipListReturn(owner) => owner.ticket(),
+    let ticket = match &app.pending_return_to_parent.state {
+        FullscreenCloseState::IssuedZipListReturn(owner) => owner.ticket(),
         _ => panic!("main issued owner"),
     };
     let before = archive_reader_snapshot(&app);
@@ -2806,7 +2876,7 @@ fn section1676_sibling_reader_acceptance_keeps_main_issued_zip_authority() {
     .unwrap();
     assert_eq!(archive_reader_snapshot(&app), before);
     assert!(
-        matches!(&app.pending_return_to_parent, FullscreenCloseContinuation::IssuedZipListReturn(current) if current.accepts(&ticket))
+        matches!(&app.pending_return_to_parent.state, FullscreenCloseState::IssuedZipListReturn(current) if current.accepts(&ticket))
     );
     assert!(app.take_pending_return_to_parent_nav().is_none());
     assert!(app.apply_fullscreen_close_nav_immediate(nav));
@@ -2848,8 +2918,8 @@ fn section1676_issued_live_terminal_teardown_preserves_valid_chosen_bookmark_own
         AddressBarNav::ZipListReturn(ZipListReturnRequest::Live { .. })
     ));
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::IssuedZipListReturn(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::IssuedZipListReturn(_)
     ));
     assert!(
         app.zip_nav
@@ -2897,14 +2967,14 @@ fn section1676_dropped_issued_navigation_allows_a_fresh_user_close() {
     }
     assert_eq!(app.fullscreen_idx, Some(1));
     assert!(matches!(
-        app.pending_return_to_parent,
-        FullscreenCloseContinuation::IssuedZipListReturn(_)
+        app.pending_return_to_parent.state,
+        FullscreenCloseState::IssuedZipListReturn(_)
     ));
     app.handle_fullscreen_close_request();
     assert!(
         matches!(
-            app.pending_return_to_parent,
-            FullscreenCloseContinuation::LiveZipListReturn(_)
+            app.pending_return_to_parent.state,
+            FullscreenCloseState::LiveZipListReturn(_)
         ),
         "an orphaned issued slot must not permanently block a later user Close"
     );

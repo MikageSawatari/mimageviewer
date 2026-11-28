@@ -2978,6 +2978,14 @@ presenter HWND の destroy を確認した時点で `SetForegroundWindow(main_hw
 cloaked にしていた場合は、`close_fullscreen` 内で先に uncloak してから reclaim 候補を
 保存する。
 
+§1.853 C5 の閉じ戻りも、この native reclaim を引き続き使う。一般の採用時 ROOT Focus は専用 still viewport
+だけを対象とし、native presenter／HUD には追加しない。close 関数の型付き結果
+`FullscreenCloseRequestOutcome::DeferredTerminalClose` は、その場ではまだ閉じていないことを表す。
+遅延 `TerminalClose` の teardown は既存の `TerminalSessionClose` effect が所有し、入口は一般の Focus を重ねない。
+画像リングは型付き結果を使い、動画リングのページ一覧 close は既存の native reclaim に任せる。
+C5 待ちの main focus guard の keep 条件だけを拡張し、grace・embedded・root-key と native input owner の
+close／restore の非対称な条件は維持する。[設計 §6.19 と実装記録](ui-sync-853-plan.md#6194-実装の記録)。
+
 ガード条件:
 - 動画フルスクリーンを通った時のみ (`native_video_fullscreen_active_for_main_backdrop()`)
 - close_fullscreen 時点で mIV プロセスが foreground を持っていた場合のみ

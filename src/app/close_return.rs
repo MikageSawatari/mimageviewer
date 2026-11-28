@@ -1,6 +1,9 @@
 //! The existing navigation return slot outlives a terminal viewer.
 use super::*;
 
+#[cfg(all(test, windows))]
+mod focus_tests;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ViewerCloseCause {
     User,
@@ -17,8 +20,54 @@ pub(crate) enum FullscreenCloseDestination {
     ChosenZipList,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FullscreenCloseRequestOutcome {
+    ClosedNow,
+    ReturnAccepted,
+    DeferredTerminalClose,
+    Ignored,
+}
+
+/// One accepted close owns both its continuation and its entry's optional Focus.
+/// Dispatch consumes the latter in the same frame; a C5 wait never retains it.
 #[derive(Debug, Default)]
-pub(crate) enum FullscreenCloseContinuation {
+pub(crate) struct FullscreenCloseContinuation {
+    pub(crate) state: FullscreenCloseState,
+    entry_focus: Option<egui::ViewportId>,
+}
+
+/// Consumed around one dispatch call. Never stored in App or a worker.
+pub(super) struct FullscreenCloseDispatchFocus {
+    target: egui::ViewportId,
+    legacy_owners_before: LegacyCloseReturnOwners,
+}
+
+/// Identities of already accepted non-C5 workers, sampled only around dispatch.
+/// A refused dispatch cannot borrow an unchanged worker's entry-frame Focus.
+#[derive(Default)]
+struct LegacyCloseReturnOwners {
+    smart: Option<u64>,
+    rating: Option<u64>,
+    history: Option<u64>,
+    classification: Option<u64>,
+    subfolder: Vec<Arc<AtomicBool>>,
+}
+
+impl LegacyCloseReturnOwners {
+    fn accepted_since(self, before: Self) -> bool {
+        (self.smart.is_some() && self.smart != before.smart)
+            || (self.rating.is_some() && self.rating != before.rating)
+            || (self.history.is_some() && self.history != before.history)
+            || (self.classification.is_some() && self.classification != before.classification)
+            || self
+                .subfolder
+                .iter()
+                .any(|owner| before.subfolder.iter().all(|old| !Arc::ptr_eq(owner, old)))
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) enum FullscreenCloseState {
     #[default]
     None,
     Live,
@@ -36,23 +85,25 @@ pub(crate) enum FullscreenCloseContinuation {
 impl FullscreenCloseContinuation {
     pub(super) fn is_live(&self) -> bool {
         matches!(
-            self,
-            Self::Live | Self::LiveWithPresentation(_) | Self::LiveZipListReturn(_)
+            self.state,
+            FullscreenCloseState::Live
+                | FullscreenCloseState::LiveWithPresentation(_)
+                | FullscreenCloseState::LiveZipListReturn(_)
         )
     }
     pub(crate) fn is_pending(&self) -> bool {
-        self.is_live() || matches!(self, Self::Terminal(_))
+        self.is_live() || matches!(self.state, FullscreenCloseState::Terminal(_))
     }
     pub(super) fn has_accepted_request(&self) -> bool {
         self.is_pending()
-            || matches!(self, Self::IssuedZipListReturn(owner) if owner.has_outstanding_tickets())
+            || matches!(&self.state, FullscreenCloseState::IssuedZipListReturn(owner) if owner.has_outstanding_tickets())
     }
     pub(crate) fn clear(&mut self) {
-        *self = Self::None;
+        *self = Self::default();
     }
     pub(crate) fn request_live(&mut self) {
         if !self.has_accepted_request() {
-            *self = Self::Live;
+            self.state = FullscreenCloseState::Live;
         }
     }
     pub(crate) fn request_live_with_presentation(
@@ -60,7 +111,10 @@ impl FullscreenCloseContinuation {
         presentation: Option<crate::ui_fullscreen::FsCloseReturnPresentation>,
     ) {
         if !self.has_accepted_request() {
-            *self = presentation.map_or(Self::Live, Self::LiveWithPresentation);
+            self.state = presentation.map_or(
+                FullscreenCloseState::Live,
+                FullscreenCloseState::LiveWithPresentation,
+            );
         }
     }
     pub(super) fn cancel_live_request(&mut self) {
@@ -94,19 +148,234 @@ enum CloseReturnEffect {
 }
 
 impl App {
+    /// Preserve the entry's existing target for the same-frame dispatch decision.
+    /// This is an attribute of the accepted close, never a new App pending slot.
+    pub(crate) fn route_fullscreen_close_entry_focus(
+        &mut self,
+        ctx: &egui::Context,
+        outcome: FullscreenCloseRequestOutcome,
+        sends_focus: bool,
+        source: &'static str,
+    ) {
+        if !sends_focus {
+            return;
+        }
+        match outcome {
+            FullscreenCloseRequestOutcome::ClosedNow => {
+                self.send_fullscreen_close_focus(ctx, ctx.viewport_id(), source);
+            }
+            FullscreenCloseRequestOutcome::ReturnAccepted => {
+                self.pending_return_to_parent.entry_focus = Some(ctx.viewport_id());
+            }
+            FullscreenCloseRequestOutcome::DeferredTerminalClose
+            | FullscreenCloseRequestOutcome::Ignored => {}
+        }
+    }
+
+    pub(crate) fn take_pending_return_to_parent_nav_with_focus(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        if !self.pending_return_to_parent.is_pending() {
+            // A second seam poll must not consume an already-issued dispatch's Focus.
+            return self.take_pending_return_to_parent_nav();
+        }
+        let target = self.pending_return_to_parent.entry_focus.take();
+        let nav = self.take_pending_return_to_parent_nav();
+        if nav.is_some() {
+            // Admission can clear the continuation. The actual dispatcher takes
+            // this attribute into a call-local owner before applying navigation.
+            self.pending_return_to_parent.entry_focus = target;
+        } else {
+            // RetireNoDestination already applied its content close in take.
+            self.finish_fullscreen_close_dispatch_focus(
+                ctx,
+                target.map(|target| FullscreenCloseDispatchFocus {
+                    target,
+                    legacy_owners_before: self.legacy_close_return_owners(),
+                }),
+            );
+        }
+        nav
+    }
+
+    pub(super) fn take_fullscreen_close_dispatch_focus(
+        &mut self,
+    ) -> Option<FullscreenCloseDispatchFocus> {
+        let target = self.pending_return_to_parent.entry_focus.take()?;
+        Some(FullscreenCloseDispatchFocus {
+            target,
+            legacy_owners_before: self.legacy_close_return_owners(),
+        })
+    }
+
+    fn legacy_close_return_owners(&self) -> LegacyCloseReturnOwners {
+        let current =
+            |navigation: &MainListNavigation| self.main_list_navigation_is_current(navigation);
+        LegacyCloseReturnOwners {
+            smart: self.staged_smart_navigation_focus_owner(),
+            rating: self
+                .rating_view_pending
+                .as_ref()
+                .filter(|pending| {
+                    !pending.cancel.load(Ordering::Acquire)
+                        && pending.sequence == self.rating_view_request_sequence
+                        && pending
+                            .navigation
+                            .as_ref()
+                            .is_some_and(|nav| current(&nav.navigation))
+                })
+                .map(|pending| pending.sequence),
+            history: self
+                .top_level_grid_view
+                .history_navigation_transition()
+                .and_then(|owner| {
+                    let (id, navigation) = match owner {
+                        HistoryNavigationTransition::Physical(owner) => {
+                            (owner.request_id, &owner.navigation)
+                        }
+                        HistoryNavigationTransition::Collection(owner) => {
+                            (owner.request_id, &owner.navigation)
+                        }
+                    };
+                    current(navigation).then_some(id)
+                }),
+            // Directory classifiers carry their completed scan into adoption;
+            // they are legacy async returns, rather than a new C5 scan wait.
+            classification: self
+                .top_level_grid_view
+                .open_path_classification()
+                .filter(|owner| {
+                    matches!(
+                        owner.continuation.as_deref(),
+                        Some(
+                            ClassifiedOpenContinuation::Physical { .. }
+                                | ClassifiedOpenContinuation::Collection { .. }
+                                | ClassifiedOpenContinuation::Direct { .. }
+                                | ClassifiedOpenContinuation::DirectNavigation { .. }
+                                | ClassifiedOpenContinuation::DirectScan { .. }
+                        )
+                    ) && !owner.cancel.load(Ordering::Acquire)
+                        && owner.navigation.as_ref().is_some_and(current)
+                })
+                .map(|owner| owner.request_id),
+            subfolder: self.subfolder_close_return_focus_owners(),
+        }
+    }
+
+    pub(super) fn finish_fullscreen_close_dispatch_focus(
+        &mut self,
+        ctx: &egui::Context,
+        focus: Option<FullscreenCloseDispatchFocus>,
+    ) {
+        let Some(focus) = focus else {
+            return;
+        };
+        if self.fs_close_return_navigation_wait_active() {
+            // Only an actually started C5 wait hands authority to adoption.
+            return;
+        }
+        let accepted_legacy_return = self
+            .legacy_close_return_owners()
+            .accepted_since(focus.legacy_owners_before);
+        // Pre-C5 synthetic/history workers retain entry-frame Focus.
+        // An open viewer after refusal/failure, with no new owner, never sends it.
+        if !self.viewer_session_blocks_main_window() || accepted_legacy_return {
+            self.send_fullscreen_close_focus(ctx, focus.target, "app::close_return_dispatch_focus");
+        }
+    }
+
+    pub(crate) fn apply_fullscreen_close_nav_immediate_with_focus(
+        &mut self,
+        ctx: &egui::Context,
+        nav: crate::ui_main::AddressBarNav,
+    ) -> bool {
+        let focus = self.take_fullscreen_close_dispatch_focus();
+        let applied = self.apply_fullscreen_close_nav_immediate(nav);
+        self.finish_fullscreen_close_dispatch_focus(ctx, focus);
+        applied
+    }
+
+    fn send_fullscreen_close_focus(
+        &self,
+        ctx: &egui::Context,
+        target: egui::ViewportId,
+        source: &'static str,
+    ) {
+        ctx.send_viewport_cmd_to(target, egui::ViewportCommand::Focus);
+        #[cfg(windows)]
+        self.observe_viewport_presentation_command(
+            target,
+            crate::presentation_observer::WindowAction::Focus,
+            source,
+            "viewport_command=Focus",
+        );
+        #[cfg(not(windows))]
+        let _ = source;
+    }
+
+    /// Capture the closing surface before install changes presentation/viewport identity.
+    /// Native presenter/HUD close belongs to its existing effect and HWND reclaim.
+    #[cfg(windows)]
+    fn main_close_return_focus_surface(&self, ctx: &egui::Context) -> Option<u64> {
+        if !self.fullscreen_close_return_is_main_context()
+            || self.current_viewer_session_is_detached_or_switching()
+            || self.viewer_presentation != ViewerPresentation::Fullscreen
+            || self.fullscreen_embedded_still_active()
+            || self.native_video_fullscreen_active_for_main_backdrop()
+            || self.fullscreen_idx.is_none()
+        {
+            return None;
+        }
+        let viewport = self.fullscreen_viewport_id();
+        if viewport == egui::ViewportId::ROOT {
+            return None;
+        }
+        let witness = eframe::native_window_input::native_window_allocation_witness(ctx, viewport)?;
+        witness.is_alive().then_some(())?;
+        witness
+            .allocation()
+            .windows_hwnd
+            .filter(|hwnd| *hwnd != 0)
+            .map(|hwnd| hwnd as u64)
+    }
+
+    /// A one-call result, not retained state. Query foreground immediately before
+    /// sending, after the confirmed C5 install has closed the captured surface.
+    #[cfg(windows)]
+    pub(super) fn resume_direct_navigation_scan_with_focus(
+        &mut self,
+        ctx: &egui::Context,
+        call: DirectNavigationContinuation,
+        scan: ScannedDir,
+    ) {
+        let surface = self.main_close_return_focus_surface(ctx);
+        let adopted_close = self.resume_direct_navigation_scan(call, scan);
+        if adopted_close
+            && let Some(surface) = surface
+            && current_close_return_foreground_hwnd() == surface
+        {
+            self.send_fullscreen_close_focus(
+                ctx,
+                egui::ViewportId::ROOT,
+                "app::close_return_adoption_focus",
+            );
+        }
+    }
+
     /// Transfer only the issued close's immutable rendering payload into the normal
     /// physical navigation owner. Unconsumed payloads retire with the return slot.
     pub(super) fn take_fullscreen_close_return_presentation(
         &mut self,
     ) -> Option<crate::ui_fullscreen::FsCloseReturnPresentation> {
         if !matches!(
-            self.pending_return_to_parent,
-            FullscreenCloseContinuation::IssuedLive(_)
+            self.pending_return_to_parent.state,
+            FullscreenCloseState::IssuedLive(_)
         ) {
             return None;
         }
-        let FullscreenCloseContinuation::IssuedLive(presentation) =
-            std::mem::take(&mut self.pending_return_to_parent)
+        let FullscreenCloseState::IssuedLive(presentation) =
+            std::mem::take(&mut self.pending_return_to_parent.state)
         else {
             unreachable!()
         };
@@ -116,10 +385,10 @@ impl App {
     /// The accepted None -> Some reader transition ends only this context's
     /// Zip return. Other navigation variants keep their existing contract.
     pub(super) fn retire_zip_close_return_for_reader_acceptance(&mut self) {
-        let is_zip_return = match &self.pending_return_to_parent {
-            FullscreenCloseContinuation::LiveZipListReturn(_)
-            | FullscreenCloseContinuation::IssuedZipListReturn(_) => true,
-            FullscreenCloseContinuation::Terminal(request) => matches!(
+        let is_zip_return = match &self.pending_return_to_parent.state {
+            FullscreenCloseState::LiveZipListReturn(_)
+            | FullscreenCloseState::IssuedZipListReturn(_) => true,
+            FullscreenCloseState::Terminal(request) => matches!(
                 request.effect,
                 CloseReturnEffect::Navigation {
                     nav: crate::ui_main::AddressBarNav::ZipListReturn(_),
@@ -140,11 +409,11 @@ impl App {
         &mut self,
         ticket: &archive_inner_book::ZipListReturnTicket,
     ) -> Option<crate::zip_tree::ZipListReturnPlan> {
-        if matches!(&self.pending_return_to_parent,
-            FullscreenCloseContinuation::IssuedZipListReturn(owner) if owner.accepts(ticket))
+        if matches!(&self.pending_return_to_parent.state,
+            FullscreenCloseState::IssuedZipListReturn(owner) if owner.accepts(ticket))
         {
-            let FullscreenCloseContinuation::IssuedZipListReturn(owner) =
-                std::mem::take(&mut self.pending_return_to_parent)
+            let FullscreenCloseState::IssuedZipListReturn(owner) =
+                std::mem::take(&mut self.pending_return_to_parent.state)
             else {
                 unreachable!()
             };
@@ -182,7 +451,7 @@ impl App {
                 return crate::ui_main::AddressBarNav::ZipListReturn(issued);
             }
         };
-        self.pending_return_to_parent = FullscreenCloseContinuation::IssuedZipListReturn(owner);
+        self.pending_return_to_parent.state = FullscreenCloseState::IssuedZipListReturn(owner);
         crate::ui_main::AddressBarNav::ZipListReturn(request)
     }
 
@@ -198,17 +467,15 @@ impl App {
         if self.projected_viewer_context_id() != self.viewer_context_main() {
             return FullscreenCloseDestination::CurrentList;
         }
-        let plan = match &self.pending_return_to_parent {
-            FullscreenCloseContinuation::Terminal(request) => match &request.effect {
+        let plan = match &self.pending_return_to_parent.state {
+            FullscreenCloseState::Terminal(request) => match &request.effect {
                 CloseReturnEffect::Navigation {
                     nav: crate::ui_main::AddressBarNav::ZipListReturn(request),
                     ..
                 } => request.prepared_plan(),
                 _ => None,
             },
-            FullscreenCloseContinuation::IssuedZipListReturn(owner)
-                if owner.has_outstanding_tickets() =>
-            {
+            FullscreenCloseState::IssuedZipListReturn(owner) if owner.has_outstanding_tickets() => {
                 Some(owner.plan())
             }
             _ => None,
@@ -289,17 +556,17 @@ impl App {
             let Some(origin) = app.close_return_origin() else {
                 return;
             };
-            if matches!(app.pending_return_to_parent, FullscreenCloseContinuation::Terminal(_))
-                || matches!(&app.pending_return_to_parent,
-                    FullscreenCloseContinuation::IssuedZipListReturn(owner) if owner.has_outstanding_tickets()) {
+            if matches!(app.pending_return_to_parent.state, FullscreenCloseState::Terminal(_))
+                || matches!(&app.pending_return_to_parent.state,
+                    FullscreenCloseState::IssuedZipListReturn(owner) if owner.has_outstanding_tickets()) {
                 return;
             }
             let parent = if matches!(
-                app.pending_return_to_parent,
-                FullscreenCloseContinuation::LiveZipListReturn(_)
+                app.pending_return_to_parent.state,
+                FullscreenCloseState::LiveZipListReturn(_)
             ) {
-                let FullscreenCloseContinuation::LiveZipListReturn(plan) =
-                    std::mem::take(&mut app.pending_return_to_parent)
+                let FullscreenCloseState::LiveZipListReturn(plan) =
+                    std::mem::take(&mut app.pending_return_to_parent.state)
                 else {
                     unreachable!()
                 };
@@ -338,8 +605,8 @@ impl App {
                     select_after_load: selection,
                 }
             };
-            app.pending_return_to_parent =
-                FullscreenCloseContinuation::Terminal(Box::new(CloseReturn { origin, effect }));
+            app.pending_return_to_parent.state =
+                FullscreenCloseState::Terminal(Box::new(CloseReturn { origin, effect }));
         });
     }
 
@@ -458,16 +725,16 @@ impl App {
     }
 
     pub(super) fn take_close_return_navigation(&mut self) -> Option<crate::ui_main::AddressBarNav> {
-        use FullscreenCloseContinuation as State;
+        use FullscreenCloseState as State;
         // Input and post-render dispatch may both poll in one frame. A taken
         // return keeps its authority until execution or a new reader/admission.
         if matches!(
-            self.pending_return_to_parent,
+            self.pending_return_to_parent.state,
             State::IssuedZipListReturn(_) | State::IssuedLive(_)
         ) {
             return None;
         }
-        let nav = match std::mem::take(&mut self.pending_return_to_parent) {
+        let nav = match std::mem::take(&mut self.pending_return_to_parent.state) {
             State::None => None,
             State::LiveZipListReturn(plan) => Some(crate::ui_main::AddressBarNav::ZipListReturn(
                 ZipListReturnRequest::PreparedLive(plan),
@@ -484,7 +751,7 @@ impl App {
                             | crate::ui_main::AddressBarNav::CollectionSource { .. }
                     ) && let State::LiveWithPresentation(presentation) = state
                     {
-                        self.pending_return_to_parent = State::IssuedLive(presentation);
+                        self.pending_return_to_parent.state = State::IssuedLive(presentation);
                     }
                     Some(nav)
                 } else {
@@ -517,14 +784,25 @@ impl App {
                 }
             }
             State::IssuedZipListReturn(owner) => {
-                self.pending_return_to_parent = State::IssuedZipListReturn(owner);
+                self.pending_return_to_parent.state = State::IssuedZipListReturn(owner);
                 None
             }
             State::IssuedLive(presentation) => {
-                self.pending_return_to_parent = State::IssuedLive(presentation);
+                self.pending_return_to_parent.state = State::IssuedLive(presentation);
                 None
             }
         }?;
         Some(self.issue_zip_list_return_navigation(nav))
     }
+}
+
+#[cfg(all(windows, not(test)))]
+fn current_close_return_foreground_hwnd() -> u64 {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    unsafe { GetForegroundWindow().0 as usize as u64 }
+}
+
+#[cfg(all(windows, test))]
+fn current_close_return_foreground_hwnd() -> u64 {
+    crate::test_native_focus::foreground_hwnd()
 }

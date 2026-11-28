@@ -791,7 +791,8 @@ pub(crate) mod operation_script_runtime;
 mod subfolder_expansion;
 mod update_phases;
 pub(crate) use close_return::{
-    FullscreenCloseContinuation, FullscreenCloseDestination, ViewerCloseCause,
+    FullscreenCloseContinuation, FullscreenCloseDestination, FullscreenCloseRequestOutcome,
+    FullscreenCloseState, ViewerCloseCause,
 };
 #[cfg(all(test, windows))]
 mod close_return_tests;
@@ -61728,7 +61729,7 @@ impl App {
         // 前フレームに立てたもので、ここで通常のナビ経路 (load → 内部で close_fullscreen)
         // へ流すことで L2 ページ一覧を見せずに L1 へ抜ける。フォーカス/ダイアログ判定より
         // 前に出す (確実に消化するため)。
-        if let Some(nav) = self.take_pending_return_to_parent_nav() {
+        if let Some(nav) = self.take_pending_return_to_parent_nav_with_focus(ctx) {
             return Some(nav);
         }
 
@@ -63763,7 +63764,7 @@ impl App {
         &mut self,
         call: DirectNavigationContinuation,
         scan: ScannedDir,
-    ) {
+    ) -> bool {
         let purpose = FolderOpenScanPurpose::DirectNavigation(Box::new(call));
         let FolderOpenScanPurpose::DirectNavigation(call) = &purpose else {
             unreachable!()
@@ -63776,7 +63777,7 @@ impl App {
             || !self.open_request_owner_is_current(&call.path, &call.owner)
         {
             self.finish_folder_open_scan_purpose(&purpose, FsNavigationSequenceFinish::Superseded);
-            return;
+            return false;
         }
         let FolderOpenScanPurpose::DirectNavigation(call) = purpose else {
             unreachable!()
@@ -63822,6 +63823,9 @@ impl App {
                 );
             }
         }
+        close_return_id.is_some()
+            && matches!(outcome, FolderOpenOutcome::Loaded)
+            && self.fullscreen_idx.is_none()
     }
 
     fn spawn_folder_open_scan(
@@ -64242,7 +64246,7 @@ impl App {
 
         match ready.purpose {
             FolderOpenScanPurpose::DirectNavigation(call) => {
-                self.resume_direct_navigation_scan(*call, scan);
+                self.resume_direct_navigation_scan_with_focus(ctx, *call, scan);
                 None
             }
             FolderOpenScanPurpose::PaneNavigation
@@ -67178,7 +67182,8 @@ impl App {
             main_viewport_focused,
             fullscreen_input_owner_blocks_main_focus,
             embedded_still,
-            self.settings.fullscreen_keep_on_app_switch,
+            self.settings.fullscreen_keep_on_app_switch
+                || self.fs_close_return_navigation_wait_active(),
             fullscreen_root_key_handled,
         ) {
             crate::logger::log(format!(
@@ -67191,7 +67196,8 @@ impl App {
             self.fs_focus_grace_elapsed,
             main_viewport_focused,
             embedded_still,
-            self.settings.fullscreen_keep_on_app_switch,
+            self.settings.fullscreen_keep_on_app_switch
+                || self.fs_close_return_navigation_wait_active(),
             fullscreen_root_key_handled,
         ) {
             self.restore_fullscreen_focus_from_main(ctx);
@@ -86216,9 +86222,9 @@ impl App {
     /// `pending_return_to_parent` を立てるだけにし、`App::update` の入力ナビ合流点が
     /// 通常のナビ (load → 内部で close_fullscreen) を発行する。BS は階層を 1 段だけ戻す
     /// (= 常に L2) ので本関数を通さず `close_fullscreen` を直接呼ぶ (ui_fullscreen 側)。
-    pub(crate) fn handle_fullscreen_close_request(&mut self) {
+    pub(crate) fn handle_fullscreen_close_request(&mut self) -> FullscreenCloseRequestOutcome {
         if self.viewer_mutation_modal_active() {
-            return;
+            return FullscreenCloseRequestOutcome::Ignored;
         }
         #[cfg(windows)]
         let close_owner = self.projected_detached_close_owner(ViewerCloseCause::User);
@@ -86228,12 +86234,11 @@ impl App {
             // One accepted close owns one frozen destination. Later refreshes
             // invalidate only that destination; they must not choose a new route.
             if self.pending_return_to_parent.has_accepted_request() {
-                return;
+                return FullscreenCloseRequestOutcome::Ignored;
             }
             if let Some(plan) = self.chosen_zip_list_return() {
-                self.pending_return_to_parent =
-                    FullscreenCloseContinuation::LiveZipListReturn(plan);
-                return;
+                self.pending_return_to_parent.state = FullscreenCloseState::LiveZipListReturn(plan);
+                return FullscreenCloseRequestOutcome::ReturnAccepted;
             }
         }
         // Detached bookmark viewers never navigate their own bundle to the bookmark surface: the
@@ -86249,14 +86254,14 @@ impl App {
         {
             self.pending_return_to_parent
                 .request_live_with_presentation(close_presentation);
-            return;
+            return FullscreenCloseRequestOutcome::ReturnAccepted;
         }
         if self.projected_viewer_context_id() == self.viewer_context_main()
             && self.auto_open_for_current_container()
         {
             self.pending_return_to_parent
                 .request_live_with_presentation(close_presentation);
-            return;
+            return FullscreenCloseRequestOutcome::ReturnAccepted;
         }
         self.accept_current_page_list_request();
         #[cfg(windows)]
@@ -86273,7 +86278,18 @@ impl App {
                 "handle_fullscreen_close_request",
             );
         }
+        #[cfg(windows)]
+        let deferred_terminal_close = self.video_presentation_transition.is_transitioning();
+        #[cfg(not(windows))]
+        let deferred_terminal_close = false;
         self.close_fullscreen();
+        if deferred_terminal_close {
+            FullscreenCloseRequestOutcome::DeferredTerminalClose
+        } else if self.fullscreen_idx.is_none() {
+            FullscreenCloseRequestOutcome::ClosedNow
+        } else {
+            FullscreenCloseRequestOutcome::Ignored
+        }
     }
 
     /// `App::update` の通常の pending-nav 消化点より後で届く close イベント向け。
@@ -86281,20 +86297,23 @@ impl App {
     /// Windows native presenter のキー・マウス・ウィンドウイベントは、そのフレームの
     /// pending-nav 消化後に処理されることがある。通常の close 要求を発行した直後に同じ
     /// ナビをここで消化し、ブックマーク一覧への復帰を次フレームへ取り残さない。
-    pub(crate) fn handle_fullscreen_close_request_immediate(&mut self) {
-        self.handle_fullscreen_close_request();
+    pub(crate) fn handle_fullscreen_close_request_immediate(
+        &mut self,
+    ) -> FullscreenCloseRequestOutcome {
+        let outcome = self.handle_fullscreen_close_request();
         #[cfg(windows)]
         if self.projected_viewer_context_id() != self.viewer_context_main() {
-            return;
+            return outcome;
         }
         let Some(nav) = self.take_pending_return_to_parent_nav() else {
-            return;
+            return outcome;
         };
         if !self.apply_fullscreen_close_nav_immediate(nav) {
             // 現在 resolve_return_to_parent_nav が返すナビはすべて即時適用可能だが、
             // 将来対象外のナビが増えても要求を失わず通常の update 経路へ戻す。
             self.pending_return_to_parent.request_live();
         }
+        outcome
     }
 
     #[cfg(windows)]
@@ -105490,7 +105509,7 @@ impl App {
         // `pending_return_to_parent` を立てる。`handle_keyboard` だけで消化すると、
         // フルスクリーン入力が root 側で処理されたフレームや専用 viewport の repaint だけが
         // 走ったフレームで予約が残るため、描画後に通常の入力ナビへ合流させる。
-        let mut fullscreen_close_nav = self.take_pending_return_to_parent_nav();
+        let mut fullscreen_close_nav = self.take_pending_return_to_parent_nav_with_focus(ctx);
         if let Some(nav) = fullscreen_close_nav.take() {
             let unsupported_history_nav = matches!(
                 nav,
@@ -105499,7 +105518,7 @@ impl App {
             );
             if unsupported_history_nav {
                 fullscreen_close_nav = Some(nav);
-            } else if self.apply_fullscreen_close_nav_immediate(nav) {
+            } else if self.apply_fullscreen_close_nav_immediate_with_focus(ctx, nav) {
                 ctx.request_repaint();
                 #[cfg(all(feature = "test-script", windows))]
                 self.release_check_record_early_tail(ctx);
@@ -105637,7 +105656,7 @@ impl App {
                 // in-window 静止画フルスクリーンではここで消化しないと親一覧への
                 // 直帰ナビが捨てられてしまう。
                 if let Some(nav) = fullscreen_close_nav.take() {
-                    if self.apply_fullscreen_close_nav_immediate(nav) {
+                    if self.apply_fullscreen_close_nav_immediate_with_focus(ctx, nav) {
                         ctx.request_repaint();
                         #[cfg(all(feature = "test-script", windows))]
                         self.release_check_record_early_tail(ctx);

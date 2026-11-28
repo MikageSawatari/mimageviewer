@@ -9535,17 +9535,13 @@ impl App {
         match context {
             RingShortcutContext::ImageFullscreen => {
                 let detached = self.viewer_session_is_detached();
-                self.handle_fullscreen_close_request();
-                if !detached {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    #[cfg(windows)]
-                    self.observe_viewport_presentation_command(
-                        ctx.viewport_id(),
-                        crate::presentation_observer::WindowAction::Focus,
-                        "gamepad::apply_ring_close_fullscreen",
-                        "viewport_command=Focus",
-                    );
-                }
+                let outcome = self.handle_fullscreen_close_request();
+                self.route_fullscreen_close_entry_focus(
+                    ctx,
+                    outcome,
+                    !detached,
+                    "gamepad::apply_ring_close_fullscreen",
+                );
                 ctx.request_repaint();
             }
             RingShortcutContext::VideoFullscreen => {

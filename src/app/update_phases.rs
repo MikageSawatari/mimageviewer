@@ -36,6 +36,9 @@ impl App {
         keyboard_nav_from_fullscreen_close: bool,
         gamepad_nav: Option<crate::ui_main::AddressBarNav>,
     ) {
+        let close_focus = self
+            .take_fullscreen_close_dispatch_focus()
+            .filter(|_| gamepad_nav.is_none() && keyboard_nav_from_fullscreen_close);
         if let Some(nav) = gamepad_nav {
             self.dispatch_main_input_nav_immediate(nav, false);
         } else if let Some(nav) = keyboard_nav {
@@ -48,6 +51,7 @@ impl App {
             #[cfg(windows)]
             self.poll_main_embedded_required_fullscreen_folder_open(ctx);
         }
+        self.finish_fullscreen_close_dispatch_focus(ctx, close_focus);
     }
 
     // Worker adoption can enter a UI-bound presentation continuation; see the ledger.
@@ -1329,6 +1333,9 @@ impl App {
             && toolbar_drive_nav.is_none()
             && input_nav.is_some()
             && input_nav_from_fullscreen_close;
+        let close_focus = self
+            .take_fullscreen_close_dispatch_focus()
+            .filter(|_| dispatches_fullscreen_close);
         let drive_jump_wins = fav_nav.is_none()
             && toolbar_fav_nav.is_none()
             && toolbar_drive_nav.is_none()
@@ -1918,6 +1925,7 @@ impl App {
                 );
             }
         }
+        self.finish_fullscreen_close_dispatch_focus(ctx, close_focus);
     }
 
     pub(super) fn post_render_native_drag(&mut self, ctx: &egui::Context) {

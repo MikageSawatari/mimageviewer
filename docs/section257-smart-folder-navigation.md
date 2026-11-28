@@ -36,6 +36,13 @@ PDF warm placeholder と準備済み PDF pages の Smart child 可視採用は�
 
 採用済み `SmartFolderSession` は Root または Child の排他 phase、Child は元 root を `Visible` move payload か `Offscreen` prepared payload として一つだけ所有する。Root へ戻る際は synthetic 側 favorite を先に確定し、stamp 同値なら選択・scroll・AutoAspect を exact 復元、真の設定差だけ anchor 付き再 prepare する。削除 tombstone も同じ root snapshot accessor を通り、offscreen root で削除した行を復活させない。
 
+§1.853 の close Focus の設計返却 R1 では、この Smart 固有の帰路を非 C5 とした。
+resident root は同期の content close 後、staged root／physical child は全画面を残す成功受付のフレームで、
+既存の close 入口が記録した viewport へ Focus を 1 回送る。実 dispatch 前後で、
+新しい受理済み Smart owner の ID と current navigation を確認した場合だけを従前維持の例外にする。拒否で全画面が残った場合は送らない。
+後の Smart 採用で Focus を追加せず、Smart の待ちと main focus guard の従来の関係も変更しない。
+実装・未検証の記録は [ui-sync-853-plan.md §6.19.4](ui-sync-853-plan.md#6194-実装の記録) を参照。
+
 `SmartFolderViewState` の Root、Container、Scoped は履歴位置の正本である。Container は root 直下 PDF/ZIP/変換書庫である。Scoped は現在地の `SmartChildKind` を同じ位置に保持する。別 Folder への `move_to` は Folder へ戻し、PDF/ZIP/変換書庫の採用時だけ exact kind を記録する。no-resident 履歴はこの kind を使うので、表示元 row の消失後も子フォルダ内の仮想本を Folder scan と誤認しない。変換元 `.7z` 等が履歴・favorite・address の論理 source、cache ZIP は実ロード alias のみである。
 
 履歴 Back/Forward は pop 前に target を peek し、成功採用で一辺だけ commit、失敗・取消・別操作では stack を変えない。連打は transition 内の仮想 cursor に集約する。root-only は root 採用、Container/Scoped は子採用で確定する。検索 Return は query と検索結果の旧 owner を採用まで保持する。Remote fullscreen 復帰は exact Smart request ID の Pending/Adopted/Retired terminal を待ち、古い grid に復帰しない。

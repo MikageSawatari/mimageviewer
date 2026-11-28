@@ -1458,6 +1458,31 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-28: C5 の main 全画面 close と Focus の所有 (§1.853、v590-focus-close)
+
+- 正本は [ui-sync-853-plan.md §6.19〜§6.19.4](ui-sync-853-plan.md#619-c5-の退行の修正-メインへの-focus-を全画面を閉じる時点へ移す-2026-11-28利用者決定案-1-で根本的に直す)。
+  設計レビュー r1〜r3 は症状パッチではなく構造的修正であることに **AGREE**、設計担当 ClaudeCode も同意している。
+  これは設計時の合意の記録であり、今回の独立実装レビューを実施したという意味ではない。
+- 触れた範囲は main context の close 受付／dispatch／C5 採用と main focus guard の keep 条件。
+  実際の close と帰路の受付を型で分け、入口の Focus 宛先を既存 continuation に属させる。
+  C5 だけ採用側へ責務を移し、閉じる前の専用 still HWND と送信直前の OS foreground を照合する。
+  新しい App 全体の pending、待ち時間、再試行、追加 repaint は導入しない。
+- 設計返却 R1 への設計担当の回答で、Focus は実 dispatch の適用後に判断する形へ改訂した。
+  SmartFolder の resident 復元は同期 close 後、全画面を残す staged 復元は従前どおり受付フレームで送る。
+  補足回答により RatingViewBack も従前維持とし、同じ形の captured origin の
+  Physical／Collection history、サブ展開 Return も受付フレームで送る。既存 owner の ID／sequence／token を
+  dispatch の呼出内だけで比較する読取 helper で成功受付を確認する。Smart／サブ展開の worker 自体は変更しない。
+  新しい採用時 Focus、wait／guard の拡張、detached session の変更は行わない。
+- 独立実装レビュー r1 (REJECT、P2×1・P3×1) の対応で、main の Direct／DirectNavigation／DirectScan の成功した
+  suffix 分類受付も、既存 request ID の照合による同フレームの Focus 対象へ含めた。分類済み Directory は scan を持ち、別の C5 待ちを作らない。
+  Everything は同期 close だったため、誤った前提の legacy Focus helper を削除した。detached の owner と lifecycle は変更しない。
+  これは別の独立レビュアーの指摘への対応記録であり、修正後の実装レビュー ACCEPT を得たという記録ではない。
+- detached の session／述語／viewport identity／寿命／placement／配送は変更しない。
+  共有 continuation は同じ bundle field を維持し、状態 enum を内包する形にした。
+  `viewer_context_registry.rs` の変更は既存テストの state 参照の機械的な追従だけで、session 実装の変更はない。
+  native presenter/HUD は既存 effect と reclaim に任せ、sibling が前面なら main の C5 採用で Focus を送らない。
+- コンパイル・テスト・実機確認・独立実装レビューは未実施。利用者の指示によりビルドと実行は設計担当へ引き渡す。
+
 ### 2026-11-28: master取り込み後のAppのサイズ
 
 `ViewerContextBundle`が持つ`FsExclusiveView::Depth`の中身を`Box<DepthViewState>`へ変更した。型の格納だけを変え、所有・寿命・退避/swap・退役、detached述語とviewport配送は変更しない。

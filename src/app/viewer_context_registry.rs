@@ -7235,19 +7235,19 @@ mod tests {
                     let main = app.viewer_context_main();
                     app.transfer_terminal_close_return(main, ViewerCloseCause::User);
                     assert!(matches!(
-                        app.pending_return_to_parent,
-                        FullscreenCloseContinuation::Terminal(_)
+                        app.pending_return_to_parent.state,
+                        FullscreenCloseState::Terminal(_)
                     ));
                 } else {
                     app.handle_fullscreen_close_request();
                     assert!(matches!(
-                        app.pending_return_to_parent,
-                        FullscreenCloseContinuation::LiveZipListReturn(_)
+                        app.pending_return_to_parent.state,
+                        FullscreenCloseState::LiveZipListReturn(_)
                     ));
                 }
                 // Keep the actual Terminal recipe identity, not merely its enum tag.
-                let terminal_pointer = match &app.pending_return_to_parent {
-                    FullscreenCloseContinuation::Terminal(request) => {
+                let terminal_pointer = match &app.pending_return_to_parent.state {
+                    FullscreenCloseState::Terminal(request) => {
                         Some(std::ptr::from_ref(request.as_ref()))
                     }
                     _ => None,
@@ -7311,8 +7311,8 @@ mod tests {
                         .unwrap()
                         .matches_list_return_plan(&plan)
                 );
-                match (&app.pending_return_to_parent, terminal_pointer) {
-                    (FullscreenCloseContinuation::LiveZipListReturn(request), None) => {
+                match (&app.pending_return_to_parent.state, terminal_pointer) {
+                    (FullscreenCloseState::LiveZipListReturn(request), None) => {
                         assert!(
                             app.zip_nav
                                 .as_ref()
@@ -7320,7 +7320,7 @@ mod tests {
                                 .matches_list_return_plan(request)
                         );
                     }
-                    (FullscreenCloseContinuation::Terminal(request), Some(pointer)) => {
+                    (FullscreenCloseState::Terminal(request), Some(pointer)) => {
                         assert_eq!(std::ptr::from_ref(request.as_ref()), pointer);
                     }
                     (state, _) => {
