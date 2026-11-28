@@ -1458,6 +1458,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-28: v5.9.0 の公開前の viewer_context_audit (A3・A4) の登録
+
+- master (`b34e61c0a`) で `viewer_context_audit` が 9 件の違反を出した。CI でしか流れない監査で、v5.9.0 の各ブランチの検証に入っていなかった (v5.6.0 と同じ経緯)。
+- A4 (公開 API の fingerprint) の未登録: §1.911 段 2 の `ViewerContextBundle.folder_order` (Box) と読み取りの `ContextRef::folder_order`、§1.920 の読み取りの `foreground_viewer_context_id` (2 cfg) と `page_edit_tools_owned_by_projected_context`。どれも上の §1.911・§1.920 の記録の範囲のままで、mount も変更もしない。fingerprint と理由だけを許可リストに足した。
+- A3 (registry の外で `ViewerContextBundle` の関連関数を呼ぶ): §1.914 と §1.911 段 6 のテスト 2 件が、別ファイルのテストから `ViewerContextBundle::empty()` を呼んでいた。registry に試験用の `App::empty_viewer_context_bundle_for_test()` (cfg(all(test, windows))) を足し、2 件をそれに差し替えた。
+- `ViewerContextBundle::empty()` は §1.911 段 6 (`e80fecb5d`) でテストのために `pub(crate)` へ広げられていた。外からの呼び出しは無くなったが、v5.9.0 の配布物と同じ製品ソースを保つため、今回は許可リストに登録して残し、公開後に非公開へ戻す。
+- 製品のコード・detached の述語・viewport の経路は変えていない (変更はテスト・試験用 helper・監査ツールの許可リストだけ)。統括 ClaudeCode の判断で、独立レビューは未実施。
+
 ### 2026-11-28: C5 の main 全画面 close と Focus の所有 (§1.853、v590-focus-close)
 
 - 正本は [ui-sync-853-plan.md §6.19〜§6.19.4](ui-sync-853-plan.md#619-c5-の退行の修正-メインへの-focus-を全画面を閉じる時点へ移す-2026-11-28利用者決定案-1-で根本的に直す)。

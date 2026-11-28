@@ -6608,6 +6608,13 @@ impl App {
         VIEWER_CONTEXT_RATING_BOUNDARY_TRACE.with(|trace| *trace.borrow_mut() = None);
     }
 
+    /// An unmounted empty bundle for tests in separate files that swap a sibling in and out.
+    /// Those files are not inline cfg(test) items, so audit rule A3 keeps them from naming
+    /// `ViewerContextBundle` associated functions directly.
+    pub(in crate::app) fn empty_viewer_context_bundle_for_test() -> Box<ViewerContextBundle> {
+        Box::new(ViewerContextBundle::empty())
+    }
+
     pub(in crate::app) fn begin_mounted_detached_session_for_test(
         &mut self,
         window_id: u64,

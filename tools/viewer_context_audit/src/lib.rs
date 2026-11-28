@@ -310,7 +310,9 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     // 1.444 freezes the main listing order in this bundle; forks leave it with the parent.
     // 1.796 r5: the ephemeral exact spread origin shares this context owner;
     // mount/swap preserve it, and a fork starts without it or its projection.
-    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { pub (in crate :: app) list_order : Option < Arc < super :: ListOrderSnapshot > > , pub (super) spread_shift : super :: spread_shift_owner :: ViewerSpreadShift , pub (super) spread_step : Option < super :: spread_shift_owner :: SpreadStep > , pub (super) book_composition : super :: book_composition_runtime :: ViewerBookComposition , pub (super) composition_editor : super :: book_composition_editor :: CompositionEditorState , pub (super) book_composition_permission : super :: book_composition_permission :: ViewerPresentationPermission }",
+    // 1.911 stage 2 (9ccc99e91, boxed in 51cce6c5a): the folder manual-order state is owned with
+    // the items in this same context; capture/swap move the Box and fork clones an independent copy.
+    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { pub (in crate :: app) list_order : Option < Arc < super :: ListOrderSnapshot > > , pub (in crate :: app) folder_order : Box < crate :: folder_order :: FolderOrderState > , pub (super) spread_shift : super :: spread_shift_owner :: ViewerSpreadShift , pub (super) spread_step : Option < super :: spread_shift_owner :: SpreadStep > , pub (super) book_composition : super :: book_composition_runtime :: ViewerBookComposition , pub (super) composition_editor : super :: book_composition_editor :: CompositionEditorState , pub (super) book_composition_permission : super :: book_composition_permission :: ViewerPresentationPermission }",
     "trait impl # [cfg (windows)]   ViewerContextBundle  Drop {   fn drop (& mut self) }",
     "item struct # [cfg (windows)] pub (in crate :: app) struct ContextRef < 'a > { }",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn mounted (app : & 'a App) -> Self",
@@ -412,6 +414,19 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     // 1.851 (b5057ecca): read-only check that a collection grid request stamp still matches the
     // mounted or at-rest context's own grid view and items generation; no mount or mutation.
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn collection_grid_request_stamp_is_current (self , context_id : ViewerContextId , stamp : top_level_grid_view :: CollectionGridRequestStamp ,) -> bool",
+    // 1.911 stage 2 (9ccc99e91): read-only projection of the mounted or at-rest context's own
+    // folder manual-order state; no mount or mutation, same kind as grid_scroll above.
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn folder_order (self) -> & 'a crate :: folder_order :: FolderOrderState",
+    // 1.920 (7dd968445): read-only identity of the foreground owner from the registry table, and the
+    // predicate that App-wide edit drafts belong to it rather than to a temporary sibling projection.
+    // No mount or mutation. Structural agreement: detached-rework-plan.md section 11, 2026-11-27.
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn foreground_viewer_context_id (& self) -> Option < ViewerContextId >",
+    "inherent fn # [cfg (not (windows))]   App ::  pub (in crate :: app) fn foreground_viewer_context_id (& self) -> Option < ViewerContextId >",
+    "inherent fn    App ::  pub (crate) fn page_edit_tools_owned_by_projected_context (& self) -> bool",
+    // 1.911 stage 6 (e80fecb5d) widened this from private for test files. Those tests now use
+    // App::empty_viewer_context_bundle_for_test, so nothing outside the registry calls it (A3 holds).
+    // Kept here only so the v5.9.0 release source stays unchanged; return it to private afterwards.
+    "inherent fn # [cfg (windows)]   ViewerContextBundle ::  pub (crate) fn empty () -> Self",
 ];
 
 /// Violations that are real, understood, and deliberately not fixed yet.

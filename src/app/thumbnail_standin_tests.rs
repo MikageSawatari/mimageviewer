@@ -671,7 +671,7 @@ fn thumbnail_standins_context_swap_close_and_fork_keep_sibling_owner_independent
     app.thumbnails[0] = loaded(texture(&ctx, "main-context"));
     install_pending_standins(&mut app);
     let source_id = app.grid_thumbnail_display_image(0).unwrap().tex.id();
-    let mut sibling = viewer_context_registry::ViewerContextBundle::empty();
+    let mut sibling = App::empty_viewer_context_bundle_for_test();
     app.swap_viewer_context_bundle(&mut sibling);
     assert!(app.thumbnail_standins.images.is_empty());
     synthetic_loaded(&mut app, 1);

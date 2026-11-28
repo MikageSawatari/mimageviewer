@@ -152,7 +152,7 @@ fn mask_detect_context_box_swap_and_drop_keep_catalog_and_sibling_state() {
         panic!("fixture catalog");
     };
     let catalog_cancel = Arc::clone(catalog_cancel);
-    let mut sibling = Box::new(viewer_context_registry::ViewerContextBundle::empty());
+    let mut sibling = App::empty_viewer_context_bundle_for_test();
     app.swap_viewer_context_bundle(&mut sibling);
     assert_ne!(std::ptr::from_ref(app.mask_detect.context.as_ref()), owner);
     assert!(app.mask_detect.context.pending.is_none());
