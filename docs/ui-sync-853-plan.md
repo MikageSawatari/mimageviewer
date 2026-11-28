@@ -2833,3 +2833,24 @@ r1 の指摘 (P2×4): native の遅延 close と既存の前面復帰の二重�
 main の採用で Focus を出さない、(f13) `fullscreen_keep_on_app_switch` ON/OFF と Ctrl+↑↓ の待ちの guard の非退行、
 (f14) `RatingViewBack`・ZipListReturn・ブックマーク・「行き先なし」で Focus が今と同じフレームに 1 回。
 (f6) は「同期に適用される閉じ戻りで Focus が 1 回」に改め、失敗は「全画面が残り Focus なし」を検査する。
+
+#### 6.19.2 設計レビュー r2 (同じ担当の継続、d67a1d01d、2026-11-28): REJECT → 改訂 (r3)
+
+r2 の指摘: (P2) 採用時の前面の判定に、保存済みの `input_for(fs_id).focused` だけを使うと、main の全画面が描かれないフレーム
+(active detached context を更新したフレーム、`app.rs` 4608・105464 付近) の後に前面が sibling や別のアプリへ移っても真のまま残り得る。
+(P3) 非 C5 の Focus の宛先 (受付元の viewport、ページめくりの barrier の中では子 viewport) を dispatch へ渡す契約が無い。
+それ以外 (非 C5 の見え方・embedded と native の分担・RatingViewBack を変えない判断・guard の keep 条件・失敗と再 close) は妥当、
+構造的修正に **AGREE**。
+
+改訂 (§6.19.1 の 1・2 に追加):
+
+- 採用時の前面の判定は、**Focus を送る直前の OS の前面の窓** (`GetForegroundWindow`、既存の `key_input.rs` の
+  `current_foreground_hwnd_raw` と同じ取り方) が、閉じる main の全画面の表示面の HWND (専用 still の viewport の窓) であることで決める。
+  保存済みの egui の focused は使わない。表示面の HWND が分からない・一致しない (sibling・別のアプリ・不明) ときは出さない。
+  前面の照合は閉じる前に取った表示面の HWND と行い、閉じた後の窓の状態には頼らない。
+- 非 C5 の Focus は、閉じる要求を受けた入口が今出している Focus をそのまま保つ: 受付の入口は、閉じる要求の結果 (型) に加えて
+  「Focus を出す入口か」と「宛先の `ViewportId` (受付元の ctx の viewport)」を、既存の close continuation (`pending_return_to_parent` の
+  受付の記録) に持たせ、dispatch が非 C5 と決めたときにその宛先へ 1 回出す。C5 の待ちになったときは持たせた Focus を捨て、採用の規則
+  (上) に従う。true close (閉じ戻りの無い閉じる) は今までどおり受付の所で出す。
+- テスト: (f12) を「保存済みの focused は真のまま、現在の前面は sibling (または別のアプリ)」でも検査する (前面の窓の取得はテストで
+  差し替えられる形にする)。(f9) は回数に加えて宛先の viewport も検査する。
