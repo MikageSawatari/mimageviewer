@@ -859,3 +859,99 @@ fn investigation_master_everything_no_origin_zipdir_rows_match_nav() {
             .is_none()
     );
 }
+
+#[test]
+fn section1853_close_focus_everything_worker_keeps_entry_frame_target_and_no_adoption_focus() {
+    fn frame(
+        ctx: &egui::Context,
+        target: egui::ViewportId,
+        run: impl FnOnce(),
+    ) -> Vec<egui::ViewportId> {
+        ctx.begin_pass(egui::RawInput {
+            viewport_id: target,
+            viewports: [
+                (egui::ViewportId::ROOT, egui::ViewportInfo::default()),
+                (
+                    target,
+                    egui::ViewportInfo {
+                        parent: (target != egui::ViewportId::ROOT)
+                            .then_some(egui::ViewportId::ROOT),
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+        run();
+        let output = ctx.end_pass();
+        let targets = output
+            .viewport_output
+            .iter()
+            .flat_map(|(target, viewport)| {
+                viewport.commands.iter().filter_map(move |command| {
+                    matches!(command, egui::ViewportCommand::Focus).then_some(*target)
+                })
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        targets
+    }
+    for child in [false, true] {
+        for immediate in [false, true] {
+            let mut app = setup_app_for_test();
+            let ctx = egui::Context::default();
+            app.settings.auto_fullscreen_image_folders = true;
+            app.settings.detached_viewer_open_images_in_window = false;
+            let root = app.tmp.path().to_path_buf();
+            app.current_folder = Some(root.clone());
+            let (row, _) = fixture(&mut app, &root, Book::Folder);
+            adopt(&mut app, &ctx, "close focus", dataset(vec![row.clone()]));
+            open(&mut app, &ctx, &row, true);
+            let target = if child {
+                app.fullscreen_viewport_id()
+            } else {
+                egui::ViewportId::ROOT
+            };
+            assert_eq!(
+                frame(&ctx, target, || {
+                    let outcome = app.handle_fullscreen_close_request();
+                    app.route_fullscreen_close_entry_focus(
+                        &ctx,
+                        outcome,
+                        true,
+                        "everything-close-focus-test",
+                    );
+                    let nav = app
+                        .take_pending_return_to_parent_nav_with_focus(&ctx)
+                        .unwrap();
+                    if immediate {
+                        assert!(app.apply_fullscreen_close_nav_immediate_with_focus(&ctx, nav));
+                    } else {
+                        app.post_render_main_navigation(
+                            &ctx,
+                            update_phases::MainFrameNavigation {
+                                fullscreen_close_nav: Some(nav),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }),
+                vec![target]
+            );
+            assert!(app.viewer_session_blocks_main_window());
+            assert!(!app.fs_close_return_navigation_wait_active());
+            assert_everything_return_only_for_test(&app);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while app.everything_has_physical_child() {
+                assert!(frame(&ctx, target, || app.poll_search_page_edit_prepare(&ctx)).is_empty());
+                assert!(Instant::now() < deadline, "Everything return did not adopt");
+                std::thread::yield_now();
+            }
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.items[app.selected.unwrap()], row);
+            assert!(frame(&ctx, target, || {}).is_empty());
+        }
+    }
+}

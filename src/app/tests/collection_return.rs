@@ -509,7 +509,9 @@ fn investigate(
             let nav = env.resolve_grid_parent_nav().expect("toolbar parent nav");
             assert!(env.apply_fullscreen_close_nav_immediate(nav));
         }
-        Return::AutoClose => env.handle_fullscreen_close_request_immediate(),
+        Return::AutoClose => {
+            env.handle_fullscreen_close_request_immediate();
+        }
     }
     if matches!(origin, Origin::CollectionRoot) {
         driver.wait_for(&mut env, |a| {

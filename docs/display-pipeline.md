@@ -3919,6 +3919,23 @@ true-close の後始末より前に、実際に描いている holdover を優�
 採用直前の `ViewerExited`、失敗／取消／置換の `Superseded` で同じ要求だけを終える。
 ページ送り・ジャンプ・スクロールの拒否と、読み込み中の表示を出さない扱いは既存の FolderItems 待ちに従う。
 Ctrl+↑↓ の previous 描画は変更しない。[設計 §6.12](ui-sync-853-plan.md#612-c5-全画面から戻る経路-全画面の-ctrl-の待ちと同じ扱い-利用者決定-61r6)。
+閉じる入口は型付きの `FullscreenCloseRequestOutcome` で、実際に閉じた結果と閉じ戻りの受付を区別する。
+既存の close continuation が受付元の Focus 宛先を持つ。実際の dispatch がその属性を呼出内の値へ移し、
+適用後に CloseReturn の待ちが始まった場合だけ資格を捨て、採用する ctx 所有の呼出元へ責務を渡す。
+待ちが無く main 全画面が閉じていれば、その dispatch フレームで元の宛先へ 1 回送る。
+失敗・拒否で全画面が残った場合は送らず、次フレームの保留も作らない。
+SmartFolder は非 C5。resident root は同期 close 後に送る。staged root／physical child は全画面を残して別フレームへ進むので、
+dispatch 前後の既存 owner ID と navigation の照合で成功受付を確認した場合だけ、従前どおり dispatch フレームで送る。
+後の Smart 採用で Focus を追加せず、Smart 復元待ちと guard の既存の関係も変えない。
+設計担当の補足に従い、同じ形の既存非 C5 帰路も受付フレームの Focus を保つ。
+RatingViewBack の root／物理階層、Everything の retained prepare、captured origin の Physical／Collection history、
+サブ展開の Return が全画面を残す場合は、dispatch 前後で新しい current owner の成功受付を確認して元の宛先へ 1 回送る。
+拒否や以前からある worker は資格にならない。これらの採用時 Focus や wait 用の guard 条件は追加しない。
+専用 still viewport の teardown 前に `native_window_allocation_witness` から HWND を捕捉し、送信直前の
+`GetForegroundWindow` と一致するときだけ送る。保存済みの egui focused は使わず、embedded・native presenter/HUD・
+不明・別窓・他アプリを対象外にする。失敗／拒否／切断／取消／置換は全画面を保ち Focus を送らない。
+C5 待ち中の main focus guard は既存 keep 設定と同じ restore を選び、走査を取り消さない。
+Ctrl+↑↓ の guard は変えない。[Focus の所有とテストの記録](ui-sync-853-plan.md#6194-実装の記録)。
 本追補のコンパイル・テスト・実機描画は未確認。
 
 単一ページは 1 ページ、見開きは左右 2 ページを表示単位として、**表示単位全体を 1 回で解決する**。

@@ -3300,6 +3300,14 @@ impl App {
             .map(|transition| &transition.navigation)
     }
 
+    /// A call-local dispatch snapshot distinguishes a newly accepted legacy return.
+    pub(super) fn staged_smart_navigation_focus_owner(&self) -> Option<u64> {
+        self.smart_folder_transition
+            .as_ref()
+            .filter(|transition| self.main_list_navigation_is_current(&transition.navigation))
+            .map(|transition| transition.request_id)
+    }
+
     /// Rapid input advances the one request's virtual cursor. A cross-kind
     /// handoff moves it unchanged; live history is never committed before load.
     pub(crate) fn advance_staged_smart_history(
@@ -10205,6 +10213,10 @@ impl App {
 #[path = "page_edit_smart_tests.rs"]
 mod page_edit_item_change_tests;
 
+#[cfg(all(test, windows))]
+#[path = "smart_folder_close_focus_tests.rs"]
+mod close_focus_tests;
+
 #[cfg(test)]
 mod tests {
     // §1.898: 実ドライブのルートは判定だけに渡す。本物の Shell を実パスに呼ばせない。
@@ -12365,7 +12377,7 @@ mod tests {
         )
     }
 
-    fn install_smart_identity_test_root_with_items(
+    pub(super) fn install_smart_identity_test_root_with_items(
         app: &mut crate::app::App,
         policy: crate::file_type_visibility::FileTypeVisibility,
         items: Vec<GridItem>,

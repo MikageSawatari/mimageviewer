@@ -463,7 +463,9 @@ fn scenario(book: Book, linked: bool, parent_starred: bool, everything: bool, ro
         match route {
             Return::Escape => viewer_key(viewer, &ctx, egui::Key::Escape),
             // HUD × uses the same request consumer, without a synthetic key.
-            Return::Hud => viewer.handle_fullscreen_close_request(),
+            Return::Hud => {
+                viewer.handle_fullscreen_close_request();
+            }
             Return::PageList => viewer_key(viewer, &ctx, egui::Key::Backspace),
         }
     };

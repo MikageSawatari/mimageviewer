@@ -1400,15 +1400,16 @@ r2 の 3 件のうち D5 の限定と設定変更の分割は解消と判定。�
    teardown へ進む。採用以外の終端 (走査の失敗・退役・`Disconnected`・`cancel_folder_pane_open`) では、同じ要求が始めた sequence を
    `Superseded` で終え、全画面のまま入力が戻る。どちらも sequence の終わりは pending の purpose 別の後始末 1 か所に置く
    (入口ごとに書かない)。
-4a. 待ちの間に全画面が別の経路で閉じたとき (r6、設計レビュー r5 P2-3): Backspace はページ一覧への close
-   (`close_fullscreen_to_page_list`、`startup_list_restore.rs` 423)、focus guard は `close_fullscreen` (`app.rs` 65591) を呼ぶ。今の
+4a. 待ちの間に全画面が別の経路で閉じたとき (r6、設計レビュー r5 P2-3、focus guard は §6.19 で改訂): Backspace はページ一覧への close
+   (`close_fullscreen_to_page_list`、`startup_list_restore.rs` 423) を呼ぶ。C5 待ち中の main focus guard は全画面へ focus を戻し、
+   close を呼ばず走査を続ける (§6.19)。今の
    true-close の後始末が取り消す pane の走査は `RequiredFullscreenTarget` だけ (`snapshot_ops.rs` 2276、`app.rs` 62519) なので、
    放っておくと L2 を出した後に残った走査が親へ移してしまう。**新しい close を受け付ける境界で、その context の C5 の要求も
    退役させる** (`RequiredFullscreenTarget` と同じ扱い。置き場所は下の r7 の段落のとおり)。採用のときは pending を取り出した後に
    install が全画面を閉じるので、この退役に当たらない (自分の採用を消さない)。二度目の「閉じる」は、この退役の
    後に新しい要求として受け付けられる (5)。
    r7 (設計レビュー r6 P2-1): 退役を置くのは**新しい close の受付**の境界 (true-close の後始末、Backspace のページ一覧への close の
-   受付、focus guard の close の受付) だけにする。**受付済みの close の teardown では繰り返さない**: native の presentation 切替中の
+   受付、C5 待ち以外の focus guard の close の受付) だけにする。**受付済みの close の teardown では繰り返さない**: native の presentation 切替中の
    content の close は `TerminalClose` を積んで戻り (`app.rs` 84684)、後の effect が content の close へ再入する
    (`native_video.rs` 3166)。その間に agent・起動の転送の受付 (`update_phases.rs` 542、`app.rs` 103125) が新しい C5 の要求を
    受け付けていると、遅れた close がそれを退役させてしまう。既存コードも、この effect は「予約の退役は済んでいる」としている
@@ -1418,14 +1419,15 @@ r2 の 3 件のうち D5 の限定と設定変更の分割は解消と判定。�
    一緒に消え、新しい要求が受付時のものを持つ (閉じる要求ごとに子の名前を置き直す今の `take_close_return_navigation` のまま)。
 6. 待ちの間に始まり得る他の要求 (Remote の取得、起動の転送、agent の open、ブックマーク): 既存の受付の境界が待ちを退役させ
    (4 の後始末で sequence も終わる)、その要求の採用が全画面を扱う (§1.805 の規則 2 と同じ)。
-7. 待ちの間の Backspace・focus guard による close は 4a のとおり待ちを退役させ、今の close の結果 (ページ一覧等) になる。
+7. 待ちの間の Backspace は 4a のとおり待ちを退役させ、今の close の結果 (ページ一覧) になる。
+   main focus guard は §6.19 のとおり restore だけを行い、待ちを退役させない。Ctrl+↑↓ の待ちの既存方針は変えない。
 
 **テスト**: (a) 「ページを直接開く」の本を閉じる・ブックマーク・コレクションの物理元の閉じ戻りで、閉じたフレームに UI 走査 0 回、
 待ちの間は全画面が出たまま (`fullscreen_idx` が残る)、描画は閉じる前の表示単位の holdover (移動先が未準備のまま閉じた場合も)、
 完了で今と同じ親の一覧・選択になり、その間のフレームで一覧が L2 にならない。(b) 待ちの間の →・PageDown・ジャンプが何も
 起こさず、採用後の一覧にも届かない。(c) 走査失敗・Remote 等による退役で全画面のまま、sequence が終わってページ送りが戻る。
-(d) もう一度「閉じる」で前の待ちが退役し、新しい待ちの完了で同じ親の一覧になる。(d2) 待ちの間の Backspace・focus guard の close の
-後に遅い結果が来ても採用されない。(d4) native の presentation 切替中の遅れた `TerminalClose` の effect より前に受け付けた新しい
+(d) もう一度「閉じる」で前の待ちが退役し、新しい待ちの完了で同じ親の一覧になる。(d2) 待ちの間の Backspace の close の
+後に遅い結果が来ても採用されない。main focus guard では待ちを保ち、その完了で親へ戻る (§6.19 の意図した期待変更)。(d4) native の presentation 切替中の遅れた `TerminalClose` の effect より前に受け付けた新しい
 C5 の要求が、その effect で退役しない。(d5) 待ちの間の拡大・回転・位置の変更が描画に出る (今のページが準備済みのとき)。今のページが
 未準備で閉じたときは捕捉した表示単位が出て、準備ができたら通常の描画に替わる。(d6) 待ちの無いときの native の Home/End・HUD の対象
 指定と、swap 中の後続入力の保持が今と同じ。(d3) 採用のフレームで `CloseReturn` の sequence が `ViewerExited` で終わり、固定した情報パネルが
@@ -2859,3 +2861,240 @@ r2 の指摘: (P2) 採用時の前面の判定に、保存済みの `input_for(f
 
 r2 の P2・P3 は解消、新しい指摘なし。全画面の表示面の HWND は既存の `native_window_allocation_witness` (`vendor/eframe/src/native_window_input.rs`) から
 取れ、描かれなかったフレームでも照合できる。構造的修正に **AGREE** (r1〜r3)。設計の確定は §6.19・§6.19.1・§6.19.2 の合わせたもの。
+
+#### 6.19.4 実装の記録
+
+2026-11-28、`v590-focus-close`、基点 `e4cfabf39`。以下はコード編集前の入口・終端の棚卸し。
+コンパイル・cargo・nextest・ビルド・製品起動は行わない。設計担当が検証を担当する。
+
+| 入口／終端（編集前の位置） | 変更後の Focus の持ち主 |
+| --- | --- |
+| `ui_fullscreen.rs:47589` close_fs（Enter／Esc／短い右クリック、root とページめくり barrier 内の子 viewport） | 型付き結果が true close なら入口。閉じ戻りなら既存 continuation に送信資格と受付 ctx の宛先を記録し、同じフレームの dispatch が判断 |
+| `gamepad_input.rs:9534` 画像リングの close | 上と同じ。宛先は受付 ctx の viewport |
+| `ui_fullscreen.rs:47623` Backspace のページ一覧 close | 既存の入口。旧 C5 を取り消して true close、既存の宛先を維持 |
+| native presenter／HUD の `_immediate`（`native_video.rs:5996,6738,7066,12854,13214,13359`）、native backdrop の close（`ui_fullscreen.rs:34519`） | 一般の ROOT Focus は追加しない。既存の HWND 破棄後の reclaim。遅延 `TerminalClose` は `TerminalSessionClose` effect が所有 |
+| 動画リング（`gamepad_input.rs:9553`） | 既存のページ一覧 close と native reclaim。一般の Focus は追加しない |
+| C5 の採用（`app.rs:33686` ViewerExited、`resolve_main_folder_open_ready`／通常 navigation tail） | teardown 前の dedicated still HWND を捕捉し、採用結果を受けた ctx 所有の呼出元が送信直前の OS foreground と一致するときだけ ROOT へ 1 回。embedded／native／不明／sibling／他アプリは対象外 |
+| C5 の走査失敗・拒否・切断・cancel_folder_pane_open・退役 | なし。全画面を維持し同じ要求の lock を解放。既存のログ・通知のみ |
+| 待ち中の二度目の close | 旧要求の資格は破棄。新しい close だけが dispatch／採用を所有 |
+| 待ち中の Backspace | 旧要求を退役。ページ一覧 true close の既存入口が Focus を所有 |
+| 新しい navigation／Remote・起動転送・agent の置換 | 旧要求の Focus 資格を破棄。新しい要求の既存表示方針に従う |
+| 同期の ZipListReturn／Bookmarks／ReadingHistory／Collection | dispatch の適用で main 全画面が閉じた場合、そのフレームに記録した元の宛先へ 1 回。全画面が残った失敗・拒否は送らない |
+| RatingViewBack の root worker／物理階層の復元（`app.rs` `rating_view_back`／`start_rating_navigation_owned`／`start_rating_physical_restore`） | 非 C5。補足回答に従い新しい既存 owner の成功受付フレームで、入口が記録した宛先へ 1 回。物理復元前の suffix classification も同じ。採用時の送信と guard の拡張は追加しない |
+| EverythingResults（`global_search_ui/everything.rs` `return_from_everything_child`） | 非 C5。retained dataset prepare が全画面を残すため、新しい Return／prepare の成功受付フレームで元の宛先へ 1 回。採用時は 0 回 |
+| captured origin への物理／Collection の履歴復元（`reading_history_origin.rs` `dispatch_main_list_restore_destination` → `dispatch_owned_folder_history_destination`） | 非 C5。新しい Physical／Collection history owner（必要ならその前の classification）の成功受付フレームで元の宛先へ 1 回。採用時は送らない |
+| captured サブ展開 origin／synthetic 帰路（`subfolder_expansion.rs` `restore_subfolder_expansion_navigation_with_state`／`restore_subfolder_expansion_for_synthetic_path_with_state`） | 非 C5。snapshot の prepare または再 scan が全画面を残すため、新しい Return owner の成功受付フレームで元の宛先へ 1 回。採用時は 0 回 |
+| 上記 legacy owner の開始前の拒否／失敗、Rating prepare の取消だけで新しい帰路が始まらない場合 | main 全画面が残れば送らない。以前の worker は送信資格にならず、新しい採用時 owner も作らない |
+| 行き先なし（RetireNoDestination） | 同じフレームの dispatch が記録された宛先へ 1 回 |
+| 閉じ戻りのない true close／無視された要求 | true close は入口、無視は送信なし。native 遅延 close は既存 effect／reclaim |
+| main focus guard | C5 wait だけ既存 keep 条件へ加え restore を選ぶ。Ctrl+↑↓ wait は従来どおり |
+| `app.rs:65003` close_reopen_focus（移動後に表示対象が無い）、browser open refusal の `activate_main_window`／Focus | close-return の入口ではない。前者は既に close 済みの DFS／slideshow の終端、後者は browser の拒否の持ち主。既存の送信を維持 |
+| SmartFolder の `Direct` 帰路（synthetic root／physical child） | R1 は下記の設計担当の判断で解決。resident root は同期 close 後に送信。受理済み staged Smart 帰路は全画面を残すため、従前維持の例外として dispatch のフレームに元の宛先へ 1 回。後の採用では送らない |
+
+通常 close と immediate close の producer は同じ `handle_fullscreen_close_request`、親の速さによらず
+`take_close_return_navigation` → Direct／CollectionSource → 同じ worker continuation → ViewerExited／install を通る。
+consumer は通常の post-render と全画面 seam（native 背景を含む）。速い親だけの別経路はない。
+ROOT Focus のその他の送り手（clipboard capture、tray／single-instance 復帰、browser 復帰、detached close の後始末、
+viewport の初回表示／復帰、native presentation の FocusHost）は閉じ戻り入口ではなく、今回変更しない。
+
+実装した内容:
+
+- 既存 field `pending_return_to_parent` を、状態 enum `FullscreenCloseState` と受付元の `Option<ViewportId>` を内包する
+  `FullscreenCloseContinuation` にした。送り手でない入口は None。既存 bundle の移動／破棄の境界はそのままで、App に別の pending は足さない。
+- close と immediate close は `ClosedNow / ReturnAccepted / DeferredTerminalClose / Ignored` を返す。
+  UI と画像リングはその結果を使い、true close だけ入口で送る。UI の既存の presentation-transition 中の抑止は保つ。
+- ctx を持つ入力／描画末尾の取り出しは `take_pending_return_to_parent_nav_with_focus` にまとめた。
+  取り出しだけでは送らず、実際の dispatch が既存 continuation の属性を呼出内だけの `FullscreenCloseDispatchFocus` へ移す。
+  適用直後の結果で送信を決める（下記 R1 の判断）。RetireNoDestination は取り出しの中で close を適用した直後に同じ判断を行う。
+  context-free な native／既存テストの consumer は従来どおり一般の Focus を発生させない。
+- 物理走査の再開は「C5 の install が成功して main 全画面を閉じた」を呼出内の結果で返す。
+  `resolve_main_folder_open_ready`（通常 tail／fullscreen seam／native backdrop が共有）が teardown 前の表示面 HWND を捕捉し、
+  その結果を受けて送信直前の OS foreground と照合する。テストは既存 `test_native_focus::scoped` で前面を注入する。
+- guard の close／restore 両述語へ渡す keep 条件だけを `設定 || C5 wait` にした。
+  native input owner が close だけを抑止する非対称性も保つ。失敗・取消の処理に retry 等を足していない。
+
+**設計返却 R1（初回発見の記録。下記の設計担当の判断で解決済み）**:
+
+`smart_folder_parent_nav_target` は Root への帰路も `AddressBarNav::Direct(synthetic_path, …)` を返す
+(`src/app/smart_folder.rs:8876,8891`)。そのため今回の設計どおりの分類では
+`LiveWithPresentation -> IssuedLive` となり、入口の Focus が捨てられる (`src/app/close_return.rs:621`)。
+しかし loader は synthetic path を物理走査に流さず、`restore_smart_folder_for_synthetic_path_with_navigation` へ分岐する
+(`src/app.rs:32185,32189`)。resident root が一致しないと `begin_staged_smart_target_navigation` に進み、
+別フレームの SmartFolder owner が完了を採用する (`src/app/smart_folder.rs:9014,9023,9049`)。
+physical child の Direct も `src/app.rs:32240` 付近で Smart 固有の navigation に分岐できる。
+Smart 側には `close_return_presentation`／CloseReturn の ViewerExited／今回の ctx 採用返却の consumer が無い
+(`rg` で `src/app/smart_folder.rs` を照合)。resident で同期に復元する場合も、今回の物理走査の採用側は通らない。
+
+これは実機で確認した障害ではなく、コードで確認した設計の前提との不一致。
+初回の差分では、その帰路の受付元 Focus が失われ得たため、実装担当は受入を止めて設計担当へ返した。
+以下の判断に従う継続実装で解決し、Smart の採用へ新しい Focus owner は追加していない。
+
+**設計担当の判断 (返却 R1)**（2026-11-28、利用者から設計担当の回答として指示）:
+
+- SmartFolder の synthetic path への Direct と、physical child から Smart 固有 navigation へ分岐する Direct は非 C5。
+  Smart の復元待ちと guard の既存の関係は今回変えず、別項目の候補とする。
+- nav の種類／`IssuedLive` だけでは決めない。close-return の適用直後に
+  `fs_close_return_navigation_wait_active()` が真なら、記録した Focus を捨て、従来の C5 採用を持ち主にする。
+  main の全画面が閉じていれば、記録した宛先へその dispatch フレームで 1 回送る。
+  失敗・拒否で main の全画面が残り、C5 の待ちでもない場合は送らず、後の Focus owner も作らない。
+- Smart が全画面を残したまま別フレームへ進む場合だけは、従前維持として dispatch のフレームで送る。
+  後の Smart 採用で閉じた時点へ Focus を足す案は採らない。
+- **Rating の補足回答（同日、設計担当）**: RatingViewBack も Smart の staged 復元と同じく、§1.853 前の挙動を保つ。
+  worker 受付フレームで元の宛先へ 1 回送り、worker 待ちと guard の既存の関係は変えない。
+  当初 R1 回答の一般規則から適用していた「Rating worker は Focus 0 回」はこの補足で取り下げ、テストの期待を 1 回へ戻した。
+  同じ形の既存非 C5 帰路も同じ扱いにする指示に従い、Everything の retained prepare、Rating の物理階層復元、
+  captured origin の Physical／Collection history 復元とサブ展開 Return を監査し、上の表へ追加した。
+  成功受付だけを従前維持の例外とし、失敗・拒否で全画面が残る場合は送らない。返却 R1 と補足確認は解決済み。
+
+コードで確認した結果と実装:
+
+- resident root の同期復元は `restore_adopted_smart_folder_session` → `install_adopted_smart_root_payload` が
+  `close_fullscreen_content()` を呼ぶ。そのため適用後の「main 全画面が閉じた」という一般の結果で送れる。
+- stamp が一致しない root は `begin_staged_smart_root_reprepare`／`begin_staged_smart_target_navigation`、
+  physical child は `begin_smart_physical_navigation_with_backing_at_stage` が `SmartFolderTransition` を作り、
+  全画面を残したまま別フレームの poll／採用へ進むことをコードで確認した。
+  この成功受付を、Rating 等と共通の `LegacyCloseReturnOwners` で確認する。dispatch 前後の既存 owner の ID と
+  navigation の current 判定を呼出内だけで比較し、新しく受理された owner がある場合だけ送る。
+  Smart／Rating／Physical・Collection history／classification は既存 request ID／sequence、Everything は既存の
+  prepare cancel token の Arc identity と wish sequence、サブ展開は既存 cancel token の Arc identity を使う。
+  token の clone は呼出の終わりに破棄し、アドレス再利用を照合に混ぜない。App／worker に Focus の pending は足さない。
+  以前からある worker、拒否、失敗、cancel だけでは送信資格にならない。Direct の C5 classifier は legacy へ含めない。
+- `apply_fullscreen_close_nav_immediate_with_focus`、通常の `post_render_main_navigation`、
+  `dispatch_native_backdrop_navigation` が適用前に Focus の属性を呼出内へ移し、適用後に同じ終端を呼ぶ。
+  別の nav が裁定で勝った場合はそのフレームに捨て、負けた close の Focus を後へ残さない。
+  新しい App 全体の pending、再試行、時間窓、追加 repaint は無い。
+- 同期 root、staged root、staged physical child の ROOT／子 viewport の宛先と送信フレームを検査する回帰を追加。
+  staged の受付フレームは全画面が残っていて Focus が 1 回、後の採用フレームは Focus 0 回を検査する。
+  Smart 拒否、および worker を始める前の modal 拒否で全画面が残る場合は Focus 0 回を検査する。
+  この判断の実装について独立レビューを受けたという主張はしない。コンパイル・テスト・実機確認も未実施。
+
+その他の境界／逸脱:
+
+- Rating／Smart／Everything／サブ展開と captured origin の staged 復元は非 C5 のまま。
+  source 上で全画面を残す成功受付を確認し、上記の設計担当の補足に従い受付フレームの Focus を維持した。
+  この既存待ちに main が前面になった場合の guard の条件や採用時 Focus は変更しない（別項目の候補）。
+  Bookmarks と ReadingHistory は loading surface の install、通常 Collection 帰路は shell install、ZipListReturn は
+  list-return install が同期で全画面を閉じるため、legacy worker の例外を要さない。
+  native 遅延 close 以外に Focus の資格を新しいフレームまで保留しなければならない終端は見つからず、残る返却はない。
+- native の遅延 close は既存 effect が所有するため、新しい Focus owner は追加していない。
+  指定された親モデル設定へ変更する手段はなく、GPT-6.1 Sol / high で動作しているという主張はしない。
+- 実装の独立レビューは未実施。設計の AGREE を実装レビューの結果へ読み替えていない。
+
+変更ファイル:
+
+| ファイル | 内容 |
+| --- | --- |
+| `src/app.rs` | 型付き close 結果、入力／描画末尾の Focus-aware 取り出し、採用結果の返却、guard の keep 条件 |
+| `src/app/close_return.rs` | 既存 continuation の属性・状態の内包、非 C5 の同一フレーム送信、HWND 捕捉と採用後の foreground 照合 |
+| `src/app/update_phases.rs` | 通常 tail／native backdrop の実 dispatch の前後で呼出内の Focus owner を取り出して終端する。裁定で負けた要求はそのフレームに破棄 |
+| `src/app/smart_folder.rs`、`src/app/smart_folder_close_focus_tests.rs` | dispatch 前後の受理済み Smart owner ID の読取照合、resident／staged root／physical child／拒否の Focus 回帰。既存 root fixture の参照をテスト子 module に公開 |
+| `src/global_search_ui/everything.rs`、`src/app/subfolder_expansion.rs` | main close dispatch が既存 Return owner の成功受付を確認する読取 helper。worker の寿命／採用／guard は変更なし |
+| `src/app/tests/everything_close_return.rs` | retained prepare の受付フレーム 1 Focus／採用フレーム 0 Focus の実帰路テスト |
+| `src/app/gamepad_input.rs`、`src/ui_fullscreen.rs` | close 結果に従う既存の Focus 入口。動画リングは変更なし |
+| `src/app/tests/fullscreen_close_focus_853.rs`、`src/app/close_return/focus_tests.rs` | 新規の状態遷移／command 列の回帰 |
+| `src/app/tests/ui_scan_853_tests.rs` | 新テストの module、guard の意図した変更、CollectionSource の Focus 検査を追加 |
+| `src/app/tests/archive_inner_book_s1.rs` | ZipListReturn の Focus 回帰、状態参照の追従、戻り型への追従 |
+| `src/app/close_return_tests.rs`、`src/app/viewer_context_registry.rs`、`src/ui_fullscreen/wheel_frame_tests.rs` | 既存テストの状態 enum の参照先だけを追従。registry の実装は変更なし |
+| `src/app/tests/collection_return.rs`、`src/app/tests/rating_filter_return_1671.rs` | 共用 helper の match arm で型付き戻り値を明示的に捨てる。期待は維持 |
+| 本書、`docs/display-pipeline.md`、`docs/video-architecture.md`、`docs/detached-rework-plan.md`、`docs/section257-smart-folder-navigation.md` | Focus の責務、§6.12 の guard 方針の訂正、設計合意・R1 判断・未検証の記録 |
+
+新規テスト（26 件、ファイル別）:
+
+`src/app/tests/fullscreen_close_focus_853.rs`（`ui_scan_853_tests::focus`）:
+
+- `section1853_close_focus_entries_discard_focus_for_c5_in_request_frame` (f1・f9、Enter／Esc／短い右クリックの分類後の実 handler／画像リング、ROOT と子 viewport)
+- `section1853_close_focus_slow_parent_guard_restores_then_adopts_once` (f2・f7・f13、keep ON/OFF、走査 cancel token、元の本の選択と採用時 1 ROOT Focus)
+- `section1853_close_focus_fast_parent_ordinary_tail_keeps_selection_and_one_root_focus` (f3、通常 tail)
+- `section1853_close_focus_stale_focused_sibling_foreign_and_unknown_never_claim_root` (f4・f12、保存済み focused=true のまま OS 前面だけを注入)
+- `section1853_close_focus_embedded_and_missing_surface_never_claim_root_at_adoption` (f11、HWND 不明も拒否)
+- `section1853_close_focus_true_close_preserves_entry_frame_and_viewport_target` (f5・f9)
+- `section1853_close_focus_error_disconnect_cancel_and_refusal_keep_reader_without_focus` (改訂 f6、エラー／切断／明示取消／採用前の modal 拒否)
+- `section1853_close_focus_dispatch_refusal_before_worker_keeps_viewer_without_focus` (R1 判断、worker の開始前の modal 拒否を immediate／通常 tail で検査)
+- `section1853_close_focus_main_and_native_tails_decide_from_started_c5_wait` (R1 判断、通常／native tail の実 dispatch で C5 wait を始めた結果と採用時の ROOT Focus を検査)
+- `section1853_close_focus_losing_return_drops_focus_in_same_frame_even_if_winner_refused` (R1 判断、上位 nav に負けた close の Focus を次フレームへ残さない)
+- `section1853_close_focus_second_close_backspace_navigation_and_remote_drop_old_authority` (f10、旧受信口と token、遅着の不採用、新要求だけの採用)
+- `section1853_close_focus_guard_ctrl_folder_wait_and_existing_gates_are_unchanged` (f13、Ctrl+↑↓ の Ordinary sequence、grace／embedded／root-key／native owner の非対称性)
+- `section1853_close_focus_native_deferred_terminal_and_immediate_have_one_effect_owner` (f8、通常／immediate の型付き結果、TerminalSessionClose の数、reclaim の予約、一般 Focus 0)
+- `section1853_close_focus_video_ring_keeps_page_list_and_native_reclaim_owner` (動画リングの非退行)
+- `section1853_close_focus_rating_back_worker_keeps_entry_focus_and_existing_guard_policy` (f14、root worker の受付フレームに元の宛先へ 1 回、次フレーム／採用は 0。main-focused guard の既存 close と、guard を通さない採用)
+- `section1853_close_focus_rating_physical_restore_keeps_entry_frame_and_no_adoption_focus` (Rating の親階層、通常 directory／archive suffix directory の classification、ROOT／子 viewport。受付 1 回／採用 0 回)
+- `section1853_close_focus_rating_refusal_cannot_borrow_existing_worker_focus` (既存 Rating worker を残す modal 拒否は Focus 0 回)
+- `section1853_close_focus_subfolder_return_keeps_entry_frame_and_no_adoption_focus` (captured サブ展開 origin、scan／snapshot prepare、ROOT／子 viewport。受付 1 回／採用 0 回)
+
+`src/app/close_return/focus_tests.rs`:
+
+- `section1853_close_focus_non_c5_kinds_preserve_dispatch_frame_target_and_count` (f6・f14、Bookmarks／ReadingHistory／Collection／EverythingResults／RatingViewBack の terminal recipe)
+- `section1853_close_focus_live_bookmark_and_no_destination_preserve_entry_target_once` (f6・f9・f14、live bookmark／RetireNoDestination)
+- `section1853_close_focus_ignored_request_and_non_focus_entry_emit_nothing` (無視・送り手でない入口)
+
+`src/app/tests/archive_inner_book_s1.rs`:
+
+- `section1853_close_focus_zip_list_return_keeps_same_frame_and_child_target` (f6・f9・f14、実 ZIP の LiveZipListReturn)
+
+`src/app/smart_folder_close_focus_tests.rs`:
+
+- `section1853_close_focus_smart_resident_root_closes_and_focuses_in_dispatch_frame` (同期 root、ROOT／子 viewport、適用フレーム 1 回・次フレーム 0 回)
+- `section1853_close_focus_smart_staged_root_and_physical_child_focus_only_in_dispatch_frame` (staged root／physical child、ROOT／子 viewport、immediate／通常 tail、全画面を残す受付フレーム 1 回・別フレームの採用 0 回)
+- `section1853_close_focus_smart_refusal_has_no_focus_or_later_focus_owner` (定義が消えて復元を拒否した場合、全画面は残り、Focus は受付・次フレームとも 0 回)
+
+`src/app/tests/everything_close_return.rs`:
+
+- `section1853_close_focus_everything_worker_keeps_entry_frame_target_and_no_adoption_focus` (retained Everything prepare、ROOT／子 viewport、immediate／通常 tail。全画面が残る受付フレーム 1 回／採用 0 回、元の項目の選択)
+
+既存テストの拡張／変更:
+
+- `src/app/tests/ui_scan_853_tests.rs`: **基点 HEAD にあった既存テストの唯一の期待変更**は
+  `section1853_page_list_and_focus_close_retire_late_parent_reply` →
+  `section1853_page_list_close_retires_but_focus_guard_preserves_parent_wait`。
+  旧 focus-guard 分岐の「token=true／遅着 send は Err／本のページ一覧に留まる」を、実 guard の入力で
+  「token=false／全画面・pending を維持／遅着 send は Ok／採用で親と元の本の選択」へ変更した。
+  理由は §6.19.1 の明示的な仕様改訂。Backspace 分岐の期待は変えない。
+- `src/app/tests/fullscreen_close_focus_853.rs`: この差分内で追加した未実行の Rating worker テストを、補足回答に従い
+  `section1853_close_focus_rating_back_worker_with_open_session_has_no_focus_and_keeps_guard_policy` から
+  `section1853_close_focus_rating_back_worker_keeps_entry_focus_and_existing_guard_policy` へ戻した。
+  受付フレームの期待を「Focus 0 回」から「入口の元の宛先へ 1 回」に戻した。理由は §1.853 前の挙動を保つという設計担当の明示指示。
+  worker の pending／fullscreen 保持、main-focused guard の close は従来どおりで、後の採用は Focus 0 回も検査する。
+  基点 HEAD にあった既存テストの期待変更ではない。他の新規テストの回数・宛先・フレームの期待は変えていない。
+- 同ファイルの `section1853_collection_descendant_close_keeps_physical_owner_through_parent_wait` は既存の owner／選択／走査回数を維持し、
+  受付 0 Focus／採用 1 ROOT Focus の検査を追加した（既存期待の変更なし）。
+- `src/app/close_return_tests.rs` は `close_return_standalone_bookmark_navigation_survives_viewer_teardown`、
+  `close_return_auto_open_zip_pdf_image_folder_and_converted_source_preserve_parent_selection`、
+  `close_return_same_path_navigation_and_new_bookmark_invalidate_old_origins_at_admission`、
+  `close_return_real_fullfeature_media_is_shared_until_promote_or_live_fork` と共用 helper `main_terminal_bookmark_return` の state 参照だけ。
+- `src/app/tests/archive_inner_book_s1.rs` の既存テストは
+  `section1675_cancel_composition_wait_does_not_reopen`、
+  `section1676_terminal_and_live_preserve_bookmark_owner`、
+  `section1676_invalidated_frozen_live_terminal_uses_current_list_teardown`、
+  `section1676_real_refresh_stale_live_plan_closes_to_current_list`、
+  `section1676_collection_live_and_terminal_close_preserve_owner_and_back_out`、
+  `section1676_embedded_page_turn_barrier_keeps_pending_close_for_update_delivery`、
+  `section1676_pending_main_live_return_preserves_newly_active_sibling_session`、
+  `section1676_stale_live_choice_delivers_current_list_through_real_update`、
+  `section1676_stale_terminal_return_cannot_close_a_later_reader`、
+  `section1676_repeated_take_retains_the_issued_zip_authority`、
+  `section1676_refused_reader_open_keeps_issued_zip_authority`、
+  `section1676_sibling_reader_acceptance_keeps_main_issued_zip_authority`、
+  `section1676_issued_live_terminal_teardown_preserves_valid_chosen_bookmark_owner`、
+  `section1676_dropped_issued_navigation_allows_a_fresh_user_close`。
+  共用 helper `close_chosen_root`／`take_terminal_archive_return` も state 参照先だけの追従。これらの既存期待は維持。
+- `src/app/viewer_context_registry.rs` は
+  `section1676_choice_independent_close_preserves_main_live_terminal_and_sibling_queues` の参照先だけ。
+- `src/ui_fullscreen/wheel_frame_tests.rs` は
+  `egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_owner` の import と参照先だけ。
+- `src/app/tests/collection_return.rs` の `investigate`、
+  `src/app/tests/rating_filter_return_1671.rs` の `scenario` は共用 helper の match arm の戻り型への追従だけ。
+  利用する各既存テスト名と期待は変えていない。
+
+設計担当へ渡す nextest の式とコマンド（**実装担当では未実行**）:
+
+```powershell
+$focus853Filter = 'test(section1853_) | test(close_return_) | test(fullscreen_main_focus_guard_tests) | test(archive_inner_book_s1::) | test(section1676_choice_independent_close_preserves_main_live_terminal_and_sibling_queues) | test(collection_return::) | test(rating1671::) | test(everything_close_return::) | test(subfolder_expansion::tests::) | test(egui037_wheel_frame_recognized_live_return) | test(history_transition_storage_keeps_app_stack_footprint_bounded) | test(operation_script_native_close_is_completed_for_vk_shared_and_script) | test(chrome_suppression_native_explicit_close_is_idempotent_and_keeps_context_lock) | test(drive_root_898_normalized_smart_path_restores_and_opens_resident_root) | test(section1705_smart_parent_return_preserves_parked_root_local_filter)'
+cargo nextest run -p mimageviewer --lib -E $focus853Filter
+cargo nextest run -p mimageviewer --lib --features test-script -E $focus853Filter
+```
+
+R1 は上記の設計担当の判断に従い解決済み。共有 close owner の変更なので同じ source の lib 全件も既存の
+`scripts/test-lib-full.ps1` で両構成とも設計担当が確認する。実装担当は cargo／nextest／build／製品起動を実行していない。
+静的確認は変更した Rust 19 ファイルへの `rustfmt --edition 2024 --check --config skip_children=true`、
+`git diff --check`、`python scripts/check_ui_glyphs.py`（危険な UI 字形 0 件）。型検査・テスト成功の証拠ではない。
+commit／stash／reset／checkout／branch switch は行っていない。確認用バイナリは利用者のビルド禁止に従い作成していない。

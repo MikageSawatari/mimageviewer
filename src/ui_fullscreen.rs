@@ -14304,7 +14304,7 @@ impl App {
         }
     }
 
-    fn fs_close_return_navigation_wait_active(&self) -> bool {
+    pub(crate) fn fs_close_return_navigation_wait_active(&self) -> bool {
         self.fs_holdover_tex
             .as_ref()
             .and_then(FsHoldover::navigation_sequence)
@@ -47586,17 +47586,13 @@ impl App {
                 );
             }
             let detached = self.viewer_session_is_detached();
-            self.handle_fullscreen_close_request();
-            if !detached && !presentation_was_transitioning {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                #[cfg(windows)]
-                self.observe_viewport_presentation_command(
-                    ctx.viewport_id(),
-                    crate::presentation_observer::WindowAction::Focus,
-                    "ui_fullscreen::close_request_focus",
-                    "viewport_command=Focus",
-                );
-            }
+            let outcome = self.handle_fullscreen_close_request();
+            self.route_fullscreen_close_entry_focus(
+                ctx,
+                outcome,
+                !detached && !presentation_was_transitioning,
+                "ui_fullscreen::close_request_focus",
+            );
             // keep_fullscreen_viewport_alive の cleanup フレーム (Visible(false) 送信) を保証。
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、偶発的な
             // input/focus repaint に頼らず明示的に次フレームを起こす。

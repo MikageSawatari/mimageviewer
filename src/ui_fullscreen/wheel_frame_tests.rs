@@ -930,7 +930,7 @@ fn egui037_wheel_frame_recognition_without_command_does_not_block_ordered_delive
 fn egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_owner() {
     #[cfg(windows)]
     let _serial = crate::key_input::lock_test_input();
-    use crate::app::{BookmarkViewReturnGridState, BookmarkViewState, FullscreenCloseContinuation};
+    use crate::app::{BookmarkViewReturnGridState, BookmarkViewState, FullscreenCloseState};
     use crate::bookmark_browser::BookmarkViewReturnTarget;
     use crate::ring_shortcut::*;
     for kind in ["book-opening", "effective-folder", "auto-open-zip"] {
@@ -1010,9 +1010,9 @@ fn egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_own
                     let result = app.apply_fs_wheel_frame_proposal(proposal, false, &mut operation);
                     assert!(
                         matches!(
-                            app.pending_return_to_parent,
-                            FullscreenCloseContinuation::Live
-                                | FullscreenCloseContinuation::LiveWithPresentation(_)
+                            app.pending_return_to_parent.state,
+                            FullscreenCloseState::Live
+                                | FullscreenCloseState::LiveWithPresentation(_)
                         ),
                         "{kind}: command {variant} must leave its accepted return pending"
                     );
@@ -1027,9 +1027,8 @@ fn egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_own
                     assert!(result.wheel_navigation_produced);
                     finish(&mut app, ui, &result, operation);
                     assert!(matches!(
-                        app.pending_return_to_parent,
-                        FullscreenCloseContinuation::Live
-                            | FullscreenCloseContinuation::LiveWithPresentation(_)
+                        app.pending_return_to_parent.state,
+                        FullscreenCloseState::Live | FullscreenCloseState::LiveWithPresentation(_)
                     ));
                     assert_eq!(
                         app.fullscreen_idx,

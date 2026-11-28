@@ -4,6 +4,9 @@
 use super::phase_c_support::{AppTestEnv, setup_app};
 use super::*;
 
+#[path = "fullscreen_close_focus_853.rs"]
+mod focus;
+
 fn directory(app: &AppTestEnv, relative: &str) -> PathBuf {
     let path = app.tmp.path().join(relative);
     std::fs::create_dir_all(&path).unwrap();
@@ -350,7 +353,7 @@ fn section1853_second_fullscreen_close_retires_first_wait_and_adopts_same_parent
 }
 
 #[test]
-fn section1853_page_list_and_focus_close_retire_late_parent_reply() {
+fn section1853_page_list_close_retires_but_focus_guard_preserves_parent_wait() {
     for close in ["page-list", "focus-guard"] {
         let mut app = setup_app();
         let parent = directory(&app, "close-late-parent");
@@ -362,8 +365,28 @@ fn section1853_page_list_and_focus_close_retire_late_parent_reply() {
         if close == "page-list" {
             app.close_fullscreen_to_page_list();
         } else {
-            // The root focus guard enters this true-close boundary.
-            app.close_fullscreen();
+            // §6.19 intentionally changes this policy: main focus restores C5
+            // rather than entering the true-close boundary and cancelling it.
+            app.settings.fullscreen_keep_on_app_switch = false;
+            app.fs_focus_grace_elapsed = true;
+            app.reconcile_fullscreen_after_main_focus(
+                &egui::Context::default(),
+                true,
+                false,
+                false,
+            );
+            assert!(!token.load(Ordering::Relaxed));
+            assert!(app.folder_pane_open_pending.is_some());
+            assert_eq!(app.fullscreen_idx, Some(0));
+            late_tx.send(result).unwrap();
+            app.poll_main_embedded_required_fullscreen_folder_open(&egui::Context::default());
+            assert!(!app.fs_nav_is_locked());
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.current_folder.as_ref(), Some(&parent));
+            assert!(
+                matches!(&app.items[app.selected.unwrap()], GridItem::PdfFile(path) if path == &book)
+            );
+            continue;
         }
         assert!(token.load(Ordering::Relaxed), "{close}");
         assert!(late_tx.send(result).is_err());
@@ -490,7 +513,22 @@ fn section1853_collection_descendant_close_keeps_physical_owner_through_parent_w
     app.finish_direct_navigation_scan_for_test();
     mount_pdf_reader(&mut app, &book);
     let scans = folder_scan::caller_scan_count_for_test();
-    issue_close(&mut app);
+    let _window = focus::surface_window(&app, &ctx);
+    let _foreground = crate::test_native_focus::scoped(focus::SURFACE, 0, true);
+    let surface = app.fullscreen_viewport_id();
+    assert!(
+        focus::frame(
+            &ctx,
+            egui::ViewportId::ROOT,
+            surface,
+            Some(egui::Key::Enter),
+            || {
+                focus::close_entry(&mut app, &ctx, "enter");
+                focus::dispatch_close(&mut app, &ctx);
+            }
+        )
+        .is_empty()
+    );
     let FolderOpenScanPurpose::DirectNavigation(call) =
         &app.folder_pane_open_pending.as_ref().unwrap().purpose
     else {
@@ -501,7 +539,14 @@ fn section1853_collection_descendant_close_keeps_physical_owner_through_parent_w
         OpenRequestOwner::CollectionGridPhysical(_)
     ));
     assert_eq!(app.fullscreen_idx, Some(0));
-    app.finish_direct_navigation_scan_for_test();
+    let (tx, result, _) = hold_scan_reply(&mut app);
+    tx.send(result).unwrap();
+    assert_eq!(
+        focus::frame(&ctx, egui::ViewportId::ROOT, surface, None, || {
+            app.poll_main_embedded_required_fullscreen_folder_open(&ctx);
+        }),
+        [egui::ViewportId::ROOT]
+    );
     assert_eq!(folder_scan::caller_scan_count_for_test(), scans);
     assert_eq!(app.current_folder.as_ref(), Some(&source));
     assert_eq!(app.fullscreen_idx, None);

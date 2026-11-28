@@ -249,8 +249,8 @@ fn close_return_standalone_bookmark_navigation_survives_viewer_teardown() {
     assert!(env.fullscreen_viewport_binding.is_none());
     assert!(env.bookmark_view_state.is_none());
     assert!(matches!(
-        env.pending_return_to_parent,
-        FullscreenCloseContinuation::Terminal(_)
+        env.pending_return_to_parent.state,
+        FullscreenCloseState::Terminal(_)
     ));
     assert!(matches!(
         env.take_pending_return_to_parent_nav(),
@@ -299,8 +299,8 @@ fn close_return_auto_open_zip_pdf_image_folder_and_converted_source_preserve_par
         assert!(env.fullscreen_idx.is_none());
         assert!(
             matches!(
-                env.pending_return_to_parent,
-                FullscreenCloseContinuation::Terminal(_)
+                env.pending_return_to_parent.state,
+                FullscreenCloseState::Terminal(_)
             ),
             "{kind}"
         );
@@ -617,8 +617,8 @@ fn main_terminal_bookmark_return(env: &mut App, path: PathBuf) {
     });
     env.transfer_terminal_close_return(env.viewer_context_main(), ViewerCloseCause::User);
     assert!(matches!(
-        env.pending_return_to_parent,
-        FullscreenCloseContinuation::Terminal(_)
+        env.pending_return_to_parent.state,
+        FullscreenCloseState::Terminal(_)
     ));
 }
 
@@ -813,8 +813,8 @@ fn close_return_same_path_navigation_and_new_bookmark_invalidate_old_origins_at_
         let request = env.bookmark_open_request_seq;
         env.transfer_terminal_close_return(old, ViewerCloseCause::User);
         assert!(!matches!(
-            env.pending_return_to_parent,
-            FullscreenCloseContinuation::Terminal(_)
+            env.pending_return_to_parent.state,
+            FullscreenCloseState::Terminal(_)
         ));
         assert_eq!(env.bookmark_open_request_seq, request);
         assert_eq!(
@@ -828,8 +828,8 @@ fn close_return_same_path_navigation_and_new_bookmark_invalidate_old_origins_at_
         // its original return identity must have been cleared at the same admission.
         let _ = env.with_viewer_context_state(old, |viewer| {
             assert!(matches!(
-                viewer.pending_return_to_parent,
-                FullscreenCloseContinuation::None
+                viewer.pending_return_to_parent.state,
+                FullscreenCloseState::None
             ))
         });
     }
@@ -1328,9 +1328,8 @@ fn close_return_real_fullfeature_media_is_shared_until_promote_or_live_fork() {
                 ));
                 assert!(
                     matches!(
-                        env.pending_return_to_parent,
-                        FullscreenCloseContinuation::Live
-                            | FullscreenCloseContinuation::LiveWithPresentation(_)
+                        env.pending_return_to_parent.state,
+                        FullscreenCloseState::Live | FullscreenCloseState::LiveWithPresentation(_)
                     ),
                     "fork must keep main's live return"
                 );

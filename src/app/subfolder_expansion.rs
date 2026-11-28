@@ -1913,6 +1913,32 @@ impl App {
         }
     }
 
+    /// Return owners predate C5 and keep their entry-frame Focus. Cloned tokens
+    /// live only across dispatch, keeping identity comparison free of address reuse.
+    pub(super) fn subfolder_close_return_focus_owners(&self) -> Vec<Arc<AtomicBool>> {
+        let scan = self
+            .subfolder_expansion_pending
+            .as_ref()
+            .map(|pending| (&pending.navigation, &pending.cancel));
+        let prepare = self
+            .subfolder_expansion_install_pending
+            .as_ref()
+            .map(|pending| (&pending.navigation, &pending.cancel));
+        scan.into_iter()
+            .chain(prepare)
+            .filter_map(|(navigation, cancel)| {
+                navigation
+                    .as_ref()
+                    .filter(|owner| {
+                        owner.purpose == SubfolderInstallPurpose::Return
+                            && !cancel.load(Ordering::Acquire)
+                            && self.main_list_navigation_is_current(&owner.navigation)
+                    })
+                    .map(|_| Arc::clone(cancel))
+            })
+            .collect()
+    }
+
     pub(crate) fn cancel_subfolder_expansion_pending(&mut self) {
         if let Some(pending) = self.subfolder_expansion_pending.take() {
             pending.cancel();
