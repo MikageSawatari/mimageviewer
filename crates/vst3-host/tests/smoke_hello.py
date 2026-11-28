@@ -65,14 +65,14 @@ def main() -> int:
         stderr=subprocess.PIPE,
     )
     try:
-        # v8 is required for lyrics and playback-position notifications.
-        write_msg(proc, '{"cmd":"hello","version":8}')
+        # v9 is required for GUI-owned mIV Sound transactions.
+        write_msg(proc, '{"cmd":"hello","version":9}')
         reply = read_msg(proc)
         print(f"<- {reply}")
         if '"event":"ready"' not in reply:
             print(f"unexpected reply: {reply}", file=sys.stderr)
             return 2
-        if '"version":8' not in reply:
+        if '"version":9' not in reply:
             print(f"version mismatch: {reply}", file=sys.stderr)
             return 3
 
@@ -108,13 +108,13 @@ def main() -> int:
         if proc.stdout.read() != b"":
             raise AssertionError("metadata unexpectedly emitted a reply event")
 
-        for old_version in (5, 6, 7):
+        for old_version in (5, 6, 7, 8):
             stale = subprocess.Popen([bridge_exe], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 write_msg(stale, '{"cmd":"hello","version":' + str(old_version) + '}')
                 rejection = read_msg(stale)
-                assert '"event":"error"' in rejection and "bridge speaks v8" in rejection, rejection
+                assert '"event":"error"' in rejection and "bridge speaks v9" in rejection, rejection
                 assert stale.wait(timeout=5) == 0
                 assert stale.stdout.read() == b"", "old client received an extra event"
                 print(f"old v{old_version} handshake rejected")

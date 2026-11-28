@@ -3,7 +3,7 @@ use serde_json::json;
 
 #[test]
 fn favorite_commands_preserve_omitted_and_explicit_index_flags() {
-    assert_eq!(AGENT_PROTOCOL_VERSION, 8);
+    assert_eq!(AGENT_PROTOCOL_VERSION, 9);
     assert_eq!(MIN_ADAPTER_PROTOCOL_VERSION, 3);
     for (fields, name, item_index, container_index) in [
         (json!({}), None, None, None),

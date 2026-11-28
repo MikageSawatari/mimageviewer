@@ -18,6 +18,11 @@ pub mod composition;
 pub(crate) mod gui_gate;
 pub(crate) mod migration;
 pub(crate) mod now_playing;
+#[cfg(test)]
+#[path = "sound_controller_tests.rs"]
+mod sound_controller_tests;
+pub(crate) mod sound_document;
+pub(crate) mod sound_service;
 pub(crate) mod startup;
 mod window;
 pub(crate) use now_playing::{NowPlayingArtworkSource, NowPlayingInput, NowPlayingOwner};
@@ -87,6 +92,7 @@ pub enum LoadOrigin {
     Startup,
     UserButton,
     AutoVideo,
+    SoundAgent,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -304,7 +310,6 @@ impl Default for LatestCapture {
 }
 
 struct CaptureJob {
-    generation: u64,
     confirmation: CaptureConfirmation,
     bridge: Arc<DspBridge>,
     reply: mpsc::Sender<Result<Vec<u8>, CaptureError>>,
@@ -329,12 +334,15 @@ impl CaptureConfirmation {
 
 enum CaptureCommand {
     Capture(CaptureJob),
+    Sound {
+        job: sound_service::SoundJob,
+        bridge: Arc<DspBridge>,
+    },
     Stop,
 }
 
 pub struct CaptureQueue {
     tx: mpsc::Sender<CaptureCommand>,
-    next_generation: AtomicU64,
     accepting: AtomicBool,
     latest: Arc<Mutex<LatestCapture>>,
     publication: Arc<PublicationGate>,
@@ -460,7 +468,29 @@ impl CaptureQueue {
         std::thread::Builder::new()
             .name("effetune-state-capture".into())
             .spawn(move || {
-                while let Ok(CaptureCommand::Capture(job)) = rx.recv() {
+                // This worker owns publication order. Assigning a generation
+                // before send on competing producers could invert FIFO order
+                // and suppress a later sound edit's successful persistence.
+                let mut generation = 0u64;
+                while let Ok(command) = rx.recv() {
+                    if matches!(&command, CaptureCommand::Stop) { break; }
+                    generation += 1;
+                    let job = match command {
+                        CaptureCommand::Capture(job) => job,
+                        CaptureCommand::Sound { job, bridge } => {
+                            let plugin_dir = state_path.parent().expect("sound state directory").join("plugin");
+                            sound_service::run(job, &bridge, &plugin_dir, |bytes| {
+                                let effective = EffectiveState::from_bytes(bytes);
+                                if let EffectiveState::Unparseable(reason) = effective {
+                                    return Err(CaptureError::State(reason));
+                                }
+                                publish_capture_state(&worker_latest, &state_path, generation, bytes,
+                                    Some(effective), &worker_publication)
+                            });
+                            continue;
+                        }
+                        CaptureCommand::Stop => break,
+                    };
                     let started = Instant::now();
                     let result = capture(&job.bridge).and_then(|bytes| {
                         let effective = EffectiveState::from_bytes(&bytes);
@@ -472,14 +502,14 @@ impl CaptureQueue {
                         publish_capture_state(
                             &worker_latest,
                             &state_path,
-                            job.generation,
+                            generation,
                             &bytes,
                             job.confirmation.effective_state(effective.clone()),
                             &worker_publication,
                         )?;
                         crate::logger::log(format!(
                             "[EffeTune] capture generation={} confirmation={:?} state={effective:?} bytes={} elapsed_ms={}",
-                            job.generation,
+                            generation,
                             job.confirmation,
                             bytes.len(),
                             started.elapsed().as_millis()
@@ -489,7 +519,7 @@ impl CaptureQueue {
                     if let Err(error) = &result {
                         crate::logger::log(format!(
                             "[EffeTune] capture generation={} failed after {}ms: {error}",
-                            job.generation,
+                            generation,
                             started.elapsed().as_millis()
                         ));
                     }
@@ -499,7 +529,6 @@ impl CaptureQueue {
             .expect("EffeTune state worker spawn");
         Self {
             tx,
-            next_generation: AtomicU64::new(0),
             accepting: AtomicBool::new(true),
             latest,
             publication,
@@ -546,11 +575,9 @@ impl CaptureQueue {
         bridge: Arc<DspBridge>,
         confirmation: CaptureConfirmation,
     ) -> Result<mpsc::Receiver<Result<Vec<u8>, CaptureError>>, CaptureError> {
-        let generation = self.next_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let (reply, rx) = mpsc::channel();
         self.tx
             .send(CaptureCommand::Capture(CaptureJob {
-                generation,
                 confirmation,
                 bridge,
                 reply,
@@ -566,6 +593,18 @@ impl CaptureQueue {
             latest.bytes.clone()?,
             latest.effective.clone()?,
         ))
+    }
+
+    fn enqueue_sound(&self, job: sound_service::SoundJob, bridge: Arc<DspBridge>) {
+        if !self.accepting.load(Ordering::Acquire) {
+            sound_service::reject(job, sound_service::SoundError::Aborted);
+            return;
+        }
+        if let Err(error) = self.tx.send(CaptureCommand::Sound { job, bridge }) {
+            if let CaptureCommand::Sound { job, .. } = error.0 {
+                sound_service::reject(job, sound_service::SoundError::Aborted);
+            }
+        }
     }
 
     pub fn latest_effective_state(&self) -> Option<EffectiveState> {
@@ -1014,6 +1053,8 @@ pub struct EffetuneController {
     bridge: Option<Arc<DspBridge>>,
     bundle_path: Option<PathBuf>,
     captures: Arc<CaptureQueue>,
+    sound_pending_load: std::collections::VecDeque<sound_service::SoundJob>,
+    sound_changes: Option<Arc<crate::agent_ipc::changes::ChangeController>>,
     pending_load: Option<mpsc::Receiver<LoadCompletion>>,
     next_audio_generation: u64,
     pending_capture: Option<mpsc::Receiver<Result<Vec<u8>, CaptureError>>>,
@@ -1178,6 +1219,8 @@ impl EffetuneController {
                     .join("mixwright-state.json"),
             )),
             startup_gate,
+            sound_pending_load: std::collections::VecDeque::new(),
+            sound_changes: None,
             pending_load: None,
             next_audio_generation: 0,
             pending_capture: None,
@@ -1551,7 +1594,9 @@ impl EffetuneController {
     }
 
     pub fn has_pending_ui_work(&self) -> bool {
-        self.pending_load.is_some() || self.pending_capture.is_some()
+        self.pending_load.is_some()
+            || self.pending_capture.is_some()
+            || !self.sound_pending_load.is_empty()
     }
 
     #[cfg(test)]
@@ -1580,6 +1625,7 @@ impl EffetuneController {
     }
 
     pub fn poll(&mut self) -> bool {
+        self.poll_sound_service();
         if let Ok(GuiFailure::Attach(detail)) = self.gui_failure_rx.try_recv() {
             self.fail(EffetuneFailure::GuiFailed(detail));
         }
@@ -1607,10 +1653,14 @@ impl EffetuneController {
                     }
                     LoadCompletion::Unavailable(reason) => {
                         crate::logger::log(format!("[EffeTune] unavailable: {reason:?}"));
+                        // Retryability belongs to the next explicit request,
+                        // never to jobs waiting for this completed load.
+                        self.reject_waiting_sound(reason.user_reason());
                         self.runtime = EffetuneRuntime::Unavailable(reason);
                     }
                     LoadCompletion::Failed(error) => self.fail(error),
                 }
+                self.poll_sound_service();
                 return true;
             }
         }
@@ -1633,6 +1683,75 @@ impl EffetuneController {
             }
         }
         false
+    }
+
+    /// UI-side typed admission seam. This method only enqueues;
+    /// callers perform the shared settings permission check before admission.
+    pub(crate) fn submit_sound(
+        &mut self,
+        request: sound_service::SoundRequest,
+        client: &str,
+        changes: Arc<crate::agent_ipc::changes::ChangeController>,
+        user_latency_secs: f64,
+        permit: Option<Arc<crate::agent_ipc::Permit>>,
+    ) -> sound_service::SoundTicket {
+        let (mut job, ticket) =
+            sound_service::job(request, client, Arc::clone(&changes), user_latency_secs);
+        job.permit = permit;
+        self.sound_changes = Some(changes);
+        self.sound_pending_load.push_back(job);
+        self.poll_sound_service();
+        ticket
+    }
+
+    fn poll_sound_service(&mut self) {
+        if let Some(bridge) = &self.bridge {
+            while let Some(release) = bridge.poll_sound_release() {
+                if release.by == "user" {
+                    if let Some(changes) = &self.sound_changes {
+                        sound_service::user_released(changes);
+                    }
+                }
+            }
+        }
+        if self.sound_pending_load.is_empty() {
+            return;
+        }
+        match &self.runtime {
+            EffetuneRuntime::Running { .. } => {
+                while let Some(job) = self.sound_pending_load.pop_front() {
+                    if let Some(bridge) = &self.bridge {
+                        self.captures.enqueue_sound(job, Arc::clone(bridge));
+                    } else {
+                        sound_service::reject(job, sound_service::SoundError::Aborted);
+                    }
+                }
+            }
+            EffetuneRuntime::Loading { .. } => {}
+            _ if self.runtime.can_start_load() && self.startup_gate.sound_allowed() => {
+                self.start_load(LoadOrigin::SoundAgent, None, None, None);
+            }
+            _ => {
+                let reason = match &self.runtime {
+                    EffetuneRuntime::Failed(failure) => failure.user_reason(),
+                    EffetuneRuntime::Unavailable(reason) => reason.user_reason(),
+                    _ => "mIV Sound の起動処理中です",
+                };
+                self.reject_waiting_sound(reason);
+            }
+        }
+    }
+
+    fn reject_waiting_sound(&mut self, reason: &str) {
+        while let Some(job) = self.sound_pending_load.pop_front() {
+            sound_service::reject(job, sound_service::SoundError::Unavailable(reason.into()));
+        }
+    }
+
+    pub(crate) fn sound_locked(&self) -> bool {
+        self.bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.sound_locked())
     }
 
     pub fn capture_on_hide(&mut self) {

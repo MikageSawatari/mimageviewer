@@ -9,12 +9,24 @@ pub(crate) struct FakeHostEvents {
     bypass_tx: crossbeam_channel::Sender<u64>,
     pending: PendingGuiRequests,
     state_pending: PendingStateQueries,
+    sound_pending: PendingSoundRequests,
+    sound_released: crossbeam_channel::Sender<SoundLockRelease>,
+    sound_locked: Arc<AtomicBool>,
 }
 
 impl FakeHostEvents {
     pub(crate) fn emit(&self, event: Event) {
         // Keep the event schema and ordered GUI/ACK router used by the stdout pump.
         let event: Event = serde_json::from_slice(&serde_json::to_vec(&event).unwrap()).unwrap();
+        if route_sound_event(
+            &event,
+            &self.sound_pending,
+            &self.sound_released,
+            &self.sound_locked,
+            None,
+        ) {
+            return;
+        }
         match event {
             Event::PluginState {
                 request_id: Some(id),
@@ -51,12 +63,18 @@ impl Bridge {
         let (bypass_tx, gui_bypass_toggle_rx) = crossbeam_channel::bounded(64);
         let pending_gui_requests = Arc::new(Mutex::new(HashMap::new()));
         let pending_state_queries = Arc::new(Mutex::new(HashMap::new()));
+        let pending_sound_requests = Arc::new(Mutex::new(HashMap::new()));
+        let (sound_released, sound_released_rx) = crossbeam_channel::unbounded();
+        let sound_locked = Arc::new(AtomicBool::new(false));
         let events = FakeHostEvents {
             event_tx,
             visibility_tx,
             bypass_tx,
             pending: Arc::clone(&pending_gui_requests),
             state_pending: Arc::clone(&pending_state_queries),
+            sound_pending: Arc::clone(&pending_sound_requests),
+            sound_released,
+            sound_locked: Arc::clone(&sound_locked),
         };
         (
             Arc::new(Self {
@@ -77,6 +95,10 @@ impl Bridge {
                 next_request_id: AtomicU64::new(0),
                 pending_state_queries,
                 pending_gui_requests,
+                pending_sound_requests,
+                sound_released_rx,
+                sound_locked,
+                sound_transport_closed: Arc::new(AtomicBool::new(false)),
                 #[cfg(windows)]
                 shm: None,
                 #[cfg(windows)]

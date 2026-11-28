@@ -4253,6 +4253,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "windows 0.61.3",
 ]

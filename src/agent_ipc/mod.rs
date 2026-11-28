@@ -26,6 +26,9 @@ pub(crate) mod operation_script;
 mod operation_script_tests;
 mod rating;
 mod recent;
+pub(crate) mod sound_chain;
+#[cfg(test)]
+mod sound_chain_tests;
 mod stack_script;
 #[cfg(test)]
 mod stack_script_tests;
@@ -250,8 +253,8 @@ impl Reply {
     }
 }
 
-/// The slot remains occupied until the actual read worker returns, including after
-/// a deadline response. A connection can cancel only its own active identity.
+/// The slot remains occupied until the actual work ends, including a sound FIFO
+/// job after its deadline response. A connection cancels only its own identity.
 struct Connection {
     handlers: Arc<Handlers>,
     running: Mutex<Option<Running>>,
@@ -271,7 +274,9 @@ struct ClientRequest {
     adapter_protocol_version: u32,
 }
 
-struct Permit {
+/// One admission owner; sound jobs share it with the response worker through
+/// Arc so the connection/global counters are released exactly once, at the end.
+pub(crate) struct Permit {
     connection: Arc<Connection>,
 }
 impl Drop for Permit {
@@ -337,6 +342,7 @@ fn check_tool_permission(
         | Command::SetFavorite { .. }
         | Command::StackScript { .. }
         | Command::OperationScript { .. }
+        | Command::SoundChain(_)
             if !snapshot.settings =>
         {
             Some(SETTINGS_PERMISSION_MESSAGE)
@@ -601,6 +607,7 @@ impl Connection {
                             | Command::SetFavorite { .. }
                             | Command::StackScript { .. }
                             | Command::OperationScript { .. }
+                            | Command::SoundChain(_)
                     )
                 {
                     metadata_response::respond(
@@ -714,7 +721,8 @@ fn request_log_line(
         | Ok(Payload::CollectionWrite(_))
         | Ok(Payload::TagWrite(_))
         | Ok(Payload::RatingWrite(_)) => "accepted",
-        Err(_) => "refused",
+        Ok(Payload::SoundChain(Ok(_))) => "accepted",
+        Ok(Payload::SoundChain(Err(_))) | Err(_) => "refused",
         _ => "ok",
     };
     format!(
@@ -735,6 +743,7 @@ fn tool_name(command: &Command) -> &'static str {
         Command::SetFavorite { .. } => "set_favorite",
         Command::StackScript { .. } => "stack_script",
         Command::OperationScript { .. } => "operation_script",
+        Command::SoundChain(_) => "sound_chain",
         Command::SearchItems { .. } => "search_items",
         Command::ListTags { .. } => "list_tags",
         Command::ItemsByTag { .. } => "items_by_tag",
@@ -812,6 +821,8 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
         }
         Ok(Payload::FavoriteWrite(_)) => (1, "none"),
         Ok(Payload::StackScript(_)) | Ok(Payload::OperationScript(_)) => (1, "none"),
+        Ok(Payload::SoundChain(Ok(_))) => (1, "none"),
+        Ok(Payload::SoundChain(Err(error))) => (0, error.code.as_str()),
         Ok(_) => (0, "none"),
         Err(e) => (
             0,
@@ -1020,6 +1031,7 @@ impl Handlers {
             | Command::SetFavorite { .. }
             | Command::StackScript { .. }
             | Command::OperationScript { .. }
+            | Command::SoundChain(_)
             | Command::SetRating { .. } => {
                 unreachable!()
             }

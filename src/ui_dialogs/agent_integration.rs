@@ -311,8 +311,9 @@ fn draw_images(ui: &mut egui::Ui, settings: &mut PermissionSelection) {
         ui.spacing_mut().indent = ui.spacing().icon_width + ui.spacing().icon_spacing;
         ui.indent("settings_description", |ui| {
             ui.add(egui::Label::new(egui::RichText::new(concat!(
-                "環境設定の確認と変更 (外部ツールの登録、スタック用スクリプトの読み書きを含む)、",
+                "環境設定の確認と変更 (外部ツールの登録、スタック用・操作スクリプトの読み書きを含む)、",
                 "キー割り当て・リング・マウスボタン・ジェスチャーの変更、",
+                "mIV Sound の並びの変更とプリセットの保存、",
                 "お気に入りへの登録と索引の切り替えを、確認なしで行います。",
                 "外部ツールは登録までで、実行するのはあなたが mIV で選んだときだけです。",
             )).weak()).wrap());
@@ -380,18 +381,19 @@ fn exposure(draft: PermissionSelection) -> Exposure {
         result.hidden.push("今開いている場所と表示中の項目");
     }
     if draft.settings {
-        result.shown.push("環境設定の項目と値・操作カスタマイズの割り当て (起動時のフォルダや保存先などの場所、外部ツールの実行ファイルと引数、スタック用スクリプトの本文を含む)");
+        result.shown.push("環境設定の項目と値・操作カスタマイズの割り当て・mIV Sound の並びと設定値 (起動時のフォルダや保存先などの場所、外部ツールの実行ファイルと引数、スタック用・操作スクリプトの本文を含む)");
         result.actions.extend([
             "環境設定の変更 (確認なし。環境設定の画面で変えたときと同じ結果になります)",
             "キー割り当て・リング・マウスボタン・ジェスチャーの変更 (確認なし)",
             "外部ツールの登録・変更・削除 (実行はしません)",
-            "スタック用スクリプトの書き換え (確認なし)",
+            "スタック用・操作スクリプトの書き換え (確認なし)",
+            "mIV Sound の並びの変更とプリセットの保存 (確認なし)",
             "お気に入りへの登録、索引の切り替え (確認なし)",
         ]);
     } else {
         result
             .hidden
-            .push("環境設定の項目と値・操作カスタマイズの割り当て・スタック用スクリプトの本文");
+            .push("環境設定の項目と値・操作カスタマイズの割り当て・スタック用・操作スクリプトの本文・mIV Sound の並びと設定値");
     }
     result.actions.push("情報の読み取り・検索");
     if draft.level >= AgentLevel::ReadAndOpen {

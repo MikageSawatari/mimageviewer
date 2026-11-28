@@ -292,6 +292,36 @@ UI にファイル検査・コピー・プロセス待機を置かず、設定�
 
 ### 5.2 取得 (音声を止めない)
 
+#### mIV Sound の AI 編集用 service (§1.843 第3段、実装・検証待ち)
+
+設計の正本は [MCP 設計 §21](mcp-guide-settings-plan.md#21-第-3-段-miv-sound-の処理の並びを組む-2026-11-27-設計収録の版は未定)。
+`sound_service::SoundRequest` / `SoundTicket` は lock・unlock・get・apply・select・undo・save_preset の型付き入口。
+`EffetuneController::submit_sound` はメモリ上の受付だけを行い、既存 `CaptureQueue` の FIFO worker へ渡す。
+まだ起動していない場合は `LoadOrigin::SoundAgent` / `open_gui_when_ready=None` で読み込み、その完了後に要求を続ける。
+読み込み失敗時は、その読み込みを待っていた要求を理由付きで閉じる。準備失敗が再読込可能な種類でも同じ要求を再試行せず、次の明示要求だけが新しい読み込みを始められる。
+読み込み・文書の組み立て・bridge 往復・プリセット I/O・成功後の状態取得と保存は UI thread では行わない。
+通常の状態取得と AI の要求は同じ列で直列化し、保存先と `EffectiveState` の正本は従来のまま。
+保存の世代はこの worker が列から取り出す順に振る。複数の送り手が採番と送信の間で前後しても、後の変更の保存を古い世代として捨てない。
+
+host protocol 9 の `sound_lock`・`sound_unlock`・`sound_get`・`sound_replace_locked`・`sound_undo_locked`・
+`sound_preset_commit` は、要求 ID の完了応答を専用経路で受ける。host の GUI thread が印・世代・取り消し1世代・
+プリセットの番を所有する。mIV Sound 専用で、汎用 VST の `restore_state` や音声 thread の fence を使わない。
+`revision` は `印:世代`、ロック外は null。`undo` は同じロック内だけで、解除時に破棄する。
+`sound_lock_released` は利用者の解除を別経路で通知し、トースト・「AI による変更」へ記録する。
+
+`sound_document` は全体状態のうち指定の並び・使う側・全体バイパスと ID watermark だけを更新する。
+未知の項目は保持し、予約の鍵は parameters 直下だけを検査する。範囲合わせは mIV Sound に任せる。
+`channel` の新規指定は同梱画面の選択肢（Stereo の空文字、A/L/R、3〜8、34/56/78）に合わせる。指定省略時は既存の広い経路も保持する。
+`src/sound_effects.generated.json` は同梱 JS から生成し、本体と MCP exe が同一ファイルを組み込む。
+プリセットは worker が全体8 MiB以下を検査して固定名の一時ファイルへ書き、閉じてから host の番を照合して置き換える。
+名前は「MCP: 」付き、同名の置換は「MCP:」で始まるものだけ。GUI thread でファイル本文を読んだりハッシュを計算しない。
+
+応答期限20秒を過ぎても worker は要求を保持し、遅い結果の記録・通知・状態保存を行う。bridge 終了時は Aborted。
+まれな保存失敗はログと通知で扱い、受理済みの変更を巻き戻さない。
+区切り4では agent IPC版9の `SoundChain` と `sound_effects` / `sound_chain` のtool登録を追加する。
+設定許可と既存の受付条件をUIで検査して同じserviceへ渡し、取り消し・状態保存の正本は増やさない。
+公開マニュアル、AI連携の許可説明、通信・端末保存の説明も同期する。コンパイル・自動テスト・実機確認・独立実装レビューは未実施。
+
 - host に **新コマンド `query_state_concurrent`** を追加する。GUI スレッドへ **非同期に** 投げて
   `getState` を呼び、結果を `plugin_state` イベント (要求 ID 付き) で返す。音声スレッドは待たない。
   VST3 の規約では `IComponent::getState` は UI スレッドから呼ばれ、処理と並行し得る (DAW の再生中

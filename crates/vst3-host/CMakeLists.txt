@@ -96,6 +96,7 @@ add_executable(mimageviewer-vst3-host
     src/vcrt_preload.cpp
     src/now_playing_notify.cpp
     src/gui_frame.cpp
+    src/sound_lock.cpp
     src/host_icon.rc
 )
 
@@ -141,6 +142,7 @@ if(WIN32)
     target_link_libraries(mimageviewer-vst3-host PRIVATE
         kernel32
         user32
+        gdi32
         dwmapi
         ole32
         uuid
@@ -202,6 +204,16 @@ set_target_properties(mimageviewer-vst3-host PROPERTIES
 # UTF-8/Windows-path and CRT-policy tests load only an inert fixture DLL,
 # never plugins or the product host.
 enable_testing()
+add_executable(vst3-sound-lock-tests tests/sound_lock.cpp src/sound_lock.cpp src/gui_frame.cpp)
+target_include_directories(vst3-sound-lock-tests PRIVATE include)
+target_compile_definitions(vst3-sound-lock-tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+target_link_libraries(vst3-sound-lock-tests PRIVATE user32 gdi32 ole32 uuid)
+add_test(NAME vst3-sound-lock-boundaries COMMAND vst3-sound-lock-tests)
+set_tests_properties(vst3-sound-lock-boundaries PROPERTIES TIMEOUT 60)
+if(MSVC)
+    target_compile_options(vst3-sound-lock-tests PRIVATE /utf-8 /W4 /permissive-)
+    set_property(TARGET vst3-sound-lock-tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 add_executable(vst3-gui-frame-tests tests/gui_frame.cpp src/gui_frame.cpp src/host_app.cpp src/protocol.cpp src/host_icon.rc
     "${VST3_SDK_ROOT}/pluginterfaces/base/coreiids.cpp"
     "${VST3_SDK_ROOT}/pluginterfaces/base/funknown.cpp"

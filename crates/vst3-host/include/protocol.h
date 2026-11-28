@@ -10,7 +10,7 @@
 // stdin がクローズされたら bridge は graceful shutdown する。
 //
 // ### 親 → bridge (要求):
-//   {"cmd":"hello","version":8}
+//   {"cmd":"hello","version":9}
 //   {"cmd":"set_now_playing","slot_id":<u64>,"revision":<u64>,"title":"",
 //    "album":"","artist":"","artwork":"<base64>","artworkMimeType":""}
 //     Complete snapshot; revision orders updates within the slot incarnation.
@@ -31,12 +31,19 @@
 //   {"cmd":"set_gui_remote_session","slot_id":<u64>,"active":<0|1>} // suppression reason, no request change
 //   {"cmd":"open","plugin_path":"<UTF-8 絶対パス>","sample_rate":48000,"block_size":480}
 //   {"cmd":"set_param","id":<u32>,"value":<f64 [0..1]>}
+//   {"cmd":"sound_lock|sound_unlock|sound_get|sound_replace_locked|sound_undo_locked|sound_preset_commit",
+//    "slot_id":0,"request_id":<nonzero u64>,"lock":"<token>","generation":<u64>,
+//    "state":"<base64>","guard":{"epoch":<u64>}|"absent"}
+//     Only fields needed by the command are sent. mIV Sound's dedicated slot only.
+//     Same-name event is emitted after its GUI transaction, with request_id,
+//     status, lock (nullable), generation, guard (nullable); sound_get adds state.
+//   {"event":"sound_lock_released","slot_id":0,"lock":"<token>","by":"user|host_exit"}
 //   {"cmd":"reset"}                 // 再生位置変更 / プラグイン状態リセット
 //   {"cmd":"close"}                 // プラグインアンロード
 //   {"cmd":"shutdown"}              // bridge 終了
 //
 // ### bridge → 親 (応答 / 通知):
-//   {"event":"ready","version":8,"shm_name":"<Windows 名前付きオブジェクト>",
+//   {"event":"ready","version":9,"shm_name":"<Windows 名前付きオブジェクト>",
 //    "shm_size":<u64>,"sig_in":"<event名>","sig_out":"<event名>"}
 //   {"event":"loaded","plugin_name":"<UTF-8>","latency_samples":<u32>,
 //    "params":[{"id":<u32>,"name":"<UTF-8>","default":<f64>}, ...]}
@@ -105,7 +112,8 @@ static_assert(sizeof(ShmHeader) == 272,
 // stale bridge による IPC スキーマ不整合を検出できる。
 // v7 requires frame-scoped GUI close/normal geometry and taskbar presentation.
 // v8 adds the lyrics trial attributes and independent playback-position notify.
-constexpr uint32_t PROTOCOL_VERSION = 8;
+// v9 adds GUI-owned mIV Sound lock/state/undo/preset transactions.
+constexpr uint32_t PROTOCOL_VERSION = 9;
 
 // 制御メッセージの最大長。
 // 通常は 1 KB 未満だが、`plugin_state` event (= IComponent::getState チャンク) は

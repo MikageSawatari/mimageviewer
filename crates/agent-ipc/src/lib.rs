@@ -41,8 +41,10 @@ mod stack_script_types;
 pub use stack_script_types::*;
 mod operation_script_types;
 pub use operation_script_types::*;
+mod sound_chain_types;
+pub use sound_chain_types::*;
 
-pub const AGENT_PROTOCOL_VERSION: u32 = 8;
+pub const AGENT_PROTOCOL_VERSION: u32 = 9;
 pub const MIN_ADAPTER_PROTOCOL_VERSION: u32 = 3;
 /// Fixed pipe namespace identifier, unrelated to business IPC versions. Never change it.
 pub const AGENT_PIPE_NAMESPACE: &str = "mimageviewer-agent-v3";
@@ -184,6 +186,7 @@ pub enum Command {
         part: Option<u32>,
         expected_sha256: Option<String>,
     },
+    SoundChain(SoundChainRequest),
     SearchItems {
         query: String,
         kind: Option<ItemKind>,
@@ -328,6 +331,7 @@ pub enum Payload {
     FavoriteWrite(FavoriteWriteResult),
     StackScript(StackScriptResult),
     OperationScript(OperationScriptResult),
+    SoundChain(SoundChainResult),
     Items(ItemPage),
     Tags(TagPage),
     Collections(CollectionPage),
@@ -881,7 +885,7 @@ mod tests {
             incomplete["command"].as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<Request>(incomplete).is_err());
         }
-        assert_eq!(AGENT_PROTOCOL_VERSION, 8);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 9);
     }
 
     #[test]
@@ -1007,7 +1011,7 @@ mod tests {
 
     #[test]
     fn collection_write_wire_roundtrips_grouped_input_positions() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 8);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 9);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -1079,7 +1083,7 @@ mod tests {
             .unwrap(),
             permission
         );
-        assert_eq!(AGENT_PROTOCOL_VERSION, 8);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 9);
     }
 
     #[test]
@@ -1158,7 +1162,7 @@ mod tests {
 
     #[test]
     fn metadata_write_wire_roundtrips_and_full_batch_outcomes_fit_budget() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 8);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 9);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -1235,7 +1239,7 @@ mod tests {
 
     #[test]
     fn open_wire_uses_typed_accepted_result_without_changing_protocol_version() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 8);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 9);
         assert_eq!(
             serde_json::to_value(Command::OpenInViewer {
                 path: "C:/猫.png".into(),

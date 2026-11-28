@@ -507,6 +507,46 @@ bridge → 親:
   {"event":"state","state":"<base64>"}
 ```
 
+### mIV Sound の AI 編集用 host コマンド (protocol v9、区切り 2)
+
+agent IPC版9の `SoundChain` は本体の既存FIFO serviceを経由して以下のhostコマンドへ接続する。
+agent IPCの版とhost protocolの版は独立で、hostの状態所有者・コマンド契約は区切り4でも変えない。
+
+`sound_lock` / `sound_unlock` / `sound_get` / `sound_replace_locked` /
+`sound_undo_locked` / `sound_preset_commit` は、専用 `MIV_SOUND_DATA_DIR` を持つ
+`mIV Sound` の先頭 slot だけに対応する。制御 thread は `post_async` で slot の GUI thread に
+渡し、処理の末尾にコマンドと同名の event と `slot_id`・`request_id` を返す。汎用 VST の
+`restore_state`、音声 thread の state fence、`setProcessing(false)` は使わない。
+
+GUI thread の `SoundLock` が、ロックの印・0 から始まる世代・取り消しの 1 世代・プリセットの
+番を一つの session として所有する。ロック開始は `Locked`、解除は `Released` / `AlreadyReleased`、
+取得は `State`、置き換えは `Replaced`、取り消しは `Undone`、保存は `Committed`。
+拒否は `Busy` / `Unlocked` / `Changed` / `Rejected` / `NothingToUndo`。
+共通の応答は `lock: string | null`・`generation`・`guard: {epoch} | "absent" | null` を持ち、
+`State` だけ base64 の `state` を持つ。`guard: null` は番を持てない状態を表し、状態の取得や
+編集は続けられるがプリセットの保存は拒否する。利用者の解除・host 終了時は
+`sound_lock_released { slot_id, lock, by: "user" | "host_exit" }` を送る。
+
+ロック中は `plugin_host` を `EnableWindow(FALSE)` にし、container の上辺中央に専用の子窓と
+実ボタン「ロックを解除」を重ねる。画面の allocation は変えない。文字とボタンは使用する
+フォントで DPI に合わせて実測し、resize・DPI 変更・後から作る窓へ反映する。
+画面へのクリックは帯を一度点滅させる。Tab / Enter / Space は native BUTTON の操作として扱い、
+アプリのキーマップに新しい操作は追加しない。WebView2 の入力が実際に止まることは実機確認待ち。
+
+プリセットの番は環境変数から決めた `plugin/effetune_presets.json` を
+`GENERIC_READ` / `FILE_SHARE_READ` で開く。内容の読取・JSON の構成・一時ファイルの書込は本体 worker が
+担当し、GUI thread は番の epoch / ファイルの不在を照合し、固定の
+`effetune_presets.json.miv-mcp.tmp` から置き換え、番を開き直す。GUI thread は内容を読まず、hash も計算しない。
+
+`GuiTaskQueue::dispatch_outer` は、外側の `DispatchMessageW` (native button の dialog 処理を含む) から
+戻るたびに残りの仕事を drain する。入れ子のファイル選択 loop が thread message を捨て、以後に通知が
+来なくても、入れ子から戻れば進む。入れ子の loop の途中では drain しない。
+
+`vst3-sound-lock-boundaries` は偽の component 境界、使い捨てファイルの Win32 handle、非表示の inert HWND と
+入れ子の message loop を使う回帰テスト。製品・プラグイン・利用者の profile は使わない。
+この区切りの実装担当は CMake / Cargo / テスト・製品起動を実行していない。ビルド・自動検証と
+成果物の identity / vendor 更新は設計担当の共有 runner へ引き継ぐ。
+
 ## 7. 動画切替時の挙動
 
 ユーザー要望: 動画再生のたびにプラグインを再初期化しない。

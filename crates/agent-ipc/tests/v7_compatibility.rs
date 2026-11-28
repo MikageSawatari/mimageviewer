@@ -3,7 +3,7 @@ use serde_json::json;
 mod v7_wire;
 
 #[test]
-fn frozen_v7_hello_and_response_projection_remain_compatible_with_v8() {
+fn frozen_v7_hello_and_response_projection_remain_compatible_with_v9() {
     let request = v7_wire::Request {
         id: 1,
         command: v7_wire::Command::Hello {
@@ -17,7 +17,7 @@ fn frozen_v7_hello_and_response_projection_remain_compatible_with_v8() {
     v7_wire::write_frame(&mut bytes, &request).unwrap();
     assert_eq!(bytes, include_bytes!("v7_wire/hello.frame"));
     assert_eq!(v7_wire::AGENT_PROTOCOL_VERSION, 7);
-    assert_eq!(current::AGENT_PROTOCOL_VERSION, 8);
+    assert_eq!(current::AGENT_PROTOCOL_VERSION, 9);
     assert_eq!(current::MIN_ADAPTER_PROTOCOL_VERSION, 3);
     assert!(current::supports_adapter_version(7));
     let parsed: current::Request = current::read_frame(&mut bytes.as_slice()).unwrap().unwrap();

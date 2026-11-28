@@ -826,6 +826,9 @@ mod agent_operation_script_tests;
 mod agent_operations;
 pub(crate) mod agent_rating_write;
 mod agent_settings;
+mod agent_sound_chain;
+#[cfg(test)]
+mod agent_sound_chain_tests;
 #[cfg(test)]
 mod agent_stack_script_tests;
 mod agent_view_state;
@@ -35004,7 +35007,12 @@ impl App {
                 format!("音響調整は停止しました: {}", reason.user_reason())
             }
             EffetuneRuntime::Running { .. } => {
-                crate::effetune::running_gui_tooltip(self.effetune.effective_state())
+                let mut text =
+                    crate::effetune::running_gui_tooltip(self.effetune.effective_state());
+                if self.effetune.sound_locked() {
+                    text.push_str("\nAI が編集中です");
+                }
+                text
             }
         }
     }
