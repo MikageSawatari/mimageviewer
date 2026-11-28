@@ -3219,7 +3219,9 @@ GPT-6.1 Sol / xhigh、read-only、同じ thread。どれもソースの読みだ
 1.5 kHz +3 dB、2.8 kHz +6 dB、LP 7 kHz) + Attack Tonal Balance + Dynamic EQ を、利用者が「少しよくなる」と評価した。
 
 `sound_chain` の tool の説明 (`crates/mcp-server/src/sound_tools.json`、`Details` の直前) に、A に近い音量での比較、
-雑音除去後の Volume による雑音の戻り、Smoothing / Mix による効きの弱まり、古いレコードへの Lo Pass、こもりへの EQ の手がかりを足した。
+雑音除去後の Volume による雑音の戻り、水中のような質感や雑音の急な変化には Smoothing を上げること、
+Mix を下げると雑音を含む原音が戻ること、雑音が楽器音より高い帯域に多い古いレコードでは Lo Pass で減らせる場合があること、
+削る境目は聴いて決めること、こもりへの EQ の手がかりを足した。
 マニュアル `ai-integration.html#sound` の A / B の比較の段落の近くにも、聞こえ方の言葉で頼む方法と、音量・高い帯域・こもりの調整、
 雑音の急な変化を「なめらかにして」と頼む方法と限界を書いた。マニュアルは既存の `get_help` の生成で同梱される。
 
