@@ -4090,7 +4090,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer"
-version = "5.8.0"
+version = "5.9.0"
 dependencies = [
  "ab_glyph",
  "base64 0.22.1",
@@ -4181,7 +4181,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-agent-ipc"
-version = "5.8.0"
+version = "5.9.0"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -4192,7 +4192,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-browser-host"
-version = "5.8.0"
+version = "5.9.0"
 dependencies = [
  "base64 0.22.1",
  "mimageviewer-browser-view-ipc",
@@ -4204,7 +4204,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-browser-view-ipc"
-version = "5.8.0"
+version = "5.9.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4213,7 +4213,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-capture-file"
-version = "5.8.0"
+version = "5.9.0"
 dependencies = [
  "tempfile",
  "url",
@@ -4222,7 +4222,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-ipc"
-version = "5.8.0"
+version = "5.9.0"
 dependencies = [
  "argon2",
  "getrandom 0.3.4",
@@ -4233,7 +4233,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-launcher"
-version = "5.8.0"
+version = "5.9.0"
 dependencies = [
  "fs4",
  "mimageviewer-browser-view-ipc",
@@ -4246,7 +4246,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-mcp"
-version = "5.8.0"
+version = "5.9.0"
 dependencies = [
  "base64 0.22.1",
  "mimageviewer-agent-ipc",
@@ -4260,7 +4260,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-remote"
-version = "5.8.0"
+version = "5.9.0"
 dependencies = [
  "argon2",
  "fast_image_resize",
