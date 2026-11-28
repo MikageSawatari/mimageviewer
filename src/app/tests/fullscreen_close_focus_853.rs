@@ -50,6 +50,12 @@ pub(super) fn frame(
             .collect(),
         ..Default::default()
     });
+    // A live dedicated child must be declared in every ROOT paint pass.
+    // RawInput's viewport info alone does not keep it alive: end_pass retires
+    // unused children before collecting their commands (including Focus).
+    if viewport == egui::ViewportId::ROOT && !ctx.embed_viewports() {
+        ctx.show_viewport_deferred(surface, Default::default(), |_, _| {});
+    }
     run();
     let output = ctx.end_pass();
     let targets = focus_targets(&output);
@@ -197,7 +203,19 @@ fn section1853_close_focus_slow_parent_guard_restores_then_adopts_once() {
         let (tx, result, token) = hold_scan_reply(&mut app);
         let generation = app.items_generation;
         let targets = frame(&ctx, egui::ViewportId::ROOT, surface, None, || {
+            assert!(app.fs_close_return_navigation_wait_active());
+            assert!(app.fs_viewport_shown);
+            assert!(!app.fullscreen_embedded_still_active());
+            assert!(
+                app.video_presentation_transition
+                    .z_order_recovery_permitted()
+            );
+            assert!(
+                eframe::native_window_input::native_window_allocation_witness(&ctx, surface)
+                    .is_some_and(|witness| witness.is_alive())
+            );
             app.reconcile_fullscreen_after_main_focus(&ctx, true, false, false);
+            assert!(app.fs_last_main_focus_restore_at.is_some());
             app.poll_main_embedded_required_fullscreen_folder_open(&ctx);
         });
         assert_eq!(targets, [surface]);
@@ -638,12 +656,20 @@ fn section1853_close_focus_second_close_backspace_navigation_and_remote_drop_old
 fn section1853_close_focus_guard_ctrl_folder_wait_and_existing_gates_are_unchanged() {
     for keep in [false, true] {
         let (mut app, ctx, _, _) = reader();
+        let _window = surface_window(&app, &ctx);
         let surface = app.fullscreen_viewport_id();
         app.settings.fullscreen_keep_on_app_switch = keep;
         app.begin_fs_folder_navigation_sequence(&ctx, 0);
         assert!(!app.fs_close_return_navigation_wait_active());
         let targets = frame(&ctx, egui::ViewportId::ROOT, surface, None, || {
+            assert!(app.fs_viewport_shown);
+            assert!(!app.fullscreen_embedded_still_active());
+            assert!(
+                app.video_presentation_transition
+                    .z_order_recovery_permitted()
+            );
             app.reconcile_fullscreen_after_main_focus(&ctx, true, false, false);
+            assert_eq!(app.fs_last_main_focus_restore_at.is_some(), keep);
         });
         assert_eq!(app.fullscreen_idx, keep.then_some(0));
         assert_eq!(targets, if keep { vec![surface] } else { vec![] });

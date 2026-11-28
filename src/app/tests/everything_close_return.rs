@@ -902,6 +902,8 @@ fn section1853_close_focus_everything_worker_keeps_entry_frame_target_and_no_ado
         for immediate in [false, true] {
             let mut app = setup_app_for_test();
             let ctx = egui::Context::default();
+            // Image-folder close return requires both direct-open settings.
+            app.settings.auto_fullscreen_zip_pdf = true;
             app.settings.auto_fullscreen_image_folders = true;
             app.settings.detached_viewer_open_images_in_window = false;
             let root = app.tmp.path().to_path_buf();
@@ -909,6 +911,8 @@ fn section1853_close_focus_everything_worker_keeps_entry_frame_target_and_no_ado
             let (row, _) = fixture(&mut app, &root, Book::Folder);
             adopt(&mut app, &ctx, "close focus", dataset(vec![row.clone()]));
             open(&mut app, &ctx, &row, true);
+            assert!(app.everything_book_close_return_available());
+            assert!(app.auto_open_for_current_container());
             let target = if child {
                 app.fullscreen_viewport_id()
             } else {
@@ -917,6 +921,7 @@ fn section1853_close_focus_everything_worker_keeps_entry_frame_target_and_no_ado
             assert_eq!(
                 frame(&ctx, target, || {
                     let outcome = app.handle_fullscreen_close_request();
+                    assert_eq!(outcome, FullscreenCloseRequestOutcome::ReturnAccepted);
                     app.route_fullscreen_close_entry_focus(
                         &ctx,
                         outcome,
@@ -925,7 +930,11 @@ fn section1853_close_focus_everything_worker_keeps_entry_frame_target_and_no_ado
                     );
                     let nav = app
                         .take_pending_return_to_parent_nav_with_focus(&ctx)
-                        .unwrap();
+                        .expect("accepted Everything close must dispatch its return");
+                    assert!(matches!(
+                        nav,
+                        crate::ui_main::AddressBarNav::EverythingResults
+                    ));
                     if immediate {
                         assert!(app.apply_fullscreen_close_nav_immediate_with_focus(&ctx, nav));
                     } else {

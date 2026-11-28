@@ -3098,3 +3098,26 @@ R1 は上記の設計担当の判断に従い解決済み。共有 close owner �
 静的確認は変更した Rust 19 ファイルへの `rustfmt --edition 2024 --check --config skip_children=true`、
 `git diff --check`、`python scripts/check_ui_glyphs.py`（危険な UI 字形 0 件）。型検査・テスト成功の証拠ではない。
 commit／stash／reset／checkout／branch switch は行っていない。確認用バイナリは利用者のビルド禁止に従い作成していない。
+
+
+**設計担当の検証後の修正（2026-11-28、基点 `47a84e458`）**:
+
+設計担当が関連 filter を run-heavy で実行した結果を `target/focus-test2.log`（読み取りのみ）で確認した。
+既定構成は 1388 件中 1385 成功・新規 3 件失敗、`--features test-script` は 1393 件中 1390 成功・同じ新規 3 件失敗。
+既存テストはすべて成功したという設計担当の報告と一致する。この実行は設計担当による修正前の検証であり、以下の修正後の成功を示さない。
+
+| 失敗したテスト（ファイル内の名前） | 原因とコードの根拠 | 修正／維持する期待 |
+| --- | --- | --- |
+| `everything_close_return.rs` `section1853_close_focus_everything_worker_keeps_entry_frame_target_and_no_adoption_focus`（旧 928 行で nav の unwrap が失敗） | **テストの前提の誤り**。画像フォルダ用の補助設定だけ ON にし、`auto_fullscreen_zip_pdf` を既定の OFF（`settings.rs:8747`）のままにした。`settings.rs:10039,10043` は実効 direct-open と画像フォルダの両設定を要求し、`close_return.rs:624` も Everything の閉じ戻りをこの実効設定で許可する。fixture の `open(..., true)` は設定と別に全画面を開けるため open は成功したが、close は `app.rs:64841,86261` の規則で true close となり、取り出す nav は無かった。既存の実帰路テストは `everything_close_return.rs:192` で両設定を ON にしていた | 必要な direct-open 設定を明示的に ON。open 後の帰路の利用可能性、close の `ReturnAccepted`、nav の `EverythingResults` を検査してから dispatch。受付の元の宛先へ 1 回／採用 0 回という §6.19.1 の非 C5 の規則と §6.19.4 の設計担当の補足判断の期待は変更しない |
+| `fullscreen_close_focus_853.rs` `section1853_close_focus_guard_ctrl_folder_wait_and_existing_gates_are_unchanged`（旧 649 行で child Focus が空） | **テストの前提の誤り**。専用子 viewport の存在を RawInput と `fs_viewport_shown` だけで表し、ctx に実際の子 viewport の生存を宣言していなかった。`restore_fullscreen_focus_from_main` は `app.rs:74910,74920` で子へ Focus を送るが、egui は root の `end_pass` で未使用の子を退役（`vendor/egui/src/context.rs:3567,3583`）させた後に command 出力を集める（同 `3606`）。`send_viewport_cmd_to` は command を積むだけで `used` を立てず（同 `5134`）、`show_viewport_deferred` は宣言時に `used=true` にする（同 `5193`） | 専用 surface の fixture を用意し、共有 `frame` helper は非 embedded の root paint pass ごとに子を宣言する。restore の表示面／transition の前提と、restore が実際に処理されたことも検査する。§6.19.1 の 4・f13 により Ctrl+↑↓ は C5 へ拡張せず、keep OFF は close／Focus 0、keep ON は維持／子へ Focus 1 の期待を変更しない |
+| `fullscreen_close_focus_853.rs` `section1853_close_focus_slow_parent_guard_restores_then_adopts_once`（旧 203 行で child Focus が空） | **テストの前提の誤り**。`surface_window` で一度だけ子を宣言していたが、その後の root pass で再宣言していなかったため、同じ egui の未使用子の退役で生存と Focus 出力を失っていた。製品の root paint は `app.rs:105418` の keep-alive／fullscreen render を通すが、このテストの簡略 frame はそれを省いていた | 同じ frame helper の修正で専用 surface と HWND witness の寿命を保つ。guard 直前の C5 wait／専用表示面／live witness と、restore が処理されたことを追加検査。§6.19 の不変条件 3 と §6.19.1 の 4 に従い、keep ON/OFF とも待ち維持／guard は子 Focus 1、scan は非取消、採用は元の本を選択して ROOT Focus 1 という期待を変更しない |
+
+変更は上のテスト 2 ファイルと本節だけ。新規テスト名と nextest filter は変更せず、既存の期待値も変更していない。
+製品コード・egui vendor・detached session は変更していない。guard／delay／retry／追加 repaint／silent fallback は追加していない。
+同型の command 検査 helper も確認した。他の close-return／Smart／Everything の helper は受付 ctx 自身への Focus を検査し、
+C5 採用は ROOT 宛のため、今回の「root pass から別の未宣言子へ送る」脱落とは異なる。
+今回の shared frame 修正は sibling／別アプリの前面テストにも適用され、HWND witness が失われたために Focus 0 と誤判定する余地も除く。
+
+修正後に実装担当が行った確認は、変更した Rust 2 ファイルへの `rustfmt --edition 2024 --check --config skip_children=true` と
+`git diff --check` のみ。いずれも成功。cargo／nextest／ビルド／製品起動／commit は実行していない。
+残る懸念は修正後の両構成の再検証が未実施であること。新しい設計返却はない。
