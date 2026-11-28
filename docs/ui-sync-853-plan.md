@@ -2712,3 +2712,80 @@ dev-runtime の検証用バイナリ (`.\scripts\build-dev.ps1`) は `5c870a954`
   直すかは利用者の判断。
 - ★固定の移動の同期の走査 (`SnapshotLeafOpen`、§6.2)。統括が master で番号を取る。
 - `.pdf` という名前の実フォルダへの検索の戻りは、基点でも成功しない (§6.17 r1、新しいテストの対象から外した)。
+
+### 6.19 C5 の退行の修正: メインへの Focus を全画面を閉じる時点へ移す (2026-11-28、利用者決定「案 1 で根本的に直す」)
+
+#### 観測 (出どころ: サブ PC の Claude、v5.9.0 rc1 master 08507d60e、`C:\home\mimageviewer-subpc\v590-rc1\results\`)
+
+- B5 (本 `book.zip` の全画面で Enter、親 `mixed` は RDP 越しの 5000 件): 242.825 に全画面が Enter を受け、同じフレームで
+  閉じ戻りを受付 (perf `close_nav_stage` … `DirectOpen outcome=Classifying`)。242.852 にルートの入力に `AltRight` の押下と離しが現れ、
+  前面がメインに変わった。242.859 に `fullscreen: main focus guard closing session`、242.865 に親の走査が `cancelled=true` で終わり、
+  本のページ一覧が残った。
+- B6 (画像のみのフォルダの全画面で Enter、親 `root` は 2 件): 同じく前面がメインに変わった (57.093) が、親の走査が 72 ms で済み、
+  そのフレームで採用が全画面を閉じたので、guard は閉じなかった。
+
+#### 原因 (コードの読み取り。設計担当)
+
+- `AltRight` は winit 0.30.13 の `focus_window` → `force_window_active` (拡張の VK_LMENU を SendInput してから SetForegroundWindow)。
+  前面でない窓に Focus を送ったときだけ出る。
+- 送り手は `src/ui_fullscreen.rs` の `close_fs` (`handle_fullscreen_close_request()` の直後の `ctx.send_viewport_cmd(Focus)`、
+  `close_request_focus`)。ここの `ctx` はルートの描画なので宛先は ROOT。同じ形が `gamepad_input.rs` の
+  `apply_ring_close_fullscreen` にもある。
+- `handle_fullscreen_close_request` は、閉じ戻りを受け付けた場合 (「ページを直接開く」の本・ブックマーク・書庫の中の本の一覧など)
+  全画面を閉じずに予約だけを立てる。§1.853 前は同じフレームで親を同期で読み、install が全画面を閉じたので Focus は無害だった。
+  C5 で全画面のまま待つようにしたため、次のフレームの main focus guard (`reconcile_fullscreen_after_main_focus`) が
+  「全画面中にメインが前面」とみなして全画面を閉じ、待っていた走査も取り消した。
+- 起きる条件: 親の採用が、Focus が効いた次のフレームより遅いとき (ネットワーク越し・件数の多いフォルダ・遅いディスク)。
+  速い親では採用が先に済むので起きない。既定の設定 (全画面は別の窓、`fullscreen_keep_on_app_switch` OFF) で、手の操作でも起きる見込み。
+  v5.8.0 からの退行。
+
+#### 守る不変条件
+
+1. **main の全画面の session が開いている間、mIV は自分から ROOT に前面を要求しない。** ROOT への Focus は、利用者の閉じる操作で
+   main の全画面の session が**実際に閉じた**ときに、その閉じた処理の持ち主が 1 回だけ出す。
+   - 今その場で閉じた (true close): 今までどおり、閉じる操作のフレームで出す。
+   - 閉じ戻りを受け付けて全画面を残した: 受付では出さない。閉じ戻りの採用 (install が全画面を閉じる、§6.12 の ViewerExited の境界) で出す。
+     採用以外で同じ閉じ戻りが全画面を閉じて終わる経路 (失敗・取り消し後の true close、同じフレームで同期に適用される閉じ戻り
+     (書庫の中の本の一覧・ブックマーク・Everything 等)) も、全画面を閉じた時点で出す。
+2. **他のアプリから前面を奪わない。** 採用の時点で出す Focus は、閉じた全画面の窓が、そのとき mIV の前面だった場合だけ
+   (OS で前面の窓を閉じると持ち主の窓へ前面が移るのと同じ)。待ちの間に利用者が別のアプリへ切り替えていたら出さない
+   (winit の `force_window_active` は前面を奪えるため)。
+3. **閉じ戻りの待ちの間 (`fs_close_return_navigation_wait_active`)、利用者が自分でメインを前面にしても (Alt+Tab・クリック)、
+   main focus guard は全画面を閉じない。** 既存の `restore_fullscreen_focus_from_main` で全画面へ focus を戻し、閉じ戻りの走査を続ける
+   (`fullscreen_keep_on_app_switch` ON と同じ既存の扱い)。利用者はすでに「一覧へ戻る」を選んでおり、その行き先は待ちの完了で出る。
+   待ちの間の閉じる操作をもう一度受けたときの扱い (§6.12) は変えない。
+   - 採否の理由: 閉じると B5 と同じく本のページ一覧が見え、移動が取り消される (§6.12 が避けたかった見え方)。全画面へ戻すのは既存の
+     経路で、状態を足さない。待ちの間に何もしない (メインを前面にしたまま全画面を残す) 案は、メインが全画面の前に出て
+     古い一覧 (本のページ一覧) が見えるので採らない。
+4. 速い親では今までどおり (採用のフレームで全画面が閉じ、メインが前面になる)。見え方の差は、Focus が受付から採用へ数十 ms 遅れる
+   ことだけで、その間は全画面が前面のまま (§6.12 の lock の規則どおり)。
+
+#### 設計 (簡素化の検討)
+
+- 新しい状態を足さず、「閉じる要求の結果」を型で返す: `handle_fullscreen_close_request` (と `_immediate`) が
+  `FullscreenCloseRequestOutcome::{ClosedNow, ReturnPending, Ignored}` のような値を返し、呼び出し側の Focus は `ClosedNow` のときだけ。
+  `ReturnPending` の Focus の持ち主は閉じ戻りの終端 (採用・失敗の true close・同期の適用)。
+- 採用の install は `ctx` を持たないので、Focus は採用を行う呼び出し側 (`post_render_main_navigation` の poll / 全画面の seam の poll /
+  同期の適用の呼び出し元など、`ctx` を持つ所) が、install の結果 (「閉じ戻りで main の全画面を閉じた」) を受けて出す。
+  1 フレームの中で完結させ、次のフレームへ持ち越す保留の状態は作らない。持ち越しが要る経路が見つかったら実装担当は設計担当へ返す。
+- guard の変更は述語 1 つ (`fs_close_return_navigation_wait_active` のときは close ではなく restore)。
+- 実装担当は、ROOT へ Focus を送るすべての箇所 (`ViewportCommand::Focus` を ROOT または root の `ctx` へ送るもの、
+  `activate_main_window`) を洗い出し、全画面を閉じる経路に付いているものを上の 1〜2 に当てはめる。閉じる経路に付いていないもの
+  (トレイからの復帰・クリップボードの取り込み・detached の後始末など) は変えない。native の動画の全画面
+  (`handle_fullscreen_close_request_immediate` を呼ぶ native presenter の経路) も同じ表で扱い、変えない場合は理由を書く。
+- detached: 変えるのは main の context の述語と main の全画面の閉じる経路だけ。detached の session には触れない
+  (`viewer_session_blocks_main_window` は detached を含まない)。触れた範囲は docs/detached-rework-plan.md §11 に記録する
+  (CLAUDE.md の detached の決まり: 構造的修正であることへの双方の合意)。
+- まれな失敗 (走査の I/O エラー・worker の停止) は既存のログと通知で割り切る。Focus の再試行はしない。
+
+#### テスト (状態の移り変わり。OS の前面はテストで再現できないので、viewport command の列と guard の入力を検査する)
+
+- (f1) 閉じ戻りを受け付けたフレームで、ROOT への `ViewportCommand::Focus` が出ない (キー Enter・Esc・右クリック・ゲームパッドの閉じる)。
+- (f2) 親の走査が遅い: 受付の後、`reconcile_fullscreen_after_main_focus(ctx, main_focused=true, …)` を走らせても全画面は閉じず、
+  走査は取り消されない。走査の完了と採用で親の一覧になり、選択が元の本、ROOT への Focus がちょうど 1 回出る。
+- (f3) 親の走査が速い (採用が受付の次のフレームまでに済む): 今までどおり親の一覧になり、ROOT への Focus が 1 回出る。
+- (f4) 採用のとき全画面の窓が前面でなかった (待ちの間に他のアプリへ切り替えた): ROOT への Focus を出さない。
+- (f5) 今その場で閉じる true close (閉じ戻りの無い全画面): 今までどおり閉じる操作のフレームで ROOT への Focus が出る。
+- (f6) 同期に適用される閉じ戻り (書庫の中の本の一覧・ブックマーク) と、失敗で true close に落ちる経路: 全画面が閉じたフレームで Focus が 1 回。
+- (f7) 閉じ戻りの待ちの間、guard は全画面へ focus を戻す (restore の経路) だけで、session・閉じ戻り・走査を変えない。
+- 既定の features と `--features test-script` の両方で通る。
