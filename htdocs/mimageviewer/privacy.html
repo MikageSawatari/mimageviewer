@@ -479,6 +479,9 @@
 
   <section>
     <h2>Data stored on your device</h2>
+    <h3 id="image-combine-data-en">Image combine layouts</h3>
+    <p>When you combine images and save the result, the App saves the absolute paths of the source images (for ZIP and PDF, the location of the file plus the image name or page number), their order, the label text, and the layout and output settings only in <code>combine.db</code> in the App's data folder. This record lets you reopen the layout with "Redo combine" (結合をやり直す). The layout is not written into the combined image itself or into the folder's <code>mimageviewer.dat</code>, and EXIF, AI prompts and similar information from the source images are not copied to the output. Labels drawn as part of the picture remain in the output image.</p>
+    <p>Renaming or moving a combined image within mImageViewer carries the record over; deleting it also deletes the layout record. Layouts are not included in settings portability or metadata transfer. Renaming or moving the source images does not change the paths stored in the layout. See also <a href="manual/image-combine.html#reopen">how to redo a combine</a>.</p>
     <h3 id="browser-integration-data-en">Browser integration registration and saved images</h3>
     <p>Turning on browser integration under Preferences → Startup and Integration (起動と連携) → Browser Integration (ブラウザ連携) creates the following entries for your current Windows account so Chrome and Edge can find mIV on this PC.
       Only a regular installation using the default data folder can change registration. Portable installations and launches with a separately specified data folder leave it unchanged.</p>
@@ -527,6 +530,7 @@
       <li>Created or imported transcripts of video and audio files (<code>transcript.db</code>). Because spoken words are written down as they are, transcripts may include names and private conversations. For favorites with item indexing enabled, saved transcripts are also stored in the full-text index on your PC. Metadata exports also save them in the selected folders. You can delete saved transcripts with "文字起こしを削除" (Delete transcripts) in the list's right-click menu</li>
       <li>The downloaded transcription model, with its LICENSE and NOTICE (<code>addons\asr\</code> within the data folder, or <code>data\addons\asr\</code> in the portable edition). It shares its execution files with AI captions. Transcription runs on your PC; audio is not sent externally for it</li>
       <li>The downloaded depth model for 3D photos, with its LICENSE and NOTICE (<code>addons\depth\</code> within the data folder, or <code>data\addons\depth\</code> in the portable edition). Depth is calculated on your PC; images are not sent externally for this calculation</li>
+      <li>Detectors you place for automatic mask detection (<code>detectors\</code> within the data folder, or <code>data\detectors\</code> in the portable edition). mIV only reads them and does not modify them. Face and other detection runs on your PC; images are not sent externally for detection. Detected masks are saved in the same place as masks added with each tool</li>
       <li>Collections (list names, ordering, and the locations of the files and folders you add), and their rolling backups</li>
       <li>An index for finding alternate versions (image locations, formats, dimensions, and information used to compare their appearance)</li>
       <li>PDF passwords (encrypted using the Windows data-protection API)</li>
