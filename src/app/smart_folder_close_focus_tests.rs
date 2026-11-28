@@ -44,12 +44,19 @@ fn frame(
 }
 
 fn reader(physical_child: bool) -> (AppTestEnvForTest, uuid::Uuid, PathBuf) {
+    reader_with_parent(physical_child, "child")
+}
+
+fn reader_with_parent(
+    physical_child: bool,
+    parent: &str,
+) -> (AppTestEnvForTest, uuid::Uuid, PathBuf) {
     let mut app = crate::app::setup_app_for_test();
     app.indexer_init.mark_unavailable_if_not_ready();
     app.active_quick_folder_slot = None;
     let entry = app.tmp.path().join("smart-close-book");
     let current = if physical_child {
-        entry.join("child").join("leaf")
+        entry.join(parent).join("leaf")
     } else {
         entry.clone()
     };
@@ -269,4 +276,83 @@ fn section1853_close_focus_smart_refusal_has_no_focus_or_later_focus_owner() {
         })
         .is_empty()
     );
+}
+
+#[test]
+fn section1853_close_focus_smart_suffix_parent_classification_focuses_only_in_dispatch_frame() {
+    use crate::app::ClassifiedOpenContinuation;
+    for child in [false, true] {
+        for ordinary_tail in [false, true] {
+            let (mut app, _, source) = reader_with_parent(true, "parent.7z");
+            let destination = source.parent().unwrap().to_path_buf();
+            let ctx = egui::Context::default();
+            let surface = app.fullscreen_viewport_id();
+            let target = if child {
+                surface
+            } else {
+                egui::ViewportId::ROOT
+            };
+            assert_eq!(
+                frame(&ctx, target, surface, || {
+                    let nav = request_close(&mut app, &ctx);
+                    assert!(matches!(&nav, AddressBarNav::Direct(path, _) if path == &destination));
+                    if ordinary_tail {
+                        app.post_render_main_navigation(
+                            &ctx,
+                            super::super::update_phases::MainFrameNavigation {
+                                fullscreen_close_nav: Some(nav),
+                                ..Default::default()
+                            },
+                        );
+                    } else {
+                        assert!(app.apply_fullscreen_close_nav_immediate_with_focus(&ctx, nav));
+                    }
+                }),
+                vec![target]
+            );
+            let candidate = app.top_level_grid_view.open_path_classification().unwrap();
+            assert!(match (candidate.continuation.as_deref(), ordinary_tail) {
+                (Some(ClassifiedOpenContinuation::Direct { .. }), false)
+                | (Some(ClassifiedOpenContinuation::DirectNavigation { .. }), true) => true,
+                _ => false,
+            });
+            assert!(
+                candidate
+                    .navigation
+                    .as_ref()
+                    .is_some_and(|nav| app.main_list_navigation_is_current(nav))
+            );
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(!app.fs_close_return_navigation_wait_active());
+            assert!(app.folder_pane_open_pending.is_none());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while app.top_level_grid_view.open_path_classification().is_some()
+                || app.smart_folder_transition.is_some()
+                || app.sidecar_restore_active()
+            {
+                assert!(
+                    frame(&ctx, egui::ViewportId::ROOT, surface, || {
+                        app.poll_open_path_classification(&ctx);
+                        app.poll_smart_folder(&ctx);
+                        app.finish_page_identity_preparation_for_test();
+                        app.poll_sidecar_restore(&ctx);
+                        assert!(!app.fs_close_return_navigation_wait_active());
+                        assert!(app.folder_pane_open_pending.is_none());
+                    })
+                    .is_empty()
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "classified Smart parent did not adopt"
+                );
+                std::thread::yield_now();
+            }
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.effective_folder(), Some(destination.clone()));
+            assert!(
+                matches!(&app.top_level_grid_view.smart_folder().unwrap().position,
+                SmartFolderPosition::Scoped { current, .. } if current == &destination)
+            );
+        }
+    }
 }

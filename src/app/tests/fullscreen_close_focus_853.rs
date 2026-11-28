@@ -869,7 +869,7 @@ fn section1853_close_focus_rating_physical_restore_keeps_entry_frame_and_no_adop
             // A directory with an archive suffix also exercises the existing
             // classification owner before physical-history preflight.
             let parent = if classify {
-                let path = parent.join("physical-parent.zip");
+                let path = parent.join("physical-parent.7z");
                 std::fs::create_dir(&path).unwrap();
                 let moved_book = path.join("book.pdf");
                 std::fs::rename(&book, &moved_book).unwrap();
@@ -894,6 +894,24 @@ fn section1853_close_focus_rating_physical_restore_keeps_entry_frame_and_no_adop
                 }),
                 vec![target]
             );
+            if classify {
+                let candidate = app.top_level_grid_view.open_path_classification().unwrap();
+                assert!(matches!(
+                    candidate.continuation.as_deref(),
+                    Some(ClassifiedOpenContinuation::Physical {
+                        intent: PhysicalHistoryIntent::Rating { .. },
+                        ..
+                    })
+                ));
+                assert!(
+                    candidate
+                        .navigation
+                        .as_ref()
+                        .is_some_and(|nav| app.main_list_navigation_is_current(nav))
+                );
+            } else {
+                assert!(app.top_level_grid_view.open_path_classification().is_none());
+            }
             assert!(app.viewer_session_blocks_main_window());
             assert!(!app.fs_close_return_navigation_wait_active());
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -1007,6 +1025,93 @@ fn section1853_close_focus_subfolder_return_keeps_entry_frame_and_no_adoption_fo
             assert_eq!(
                 app.current_folder,
                 Some(subfolder_expansion_synthetic_path())
+            );
+        }
+    }
+}
+
+#[test]
+fn section1853_close_focus_direct_suffix_classification_focuses_only_in_dispatch_frame() {
+    for child in [false, true] {
+        for ordinary_tail in [false, true] {
+            let (mut app, ctx, parent, book) = reader();
+            let destination = parent.with_extension("7z");
+            std::fs::create_dir(&destination).unwrap();
+            let source = destination.join("book.pdf");
+            std::fs::rename(&book, &source).unwrap();
+            mount_pdf_reader(&mut app, &source);
+            let _window = surface_window(&app, &ctx);
+            let _foreground = crate::test_native_focus::scoped(SURFACE, 0, true);
+            let surface = app.fullscreen_viewport_id();
+            let target = if child {
+                surface
+            } else {
+                egui::ViewportId::ROOT
+            };
+            assert_eq!(
+                frame(&ctx, target, surface, Some(egui::Key::Enter), || {
+                    close_entry(&mut app, &ctx, "enter");
+                    let nav = app
+                        .take_pending_return_to_parent_nav_with_focus(&ctx)
+                        .unwrap();
+                    assert!(
+                        matches!(&nav, crate::ui_main::AddressBarNav::Direct(path, _) if path == &destination)
+                    );
+                    if ordinary_tail {
+                        app.post_render_main_navigation(
+                            &ctx,
+                            update_phases::MainFrameNavigation {
+                                fullscreen_close_nav: Some(nav),
+                                ..Default::default()
+                            },
+                        );
+                    } else {
+                        assert!(app.apply_fullscreen_close_nav_immediate_with_focus(&ctx, nav));
+                    }
+                }),
+                vec![target]
+            );
+            let candidate = app.top_level_grid_view.open_path_classification().unwrap();
+            assert!(match (candidate.continuation.as_deref(), ordinary_tail) {
+                (Some(ClassifiedOpenContinuation::Direct { .. }), false)
+                | (Some(ClassifiedOpenContinuation::DirectNavigation { .. }), true) => true,
+                _ => false,
+            });
+            assert!(
+                candidate
+                    .navigation
+                    .as_ref()
+                    .is_some_and(|nav| app.main_list_navigation_is_current(nav))
+            );
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(!app.fs_close_return_navigation_wait_active());
+            assert!(!app.direct_navigation_scan_pending());
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while app.top_level_grid_view.open_path_classification().is_some()
+                || app.sidecar_restore_active()
+            {
+                assert!(
+                    frame(&ctx, egui::ViewportId::ROOT, surface, None, || {
+                        app.poll_open_path_classification(&ctx);
+                        app.poll_sidecar_restore(&ctx);
+                        assert!(!app.fs_close_return_navigation_wait_active());
+                        assert!(!app.direct_navigation_scan_pending());
+                    })
+                    .is_empty()
+                );
+                assert!(Instant::now() < deadline, "classified parent did not adopt");
+                std::thread::yield_now();
+            }
+            assert_eq!(app.fullscreen_idx, None);
+            assert_eq!(app.current_folder.as_ref(), Some(&destination));
+            assert!(
+                matches!(&app.items[app.selected.unwrap()], GridItem::PdfFile(path) if path == &source)
+            );
+            assert!(
+                frame(&ctx, egui::ViewportId::ROOT, surface, None, || {
+                    app.post_render_main_navigation(&ctx, Default::default());
+                })
+                .is_empty()
             );
         }
     }

@@ -1469,10 +1469,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
   新しい App 全体の pending、待ち時間、再試行、追加 repaint は導入しない。
 - 設計返却 R1 への設計担当の回答で、Focus は実 dispatch の適用後に判断する形へ改訂した。
   SmartFolder の resident 復元は同期 close 後、全画面を残す staged 復元は従前どおり受付フレームで送る。
-  補足回答により RatingViewBack も従前維持とし、同じ形の Everything retained prepare、captured origin の
+  補足回答により RatingViewBack も従前維持とし、同じ形の captured origin の
   Physical／Collection history、サブ展開 Return も受付フレームで送る。既存 owner の ID／sequence／token を
-  dispatch の呼出内だけで比較する読取 helper で成功受付を確認する。Smart／Everything／サブ展開の worker 自体は変更しない。
+  dispatch の呼出内だけで比較する読取 helper で成功受付を確認する。Smart／サブ展開の worker 自体は変更しない。
   新しい採用時 Focus、wait／guard の拡張、detached session の変更は行わない。
+- 独立実装レビュー r1 (REJECT、P2×1・P3×1) の対応で、main の Direct／DirectNavigation／DirectScan の成功した
+  suffix 分類受付も、既存 request ID の照合による同フレームの Focus 対象へ含めた。分類済み Directory は scan を持ち、別の C5 待ちを作らない。
+  Everything は同期 close だったため、誤った前提の legacy Focus helper を削除した。detached の owner と lifecycle は変更しない。
+  これは別の独立レビュアーの指摘への対応記録であり、修正後の実装レビュー ACCEPT を得たという記録ではない。
 - detached の session／述語／viewport identity／寿命／placement／配送は変更しない。
   共有 continuation は同じ bundle field を維持し、状態 enum を内包する形にした。
   `viewer_context_registry.rs` の変更は既存テストの state 参照の機械的な追従だけで、session 実装の変更はない。

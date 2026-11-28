@@ -861,7 +861,7 @@ fn investigation_master_everything_no_origin_zipdir_rows_match_nav() {
 }
 
 #[test]
-fn section1853_close_focus_everything_worker_keeps_entry_frame_target_and_no_adoption_focus() {
+fn section1853_close_focus_everything_sync_close_keeps_entry_frame_target_and_no_adoption_focus() {
     fn frame(
         ctx: &egui::Context,
         target: egui::ViewportId,
@@ -949,7 +949,10 @@ fn section1853_close_focus_everything_worker_keeps_entry_frame_target_and_no_ado
                 }),
                 vec![target]
             );
-            assert!(app.viewer_session_blocks_main_window());
+            // return_from_everything_child closes at finish_everything_edit_boundary;
+            // its retained result worker only restores the list afterwards.
+            assert!(!app.viewer_session_blocks_main_window());
+            assert_eq!(app.fullscreen_idx, None);
             assert!(!app.fs_close_return_navigation_wait_active());
             assert_everything_return_only_for_test(&app);
             let deadline = Instant::now() + Duration::from_secs(30);

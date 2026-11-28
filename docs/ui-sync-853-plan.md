@@ -2881,7 +2881,8 @@ r2 の P2・P3 は解消、新しい指摘なし。全画面の表示面の HWND
 | 新しい navigation／Remote・起動転送・agent の置換 | 旧要求の Focus 資格を破棄。新しい要求の既存表示方針に従う |
 | 同期の ZipListReturn／Bookmarks／ReadingHistory／Collection | dispatch の適用で main 全画面が閉じた場合、そのフレームに記録した元の宛先へ 1 回。全画面が残った失敗・拒否は送らない |
 | RatingViewBack の root worker／物理階層の復元（`app.rs` `rating_view_back`／`start_rating_navigation_owned`／`start_rating_physical_restore`） | 非 C5。補足回答に従い新しい既存 owner の成功受付フレームで、入口が記録した宛先へ 1 回。物理復元前の suffix classification も同じ。採用時の送信と guard の拡張は追加しない |
-| EverythingResults（`global_search_ui/everything.rs` `return_from_everything_child`） | 非 C5。retained dataset prepare が全画面を残すため、新しい Return／prepare の成功受付フレームで元の宛先へ 1 回。採用時は 0 回 |
+| EverythingResults（`global_search_ui/everything.rs` `return_from_everything_child`） | 非 C5。`finish_everything_edit_boundary`（`app.rs:24690`）が受付 dispatch 中に全画面を同期 close。元の宛先へ同じフレームに 1 回、後の retained dataset prepare の採用は 0 回。下の A の調査で「全画面を残す」という初期の棚卸しを訂正 |
+| suffix 分類を挟む Direct／DirectNavigation／DirectScan の閉じ戻り（通常／Smart の物理親、`app.rs:30828,30951,31205,31286,31310`） | 非 C5。成功した新しい分類 owner の受付フレームに記録した元の宛先へ 1 回。Directory の分類 worker は scan と folder-order input も返すため、分類後はその scan から同期 install または Smart 固有の採用へ進み、C5 の別の物理走査待ちには入らない。採用時は 0 回。suffix 分類の無い Direct／CollectionSource の実 C5 は従来どおり採用時 1 ROOT Focus |
 | captured origin への物理／Collection の履歴復元（`reading_history_origin.rs` `dispatch_main_list_restore_destination` → `dispatch_owned_folder_history_destination`） | 非 C5。新しい Physical／Collection history owner（必要ならその前の classification）の成功受付フレームで元の宛先へ 1 回。採用時は送らない |
 | captured サブ展開 origin／synthetic 帰路（`subfolder_expansion.rs` `restore_subfolder_expansion_navigation_with_state`／`restore_subfolder_expansion_for_synthetic_path_with_state`） | 非 C5。snapshot の prepare または再 scan が全画面を残すため、新しい Return owner の成功受付フレームで元の宛先へ 1 回。採用時は 0 回 |
 | 上記 legacy owner の開始前の拒否／失敗、Rating prepare の取消だけで新しい帰路が始まらない場合 | main 全画面が残れば送らない。以前の worker は送信資格にならず、新しい採用時 owner も作らない |
@@ -2942,7 +2943,7 @@ Smart 側には `close_return_presentation`／CloseReturn の ViewerExited／今
 - **Rating の補足回答（同日、設計担当）**: RatingViewBack も Smart の staged 復元と同じく、§1.853 前の挙動を保つ。
   worker 受付フレームで元の宛先へ 1 回送り、worker 待ちと guard の既存の関係は変えない。
   当初 R1 回答の一般規則から適用していた「Rating worker は Focus 0 回」はこの補足で取り下げ、テストの期待を 1 回へ戻した。
-  同じ形の既存非 C5 帰路も同じ扱いにする指示に従い、Everything の retained prepare、Rating の物理階層復元、
+  同じ形の既存非 C5 帰路も同じ扱いにする指示に従い、Rating の物理階層復元、
   captured origin の Physical／Collection history 復元とサブ展開 Return を監査し、上の表へ追加した。
   成功受付だけを従前維持の例外とし、失敗・拒否で全画面が残る場合は送らない。返却 R1 と補足確認は解決済み。
 
@@ -2955,10 +2956,10 @@ Smart 側には `close_return_presentation`／CloseReturn の ViewerExited／今
   全画面を残したまま別フレームの poll／採用へ進むことをコードで確認した。
   この成功受付を、Rating 等と共通の `LegacyCloseReturnOwners` で確認する。dispatch 前後の既存 owner の ID と
   navigation の current 判定を呼出内だけで比較し、新しく受理された owner がある場合だけ送る。
-  Smart／Rating／Physical・Collection history／classification は既存 request ID／sequence、Everything は既存の
-  prepare cancel token の Arc identity と wish sequence、サブ展開は既存 cancel token の Arc identity を使う。
+  Smart／Rating／Physical・Collection history／classification は既存 request ID／sequence、
+  サブ展開は既存 cancel token の Arc identity を使う。
   token の clone は呼出の終わりに破棄し、アドレス再利用を照合に混ぜない。App／worker に Focus の pending は足さない。
-  以前からある worker、拒否、失敗、cancel だけでは送信資格にならない。Direct の C5 classifier は legacy へ含めない。
+  以前からある worker、拒否、失敗、cancel だけでは送信資格にならない。Direct の成功した suffix 分類受付も、下の独立レビュー r1 対応で非 C5 として含める。
 - `apply_fullscreen_close_nav_immediate_with_focus`、通常の `post_render_main_navigation`、
   `dispatch_native_backdrop_navigation` が適用前に Focus の属性を呼出内へ移し、適用後に同じ終端を呼ぶ。
   別の nav が裁定で勝った場合はそのフレームに捨て、負けた close の Focus を後へ残さない。
@@ -2970,7 +2971,7 @@ Smart 側には `close_return_presentation`／CloseReturn の ViewerExited／今
 
 その他の境界／逸脱:
 
-- Rating／Smart／Everything／サブ展開と captured origin の staged 復元は非 C5 のまま。
+- Rating／Smart／サブ展開と captured origin の staged 復元は非 C5 のまま。
   source 上で全画面を残す成功受付を確認し、上記の設計担当の補足に従い受付フレームの Focus を維持した。
   この既存待ちに main が前面になった場合の guard の条件や採用時 Focus は変更しない（別項目の候補）。
   Bookmarks と ReadingHistory は loading surface の install、通常 Collection 帰路は shell install、ZipListReturn は
@@ -2988,7 +2989,8 @@ Smart 側には `close_return_presentation`／CloseReturn の ViewerExited／今
 | `src/app/close_return.rs` | 既存 continuation の属性・状態の内包、非 C5 の同一フレーム送信、HWND 捕捉と採用後の foreground 照合 |
 | `src/app/update_phases.rs` | 通常 tail／native backdrop の実 dispatch の前後で呼出内の Focus owner を取り出して終端する。裁定で負けた要求はそのフレームに破棄 |
 | `src/app/smart_folder.rs`、`src/app/smart_folder_close_focus_tests.rs` | dispatch 前後の受理済み Smart owner ID の読取照合、resident／staged root／physical child／拒否の Focus 回帰。既存 root fixture の参照をテスト子 module に公開 |
-| `src/global_search_ui/everything.rs`、`src/app/subfolder_expansion.rs` | main close dispatch が既存 Return owner の成功受付を確認する読取 helper。worker の寿命／採用／guard は変更なし |
+| `src/app/subfolder_expansion.rs` | main close dispatch が既存 Return owner の成功受付を確認する読取 helper。worker の寿命／採用／guard は変更なし |
+| `src/global_search_ui/everything.rs` | A の同期 close の調査で、誤った前提に基づく不要な Everything legacy Focus owner の読取 helper を削除 |
 | `src/app/tests/everything_close_return.rs` | retained prepare の受付フレーム 1 Focus／採用フレーム 0 Focus の実帰路テスト |
 | `src/app/gamepad_input.rs`、`src/ui_fullscreen.rs` | close 結果に従う既存の Focus 入口。動画リングは変更なし |
 | `src/app/tests/fullscreen_close_focus_853.rs`、`src/app/close_return/focus_tests.rs` | 新規の状態遷移／command 列の回帰 |
@@ -2998,7 +3000,7 @@ Smart 側には `close_return_presentation`／CloseReturn の ViewerExited／今
 | `src/app/tests/collection_return.rs`、`src/app/tests/rating_filter_return_1671.rs` | 共用 helper の match arm で型付き戻り値を明示的に捨てる。期待は維持 |
 | 本書、`docs/display-pipeline.md`、`docs/video-architecture.md`、`docs/detached-rework-plan.md`、`docs/section257-smart-folder-navigation.md` | Focus の責務、§6.12 の guard 方針の訂正、設計合意・R1 判断・未検証の記録 |
 
-新規テスト（26 件、ファイル別）:
+新規テスト（28 件、ファイル別、独立レビュー r1 対応後）:
 
 `src/app/tests/fullscreen_close_focus_853.rs`（`ui_scan_853_tests::focus`）:
 
@@ -3017,7 +3019,8 @@ Smart 側には `close_return_presentation`／CloseReturn の ViewerExited／今
 - `section1853_close_focus_native_deferred_terminal_and_immediate_have_one_effect_owner` (f8、通常／immediate の型付き結果、TerminalSessionClose の数、reclaim の予約、一般 Focus 0)
 - `section1853_close_focus_video_ring_keeps_page_list_and_native_reclaim_owner` (動画リングの非退行)
 - `section1853_close_focus_rating_back_worker_keeps_entry_focus_and_existing_guard_policy` (f14、root worker の受付フレームに元の宛先へ 1 回、次フレーム／採用は 0。main-focused guard の既存 close と、guard を通さない採用)
-- `section1853_close_focus_rating_physical_restore_keeps_entry_frame_and_no_adoption_focus` (Rating の親階層、通常 directory／archive suffix directory の classification、ROOT／子 viewport。受付 1 回／採用 0 回)
+- `section1853_close_focus_rating_physical_restore_keeps_entry_frame_and_no_adoption_focus` (Rating の親階層、通常 directory／実際に分類される `.7z` directory の Physical continuation、ROOT／子 viewport。受付 1 回／採用 0 回)
+- `section1853_close_focus_direct_suffix_classification_focuses_only_in_dispatch_frame` (通常の物理親 `.7z`、immediate の Direct／通常 tail の DirectNavigation、ROOT／子 viewport、受付 1 回／分類後と採用 0 回、元の本の選択)
 - `section1853_close_focus_rating_refusal_cannot_borrow_existing_worker_focus` (既存 Rating worker を残す modal 拒否は Focus 0 回)
 - `section1853_close_focus_subfolder_return_keeps_entry_frame_and_no_adoption_focus` (captured サブ展開 origin、scan／snapshot prepare、ROOT／子 viewport。受付 1 回／採用 0 回)
 
@@ -3039,7 +3042,11 @@ Smart 側には `close_return_presentation`／CloseReturn の ViewerExited／今
 
 `src/app/tests/everything_close_return.rs`:
 
-- `section1853_close_focus_everything_worker_keeps_entry_frame_target_and_no_adoption_focus` (retained Everything prepare、ROOT／子 viewport、immediate／通常 tail。全画面が残る受付フレーム 1 回／採用 0 回、元の項目の選択)
+- `section1853_close_focus_everything_sync_close_keeps_entry_frame_target_and_no_adoption_focus` (同期 close と retained Everything prepare、ROOT／子 viewport、immediate／通常 tail。受付フレームに閉じて 1 回／採用 0 回、元の項目の選択)
+
+追加の `src/app/smart_folder_close_focus_tests.rs` 回帰:
+
+- `section1853_close_focus_smart_suffix_parent_classification_focuses_only_in_dispatch_frame` (Smart の物理親 `.7z`、immediate／通常 tail、ROOT／子 viewport。実際の Direct／DirectNavigation 分類 owner を検査、受付 1 回／Smart 採用 0 回)
 
 既存テストの拡張／変更:
 
@@ -3121,3 +3128,58 @@ C5 採用は ROOT 宛のため、今回の「root pass から別の未宣言子�
 修正後に実装担当が行った確認は、変更した Rust 2 ファイルへの `rustfmt --edition 2024 --check --config skip_children=true` と
 `git diff --check` のみ。いずれも成功。cargo／nextest／ビルド／製品起動／commit は実行していない。
 残る懸念は修正後の両構成の再検証が未実施であること。新しい設計返却はない。
+
+
+**独立実装レビュー r1 (REJECT、P2×1・P3×1) の指摘への対応、および設計担当の3回目の検証（2026-11-28、基点 `50e9bafe9`）**:
+
+独立レビューは別の Sol / xhigh が実施したもので、以下は実装担当による指摘への修正記録である。
+修正後の実装レビュー／ACCEPT を得たという記録ではない。
+設計担当の `target/focus-test3.log`（読み取りのみ）は既定 1388 件中 1387 成功・新規 1 件失敗、
+`test-script` 1393 件中 1392 成功・同じ新規 1 件失敗。前回の guard 2 件はこの設計担当の実行で成功した。
+
+A. Everything テストの前提の誤り:
+
+- `return_from_everything_child` → `finish_everything_edit_boundary`（`src/app.rs:24690`）は、pending Search prepare の開始前に
+  `close_fullscreen_for_rating_membership` を呼んで main 全画面を同期で閉じる。したがって旧テスト 952 行の
+  `viewer_session_blocks_main_window()==true` は製品の境界に合っていなかった。前の棚卸しで「retained worker が全画面を残す」と
+  判断した点を訂正し、上の表／display-pipeline／detached の記録も修正した。
+- テストを `section1853_close_focus_everything_sync_close_keeps_entry_frame_target_and_no_adoption_focus` へ改名。
+  期待を「受付後も全画面が残る」から「受付フレームで全画面が閉じている」へ変更する。Focus の元の宛先・同フレーム 1 回と
+  後の結果一覧採用 0 回、元の本の選択は変更しない。根拠は §6.19.1 の 1 の同期非 C5 の規則。
+- 同期 close で送信が決まるため不要だった `LegacyCloseReturnOwners.everything` と
+  `everything_close_return_focus_owner` を削除。Everything の worker／close／native reclaim の挙動を変える修正ではない。
+
+B. P2（製品コードの所有者の取り漏れ）:
+
+- `legacy_close_return_owners` は classification の Physical／Collection しか認めず、`Direct`（immediate）と
+  `DirectNavigation`（通常 tail）、`DirectScan` の成功した分類受付で入口 Focus を失っていた。
+  `ClassifiedOpenContinuation` のこの3種類も、新しい current な既存 request ID の成功受付として照合する。
+  以前の owner、取消済み／拒否された要求には資格を与えず、新しい App pending は作らない。
+- 設計担当はこの分類受付を §1.853 前からの非 C5 と同じく受付フレームで送ると判断した。
+  分類 worker（`app.rs:30987` 以降）は Directory の結果を必ず `folder_scan: Some(scan)` と folder-order read 付きで返す。
+  `Direct`（`31286`）、`DirectNavigation`（`31205`）、`DirectScan`（`31310`）はその scan を引き継ぐ。
+  C5 の新しい走査を開始する条件は `pre_scan.is_none()`（`33489` 付近）なので、この Directory 分類後はそこを通らない。
+  通常の採用か Smart 固有 continuation で閉じ、C5 採用 Focus helper を通らず、2 回目の Focus を送らない。
+  File／Other／失敗の分類にも新しい Directory C5 wait を作る分岐はない。実 C5 wait になった dispatch の優先判定自体は維持する。
+- 新規2テストで通常の PDF 本／Smart の画像本から実ディレクトリ `parent.7z` へ戻る経路を検査する。
+  各テストが immediate／通常 tail × ROOT／子 viewport を実際に dispatch し、直後の Direct／DirectNavigation continuation と
+  current navigation の存在を検査する。分類を待つ間は全画面を保ち、受付 Focus 1 回、分類後／採用は 0 回。
+  後続の各 poll でも C5 wait と別の物理走査 pending が無いことを検査し、通常の帰路は元の本の選択も確認する。
+  `DirectScan` は同じ既存分類 producer／Directory scan 引き渡しを source で監査し、認可対象へ含める（新しい直接テストを追加したという主張はしない）。
+
+B. P3（テストの分類経路の前提の誤り）:
+
+- `physical-parent.zip` は `path_needs_open_classification`（`app.rs:30828`）の対象でなかった。
+  Rating の物理階層復元テストを `physical-parent.7z` に変更し、dispatch 直後に
+  `ClassifiedOpenContinuation::Physical { intent: PhysicalHistoryIntent::Rating { .. }, .. }` と current navigation を検査する。
+  classify=false は分類 owner が無いことも検査する。受付 1 Focus／採用 0 の期待は変えない。
+  旧記録の「ZIP suffix で classification を検証した」という範囲の主張は取り下げ、上のテスト一覧も `.7z` に訂正した。
+
+変更ファイルは `src/app/close_return.rs`、`src/global_search_ui/everything.rs`、
+`src/app/tests/everything_close_return.rs`、`src/app/tests/fullscreen_close_focus_853.rs`、
+`src/app/smart_folder_close_focus_tests.rs` と本書・display-pipeline・detached の記録。
+新規2テストは既存の `test(section1853_)` filter に含まれ、両構成の上記 nextest 式は変更不要。
+期待変更は A の今回追加した Everything テストの全画面保持だけ。基点以前の既存テスト期待は変えていない。
+今回の静的確認は変更した Rust 5 ファイルの `rustfmt --edition 2024 --check --config skip_children=true` と `git diff --check`。
+実装担当は cargo／nextest／ビルド／製品起動／commit を行っていない。修正後の両構成の実行と独立レビューの再確認は未実施。
+新しい設計返却はない。

@@ -3928,9 +3928,13 @@ SmartFolder は非 C5。resident root は同期 close 後に送る。staged root
 dispatch 前後の既存 owner ID と navigation の照合で成功受付を確認した場合だけ、従前どおり dispatch フレームで送る。
 後の Smart 採用で Focus を追加せず、Smart 復元待ちと guard の既存の関係も変えない。
 設計担当の補足に従い、同じ形の既存非 C5 帰路も受付フレームの Focus を保つ。
-RatingViewBack の root／物理階層、Everything の retained prepare、captured origin の Physical／Collection history、
+RatingViewBack の root／物理階層、captured origin の Physical／Collection history、
 サブ展開の Return が全画面を残す場合は、dispatch 前後で新しい current owner の成功受付を確認して元の宛先へ 1 回送る。
 拒否や以前からある worker は資格にならない。これらの採用時 Focus や wait 用の guard 条件は追加しない。
+suffix 分類を挟む Direct／DirectNavigation／DirectScan も、成功した新しい分類受付フレームに元の宛先へ 1 回送る。
+Directory の分類結果は走査済み一覧を持つため、別の C5 物理走査待ちを作らず、その一覧または Smart の既存 owner が採用する。
+Everything の退出は finish_everything_edit_boundary が dispatch 中に全画面を同期 close するため、同じフレームの一般規則で送り、
+後の retained dataset prepare の採用では送らない。
 専用 still viewport の teardown 前に `native_window_allocation_witness` から HWND を捕捉し、送信直前の
 `GetForegroundWindow` と一致するときだけ送る。保存済みの egui focused は使わず、embedded・native presenter/HUD・
 不明・別窓・他アプリを対象外にする。失敗／拒否／切断／取消／置換は全画面を保ち Focus を送らない。

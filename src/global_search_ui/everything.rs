@@ -301,29 +301,6 @@ impl App {
             && policy.video_thumb_use_sidecar_image == self.settings.video_thumb_use_sidecar_image)
     }
 
-    /// Existing Return/prepare identities, sampled only during close dispatch.
-    pub(crate) fn everything_close_return_focus_owner(&self) -> Option<(Arc<AtomicBool>, u64)> {
-        if !self.everything_running_is_current()
-            || !matches!(
-                &self.global_search.pending,
-                Some(SearchProducer::Everything {
-                    intent: EverythingIntent::Return,
-                    ..
-                })
-            )
-        {
-            return None;
-        }
-        let prepare = self.global_search.page_edit_prepare.as_ref()?;
-        let wish = prepare.desired.as_ref()?;
-        (matches!(&wish.source, SearchProjection::Everything { .. })
-            && self.search_projection_is_current(wish)
-            && wish.context == self.virtual_list_context_id()
-            && wish.source_generation == self.items_generation
-            && !prepare.cancel.load(Ordering::Acquire))
-        .then(|| (Arc::clone(&prepare.cancel), wish.sequence))
-    }
-
     pub(crate) fn cancel_everything_search(&mut self) {
         if !matches!(
             self.global_search.pending,

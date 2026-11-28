@@ -50,7 +50,6 @@ struct LegacyCloseReturnOwners {
     rating: Option<u64>,
     history: Option<u64>,
     classification: Option<u64>,
-    everything: Option<(Arc<AtomicBool>, u64)>,
     subfolder: Vec<Arc<AtomicBool>>,
 }
 
@@ -60,14 +59,6 @@ impl LegacyCloseReturnOwners {
             || (self.rating.is_some() && self.rating != before.rating)
             || (self.history.is_some() && self.history != before.history)
             || (self.classification.is_some() && self.classification != before.classification)
-            || self.everything.as_ref().is_some_and(|(worker, sequence)| {
-                before
-                    .everything
-                    .as_ref()
-                    .is_none_or(|(old, old_sequence)| {
-                        !Arc::ptr_eq(worker, old) || sequence != old_sequence
-                    })
-            })
             || self
                 .subfolder
                 .iter()
@@ -249,6 +240,8 @@ impl App {
                     };
                     current(navigation).then_some(id)
                 }),
+            // Directory classifiers carry their completed scan into adoption;
+            // they are legacy async returns, rather than a new C5 scan wait.
             classification: self
                 .top_level_grid_view
                 .open_path_classification()
@@ -258,12 +251,14 @@ impl App {
                         Some(
                             ClassifiedOpenContinuation::Physical { .. }
                                 | ClassifiedOpenContinuation::Collection { .. }
+                                | ClassifiedOpenContinuation::Direct { .. }
+                                | ClassifiedOpenContinuation::DirectNavigation { .. }
+                                | ClassifiedOpenContinuation::DirectScan { .. }
                         )
                     ) && !owner.cancel.load(Ordering::Acquire)
                         && owner.navigation.as_ref().is_some_and(current)
                 })
                 .map(|owner| owner.request_id),
-            everything: self.everything_close_return_focus_owner(),
             subfolder: self.subfolder_close_return_focus_owners(),
         }
     }
