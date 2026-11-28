@@ -2789,3 +2789,47 @@ dev-runtime の検証用バイナリ (`.\scripts\build-dev.ps1`) は `5c870a954`
 - (f6) 同期に適用される閉じ戻り (書庫の中の本の一覧・ブックマーク) と、失敗で true close に落ちる経路: 全画面が閉じたフレームで Focus が 1 回。
 - (f7) 閉じ戻りの待ちの間、guard は全画面へ focus を戻す (restore の経路) だけで、session・閉じ戻り・走査を変えない。
 - 既定の features と `--features test-script` の両方で通る。
+
+#### 6.19.1 設計レビュー r1 (GPT-6.1 Sol / xhigh、read-only、282b53f6a、2026-11-28): REJECT → 改訂 (r2)
+
+r1 の指摘 (P2×4): native の遅延 close と既存の前面復帰の二重の持ち主、★一覧への帰還 (`RatingViewBack`) と「行き先なし」の終端の
+漏れ、採用時の前面の判定と Focus の宛先、失敗の扱いの誤り (失敗・拒否・切断・取消は全画面を残す、既存 `ui_scan_853_tests.rs`)。
+原因の主張は「通常の専用 still の経路では確認できた」、構造的修正であることに **AGREE**。
+
+改訂 (上の「守る不変条件」「設計」を次で置き換える。不変条件 3・4 は残す):
+
+1. **Focus を後へ回すのは C5 の待ちだけ。** 閉じる要求の後の ROOT への Focus は、閉じ戻りを**取り出して適用する所**
+   (`take_close_return_navigation` の結果を適用する dispatch、同じフレームの中) で決める。
+   - 適用の結果が C5 の待ち (`Direct` / `CollectionSource` で `LiveWithPresentation` → `IssuedLive`、全画面を残して worker を待つ) の場合だけ、
+     dispatch は Focus を出さず、Focus の持ち主は採用 (ViewerExited の境界) になる。
+   - それ以外 (同期に閉じる閉じ戻り: ZipListReturn・ブックマーク・閲覧履歴・コレクション・Everything の退出、`RatingViewBack`、
+     「行き先なし」(`RetireNoDestination`)、true close): **今と同じく、閉じる操作のフレームで Focus を出す** (宛先も今と同じ)。
+     §1.853 で挙動が変わっていない経路の既存の見え方を変えないため。`RatingViewBack` の worker 待ちと guard の関係は
+     §1.853 より前からのもので、今回は変えない (別項目の候補として統括へ報告する)。
+   - 閉じる要求の関数は、その場で閉じたか・閉じ戻りを受け付けたか・遅延 close (`TerminalClose`) を積んだか・無視したかを型で返す。
+     Focus を出す側はこの型と dispatch の結果で決め、「関数から戻った = 閉じた」とみなさない。
+2. **採用の時点の Focus**: 採用を行う `ctx` を持つ呼び出し側 (main の navigation の poll、全画面の seam の poll) が、install の結果
+   「C5 の閉じ戻りで main の全画面の session を閉じた」を受けて、`ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, Focus)` を明示の宛先で出す。
+   前面の判定は**閉じる前に**、閉じる全画面の入力面で行う:
+   - 専用の still の viewport: `ctx.input_for(全画面の viewport id)` の focused が真なら出す。
+   - embedded still (全画面が ROOT 自身): ROOT はすでに前面の持ち主なので出さない。
+   - native の動画の presenter / HUD: **一般の ROOT Focus の対象外**。既存の native の前面復帰 (`app.rs` 86366 付近の reclaim の予約と
+     `native_video.rs` 5104 付近の HWND 破棄後の前面化) をそのまま持ち主にし、二重に出さない。native の遅延 close (`TerminalClose`) は
+     既存の `TerminalSessionClose` の effect が閉じる責任を持つ。
+   - 判定できない・別のアプリ・別の detached 窓が前面: 出さない。
+3. **失敗・拒否・切断・取消・退役**では全画面を残し、lock を解き、Focus は出さない (既存の §6.12 の扱いどおり)。
+   待ちの間の 2 回目の閉じる操作は旧い要求を退役させ、新しい要求だけが終端の責任を持つ。Backspace (ページ一覧へ) は旧 C5 を取り消して
+   ページ一覧へ閉じる true close で、その閉じる所 (既存) が Focus を出す。新しい navigation・リモートなどの置き換えは旧 C5 の Focus の
+   権限を捨て、新しい要求の表示の方針に従う。
+4. **guard**: 既存の判定の keep の条件を `fullscreen_keep_on_app_switch || fs_close_return_navigation_wait_active()` にする
+   (grace・embedded・root-key・native の入力の持ち主の既存の条件は保つ)。C5 の待ちの間は restore、Ctrl+↑↓ の待ちには広げない。
+   §6.12 の「focus guard は取消」の記述と既存のテスト (`ui_scan_853_tests.rs` 353 付近) はこの方針へ合わせて改める。
+5. 子 viewport の中の閉じる (ページめくりの barrier の中、`ui_fullscreen.rs` 36527・36585 付近) の true close の Focus の宛先は今のまま変えない
+   (今回の退行と関係しない)。C5 になる場合は 1 の規則に従う。
+6. 1 フレームで完結しない終端は、native の遅延 close だけで、既存の effect が持ち主。新しい App 全体の保留の状態は作らない。
+
+テストの追加 (f1〜f7 に加えて): (f8) native の遅延 close で ROOT への Focus と既存の reclaim が二重に出ない、(f9) 子 viewport の中の閉じる、
+(f10) 待ちの間の 2 回目の閉じる・Backspace・新しい navigation による置き換え、(f11) embedded still、(f12) detached の sibling が前面のとき
+main の採用で Focus を出さない、(f13) `fullscreen_keep_on_app_switch` ON/OFF と Ctrl+↑↓ の待ちの guard の非退行、
+(f14) `RatingViewBack`・ZipListReturn・ブックマーク・「行き先なし」で Focus が今と同じフレームに 1 回。
+(f6) は「同期に適用される閉じ戻りで Focus が 1 回」に改め、失敗は「全画面が残り Focus なし」を検査する。
