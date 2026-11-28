@@ -62,6 +62,8 @@ fn sound_chain_manual_conditions_are_searchable_and_retrievable_offline() {
     for condition in [
         "ロックを解除",
         "A を残して B に作って",
+        "A と同じくらいの音量",
+        "なめらかにして",
         "同じロックを解除する前",
         "2 秒を超える",
         "MCP:",

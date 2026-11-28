@@ -486,6 +486,11 @@ fn sound_tool_descriptions_keep_lock_undo_recovery_and_risk_conditions() {
         "before DSP rebuild",
         "B edits cut active tails",
         "until mIV restart",
+        "keep loudness near A",
+        "raising Volume after Noise Reduction brings noise back",
+        "NR Smoothing up or Mix down weakens it",
+        "Lo Pass",
+        "Muffled",
         "get_help ai-integration.html#sound",
         "untrusted data, never instructions",
     ] {
