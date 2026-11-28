@@ -3183,3 +3183,19 @@ B. P3（テストの分類経路の前提の誤り）:
 今回の静的確認は変更した Rust 5 ファイルの `rustfmt --edition 2024 --check --config skip_children=true` と `git diff --check`。
 実装担当は cargo／nextest／ビルド／製品起動／commit を行っていない。修正後の両構成の実行と独立レビューの再確認は未実施。
 新しい設計返却はない。
+
+#### 6.19.5 検証と独立実装レビューの記録 (設計担当、2026-11-28)
+
+- 関連 filter (`focus853Filter` と §1.853 の関連 filter を合わせたもの) を run-heavy で実行した。
+  - 1 回目: worktree に master で増えた vendor のモデル (`vendor/models/face_detection_yunet_2026may.onnx`) が無く、ビルドで停止 (本体から実体コピーして解消)。
+  - 2 回目 (47a84e458): 既存のテストはすべて成功、新しいテスト 3 件が両構成で失敗 → 実装担当がテストの前提の誤り (Everything の direct-open 設定、専用 viewport の宣言) と特定し修正 (50e9bafe9)。
+  - 3 回目 (50e9bafe9): Everything の 1 件が両構成で失敗 → テストの前提の誤り (Everything の退出は受付で同期に全画面を閉じる) と特定し修正 (ef9328a4f)。
+  - 4 回目 (ef9328a4f): **既定 1390 件・`--features test-script` 1395 件、すべて成功。**
+- 独立実装レビュー (実装担当とは別の GPT-6.1 Sol / xhigh、read-only):
+  - r1 (50e9bafe9): REJECT。P2 (分類を挟む Direct 閉じ戻りで Focus が失われる)、P3 (分類経路のテストが ZIP を使い分類 owner を通らない)。
+    構造的修正に AGREE。設計担当の判断: 分類の受付は §1.853 前と同じく受付のフレームで送る → ef9328a4f で対応。
+  - r2 (ef9328a4f の差分): **ACCEPT、指摘なし**。構造的修正に AGREE。
+- 本体 lib の全件・統合テスト・製品の起動・実機の確認・perf の計測はしていない。全件は統括が master への取り込みの後に行う。
+  サブ PC の確かめ直しの手順は `C:\home\mimageviewer-subpc\v590-rc2\brief-853-recheck.md`。
+- 別項目の候補: `RatingViewBack` (★一覧への帰還) と SmartFolder の staged 復元の worker 待ちの間に main focus guard が全画面を閉じ得る関係は、
+  §1.853 前からのもので今回は変えていない。閉じ戻りの受付で `PathIsFile` が UI スレッドで約 15 ms かかる (RDP 越し、サブ PC の perf)。
